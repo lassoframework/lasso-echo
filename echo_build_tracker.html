@@ -1,0 +1,248 @@
+<!-- Echo Build Status — executive tracker, LASSO V3 brand-locked. Self-contained. -->
+<div id="echo-status"></div>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+  #echo-status, #echo-status * { box-sizing: border-box; margin: 0; padding: 0; }
+  #echo-status {
+    --navy:#121E3C; --navy2:#1B326E; --red:#FF0000; --sky:#5EB9E6;
+    --white:#FFFFFF; --steel:#D8E3EE; --muted:rgba(216,227,238,.32);
+    font-family:'Inter',Helvetica,Arial,sans-serif;
+    background:var(--navy); color:var(--white);
+    padding:40px 34px 44px; border-radius:16px; max-width:1000px; margin:0 auto;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* header */
+  #echo-status .eyebrow{ font-size:12px; font-weight:800; letter-spacing:.26em; text-transform:uppercase; color:var(--sky); }
+  #echo-status .title{ font-size:46px; font-weight:900; line-height:.98; letter-spacing:-.02em; margin:8px 0 6px; }
+  #echo-status .title .a{ color:var(--red); }
+  #echo-status .deck{ font-size:14px; font-weight:500; color:var(--steel); letter-spacing:.01em; }
+  #echo-status .deck .dot{ color:var(--red); font-weight:900; padding:0 8px; }
+
+  /* phase rail (signature) */
+  #echo-status .rail-wrap{ margin:36px 0 34px; }
+  #echo-status .rail-label{ font-size:11px; font-weight:800; letter-spacing:.22em; text-transform:uppercase; color:var(--steel); margin-bottom:20px; }
+  #echo-status .rail{ display:grid; grid-template-columns:repeat(5,1fr); position:relative; }
+  #echo-status .rail::before{ content:""; position:absolute; left:10%; right:10%; top:23px; height:3px; background:var(--muted); border-radius:99px; }
+  #echo-status .node{ position:relative; text-align:center; }
+  #echo-status .node .seg{ position:absolute; top:23px; height:3px; left:-50%; right:50%; z-index:1; }
+  #echo-status .node:first-child .seg{ display:none; }
+  #echo-status .node .disc{
+    position:relative; z-index:2; width:48px; height:48px; border-radius:50%;
+    margin:0 auto 12px; display:grid; place-items:center;
+    font-size:18px; font-weight:900; background:var(--navy);
+    border:3px solid var(--muted); color:var(--steel);
+  }
+  #echo-status .node.done .disc{ background:var(--sky); border-color:var(--sky); color:var(--navy); }
+  #echo-status .node.active .disc{ border-color:var(--red); color:var(--white); box-shadow:0 0 0 6px rgba(255,0,0,.16); }
+  #echo-status .node .nm{ font-size:12.5px; font-weight:800; line-height:1.2; }
+  #echo-status .node .pc{ font-size:11px; font-weight:700; color:var(--steel); margin-top:3px; }
+  #echo-status .node.done .pc{ color:var(--sky); }
+  #echo-status .node.active .pc{ color:var(--red); }
+  #echo-status .youarehere{ display:inline-block; margin-top:7px; font-size:9px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; background:var(--red); color:var(--white); padding:3px 7px; border-radius:99px; }
+
+  /* summary tiles */
+  #echo-status .tiles{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  #echo-status .tile{ background:var(--white); color:var(--navy); border-radius:12px; padding:18px 16px; }
+  #echo-status .tile .k{ font-size:10.5px; font-weight:800; letter-spacing:.13em; text-transform:uppercase; color:#5c6b86; }
+  #echo-status .tile .v{ font-size:30px; font-weight:900; line-height:1; margin-top:8px; letter-spacing:-.02em; }
+  #echo-status .tile .v.red{ color:var(--red); } #echo-status .tile .v.sky{ color:#2f7fb0; }
+  #echo-status .tile .v.small{ font-size:19px; }
+  #echo-status .tile .vs{ font-size:13px; font-weight:700; color:#5c6b86; margin-top:6px; }
+
+  /* next moves */
+  #echo-status .next{ margin-top:24px; background:var(--white); border-radius:12px; overflow:hidden; }
+  #echo-status .next .cap{ background:var(--red); color:var(--white); padding:12px 18px; font-size:12px; font-weight:900; letter-spacing:.13em; text-transform:uppercase; }
+  #echo-status .next ol{ list-style:none; padding:6px 18px 14px; }
+  #echo-status .next li{ display:flex; gap:12px; align-items:baseline; padding:9px 0; border-top:1px solid #eef2f7; color:var(--navy); }
+  #echo-status .next li:first-child{ border-top:none; }
+  #echo-status .next .n{ flex:0 0 22px; font-size:14px; font-weight:900; color:var(--red); }
+  #echo-status .next .t{ font-size:14px; font-weight:600; line-height:1.35; }
+  #echo-status .next .by{ margin-left:auto; flex:0 0 auto; font-size:9.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#8a96aa; align-self:center; white-space:nowrap; }
+
+  /* stage detail grid */
+  #echo-status .grid{ margin-top:30px; display:grid; grid-template-columns:repeat(2,1fr); gap:14px; }
+  #echo-status .card{ background:var(--navy2); border-radius:12px; padding:18px; }
+  #echo-status .card.full{ grid-column:1 / -1; }
+  #echo-status .card > header{ display:flex; align-items:center; gap:14px; margin-bottom:14px; }
+  #echo-status .card h3{ font-size:15px; font-weight:800; line-height:1.15; }
+  #echo-status .card .cmeta{ font-size:11.5px; font-weight:600; color:var(--steel); margin-top:3px; }
+  #echo-status .tasks{ list-style:none; }
+  #echo-status .tasks li{ display:flex; gap:10px; align-items:flex-start; padding:7px 0; border-top:1px solid rgba(255,255,255,.07); font-size:13px; line-height:1.38; cursor:pointer; }
+  #echo-status .tasks li:first-child{ border-top:none; }
+  #echo-status .tasks li:focus-visible{ outline:2px solid var(--sky); outline-offset:3px; border-radius:4px; }
+  #echo-status .chk{ flex:0 0 18px; width:18px; height:18px; border-radius:5px; margin-top:1px; border:2px solid var(--muted); display:grid; place-items:center; font-size:11px; font-weight:900; color:transparent; }
+  #echo-status .tasks li.done .chk{ background:var(--sky); border-color:var(--sky); color:var(--navy); }
+  #echo-status .tasks li.ready .chk{ border-color:var(--red); color:var(--red); }
+  #echo-status .tasks li.done .tt{ color:var(--steel); text-decoration:line-through; text-decoration-color:var(--muted); }
+  #echo-status .tasks li .tt{ flex:1; }
+  #echo-status .card.deferred{ background:transparent; border:1.5px dashed var(--muted); }
+  #echo-status .card.deferred h3{ color:var(--steel); }
+
+  #echo-status .foot{ margin-top:26px; text-align:center; font-size:10.5px; font-weight:600; letter-spacing:.05em; color:var(--steel); }
+
+  @media (max-width:720px){
+    #echo-status{ padding:28px 18px 32px; }
+    #echo-status .title{ font-size:34px; }
+    #echo-status .rail{ grid-template-columns:1fr; gap:4px; }
+    #echo-status .rail::before{ display:none; }
+    #echo-status .node{ display:grid; grid-template-columns:48px 1fr; align-items:center; text-align:left; gap:14px; padding:4px 0; }
+    #echo-status .node .seg{ display:none; }
+    #echo-status .node .disc{ margin:0; }
+    #echo-status .tiles{ grid-template-columns:repeat(2,1fr); }
+    #echo-status .grid{ grid-template-columns:1fr; }
+  }
+  @media (prefers-reduced-motion:no-preference){
+    #echo-status .seg, #echo-status .ringfg{ transition:all .4s ease; }
+  }
+</style>
+
+<script>
+(function(){
+  const STAGES=[
+    { n:"0", short:"Foundation", name:"Stage 0 — Foundation", meta:"Brand, repo, gates, tests",
+      items:[
+        ["Canonical LASSO brand bible","done"],
+        ["Reference repo scaffolded (own body, Ranger spine as pattern)","done"],
+        ["Gates baked into code","done"],
+        ["Test suite green (16 of 16)","done"],
+        ["Stage 1 build prompt for Claude Code","done"],
+        ["Railway and separation plan documented","done"],
+        ["Brain hook stubbed (read-only, proposes)","done"],
+    ]},
+    { n:"1", short:"LASSO Only", name:"Stage 1 — Draft, approve, publish", meta:"Draft-only, prove it on us",
+      items:[
+        ["Daily drafter, one post per account","done"],
+        ["Slack approval cards to #echoclaude","done"],
+        ["Meta publisher with draft-only guard","done"],
+        ["Post logging (no tokens)","done"],
+        ["Create lasso-echo GitHub repo","todo"],
+        ["New Railway project + echo service + env vars","todo"],
+        ["Meta App + Graph permissions approved","todo"],
+        ["Per-account tokens set by hand","todo"],
+        ["Slack app + #echoclaude wired","todo"],
+        ["Brand voice doc approved by Blake","todo"],
+        ["Host creative media for public URLs","todo"],
+        ["Run master ON, publish OFF, watch drafts","ready"],
+        ["Run the full 30-day loop once","todo"],
+        ["Arm publishing once drafts look right","todo"],
+    ]},
+    { n:"2", short:"First Client", name:"Stage 2 — One paying client", meta:"Prove the voice holds",
+      items:[
+        ["Brand voice intake template","todo"],
+        ["Client approval flow via portal","todo"],
+        ["Prove the voice holds for a non-Blake client","todo"],
+        ["Prove the 30-day refresh lands","todo"],
+    ]},
+    { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
+      items:[
+        ["Launch as the $99 Social Media add-on ($99 ad clients, $199 non-ad)","todo"],
+        ["Template intake, approval, calendar, review","todo"],
+        ["Portal exposes creative library (read)","todo"],
+        ["Portal hosts reporting dashboard (write)","todo"],
+        ["Onboard client by client","todo"],
+    ]},
+    { n:"4", short:"Scale", name:"Stage 4 — Scale automation", meta:"Near-zero-touch at volume",
+      items:[
+        ["Per-account trust ladder climbing","todo"],
+        ["Multi-account near-zero-touch oversight","todo"],
+        ["Nightly brain loop armed","todo"],
+    ]},
+  ];
+  const STUBS={ name:"Deferred by design", meta:"Documented hooks, built when their stage arrives",
+    items:["Stories posting","Comment handling","30-day refresh loop","Portal library read","Portal reporting write","Nightly brain read"]};
+
+  const root=document.getElementById("echo-status");
+  const done=s=>s.items.filter(i=>i[1]==="done").length;
+  const pct=s=>Math.round((done(s)/s.items.length)*100);
+
+  function ring(p,color){
+    const r=21,c=2*Math.PI*r,off=c*(1-p/100);
+    return `<svg width="54" height="54" viewBox="0 0 54 54" style="flex:0 0 auto">
+      <circle cx="27" cy="27" r="${r}" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="5"/>
+      <circle class="ringfg" cx="27" cy="27" r="${r}" fill="none" stroke="${color}" stroke-width="5"
+        stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}" transform="rotate(-90 27 27)"/>
+      <text x="27" y="31" text-anchor="middle" fill="#fff" font-size="13" font-weight="900" font-family="Inter,Helvetica,Arial">${p}%</text>
+    </svg>`;
+  }
+
+  function render(){
+    let tot=0,dn=0;
+    STAGES.forEach(s=>{tot+=s.items.length;dn+=done(s);});
+    const overall=Math.round((dn/tot)*100);
+    let activeIdx=STAGES.findIndex(s=>pct(s)<100);
+    if(activeIdx<0) activeIdx=STAGES.length-1;
+
+    let h=`<p class="eyebrow">LASSO Framework</p>
+      <h1 class="title">Echo <span class="a">Build</span> Status</h1>
+      <p class="deck">Social agent buildout<span class="dot">/</span>Draft-only<span class="dot">/</span>Publishing not armed</p>`;
+
+    // rail
+    h+=`<div class="rail-wrap"><p class="rail-label">The Path</p><div class="rail">`;
+    STAGES.forEach((s,i)=>{
+      const p=pct(s);
+      const state=p===100?"done":(i===activeIdx?"active":"");
+      const segColor=(i>0 && pct(STAGES[i-1])===100)?"var(--sky)":"var(--muted)";
+      h+=`<div class="node ${state}">
+        ${i>0?`<span class="seg" style="background:${segColor}"></span>`:""}
+        <div class="disc">${p===100?"&#10003;":s.n}</div>
+        <div><div class="nm">${s.short}</div><div class="pc">${p}%</div>
+        ${i===activeIdx?`<span class="youarehere">You are here</span>`:""}</div>
+      </div>`;
+    });
+    h+=`</div></div>`;
+
+    // tiles
+    h+=`<div class="tiles">
+      <div class="tile"><div class="k">Overall</div><div class="v red">${overall}%</div><div class="vs">${dn} of ${tot} items</div></div>
+      <div class="tile"><div class="k">Current phase</div><div class="v small">Stage ${STAGES[activeIdx].n}</div><div class="vs">${STAGES[activeIdx].short}</div></div>
+      <div class="tile"><div class="k">Stage 1 code</div><div class="v sky small">Complete</div><div class="vs">Deploy pending</div></div>
+      <div class="tile"><div class="k">Publishing</div><div class="v small">Draft-only</div><div class="vs">Flag OFF, by design</div></div>
+    </div>`;
+
+    // next moves
+    const blockers=STAGES[activeIdx].items.filter(i=>i[1]==="todo").slice(0,5);
+    h+=`<div class="next"><div class="cap">Next moves &middot; Stage ${STAGES[activeIdx].n}</div><ol>`;
+    blockers.forEach((b,i)=>{
+      const byhand=/Meta App|tokens|GitHub|Railway|Slack|approved by Blake|Host creative/.test(b[0]);
+      h+=`<li><span class="n">${i+1}</span><span class="t">${b[0]}</span><span class="by">${byhand?"By hand":"Build"}</span></li>`;
+    });
+    if(!blockers.length){ h+=`<li><span class="n">&#10003;</span><span class="t">This stage is clear. Advance to the next phase.</span></li>`; }
+    h+=`</ol></div>`;
+
+    // stage cards
+    h+=`<div class="grid">`;
+    STAGES.forEach((s,si)=>{
+      const p=pct(s);
+      const col=p===100?"var(--sky)":"var(--red)";
+      h+=`<div class="card"><header>${ring(p,col)}<div><h3>${s.name}</h3><div class="cmeta">${s.meta} &middot; ${done(s)}/${s.items.length}</div></div></header><ul class="tasks">`;
+      s.items.forEach((it,ii)=>{
+        const cls=it[1]==="done"?"done":it[1]==="ready"?"ready":"";
+        const mark=it[1]==="done"?"&#10003;":it[1]==="ready"?"&bull;":"";
+        h+=`<li class="${cls}" tabindex="0" role="button" data-s="${si}" data-i="${ii}"><span class="chk">${mark}</span><span class="tt">${it[0]}</span></li>`;
+      });
+      h+=`</ul></div>`;
+    });
+    h+=`<div class="card deferred full"><header><div><h3>${STUBS.name}</h3><div class="cmeta">${STUBS.meta}</div></div></header><ul class="tasks">`;
+    STUBS.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk"></span><span class="tt" style="color:var(--steel)">${t}</span></li>`; });
+    h+=`</ul></div></div>`;
+
+    h+=`<p class="foot">Tap a task to cycle to do &rarr; ready &rarr; done &middot; source of truth is PROGRESS.md &middot; this view does not save on reload</p>`;
+
+    root.innerHTML=h;
+
+    root.querySelectorAll('.tasks li[data-s]').forEach(li=>{
+      const toggle=()=>{
+        const s=+li.dataset.s,i=+li.dataset.i,cur=STAGES[s].items[i][1];
+        STAGES[s].items[i][1]= cur==="todo"?"ready":cur==="ready"?"done":"todo";
+        render();
+      };
+      li.addEventListener('click',toggle);
+      li.addEventListener('keydown',e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggle(); }});
+    });
+  }
+  render();
+})();
+</script>

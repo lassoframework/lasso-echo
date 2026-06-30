@@ -1,0 +1,25 @@
+# Echo Slack app manifest. Create app -> "From a manifest" -> paste this.
+# Socket Mode: no public URL needed.
+display_information:
+  name: Echo
+  description: LASSO social agent. Drafts posts and holds them for approval.
+  background_color: "#121E3C"
+features:
+  bot_user:
+    display_name: Echo
+    always_online: true
+  slash_commands:
+    - command: /echo-draft
+      description: Draft today's posts now and send approval cards
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+settings:
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
