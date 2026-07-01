@@ -59,6 +59,42 @@ def _fallback_text(draft):
     return f"Approval needed: {draft.account_key} post {draft.draft_id}"
 
 
+def _is_hosted_image(url):
+    """True if `url` is a hosted still image (.png/.jpg/.jpeg/.webp), case-insensitive."""
+    return bool(url) and str(url).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+
+def _preview_blocks(draft):
+    """
+    Inline creative preview for the approval card. ADDITIVE — this never replaces
+    the *Creative:* text line, the fields, the buttons, or the reply protocol.
+    Returns a list of 0+ Block Kit blocks:
+      - carousel (2+ slides) with hosted slide_urls -> image of slide 1 + a note
+      - single hosted still image                   -> an image block
+      - video / Reel                                -> a note (not previewed inline)
+      - no hosted url                               -> a note (shows once hosted)
+    """
+    slides = getattr(draft, "slides", None) or []
+    slide_urls = getattr(draft, "slide_urls", None) or []
+
+    def _ctx(text):
+        return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+    if len(slides) > 1 and slide_urls:
+        n = len(slides)
+        return [
+            {"type": "image", "image_url": slide_urls[0],
+             "alt_text": f"carousel cover, slide 1 of {n}"},
+            _ctx(f"Carousel preview: slide 1 of {n}. The remaining slides post in order."),
+        ]
+    if _is_video(draft.creative_public_url) or _is_video(draft.creative_path):
+        return [_ctx("Video creative (Reel): not previewed inline in Slack.")]
+    if _is_hosted_image(draft.creative_public_url):
+        return [{"type": "image", "image_url": draft.creative_public_url,
+                 "alt_text": "creative preview"}]
+    return [_ctx("The image will show here once the creative is hosted at a public URL.")]
+
+
 def build_card_blocks(draft):
     """Block Kit card. Buttons carry the draft_id in their value."""
     if draft.status.value == "blocked":
@@ -90,6 +126,7 @@ def build_card_blocks(draft):
         ]},
         {"type": "section",
          "text": {"type": "mrkdwn", "text": f"*Creative:*\n{creative_ref}"}},
+        *_preview_blocks(draft),
         {"type": "section",
          "text": {"type": "mrkdwn", "text": f"*Caption:*\n{caption_preview}"}},
         {"type": "context",

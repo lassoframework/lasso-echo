@@ -33,6 +33,12 @@ SLACK_CHANNEL_ID = os.environ.get("AGENT_SLACK_CHANNEL_ID", "")
 GRAPH_API_VERSION = os.environ.get("AGENT_GRAPH_API_VERSION", "v21.0")
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
+# ---- Creative studio (Nano Banana infographic generation) --------------------
+# OFF by default. The API key is read lazily in creative_studio.py (like tokens),
+# never stored on an object and never logged. Only the env var NAME lives here.
+NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
+NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
+
 
 def _truthy(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -50,3 +56,12 @@ def publish_enabled() -> bool:
     Blake arms this by hand once the drafts look right.
     """
     return _truthy(os.environ.get("AGENT_PUBLISH_ENABLED", "false"))
+
+
+def creative_studio_enabled() -> bool:
+    """
+    Nano Banana image generation switch. OFF by default. When OFF, generate()
+    returns None and makes NO API call. Independent of publishing; this only
+    controls whether Echo draws an infographic, never whether it posts.
+    """
+    return _truthy(os.environ.get("AGENT_NANO_ENABLED", "false"))
