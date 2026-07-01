@@ -45,9 +45,13 @@ BRAND_PALETTE = (
 COMPOSITION_STYLE = (
     "House style (keep this CONSISTENT on every card so the whole run reads as one brand "
     "system): a clean, minimal, modern FLAT infographic with generous negative space, "
-    "uncluttered and premium. Use an icon-driven left to right (or otherwise simple) flow "
-    "with a few clear, labeled icons in a simple line-and-icon illustration style, a "
-    "consistent stroke weight, and the brand palette throughout.\n"
+    "uncluttered and premium. Use an icon-driven flow with a few clear, labeled icons in a "
+    "simple line-and-icon illustration style, a consistent stroke weight, and the brand "
+    "palette throughout.\n"
+    "Portrait layout: lay the whole design out for a TALL vertical frame. Put the one short "
+    "headline near the TOP, then arrange the icon flow vertically (stacked top to bottom, or "
+    "a simple flow) so it FILLS the tall portrait canvas. Keep generous margins and make "
+    "sure nothing is cut off at the edges.\n"
     "Subject varies by pillar: choose simple icons that FIT this card's topic and message. "
     "Do NOT default to a computer, monitor, or dashboard every time; pick the everyday "
     "objects relevant to the subject, rendered in the SAME clean house style and palette. "
@@ -84,7 +88,15 @@ def build_prompt(headline, facts):
     Dashes in the approved text are scrubbed. Nothing is invented.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
+    # Aspect first and prominent: IG/FB feed posts are 4:5 portrait. Config-tunable.
+    aspect = (
+        f"Canvas: a VERTICAL {config.IMAGE_ASPECT} PORTRAIT ({config.IMAGE_PIXELS}, taller "
+        "than wide), designed for an Instagram and Facebook feed post. Fit the entire "
+        "composition inside this tall portrait frame with generous margins; nothing is cut "
+        "off at the edges."
+    )
     prompt = (
+        f"{aspect}\n"
         "Design a clean, minimal, premium LASSO-branded infographic.\n"
         f"Headline (the ONLY text to render on the image, keep it short): "
         f"{_scrub_dashes(headline)}\n"

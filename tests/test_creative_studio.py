@@ -158,10 +158,16 @@ def test_prompt_locks_house_style_and_varies_subject():
     # a locked, consistent house look
     assert "house style" in low
     assert "minimal" in low
-    assert "icon-driven left to right" in low
+    assert "icon-driven" in low
     assert "consistent stroke weight" in low
     assert "negative space" in low
     assert "not a busy poster" in low
+    # 4:5 PORTRAIT canvas for IG/FB feed
+    assert "4:5" in p
+    assert "1080x1350" in p
+    assert "portrait" in low
+    assert "taller than wide" in low
+    assert "near the top" in low            # portrait layout: headline up top
     # the SUBJECT varies by pillar; do NOT force a monitor/dashboard every time
     assert "subject varies by pillar" in low
     assert "do not default to a computer, monitor, or dashboard" in low
@@ -173,3 +179,12 @@ def test_prompt_locks_house_style_and_varies_subject():
     # the palette is retained (all four locked V3 colors)
     for hexcode in ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0"):
         assert hexcode in p
+
+
+def test_image_aspect_is_config_tunable(monkeypatch):
+    # default is 4:5 portrait; a config/env override retunes the prompt without a code edit
+    assert "4:5" in creative_studio.build_prompt("H", ["a body line"])
+    monkeypatch.setattr(config, "IMAGE_ASPECT", "1:1")
+    monkeypatch.setattr(config, "IMAGE_PIXELS", "1080x1080")
+    p = creative_studio.build_prompt("H", ["a body line"])
+    assert "1:1" in p and "1080x1080" in p

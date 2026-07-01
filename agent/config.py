@@ -59,6 +59,10 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # never stored on an object and never logged. Only the env var NAME lives here.
 NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
 NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
+# Image output aspect: IG/FB feed posts are 4:5 PORTRAIT (1080x1350). Tunable via env
+# so the target can change without a code edit.
+IMAGE_ASPECT = os.environ.get("AGENT_IMAGE_ASPECT", "4:5")
+IMAGE_PIXELS = os.environ.get("AGENT_IMAGE_PIXELS", "1080x1350")
 
 # ---- Media hosting (S3-compatible; scale-hardened for 200+ clients) ----------
 # OFF by default. Credentials are read lazily in media_host.py by the env var NAMES
