@@ -6,7 +6,10 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-01 (card preview + Creative Studio committed to origin/main 30e5b12, 44 green)
+Last updated: 2026-07-01 (FIRST LIVE CARD SHIPPED — Nano Banana infographic generated
++ R2-hosted + posted to #echoclaude, approval gate proven, publishing still OFF.
+Cleared today: Gemini billing, model env, /data volume, R2 hosting auth, V3 palette,
+clean house style. Next: drop personal FB, run the 30-day loop, then arm publishing.)
 
 ---
 
