@@ -14,9 +14,9 @@ Last updated: 2026-07-01
 - [x] Canonical LASSO brand bible written (`brand_voice/lasso_voice.md`)
 - [x] Reference repo scaffolded (`lasso-echo`), own body, Ranger spine as pattern
 - [x] Gates baked into code (approval, draft-only, trust ladder, no-fabrication)
-- [x] Test suite green (31/31: one-per-account, approval required, draft-only no
+- [x] Test suite green (35/35: one-per-account, approval required, draft-only no
       network, missing voice blocks, non-approver denied, tokens never logged,
-      plus growth pack — CTA rotation, hashtag cap, carousel)
+      plus growth pack — CTA rotation, hashtag cap, carousel — and reels)
 - [x] Stage 1 build prompt for Claude Code (`echo-stage1-build-prompt.md`)
 - [x] Railway + separation plan documented (own project, own service, #echoclaude)
 - [x] Brain hook stubbed (read-only, proposes, never rewrites voice)
@@ -32,6 +32,7 @@ Build (reference implementation done; real deploy pending):
 - [x] Growth pack: hashtag cap (5)
 - [x] Carousel support (multi-slide drafts + IG carousel publish path, draft-only)
 - [x] Push growth pack to origin/main (dde2f3a)
+- [x] Reels support (draft-only)
 
 Blake-by-hand and deploy (open):
 - [ ] Create lasso-echo repo on GitHub
