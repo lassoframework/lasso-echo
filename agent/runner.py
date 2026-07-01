@@ -12,7 +12,7 @@ later, only on a human Approve, and only if the publish flag is armed.
 
 from datetime import datetime, timezone
 
-from . import config
+from . import config, schedule
 from .accounts import active_accounts
 from .daily_studio import build_daily_infographic_draft
 from .drafter import draft_post
@@ -52,6 +52,11 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     lib = library_path or config.LIBRARY_PATH
 
     for account in (accounts or active_accounts()):
+        # Cadence gate FIRST: a skip day (default Saturday) produces no draft and no
+        # card for this account.
+        if not schedule.should_post_on(day_key):
+            continue
+
         draft = None
         # For a LASSO account, try the fully-automated infographic path FIRST. It is
         # dormant unless all three flags are armed; None -> fall back to the library
@@ -60,7 +65,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             draft = build_daily_infographic_draft(account, day_key)
         if draft is None:
             creative = pick_next(account, lib, used_creatives_for(account.key))
-            draft = draft_post(account, creative, when, voice=voice)
+            # Schedule the fallback draft to the same cadence slot.
+            draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=voice)
         poster.post_approval_card(draft)
         if draft.status.value != "blocked":
             store.put(draft)

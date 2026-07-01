@@ -79,6 +79,7 @@ def test_daily_drafts_one_per_account(monkeypatch, tmp_path):
     from agent.store import PendingStore
     out = runner.run_daily(poster=poster, voice_path=str(vp),
                            library_path=str(lib), accounts=accts,
+                           scheduled_for="2026-07-01T12:00:00Z",  # Wednesday, a posting day
                            store=PendingStore(path=str(tmp_path / "pend.json")))
     assert out["status"] == "drafted"
     assert len(poster.cards) == 3  # exactly one per account

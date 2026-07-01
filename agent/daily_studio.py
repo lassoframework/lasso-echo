@@ -13,7 +13,7 @@ blocked plan returns a BLOCKED Draft. Nothing here publishes — publishing stay
 the approver gate and AGENT_PUBLISH_ENABLED.
 """
 
-from . import config, content_planner, creative_studio, media_host
+from . import config, content_planner, creative_studio, media_host, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
 
@@ -64,6 +64,6 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
         draft_id=draft_id, account_key=account.key, platform=account.platform,
         caption=plan["caption"], hashtags=list(plan["hashtags"]),
         creative_path=art["path"], creative_public_url=hosted,
-        scheduled_for=day_key, status=DraftStatus.PENDING,
+        scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[headline] + facts,  # no-fabrication audit trail
     )

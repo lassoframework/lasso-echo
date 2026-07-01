@@ -33,6 +33,23 @@ POST_LOG_PATH = os.environ.get("AGENT_POST_LOG_PATH", "post_log.jsonl")
 SLACK_BOT_TOKEN_ENV = "AGENT_SLACK_BOT_TOKEN"  # name of the env var, not the value
 SLACK_CHANNEL_ID = os.environ.get("AGENT_SLACK_CHANNEL_ID", "")
 
+# ---- Posting schedule (2026 cadence) -----------------------------------------
+# Timing only: which days and what time a post is scheduled for. This never
+# publishes and never touches approval (see schedule.py).
+def _csv_list(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default)
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+POSTING_TIMEZONE = os.environ.get("AGENT_POSTING_TZ", "America/New_York")
+POSTING_PRIMARY_TIME = os.environ.get("AGENT_POSTING_PRIMARY_TIME", "18:30")
+POSTING_MORNING_TIME = os.environ.get("AGENT_POSTING_MORNING_TIME", "07:30")
+POSTS_PER_DAY = int(os.environ.get("AGENT_POSTS_PER_DAY", "1"))
+POSTING_SKIP_DAYS = _csv_list("AGENT_POSTING_SKIP_DAYS", ["sat"])
+POSTING_PRIORITY_DAYS = _csv_list("AGENT_POSTING_PRIORITY_DAYS", ["tue", "wed", "thu"])
+
 # ---- Meta Graph API ----------------------------------------------------------
 GRAPH_API_VERSION = os.environ.get("AGENT_GRAPH_API_VERSION", "v21.0")
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
