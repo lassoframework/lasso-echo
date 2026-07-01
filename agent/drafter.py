@@ -12,9 +12,11 @@ be constrained to the voice doc + client note and stay inside the same contract.
 import hashlib
 import os
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 
 from . import config
+from . import content_planner
 from . import media_host
 from .voice import load_voice
 
@@ -189,7 +191,28 @@ def draft_post(account, creative, scheduled_for, voice=None,
         )
 
     gen = generator or TemplateGenerator()
-    caption, hashtags, fragments = gen.build(voice, creative)
+
+    # Daily content brain: for a LASSO account with the brain armed, compose the
+    # caption ONLY from the approved source doc (never the per-creative note, never
+    # invented text). A blocked plan blocks the draft. Off / non-LASSO -> unchanged.
+    if config.content_brain_enabled() and account.key.startswith("lasso"):
+        plan = content_planner.plan_for(date.today().isoformat())
+        if plan.get("blocked"):
+            return Draft(
+                draft_id=draft_id,
+                account_key=account.key,
+                platform=account.platform,
+                caption="",
+                hashtags=[],
+                creative_path="",
+                creative_public_url="",
+                scheduled_for=scheduled_for,
+                status=DraftStatus.BLOCKED,
+                blocked_reason="Content brain: " + plan["reason"],
+            )
+        caption, hashtags, fragments = plan["caption"], plan["hashtags"], plan["fragments"]
+    else:
+        caption, hashtags, fragments = gen.build(voice, creative)
 
     creative_public_url = getattr(creative, "public_url", "")
     slides = list(getattr(creative, "slides", []) or [])

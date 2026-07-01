@@ -22,6 +22,10 @@ VOICE_DOC_PATH = os.environ.get("AGENT_VOICE_DOC_PATH", "brand_voice/lasso_voice
 # Stage 1 content library is a local folder. Portal wiring comes later (stubs.py).
 LIBRARY_PATH = os.environ.get("AGENT_LIBRARY_PATH", "content_library")
 
+# The approved "LASSO Now" source doc: the ONLY well of story, pillars, copy bank,
+# CTAs, and hashtags the daily content brain may draw from. Missing -> brain blocks.
+SOURCE_DOC_PATH = os.environ.get("AGENT_SOURCE_DOC_PATH", "brand_voice/lasso_now.md")
+
 # Append-only log of every post we publish (or "would publish" in draft-only).
 POST_LOG_PATH = os.environ.get("AGENT_POST_LOG_PATH", "post_log.jsonl")
 
@@ -85,3 +89,13 @@ def hosting_enabled() -> bool:
     publishing; this only controls whether Echo uploads creatives for public URLs.
     """
     return _truthy(os.environ.get("AGENT_HOSTING_ENABLED", "false"))
+
+
+def content_brain_enabled() -> bool:
+    """
+    Daily content brain switch. OFF by default. When OFF (or for a non-LASSO
+    account) the drafter keeps its current per-creative behavior. When ON for a
+    LASSO account, the caption is composed ONLY from the approved source doc; a
+    missing doc or pillar BLOCKS the draft. Independent of publishing.
+    """
+    return _truthy(os.environ.get("AGENT_CONTENT_BRAIN_ENABLED", "false"))
