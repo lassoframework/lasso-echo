@@ -7,9 +7,43 @@ the no-dash rule (with dashes scrubbed). No network — a fake client only.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import config, creative_studio  # noqa: E402
+
+
+# --- fakes modelling the genai.Client -> models.generate_content -> inline image path
+class _FakeInlineData:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakePart:
+    def __init__(self, inline_data=None):
+        self.inline_data = _FakeInlineData(inline_data) if inline_data is not None else None
+
+
+class _FakeResp:
+    def __init__(self, parts):
+        content = type("Content", (), {"parts": parts})()
+        self.candidates = [type("Candidate", (), {"content": content})()]
+
+
+class _FakeModels:
+    def __init__(self, resp):
+        self._resp = resp
+        self.calls = []
+
+    def generate_content(self, model, contents):
+        self.calls.append((model, contents))
+        return self._resp
+
+
+class _FakeGenaiClient:
+    def __init__(self, resp):
+        self.models = _FakeModels(resp)
 
 
 class _FakeClient:
@@ -89,3 +123,24 @@ def test_dashes_are_scrubbed(monkeypatch, tmp_path):
         client=fake, out_path=str(out))
     assert "—" not in res["prompt"]   # em dash gone
     assert "–" not in res["prompt"]   # en dash gone
+
+
+# ---- the Gemini client calls generate_content and extracts inline image bytes ----
+def test_gemini_client_uses_generate_content_and_extracts_inline_bytes():
+    # A text part first, then the image part -> the first inline_data wins.
+    resp = _FakeResp([_FakePart(inline_data=None), _FakePart(inline_data=b"IMGBYTES")])
+    genai_client = _FakeGenaiClient(resp)
+    client = creative_studio._GeminiImageClient("fake-key", genai_client=genai_client)
+
+    out = client.generate_image("a prompt", "gemini-3-pro-image")
+    assert out == b"IMGBYTES"
+    # called generate_content (not generate_images/predict) with model + prompt
+    assert genai_client.models.calls == [("gemini-3-pro-image", "a prompt")]
+
+
+def test_gemini_client_raises_when_no_inline_image_part():
+    resp = _FakeResp([_FakePart(inline_data=None)])  # text only, no image
+    client = creative_studio._GeminiImageClient("fake-key",
+                                                genai_client=_FakeGenaiClient(resp))
+    with pytest.raises(ValueError, match="no image returned from Gemini"):
+        client.generate_image("a prompt", "gemini-3-pro-image")

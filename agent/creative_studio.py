@@ -69,16 +69,26 @@ class _GeminiImageClient:
     the key is held for the call and never logged, printed, or returned.
     """
 
-    def __init__(self, api_key):
-        self._api_key = api_key  # never logged or exposed
+    def __init__(self, api_key, genai_client=None):
+        self._api_key = api_key          # never logged or exposed
+        self._genai_client = genai_client  # injection seam for tests; None in production
 
     def generate_image(self, prompt, model):
-        # Lazy import so flag-off / draft-only never needs the SDK installed.
-        from google import genai  # type: ignore
+        # The Gemini image models (gemini-3-pro-image, gemini-2.5-flash-image, ...)
+        # support generateContent, NOT predict/generate_images. Lazy import so
+        # flag-off / draft-only never needs the SDK installed.
+        client = self._genai_client
+        if client is None:
+            from google import genai  # type: ignore
+            from google.genai import types  # noqa: F401
 
-        client = genai.Client(api_key=self._api_key)
-        resp = client.models.generate_images(model=model, prompt=prompt)
-        return resp.generated_images[0].image.image_bytes
+            client = genai.Client(api_key=self._api_key)
+        resp = client.models.generate_content(model=model, contents=prompt)
+        # The image comes back as inline data on a response part. Return the first one.
+        for part in resp.candidates[0].content.parts:
+            if getattr(part, "inline_data", None):
+                return part.inline_data.data  # raw image bytes
+        raise ValueError("no image returned from Gemini")
 
 
 def _default_client():
