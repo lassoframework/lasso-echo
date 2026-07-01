@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from . import config
 from .accounts import active_accounts
+from .daily_studio import build_daily_infographic_draft
 from .drafter import draft_post
 from .library import pick_next
 from .postlog import used_creatives_for
@@ -47,11 +48,19 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         store = PendingStore()
 
     when = scheduled_for or datetime.now(timezone.utc).isoformat()
+    day_key = when[:10]  # YYYY-MM-DD, the day this post is for
     lib = library_path or config.LIBRARY_PATH
 
     for account in (accounts or active_accounts()):
-        creative = pick_next(account, lib, used_creatives_for(account.key))
-        draft = draft_post(account, creative, when, voice=voice)
+        draft = None
+        # For a LASSO account, try the fully-automated infographic path FIRST. It is
+        # dormant unless all three flags are armed; None -> fall back to the library
+        # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
+        if account.key.startswith("lasso"):
+            draft = build_daily_infographic_draft(account, day_key)
+        if draft is None:
+            creative = pick_next(account, lib, used_creatives_for(account.key))
+            draft = draft_post(account, creative, when, voice=voice)
         poster.post_approval_card(draft)
         if draft.status.value != "blocked":
             store.put(draft)

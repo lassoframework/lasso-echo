@@ -1,0 +1,69 @@
+"""
+Daily Studio: the fully-automated daily post path.
+
+When (and ONLY when) all three capabilities are armed — content brain + creative
+studio + hosting — Echo drafts a LASSO infographic from the approved source doc,
+generates the image (Nano Banana), hosts it for a public URL, and returns a PENDING
+Draft for human approval.
+
+Dormant by default: if any of the three flags is OFF it returns None and the caller
+falls back to library creatives. NO FABRICATION: the infographic is built only from
+the chosen pillar's approved hook (headline) + body lines (facts); a missing doc or a
+blocked plan returns a BLOCKED Draft. Nothing here publishes — publishing stays behind
+the approver gate and AGENT_PUBLISH_ENABLED.
+"""
+
+from . import config, content_planner, creative_studio, media_host
+from .drafter import Draft, DraftStatus, _make_id
+
+
+def build_daily_infographic_draft(account, day_key, *, nano_client=None,
+                                  s3_client=None, source_path=None):
+    # All three capabilities must be armed; otherwise dormant (caller falls back).
+    if not (config.content_brain_enabled()
+            and config.creative_studio_enabled()
+            and config.hosting_enabled()):
+        return None
+
+    draft_id = _make_id(account.key, "daily_infographic", day_key)
+
+    def _blocked(reason):
+        return Draft(
+            draft_id=draft_id, account_key=account.key, platform=account.platform,
+            caption="", hashtags=[], creative_path="", creative_public_url="",
+            scheduled_for=day_key, status=DraftStatus.BLOCKED,
+            blocked_reason="Daily studio: " + reason,
+        )
+
+    # Load the source doc + plan. A missing doc or a blocked plan blocks the draft.
+    doc = content_planner.load_source_doc(source_path)
+    if doc is None:
+        return _blocked("source doc missing or empty. Not drafting.")
+
+    plan = content_planner.plan_for(day_key, path=source_path)
+    if plan.get("blocked"):
+        return _blocked(plan["reason"])
+
+    # Build the infographic ONLY from that pillar's approved lines.
+    block = doc.copy_bank.get(plan["pillar"], {})
+    hooks = list(block.get("hooks", []))
+    facts = list(block.get("bodies", []))
+    headline = hooks[0] if hooks else ""
+    if not facts:
+        return None  # no approved body lines -> nothing to render honestly; fall back
+
+    art = creative_studio.generate(headline, facts, client=nano_client)
+    if not art:
+        return None  # generation off / produced nothing -> fall back to library
+
+    hosted = media_host.host_media(art["path"], account.key, client=s3_client)
+    if not hosted:
+        return None  # could not host -> no public URL -> fall back to library
+
+    return Draft(
+        draft_id=draft_id, account_key=account.key, platform=account.platform,
+        caption=plan["caption"], hashtags=list(plan["hashtags"]),
+        creative_path=art["path"], creative_public_url=hosted,
+        scheduled_for=day_key, status=DraftStatus.PENDING,
+        source_fragments=[headline] + facts,  # no-fabrication audit trail
+    )
