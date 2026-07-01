@@ -132,7 +132,7 @@
         ["Canonical LASSO brand bible","done"],
         ["Reference repo scaffolded (own body, Ranger spine as pattern)","done"],
         ["Gates baked into code (approval, draft-only, trust ladder, no-fabrication)","done"],
-        ["Test suite green (35 of 35)","done"],
+        ["Test suite green (44: +5 Creative Studio, +4 card preview)","done"],
         ["Stage 1 build prompt for Claude Code","done"],
         ["Railway and separation plan documented","done"],
         ["Brain hook stubbed (read-only, proposes)","done"],
@@ -154,11 +154,12 @@
         ["Carousel support (folder = carousel, draft-only)","done"],
         ["Reels support (draft-only, a video = a Reel)","done"],
         ["Bible updated for 2026 (3 to 5 tags, caption SEO)","done"],
-        ["Inline creative preview on the approval card","ready"],
-        ["Creative Studio module wired (Nano Banana, flag OFF)","ready"],
+        ["Inline creative preview on the approval card","done"],
+        ["Creative Studio module wired (Nano Banana, flag OFF)","done"],
         ["Push growth pack via Claude Code + redeploy","done"],
-        ["Rename live Slack app to Echo, drop duplicate","todo"],
-        ["Host creative media for public URLs","todo"],
+        ["Rename live Slack app to Echo, drop duplicate","done"],
+        ["Media hosting shipped: S3-compatible, tenant-scoped, dedupe, retry, wired into drafts (200-client ready)","done"],
+        ["Content brain: daily post from source doc across pillars (flag OFF)","ready"],
         ["Run master ON, publish OFF, watch drafts","ready"],
         ["Run the full 30-day loop once","todo"],
         ["Arm publishing once drafts look right","todo"],
@@ -216,7 +217,7 @@
       ["Repo divergence","deployed repo has commits from other agents (ruvnet, Manus); the reference sandbox may differ. Code ships as a behavior-described Claude Code prompt, never a wholesale push."],
       ["Rotate secrets by hand","Meta app secret + long-lived token, Slack tokens, and the client Page tokens that were exposed. Explorer tokens are short-lived; rotate on principle."],
       ["Verify one caption line","confirm \"That difference is your revenue\" was Blake's own note edit (fabrication gate intact), not a generator writing text."],
-      ["Brand palette conflict","spec lists Navy #0F1B33 / Red #EF3340 / Cream / Charcoal; the V3 kit used everywhere else is Navy #121E3C / Red #FF0000 / Sky #5EB9E6. Blake must pick the canonical set before any infographic bakes in a color."],
+      ["Brand palette (resolved)","canonical = V3: Navy #121E3C / Red #FF0000 / Sky #5EB9E6 / Cream #FAF6F0. Baked into creative_studio.py; BUILD_SPEC.md updated; the #0F1B33 draft is superseded."],
       ["Publish path decision","spec routes publishing through GHL Social Planner V2; Echo currently publishes direct via Meta Graph (built, working). Lean: keep direct Meta for LASSO now, move to GHL at 100+ client scale for its rate-limit handling."],
   ]};
 
@@ -408,7 +409,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in docs/BUILD_SPEC.md &middot; updated 2026-07-01 (card preview + Creative Studio built; full build spec folded in) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in docs/BUILD_SPEC.md &middot; updated 2026-07-01 (content brain built: daily post from source doc, no fabrication; 41 tests in sandbox) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 

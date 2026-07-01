@@ -6,7 +6,7 @@ full organic-system scope lives in `docs/BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-01 (card preview + Creative Studio built; full build spec folded in)
+Last updated: 2026-07-01 (card preview + Creative Studio committed to origin/main 30e5b12, 44 green)
 
 ---
 
@@ -34,9 +34,11 @@ Last updated: 2026-07-01 (card preview + Creative Studio built; full build spec 
 - [x] Carousel support (folder = carousel, draft-only)
 - [x] Reels support (draft-only, a video = a Reel)
 - [x] Growth pack pushed via Claude Code + redeployed
-- [~] Inline creative preview on the approval card (see the image before approving)
-- [~] Creative Studio module wired (Nano Banana infographics, flag AGENT_NANO_ENABLED OFF)
-- [ ] Host creative media so there are public URLs (unlocks card preview + Meta publish)
+- [x] Inline creative preview on the approval card (see the image before approving)
+- [x] Creative Studio module wired (Nano Banana infographics, flag AGENT_NANO_ENABLED OFF)
+- [x] Media hosting shipped: S3-compatible, 200-client hardened (tenant-scoped, dedupe, retry), wired into drafts, flag OFF; stand up bucket + creds by hand to arm
+- [~] Content brain: drafts the daily post from the source doc (brand_voice/lasso_now.md)
+      across the 5 pillars, growth CTA, 5 hashtags, no fabrication; flag AGENT_CONTENT_BRAIN_ENABLED OFF
 - [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
 - [~] Run master ON / publish OFF, watch daily drafts
 - [ ] Run the full 30-day loop once (see the 30-day IG plan below)
@@ -99,9 +101,8 @@ The complete scope Echo grows into. Everything plugs onto the proven Stage 1 cor
   never a wholesale push.
 - Rotate secrets by hand: Meta app secret + long-lived token, Slack tokens, client Page tokens.
 - Verify one caption line ("That difference is your revenue") was Blake's own note edit.
-- DECISION — brand palette: spec lists Navy #0F1B33 / Red #EF3340 / Cream / Charcoal; the V3
-  kit used everywhere else is Navy #121E3C / Red #FF0000 / Sky #5EB9E6. Pick the canonical set
-  before any infographic bakes in a color.
+- DECISION (resolved) — brand palette: canonical = V3 Navy #121E3C / Red #FF0000 / Sky #5EB9E6 /
+  Cream #FAF6F0. Locked in creative_studio.py; BUILD_SPEC.md updated; #0F1B33 draft superseded.
 - DECISION — publish path: spec routes through GHL Social Planner V2; Echo publishes direct via
   Meta Graph today. Lean: keep direct Meta for LASSO now, move to GHL at 100+ client scale.
 
