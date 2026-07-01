@@ -1,89 +1,118 @@
 # Echo Build Tracker
 
 Living tracker for the Echo social agent build. This markdown is the source of
-truth; update the boxes as work completes. The HTML dashboard is the visual view.
+truth; the HTML dashboard (`echo_build_tracker.html`) is the visual view. The
+full organic-system scope lives in `docs/BUILD_SPEC.md`.
 
-Status key: [x] done  ·  [~] ready / in progress  ·  [ ] not started
+Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-01
+Last updated: 2026-07-01 (card preview + Creative Studio built; full build spec folded in)
 
 ---
 
-## Stage 0 — Foundation (the prove-it groundwork)
-
-- [x] Canonical LASSO brand bible written (`brand_voice/lasso_voice.md`)
+## Stage 0 — Foundation
+- [x] Canonical LASSO brand bible (`brand_voice/lasso_voice.md`)
 - [x] Reference repo scaffolded (`lasso-echo`), own body, Ranger spine as pattern
 - [x] Gates baked into code (approval, draft-only, trust ladder, no-fabrication)
-- [x] Test suite green (35/35: one-per-account, approval required, draft-only no
-      network, missing voice blocks, non-approver denied, tokens never logged,
-      plus growth pack — CTA rotation, hashtag cap, carousel — and reels)
-- [x] Stage 1 build prompt for Claude Code (`echo-stage1-build-prompt.md`)
+- [x] Test suite green (35 deployed; +5 Creative Studio in sandbox pending push)
+- [x] Stage 1 build prompt for Claude Code
 - [x] Railway + separation plan documented (own project, own service, #echoclaude)
 - [x] Brain hook stubbed (read-only, proposes, never rewrites voice)
 
 ## Stage 1 — LASSO only: draft + approve + publish (DRAFT-ONLY)
-
-Build (reference implementation done; real deploy pending):
 - [x] Daily drafter, one feed post per account
 - [x] Slack approval cards (Approve / Edit / Skip) to #echoclaude
-- [x] Meta publisher with two-place draft-only guard (publish flag OFF)
-- [x] Post logging for reporting (no tokens)
-- [x] Growth pack: CTA rotation on every draft
-- [x] Growth pack: hashtag cap (5)
-- [x] Carousel support (multi-slide drafts + IG carousel publish path, draft-only)
-- [x] Push growth pack to origin/main (dde2f3a)
-- [x] Reels support (draft-only)
-
-Blake-by-hand and deploy (open):
-- [ ] Create lasso-echo repo on GitHub
-- [ ] New Railway project `lasso-echo`, service `echo`, own env vars
-- [ ] Meta App + Graph permissions approved (instagram_content_publish,
-      pages_manage_posts, pages_read_engagement, instagram_basic, pages_show_list)
-- [ ] Per-account tokens + target ids set by hand in Railway
-- [ ] Slack app + #echoclaude channel wired (bot token, channel id)
-- [ ] Brand voice doc approved by Blake (currently canonical draft in repo)
-- [ ] Host creative library media so IG has public URLs
-- [~] Run master ON / publish OFF, watch daily drafts for several days
-- [ ] Run the full 30-day loop once, learn what good looks like
-- [ ] Arm publishing (AGENT_PUBLISH_ENABLED=true) once drafts look right
+- [x] Meta publisher with draft-only guard (publish flag OFF)
+- [x] Post logging (no tokens)
+- [x] lasso-echo repo (private), Railway project + echo service + env vars
+- [x] Meta App "LASSO Social Poster" (Dev mode ok for own accounts)
+- [x] Per-account tokens + ids set by hand
+- [x] Slack app + #echoclaude wired; first cards proven; app renamed to Echo
+- [x] Voice doc loading fixed (real bible on Railway)
+- [x] CTA rotation (growth-biased, placeholder-filtered)
+- [x] Hashtags capped to 5; bible updated for 2026 (3 to 5 tags, caption SEO)
+- [x] Carousel support (folder = carousel, draft-only)
+- [x] Reels support (draft-only, a video = a Reel)
+- [x] Growth pack pushed via Claude Code + redeployed
+- [~] Inline creative preview on the approval card (see the image before approving)
+- [~] Creative Studio module wired (Nano Banana infographics, flag AGENT_NANO_ENABLED OFF)
+- [ ] Host creative media so there are public URLs (unlocks card preview + Meta publish)
+- [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
+- [~] Run master ON / publish OFF, watch daily drafts
+- [ ] Run the full 30-day loop once (see the 30-day IG plan below)
+- [ ] Arm publishing once drafts look right
 
 ## Stage 2 — One paying client (hand-picked, forgiving)
-
 - [ ] Brand voice intake template (turn the bible into a client questionnaire)
+- [ ] Texted-link intake as the primary path (full-res upload page; MMS is fallback)
+- [ ] Idempotent Railway ingest worker (convert, dedupe, moderate, tag, thumbnail)
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
 - [ ] Prove the 30-day refresh lands for a real client
 
 ## Stage 3 — Productize ($99/mo)
-
-- [ ] Launch Echo as the $99 Social Media add-on (the revenue target: $99/mo for
-      active ad clients, $199/mo for non-ad clients)
-- [ ] Template the brand voice intake, approval flow, calendar, monthly review
-- [ ] Portal exposes creative library to Echo (read)
-- [ ] Portal hosts the reporting dashboard (write/display)
+- [ ] Launch as the $99 Social Media add-on ($99 ad clients, $199 non-ad)
+- [ ] Template intake, approval, calendar, monthly review
+- [ ] DAM with member-photo consent tracking
+- [ ] Creative runway card (days of content left) + text-back alert
+- [ ] Reporting on Meta Graph views (not impressions), daily snapshots cached
+- [ ] Portal exposes creative library (read); portal hosts reporting dashboard (write)
 - [ ] Onboard client by client; $99 starts stacking
 
 ## Stage 4 — Scale automation (near-zero-touch)
+- [ ] Claude Agent SDK agent behind approval-gate hooks
+- [ ] Per-account trust ladder climbing (routine auto-publish inside approved calendars)
+- [ ] Multi-account oversight; one human owns exceptions + monthly review
+- [ ] Per-gym agent memory + audit log prove reliability
+- [ ] Nightly brain loop armed (read brain + performance, propose, never auto-edit voice)
 
-- [ ] Per-account trust ladder climbing (routine auto-publish inside approved
-      calendars; off-template still surfaces)
-- [ ] Multi-account oversight, one human owns exceptions + monthly review
-- [ ] Nightly brain loop armed (read brain + performance, propose, never auto-edit
-      voice)
+## Roadmap / next builds (scoped, not started)
+- [ ] Daily Stories posting (warm-audience signal)
+- [ ] Caption SEO baked into the drafter (keyword guidance in notes)
 
 ## Stubs (documented, intentionally not built yet)
-
-- [ ] Stories posting
 - [ ] Comment handling (Tier 1 auto-safe / Tier 2 surface / no auto DMs)
 - [ ] 30-day creative refresh loop (the product)
-- [ ] Portal creative-library read
-- [ ] Portal reporting write
-- [ ] Nightly brain read
+- [ ] Portal creative-library read; portal reporting write; nightly brain read
 
 ---
 
-### Reporting to wire in Stage 3 (per account, per 30-day cycle)
+## Full build spec — the organic system (see docs/BUILD_SPEC.md)
+The complete scope Echo grows into. Everything plugs onto the proven Stage 1 core.
+- Ingestion: texted short link primary (MMS/portal fallback); event-driven queue to
+  idempotent Railway worker; HEIC/MOV convert; SHA-256 + pHash dedupe; AV + moderation;
+  thumbnails; dead-letter + backoff.
+- DAM: asset metadata + AI tags with confidence; human review queue; member-photo
+  CONSENT tracking (release required to publish); usage tracking prevents reposts.
+- Creative runway: days of content left = unused approved assets / posts per day; one
+  glanceable green/amber/red card with a zero-date; below threshold the agent texts a request.
+- Agent (Claude Agent SDK): model routing (Opus judgment, Sonnet copy, Haiku classify);
+  gated act-tools; per-gym memory; PreToolUse approval hooks; decision audit log; SB7 skills.
+- Platform + reporting: Supabase RLS + Clerk org isolation; idempotency; rate-limit-aware
+  GHL + Meta clients; reporting on views not impressions; white-label dashboard + branded PDF.
 
-Engagement (rate + raw), saves, likes, comments, reach/impressions, follower
-growth (net new + rate), posting frequency before vs after Echo, top 3 and bottom
-3 posts by engagement, and a health read (growing / flat / declining).
+---
+
+## Open risks / watch items
+- Repo divergence: deployed repo has commits from other agents (ruvnet, Manus); the
+  reference sandbox may differ. Code ships as a behavior-described Claude Code prompt,
+  never a wholesale push.
+- Rotate secrets by hand: Meta app secret + long-lived token, Slack tokens, client Page tokens.
+- Verify one caption line ("That difference is your revenue") was Blake's own note edit.
+- DECISION — brand palette: spec lists Navy #0F1B33 / Red #EF3340 / Cream / Charcoal; the V3
+  kit used everywhere else is Navy #121E3C / Red #FF0000 / Sky #5EB9E6. Pick the canonical set
+  before any infographic bakes in a color.
+- DECISION — publish path: spec routes through GHL Social Planner V2; Echo publishes direct via
+  Meta Graph today. Lean: keep direct Meta for LASSO now, move to GHL at 100+ client scale.
+
+## Reporting to wire in Stage 3 (per account, per 30-day cycle)
+From the Meta Graph API, on VIEWS not impressions (Meta migrated April 2025; pre/post are not
+comparable). Engagement (rate + raw), saves, sends/shares, likes, comments, reach, views,
+follower growth (net + rate), posting frequency before vs after Echo, top 3 / bottom 3 posts,
+health read (growing / flat / declining).
+
+## 30-day IG plan (pre-publish gate)
+Diagnosis: the account is high-output, low-reach (1,308 posts, ~1,169 followers). Fix is reach
+and follow-through, not volume. Plan biases to Reels + carousels with save/send CTAs and caption
+SEO, one post/day rotating the 5 pillars. Full plan: `lasso_ig_30day_plan.md`. Refine with real
+per-post data once Stage 3 reporting is live.
