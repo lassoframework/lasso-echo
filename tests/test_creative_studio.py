@@ -107,7 +107,9 @@ def test_prompt_carries_palette_and_no_dash_rule(monkeypatch, tmp_path):
     out = tmp_path / "info.png"
     res = creative_studio.generate("H", ["A real approved fact"],
                                    client=fake, out_path=str(out))
-    assert "#121E3C" in res["prompt"]                 # brand palette anchor
+    # the full locked V3 palette must be enforced, not just navy
+    for hexcode in ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0"):
+        assert hexcode in res["prompt"], hexcode
     assert "no em dashes" in res["prompt"].lower()    # no-dash rule
     assert "no en dashes" in res["prompt"].lower()
 

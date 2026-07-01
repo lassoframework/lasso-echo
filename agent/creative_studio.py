@@ -21,12 +21,23 @@ import re
 from . import config
 
 
-# LASSO brand palette for infographic styling. Anchored on the documented brand
-# navy (#121E3C — see the visual-identity note in agent/voice.py). White + slate
-# are neutral supports for contrast, not brand claims.
+# LOCKED LASSO V3 brand palette for infographic styling. The directive tells the model
+# HOW to use each color (role + usage), not just lists hexes, so images come out on
+# brand (navy/red/sky/cream) instead of navy/gray/white.
 BRAND_PALETTE = (
-    "LASSO brand palette: deep navy #121E3C as the primary, clean white #FFFFFF "
-    "background, slate gray #6C6C6C for secondary text. Bold, high contrast, modern."
+    "LOCKED LASSO V3 BRAND PALETTE (apply these exact colors, do not substitute or "
+    "invent others):\n"
+    "- Navy #121E3C: the PRIMARY, dominant dark. Use for the main background and the "
+    "structure of the layout.\n"
+    "- Red #FF0000: the accent for emphasis and key highlights. Use SPARINGLY, for the "
+    "single most important element only (one arrow, or one key word), never everywhere.\n"
+    "- Sky Blue #5EB9E6: the secondary accent. Use for supporting icons, lines, and "
+    "highlights.\n"
+    "- Cream #FAF6F0: the light background, negative space, and card fill. Use cream as "
+    "the light background instead of pure white.\n"
+    "Style: clean, flat, modern infographic; high contrast; brand-consistent. Navy is "
+    "the dominant dark, cream is the light background (not white), sky blue carries the "
+    "supporting icons and lines, and red is reserved for one single focal accent."
 )
 
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
