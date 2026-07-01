@@ -146,3 +146,25 @@ def test_gemini_client_raises_when_no_inline_image_part():
                                                 genai_client=_FakeGenaiClient(resp))
     with pytest.raises(ValueError, match="no image returned from Gemini"):
         client.generate_image("a prompt", "gemini-3-pro-image")
+
+
+# ---- the image prompt is clean/minimal, headline-only, palette retained ------
+def test_prompt_is_clean_minimal_and_headline_only():
+    headline = "Every lead, every post, every result. One screen."
+    body = "Your leads, content, and reporting live in one place."
+    p = creative_studio.build_prompt(headline, [body])
+    low = p.lower()
+
+    # clean / minimal composition steer
+    assert "minimal" in low
+    assert "one clean focal graphic" in low
+    assert "negative space" in low
+    assert "not a busy poster" in low
+    # only the headline is rendered; body lines are context, not on-image text
+    assert "only text to render on the image" in low
+    assert "do not render this text on the image" in low
+    # the single headline is the approved hook (scrubbed of dashes)
+    assert headline in p
+    # the palette is retained (all four locked V3 colors)
+    for hexcode in ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0"):
+        assert hexcode in p

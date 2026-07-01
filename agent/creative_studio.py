@@ -40,6 +40,20 @@ BRAND_PALETTE = (
     "supporting icons and lines, and red is reserved for one single focal accent."
 )
 
+# Composition: clean, minimal, premium. ONE focal graphic, headline-only text — the
+# recent outputs were too busy, so this steers hard toward calm negative space.
+COMPOSITION_STYLE = (
+    "Composition: a single, calm, uncluttered layout with generous negative space and "
+    "very few elements. Center the design on ONE clean focal graphic (for example a "
+    "single monitor or dashboard, or a simple left to right flow), NOT a dense collage "
+    "of many icons and boxes. Render ONLY the one short headline as text on the image; "
+    "do NOT put body sentences, paragraphs, or the caption on the image. Use at most "
+    "simple one or two word labels; prefer clean icons and clear whitespace over dense "
+    "text or many small graphics. Overall feel: minimal, modern, high end, "
+    "brand-consistent, and easy to read at a glance. Think one clean diagram, not a busy "
+    "poster."
+)
+
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
 NO_DASH_RULE = (
     "Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered "
@@ -59,15 +73,21 @@ def _scrub_dashes(text):
 
 def build_prompt(headline, facts):
     """
-    Build the image prompt from APPROVED input only: the headline + the facts, plus
-    the brand palette and the no-dash rule. Dashes in the approved text are scrubbed.
+    Build the image prompt from APPROVED input only. The single on-image headline is
+    the approved pillar hook (kept short); the approved body lines are passed as CONCEPT
+    CONTEXT for the focal graphic and are NOT rendered as text on the image (the caption
+    carries the words). Plus the brand palette, composition style, and no-dash rule.
+    Dashes in the approved text are scrubbed. Nothing is invented.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
     prompt = (
-        "Design a clean LASSO-branded infographic.\n"
-        f"Headline: {_scrub_dashes(headline)}\n"
-        "Facts to feature (verbatim, do not invent any others):\n"
+        "Design a clean, minimal, premium LASSO-branded infographic.\n"
+        f"Headline (the ONLY text to render on the image, keep it short): "
+        f"{_scrub_dashes(headline)}\n"
+        "Concept context for the single focal graphic (do NOT render this text on the "
+        "image; the caption carries the words):\n"
         f"{fact_lines}\n"
+        f"{COMPOSITION_STYLE}\n"
         f"{BRAND_PALETTE}\n"
         f"{NO_DASH_RULE}"
     )
