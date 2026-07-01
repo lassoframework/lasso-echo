@@ -54,6 +54,10 @@ Last updated: 2026-07-01 (card preview + Creative Studio committed to origin/mai
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
 - [ ] Prove the 30-day refresh lands for a real client
+- [ ] Document intake: client sends a PDF (texts + email); Echo extracts the text,
+      splits it into N post ideas, drafts an infographic card per idea, holds ALL for
+      approval. No-fabrication gate applies (PDF is raw material, never approved fact).
+      This is the seed of client intake. Flag AGENT_DOC_INTAKE_ENABLED, default OFF.
 
 ## Stage 3 — Productize ($99/mo)
 - [ ] Launch as the $99 Social Media add-on ($99 ad clients, $199 non-ad)
