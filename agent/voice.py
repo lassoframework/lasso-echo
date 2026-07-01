@@ -66,11 +66,21 @@ def _extract_hashtags(raw):
 
 def _extract_ctas(raw):
     """
-    Extract the numbered CTA rotation list from the '### CTA rotation' section
-    of the voice doc. Returns a list of CTA strings in order.
-    Only CTAs that literally appear in the approved doc are usable.
+    Extract the approved CTA rotation from the '### CTA rotation' section of the
+    voice doc. Reads ONLY that section, up to the next heading.
+
+    Two doc styles are supported so the extractor stays robust as the bible
+    evolves:
+      - quoted CTAs   -> "Save this post." "Tag a gym owner."
+      - list items    -> 1. Save this post.   or   - Tag a gym owner.
+    If any quoted strings exist in the section they win; otherwise numbered /
+    bulleted list items are used.
+
+    In every case: whitespace is normalized, any candidate containing '[' or ']'
+    is SKIPPED (those are templated placeholders, not approved copy), and the
+    result is deduped preserving order. Only CTAs that literally appear in the
+    approved doc are ever usable — nothing is invented here.
     """
-    # Find the CTA rotation section
     section_match = re.search(
         r"###\s+CTA rotation.*?\n(.*?)(?=\n###|\n##|\Z)",
         raw,
@@ -80,6 +90,32 @@ def _extract_ctas(raw):
         return []
 
     section_text = section_match.group(1)
-    # Extract numbered items: "1. Some CTA text."
-    items = re.findall(r"^\d+\.\s+(.+)$", section_text, re.MULTILINE)
-    return [item.strip() for item in items if item.strip()]
+    out, seen = [], set()
+
+    def _add(candidate):
+        cta = re.sub(r"\s+", " ", candidate).strip()
+        if not cta:
+            return
+        if "[" in cta or "]" in cta:  # skip templated placeholders
+            return
+        key = cta.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(cta)
+
+    quoted = re.findall(r'"([^"]+)"', section_text)
+    if quoted:
+        for q in quoted:
+            _add(q)
+        return out
+
+    for line in section_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(?:\d+[.)]|[-*])\s+(.+)$", line)
+        if not m:
+            continue
+        _add(m.group(1))
+    return out

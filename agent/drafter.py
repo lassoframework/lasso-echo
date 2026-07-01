@@ -10,6 +10,7 @@ be constrained to the voice doc + client note and stay inside the same contract.
 """
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -38,6 +39,9 @@ class Draft:
     blocked_reason: str = ""
     # source spans we composed FROM, kept for the no-fabrication test + audit
     source_fragments: list = field(default_factory=list)
+    # carousel support: local slide paths + their public URLs (empty for singles)
+    slides: list = field(default_factory=list)
+    slide_urls: list = field(default_factory=list)
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -45,27 +49,53 @@ def _make_id(account_key, creative_path, scheduled_for):
     return h[:10]
 
 
-def _pick_cta(voice, creative_path):
+def _stem(creative):
+    """The creative filename stem, used as the stable rotation key."""
+    stem = getattr(creative, "stem", None)
+    if stem:
+        return stem
+    path = getattr(creative, "path", "") or ""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _det_index(key, n):
+    """Deterministic index in [0, n) from sha1(key). Stable across re-runs."""
+    if n <= 0:
+        return 0
+    return int(hashlib.sha1((key or "").encode()).hexdigest(), 16) % n
+
+
+def _pick_cta(voice, creative):
     """
     Pick one CTA from the approved rotation in the voice doc.
-    Uses a deterministic index based on the creative filename so the same card
-    always gets the same CTA (stable across re-runs), but different cards rotate
-    through the full list.
-    Returns an empty string if no CTAs are defined in the voice doc.
+
+    Growth-hint CTAs (save / tag / share / dm / send) are PREFERRED — they drive
+    the reach signals that actually grow an account. Selection within the chosen
+    pool is deterministic by sha1 of the creative filename stem, so the same card
+    always gets the same CTA while different cards rotate through the list.
+    Returns "" if the voice doc defines no CTAs.
     """
     if not voice.ctas:
         return ""
-    # Use the creative filename as a stable rotation key
-    key = creative_path or ""
-    idx = hash(key) % len(voice.ctas)
-    return voice.ctas[idx]
+    growth = [c for c in voice.ctas
+              if any(h in c.lower() for h in TemplateGenerator.GROWTH_CTA_HINTS)]
+    pool = growth if growth else list(voice.ctas)
+    return pool[_det_index(_stem(creative), len(pool))]
 
 
-def _select_hashtags(voice, creative_path):
+def _caption_has_cta(caption, voice):
+    """True if the caption already ends with an approved CTA verbatim, so we
+    don't append (and duplicate) one."""
+    low = caption.lower()
+    return any(c.lower() in low for c in voice.ctas)
+
+
+def _select_hashtags(voice, creative):
     """
-    Select 8 to 11 hashtags from the approved set in the voice doc.
-    Always includes the 3 brand-tier tags if present, then fills from the rest.
-    Uses a deterministic rotation so different cards get varied niche/topic tags.
+    Select up to HASHTAG_LIMIT (5) hashtags from the approved set in the voice
+    doc. Brand-tier tags come first if present, then niche/topic tags rotated
+    deterministically per creative. In 2026, 3–5 tags is the whole strategy —
+    more does not help (see the bible's hashtag section).
     """
     BRAND_TAGS = {"#LASSOFramework", "#GymMarketingMadeSimple", "#LASSOPinnacle"}
     all_tags = list(voice.hashtags)
@@ -73,14 +103,12 @@ def _select_hashtags(voice, creative_path):
     brand = [t for t in all_tags if t in BRAND_TAGS]
     rest = [t for t in all_tags if t not in BRAND_TAGS]
 
-    # Rotate the non-brand tags deterministically per creative
-    key = creative_path or ""
-    offset = hash(key) % max(len(rest), 1)
+    offset = _det_index(_stem(creative), max(len(rest), 1))
     rotated = rest[offset:] + rest[:offset]
 
-    # Fill to 11 total (3 brand + up to 8 from rest)
-    selected = brand + rotated[: max(0, 11 - len(brand))]
-    return selected[:11]
+    limit = TemplateGenerator.HASHTAG_LIMIT
+    selected = brand + rotated[: max(0, limit - len(brand))]
+    return selected[:limit]
 
 
 class TemplateGenerator:
@@ -94,6 +122,9 @@ class TemplateGenerator:
     doc + client note and keep this same contract.
     """
 
+    HASHTAG_LIMIT = 5
+    GROWTH_CTA_HINTS = ("save", "tag", "share", "dm", "send")
+
     def build(self, voice, creative):
         fragments = []
 
@@ -101,15 +132,17 @@ class TemplateGenerator:
         if creative.client_note:
             fragments.append(creative.client_note.strip())
 
-        # 2. CTA from the approved rotation in the voice doc
-        cta = _pick_cta(voice, getattr(creative, "path", ""))
-        if cta:
-            fragments.append(cta)
-
         caption = "\n\n".join(fragments).strip()
 
-        # 3. Hashtags: brand tier always present, rest rotated per creative
-        hashtags = _select_hashtags(voice, getattr(creative, "path", ""))
+        # 2. CTA from the approved rotation — appended verbatim, but ONLY if the
+        #    caption doesn't already carry one.
+        cta = _pick_cta(voice, creative)
+        if cta and not _caption_has_cta(caption, voice):
+            fragments.append(cta)
+            caption = "\n\n".join(fragments).strip()
+
+        # 3. Hashtags: brand tier first, rest rotated per creative, capped at 5.
+        hashtags = _select_hashtags(voice, creative)
 
         return caption, hashtags, fragments
 
@@ -168,4 +201,6 @@ def draft_post(account, creative, scheduled_for, voice=None,
         scheduled_for=scheduled_for,
         status=DraftStatus.PENDING,
         source_fragments=fragments,
+        slides=list(getattr(creative, "slides", []) or []),
+        slide_urls=list(getattr(creative, "slide_urls", []) or []),
     )

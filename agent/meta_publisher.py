@@ -85,6 +85,9 @@ def _publish_instagram(client, account, draft, caption, token):
     ig_id = account.get_target_id()
     if not ig_id:
         raise PublishError(f"No IG user id for '{account.key}'.")
+    # Carousel: 2+ public slide URLs -> multi-child container flow.
+    if len(getattr(draft, "slide_urls", []) or []) >= 2:
+        return _publish_instagram_carousel(client, ig_id, draft, caption, token)
     if not draft.creative_public_url:
         raise PublishError(
             "Instagram needs a PUBLIC media URL. This creative has none. "
@@ -104,6 +107,43 @@ def _publish_instagram(client, account, draft, caption, token):
     r2 = client.post(
         f"{base}/{ig_id}/media_publish",
         data={"creation_id": container_id, "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r2)
+    return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
+
+
+def _publish_instagram_carousel(client, ig_id, draft, caption, token):
+    """
+    IG carousel: create one child container per slide (is_carousel_item=true),
+    then a parent container (media_type=CAROUSEL, children=...), then publish it.
+
+    DORMANT in draft-only mode: publish() short-circuits before we ever get here
+    while the publish flag is OFF. This path only runs once Blake arms publishing.
+    """
+    base = config.GRAPH_API_BASE
+    child_ids = []
+    for url in draft.slide_urls:
+        rc = client.post(
+            f"{base}/{ig_id}/media",
+            data={"image_url": url, "is_carousel_item": "true", "access_token": token},
+            timeout=30,
+        )
+        _raise_for_status(rc)
+        child_ids.append(rc.json().get("id"))
+
+    rp = client.post(
+        f"{base}/{ig_id}/media",
+        data={"media_type": "CAROUSEL", "children": ",".join(child_ids),
+              "caption": caption, "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(rp)
+    parent_id = rp.json().get("id")
+
+    r2 = client.post(
+        f"{base}/{ig_id}/media_publish",
+        data={"creation_id": parent_id, "access_token": token},
         timeout=30,
     )
     _raise_for_status(r2)

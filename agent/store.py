@@ -32,6 +32,8 @@ def _to_dict(d: Draft):
         "status": d.status.value,
         "blocked_reason": d.blocked_reason,
         "source_fragments": d.source_fragments,
+        "slides": d.slides,
+        "slide_urls": d.slide_urls,
     }
 
 
@@ -48,6 +50,8 @@ def _from_dict(r):
         status=DraftStatus(r.get("status", "pending")),
         blocked_reason=r.get("blocked_reason", ""),
         source_fragments=r.get("source_fragments", []),
+        slides=r.get("slides", []),
+        slide_urls=r.get("slide_urls", []),
     )
 
 

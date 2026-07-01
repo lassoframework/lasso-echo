@@ -68,8 +68,14 @@ def build_card_blocks(draft):
         }]
 
     tags = " ".join(draft.hashtags)
-    creative_ref = draft.creative_public_url or draft.creative_path or "(no creative)"
     caption_preview = draft.caption if draft.caption else "(empty caption)"
+
+    slides = getattr(draft, "slides", None) or []
+    if slides:
+        names = ", ".join(os.path.basename(s) for s in slides)
+        creative_ref = f"Carousel — {len(slides)} slides\n{names}"
+    else:
+        creative_ref = draft.creative_public_url or draft.creative_path or "(no creative)"
 
     return [
         {"type": "header",

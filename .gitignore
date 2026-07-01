@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.venv/
 post_log.jsonl
 .pytest_cache/
 content_library/
@@ -16,3 +17,6 @@ brand_voice/*
 !brand_voice/.gitkeep
 !brand_voice/lasso_voice.example.md
 !brand_voice/lasso_voice.md
+
+# claude-flow tooling state
+.claude-flow/
