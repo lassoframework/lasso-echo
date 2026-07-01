@@ -3,7 +3,7 @@
 You are working on Echo, the LASSO social media agent. Before planning or writing
 any code, read these three files. They are the source of truth for scope and state.
 
-1. `docs/BUILD_SPEC.md` — the FULL build-out scope (the organic system Echo grows
+1. `BUILD_SPEC.md` — the FULL build-out scope (the organic system Echo grows
    into: intake, DAM, runway, reporting, the Agent SDK). Always know where the
    current task sits inside this bigger picture.
 2. `PROGRESS.md` — current state, stage by stage. Update the checkboxes as work

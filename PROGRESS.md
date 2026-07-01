@@ -2,7 +2,7 @@
 
 Living tracker for the Echo social agent build. This markdown is the source of
 truth; the HTML dashboard (`echo_build_tracker.html`) is the visual view. The
-full organic-system scope lives in `docs/BUILD_SPEC.md`.
+full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
@@ -82,7 +82,7 @@ Last updated: 2026-07-01 (card preview + Creative Studio committed to origin/mai
 
 ---
 
-## Full build spec — the organic system (see docs/BUILD_SPEC.md)
+## Full build spec — the organic system (see BUILD_SPEC.md)
 The complete scope Echo grows into. Everything plugs onto the proven Stage 1 core.
 - Ingestion: texted short link primary (MMS/portal fallback); event-driven queue to
   idempotent Railway worker; HEIC/MOV convert; SHA-256 + pHash dedupe; AV + moderation;
