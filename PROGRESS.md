@@ -47,6 +47,17 @@ clean house style. Next: drop personal FB, run the 30-day loop, then arm publish
 - [~] Google Business Profile posting branch (local posts): gbp_publisher, draft-only guard,
       routing (GBP -> gbp_publisher, IG/FB -> meta_publisher), content-brain GBP variant
       (trimmed summary, one image, CTA button, no hashtags); flag AGENT_GBP_ENABLED OFF. See BUILD_SPEC.md Addendum A
+- [~] Stories draft path: one 9:16 (1080x1920) Story per account per day alongside the feed
+      post, reusing the day's approved creative (9:16 re-render via per-use aspect when the
+      studio is armed, else the feed image as is); no caption, PENDING in the same card flow,
+      loudly labeled STORY. Publish path (IG STORIES container / FB photo_stories) sits behind
+      BOTH the publish flag AND AGENT_STORIES_ENABLED, default OFF (fully dormant: flag off = no
+      Story drafts at all)
+- [~] Caption SEO (2026): content brain front-loads the hook and moves a body line carrying the
+      hook's topic terms first among the bodies; reorder of APPROVED lines only, never new text;
+      flag AGENT_CAPTION_SEO_ENABLED OFF
+- [~] Per-platform caption variants: IG keeps up to 5 approved tags, FB Page keeps at most 2 at
+      the end; selection only from the approved set; flag AGENT_PLATFORM_VARIANTS_ENABLED OFF
 - [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
 - [~] Run master ON / publish OFF, watch daily drafts
 - [ ] Run the full 30-day loop once (see the 30-day IG plan below)
@@ -83,8 +94,8 @@ clean house style. Next: drop personal FB, run the 30-day loop, then arm publish
 - [ ] Nightly brain loop armed (read brain + performance, propose, never auto-edit voice)
 
 ## Roadmap / next builds (scoped, not started)
-- [ ] Daily Stories posting (warm-audience signal)
-- [ ] Caption SEO baked into the drafter (keyword guidance in notes)
+- [x] Daily Stories posting (warm-audience signal) -> built, moved into Stage 1 as [~]
+- [x] Caption SEO baked into the drafter -> built into the content brain, in Stage 1 as [~]
 
 ## Stubs (documented, intentionally not built yet)
 - [ ] Comment handling (Tier 1 auto-safe / Tier 2 surface / no auto DMs)
