@@ -1,0 +1,428 @@
+<!-- Echo Master Tracker — build status + full progress in one. LASSO V3 brand-locked. Self-contained. -->
+<div id="echo-status"></div>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+  #echo-status, #echo-status * { box-sizing: border-box; margin: 0; padding: 0; }
+  #echo-status {
+    --navy:#121E3C; --navy2:#1B326E; --red:#FF0000; --sky:#5EB9E6;
+    --white:#FFFFFF; --steel:#D8E3EE; --muted:rgba(216,227,238,.32);
+    font-family:'Inter',Helvetica,Arial,sans-serif;
+    background:var(--navy); color:var(--white);
+    padding:40px 34px 44px; border-radius:16px; max-width:1000px; margin:0 auto;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* header */
+  #echo-status .eyebrow{ font-size:12px; font-weight:800; letter-spacing:.26em; text-transform:uppercase; color:var(--sky); }
+  #echo-status .title{ font-size:46px; font-weight:900; line-height:.98; letter-spacing:-.02em; margin:8px 0 6px; }
+  #echo-status .title .a{ color:var(--red); }
+  #echo-status .deck{ font-size:14px; font-weight:500; color:var(--steel); letter-spacing:.01em; }
+  #echo-status .deck .dot{ color:var(--red); font-weight:900; padding:0 8px; }
+
+  /* legend */
+  #echo-status .legend{ display:flex; gap:18px; margin-top:16px; flex-wrap:wrap; }
+  #echo-status .legend .lg{ display:flex; align-items:center; gap:7px; font-size:11px; font-weight:700; color:var(--steel); letter-spacing:.04em; }
+  #echo-status .legend .sw{ width:14px; height:14px; border-radius:4px; border:2px solid var(--muted); }
+  #echo-status .legend .sw.done{ background:var(--sky); border-color:var(--sky); }
+  #echo-status .legend .sw.ready{ border-color:var(--red); }
+
+  /* phase rail (signature) */
+  #echo-status .rail-wrap{ margin:32px 0 34px; }
+  #echo-status .rail-label{ font-size:11px; font-weight:800; letter-spacing:.22em; text-transform:uppercase; color:var(--steel); margin-bottom:20px; }
+  #echo-status .rail{ display:grid; grid-template-columns:repeat(5,1fr); position:relative; }
+  #echo-status .rail::before{ content:""; position:absolute; left:10%; right:10%; top:23px; height:3px; background:var(--muted); border-radius:99px; }
+  #echo-status .node{ position:relative; text-align:center; }
+  #echo-status .node .seg{ position:absolute; top:23px; height:3px; left:-50%; right:50%; z-index:1; }
+  #echo-status .node:first-child .seg{ display:none; }
+  #echo-status .node .disc{
+    position:relative; z-index:2; width:48px; height:48px; border-radius:50%;
+    margin:0 auto 12px; display:grid; place-items:center;
+    font-size:18px; font-weight:900; background:var(--navy);
+    border:3px solid var(--muted); color:var(--steel);
+  }
+  #echo-status .node.done .disc{ background:var(--sky); border-color:var(--sky); color:var(--navy); }
+  #echo-status .node.active .disc{ border-color:var(--red); color:var(--white); box-shadow:0 0 0 6px rgba(255,0,0,.16); }
+  #echo-status .node .nm{ font-size:12.5px; font-weight:800; line-height:1.2; }
+  #echo-status .node .pc{ font-size:11px; font-weight:700; color:var(--steel); margin-top:3px; }
+  #echo-status .node.done .pc{ color:var(--sky); }
+  #echo-status .node.active .pc{ color:var(--red); }
+  #echo-status .youarehere{ display:inline-block; margin-top:7px; font-size:9px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; background:var(--red); color:var(--white); padding:3px 7px; border-radius:99px; }
+
+  /* summary tiles */
+  #echo-status .tiles{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  #echo-status .tile{ background:var(--white); color:var(--navy); border-radius:12px; padding:18px 16px; }
+  #echo-status .tile .k{ font-size:10.5px; font-weight:800; letter-spacing:.13em; text-transform:uppercase; color:#5c6b86; }
+  #echo-status .tile .v{ font-size:30px; font-weight:900; line-height:1; margin-top:8px; letter-spacing:-.02em; }
+  #echo-status .tile .v.red{ color:var(--red); } #echo-status .tile .v.sky{ color:#2f7fb0; }
+  #echo-status .tile .v.small{ font-size:19px; }
+  #echo-status .tile .vs{ font-size:13px; font-weight:700; color:#5c6b86; margin-top:6px; }
+
+  /* next moves */
+  #echo-status .next{ margin-top:24px; background:var(--white); border-radius:12px; overflow:hidden; }
+  #echo-status .next .cap{ background:var(--red); color:var(--white); padding:12px 18px; font-size:12px; font-weight:900; letter-spacing:.13em; text-transform:uppercase; }
+  #echo-status .next ol{ list-style:none; padding:6px 18px 14px; }
+  #echo-status .next li{ display:flex; gap:12px; align-items:baseline; padding:9px 0; border-top:1px solid #eef2f7; color:var(--navy); }
+  #echo-status .next li:first-child{ border-top:none; }
+  #echo-status .next .n{ flex:0 0 22px; font-size:14px; font-weight:900; color:var(--red); }
+  #echo-status .next .t{ font-size:14px; font-weight:600; line-height:1.35; }
+  #echo-status .next .by{ margin-left:auto; flex:0 0 auto; font-size:9.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#8a96aa; align-self:center; white-space:nowrap; }
+
+  /* section label */
+  #echo-status .seclabel{ margin:34px 0 2px; font-size:11px; font-weight:800; letter-spacing:.22em; text-transform:uppercase; color:var(--sky); }
+
+  /* stage detail grid */
+  #echo-status .grid{ margin-top:16px; display:grid; grid-template-columns:repeat(2,1fr); gap:14px; }
+  #echo-status .card{ background:var(--navy2); border-radius:12px; padding:18px; }
+  #echo-status .card.full{ grid-column:1 / -1; }
+  #echo-status .card > header{ display:flex; align-items:center; gap:14px; margin-bottom:14px; }
+  #echo-status .card h3{ font-size:15px; font-weight:800; line-height:1.15; }
+  #echo-status .card .cmeta{ font-size:11.5px; font-weight:600; color:var(--steel); margin-top:3px; }
+  #echo-status .card .badge{ margin-left:auto; flex:0 0 auto; font-size:9px; font-weight:900; letter-spacing:.13em; text-transform:uppercase; padding:4px 9px; border-radius:99px; align-self:flex-start; }
+  #echo-status .badge.next{ background:var(--red); color:#fff; }
+  #echo-status .badge.watch{ background:rgba(255,0,0,.16); color:#ff6b6b; border:1px solid rgba(255,0,0,.4); }
+  #echo-status .badge.spec{ background:rgba(94,185,230,.18); color:var(--sky); border:1px solid rgba(94,185,230,.4); }
+  #echo-status .tasks{ list-style:none; }
+  #echo-status .tasks li{ display:flex; gap:10px; align-items:flex-start; padding:7px 0; border-top:1px solid rgba(255,255,255,.07); font-size:13px; line-height:1.38; cursor:pointer; }
+  #echo-status .tasks li:first-child{ border-top:none; }
+  #echo-status .tasks li:focus-visible{ outline:2px solid var(--sky); outline-offset:3px; border-radius:4px; }
+  #echo-status .chk{ flex:0 0 18px; width:18px; height:18px; border-radius:5px; margin-top:1px; border:2px solid var(--muted); display:grid; place-items:center; font-size:11px; font-weight:900; color:transparent; }
+  #echo-status .tasks li.done .chk{ background:var(--sky); border-color:var(--sky); color:var(--navy); }
+  #echo-status .tasks li.ready .chk{ border-color:var(--red); color:var(--red); }
+  #echo-status .tasks li.done .tt{ color:var(--steel); text-decoration:line-through; text-decoration-color:var(--muted); }
+  #echo-status .tasks li .tt{ flex:1; }
+  #echo-status .card.deferred{ background:transparent; border:1.5px dashed var(--muted); }
+  #echo-status .card.deferred h3{ color:var(--steel); }
+
+  /* risks */
+  #echo-status .risk{ list-style:none; }
+  #echo-status .risk li{ display:flex; gap:11px; align-items:flex-start; padding:10px 0; border-top:1px solid rgba(255,255,255,.07); font-size:13px; line-height:1.42; color:var(--steel); }
+  #echo-status .risk li:first-child{ border-top:none; }
+  #echo-status .risk li b{ color:var(--white); font-weight:800; }
+  #echo-status .risk .ic{ flex:0 0 18px; width:18px; height:18px; border-radius:5px; background:var(--red); color:#fff; font-weight:900; font-size:12px; display:grid; place-items:center; margin-top:1px; }
+
+  /* reporting pills */
+  #echo-status .report{ display:flex; flex-wrap:wrap; gap:8px; }
+  #echo-status .report .pill{ background:rgba(94,185,230,.14); color:var(--sky); border:1px solid rgba(94,185,230,.3); border-radius:99px; padding:7px 13px; font-size:12px; font-weight:700; }
+
+  #echo-status .foot{ margin-top:26px; text-align:center; font-size:10.5px; font-weight:600; letter-spacing:.05em; color:var(--steel); }
+
+  @media (max-width:720px){
+    #echo-status{ padding:28px 18px 32px; }
+    #echo-status .title{ font-size:34px; }
+    #echo-status .rail{ grid-template-columns:1fr; gap:4px; }
+    #echo-status .rail::before{ display:none; }
+    #echo-status .node{ display:grid; grid-template-columns:48px 1fr; align-items:center; text-align:left; gap:14px; padding:4px 0; }
+    #echo-status .node .seg{ display:none; }
+    #echo-status .node .disc{ margin:0; }
+    #echo-status .tiles{ grid-template-columns:repeat(2,1fr); }
+    #echo-status .grid{ grid-template-columns:1fr; }
+  }
+  @media (prefers-reduced-motion:no-preference){
+    #echo-status .seg, #echo-status .ringfg{ transition:all .4s ease; }
+  }
+</style>
+
+<script>
+(function(){
+  const STAGES=[
+    { n:"0", short:"Foundation", name:"Stage 0 — Foundation", meta:"Brand, repo, gates, tests",
+      items:[
+        ["Canonical LASSO brand bible","done"],
+        ["Reference repo scaffolded (own body, Ranger spine as pattern)","done"],
+        ["Gates baked into code (approval, draft-only, trust ladder, no-fabrication)","done"],
+        ["Test suite green (44: +5 Creative Studio, +4 card preview)","done"],
+        ["Stage 1 build prompt for Claude Code","done"],
+        ["Railway and separation plan documented","done"],
+        ["Brain hook stubbed (read-only, proposes)","done"],
+    ]},
+    { n:"1", short:"LASSO Only", name:"Stage 1 — Draft, approve, publish", meta:"Draft-only, prove it on us",
+      items:[
+        ["Daily drafter, one post per account","done"],
+        ["Slack approval cards to #echoclaude","done"],
+        ["Meta publisher with draft-only guard","done"],
+        ["Post logging (no tokens)","done"],
+        ["Create lasso-echo GitHub repo (private)","done"],
+        ["New Railway project + echo service + env vars","done"],
+        ["Meta App live (Dev mode ok for own accounts)","done"],
+        ["Per-account tokens + ids set by hand","done"],
+        ["Slack app + #echoclaude wired, first cards proven","done"],
+        ["Voice doc loading fixed (real bible on Railway)","done"],
+        ["CTA rotation: growth-biased, placeholder-filtered","done"],
+        ["Hashtags capped to 5 (2026 best practice)","done"],
+        ["Carousel support (folder = carousel, draft-only)","done"],
+        ["Reels support (draft-only, a video = a Reel)","done"],
+        ["Bible updated for 2026 (3 to 5 tags, caption SEO)","done"],
+        ["Inline creative preview on the approval card","done"],
+        ["Creative Studio module wired (Nano Banana, flag OFF)","done"],
+        ["Push growth pack via Claude Code + redeploy","done"],
+        ["Rename live Slack app to Echo, drop duplicate","done"],
+        ["Media hosting shipped: S3-compatible, tenant-scoped, dedupe, retry, wired into drafts (200-client ready)","done"],
+        ["Content brain: daily post from source doc across pillars (flag OFF)","ready"],
+        ["Run master ON, publish OFF, watch drafts","ready"],
+        ["Run the full 30-day loop once","todo"],
+        ["Arm publishing once drafts look right","todo"],
+    ]},
+    { n:"2", short:"First Client", name:"Stage 2 — One paying client", meta:"Prove the voice holds",
+      items:[
+        ["Brand voice intake template","todo"],
+        ["Texted link intake (primary path, full-res upload)","todo"],
+        ["Idempotent Railway ingest worker (convert, dedupe, moderate, tag, thumbnail)","todo"],
+        ["Client approval flow via portal","todo"],
+        ["Prove the voice holds for a non-Blake client","todo"],
+        ["Prove the 30-day refresh lands","todo"],
+    ]},
+    { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
+      items:[
+        ["Launch as the $99 Social Media add-on ($99 ad clients, $199 non-ad)","todo"],
+        ["Template intake, approval, calendar, review","todo"],
+        ["DAM with member-photo consent tracking","todo"],
+        ["Creative runway card (days of content left) + text-back alert","todo"],
+        ["Reporting on Meta Graph views (not impressions), daily snapshots","todo"],
+        ["Portal exposes creative library (read)","todo"],
+        ["Portal hosts reporting dashboard (write)","todo"],
+        ["Onboard client by client","todo"],
+    ]},
+    { n:"4", short:"Scale", name:"Stage 4 — Scale automation", meta:"Near-zero-touch at volume",
+      items:[
+        ["Claude Agent SDK agent behind approval-gate hooks","todo"],
+        ["Per-account trust ladder climbing","todo"],
+        ["Multi-account near-zero-touch oversight","todo"],
+        ["Per-gym agent memory + audit log proves reliability","todo"],
+        ["Nightly brain loop armed","todo"],
+    ]},
+  ];
+
+  // Scoped next builds (planned, not started) — the real growth formats
+  const ROADMAP={ name:"Roadmap — next builds", meta:"Scoped, not started",
+    items:[
+      "Daily Stories posting (warm-audience signal)",
+      "Caption SEO baked into the drafter (keyword guidance in notes)",
+  ]};
+
+  // Deferred by design — hooks documented, built when their stage arrives
+  const STUBS={ name:"Deferred by design", meta:"Documented hooks, built when their stage arrives",
+    items:[
+      "Comment handling (Tier 1 auto-safe / Tier 2 surface / no auto DMs)",
+      "30-day creative refresh loop (the product)",
+      "Portal creative-library read",
+      "Portal reporting write",
+      "Nightly brain read",
+  ]};
+
+  // Open risks / watch items
+  const RISKS={ name:"Open risks & watch items", meta:"Track these, do not let them drift",
+    items:[
+      ["Repo divergence","deployed repo has commits from other agents (ruvnet, Manus); the reference sandbox may differ. Code ships as a behavior-described Claude Code prompt, never a wholesale push."],
+      ["Rotate secrets by hand","Meta app secret + long-lived token, Slack tokens, and the client Page tokens that were exposed. Explorer tokens are short-lived; rotate on principle."],
+      ["Verify one caption line","confirm \"That difference is your revenue\" was Blake's own note edit (fabrication gate intact), not a generator writing text."],
+      ["Brand palette (resolved)","canonical = V3: Navy #121E3C / Red #FF0000 / Sky #5EB9E6 / Cream #FAF6F0. Baked into creative_studio.py; BUILD_SPEC.md updated; the #0F1B33 draft is superseded."],
+      ["Publish path decision","spec routes publishing through GHL Social Planner V2; Echo currently publishes direct via Meta Graph (built, working). Lean: keep direct Meta for LASSO now, move to GHL at 100+ client scale for its rate-limit handling."],
+  ]};
+
+  // Stage 3 reporting spec (per account, per 30-day cycle)
+  const REPORTING={ name:"Reporting spec — wire in Stage 3", meta:"Per account, per 30-day cycle, from the Meta Graph API (the authoritative source). Use views, not impressions (Meta migrated April 2025; pre/post are not comparable). Daily snapshots cached locally. Doubles as client proof of value + the monthly refresh input.",
+    metrics:["Engagement (rate + raw)","Saves","Sends / shares","Likes","Comments","Reach","Views (not impressions)","Follower growth (net + rate)","Posting frequency: before vs after Echo","Top 3 posts","Bottom 3 posts","Health read: growing / flat / declining"]};
+
+  // Client intake — how clients feed the creative library (Stage 2)
+  const CLIENT_INTAKE={ name:"Client Intake \u2014 texted link to portal", meta:"Stage 2. Primary path is a texted short link to a full-res upload page (MMS compresses media before it ever reaches us). MMS inbound is the fallback. It is the client's own media and words, so fabrication risk stays near zero.",
+    items:[
+      "Client texts a keyword; auto-reply sends a per-gym branded upload link",
+      "Upload page streams originals to storage (full-res, HEIC/MOV, EXIF preserved)",
+      "Short token maps to the gym: attribution is automatic, no login",
+      "Fallback: capture inbound MMS media immediately (carrier URLs expire), flag as low-res",
+      "Texted sentence becomes the caption note (no-fabrication gate holds)",
+      "Missing caption: auto-reply asks for one; draft stays blocked until provided",
+      "Confirmation reply: friendly, branded, no dashes (in your approval queue)",
+      "A2P 10DLC brand + campaign registered before any texting goes live",
+      "Tool: GoHighLevel or Twilio; verify webhook with Ed25519 X-GHL-Signature",
+  ]};
+
+  // Creative Studio — generated assets, flagged and default OFF (Stage 2 & 3)
+  const CREATIVE_STUDIO={ name:"Creative Studio \u2014 generated assets", meta:"Flagged, default OFF. Every output is a draft that still needs your tap. One flag per generator.",
+    items:[
+      "Opus Clip factory (Stage 2\u20133): one long client video in, candidate Reels out as drafts; publish via Echo's Meta pipeline, not the Opus scheduler",
+      "Nano Banana infographics (Stage 3): visualize ONLY approved facts from the bible or client note; V3 brand kit locked as the reference",
+      "AI images carry a SynthID watermark; always verify data-driven output",
+      "Cost line: per-image (Nano Banana) + per-minute (Opus) priced into the $99 SKU",
+  ]};
+
+  // Full build spec (from the A-Plus Build Specification, folded in July 2026).
+  // The complete organic-system scope. Reference doc lives at docs/BUILD_SPEC.md.
+  const ARCH={ name:"Full build spec \u2014 the organic system", meta:"From the A-Plus Build Specification. The complete scope Echo grows into. Canonical doc: docs/BUILD_SPEC.md in the repo. Everything here plugs onto the proven Stage 1 core.",
+    groups:[
+      { title:"Ingestion pipeline", items:[
+        "Texted short link is primary; MMS + portal upload are fallbacks",
+        "Event-driven: webhook to queue to idempotent Railway worker (safe to retry)",
+        "Convert HEIC to JPEG/AVIF and MOV to MP4; always keep the original",
+        "Dedupe: SHA-256 exact + perceptual hash for near-dupes",
+        "AV + image moderation on ingest; auto-reject clear, flag borderline",
+        "Thumbnails/posters generated in the worker, never in a web request",
+        "Dead-letter queue with exponential backoff",
+      ]},
+      { title:"Creative library / DAM", items:[
+        "Asset row: tenant, storage keys, type, hashes, EXIF, AI tags + confidence",
+        "AI auto-tag + auto-caption; low-confidence tags go to a human review queue",
+        "Member-photo CONSENT tracking: face-detect flags, release required to publish",
+        "Usage tracking links assets to posts so nothing is reposted by accident",
+        "One canonical original; derivatives on demand; cold-tier the rarely used",
+      ]},
+      { title:"Creative runway", items:[
+        "Days of content left = unused approved assets / posts per day",
+        "Count only approved, moderation-clean, consent-cleared, unposted assets",
+        "One glanceable card: big number, green/amber/red, projected zero-date",
+        "Below threshold (default ~7 days): agent texts a specific request, debounced",
+      ]},
+      { title:"Agent (Claude Agent SDK)", items:[
+        "Model routing: Opus 4.8 judgment, Sonnet 4.6 copy, Haiku 4.5 classification",
+        "Read tools: library, runway, performance, brand profile, schedule",
+        "Act tools (gated): draft, schedule, generate, text client, request creative, report",
+        "Per-gym memory: always-in-context core + retrieval + consolidated learnings",
+        "Approval gates enforced with PreToolUse hooks; full decision audit log",
+        "Subagents/skills: tagging, copywriting (SB7), analyst, runway-guardian",
+      ]},
+      { title:"Platform + reporting", items:[
+        "Supabase RLS keyed to Clerk org claims = hard multi-tenant isolation",
+        "Idempotency keys everywhere; rate-limit-aware GHL + Meta clients",
+        "Reporting from Meta Graph, on views not impressions, daily snapshots cached",
+        "White-label in-portal dashboard + scheduled branded PDF, mobile first",
+        "One place for the client: library, runway, and reporting together",
+      ]},
+    ]};
+
+  const root=document.getElementById("echo-status");
+  const done=s=>s.items.filter(i=>i[1]==="done").length;
+  const pct=s=>Math.round((done(s)/s.items.length)*100);
+
+  function ring(p,color){
+    const r=21,c=2*Math.PI*r,off=c*(1-p/100);
+    return `<svg width="54" height="54" viewBox="0 0 54 54" style="flex:0 0 auto">
+      <circle cx="27" cy="27" r="${r}" fill="none" stroke="rgba(255,255,255,.14)" stroke-width="5"/>
+      <circle class="ringfg" cx="27" cy="27" r="${r}" fill="none" stroke="${color}" stroke-width="5"
+        stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}" transform="rotate(-90 27 27)"/>
+      <text x="27" y="31" text-anchor="middle" fill="#fff" font-size="13" font-weight="900" font-family="Inter,Helvetica,Arial">${p}%</text>
+    </svg>`;
+  }
+
+  function render(){
+    let tot=0,dn=0;
+    STAGES.forEach(s=>{tot+=s.items.length;dn+=done(s);});
+    const overall=Math.round((dn/tot)*100);
+    let activeIdx=STAGES.findIndex(s=>pct(s)<100);
+    if(activeIdx<0) activeIdx=STAGES.length-1;
+
+    let h=`<p class="eyebrow">LASSO Framework</p>
+      <h1 class="title">Echo <span class="a">Master</span> Tracker</h1>
+      <p class="deck">Build status + full progress<span class="dot">/</span>Draft-only<span class="dot">/</span>Publishing not armed</p>
+      <div class="legend">
+        <span class="lg"><span class="sw done"></span>Done</span>
+        <span class="lg"><span class="sw ready"></span>Built, push pending</span>
+        <span class="lg"><span class="sw"></span>To do</span>
+      </div>`;
+
+    // rail
+    h+=`<div class="rail-wrap"><p class="rail-label">The Path</p><div class="rail">`;
+    STAGES.forEach((s,i)=>{
+      const p=pct(s);
+      const state=p===100?"done":(i===activeIdx?"active":"");
+      const segColor=(i>0 && pct(STAGES[i-1])===100)?"var(--sky)":"var(--muted)";
+      h+=`<div class="node ${state}">
+        ${i>0?`<span class="seg" style="background:${segColor}"></span>`:""}
+        <div class="disc">${p===100?"&#10003;":s.n}</div>
+        <div><div class="nm">${s.short}</div><div class="pc">${p}%</div>
+        ${i===activeIdx?`<span class="youarehere">You are here</span>`:""}</div>
+      </div>`;
+    });
+    h+=`</div></div>`;
+
+    // tiles
+    h+=`<div class="tiles">
+      <div class="tile"><div class="k">Overall</div><div class="v red">${overall}%</div><div class="vs">${dn} of ${tot} items</div></div>
+      <div class="tile"><div class="k">Current phase</div><div class="v small">Stage ${STAGES[activeIdx].n}</div><div class="vs">${STAGES[activeIdx].short}</div></div>
+      <div class="tile"><div class="k">2026 Growth pack</div><div class="v sky small">Shipped</div><div class="vs">Live in drafts</div></div>
+      <div class="tile"><div class="k">Publishing</div><div class="v small">Draft-only</div><div class="vs">Flag OFF, by design</div></div>
+    </div>`;
+
+    // next moves
+    const blockers=STAGES[activeIdx].items.filter(i=>i[1]==="todo").slice(0,5);
+    h+=`<div class="next"><div class="cap">Next moves &middot; Stage ${STAGES[activeIdx].n}</div><ol>`;
+    blockers.forEach((b,i)=>{
+      const byhand=/Meta App|tokens|GitHub|Railway|Slack|approved by Blake|Host creative|Rename|redeploy/.test(b[0]);
+      h+=`<li><span class="n">${i+1}</span><span class="t">${b[0]}</span><span class="by">${byhand?"By hand":"Build"}</span></li>`;
+    });
+    if(!blockers.length){ h+=`<li><span class="n">&#10003;</span><span class="t">This stage is clear. Advance to the next phase.</span></li>`; }
+    h+=`</ol></div>`;
+
+    // stage cards
+    h+=`<p class="seclabel">The Build &middot; Stage by Stage</p>`;
+    h+=`<div class="grid">`;
+    STAGES.forEach((s,si)=>{
+      const p=pct(s);
+      const col=p===100?"var(--sky)":"var(--red)";
+      h+=`<div class="card"><header>${ring(p,col)}<div><h3>${s.name}</h3><div class="cmeta">${s.meta} &middot; ${done(s)}/${s.items.length}</div></div></header><ul class="tasks">`;
+      s.items.forEach((it,ii)=>{
+        const cls=it[1]==="done"?"done":it[1]==="ready"?"ready":"";
+        const mark=it[1]==="done"?"&#10003;":it[1]==="ready"?"&bull;":"";
+        h+=`<li class="${cls}" tabindex="0" role="button" data-s="${si}" data-i="${ii}"><span class="chk">${mark}</span><span class="tt">${it[0]}</span></li>`;
+      });
+      h+=`</ul></div>`;
+    });
+
+    // roadmap card
+    h+=`<div class="card"><header><div><h3>${ROADMAP.name}</h3><div class="cmeta">${ROADMAP.meta}</div></div><span class="badge next">Next up</span></header><ul class="tasks">`;
+    ROADMAP.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk" style="border-color:var(--red)"></span><span class="tt">${t}</span></li>`; });
+    h+=`</ul></div>`;
+
+    // deferred stubs
+    h+=`<div class="card deferred full"><header><div><h3>${STUBS.name}</h3><div class="cmeta">${STUBS.meta}</div></div></header><ul class="tasks">`;
+    STUBS.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk"></span><span class="tt" style="color:var(--steel)">${t}</span></li>`; });
+    h+=`</ul></div>`;
+
+    // risks
+    h+=`<div class="card full"><header><div><h3>${RISKS.name}</h3><div class="cmeta">${RISKS.meta}</div></div><span class="badge watch">Watch</span></header><ul class="risk">`;
+    RISKS.items.forEach(r=>{ h+=`<li><span class="ic">!</span><span><b>${r[0]}:</b> ${r[1]}</span></li>`; });
+    h+=`</ul></div>`;
+
+    // reporting spec
+    h+=`<div class="card full"><header><div><h3>${REPORTING.name}</h3><div class="cmeta">${REPORTING.meta}</div></div><span class="badge spec">Stage 3</span></header><div class="report">`;
+    REPORTING.metrics.forEach(m=>{ h+=`<span class="pill">${m}</span>`; });
+    h+=`</div></div>`;
+
+    // client intake (Stage 2)
+    h+=`<div class="card full"><header><div><h3>${CLIENT_INTAKE.name}</h3><div class="cmeta">${CLIENT_INTAKE.meta}</div></div><span class="badge spec">Stage 2</span></header><ul class="tasks">`;
+    CLIENT_INTAKE.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk"></span><span class="tt">${t}</span></li>`; });
+    h+=`</ul></div>`;
+
+    // creative studio (Stage 2 & 3, flagged)
+    h+=`<div class="card full"><header><div><h3>${CREATIVE_STUDIO.name}</h3><div class="cmeta">${CREATIVE_STUDIO.meta}</div></div><span class="badge next">Flagged</span></header><ul class="tasks">`;
+    CREATIVE_STUDIO.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk"></span><span class="tt">${t}</span></li>`; });
+    h+=`</ul></div>`;
+
+    // full build spec (the organic system) — folded in from the A-Plus spec
+    h+=`<div class="card full"><header><div><h3>${ARCH.name}</h3><div class="cmeta">${ARCH.meta}</div></div><span class="badge spec">Spec</span></header></div>`;
+    ARCH.groups.forEach(g=>{
+      h+=`<div class="card"><header><div><h3>${g.title}</h3></div></header><ul class="tasks">`;
+      g.items.forEach(t=>{ h+=`<li style="cursor:default"><span class="chk"></span><span class="tt">${t}</span></li>`; });
+      h+=`</ul></div>`;
+    });
+
+    h+=`</div>`; // close grid
+
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in docs/BUILD_SPEC.md &middot; updated 2026-07-01 (content brain built: daily post from source doc, no fabrication; 41 tests in sandbox) &middot; this view does not save on reload</p>`;
+
+    root.innerHTML=h;
+
+    root.querySelectorAll('.tasks li[data-s]').forEach(li=>{
+      const toggle=()=>{
+        const s=+li.dataset.s,i=+li.dataset.i,cur=STAGES[s].items[i][1];
+        STAGES[s].items[i][1]= cur==="todo"?"ready":cur==="ready"?"done":"todo";
+        render();
+      };
+      li.addEventListener('click',toggle);
+      li.addEventListener('keydown',e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggle(); }});
+    });
+  }
+  render();
+})();
+</script>
