@@ -8,7 +8,7 @@ NOTHING and says so. No voice doc, no posts. Hard rule.
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class VoiceDocMissing(Exception):
@@ -19,6 +19,7 @@ class VoiceDocMissing(Exception):
 class VoiceDoc:
     raw: str
     hashtags: list  # approved hashtags pulled from the doc, never invented
+    ctas: list = field(default_factory=list)  # approved CTA rotation from the doc
 
     @property
     def text(self):
@@ -36,7 +37,11 @@ def load_voice(path):
         raw = f.read().strip()
     if not raw:
         return None
-    return VoiceDoc(raw=raw, hashtags=_extract_hashtags(raw))
+    return VoiceDoc(
+        raw=raw,
+        hashtags=_extract_hashtags(raw),
+        ctas=_extract_ctas(raw),
+    )
 
 
 def _extract_hashtags(raw):
@@ -57,3 +62,24 @@ def _extract_hashtags(raw):
         seen.add(h.lower())
         out.append(h)
     return out
+
+
+def _extract_ctas(raw):
+    """
+    Extract the numbered CTA rotation list from the '### CTA rotation' section
+    of the voice doc. Returns a list of CTA strings in order.
+    Only CTAs that literally appear in the approved doc are usable.
+    """
+    # Find the CTA rotation section
+    section_match = re.search(
+        r"###\s+CTA rotation.*?\n(.*?)(?=\n###|\n##|\Z)",
+        raw,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not section_match:
+        return []
+
+    section_text = section_match.group(1)
+    # Extract numbered items: "1. Some CTA text."
+    items = re.findall(r"^\d+\.\s+(.+)$", section_text, re.MULTILINE)
+    return [item.strip() for item in items if item.strip()]

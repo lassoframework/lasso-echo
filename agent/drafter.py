@@ -45,25 +45,72 @@ def _make_id(account_key, creative_path, scheduled_for):
     return h[:10]
 
 
+def _pick_cta(voice, creative_path):
+    """
+    Pick one CTA from the approved rotation in the voice doc.
+    Uses a deterministic index based on the creative filename so the same card
+    always gets the same CTA (stable across re-runs), but different cards rotate
+    through the full list.
+    Returns an empty string if no CTAs are defined in the voice doc.
+    """
+    if not voice.ctas:
+        return ""
+    # Use the creative filename as a stable rotation key
+    key = creative_path or ""
+    idx = hash(key) % len(voice.ctas)
+    return voice.ctas[idx]
+
+
+def _select_hashtags(voice, creative_path):
+    """
+    Select 8 to 11 hashtags from the approved set in the voice doc.
+    Always includes the 3 brand-tier tags if present, then fills from the rest.
+    Uses a deterministic rotation so different cards get varied niche/topic tags.
+    """
+    BRAND_TAGS = {"#LASSOFramework", "#GymMarketingMadeSimple", "#LASSOPinnacle"}
+    all_tags = list(voice.hashtags)
+
+    brand = [t for t in all_tags if t in BRAND_TAGS]
+    rest = [t for t in all_tags if t not in BRAND_TAGS]
+
+    # Rotate the non-brand tags deterministically per creative
+    key = creative_path or ""
+    offset = hash(key) % max(len(rest), 1)
+    rotated = rest[offset:] + rest[:offset]
+
+    # Fill to 11 total (3 brand + up to 8 from rest)
+    selected = brand + rotated[: max(0, 11 - len(brand))]
+    return selected[:11]
+
+
 class TemplateGenerator:
     """
     Deterministic, zero-fabrication caption builder (the safe Stage 1 baseline).
-    Caption is the client's approved note verbatim. Nothing is invented or added.
-    Hashtags are pulled from the approved doc and capped to the brand limit.
+    Caption = client's approved note + one CTA from the voice doc rotation.
+    Hashtags are pulled from the approved doc, brand tier always included.
 
     Upgrade path: a constrained LLM generator can replace this to write a real
     hook / problem / insight / CTA caption, but it must draw ONLY from the voice
     doc + client note and keep this same contract.
     """
 
-    HASHTAG_LIMIT = 11  # brand standard is 8 to 12 per post
-
     def build(self, voice, creative):
         fragments = []
+
+        # 1. Client note (the core body — verbatim, no fabrication)
         if creative.client_note:
             fragments.append(creative.client_note.strip())
+
+        # 2. CTA from the approved rotation in the voice doc
+        cta = _pick_cta(voice, getattr(creative, "path", ""))
+        if cta:
+            fragments.append(cta)
+
         caption = "\n\n".join(fragments).strip()
-        hashtags = list(voice.hashtags)[: self.HASHTAG_LIMIT]
+
+        # 3. Hashtags: brand tier always present, rest rotated per creative
+        hashtags = _select_hashtags(voice, getattr(creative, "path", ""))
+
         return caption, hashtags, fragments
 
 
