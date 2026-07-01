@@ -130,3 +130,56 @@ def test_missing_doc_blocks(monkeypatch, tmp_path):
     d = _build(tmp_path, source_path=str(tmp_path / "nope.md"))
     assert d.status == DraftStatus.BLOCKED
     assert "missing" in d.blocked_reason.lower()
+
+
+# ---- 5. the REAL brand_voice/lasso_now.md produces a hosted PENDING draft ----
+# (Regression guard: content_planner writes copy_bank as {"hooks","bodies"} and
+# daily_studio reads those same keys, so a real pillar's hook + body reach the draft.)
+_REAL_DOC = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                         "brand_voice", "lasso_now.md")
+
+
+def test_real_source_doc_produces_pending_draft_with_hook_and_body(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    day = "2026-07-01"
+    d = daily_studio.build_daily_infographic_draft(
+        _acct(), day, nano_client=FakeNano(), s3_client=FakeS3(), source_path=_REAL_DOC)
+
+    assert d is not None
+    assert d.status == DraftStatus.PENDING
+    assert d.creative_public_url                       # non-empty hosted URL
+
+    # source_fragments must carry the chosen pillar's hook + every body line.
+    doc = content_planner.load_source_doc(_REAL_DOC)
+    pillar = content_planner.plan_for(day, path=_REAL_DOC)["pillar"]
+    block = doc.copy_bank[pillar]
+    assert block["hooks"][0] in d.source_fragments     # the hook (headline)
+    for body in block["bodies"]:
+        assert body in d.source_fragments              # all body lines (facts)
+
+
+# ---- 6. a doc/parse gap surfaces as BLOCKED, not a silent None ---------------
+_HOOK_ONLY_DOC = """# LASSO Now
+## Pillars
+- Only Hook
+## Pillar copy bank
+### Pillar: Only Hook
+Hook: A hook with no body line.
+## CTAs
+- Save this post.
+## Hashtags
+#LASSOFramework
+"""
+
+
+def test_pillar_with_no_body_blocks_not_silent_none(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    p = tmp_path / "hookonly.md"
+    p.write_text(_HOOK_ONLY_DOC, encoding="utf-8")
+    d = daily_studio.build_daily_infographic_draft(
+        _acct(), "2026-07-01", nano_client=FakeNano(), s3_client=FakeS3(), source_path=str(p))
+    # Before the fix this returned a silent None (masked as a library fallback).
+    assert d is not None
+    assert d.status == DraftStatus.BLOCKED
+    assert "no approved body lines" in d.blocked_reason.lower()
+    assert "only hook" in d.blocked_reason.lower()

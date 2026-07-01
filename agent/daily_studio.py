@@ -44,21 +44,32 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     if plan.get("blocked"):
         return _blocked(plan["reason"])
 
-    # Build the infographic ONLY from that pillar's approved lines.
+    # Build the infographic ONLY from that pillar's approved lines. copy_bank stores
+    # each pillar as {"hooks": [...], "bodies": [...]} (content_planner._parse_copy_bank);
+    # read those exact keys. A missing block or empty hook/body is a doc/parse problem:
+    # surface it as BLOCKED (it shows on the Slack card) rather than a silent None that
+    # would masquerade as a normal library fallback.
     block = doc.copy_bank.get(plan["pillar"], {})
     hooks = list(block.get("hooks", []))
     facts = list(block.get("bodies", []))
+    if not hooks and not facts:
+        return _blocked(f"pillar '{plan['pillar']}' has no approved hook/body lines in lasso_now.md")
     headline = hooks[0] if hooks else ""
     if not facts:
-        return None  # no approved body lines -> nothing to render honestly; fall back
+        return _blocked(f"pillar '{plan['pillar']}' has no approved body lines in lasso_now.md")
 
     art = creative_studio.generate(headline, facts, client=nano_client)
     if not art:
-        return None  # generation off / produced nothing -> fall back to library
+        # Acceptable library fallback for now, but make it VISIBLE in run-daily output.
+        print(f"[daily-studio] {account.key}: image generation produced nothing; "
+              "falling back to library creative.")
+        return None
 
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)
     if not hosted:
-        return None  # could not host -> no public URL -> fall back to library
+        print(f"[daily-studio] {account.key}: media hosting failed (no public URL); "
+              "falling back to library creative.")
+        return None
 
     return Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
