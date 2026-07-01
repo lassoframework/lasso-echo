@@ -46,6 +46,8 @@ class ConsolePoster:
 
 def _status():
     print("AGENT status")
+    # gates (all read from config at call time; display only)
+    print("  -- gates --")
     print(f"  master_enabled : {config.master_enabled()}  (env AGENT_ENABLED)")
     print(f"  publish_enabled: {config.publish_enabled()}  (env AGENT_PUBLISH_ENABLED)")
     print(f"  approver       : {config.APPROVER_SLACK_ID}")
@@ -53,6 +55,22 @@ def _status():
     print(f"  library        : {config.LIBRARY_PATH}")
     mode = "DRAFT-ONLY" if not config.publish_enabled() else "PUBLISH ARMED"
     print(f"  mode           : {mode}")
+    # capability flags (all default OFF)
+    print("  -- capability flags --")
+    print(f"  content_brain  : {config.content_brain_enabled()}  (env AGENT_CONTENT_BRAIN_ENABLED)")
+    print(f"  creative_studio: {config.creative_studio_enabled()}  (env AGENT_NANO_ENABLED)")
+    print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
+    print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
+    print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
+    print(f"  comments       : {config.comments_enabled()}  (env AGENT_COMMENTS_ENABLED)")
+    # posting schedule (2026 cadence)
+    print("  -- posting schedule --")
+    print(f"  primary time   : {config.POSTING_PRIMARY_TIME}")
+    print(f"  morning time   : {config.POSTING_MORNING_TIME}")
+    print(f"  posts per day  : {config.POSTS_PER_DAY}")
+    print(f"  skip days      : {config.POSTING_SKIP_DAYS}")
+    print(f"  priority days  : {config.POSTING_PRIORITY_DAYS}")
+    print(f"  timezone       : {config.POSTING_TIMEZONE}")
 
 
 def _dry_run():
