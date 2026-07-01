@@ -40,6 +40,8 @@ clean house style. Next: drop personal FB, run the 30-day loop, then arm publish
 - [x] Inline creative preview on the approval card (see the image before approving)
 - [x] Creative Studio module wired (Nano Banana infographics, flag AGENT_NANO_ENABLED OFF)
 - [x] Media hosting shipped: S3-compatible, 200-client hardened (tenant-scoped, dedupe, retry), wired into drafts, flag OFF; stand up bucket + creds by hand to arm
+- [x] Infographics target 4:5 PORTRAIT (1080x1350) for the IG/FB feed; V3 palette + clean house style locked; aspect tunable via AGENT_IMAGE_ASPECT
+- [x] Dropped personal FB: blake_personal marked inactive (Meta ended personal-profile publishing 2018); run-daily drafts lasso_ig + lasso_fb only (record kept)
 - [~] Content brain: drafts the daily post from the source doc (brand_voice/lasso_now.md)
       across the 5 pillars, growth CTA, 5 hashtags, no fabrication; flag AGENT_CONTENT_BRAIN_ENABLED OFF
 - [~] Google Business Profile posting branch (local posts): gbp_publisher, draft-only guard,
@@ -57,9 +59,11 @@ clean house style. Next: drop personal FB, run the 30-day loop, then arm publish
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
 - [ ] Prove the 30-day refresh lands for a real client
-- [ ] Document intake: client sends a PDF (texts + email); Echo extracts the text,
-      splits it into N post ideas, drafts an infographic card per idea, holds ALL for
-      approval. No-fabrication gate applies (PDF is raw material, never approved fact).
+- [~] Document intake: client sends a PDF (texts + email); Echo extracts the text,
+      splits it into N post ideas (deterministic, no LLM), drafts an infographic card
+      per idea, holds ALL for approval. No-fabrication gate applies (PDF is raw material,
+      never approved fact). Built in sandbox: agent/doc_intake.py + CLI intake-doc,
+      reuses creative_studio + media_host; flag AGENT_DOC_INTAKE_ENABLED OFF. pypdf added.
       This is the seed of client intake. Flag AGENT_DOC_INTAKE_ENABLED, default OFF.
 
 ## Stage 3 — Productize ($99/mo)
