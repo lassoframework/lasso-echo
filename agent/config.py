@@ -122,3 +122,19 @@ def gbp_enabled() -> bool:
     a would_publish result. Independent of the Meta path.
     """
     return _truthy(os.environ.get("AGENT_GBP_ENABLED", "false"))
+
+
+def reporting_enabled() -> bool:
+    """
+    30-day reporting switch. OFF by default. When OFF, fetch_insights() returns None
+    and reads nothing. Reporting is READ-ONLY: it never posts, edits, or sends.
+    """
+    return _truthy(os.environ.get("AGENT_REPORTING_ENABLED", "false"))
+
+
+def comments_enabled() -> bool:
+    """
+    Comment/DM handling switch. OFF by default. Nothing here ever auto-sends: replies
+    are drafted and HELD for human approval; a first-contact DM is always surfaced.
+    """
+    return _truthy(os.environ.get("AGENT_COMMENTS_ENABLED", "false"))
