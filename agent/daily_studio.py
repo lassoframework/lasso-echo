@@ -14,7 +14,7 @@ the approver gate and AGENT_PUBLISH_ENABLED.
 """
 
 from . import config, content_planner, creative_studio, media_host, schedule
-from .drafter import Draft, DraftStatus, _make_id
+from .drafter import Draft, DraftStatus, _make_id, variant_hashtags
 
 
 def build_daily_infographic_draft(account, day_key, *, nano_client=None,
@@ -73,7 +73,10 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
 
     return Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
-        caption=plan["caption"], hashtags=list(plan["hashtags"]),
+        caption=plan["caption"],
+        # Per-platform variant (flag OFF -> unchanged): selection from the same
+        # approved tag set only. FB keeps at most 2; IG keeps up to 5.
+        hashtags=variant_hashtags(account.platform, plan["hashtags"]),
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[headline] + facts,  # no-fabrication audit trail

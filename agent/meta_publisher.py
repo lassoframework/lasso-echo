@@ -66,12 +66,25 @@ def publish(draft, account, http=None):
         return PublishResult(ok=True, mode="would_publish",
                              detail="publish flag OFF (draft-only)")
 
+    # Stories sit behind BOTH gates: even with publishing armed, a Story draft makes
+    # NO network call until AGENT_STORIES_ENABLED is also armed.
+    if getattr(draft, "is_story", False) and not config.stories_enabled():
+        return PublishResult(ok=True, mode="would_publish",
+                             detail="stories flag OFF (draft only)")
+
     token = account.get_token()
     if not token:
         raise MissingToken(f"No token set for account '{account.key}'.")
 
     full_caption = _compose_caption(draft)
     client = http or _requests()
+
+    if getattr(draft, "is_story", False):
+        if account.platform == Platform.INSTAGRAM:
+            return _publish_instagram_story(client, account, draft, token)
+        if account.platform == Platform.FACEBOOK_PAGE:
+            return _publish_fb_page_story(client, account, draft, token)
+        raise NotSupported(f"Stories are not supported on platform: {account.platform}")
 
     if account.platform == Platform.INSTAGRAM:
         return _publish_instagram(client, account, draft, full_caption, token)
@@ -230,6 +243,73 @@ def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
     )
     _raise_for_status(r2)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
+
+
+def _publish_instagram_story(client, account, draft, token):
+    """
+    IG Story: create a STORIES container (image_url or video_url, no caption), then
+    publish it. DORMANT until BOTH the publish flag and the stories flag are armed:
+    publish() short-circuits upstream before this is ever reached.
+    """
+    ig_id = account.get_target_id()
+    if not ig_id:
+        raise PublishError(f"No IG user id for '{account.key}'.")
+    if not draft.creative_public_url:
+        raise PublishError(
+            "An Instagram Story needs a PUBLIC media URL. This creative has none. "
+            "Host it first. See AGENT_README.md."
+        )
+    base = config.GRAPH_API_BASE
+    media_param = "video_url" if _is_video(draft.creative_public_url) else "image_url"
+    r1 = client.post(
+        f"{base}/{ig_id}/media",
+        data={"media_type": "STORIES", media_param: draft.creative_public_url,
+              "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r1)
+    container_id = r1.json().get("id")
+    r2 = client.post(
+        f"{base}/{ig_id}/media_publish",
+        data={"creation_id": container_id, "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r2)
+    return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
+
+
+def _publish_fb_page_story(client, account, draft, token):
+    """
+    FB Page photo Story: upload the photo unpublished, then attach it to
+    /photo_stories. DORMANT until BOTH the publish flag and the stories flag are
+    armed: publish() short-circuits upstream before this is ever reached.
+    """
+    page_id = account.get_target_id()
+    if not page_id:
+        raise PublishError(f"No Page id for '{account.key}'.")
+    if not draft.creative_public_url:
+        raise PublishError(
+            "A Facebook Page Story needs a PUBLIC media URL. This creative has none. "
+            "Host it first. See AGENT_README.md."
+        )
+    base = config.GRAPH_API_BASE
+    r1 = client.post(
+        f"{base}/{page_id}/photos",
+        data={"url": draft.creative_public_url, "published": "false",
+              "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r1)
+    photo_id = r1.json().get("id")
+    r2 = client.post(
+        f"{base}/{page_id}/photo_stories",
+        data={"photo_id": photo_id, "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r2)
+    body = r2.json()
+    return PublishResult(ok=True, mode="published",
+                         media_id=body.get("post_id") or body.get("id", ""))
 
 
 def _publish_fb_page(client, account, draft, caption, token):

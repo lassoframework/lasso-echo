@@ -27,7 +27,8 @@ class ConsolePoster:
         if draft.status.value == "blocked":
             print(f"  [BLOCKED] {draft.account_key}: {draft.blocked_reason}")
             return {"ok": True}
-        print(f"  APPROVAL CARD  ->  #echoclaude")
+        kind = "STORY APPROVAL CARD" if getattr(draft, "is_story", False) else "APPROVAL CARD"
+        print(f"  {kind}  ->  #echoclaude")
         print(f"  Account   : {draft.account_key} ({draft.platform})")
         print(f"  Scheduled : {draft.scheduled_for}")
         print(f"  Creative  : {draft.creative_public_url or draft.creative_path}")
@@ -65,6 +66,9 @@ def _status():
     print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
     print(f"  comments       : {config.comments_enabled()}  (env AGENT_COMMENTS_ENABLED)")
     print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
+    print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
+    print(f"  caption_seo    : {config.caption_seo_enabled()}  (env AGENT_CAPTION_SEO_ENABLED)")
+    print(f"  platform_var   : {config.platform_variants_enabled()}  (env AGENT_PLATFORM_VARIANTS_ENABLED)")
     # posting schedule (2026 cadence)
     print("  -- posting schedule --")
     print(f"  primary time   : {config.POSTING_PRIMARY_TIME}")

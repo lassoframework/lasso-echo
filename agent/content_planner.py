@@ -43,6 +43,55 @@ from . import config
 # Growth-hint CTAs sort first: they drive the save/send/reach signals that grow reach.
 GROWTH_CTA_HINTS = ("save", "send", "tag", "share", "dm")
 
+# Caption SEO (2026): words too generic to count as a topic term. Topic terms are
+# derived ONLY from the approved hook; nothing is invented.
+_SEO_STOPWORDS = {
+    "the", "and", "that", "this", "with", "your", "you", "for", "are", "our",
+    "not", "but", "one", "who", "what", "when", "where", "how", "why", "them",
+    "they", "their", "there", "then", "than", "into", "from", "have", "has",
+    "was", "were", "will", "would", "can", "could", "should", "about", "every",
+    "more", "most", "some", "any", "all", "just", "like", "get", "gets", "got",
+    "make", "makes", "made", "own", "out", "off", "over", "under", "after",
+    "before", "while", "still", "only", "even", "also", "very", "much",
+}
+
+
+def _topic_terms(hook):
+    """The hook's key topic terms: its significant words (4+ letters, not a stopword),
+    lowercased. Derived from APPROVED text only; nothing is invented."""
+    words = re.findall(r"[A-Za-z]+", (hook or "").lower())
+    return [w for w in words if len(w) >= 4 and w not in _SEO_STOPWORDS]
+
+
+def seo_order_bodies(hook, bodies):
+    """
+    Caption SEO placement (flag-gated, default OFF -> input order unchanged).
+
+    Goal: a body line carrying the hook's key topic terms sits FIRST after the hook,
+    so the topic phrase lands in the caption's opening. This function only REORDERS
+    the approved lines it is given; it never rewrites, drops, or adds a line. If the
+    first body already carries a topic term, or no body does, the original order is
+    kept (never invent to satisfy placement).
+    """
+    bodies = list(bodies)
+    if not config.caption_seo_enabled():
+        return bodies
+    terms = _topic_terms(hook)
+    if not terms or not bodies:
+        return bodies
+
+    def _hits(line):
+        low = line.lower()
+        return any(t in low for t in terms)
+
+    if _hits(bodies[0]):
+        return bodies  # placement already satisfied
+    for i, line in enumerate(bodies):
+        if _hits(line):
+            # stable move-to-front: the matching line leads, the rest keep order
+            return [line] + bodies[:i] + bodies[i + 1:]
+    return bodies  # nothing matches: keep the original order, never invent
+
 
 @dataclass
 class SourceDoc:
@@ -211,7 +260,10 @@ def plan_for(day_key, path=None):
     cta = pick_cta(doc, seed=f"{day_key}|{pillar}")
 
     hook_line = hooks[_day_seq(day_key) % len(hooks)] if hooks else None
-    body_lines = list(bodies)
+    # Caption SEO (flag OFF -> order unchanged): the caption stays front-loaded with
+    # the hook as the first line, and a body line carrying the hook's topic terms is
+    # moved first among the bodies. Reorder of approved lines only; nothing new.
+    body_lines = seo_order_bodies(hook_line or "", bodies)
 
     # IG/FB caption: hook + body + verbatim CTA text (hashtags carried separately).
     caption_lines = ([hook_line] if hook_line else []) + body_lines + ([cta] if cta else [])

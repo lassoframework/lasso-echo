@@ -79,19 +79,26 @@ def _scrub_dashes(text):
     return re.sub(r"[ \t]{2,}", " ", cleaned)
 
 
-def build_prompt(headline, facts):
+def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
     """
     Build the image prompt from APPROVED input only. The single on-image headline is
     the approved pillar hook (kept short); the approved body lines are passed as CONCEPT
     CONTEXT for the focal graphic and are NOT rendered as text on the image (the caption
     carries the words). Plus the brand palette, composition style, and no-dash rule.
     Dashes in the approved text are scrubbed. Nothing is invented.
+
+    Aspect is PER USE, not a global switch: the defaults are the feed target
+    (config.IMAGE_ASPECT / IMAGE_PIXELS, 4:5); a caller like Stories passes its own
+    aspect (9:16) and surface label without changing the feed's target.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
-    # Aspect first and prominent: IG/FB feed posts are 4:5 portrait. Config-tunable.
+    # Aspect first and prominent. Config-tunable; per-use overridable.
+    use_aspect = aspect or config.IMAGE_ASPECT
+    use_pixels = pixels or config.IMAGE_PIXELS
+    use_surface = surface or "feed post"
     aspect = (
-        f"Canvas: a VERTICAL {config.IMAGE_ASPECT} PORTRAIT ({config.IMAGE_PIXELS}, taller "
-        "than wide), designed for an Instagram and Facebook feed post. Fit the entire "
+        f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
+        f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the entire "
         "composition inside this tall portrait frame with generous margins; nothing is cut "
         "off at the edges."
     )
@@ -152,20 +159,24 @@ def _default_client():
     return _GeminiImageClient(key)
 
 
-def generate(headline, facts, client=None, out_path=None):
+def generate(headline, facts, client=None, out_path=None,
+             aspect=None, pixels=None, surface=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
       - the flag is OFF (creative_studio_enabled() is False) -> None, no API call
       - facts is empty (the no-fabrication gate)             -> None, no API call
       - no client and no key available                       -> None, no API call
+
+    aspect/pixels/surface are per-use overrides (see build_prompt): the feed keeps
+    its 4:5 default; a Story passes 9:16 for its own call only.
     """
     if not config.creative_studio_enabled():
         return None
     if not facts:
         return None
 
-    prompt = build_prompt(headline, facts)
+    prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels, surface=surface)
 
     client = client or _default_client()
     if client is None:

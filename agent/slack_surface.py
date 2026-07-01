@@ -56,7 +56,8 @@ class SlackPoster:
 
 
 def _fallback_text(draft):
-    return f"Approval needed: {draft.account_key} post {draft.draft_id}"
+    kind = "STORY" if getattr(draft, "is_story", False) else "post"
+    return f"Approval needed: {draft.account_key} {kind} {draft.draft_id}"
 
 
 def _is_hosted_image(url):
@@ -107,6 +108,7 @@ def build_card_blocks(draft):
     tags = " ".join(draft.hashtags)
     caption_preview = draft.caption if draft.caption else "(empty caption)"
 
+    is_story = getattr(draft, "is_story", False)
     slides = getattr(draft, "slides", None) or []
     if slides:
         names = ", ".join(os.path.basename(s) for s in slides)
@@ -116,10 +118,15 @@ def build_card_blocks(draft):
         creative_ref = f"Reel — {fname}"
     else:
         creative_ref = draft.creative_public_url or draft.creative_path or "(no creative)"
+    if is_story:
+        # Label a Story loudly so it can never be confused with a feed post.
+        creative_ref = "STORY (9:16 vertical)\n" + creative_ref
 
+    header = (f"Approve STORY: {draft.account_key}" if is_story
+              else f"Approve post — {draft.account_key}")
     return [
         {"type": "header",
-         "text": {"type": "plain_text", "text": f"Approve post — {draft.account_key}"}},
+         "text": {"type": "plain_text", "text": header}},
         {"type": "section", "fields": [
             {"type": "mrkdwn", "text": f"*Account:*\n{draft.account_key} ({draft.platform})"},
             {"type": "mrkdwn", "text": f"*Scheduled:*\n{draft.scheduled_for}"},

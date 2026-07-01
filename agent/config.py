@@ -63,6 +63,10 @@ NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
 # so the target can change without a code edit.
 IMAGE_ASPECT = os.environ.get("AGENT_IMAGE_ASPECT", "4:5")
 IMAGE_PIXELS = os.environ.get("AGENT_IMAGE_PIXELS", "1080x1350")
+# Stories aspect: 9:16 vertical (1080x1920). Per-use, NOT a global switch: the feed
+# keeps IMAGE_ASPECT and a Story requests STORY_ASPECT for its own generation call.
+STORY_ASPECT = os.environ.get("AGENT_STORY_ASPECT", "9:16")
+STORY_PIXELS = os.environ.get("AGENT_STORY_PIXELS", "1080x1920")
 
 # ---- Media hosting (S3-compatible; scale-hardened for 200+ clients) ----------
 # OFF by default. Credentials are read lazily in media_host.py by the env var NAMES
@@ -159,6 +163,39 @@ def comments_enabled() -> bool:
     are drafted and HELD for human approval; a first-contact DM is always surfaced.
     """
     return _truthy(os.environ.get("AGENT_COMMENTS_ENABLED", "false"))
+
+
+def stories_enabled() -> bool:
+    """
+    Instagram/Facebook Stories switch. OFF by default = FULLY DORMANT: no Story
+    drafts are generated at all. ON, Echo drafts one 9:16 Story per account per day
+    reusing the day's approved creative; every Story draft is PENDING and held for
+    approval. Publishing a Story additionally requires AGENT_PUBLISH_ENABLED (both
+    gates must be armed); with this flag OFF, publish() returns would_publish and
+    makes NO network call even when the publish flag is armed.
+    """
+    return _truthy(os.environ.get("AGENT_STORIES_ENABLED", "false"))
+
+
+def caption_seo_enabled() -> bool:
+    """
+    2026 caption SEO switch for the content brain. OFF by default = captions are
+    assembled exactly as today. ON, the planner may REORDER the approved body lines
+    so a line carrying the hook's key topic terms sits first after the hook. It only
+    reorders or selects among APPROVED lines; it never writes new text. If no
+    reorder satisfies placement, the original order is kept.
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_SEO_ENABLED", "false"))
+
+
+def platform_variants_enabled() -> bool:
+    """
+    Per-platform caption variant switch. OFF by default = one identical caption and
+    hashtag set for every platform, exactly as today. ON, Instagram keeps up to 5
+    approved hashtags and a Facebook Page keeps at most 2 (placed at the end, which
+    is where the composer already puts them). Selection only; no new text.
+    """
+    return _truthy(os.environ.get("AGENT_PLATFORM_VARIANTS_ENABLED", "false"))
 
 
 def doc_intake_enabled() -> bool:

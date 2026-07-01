@@ -19,6 +19,7 @@ from .drafter import draft_post
 from .library import pick_next
 from .postlog import used_creatives_for
 from .slack_surface import SlackPoster
+from .stories import build_story_draft
 from .voice import load_voice
 
 
@@ -71,5 +72,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         if draft.status.value != "blocked":
             store.put(draft)
         results.append(draft)
+
+        # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one
+        # 9:16 Story per account reusing the day's creative; PENDING, its own
+        # approval card, clearly labeled STORY. Nothing publishes here.
+        story = build_story_draft(account, day_key, feed_draft=draft)
+        if story is not None:
+            poster.post_approval_card(story)
+            store.put(story)
+            results.append(story)
 
     return {"status": "drafted", "drafts": results}

@@ -50,6 +50,9 @@ class Draft:
     cta_type: str = ""
     cta_url: str = ""
     topic_type: str = "STANDARD"
+    # Stories: True for a 9:16 Story draft so the card and the publisher can never
+    # confuse it with a feed post. Feed drafts leave this False.
+    is_story: bool = False
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -117,6 +120,28 @@ def _select_hashtags(voice, creative):
     limit = TemplateGenerator.HASHTAG_LIMIT
     selected = brand + rotated[: max(0, limit - len(brand))]
     return selected[:limit]
+
+
+# Facebook best practice: at most 2 hashtags, at the end of the caption (the
+# composer already appends hashtags at the end, so placement is preserved).
+FB_HASHTAG_LIMIT = 2
+
+
+def variant_hashtags(platform, hashtags):
+    """
+    Per-platform hashtag selection (Task: platform variants). SELECTION ONLY, never
+    new text: every returned tag is one of the approved tags passed in.
+
+    Flag OFF (default) -> the list is returned unchanged, exactly today's behavior.
+    Flag ON  -> Instagram keeps up to 5 (the existing cap); a Facebook Page keeps
+    at most FB_HASHTAG_LIMIT (2).
+    """
+    tags = list(hashtags or [])
+    if not config.platform_variants_enabled():
+        return tags
+    if platform == Platform.FACEBOOK_PAGE:
+        return tags[:FB_HASHTAG_LIMIT]
+    return tags[:TemplateGenerator.HASHTAG_LIMIT]
 
 
 class TemplateGenerator:
@@ -226,6 +251,10 @@ def draft_post(account, creative, scheduled_for, voice=None,
             caption, hashtags, fragments = plan["caption"], plan["hashtags"], plan["fragments"]
     else:
         caption, hashtags, fragments = gen.build(voice, creative)
+
+    # Per-platform variant (flag OFF -> unchanged): selection only, from the same
+    # approved set. FB keeps at most 2 tags; IG keeps its existing cap of 5.
+    hashtags = variant_hashtags(account.platform, hashtags)
 
     creative_public_url = getattr(creative, "public_url", "")
     slides = list(getattr(creative, "slides", []) or [])
