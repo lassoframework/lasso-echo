@@ -214,8 +214,12 @@ trust is earned per account.
 ### Caption structure (every post)
 
 Hook line (one sentence, bold claim or stat). Then 2 to 4 short body lines.
-Then one CTA line from the approved rotation below. Then hashtags on a new line.
-Never more than 150 words total. Never dense paragraphs.
+Then one CTA line from the approved rotation below. Prefer CTAs that prompt save, share, tag, or send. Then hashtags on a new line.
+Never more than 150 words total. Never dense paragraphs. Keep captions under 500 characters.
+
+Caption SEO: write the words a gym owner would actually search into the caption
+(gym marketing, gym leads, gym owner, show rate, close rate). In 2026 Instagram
+reads caption language like search copy, and keywords beat hashtags for discovery.
 
 ### CTA rotation (cycle in order, one per post)
 Echo appends exactly one CTA to every caption. Rotate through this list in order,
@@ -223,18 +227,20 @@ restarting from the top after the last one.
 
 1. Book a free call and we will look at your numbers. Link in bio.
 2. Take the 2 minute quiz and find out where your gym is leaking revenue. Link in bio.
-3. DM us the word GROW and we will send you the full funnel diagnostic.
+3. Send this to a gym owner who needs it.
 4. Follow for daily gym growth systems from owners doing the work.
 5. Save this post. Come back when your close rate stalls.
 
-### Approved hashtag set (use 8 to 11 per post, always include the brand tier)
-Brand tier (always include all 3):
-#LASSOFramework #GymMarketingMadeSimple #LASSOPinnacle
+### Hashtag strategy (3 to 5 per post)
 
-Niche tier (pick 3 to 4 per post, rotate):
-#BoutiqueGym #GymOwner #FitnessBusinessOwner #GymMarketing #FitnessBusiness
-#GymGrowth #BoutiqueGymOwner #FitnessMarketing
+In 2026 hashtags are a minor topic signal, not a discovery channel, and they do
+not drive follows. Three to five relevant tags is enough. More does not help.
+Discovery comes from caption SEO, format, and shares, not from tag count.
 
-Topic tier (pick 2 to 3 per post, match the card topic):
-#SpeedToLead #LeadConversion #SalesSystem #GymLeads #MetaAds #FacebookAds
-#GymSales #CloseRate #MemberRetention #GymRevenue #FunnelDiagnostic
+- Brand (1 to 2): #LASSOFramework #GymMarketingMadeSimple #LASSOPinnacle
+- Niche (2 to 3, rotate): #GymMarketing #FitnessBusiness #GymOwnerTips #GymGrowth
+  #FitnessBusinessGrowth #GymOwnerLife #GymOwners #FitnessMarketing
+- Topic (match content): #GymSales #LeadGeneration #PaidMarketing
+  #StoryBrand #LeadNurture #MemberRetention #GrowYourGym
+
+Echo only uses hashtags listed here. It does not invent new ones.
