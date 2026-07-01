@@ -40,18 +40,22 @@ BRAND_PALETTE = (
     "supporting icons and lines, and red is reserved for one single focal accent."
 )
 
-# Composition: clean, minimal, premium. ONE focal graphic, headline-only text — the
-# recent outputs were too busy, so this steers hard toward calm negative space.
+# Composition: a LOCKED house style (consistent every card so the run reads as one brand
+# system) while the illustrated SUBJECT varies by pillar. No forced monitor/dashboard.
 COMPOSITION_STYLE = (
-    "Composition: a single, calm, uncluttered layout with generous negative space and "
-    "very few elements. Center the design on ONE clean focal graphic (for example a "
-    "single monitor or dashboard, or a simple left to right flow), NOT a dense collage "
-    "of many icons and boxes. Render ONLY the one short headline as text on the image; "
-    "do NOT put body sentences, paragraphs, or the caption on the image. Use at most "
-    "simple one or two word labels; prefer clean icons and clear whitespace over dense "
-    "text or many small graphics. Overall feel: minimal, modern, high end, "
-    "brand-consistent, and easy to read at a glance. Think one clean diagram, not a busy "
-    "poster."
+    "House style (keep this CONSISTENT on every card so the whole run reads as one brand "
+    "system): a clean, minimal, modern FLAT infographic with generous negative space, "
+    "uncluttered and premium. Use an icon-driven left to right (or otherwise simple) flow "
+    "with a few clear, labeled icons in a simple line-and-icon illustration style, a "
+    "consistent stroke weight, and the brand palette throughout.\n"
+    "Subject varies by pillar: choose simple icons that FIT this card's topic and message. "
+    "Do NOT default to a computer, monitor, or dashboard every time; pick the everyday "
+    "objects relevant to the subject, rendered in the SAME clean house style and palette. "
+    "Avoid a dense collage of many icons and boxes.\n"
+    "Text: render ONLY the one short headline as text on the image; do NOT put body "
+    "sentences, paragraphs, or the caption on the image. Labels on icons are one or two "
+    "words at most. Overall feel: minimal, modern, high end, brand-consistent, easy to "
+    "read at a glance. Think one clean diagram, not a busy poster."
 )
 
 # Copy mechanics from the brand bible: rendered copy carries no dashes.

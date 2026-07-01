@@ -148,18 +148,23 @@ def test_gemini_client_raises_when_no_inline_image_part():
         client.generate_image("a prompt", "gemini-3-pro-image")
 
 
-# ---- the image prompt is clean/minimal, headline-only, palette retained ------
-def test_prompt_is_clean_minimal_and_headline_only():
+# ---- consistent house style, subject varies by pillar, headline-only, palette kept --
+def test_prompt_locks_house_style_and_varies_subject():
     headline = "Every lead, every post, every result. One screen."
     body = "Your leads, content, and reporting live in one place."
     p = creative_studio.build_prompt(headline, [body])
     low = p.lower()
 
-    # clean / minimal composition steer
+    # a locked, consistent house look
+    assert "house style" in low
     assert "minimal" in low
-    assert "one clean focal graphic" in low
+    assert "icon-driven left to right" in low
+    assert "consistent stroke weight" in low
     assert "negative space" in low
     assert "not a busy poster" in low
+    # the SUBJECT varies by pillar; do NOT force a monitor/dashboard every time
+    assert "subject varies by pillar" in low
+    assert "do not default to a computer, monitor, or dashboard" in low
     # only the headline is rendered; body lines are context, not on-image text
     assert "only text to render on the image" in low
     assert "do not render this text on the image" in low
