@@ -4,6 +4,9 @@ __pycache__/
 post_log.jsonl
 .pytest_cache/
 content_library/*
+!content_library/*.png
+!content_library/*.jpg
+!content_library/*.json
 !content_library/.gitkeep
 !content_library/README.md
 brand_voice/*
