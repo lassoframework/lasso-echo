@@ -210,18 +210,20 @@ def plan_for(day_key, path=None):
 
     cta = pick_cta(doc, seed=f"{day_key}|{pillar}")
 
-    lines = []
-    if hooks:
-        lines.append(hooks[_day_seq(day_key) % len(hooks)])  # verbatim hook
-    lines.extend(bodies)                                     # verbatim body lines
-    if cta:
-        lines.append(cta)                                    # verbatim CTA
+    hook_line = hooks[_day_seq(day_key) % len(hooks)] if hooks else None
+    body_lines = list(bodies)
 
-    caption = "\n\n".join(lines).strip()
+    # IG/FB caption: hook + body + verbatim CTA text (hashtags carried separately).
+    caption_lines = ([hook_line] if hook_line else []) + body_lines + ([cta] if cta else [])
+    # GBP summary: hook + body ONLY — no inline CTA text (it becomes a button), no hashtags.
+    summary_lines = ([hook_line] if hook_line else []) + body_lines
+
     return {
         "pillar": pillar,
-        "caption": caption,
+        "caption": "\n\n".join(caption_lines).strip(),
+        "summary": "\n\n".join(summary_lines).strip(),
         "cta": cta,
         "hashtags": list(doc.hashtags[:5]),
-        "fragments": list(lines),
+        "fragments": list(caption_lines),
+        "summary_fragments": list(summary_lines),
     }

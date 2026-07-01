@@ -19,6 +19,7 @@ class Platform:
     INSTAGRAM = "instagram"            # IG Business/Creator via Instagram Graph API
     FACEBOOK_PAGE = "facebook_page"    # a Facebook Page
     PERSONAL = "personal"              # see README: Graph API cannot post to a personal FB profile
+    GOOGLE_BUSINESS = "google_business"  # Google Business Profile local posts (own draft-only branch)
 
 
 @dataclass

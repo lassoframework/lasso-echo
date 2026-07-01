@@ -39,6 +39,9 @@ Last updated: 2026-07-01 (card preview + Creative Studio committed to origin/mai
 - [x] Media hosting shipped: S3-compatible, 200-client hardened (tenant-scoped, dedupe, retry), wired into drafts, flag OFF; stand up bucket + creds by hand to arm
 - [~] Content brain: drafts the daily post from the source doc (brand_voice/lasso_now.md)
       across the 5 pillars, growth CTA, 5 hashtags, no fabrication; flag AGENT_CONTENT_BRAIN_ENABLED OFF
+- [~] Google Business Profile posting branch (local posts): gbp_publisher, draft-only guard,
+      routing (GBP -> gbp_publisher, IG/FB -> meta_publisher), content-brain GBP variant
+      (trimmed summary, one image, CTA button, no hashtags); flag AGENT_GBP_ENABLED OFF. See BUILD_SPEC.md Addendum A
 - [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
 - [~] Run master ON / publish OFF, watch daily drafts
 - [ ] Run the full 30-day loop once (see the 30-day IG plan below)
@@ -92,6 +95,9 @@ The complete scope Echo grows into. Everything plugs onto the proven Stage 1 cor
   gated act-tools; per-gym memory; PreToolUse approval hooks; decision audit log; SB7 skills.
 - Platform + reporting: Supabase RLS + Clerk org isolation; idempotency; rate-limit-aware
   GHL + Meta clients; reporting on views not impressions; white-label dashboard + branded PDF.
+- Google Business Profile: first-class publishing channel (local posts) alongside IG + FB;
+  own draft-only branch, own post variant (one image, <=1500 chars, CTA button, no hashtags).
+  Full scope + access gate in BUILD_SPEC.md Addendum A.
 
 ---
 

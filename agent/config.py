@@ -54,6 +54,20 @@ S3_MAX_RETRIES = int(os.environ.get("AGENT_S3_MAX_RETRIES", "3"))
 S3_ACCESS_KEY_ID_ENV = "AGENT_S3_ACCESS_KEY_ID"          # name of the env var, not the value
 S3_SECRET_ACCESS_KEY_ENV = "AGENT_S3_SECRET_ACCESS_KEY"  # name of the env var, not the value
 
+# ---- Google Business Profile (local posts) -----------------------------------
+# OFF by default. Real writes ALSO require publish_enabled() (the publish flag governs
+# every real write). The access token is read lazily by NAME below, never logged.
+GBP_API_BASE = os.environ.get("AGENT_GBP_API_BASE", "https://mybusiness.googleapis.com/v4")
+GBP_ACCOUNT_ID = os.environ.get("AGENT_GBP_ACCOUNT_ID", "")
+GBP_LOCATION_ID = os.environ.get("AGENT_GBP_LOCATION_ID", "")
+GBP_TOKEN_ENV = "AGENT_GBP_ACCESS_TOKEN"  # name of the env var, not the value
+GBP_CTA_TYPES = ("LEARN_MORE", "BOOK", "ORDER", "SHOP", "SIGN_UP", "CALL")
+GBP_DEFAULT_CTA = os.environ.get("AGENT_GBP_DEFAULT_CTA", "LEARN_MORE")
+GBP_SUMMARY_LIMIT = 1500
+# The url the GBP call-to-action button points at (booking/site link). Empty -> no
+# button is attached (except CALL, which needs no url). Set by hand when armed.
+GBP_CTA_URL = os.environ.get("AGENT_GBP_CTA_URL", "")
+
 
 def _truthy(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -99,3 +113,12 @@ def content_brain_enabled() -> bool:
     missing doc or pillar BLOCKS the draft. Independent of publishing.
     """
     return _truthy(os.environ.get("AGENT_CONTENT_BRAIN_ENABLED", "false"))
+
+
+def gbp_enabled() -> bool:
+    """
+    Google Business Profile posting branch switch. OFF by default. When OFF (or when
+    the publish flag is OFF) gbp_publisher.publish() makes NO network call and returns
+    a would_publish result. Independent of the Meta path.
+    """
+    return _truthy(os.environ.get("AGENT_GBP_ENABLED", "false"))

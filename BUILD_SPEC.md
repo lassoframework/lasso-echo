@@ -155,3 +155,29 @@ Every act-tool is permission-scoped and tenant-scoped; an agent instance for gym
 - **AI tagging and moderation are imperfect** — keep the human-review layer; never auto-publish member content.
 - **Agent autonomy must be earned** — start gated, expand only with audit evidence and rubric-graded output; watch subagent sprawl for cost/memory.
 - **Vendor/tool references are illustrative** (DAM, moderation APIs, agent-memory frameworks such as Mem0/Letta/Zep); confirm current pricing and capabilities at build. The Claude Agent SDK's separate metered credit pool (effective June 15, 2026) should be factored into run-cost budgeting.
+
+## Addendum A — Google Business Profile posting channel (added July 2026)
+
+Google Business Profile (GBP) is a first-class publishing channel in Echo,
+alongside Instagram and Facebook. It matters for gyms because it is local-search
+visibility, where gym buyers actually look. It is embedded scope, not optional.
+
+API reality (verified July 2026): the Local Posts API is active and supports
+standard, event, offer, and recurring posts at multi-location scale
+(accounts/{id}/locations/{id}/localPosts). The Q&A API shut down November 2025.
+
+Post shape (its own variant, never a copy of the IG caption): one image only
+(jpg/png, no video, no carousel), up to 1500 characters, a structured CTA button
+(LEARN_MORE, BOOK, ORDER, SHOP, SIGN_UP, CALL; all except CALL need a url), no
+hashtags.
+
+Access gate (client-onboarding long pole, start early): Google approval needs a
+Cloud project, a verified profile 60+ days old, a business website, and a use-case
+review, typically days to weeks; then OAuth 2.0 per location. Quota ~300 QPM.
+
+Plugs into Echo: agent/gbp_publisher.py branch, draft-only guard, flag
+AGENT_GBP_ENABLED default OFF, tokens by hand. The content brain writes a GBP
+variant from the approved source doc only (no fabrication). Routing sends GBP to
+gbp_publisher, IG/FB to meta_publisher. At 200-client scale, multi-location is
+native; per-client OAuth tokens by hand; reviews via the Reviews API are a future
+add under the Tier 2 human-approval comment policy.

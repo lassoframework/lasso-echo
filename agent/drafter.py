@@ -18,6 +18,7 @@ from enum import Enum
 from . import config
 from . import content_planner
 from . import media_host
+from .accounts import Platform
 from .voice import load_voice
 
 
@@ -45,6 +46,10 @@ class Draft:
     # carousel support: local slide paths + their public URLs (empty for singles)
     slides: list = field(default_factory=list)
     slide_urls: list = field(default_factory=list)
+    # Google Business Profile only: structured CTA button + post topic (Meta paths ignore).
+    cta_type: str = ""
+    cta_url: str = ""
+    topic_type: str = "STANDARD"
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -192,6 +197,9 @@ def draft_post(account, creative, scheduled_for, voice=None,
 
     gen = generator or TemplateGenerator()
 
+    cta_type = cta_url = ""
+    topic_type = "STANDARD"
+
     # Daily content brain: for a LASSO account with the brain armed, compose the
     # caption ONLY from the approved source doc (never the per-creative note, never
     # invented text). A blocked plan blocks the draft. Off / non-LASSO -> unchanged.
@@ -210,7 +218,12 @@ def draft_post(account, creative, scheduled_for, voice=None,
                 status=DraftStatus.BLOCKED,
                 blocked_reason="Content brain: " + plan["reason"],
             )
-        caption, hashtags, fragments = plan["caption"], plan["hashtags"], plan["fragments"]
+        if account.platform == Platform.GOOGLE_BUSINESS:
+            # GBP variant: trimmed summary, NO hashtags, a structured CTA button + url.
+            caption, hashtags, fragments = plan["summary"], [], plan["summary_fragments"]
+            cta_type, cta_url = config.GBP_DEFAULT_CTA, config.GBP_CTA_URL
+        else:
+            caption, hashtags, fragments = plan["caption"], plan["hashtags"], plan["fragments"]
     else:
         caption, hashtags, fragments = gen.build(voice, creative)
 
@@ -243,4 +256,7 @@ def draft_post(account, creative, scheduled_for, voice=None,
         source_fragments=fragments,
         slides=slides,
         slide_urls=slide_urls,
+        cta_type=cta_type,
+        cta_url=cta_url,
+        topic_type=topic_type,
     )
