@@ -14,6 +14,7 @@ import json
 import os
 
 from . import config
+from .meta_publisher import _is_video
 
 
 def _requests():
@@ -74,6 +75,9 @@ def build_card_blocks(draft):
     if slides:
         names = ", ".join(os.path.basename(s) for s in slides)
         creative_ref = f"Carousel — {len(slides)} slides\n{names}"
+    elif _is_video(draft.creative_public_url) or _is_video(draft.creative_path):
+        fname = os.path.basename(draft.creative_path or draft.creative_public_url)
+        creative_ref = f"Reel — {fname}"
     else:
         creative_ref = draft.creative_public_url or draft.creative_path or "(no creative)"
 

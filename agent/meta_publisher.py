@@ -15,10 +15,19 @@ Honest limits (documented in AGENT_README.md):
     In draft-only mode this never triggers; it only matters once publish is armed.
 """
 
+import time
 from dataclasses import dataclass
 
 from . import config
 from .accounts import Platform
+
+
+def _is_video(url):
+    """True if the path/URL ends in a video extension (.mp4/.mov), case-insensitive.
+
+    Accepts None/empty and returns False. Used to route a video creative to the
+    Reels flow (and to label it in the Slack card)."""
+    return bool(url) and str(url).lower().endswith((".mp4", ".mov"))
 
 
 class PublishError(Exception):
@@ -88,6 +97,9 @@ def _publish_instagram(client, account, draft, caption, token):
     # Carousel: 2+ public slide URLs -> multi-child container flow.
     if len(getattr(draft, "slide_urls", []) or []) >= 2:
         return _publish_instagram_carousel(client, ig_id, draft, caption, token)
+    # Reel: a video creative -> REELS container flow (dormant in draft-only).
+    if _is_video(draft.creative_public_url) or _is_video(draft.creative_path):
+        return _publish_instagram_reel(client, account, draft, caption, token, ig_id)
     if not draft.creative_public_url:
         raise PublishError(
             "Instagram needs a PUBLIC media URL. This creative has none. "
@@ -144,6 +156,76 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
     r2 = client.post(
         f"{base}/{ig_id}/media_publish",
         data={"creation_id": parent_id, "access_token": token},
+        timeout=30,
+    )
+    _raise_for_status(r2)
+    return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
+
+
+REEL_POLL_MAX_TRIES = 20
+REEL_POLL_INTERVAL_SEC = 3
+
+
+def _await_reel_container(client, base, container_id, token,
+                          *, max_tries=REEL_POLL_MAX_TRIES,
+                          interval=REEL_POLL_INTERVAL_SEC, sleep=time.sleep):
+    """
+    Poll a REELS container's status_code until FINISHED. Raise on ERROR or if it
+    never finishes within the bounded retries. `sleep` is injectable so a test
+    never actually waits. Only runs once publishing is armed (guarded upstream).
+    """
+    for _ in range(max_tries):
+        r = client.get(
+            f"{base}/{container_id}",
+            params={"fields": "status_code", "access_token": token},
+            timeout=30,
+        )
+        _raise_for_status(r)
+        status = (r.json() or {}).get("status_code")
+        if status == "FINISHED":
+            return
+        if status == "ERROR":
+            raise PublishError(f"Reel container {container_id} processing failed (status ERROR).")
+        sleep(interval)
+    raise PublishError(
+        f"Reel container {container_id} not FINISHED after {max_tries} tries."
+    )
+
+
+def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
+    """
+    IG Reel: create a REELS container (video_url + share_to_feed=true), poll the
+    container's status_code until FINISHED, then publish it.
+
+    DORMANT in draft-only mode: publish() short-circuits before we ever get here
+    while the publish flag is OFF. This path only runs once Blake arms publishing.
+    """
+    if not draft.creative_public_url:
+        raise PublishError(
+            "Instagram Reels need a PUBLIC video URL. This creative has none. "
+            "Host it and set public_url in its sidecar. See AGENT_README.md."
+        )
+    base = config.GRAPH_API_BASE
+    # step 1: create the REELS container
+    r1 = client.post(
+        f"{base}/{ig_id}/media",
+        data={
+            "media_type": "REELS",
+            "video_url": draft.creative_public_url,
+            "caption": caption,
+            "share_to_feed": "true",
+            "access_token": token,
+        },
+        timeout=30,
+    )
+    _raise_for_status(r1)
+    container_id = r1.json().get("id")
+    # step 2: a Reel's video is processed asynchronously; wait for FINISHED.
+    _await_reel_container(client, base, container_id, token)
+    # step 3: publish the processed container
+    r2 = client.post(
+        f"{base}/{ig_id}/media_publish",
+        data={"creation_id": container_id, "access_token": token},
         timeout=30,
     )
     _raise_for_status(r2)
