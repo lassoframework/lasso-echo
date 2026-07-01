@@ -39,6 +39,17 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
 NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
 
+# ---- Media hosting (S3-compatible; scale-hardened for 200+ clients) ----------
+# OFF by default. Credentials are read lazily in media_host.py by the env var NAMES
+# below, never stored here and never logged. Only NAMES live here, not values.
+S3_ENDPOINT = os.environ.get("AGENT_S3_ENDPOINT", "")
+S3_BUCKET = os.environ.get("AGENT_S3_BUCKET", "")
+S3_REGION = os.environ.get("AGENT_S3_REGION", "")
+S3_PUBLIC_BASE_URL = os.environ.get("AGENT_S3_PUBLIC_BASE_URL", "")
+S3_MAX_RETRIES = int(os.environ.get("AGENT_S3_MAX_RETRIES", "3"))
+S3_ACCESS_KEY_ID_ENV = "AGENT_S3_ACCESS_KEY_ID"          # name of the env var, not the value
+S3_SECRET_ACCESS_KEY_ENV = "AGENT_S3_SECRET_ACCESS_KEY"  # name of the env var, not the value
+
 
 def _truthy(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -65,3 +76,12 @@ def creative_studio_enabled() -> bool:
     controls whether Echo draws an infographic, never whether it posts.
     """
     return _truthy(os.environ.get("AGENT_NANO_ENABLED", "false"))
+
+
+def hosting_enabled() -> bool:
+    """
+    S3-compatible media hosting switch. OFF by default. When OFF, host_media()
+    returns None and the draft build keeps its current behavior. Independent of
+    publishing; this only controls whether Echo uploads creatives for public URLs.
+    """
+    return _truthy(os.environ.get("AGENT_HOSTING_ENABLED", "false"))

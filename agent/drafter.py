@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from . import config
+from . import media_host
 from .voice import load_voice
 
 
@@ -190,6 +191,22 @@ def draft_post(account, creative, scheduled_for, voice=None,
     gen = generator or TemplateGenerator()
     caption, hashtags, fragments = gen.build(voice, creative)
 
+    creative_public_url = getattr(creative, "public_url", "")
+    slides = list(getattr(creative, "slides", []) or [])
+    slide_urls = list(getattr(creative, "slide_urls", []) or [])
+
+    # Scale-harden: when hosting is armed, publish the local creative(s) to S3 and use
+    # the hosted URLs (tenant-scoped by account). OFF, or any failure, leaves the
+    # existing sidecar URLs untouched -> current behavior is unchanged.
+    if config.hosting_enabled():
+        hosted = media_host.host_media(creative.path, account.key)
+        if hosted:
+            creative_public_url = hosted
+        if slides:
+            hosted_slides = media_host.host_many(slides, account.key)
+            if hosted_slides:
+                slide_urls = hosted_slides
+
     return Draft(
         draft_id=draft_id,
         account_key=account.key,
@@ -197,10 +214,10 @@ def draft_post(account, creative, scheduled_for, voice=None,
         caption=caption,
         hashtags=hashtags,
         creative_path=creative.path,
-        creative_public_url=getattr(creative, "public_url", ""),
+        creative_public_url=creative_public_url,
         scheduled_for=scheduled_for,
         status=DraftStatus.PENDING,
         source_fragments=fragments,
-        slides=list(getattr(creative, "slides", []) or []),
-        slide_urls=list(getattr(creative, "slide_urls", []) or []),
+        slides=slides,
+        slide_urls=slide_urls,
     )
