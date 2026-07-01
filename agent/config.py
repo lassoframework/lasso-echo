@@ -155,3 +155,12 @@ def comments_enabled() -> bool:
     are drafted and HELD for human approval; a first-contact DM is always surfaced.
     """
     return _truthy(os.environ.get("AGENT_COMMENTS_ENABLED", "false"))
+
+
+def doc_intake_enabled() -> bool:
+    """
+    Document intake switch (Stage 2 seed). OFF by default. When OFF, process_document
+    returns None and reads nothing. A client PDF is raw material held for approval; it
+    is never treated as approved fact and nothing here publishes.
+    """
+    return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))

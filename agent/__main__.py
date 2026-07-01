@@ -1,9 +1,10 @@
 """
 CLI entrypoint.
 
-  python -m agent run-daily         # draft one post per account, post cards to Slack
-  python -m agent dry-run           # run the whole Stage 1 loop OFFLINE, no tokens
-  python -m agent status            # show flag + gate state
+  python -m agent run-daily             # draft one post per account, post cards to Slack
+  python -m agent dry-run               # run the whole Stage 1 loop OFFLINE, no tokens
+  python -m agent intake-doc <path>     # turn a client PDF into draft posts (held for approval)
+  python -m agent status                # show flag + gate state
 
 Approval actions are handled by your Slack listener calling
 agent.approvals.handle_action(...). A minimal manual hook is included for
@@ -63,6 +64,7 @@ def _status():
     print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
     print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
     print(f"  comments       : {config.comments_enabled()}  (env AGENT_COMMENTS_ENABLED)")
+    print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
     # posting schedule (2026 cadence)
     print("  -- posting schedule --")
     print(f"  primary time   : {config.POSTING_PRIMARY_TIME}")
@@ -109,6 +111,32 @@ def _dry_run():
     print("#" * 64 + "\n")
 
 
+def _intake_doc(args):
+    """python -m agent intake-doc <path> [--max N]: turn a client PDF into draft posts,
+    all held for approval. Nothing publishes; the PDF is raw material, not approved fact."""
+    path, max_posts, i = None, 7, 0
+    while i < len(args):
+        if args[i] == "--max" and i + 1 < len(args):
+            max_posts = int(args[i + 1]); i += 2; continue
+        if path is None and not args[i].startswith("--"):
+            path = args[i]
+        i += 1
+    if not path:
+        print("usage: python -m agent intake-doc <path> [--max N]")
+        return
+    from .doc_intake import process_document
+    drafts = process_document(path, max_posts=max_posts)
+    if drafts is None:
+        print("doc intake is OFF (set AGENT_DOC_INTAKE_ENABLED=true to arm it). Nothing done.")
+        return
+    pending = sum(1 for d in drafts if d.status.value != "blocked")
+    print(f"\nintake-doc: {len(drafts)} draft(s), {pending} pending, "
+          f"{len(drafts) - pending} blocked (all held for approval, nothing published)")
+    poster = ConsolePoster()
+    for d in drafts:
+        poster.post_approval_card(d)
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
@@ -120,6 +148,8 @@ def main(argv=None):
         run_listener()
     elif cmd == "dry-run":
         _dry_run()
+    elif cmd == "intake-doc":
+        _intake_doc(argv[1:])
     elif cmd == "status":
         _status()
     else:
