@@ -15,6 +15,10 @@ Link: https://lassoframework.com/summit
   revenue (podcast framing).
 
 ## PENDING BLAKE — not postable yet
+- Countdown: X weeks until Nashville. Seats are going. (moved from angles: the X
+  placeholder would render literally; needs a computed countdown before use)
+- Speaker spotlights: ONLY after Blake confirms the roster. (moved from angles:
+  this is an instruction, not a postable angle, until the roster is confirmed)
 - Ticket pricing, tiers, early bird deadline.
 - Exact registration CTA button wording beyond "claim your seat."
 - Full confirmed speaker roster and agenda. (Podcast mentioned Brian Alexander
@@ -33,5 +37,3 @@ Link: https://lassoframework.com/summit
 6. Who it is for: 100 serious operators. Not hobbyists.
 7. Networking: two days with 99 other serious operators. The room is the ROI.
 8. Urgency: 2026 is closing. Build your 2027 plan before your competitors do.
-9. Countdown: X weeks until Nashville. Seats are going.
-10. Speaker spotlights: ONLY after Blake confirms the roster.

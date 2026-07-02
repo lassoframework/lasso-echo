@@ -35,10 +35,23 @@ def _has_marker(line):
     return any(m in upper for m in _BLOCK_MARKERS)
 
 
+_ITEM_START_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s")
+
+
+def _is_continuation(line):
+    """An indented wrap of the previous list item (not a new item, not a heading)."""
+    return bool(line[:1].isspace() and line.strip()
+                and not _ITEM_START_RE.match(line) and not _HEADING_RE.match(line))
+
+
 def _usable_lines(text):
-    """The lines of one file that MAY be drafting sources, exclusions applied."""
+    """The lines of one file that MAY be drafting sources, exclusions applied.
+    A wrapped continuation line follows its parent's fate: if the marked line was
+    dropped, its indented continuations drop with it (no orphaned fragments of
+    LOCKED/PENDING content can survive the line gate)."""
     usable = []
-    skip_until_level = None  # inside a LOCKED/PENDING/NOT FOUND section
+    skip_until_level = None   # inside a LOCKED/PENDING/NOT FOUND section
+    prev_dropped = False      # the previous CONTENT line was a dropped marked line
     for line in (text or "").splitlines():
         m = _HEADING_RE.match(line)
         if m:
@@ -47,17 +60,36 @@ def _usable_lines(text):
                 skip_until_level = None  # the excluded section ended
             if _has_marker(line):
                 skip_until_level = len(m.group(1))
+                prev_dropped = False
                 continue
             if skip_until_level is not None:
                 continue
             usable.append(line)
+            prev_dropped = False
             continue
         if skip_until_level is not None:
             continue
         if _has_marker(line):
+            prev_dropped = True
             continue  # a single marked line is excluded
+        if prev_dropped and _is_continuation(line):
+            continue  # the wrap of a dropped line drops with it
+        if line.strip():
+            prev_dropped = False
         usable.append(line)
     return usable
+
+
+def join_items(lines):
+    """List items with their wrapped continuations joined into single strings.
+    Non-item content lines pass through one per line."""
+    items = []
+    for line in lines:
+        if _is_continuation(line) and items:
+            items[-1] = f"{items[-1]} {line.strip()}"
+        elif line.strip():
+            items.append(line.strip())
+    return items
 
 
 def _is_source_file(name):
@@ -105,8 +137,8 @@ def usable_stats(knowledge_dir=None):
     """
     stats = []
     for lines in load_corpus(knowledge_dir).values():
-        for line in lines:
-            m = _USE_RE.match(line)
+        for item in join_items(lines):
+            m = _USE_RE.match(item)
             if m:
                 stats.append(m.group(1))
     return stats

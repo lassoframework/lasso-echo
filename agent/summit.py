@@ -35,20 +35,27 @@ def load_campaign(knowledge_dir=None):
     except OSError:
         return [], []
 
-    facts, angles, current = [], [], None
+    # Split into blocks by heading, then join wrapped list items inside each block
+    # so a multi-line fact or angle is ONE string, wording intact across the wrap.
+    facts, angles, current, buf = [], [], None, []
+
+    def _flush():
+        if current is not None:
+            for item in knowledge.join_items(buf):
+                cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", item).strip()
+                if cleaned:
+                    current.append(cleaned)
+
     for line in lines:
         if re.match(r"^#{1,6}\s", line):
+            _flush()
+            buf = []
             upper = line.upper()
-            if "VERIFIED FACTS" in upper:
-                current = facts
-            elif "APPROVED ANGLES" in upper:
-                current = angles
-            else:
-                current = None
+            current = (facts if "VERIFIED FACTS" in upper
+                       else angles if "APPROVED ANGLES" in upper else None)
             continue
-        item = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-        if current is not None and item:
-            current.append(item)
+        buf.append(line)
+    _flush()
     return facts, angles
 
 
