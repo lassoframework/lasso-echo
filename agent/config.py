@@ -215,6 +215,15 @@ def doc_intake_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))
 
 
+def grade_enabled() -> bool:
+    """
+    Social Grade switch. OFF by default. ON, the reporting assembler adds a per
+    account letter grade (A to F) + subscores to the report payload. Honest grades:
+    a missing metric lowers nothing and fakes nothing; it is listed as a gap.
+    """
+    return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
+
+
 def intake_enabled() -> bool:
     """
     Texted-link intake switch (upload page + listener ingest). OFF by default: the

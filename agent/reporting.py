@@ -12,6 +12,8 @@ Two honesty rules mirror the rest of Echo:
 fetch_insights() is the only read path and returns None while the flag is OFF.
 """
 
+import os
+
 from . import config
 
 
@@ -153,3 +155,130 @@ def build_report(account_key, current, baseline, posts):
     }
     report["health"] = health_read(report)
     return report
+
+
+# =============================================================================
+# Social Grade v1 (flag AGENT_GRADE_ENABLED, default OFF). Rubric documented in
+# docs/SOCIAL_GRADE.md. HONEST GRADES: a missing input never fakes a score; the
+# subscore is None, listed in grade["gaps"], and simply does not vote.
+# =============================================================================
+
+def _letter(score):
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+def load_posting_baseline(account_key, month, base_dir=None):
+    """avg_posts_per_week from /data/baseline_<month>.json when present, else None.
+    The baseline file is written by `capture-baseline` (agent/baseline.py)."""
+    import json
+    base_dir = base_dir or os.environ.get("AGENT_BASELINE_DIR", "/data")
+    try:
+        with open(os.path.join(base_dir, f"baseline_{month}.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return (data.get("accounts", {}).get(account_key, {}) or {}).get("avg_posts_per_week")
+    except Exception:
+        return None
+
+
+def compute_grade(report, planned_posts=None, pillar_counts=None, proof_posts=None,
+                  baseline_month="2026-07", base_dir=None):
+    """
+    The per-account Social Grade: letter + subscores (each 0 to 100 or None).
+    Returns None while AGENT_GRADE_ENABLED is OFF. Subscores:
+      consistency: published vs planned posts
+      mix:         balance across content pillars (evenness of pillar_counts)
+      engagement:  engagement rate trend vs its baseline window
+      growth:      follower growth rate
+      proof:       verified social proof used in the window
+    """
+    if not config.grade_enabled():
+        return None
+
+    subs, gaps = {}, []
+
+    published = _num(report.get("posting_freq_current"))
+    if planned_posts and published is not None:
+        subs["consistency"] = round(min(1.0, published / planned_posts) * 100)
+    else:
+        subs["consistency"] = None
+        gaps.append("consistency (planned or published count missing)")
+
+    counts = [c for c in (pillar_counts or {}).values() if _num(c) is not None]
+    if counts and sum(counts) > 0:
+        if len(counts) == 1:
+            subs["mix"] = 40  # one pillar only: on-message but not a balanced mix
+        else:
+            subs["mix"] = round((min(counts) / max(counts)) * 100) if max(counts) else None
+    else:
+        subs["mix"] = None
+        gaps.append("mix (no pillar counts)")
+
+    er, erb = report.get("engagement_rate"), report.get("engagement_rate_baseline")
+    if er is not None and erb is not None:
+        if erb <= 0:
+            subs["engagement"] = 70 if er <= 0 else 90
+        else:
+            change = (er - erb) / erb
+            subs["engagement"] = 90 if change > 0.05 else 70 if change >= -0.05 else 40
+    else:
+        subs["engagement"] = None
+        gaps.append("engagement (rate or baseline missing)")
+
+    g = report.get("followers_growth_rate")
+    if g is not None:
+        subs["growth"] = 90 if g > 0.02 else 70 if g >= 0 else 40
+    else:
+        subs["growth"] = None
+        gaps.append("growth (follower data missing)")
+
+    if proof_posts is None:
+        subs["proof"] = None
+        gaps.append("proof (usage not tracked in window)")
+    else:
+        subs["proof"] = 100 if proof_posts >= 1 else 40
+
+    votes = [v for v in subs.values() if v is not None]
+    if not votes:
+        return {"letter": None, "score": None, "subscores": subs, "gaps": gaps,
+                "posting_freq_before": None, "posting_freq_after": published}
+
+    score = round(sum(votes) / len(votes))
+    before = load_posting_baseline(report.get("account_key", ""), baseline_month,
+                                   base_dir=base_dir)
+    if before is None:
+        gaps.append(f"baseline_{baseline_month}.json not present")
+    return {
+        "letter": _letter(score),
+        "score": score,
+        "subscores": subs,
+        "gaps": gaps,
+        # before/after posting frequency (before = pre-Echo baseline capture)
+        "posting_freq_before": before,
+        "posting_freq_after": published,
+    }
+
+
+def grade_summary_line(account_key, grade):
+    """The one-line Slack summary. Honest: gaps shown, absent subscores marked '-'."""
+    if not grade or grade.get("letter") is None:
+        return f"GRADE {account_key}: not enough data to grade honestly"
+    s = grade["subscores"]
+
+    def fmt(k):
+        return str(s[k]) if s.get(k) is not None else "-"
+
+    line = (f"GRADE {account_key}: {grade['letter']} ({grade['score']}) "
+            f"consistency {fmt('consistency')}, mix {fmt('mix')}, "
+            f"engagement {fmt('engagement')}, growth {fmt('growth')}, proof {fmt('proof')}")
+    if grade.get("posting_freq_before") is not None and grade.get("posting_freq_after") is not None:
+        line += (f" | posts/wk {grade['posting_freq_before']} before -> "
+                 f"{grade['posting_freq_after']} now")
+    return line
