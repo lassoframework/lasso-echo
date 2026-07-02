@@ -158,9 +158,10 @@ def test_cleared_claim_passes_gate_unit():
 def test_served_log_persists_across_restart(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     rotation.record_served("lasso_ig", "lasso_p1_story.jpg", "p1", "2026-07-06")
-    # a fresh process = a fresh read of the same /data file
-    raw = json.loads((tmp_path / "state" / "rotation_served.json").read_text())
-    assert raw["lasso_ig"][0]["key"] == "lasso_p1_story.jpg"
+    # a fresh process = a fresh read of the same /data sqlite db
+    assert (tmp_path / "echo_test.db").exists()          # persisted on the volume
+    fresh = rotation.load_served()
+    assert fresh["lasso_ig"][0]["key"] == "lasso_p1_story.jpg"
     lib = _lib(tmp_path, CLEAN)
     kind, creative = rotation.choose("lasso_ig", "2026-07-07", lib)
     assert os.path.basename(creative.path) != "lasso_p1_story.jpg"  # window enforced

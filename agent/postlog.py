@@ -34,6 +34,21 @@ def log_post(account_key, platform, caption, media_id, mode, draft_id,
     record = {k: v for k, v in record.items() if k in _FIELDS}
     with open(path or config.POST_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+    # STORAGE SWAP (Tier 2): the same record also lands in the posts table on
+    # /data (agent/db.py) so reporting can query it. The jsonl stays for compat.
+    try:
+        from . import db as _db
+        with _db.connect() as conn:
+            conn.execute(
+                "INSERT INTO posts (draft_id, account_key, platform, caption, "
+                "media_id, mode, published_at) VALUES (?,?,?,?,?,?,?)",
+                (record["draft_id"], record["account_key"], record["platform"],
+                 record["caption"], record["media_id"], record["mode"],
+                 record["published_at"]))
+            conn.commit()
+    except Exception as e:
+        print(f"[postlog] db mirror failed (jsonl still written): "
+              f"{type(e).__name__}: {e}")
     return record
 
 

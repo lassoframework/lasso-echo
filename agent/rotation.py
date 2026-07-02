@@ -46,36 +46,68 @@ _PILLAR_RE = re.compile(r"lasso_(p\d)_", re.IGNORECASE)
 _CLAIM_RE = re.compile(r"%|\bpercent\b|\$\s?\d|\b\d+(?:\.\d+)?\s*(?:x|times)\b", re.IGNORECASE)
 
 
-# ---- served log (persists on /data; in-memory fallback never crashes) ----------
-def _state_path():
+# ---- served log (SQLite on /data via agent/db.py; legacy json migrates once) ----
+def _legacy_state_path():
     return os.path.join(os.environ.get("AGENT_ROTATION_STATE_DIR", "/data"), _STATE_FILE)
 
 
+def _conn():
+    from . import db as _db
+    conn = _db.connect()
+    _db.migrate_legacy(conn, served_json=_legacy_state_path())
+    return conn
+
+
 def load_served():
+    """{account: [entries oldest..newest]} from the served table (same shape the
+    json store returned, so every caller is unchanged)."""
     try:
-        with open(_state_path(), encoding="utf-8") as fh:
-            return json.load(fh) or {}
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT account_key, key, pillar, date, archetype, set_name "
+                "FROM served ORDER BY date, id").fetchall()
     except Exception:
         return {}
+    served = {}
+    for r in rows:
+        served.setdefault(r["account_key"], []).append(
+            {"key": r["key"], "pillar": r["pillar"], "date": r["date"],
+             "archetype": r["archetype"], "set": r["set_name"]})
+    return served
 
 
 def save_served(served):
+    """Replace-all write (kept for the few callers that mutate the whole dict)."""
     try:
-        with open(_state_path(), "w", encoding="utf-8") as fh:
-            json.dump(served, fh)
+        with _conn() as conn:
+            conn.execute("DELETE FROM served")
+            for account_key, entries in (served or {}).items():
+                for e in entries:
+                    conn.execute(
+                        "INSERT INTO served (account_key, key, pillar, date, "
+                        "archetype, set_name) VALUES (?,?,?,?,?,?)",
+                        (account_key, e.get("key", ""), e.get("pillar", ""),
+                         e.get("date", ""), e.get("archetype", ""),
+                         e.get("set", "")))
+            conn.commit()
     except Exception as e:
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
 
 
 def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
-    served = load_served()
-    entries = served.setdefault(account_key, [])
-    entries.append({"key": key, "pillar": pillar, "date": day_key,
-                    "archetype": archetype, "set": set_name})
-    # prune far beyond the window so the file never grows unbounded
-    cutoff = _days_ago(day_key, config.ROTATION_WINDOW_DAYS * 3)
-    served[account_key] = [e for e in entries if e.get("date", "") >= cutoff]
-    save_served(served)
+    try:
+        with _conn() as conn:
+            conn.execute(
+                "INSERT INTO served (account_key, key, pillar, date, archetype, "
+                "set_name) VALUES (?,?,?,?,?,?)",
+                (account_key, key, pillar, day_key, archetype, set_name))
+            # prune far beyond the window so the table never grows unbounded
+            cutoff = _days_ago(day_key, config.ROTATION_WINDOW_DAYS * 3)
+            conn.execute("DELETE FROM served WHERE account_key=? AND date < ?",
+                         (account_key, cutoff))
+            conn.commit()
+    except Exception as e:
+        print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
 
 
 def _days_ago(day_key, n):

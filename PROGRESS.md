@@ -94,6 +94,9 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       AGENT_OPUS_POLL_ENABLED (interval AGENT_OPUS_POLL_MINUTES, default 60), failed clips
       retry then dead-letter with one ops alert. Flags AGENT_OPUS_ENABLED +
       AGENT_OPUS_POLL_ENABLED, both OFF
+- [x] SQLite store on /data (echo.db, WAL): drafts, posts, served, snapshots, counters,
+      kv; legacy pending_drafts.json / rotation_served.json / post_log.jsonl migrate once
+      with .migrated.bak backups; storage swap only, no behavior change
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

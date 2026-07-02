@@ -248,7 +248,8 @@ def test_store_roundtrip_and_no_token(tmp_path):
     got = s.get(d.draft_id)
     assert got is not None and got.caption == d.caption
     assert len(s.list_pending()) == 1
-    body = (tmp_path / "p.json").read_text(encoding="utf-8")
-    assert "token" not in body.lower()
+    # the store is sqlite now: scan the raw bytes for any token leakage
+    body = (tmp_path / "p.json").read_bytes()
+    assert b"token" not in body.lower()
     assert s.remove(d.draft_id) is True
     assert s.get(d.draft_id) is None

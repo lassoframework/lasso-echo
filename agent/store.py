@@ -66,66 +66,87 @@ def _from_dict(r):
 
 
 class PendingStore:
+    """Same API as the json store it replaces; SQLite-backed (agent/db.py, WAL on
+    /data). `path` still accepted: it becomes this store's own sqlite file (tests
+    pass tmp paths). A legacy pending_drafts.json at the default location migrates
+    in once and is kept as .migrated.bak. STORAGE SWAP ONLY: behavior unchanged.
+    """
+
     def __init__(self, path=None):
-        self.path = path or STORE_PATH_DEFAULT
-
-    def _load(self):
-        if not os.path.exists(self.path):
-            return {}
+        from . import db as _db
+        self._db = _db
+        # a caller-provided path is that store's own sqlite file; default = the
+        # shared /data db. Legacy json migrates on first open either way.
+        self.path = path or None
+        legacy = path if (path and path.endswith(".json") and os.path.exists(path)
+                          and not _is_sqlite(path)) else STORE_PATH_DEFAULT
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with self._conn() as conn:
+                self._db.migrate_legacy(conn, pending_json=legacy)
         except Exception:
-            return {}
+            pass  # an unopenable db fails LOUDLY on the first write (put), not here
 
-    def _save(self, data):
+    def _conn(self):
+        if self.path and not (self.path.endswith(".json") and os.path.exists(self.path)
+                              and not _is_sqlite(self.path)):
+            return self._db.connect(self.path)
+        if self.path:
+            # a legacy json path was passed: use a sibling sqlite file
+            return self._db.connect(self.path + ".db")
+        return self._db.connect()
+
+    def put(self, draft: Draft):
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            with self._conn() as conn:
+                rec = _to_dict(draft)
+                conn.execute(
+                    "INSERT OR REPLACE INTO drafts "
+                    "(draft_id, account_key, status, day_key, draft_type, data) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (draft.draft_id, draft.account_key, draft.status.value,
+                     draft.day_key, draft.draft_type, json.dumps(rec)))
+                conn.commit()
         except Exception as e:
-            # Behavior unchanged (the error still raises); it is just never silent:
-            # logged always, plus one ops alert when the flag is armed.
-            msg = f"store write failed for {self.path}: {type(e).__name__}: {e}"
+            msg = f"store write failed: {type(e).__name__}: {e}"
             print(f"[store] {ops_alerts.scrub(msg)}")
             ops_alerts.alert(msg)
             raise
-
-    def put(self, draft: Draft):
-        data = self._load()
-        data[draft.draft_id] = _to_dict(draft)
-        self._save(data)
         return draft
 
     def get(self, draft_id):
-        data = self._load()
-        r = data.get(draft_id)
-        return _from_dict(r) if r else None
+        with self._conn() as conn:
+            row = conn.execute("SELECT data FROM drafts WHERE draft_id=?",
+                               (draft_id,)).fetchone()
+        return _from_dict(json.loads(row["data"])) if row else None
 
     def remove(self, draft_id):
-        data = self._load()
-        if draft_id in data:
-            del data[draft_id]
-            self._save(data)
-            return True
-        return False
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM drafts WHERE draft_id=?", (draft_id,))
+            conn.commit()
+            return cur.rowcount > 0
 
     def list_pending(self):
-        data = self._load()
-        return [_from_dict(r) for r in data.values()
-                if r.get("status") == DraftStatus.PENDING.value]
+        with self._conn() as conn:
+            rows = conn.execute("SELECT data FROM drafts WHERE status=?",
+                                (DraftStatus.PENDING.value,)).fetchall()
+        return [_from_dict(json.loads(r["data"])) for r in rows]
 
     def find_pending(self, account_key, day_key, draft_type):
-        """
-        The PENDING draft for (account, day, type), or None. This is the idempotency
-        lookup: run-daily uses it to return an existing draft instead of creating a
-        duplicate. Only drafts written with the idempotent flag ON carry day_key and
-        draft_type, so older records simply never match.
-        """
-        data = self._load()
-        for r in data.values():
-            if (r.get("status") == DraftStatus.PENDING.value
-                    and r.get("account_key") == account_key
-                    and r.get("day_key") == day_key
-                    and r.get("draft_type") == draft_type):
-                return _from_dict(r)
-        return None
+        """The PENDING draft for (account, day, type), or None: the idempotency
+        lookup, exactly as before. Older records without day_key never match."""
+        if not day_key or not draft_type:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT data FROM drafts WHERE status=? AND account_key=? "
+                "AND day_key=? AND draft_type=?",
+                (DraftStatus.PENDING.value, account_key, day_key, draft_type)).fetchone()
+        return _from_dict(json.loads(row["data"])) if row else None
+
+
+def _is_sqlite(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(16).startswith(b"SQLite format 3")
+    except OSError:
+        return False
