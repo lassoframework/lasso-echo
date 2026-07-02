@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import config, meta_publisher, stories  # noqa: E402
+from agent import config, creative_studio, meta_publisher, stories  # noqa: E402
 from agent.accounts import Account, Platform  # noqa: E402
 from agent.drafter import Draft, DraftStatus  # noqa: E402
 from agent.runner import run_daily  # noqa: E402
@@ -121,11 +121,42 @@ def test_story_requests_9_16_and_feed_stays_4_5(monkeypatch, tmp_path):
     assert "9:16" in cap.prompts[0]
     assert "1080x1920" in cap.prompts[0]
     assert "Story" in cap.prompts[0]
+    # true vertical composition, not a reused feed card: story layout markers
+    assert "UPPER THIRD" in cap.prompts[0]
+    assert "safe zones" in cap.prompts[0].lower()
+    assert "FILLS the tall portrait canvas" not in cap.prompts[0]
     # per-use aspect: the module-level feed target was not switched
     assert config.IMAGE_ASPECT == "4:5"
     # the 9:16 render got its own file; the feed image was not overwritten
     assert os.path.basename(story.creative_path).startswith("nano_story_")
     assert story.creative_public_url.startswith("https://cdn.echo.test/echo/lasso_ig/")
+
+
+# ---- 3b. Story layout is its own vertical composition; feed layout untouched --
+def test_story_layout_true_vertical_feed_unchanged():
+    story = creative_studio.build_prompt(
+        "Leads go cold in minutes.", ["Answer inside five minutes."],
+        aspect="9:16", pixels="1080x1920", surface="Story")
+    # headline upper third, one centered focal graphic, 250px top/bottom safe zones
+    assert "UPPER THIRD" in story
+    assert "ONE single focal graphic in the MIDDLE" in story
+    assert "TOP 250 pixels" in story and "BOTTOM 250 pixels" in story
+    assert "never a cropped, stretched, or reused feed card" in story
+    # the feed flow guidance must NOT leak into the Story composition
+    assert "FILLS the tall portrait canvas" not in story
+    # house style + V3 palette unchanged on the Story
+    assert "House style" in story
+    for hexcode in ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0"):
+        assert hexcode in story, hexcode
+
+    # the default (feed) prompt is untouched: original layout, no story markers
+    feed = creative_studio.build_prompt(
+        "Leads go cold in minutes.", ["Answer inside five minutes."])
+    assert "FILLS the tall portrait canvas" in feed
+    assert "UPPER THIRD" not in feed
+    assert "safe zones" not in feed.lower()
+    # the shipped feed composition constant is intact inside the feed prompt
+    assert creative_studio.COMPOSITION_STYLE in feed
 
 
 # ---- 4. the card is clearly labeled STORY ------------------------------------

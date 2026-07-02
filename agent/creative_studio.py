@@ -42,16 +42,38 @@ BRAND_PALETTE = (
 
 # Composition: a LOCKED house style (consistent every card so the run reads as one brand
 # system) while the illustrated SUBJECT varies by pillar. No forced monitor/dashboard.
-COMPOSITION_STYLE = (
+# The house style is shared by every surface; the LAYOUT block is per surface (the 4:5
+# feed card and the 9:16 Story compose differently), selected in build_prompt.
+_HOUSE_STYLE_LEAD = (
     "House style (keep this CONSISTENT on every card so the whole run reads as one brand "
     "system): a clean, minimal, modern FLAT infographic with generous negative space, "
     "uncluttered and premium. Use an icon-driven flow with a few clear, labeled icons in a "
     "simple line-and-icon illustration style, a consistent stroke weight, and the brand "
-    "palette throughout.\n"
+    "palette throughout."
+)
+
+# Feed (4:5) layout: the original portrait guidance, unchanged.
+FEED_LAYOUT = (
     "Portrait layout: lay the whole design out for a TALL vertical frame. Put the one short "
     "headline near the TOP, then arrange the icon flow vertically (stacked top to bottom, or "
     "a simple flow) so it FILLS the tall portrait canvas. Keep generous margins and make "
-    "sure nothing is cut off at the edges.\n"
+    "sure nothing is cut off at the edges."
+)
+
+# Story (9:16) layout: a TRUE full screen vertical composition, never a reused or
+# stretched feed card. IG overlays its own UI at the top and bottom of a Story, so
+# those bands stay empty (safe zones).
+STORY_LAYOUT = (
+    "Story layout (9:16 FULL SCREEN vertical): compose this as a NEW full screen vertical "
+    "design, never a cropped, stretched, or reused feed card. Put the one short headline in "
+    "the UPPER THIRD of the frame. Center ONE single focal graphic in the MIDDLE of the "
+    "frame, large and clear. Keep the TOP 250 pixels and the BOTTOM 250 pixels of the frame "
+    "EMPTY as safe zones (the Instagram Story interface draws its own overlays there): no "
+    "text, no icons, no key elements in those bands. Generous margins on every side, calm "
+    "vertical balance, and nothing cut off at the edges."
+)
+
+_HOUSE_STYLE_REST = (
     "Subject varies by pillar: choose simple icons that FIT this card's topic and message. "
     "Do NOT default to a computer, monitor, or dashboard every time; pick the everyday "
     "objects relevant to the subject, rendered in the SAME clean house style and palette. "
@@ -61,6 +83,16 @@ COMPOSITION_STYLE = (
     "words at most. Overall feel: minimal, modern, high end, brand-consistent, easy to "
     "read at a glance. Think one clean diagram, not a busy poster."
 )
+
+
+def _composition_style(layout):
+    """House style + the per-surface layout block, assembled in the original order so
+    the feed prompt stays exactly what it was."""
+    return f"{_HOUSE_STYLE_LEAD}\n{layout}\n{_HOUSE_STYLE_REST}"
+
+
+# Kept for compatibility: the feed composition, byte for byte what shipped before.
+COMPOSITION_STYLE = _composition_style(FEED_LAYOUT)
 
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
 NO_DASH_RULE = (
@@ -89,13 +121,18 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
 
     Aspect is PER USE, not a global switch: the defaults are the feed target
     (config.IMAGE_ASPECT / IMAGE_PIXELS, 4:5); a caller like Stories passes its own
-    aspect (9:16) and surface label without changing the feed's target.
+    aspect (9:16) and surface label without changing the feed's target. A Story
+    surface also swaps in the STORY_LAYOUT composition (headline upper third, one
+    centered focal graphic, empty 250 pixel safe zones top and bottom); every other
+    surface keeps the original feed layout.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
     # Aspect first and prominent. Config-tunable; per-use overridable.
     use_aspect = aspect or config.IMAGE_ASPECT
     use_pixels = pixels or config.IMAGE_PIXELS
     use_surface = surface or "feed post"
+    is_story = "story" in use_surface.lower()
+    composition = _composition_style(STORY_LAYOUT if is_story else FEED_LAYOUT)
     aspect = (
         f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
         f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the entire "
@@ -110,7 +147,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
         "Concept context for the single focal graphic (do NOT render this text on the "
         "image; the caption carries the words):\n"
         f"{fact_lines}\n"
-        f"{COMPOSITION_STYLE}\n"
+        f"{composition}\n"
         f"{BRAND_PALETTE}\n"
         f"{NO_DASH_RULE}"
     )
