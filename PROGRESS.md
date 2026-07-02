@@ -97,6 +97,13 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
 - [x] SQLite store on /data (echo.db, WAL): drafts, posts, served, snapshots, counters,
       kv; legacy pending_drafts.json / rotation_served.json / post_log.jsonl migrate once
       with .migrated.bak backups; storage swap only, no behavior change
+- [~] Reporting live path: daily Graph snapshot job in the listener after the daily
+      draft (VIEWS never impressions + reach/likes/comments/saves/shares/followers,
+      per post metrics refreshed), monthly-report CLI builds the per account 30 day
+      HTML report (V3 brand, /data/reports) + Slack summary + the creative REFRESH
+      proposal (pillar/archetype/set performance from real data, three angles cited
+      only from approved sources, plain raw material ask list). Gate stays
+      AGENT_REPORTING_ENABLED (OFF)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

@@ -107,6 +107,15 @@ def handle_action(action, draft, actor_slack_id, note="",
         # Meta returns media_id, GBP returns post_id — log whichever the result carries.
         post_ref = getattr(result, "media_id", "") or getattr(result, "post_id", "")
         log = logger or postlog
+        # reporting enrichment (best effort, never blocks the approve path)
+        import os as _os
+        creative_key = _os.path.basename(draft.creative_path or "")
+        try:
+            from .rotation import sidecar_archetype, sidecar_set
+            archetype = sidecar_archetype(draft.creative_path)
+            set_name = sidecar_set(draft.creative_path)
+        except Exception:
+            archetype = set_name = ""
         log.log_post(
             account_key=draft.account_key,
             platform=draft.platform,
@@ -114,6 +123,9 @@ def handle_action(action, draft, actor_slack_id, note="",
             media_id=post_ref,
             mode=result.mode,                  # "published" or "would_publish"
             draft_id=draft.draft_id,
+            creative_key=creative_key,
+            archetype=archetype,
+            set_name=set_name,
         )
         # Publish confirmation loop: dormant behind AGENT_PUBLISH_CONFIRM_ENABLED
         # (returns None immediately when OFF, and only ever READS when ON).

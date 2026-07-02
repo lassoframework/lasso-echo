@@ -56,12 +56,21 @@ def db_path():
     return "echo.db"  # local dev fallback; production has the volume
 
 
+_POST_METRIC_COLUMNS = ("likes", "comments", "saves", "shares", "views", "reach")
+
+
 def connect(path=None):
     """A WAL-mode connection with the schema ensured. Callers close it."""
     conn = sqlite3.connect(path or db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    # additive column migration: per-post metrics for reporting (VIEWS, never an
+    # impressions column, by design)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(posts)")}
+    for col in _POST_METRIC_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE posts ADD COLUMN {col} INTEGER")
     return conn
 
 

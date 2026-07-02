@@ -95,8 +95,11 @@ def save_served(served):
 
 
 def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
+    from . import db as _db
     try:
-        with _conn() as conn:
+        # in-process serialization (the listener's threads share this process);
+        # WAL covers cross-process safety. No write is ever silently dropped.
+        with _db._lock, _conn() as conn:
             conn.execute(
                 "INSERT INTO served (account_key, key, pillar, date, archetype, "
                 "set_name) VALUES (?,?,?,?,?,?)",

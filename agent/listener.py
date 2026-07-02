@@ -122,6 +122,15 @@ def _daily_scheduler(store):
             _fire_daily(store, today)
             last_run_date = today
             _write_last_run_date(today)
+            # Daily metrics snapshot AFTER the daily draft: READ-ONLY Graph pulls
+            # (views, never impressions), dormant unless AGENT_REPORTING_ENABLED.
+            # Failures alert inside snapshot_all; nothing here crashes the loop.
+            if config.reporting_enabled():
+                try:
+                    from . import reporting_live
+                    reporting_live.snapshot_all()
+                except Exception as e:
+                    print(f"[reporting] snapshot pass failed: {type(e).__name__}: {e}")
         # Intake ingest: dormant unless AGENT_INTAKE_ENABLED. Runs INSIDE this
         # listener (the one process with /data + R2); an error never kills the loop.
         if config.intake_enabled() and time.monotonic() - last_ingest >= ingest_every:

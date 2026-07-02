@@ -228,6 +228,19 @@ def main(argv=None):
             print(err)
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name)
+    elif cmd == "monthly-report":
+        # The per-account 30 day cycle report from /data snapshots + posts, plus
+        # the creative REFRESH proposal. Gated by AGENT_REPORTING_ENABLED.
+        acct_filter, args = None, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_filter = args[i + 1]; i += 2; continue
+            if args[i].startswith("--account="):
+                acct_filter = args[i].split("=", 1)[1]
+            i += 1
+        from .monthly_report import run as monthly_run
+        monthly_run(account=acct_filter, poster=ConsolePoster())
     elif cmd == "pull-opus":
         # MANUAL Opus Clip ingest: list new finished clips since the watermark,
         # host to R2, file as video assets (future Reel DRAFTS via the normal
