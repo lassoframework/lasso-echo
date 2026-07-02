@@ -113,6 +113,10 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       hand-edited config only, typos fail safe to 0; DOUBLE GATE via
       AGENT_TRUST_LADDER_ENABLED (OFF) so nothing changes today; the auto-publish
       wiring itself stays a deliberate by-hand step. Enforcement unchanged
+- [~] add-client CLI (manual): full per client scaffold in one command (voice doc TODO
+      template, social_proof.md with the Permission: yes rule header, library folder,
+      printed Account config entry at level 0 + the by-hand checklist). Touches no env,
+      creates no tokens, arms nothing; idempotent re-run never destroys hand edits
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

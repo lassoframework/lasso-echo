@@ -230,6 +230,22 @@ def main(argv=None):
             print(err)
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name)
+    elif cmd == "add-client":
+        # MANUAL onboarding scaffold: config entry + voice/proof templates +
+        # library folder + the by-hand checklist. Touches no env, arms nothing.
+        key, name, args = "", "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--key" and i + 1 < len(args):
+                key = args[i + 1]; i += 2; continue
+            if args[i] == "--name" and i + 1 < len(args):
+                name = args[i + 1]; i += 2; continue
+            i += 1
+        if not key:
+            print("usage: python -m agent add-client --key <k> --name <n>")
+        else:
+            from .onboard import add_client
+            add_client(key, name)
     elif cmd == "monthly-report":
         # The per-account 30 day cycle report from /data snapshots + posts, plus
         # the creative REFRESH proposal. Gated by AGENT_REPORTING_ENABLED.
