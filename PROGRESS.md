@@ -141,6 +141,10 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       Gemini vision call per new asset: tags + people flag + description; low
       confidence marks review=true; counts against the spend cap; flag
       AGENT_AUTOTAG_ENABLED OFF)
+- [~] Decision audit log: append-only audit table records every selection (and WHY),
+      every gate exclusion (fabrication, consent, style), publish confirms, and every
+      ops alert (even when Slack is dormant); reasons pass the secret scrub; `audit`
+      CLI prints the readable trail. Always on, no flag: logging truth is not optional
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

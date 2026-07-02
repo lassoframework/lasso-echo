@@ -88,4 +88,11 @@ def confirm_publish(draft, account, result, http=None, poster=None):
                      "post found but no permalink was returned")
 
     _reply(poster, draft, f"LIVE: {permalink}")
+    try:
+        from datetime import datetime, timezone
+        from . import db as _db
+        _db.audit("publish_confirm", draft.draft_id, f"verified live: {permalink}",
+                  draft.account_key, datetime.now(timezone.utc).date().isoformat())
+    except Exception:
+        pass
     return {"verified": True, "permalink": permalink}

@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS counters (
   name TEXT, day TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (name, day));
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT (datetime('now')),
+  day TEXT, account_key TEXT, kind TEXT, subject TEXT, reason TEXT);
 """
 
 
@@ -175,3 +178,35 @@ def counter_get(name, day):
         row = conn.execute("SELECT count FROM counters WHERE name=? AND day=?",
                            (name, day)).fetchone()
         return row["count"] if row else 0
+
+
+def audit(kind, subject, reason, account_key="", day=""):
+    """APPEND-ONLY decision trail: why the agent did what it did. Always on (no
+    flag: logging truth is not optional). Reasons pass through the secret scrub
+    so tokens and key material can never land in the table. Never raises."""
+    try:
+        from . import ops_alerts
+        with _lock, connect() as conn:
+            conn.execute(
+                "INSERT INTO audit (day, account_key, kind, subject, reason) "
+                "VALUES (?,?,?,?,?)",
+                (day, account_key, str(kind)[:40], str(subject)[:200],
+                 ops_alerts.scrub(str(reason))[:500]))
+            conn.commit()
+    except Exception as e:
+        print(f"[audit] write failed: {type(e).__name__}: {e}")
+
+
+def audit_rows(day=None, account_key=None, limit=500):
+    q = "SELECT ts, day, account_key, kind, subject, reason FROM audit WHERE 1=1"
+    params = []
+    if day:
+        q += " AND day=?"
+        params.append(day)
+    if account_key:
+        q += " AND account_key=?"
+        params.append(account_key)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(q, params).fetchall()]

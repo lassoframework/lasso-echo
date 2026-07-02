@@ -64,6 +64,14 @@ def alert(message, poster=None, force=False):
     by callers that carry their OWN default-OFF flag, e.g. the token watchdog).
     The message is scrubbed of secret env values either way.
     """
+    # decision-trail: every alert (fired or dormant) lands in the audit table
+    try:
+        from datetime import datetime, timezone
+        from . import db as _db
+        _db.audit("ops_alert", "alert", scrub(message),
+                  day=datetime.now(timezone.utc).date().isoformat())
+    except Exception:
+        pass
     if not force and not config.ops_alerts_enabled():
         return None
     text = "ECHO ALERT: " + scrub(message)

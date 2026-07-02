@@ -251,6 +251,23 @@ def main(argv=None):
         else:
             from .onboard import add_client
             add_client(key, name)
+    elif cmd == "audit":
+        # The readable decision trail. No flag: logging truth is always on.
+        day, acct_f, args = None, None, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--day" and i + 1 < len(args):
+                day = args[i + 1]; i += 2; continue
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            i += 1
+        from .db import audit_rows
+        rows = audit_rows(day=day, account_key=acct_f)
+        if not rows:
+            print("audit: no decisions recorded for that filter.")
+        for r in reversed(rows):
+            who = r["account_key"] or "-"
+            print(f"{r['ts']}  [{r['kind']:<15}] {who:<12} {r['subject']}: {r['reason']}")
     elif cmd == "dam-scan":
         # MANUAL DAM pass over the library: mark perceptual near-dupe groups in
         # sidecars, and (when AGENT_AUTOTAG_ENABLED) tag untagged assets.

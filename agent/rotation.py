@@ -251,18 +251,24 @@ def choose(account_key, day_key, library_path, poster=None):
     off_style = style_exclusions(library_path)
     candidates = []  # (key, pillar, kind, payload)
     excluded_dirty = 0
-    from . import dam
+    from . import dam, db
     for c in list_creatives(library_path):
         base = os.path.basename(c.path)
         if base in off_style:
+            db.audit("exclusion", base, "off-style (pre house-style card)",
+                     account_key, day_key)
             continue  # OFF-STYLE (pre house-style card): never selected, never deleted
         if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
             continue  # a generated 9:16 story VARIANT (regen convention) is never a
             # feed candidate; a topic card that merely ends in "story" still rotates
         if dam.consent_blocked(c.path):
+            db.audit("exclusion", base, "consent guard (fail safe)",
+                     account_key, day_key)
             continue  # consent guard (fail safe): the card path never sees it
         if not is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded_dirty += 1
+            db.audit("exclusion", base, "fabrication gate (uncleared claim in note)",
+                     account_key, day_key)
             continue
         # near-dupes share a rotation key, so the window blocks the whole group
         candidates.append((dam.rotation_key(c.path), pillar_of(c.path), "library", c))
@@ -306,6 +312,11 @@ def choose(account_key, day_key, library_path, poster=None):
 
         pool.sort(key=lambda it: (_variety_penalty(it), last_served.get(it[0], ""), it[0]))
         key, pillar, kind, payload = pool[0]
+        db.audit("selection", key,
+                 f"kind={kind} pillar={pillar} eligible={len(pool)} "
+                 f"variety_penalty={_variety_penalty(pool[0])} "
+                 f"last_served={last_served.get(key, 'never')} window_ok=yes",
+                 account_key, day_key)
         return kind, payload
 
     # Thin approved pool: everything fresh was excluded. Fall back to the OLDEST
@@ -318,6 +329,10 @@ def choose(account_key, day_key, library_path, poster=None):
     if served_candidates:
         served_candidates.sort(key=lambda it: (last_served.get(it[0], ""), it[0]))
         key, pillar, kind, payload = served_candidates[0]
+        db.audit("selection", key,
+                 f"THIN POOL fallback: oldest served approved creative "
+                 f"({excluded_dirty} held by the fabrication gate)",
+                 account_key, day_key)
         return kind, payload
     return None, None
 
