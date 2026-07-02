@@ -112,18 +112,24 @@ def _default_api():
     return OpusAPI(key, config.OPUS_ORG_ID)
 
 
-def _sources(api):
+def _sources(api, vprint=lambda *a, **k: None):
     """(q, id) pairs to scan: pinned project ids + pinned collections, else every
     collection the account owns (the documented discovery path)."""
     sources = [("findByProjectId", pid) for pid in config.OPUS_PROJECT_IDS]
     collections = config.OPUS_COLLECTION_IDS
+    if config.OPUS_PROJECT_IDS or collections:
+        vprint(f"[opus] discovery: PINNED ids ({len(config.OPUS_PROJECT_IDS)} project, "
+               f"{len(collections)} collection)")
     if not collections and not sources:
         try:
             collections = api.list_collections()
+            vprint(f"[opus] discovery: collections endpoint (q=mine) returned "
+                   f"{len(collections)} collection id(s): {collections}")
         except Exception as e:
             print(f"[opus] could not list collections: {type(e).__name__}: {e}")
             collections = []
     sources.extend(("findByCollectionId", cid) for cid in collections)
+    vprint(f"[opus] scanning {len(sources)} source(s)")
     return sources
 
 
@@ -131,13 +137,17 @@ def _slug(text, limit=40):
     return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")[:limit]
 
 
-def pull(api=None, s3_client=None, poster=None, out_dir=None):
+def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
     """
     One ingest pass: list new finished clips since the watermark, download, host to
     R2 (content addressed, dedupe by hash), file into the library as a video asset
     with its sidecar, and print one hosted URL per clip. Returns a summary dict, or
     None while AGENT_OPUS_ENABLED is OFF. Never raises for a single bad clip.
+
+    verbose prints per-step debug (discovery route, per-source clip counts, and the
+    WHY for every skipped clip). The API key and auth headers are NEVER printed.
     """
+    vprint = print if verbose else (lambda *a, **k: None)
     if not config.opus_enabled():
         return None
     api = api or _default_api()
@@ -155,7 +165,7 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None):
     out_dir = out_dir or config.LIBRARY_PATH
     summary = {"pulled": 0, "skipped": 0, "failed": 0}
 
-    for q, source_id in _sources(api):
+    for q, source_id in _sources(api, vprint):
         source_key = f"{q}:{source_id}"
         watermark = watermarks.get(source_key, "")
         try:
@@ -165,6 +175,8 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None):
             ops_alerts.alert(f"opus ingest could not list clips for {source_id}: "
                              f"{type(e).__name__}: {e}")
             continue
+        vprint(f"[opus] {source_key}: {len(clips)} clip(s) listed "
+               f"(watermark: {watermark or 'none'})")
 
         # The watermark only advances past RESOLVED clips (ingested, deduped, or
         # dead-lettered). It stalls at the first unresolved failure so the next
@@ -174,12 +186,21 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None):
         for clip in sorted(clips, key=lambda c: c.get("createdAt", "")):
             created = clip.get("createdAt", "")
             clip_id = clip.get("id", "")
+            title = clip.get("title", "")
+
+            def _vskip(reason):
+                vprint(f"[opus]   clip {clip_id or '(no id)'} '{title[:40]}': "
+                       f"SKIPPED, {reason}")
+
             if not clip_id or not clip.get("uriForExport"):
+                _vskip("not exportable (missing id or export URL)")
                 continue
             if created and created <= watermark:
+                _vskip(f"watermark ({created} <= {watermark})")
                 continue  # already covered by the watermark
             if clip_id in ingested or clip_id in dead:
                 summary["skipped"] += 1
+                _vskip("dead-lettered" if clip_id in dead else "already ingested")
                 if not stalled:
                     newest = max(newest, created)
                 continue
@@ -188,6 +209,7 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None):
                 sha = hashlib.sha256(data).hexdigest()
                 if sha in hashes:
                     summary["skipped"] += 1     # same content pulled before
+                    _vskip("hash dedupe (same bytes already in the library)")
                     ingested.add(clip_id)
                     if not stalled:
                         newest = max(newest, created)
@@ -240,3 +262,51 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None):
     state["deadletter"] = sorted(dead)
     save_state(state)
     return summary
+
+
+def opus_check(http=None):
+    """
+    READ-ONLY connectivity probe (CLI: opus-check). Calls the collections endpoint
+    directly, prints the HTTP status and how many collections came back, and when
+    zero (or on an error / non-JSON body) prints the raw response body, TRUNCATED
+    and key-scrubbed, so we can see whether the account looks empty to this key.
+    Never prints the API key or any auth header. Returns a small summary dict.
+    """
+    key = os.environ.get(config.OPUS_API_KEY_ENV)
+    if not key:
+        print("opus-check: OPUS_API_KEY is not set.")
+        return {"status": None, "collections": None}
+
+    if http is None:
+        import requests  # lazy
+        http = requests
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    if config.OPUS_ORG_ID:
+        headers["x-opus-org-id"] = config.OPUS_ORG_ID
+    url = f"{config.OPUS_API_BASE}/api/collections"
+    try:
+        r = http.get(url, params={"q": "mine"}, headers=headers, timeout=30)
+    except Exception as e:
+        print(f"opus-check: request failed: {type(e).__name__}: {e}")
+        return {"status": None, "collections": None}
+
+    status = getattr(r, "status_code", 0)
+    body_text = getattr(r, "text", "") or ""
+    count = None
+    try:
+        body = r.json()
+        items = body if isinstance(body, list) else (body or {}).get("data", []) or []
+        count = len(items)
+    except Exception:
+        pass  # non-JSON body; shown below
+
+    print(f"opus-check: GET /api/collections?q=mine -> HTTP {status}")
+    if count is not None:
+        print(f"opus-check: {count} collection(s) returned")
+    else:
+        print("opus-check: response body is not JSON")
+    if status >= 400 or not count:
+        from .ops_alerts import scrub  # key-scrub anything echoed back
+        snippet = scrub(body_text)[:500]
+        print(f"opus-check: raw body (truncated, scrubbed): {snippet!r}")
+    return {"status": status, "collections": count}

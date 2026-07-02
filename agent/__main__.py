@@ -232,13 +232,19 @@ def main(argv=None):
         # MANUAL Opus Clip ingest: list new finished clips since the watermark,
         # host to R2, file as video assets (future Reel DRAFTS via the normal
         # path). Nothing publishes; the key is env-only and never printed.
+        # --verbose prints discovery route, per-source counts, and skip reasons.
         from .opus_ingest import pull as opus_pull
-        out = opus_pull()
+        out = opus_pull(verbose="--verbose" in argv[1:])
         if out is None:
             print("opus ingest is OFF (set AGENT_OPUS_ENABLED=true to arm it). Nothing done.")
         else:
             print(f"pull-opus: {out['pulled']} pulled, {out['skipped']} skipped, "
                   f"{out['failed']} failed")
+    elif cmd == "opus-check":
+        # READ-ONLY connectivity probe: HTTP status + collection count, and the
+        # truncated key-scrubbed body when the account looks empty to this key.
+        from .opus_ingest import opus_check
+        opus_check()
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
