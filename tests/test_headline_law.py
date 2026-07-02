@@ -23,7 +23,7 @@ EXPECTED_HEADLINES = {
     "posting_cadence": "Post every day. Grow every month.",
     "speed_to_lead_concept": "Answer leads fast. Close more of them.",
     "system_runs_itself": "Your follow up runs on autopilot",
-    "coach_in_your_corner": "We coach your sales team",
+    "coach_in_your_corner": "You run the gym. We bring the plan.",
     "ads_done_for_you": "We run your ads. You run your gym.",
     "follow_up_system": "Every lead gets a follow up.",
     "booked_to_close": "From lead to member.",

@@ -100,7 +100,7 @@ CONCEPTS = {
         "archetype": "flow",
     },
     "coach_in_your_corner": {
-        "headline": "We coach your sales team",
+        "headline": "You run the gym. We bring the plan.",
         "concept": ["Tension: an owner slumped at a messy desk, out of answers.",
                     "Resolution: a guide beside them handing over one simple visible plan, the owner sitting up."],
         "story": False,
