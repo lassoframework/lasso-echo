@@ -249,6 +249,19 @@ def main(argv=None):
         else:
             from .onboard import add_client
             add_client(key, name)
+    elif cmd == "grade-card":
+        # One page Social Grade card (HTML + PDF) from live store data. Respects
+        # AGENT_GRADE_ENABLED; drafts nothing, posts nothing.
+        acct_filter, args = None, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_filter = args[i + 1]; i += 2; continue
+            if args[i].startswith("--account="):
+                acct_filter = args[i].split("=", 1)[1]
+            i += 1
+        from .grade_card import run as grade_run
+        grade_run(account=acct_filter)
     elif cmd == "monthly-report":
         # The per-account 30 day cycle report from /data snapshots + posts, plus
         # the creative REFRESH proposal. Gated by AGENT_REPORTING_ENABLED.

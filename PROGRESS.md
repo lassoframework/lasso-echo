@@ -130,6 +130,9 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       clean branded PDF (reportlab rebuild; weasyprint/wkhtmltopdf need system libs
       the container lacks), per account white labeling (display name + optional
       brand_voice/<client>/logo.png; LASSO default), dash free text layer
+- [~] Social Grade client report card: grade-card CLI renders the computed grade
+      (A to F + six area rubric + before/after posting frequency) as one page V3
+      HTML + PDF from live store data; respects AGENT_GRADE_ENABLED; drafts nothing
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
