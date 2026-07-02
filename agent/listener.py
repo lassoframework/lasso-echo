@@ -16,11 +16,13 @@ approver's taps do anything. Everyone else is denied.
 Run:  python -m agent listen
 """
 
+import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
 
-from . import config
+from . import config, ops_alerts, schedule
 from .approvals import handle_action
 from .accounts import get_account
 from .drafter import Draft, DraftStatus, draft_post
@@ -46,24 +48,76 @@ def _redraft_with_note(old: Draft, note: str) -> Draft:
     return new
 
 
+# The scheduler's fire date persists to /data (the volume on the echo service) so a
+# redeploy inside the fire window cannot double-fire even with idempotency disarmed.
+_SCHEDULER_STATE_FILE = "scheduler_state.json"
+
+
+def _scheduler_state_path():
+    return os.path.join(os.environ.get("AGENT_SCHEDULER_STATE_DIR", "/data"),
+                        _SCHEDULER_STATE_FILE)
+
+
+def _read_last_run_date():
+    """The persisted last fire date, or None when /data is unavailable or empty
+    (in-memory tracking then carries the day, exactly the old behavior)."""
+    try:
+        with open(_scheduler_state_path(), encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("last_run_date")
+    except Exception:
+        return None
+
+
+def _write_last_run_date(day):
+    """Best-effort persist; a missing /data never breaks the scheduler."""
+    try:
+        with open(_scheduler_state_path(), "w", encoding="utf-8") as fh:
+            json.dump({"last_run_date": day}, fh)
+    except Exception as e:
+        print(f"[scheduler] could not persist last run date: {type(e).__name__}: {e}")
+
+
+def _fire_daily(store, today, run=run_daily):
+    """
+    One scheduled fire, LOUD on every no-card outcome. Any result other than a
+    drafted run with at least one card (on a posting day) raises one ops alert, so
+    a silent no-card morning is impossible while AGENT_OPS_ALERTS_ENABLED is true.
+    A skip day (schedule.should_post_on false) drafting zero cards is EXPECTED and
+    does not alert.
+    """
+    try:
+        out = run(store=store)
+    except Exception as e:
+        print(f"[scheduler] run_daily error: {e}")  # log either way (old behavior)
+        ops_alerts.alert("scheduled draft run produced no cards - "
+                         f"{type(e).__name__}: {e}")
+        return None
+    status = (out or {}).get("status")
+    drafts = (out or {}).get("drafts") or []
+    if status != "drafted":
+        ops_alerts.alert(f"scheduled draft run produced no cards - status '{status}' "
+                         "(check AGENT_ENABLED and the voice doc)")
+    elif not drafts and schedule.should_post_on(today):
+        ops_alerts.alert("scheduled draft run produced no cards - drafted 0 drafts "
+                         "on a posting day")
+    return out
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
     UTC hour. Simple by design. For stricter reliability, run `run-daily` as a
     Railway cron service instead and disable this with AGENT_SCHEDULER_ENABLED=false.
     """
-    import os
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
-    last_run_date = None
+    last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
         if now.hour == target_hour and last_run_date != today:
-            try:
-                run_daily(store=store)
-            except Exception as e:
-                print(f"[scheduler] run_daily error: {e}")
+            _fire_daily(store, today)
             last_run_date = today
+            _write_last_run_date(today)
         time.sleep(60)
 
 
