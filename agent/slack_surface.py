@@ -155,6 +155,7 @@ def build_card_blocks(draft):
 
     tags = " ".join(draft.hashtags)
     caption_preview = draft.caption if draft.caption else "(empty caption)"
+    warnings = getattr(draft, "warnings", None) or []
 
     is_story = getattr(draft, "is_story", False)
     slides = getattr(draft, "slides", None) or []
@@ -186,6 +187,10 @@ def build_card_blocks(draft):
          "text": {"type": "mrkdwn", "text": f"*Caption:*\n{caption_preview}"}},
         {"type": "context",
          "elements": [{"type": "mrkdwn", "text": f"*Hashtags:* {tags or '(none)'}"}]},
+        # quality-guard warnings (e.g. the OCR headline check): visible, never blocking
+        *[{"type": "context",
+           "elements": [{"type": "mrkdwn", "text": f":warning: {w}"}]}
+          for w in warnings],
         {"type": "actions", "block_id": f"approve_block::{draft.draft_id}", "elements": [
             {"type": "button", "style": "primary",
              "text": {"type": "plain_text", "text": "Approve"},

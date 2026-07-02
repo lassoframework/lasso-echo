@@ -302,6 +302,24 @@ def trust_ladder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
 
 
+def ocr_check_enabled() -> bool:
+    """
+    Headline OCR check switch. OFF by default. ON, a rendered card's headline is
+    transcribed (Gemini vision, lowest cost) and fuzzy matched to the intended
+    headline; a mismatch adds a WARNING line to the Slack card, never a block.
+    """
+    return _truthy(os.environ.get("AGENT_OCR_CHECK_ENABLED", "false"))
+
+
+def spend_cap_enabled() -> bool:
+    """
+    Gemini spend cap switch. OFF by default. ON, generation calls count per day
+    in the store; at AGENT_GEMINI_DAILY_CAP (default 40) further generation for
+    the day returns None (library-only selection takes over) plus one ops alert.
+    """
+    return _truthy(os.environ.get("AGENT_SPEND_CAP_ENABLED", "false"))
+
+
 def runway_enabled() -> bool:
     """
     Creative runway switch. OFF by default. ON, one line per account per day:

@@ -70,6 +70,7 @@ class Draft:
     draft_type: str = ""       # "feed" or "story" (empty while the flag is OFF)
     slack_channel: str = ""
     slack_ts: str = ""
+    warnings: list = field(default_factory=list)  # card-time notes (e.g. OCR check)
 
 
 def _make_id(account_key, creative_path, scheduled_for):

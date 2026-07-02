@@ -81,6 +81,14 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
               "falling back to library creative.")
         return None
 
+    # Headline OCR check (AGENT_OCR_CHECK_ENABLED, OFF): a mismatch adds a
+    # warning line to the card; it never blocks. Blake decides at the tap.
+    warnings = []
+    from .ocr_check import headline_warning
+    warning = headline_warning(art["path"], headline)
+    if warning:
+        warnings.append(warning)
+
     return Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
         caption=plan["caption"],
@@ -90,4 +98,5 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[headline] + facts,  # no-fabrication audit trail
+        warnings=warnings,
     )

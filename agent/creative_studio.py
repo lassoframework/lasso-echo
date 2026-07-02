@@ -407,6 +407,22 @@ def generate(headline, facts, client=None, out_path=None,
     if not facts:
         return None
 
+    # Gemini spend cap (AGENT_SPEND_CAP_ENABLED, default OFF): at the daily cap
+    # generation stops for the day (returning None makes every caller fall back
+    # to library-only selection) with ONE ops alert. Counter resets by date key.
+    if config.spend_cap_enabled():
+        from datetime import date as _date
+        from . import db as _db, ops_alerts as _ops
+        day = _date.today().isoformat()
+        cap = int(os.environ.get("AGENT_GEMINI_DAILY_CAP", "40"))
+        if _db.counter_get("gemini_calls", day) >= cap:
+            if _db.kv_get(f"spend_cap_alerted_{day}") != "1":
+                _db.kv_set(f"spend_cap_alerted_{day}", "1")
+                _ops.alert(f"Gemini daily cap reached ({cap} calls). Generation "
+                           "paused for today; library-only selection takes over.")
+            return None
+        _db.counter_bump("gemini_calls", day)
+
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                           surface=surface, archetype=archetype)
 

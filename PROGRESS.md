@@ -117,6 +117,12 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       template, social_proof.md with the Permission: yes rule header, library folder,
       printed Account config entry at level 0 + the by-hand checklist). Touches no env,
       creates no tokens, arms nothing; idempotent re-run never destroys hand edits
+- [~] Quality + cost guards: headline OCR check (Gemini vision transcription, lowest
+      cost, since the container has no pure python OCR; mismatch = warning line on the
+      card, never a block; flag AGENT_OCR_CHECK_ENABLED OFF) and Gemini spend cap
+      (per day counter in the store, at AGENT_GEMINI_DAILY_CAP default 40 generation
+      pauses for the day with one ops alert and library-only selection takes over;
+      flag AGENT_SPEND_CAP_ENABLED OFF)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
