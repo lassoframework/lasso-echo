@@ -32,6 +32,14 @@ class Account:
     target_id_env: str        # NAME of the env var holding the IG user id / Page id
     trust: TrustLevel = field(default_factory=default_trust_for_new_account)
     active: bool = True       # inactive accounts stay in the registry (history) but never draft/publish
+    # ---- Multi-client fields (Stage 2). Empty = fall back to the global config, so
+    # LASSO's accounts (client zero) behave exactly as before. A client account sets
+    # its own paths/channel and can NEVER cross-read another client's docs or library.
+    voice_doc: str = ""           # per-client brand bible path
+    social_proof_doc: str = ""    # per-client verified social proof path
+    library_prefix: str = ""      # per-client content library directory
+    slack_channel: str = ""       # per-client approval channel id
+    approvers: list = field(default_factory=list)  # per-client approver Slack ids
 
     def get_token(self):
         """Read the token from env at call time. Returns None if unset. Never logged."""
@@ -39,6 +47,33 @@ class Account:
 
     def get_target_id(self):
         return os.environ.get(self.target_id_env)
+
+    # ---- Config resolvers: the account's own value, else the global (client zero)
+    # config. Every consumer resolves through these so isolation is by construction.
+    @property
+    def trust_level(self):
+        """The account's trust rung (default: full approval, the Stage 1 gate)."""
+        return self.trust
+
+    def voice_doc_path(self):
+        from . import config
+        return self.voice_doc or config.VOICE_DOC_PATH
+
+    def social_proof_doc_path(self):
+        from . import config
+        return self.social_proof_doc or config.SOCIAL_PROOF_PATH
+
+    def library_path(self):
+        from . import config
+        return self.library_prefix or config.LIBRARY_PATH
+
+    def approval_channel(self):
+        from . import config
+        return self.slack_channel or config.SLACK_CHANNEL_ID
+
+    def approver_ids(self):
+        from . import config
+        return list(self.approvers) or [config.APPROVER_SLACK_ID]
 
     def __repr__(self):
         # Deliberately omits any secret. Safe to log.

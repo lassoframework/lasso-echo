@@ -136,21 +136,31 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         if not schedule.should_post_on(day_key):
             continue
 
+        # Multi-client resolution: an account with its own voice doc or library uses
+        # them; empty fields (client zero, the LASSO accounts) fall back to the
+        # globals above, so existing behavior is byte-for-byte identical.
+        acct_voice = load_voice(account.voice_doc) if account.voice_doc else voice
+        if acct_voice is None:
+            poster.post_notice(f":warning: Voice doc missing for {account.key}. "
+                               "Drafting nothing for this account.")
+            continue
+        acct_lib = account.library_prefix or lib
+
         draft = None
         # Social proof card FIRST, but only on the weekly proof day and only when
         # its flag is armed with approved (permissioned + verified) entries. It is
         # dormant otherwise; None -> the normal paths below run untouched.
         if account.key.startswith("lasso"):
-            draft = build_social_proof_draft(account, day_key, voice=voice, poster=poster)
+            draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
         # For a LASSO account, try the fully-automated infographic path next. It is
         # dormant unless all three flags are armed; None -> fall back to the library
         # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
         if draft is None and account.key.startswith("lasso"):
             draft = build_daily_infographic_draft(account, day_key)
         if draft is None:
-            creative = pick_next(account, lib, used_creatives_for(account.key))
+            creative = pick_next(account, acct_lib, used_creatives_for(account.key))
             # Schedule the fallback draft to the same cadence slot.
-            draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=voice)
+            draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
 
         existing = None
         if idempotent:

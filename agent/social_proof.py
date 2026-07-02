@@ -125,7 +125,9 @@ def build_social_proof_draft(account, day_key, *, voice=None, voice_path=None,
     if not is_proof_day(day_key):
         return None
 
-    src = path or source_path(account.key)
+    # Resolution order: explicit path arg, the account's own doc (multi-client),
+    # the per-account file convention, then the shared default.
+    src = path or getattr(account, "social_proof_doc", "") or source_path(account.key)
     approved, skipped = load_entries(src)
     if skipped and poster is not None:
         for entry, reason in skipped:
