@@ -48,48 +48,56 @@ CONCEPTS = {
         "concept": ["Flow diagram: our gym, then the proven system, then your gym.",
                     "Three stations connected left to right by flow arrows."],
         "story": True,
+        "archetype": "flow",
     },
     "one_screen": {
         "headline": "Every lead, every post, every result. One screen.",
         "concept": ["Leads, posts, and results flow from three sides into one dashboard.",
                     "One central screen icon receiving three labeled streams."],
         "story": False,
+        "archetype": "hero",
     },
     "three_step_path": {
         "headline": "Three steps. One path.",
         "concept": ["A simple path diagram with three labeled stops along one road.",
                     "No numbered text list; the path itself carries the three steps."],
         "story": True,
+        "archetype": "path",
     },
     "follow_up_problem": {
         "headline": "Most gyms don't have a lead problem. They have a follow up problem.",
         "concept": ["Leads pooling beside an unanswered phone on one side.",
                     "On the other side an answered phone with leads flowing through."],
         "story": False,
+        "archetype": "split",
     },
     "posting_cadence": {
         "headline": "Consistency beats intensity.",
         "concept": ["Two calendars side by side: one nearly empty and quiet, one with a",
                     "steady daily rhythm of posts. Illustrated, no counts, no percentages."],
         "story": False,
+        "archetype": "split",
     },
     "speed_to_lead_concept": {
         "headline": "Speed to lead wins.",
         "concept": ["A clock and a lead handoff: speed as an idea.",
                     "No hours or minutes claim text anywhere on the card."],
         "story": False,
+        "archetype": "hero",
     },
     "system_runs_itself": {
         "headline": "The system runs itself.",
         "concept": ["Gears turning a calendar that produces a checkmark.",
                     "Done for you as a machine that quietly works."],
         "story": False,
+        "archetype": "flow",
     },
     "coach_in_your_corner": {
         "headline": "A coach in your corner.",
         "concept": ["A gym owner and a guide figure pointing together at one simple plan.",
                     "StoryBrand guide framing: the owner is the hero, the guide has the plan."],
         "story": False,
+        "archetype": "headline",
     },
 }
 
@@ -127,14 +135,18 @@ def parse_args(args):
 
 
 def assemble_prompts(key):
-    """[(variant, prompt)] for one concept through the LOCKED house-style spec."""
+    """[(variant, prompt)] for one concept through the LOCKED house-style spec,
+    composed by the concept's assigned layout ARCHETYPE (story variants inherit the
+    archetype, recomposed for 9:16 with the safe zones)."""
     spec = CONCEPTS[key]
-    out = [("feed", creative_studio.build_prompt(spec["headline"], spec["concept"]))]
+    arch = spec.get("archetype", "flow")
+    out = [("feed", creative_studio.build_prompt(spec["headline"], spec["concept"],
+                                                 archetype=arch))]
     if spec.get("story"):
         aspect, pixels, surface = STORY_ASPECT
         out.append(("story", creative_studio.build_prompt(
             spec["headline"], spec["concept"],
-            aspect=aspect, pixels=pixels, surface=surface)))
+            aspect=aspect, pixels=pixels, surface=surface, archetype=arch)))
     return out
 
 
@@ -142,10 +154,10 @@ def _generate_one(key, variant, nano_client, out_dir):
     spec = CONCEPTS[key]
     suffix = "" if variant == "feed" else "_story"
     out_path = os.path.join(out_dir, f"{V2_PREFIX}{key}{suffix}.png")
-    kwargs = {}
+    kwargs = {"archetype": spec.get("archetype", "flow")}
     if variant == "story":
         aspect, pixels, surface = STORY_ASPECT
-        kwargs = {"aspect": aspect, "pixels": pixels, "surface": surface}
+        kwargs.update({"aspect": aspect, "pixels": pixels, "surface": surface})
     return creative_studio.generate(spec["headline"], spec["concept"],
                                     client=nano_client, out_path=out_path, **kwargs)
 
@@ -192,6 +204,7 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
                 "headline": spec["headline"],
                 "generated": date.today().isoformat(),
                 "style": "v2",
+                "archetype": spec.get("archetype", "flow"),
             }
             if hosted:
                 sidecar["public_url"] = hosted

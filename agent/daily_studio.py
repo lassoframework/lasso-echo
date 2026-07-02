@@ -60,7 +60,10 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     if not facts:
         return _blocked(f"pillar '{plan['pillar']}' has no approved body lines in lasso_now.md")
 
-    art = creative_studio.generate(headline, facts, client=nano_client)
+    # The daily card draws a layout archetype on a deterministic rotation, so the
+    # generated run varies in composition day to day (the brand never varies).
+    art = creative_studio.generate(headline, facts, client=nano_client,
+                                   archetype=creative_studio.archetype_for_day(day_key))
     if not art:
         # Acceptable library fallback for now, but make it VISIBLE: run-daily output
         # always, plus one ops alert when AGENT_OPS_ALERTS_ENABLED is armed.

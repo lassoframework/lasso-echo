@@ -77,6 +77,13 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       per card for the eyeball pass; --only <key> single card redo, --dry-run prints prompts
       free. Story variants never enter feed rotation. BLAKE BY HAND: run it in the container,
       eyeball every URL, redo misses with --only
+- [x] Layout archetypes inside the locked house style: FLOW, SPLIT, HERO, PATH, HEADLINE
+      (structure varies, brand never does; secondary knobs per archetype: illustration
+      scale, label density, red accent placement). Regen batch assigned (no archetype more
+      than twice); story variants inherit the archetype recomposed 9:16 with safe zones;
+      daily Nano cards rotate archetypes deterministically; rotation logs the served
+      archetype and softly prefers alternation (never overrides the no repeat window or
+      the fabrication gate)
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

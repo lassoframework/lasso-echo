@@ -167,7 +167,7 @@ def test_prompt_locks_house_style_and_varies_subject():
     assert "1080x1350" in p
     assert "portrait" in low
     assert "taller than wide" in low
-    assert "near the top" in low            # portrait layout: headline up top
+    assert "headline at the top" in low     # flow archetype default: headline up top
     # the SUBJECT varies by pillar; do NOT force a monitor/dashboard every time
     assert "subject varies by pillar" in low
     assert "do not default to a computer, monitor, or dashboard" in low

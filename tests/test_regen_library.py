@@ -175,10 +175,11 @@ def test_v2_cards_rotate_old_exclusions_hold(monkeypatch, tmp_path):
 
 # ---- every concept's prompt carries the locked style + no-dash rule ------------
 def test_all_concept_prompts_carry_style_and_no_dashes():
-    for key in regen_library.CONCEPTS:
+    for key, spec in regen_library.CONCEPTS.items():
         for variant, prompt in regen_library.assemble_prompts(key):
             low = prompt.lower()
-            assert "illustrated diagram" in low, key
+            # the concept's assigned archetype drives the composition
+            assert f"archetype {spec['archetype']}" in low, key
             assert "cream #faf6f0: the canvas" in low, key
             assert "never a full bleed solid color slab" in low, key
             assert "one idea per card" in low, key

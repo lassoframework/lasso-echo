@@ -44,26 +44,76 @@ BRAND_PALETTE = (
 # The house style is shared by every surface; the LAYOUT block is per surface (the 4:5
 # feed card and the 9:16 Story compose differently), selected in build_prompt.
 _HOUSE_STYLE_LEAD = (
-    "House style, the ILLUSTRATED DIAGRAM concept (keep this CONSISTENT on every card so "
-    "the whole run reads as one brand system): a clean, minimal, modern FLAT infographic "
-    "on a cream canvas with generous negative space, uncluttered and premium. ONE "
-    "headline at the TOP of the card in navy, bold but not shouting; the headline is the "
-    "ONLY large text. The BODY of the card is an ILLUSTRATED DIAGRAM: simple line-icon "
-    "illustrations with small UPPERCASE labels, connected by flow arrows, drawn with a "
-    "consistent stroke weight in the brand palette. The diagram carries the idea "
-    "visually."
+    "House style, the LASSO brand system (keep this CONSISTENT on every card so the "
+    "whole run reads as one brand system): a clean, minimal, modern FLAT infographic on "
+    "a cream canvas with generous negative space, uncluttered and premium. ONE navy "
+    "headline, bold but not shouting; the headline is the ONLY large text. All artwork "
+    "is simple line-icon illustrations with small UPPERCASE labels, drawn with a "
+    "consistent stroke weight in the brand palette."
 )
 
-# Feed (4:5) layout: the original portrait guidance, unchanged.
+# ---- Layout ARCHETYPES: the composition varies, the brand never does. Every card
+# gets exactly ONE archetype; each block also sets the secondary knobs (illustration
+# scale, label density, where the single red accent lands) so cards differ beyond
+# structure. Palette and canvas never vary.
+ARCHETYPES = {
+    "flow": (
+        "Archetype FLOW: the body of the card is an ILLUSTRATED DIAGRAM, a vertical "
+        "flow diagram with the headline at the top. Line-icon steps connected by flow "
+        "arrows running top to bottom. Illustration scale medium with a few clear "
+        "steps; label density normal, one small UPPERCASE label per step; the single "
+        "red accent is ONE arrow or ONE step marker."
+    ),
+    "split": (
+        "Archetype SPLIT: a two side contrast, left vs right or top vs bottom, with "
+        "the headline at the top. One side muted and faded, one side alive in the "
+        "brand palette; the ONE red element marks the winning side only. A small "
+        "illustrated diagram vignette on each side; illustration scale medium; label "
+        "density low, one or two small UPPERCASE labels per side."
+    ),
+    "hero": (
+        "Archetype HERO: ONE LARGE central illustration filling most of the card, with "
+        "the headline at the top and MAXIMUM negative space. The boldest, simplest "
+        "read on the feed. Illustration scale large; label density minimal, at most "
+        "TWO small UPPERCASE labels on the whole card; the single red accent is one "
+        "small element inside the hero illustration."
+    ),
+    "path": (
+        "Archetype PATH: an ILLUSTRATED DIAGRAM of a winding journey path with labeled "
+        "stops, START at the BOTTOM of the card and FINISH at the TOP, headline at the "
+        "top. Illustration scale medium; label density normal, one small UPPERCASE "
+        "label per stop; the single red accent is the FINISH marker only."
+    ),
+    "headline": (
+        "Archetype HEADLINE, typography forward (use sparingly): the headline IS the "
+        "hero, LARGE and CENTERED in the MIDDLE of the card, with ONE small line-icon "
+        "accent above or below it. No diagram. Label density zero; the single red "
+        "accent is one emphasized word in the headline or the small icon, never both."
+    ),
+}
+
+# The order daily generated cards walk through (rotating, never random).
+ARCHETYPE_ORDER = ["flow", "hero", "split", "path", "headline"]
+
+
+def archetype_for_day(day_key):
+    """The daily studio's archetype: a deterministic rotation by calendar day, so
+    consecutive generated cards differ in composition (variety, not randomness)."""
+    from datetime import date as _date
+    ordinal = _date.fromisoformat(str(day_key)[:10]).toordinal()
+    return ARCHETYPE_ORDER[ordinal % len(ARCHETYPE_ORDER)]
+
+
+# Feed (4:5) fit: generic portrait guidance; the headline position and body
+# structure come from the archetype block.
 FEED_LAYOUT = (
-    "Portrait layout: lay the whole design out for a TALL vertical frame. Put the one short "
-    "headline near the TOP, then arrange the icon flow vertically (stacked top to bottom, or "
-    "a simple flow) so it FILLS the tall portrait canvas. Keep generous margins and make "
-    "sure nothing is cut off at the edges."
+    "Portrait fit: lay the whole design out for a TALL vertical frame so it FILLS the "
+    "tall portrait canvas. Keep generous margins and make sure nothing is cut off at "
+    "the edges."
 )
 
-# Story (9:16) layout: a TRUE full screen vertical composition, never a reused or
-# stretched feed card. IG overlays its own UI at the top and bottom of a Story, so
+# Story (9:16), FLOW default: a TRUE full screen vertical composition, never a reused
+# or stretched feed card. IG overlays its own UI at the top and bottom of a Story, so
 # those bands stay empty (safe zones).
 STORY_LAYOUT = (
     "Story layout (9:16 FULL SCREEN vertical): compose this as a NEW full screen vertical "
@@ -75,28 +125,45 @@ STORY_LAYOUT = (
     "vertical balance, and nothing cut off at the edges."
 )
 
+# Story recomposition for the non-FLOW archetypes: the SAME archetype rebuilt for
+# 9:16 with the same safe zones.
+STORY_RECOMPOSE = (
+    "Story recomposition (9:16 FULL SCREEN vertical): recompose this SAME archetype as "
+    "a NEW full screen vertical design, never a cropped, stretched, or reused feed "
+    "card. Keep the TOP 250 pixels and the BOTTOM 250 pixels of the frame EMPTY as "
+    "safe zones (the Instagram Story interface draws its own overlays there): no text, "
+    "no icons, no key elements in those bands. Calm vertical balance, generous margins "
+    "on every side, and nothing cut off at the edges."
+)
+
 _HOUSE_STYLE_REST = (
     "Subject varies by pillar: choose simple icons that FIT this card's topic and message. "
     "Do NOT default to a computer, monitor, or dashboard every time; pick the everyday "
     "objects relevant to the subject, rendered in the SAME clean house style and palette. "
     "Avoid a dense collage of many icons and boxes.\n"
     "ONE idea per card. No multi panel text blocks, no stacked slogans, no text only "
-    "compositions: the illustration, not typography, carries the card.\n"
+    "compositions.\n"
     "Text: render ONLY the one short headline as large text; small UPPERCASE labels on "
     "icons are one or two words at most; do NOT put body sentences, paragraphs, or the "
     "caption on the image. Overall feel: minimal, modern, high end, brand-consistent, "
-    "easy to read at a glance. Think one clean illustrated diagram, not a busy poster."
+    "easy to read at a glance. Think one clean composition, not a busy poster."
 )
 
 
-def _composition_style(layout):
-    """House style + the per-surface layout block, assembled in the original order so
-    the feed prompt stays exactly what it was."""
-    return f"{_HOUSE_STYLE_LEAD}\n{layout}\n{_HOUSE_STYLE_REST}"
+def _composition_style(archetype="flow", is_story=False):
+    """House style lead + the archetype's structure + the surface fit + the shared
+    rules. The archetype changes the card's STRUCTURE, never its brand."""
+    a = (archetype or "flow").lower()
+    block = ARCHETYPES.get(a, ARCHETYPES["flow"])
+    if is_story:
+        surface = STORY_LAYOUT if a == "flow" else STORY_RECOMPOSE
+    else:
+        surface = FEED_LAYOUT
+    return f"{_HOUSE_STYLE_LEAD}\n{block}\n{surface}\n{_HOUSE_STYLE_REST}"
 
 
-# Kept for compatibility: the feed composition, byte for byte what shipped before.
-COMPOSITION_STYLE = _composition_style(FEED_LAYOUT)
+# Kept for compatibility: the default feed composition (FLOW archetype).
+COMPOSITION_STYLE = _composition_style("flow", False)
 
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
 NO_DASH_RULE = (
@@ -115,7 +182,8 @@ def _scrub_dashes(text):
     return re.sub(r"[ \t]{2,}", " ", cleaned)
 
 
-def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
+def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
+                 archetype=None):
     """
     Build the image prompt from APPROVED input only. The single on-image headline is
     the approved pillar hook (kept short); the approved body lines are passed as CONCEPT
@@ -125,10 +193,12 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
 
     Aspect is PER USE, not a global switch: the defaults are the feed target
     (config.IMAGE_ASPECT / IMAGE_PIXELS, 4:5); a caller like Stories passes its own
-    aspect (9:16) and surface label without changing the feed's target. A Story
-    surface also swaps in the STORY_LAYOUT composition (headline upper third, one
-    centered focal graphic, empty 250 pixel safe zones top and bottom); every other
-    surface keeps the original feed layout.
+    aspect (9:16) and surface label without changing the feed's target.
+
+    `archetype` selects one of the LAYOUT ARCHETYPES (flow, split, hero, path,
+    headline; default flow, the original look). The archetype varies the card's
+    STRUCTURE; the brand system (canvas, palette, line-icon language) never varies.
+    A Story surface recomposes the SAME archetype for 9:16 with the safe zones.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
     # Aspect first and prominent. Config-tunable; per-use overridable.
@@ -136,7 +206,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
     use_pixels = pixels or config.IMAGE_PIXELS
     use_surface = surface or "feed post"
     is_story = "story" in use_surface.lower()
-    composition = _composition_style(STORY_LAYOUT if is_story else FEED_LAYOUT)
+    composition = _composition_style(archetype, is_story)
     aspect = (
         f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
         f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the entire "
@@ -290,7 +360,7 @@ def _default_client():
 
 
 def generate(headline, facts, client=None, out_path=None,
-             aspect=None, pixels=None, surface=None):
+             aspect=None, pixels=None, surface=None, archetype=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -298,15 +368,17 @@ def generate(headline, facts, client=None, out_path=None,
       - facts is empty (the no-fabrication gate)             -> None, no API call
       - no client and no key available                       -> None, no API call
 
-    aspect/pixels/surface are per-use overrides (see build_prompt): the feed keeps
-    its 4:5 default; a Story passes 9:16 for its own call only.
+    aspect/pixels/surface/archetype are per-use overrides (see build_prompt): the
+    feed keeps its 4:5 default; a Story passes 9:16 for its own call only; the
+    archetype varies the composition inside the locked brand (default flow).
     """
     if not config.creative_studio_enabled():
         return None
     if not facts:
         return None
 
-    prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels, surface=surface)
+    prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
+                          surface=surface, archetype=archetype)
 
     client = client or _default_client()
     if client is None:
