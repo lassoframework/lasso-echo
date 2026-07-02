@@ -72,6 +72,7 @@ def _status():
     print(f"  intake         : {config.intake_enabled()}  (env AGENT_INTAKE_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
+    print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
     print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "

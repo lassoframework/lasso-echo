@@ -291,6 +291,16 @@ def summit_campaign_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SUMMIT_CAMPAIGN_ENABLED", "false"))
 
 
+def runway_enabled() -> bool:
+    """
+    Creative runway switch. OFF by default. ON, one line per account per day:
+    days of approved gate-clean content left, green/amber/red, projected zero
+    date; below AGENT_RUNWAY_ALERT_DAYS one debounced ops alert asks for raw
+    material. Read-only over the library and the store; never posts content.
+    """
+    return _truthy(os.environ.get("AGENT_RUNWAY_ENABLED", "false"))
+
+
 def grade_enabled() -> bool:
     """
     Social Grade switch. OFF by default. ON, the reporting assembler adds a per

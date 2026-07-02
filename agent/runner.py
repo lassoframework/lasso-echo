@@ -198,6 +198,18 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 _post_and_save(story, store, poster, idempotent)
                 results.append(story)
 
+    # Creative runway: dormant unless AGENT_RUNWAY_ENABLED. Armed, one line per
+    # account with the day's cards (days of approved content left + projected
+    # zero date); a runway error never takes the draft run down.
+    if config.runway_enabled():
+        from .runway import daily_runway
+        for account in active_accounts():
+            try:
+                daily_runway(account.key, account.library_prefix or lib, day_key,
+                             poster=poster)
+            except Exception as e:
+                print(f"[runway] {account.key}: {type(e).__name__}: {e}")
+
     # Token watchdog: dormant unless AGENT_TOKEN_WATCHDOG_ENABLED. Armed, one
     # READ-ONLY expiry check per daily cycle; a near-expiry token posts one ops
     # alert. A watchdog error never takes the draft run down.

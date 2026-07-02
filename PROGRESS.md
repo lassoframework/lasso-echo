@@ -104,6 +104,10 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       proposal (pillar/archetype/set performance from real data, three angles cited
       only from approved sources, plain raw material ask list). Gate stays
       AGENT_REPORTING_ENABLED (OFF)
+- [~] Creative runway card: days of approved gate-clean content left per account
+      (in-style, unposted, gate-clean only), one daily line with green/amber/red +
+      projected zero date, debounced low-runway ops alert asking for raw material;
+      flag AGENT_RUNWAY_ENABLED OFF, threshold AGENT_RUNWAY_ALERT_DAYS (7)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
