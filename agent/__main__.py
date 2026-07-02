@@ -191,6 +191,23 @@ def main(argv=None):
         # SEPARATE web process (own Railway service). R2 only, never /data.
         from .intake_web import serve
         serve()
+    elif cmd == "draft-bible":
+        # MANUAL onboarding tool: intake doc -> DRAFT bible + social proof under
+        # brand_voice/drafts/<client>/. Never auto-activated; a human copies files.
+        client, intake, args = "", "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--client" and i + 1 < len(args):
+                client = args[i + 1]; i += 2; continue
+            if args[i] == "--intake" and i + 1 < len(args):
+                intake = args[i + 1]; i += 2; continue
+            i += 1
+        if not client or not intake:
+            print("usage: python -m agent draft-bible --client <key> --intake <path>")
+        else:
+            from .bible_drafter import run as draft_bible_run
+            bible_path, proof_path = draft_bible_run(client, intake)
+            print(f"DRAFTS written (review + activate by hand):\n  {bible_path}\n  {proof_path}")
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
