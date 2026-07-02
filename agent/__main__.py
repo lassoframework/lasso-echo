@@ -187,6 +187,10 @@ def main(argv=None):
         _dry_run()
     elif cmd == "intake-doc":
         _intake_doc(argv[1:])
+    elif cmd == "intake-web":
+        # SEPARATE web process (own Railway service). R2 only, never /data.
+        from .intake_web import serve
+        serve()
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":

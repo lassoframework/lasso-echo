@@ -215,6 +215,15 @@ def doc_intake_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))
 
 
+def intake_enabled() -> bool:
+    """
+    Texted-link intake switch (upload page + listener ingest). OFF by default: the
+    upload page 404s everything and the ingest step never runs. Tokens are per-client
+    env values (AGENT_INTAKE_TOKEN_<CLIENTKEY>), set by hand, never logged.
+    """
+    return _truthy(os.environ.get("AGENT_INTAKE_ENABLED", "false"))
+
+
 def social_proof_enabled() -> bool:
     """
     Social proof cards switch. OFF by default (every new capability ships behind a
