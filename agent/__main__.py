@@ -214,6 +214,20 @@ def main(argv=None):
             from .bible_drafter import run as draft_bible_run
             bible_path, proof_path = draft_bible_run(client, intake)
             print(f"DRAFTS written (review + activate by hand):\n  {bible_path}\n  {proof_path}")
+    elif cmd == "regen-library":
+        # MANUAL batch rebuild of the seed library in the v2 house style (never
+        # scheduled, no flag arms it into the daily path). Prints one public URL
+        # per card for the eyeball pass. Nothing it makes can post on its own.
+        only, dry_run, args = None, False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--only" and i + 1 < len(args):
+                only = args[i + 1]; i += 2; continue
+            if args[i] == "--dry-run":
+                dry_run = True
+            i += 1
+        from .regen_library import run as regen_run
+        regen_run(only=only, dry_run=dry_run)
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":

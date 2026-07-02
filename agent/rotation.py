@@ -170,12 +170,16 @@ def choose(account_key, day_key, library_path, poster=None):
     candidates = []  # (key, pillar, kind, payload)
     excluded_dirty = 0
     for c in list_creatives(library_path):
-        if os.path.basename(c.path) in off_style:
+        base = os.path.basename(c.path)
+        if base in off_style:
             continue  # OFF-STYLE (pre house-style card): never selected, never deleted
+        if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
+            continue  # a generated 9:16 story VARIANT (regen convention) is never a
+            # feed candidate; a topic card that merely ends in "story" still rotates
         if not is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded_dirty += 1
             continue
-        candidates.append((os.path.basename(c.path), pillar_of(c.path), "library", c))
+        candidates.append((base, pillar_of(c.path), "library", c))
 
     gen_pillar = None
     plan = content_planner.plan_for(day_key)

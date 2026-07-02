@@ -71,6 +71,12 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       scratch. Seed library swept: ALL 14 slab cards classified OFF-STYLE and held out via
       content_library/style_exclusions.json (nothing deleted; regenerate card by card and
       remove each line to bring the slot back). BLAKE BY HAND: regenerate replacements
+- [~] regen-library CLI (manual, like capture-baseline; no flag, never scheduled): rebuilds
+      the seed library in the v2 house style. 8 non stat concepts (2 with from scratch 9:16
+      story variants), lasso_v2_ files + json sidecars with hosted public_url, prints one URL
+      per card for the eyeball pass; --only <key> single card redo, --dry-run prints prompts
+      free. Story variants never enter feed rotation. BLAKE BY HAND: run it in the container,
+      eyeball every URL, redo misses with --only
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);
