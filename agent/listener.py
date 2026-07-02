@@ -159,6 +159,14 @@ def _daily_scheduler(store):
                 digest.maybe_send(poster, now=now, library_path=config.LIBRARY_PATH)
             except Exception as e:
                 print(f"[digest] pass failed: {type(e).__name__}: {e}")
+        # Nightly brain: one read-only proposal note, dormant unless
+        # AGENT_BRAIN_PROPOSALS_ENABLED. Never crashes the loop.
+        if config.brain_proposals_enabled():
+            try:
+                from . import brain, ops_alerts
+                brain.maybe_send(ops_alerts._default_poster(), now=now)
+            except Exception as e:
+                print(f"[brain] pass failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 

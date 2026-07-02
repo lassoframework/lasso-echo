@@ -145,6 +145,11 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       every gate exclusion (fabrication, consent, style), publish confirms, and every
       ops alert (even when Slack is dormant); reasons pass the secret scrub; `audit`
       CLI prints the readable trail. Always on, no flag: logging truth is not optional
+- [~] Nightly brain (the read only proposer the spec stubbed, now real): one Slack
+      note per night after the digest hour: what is winning (pillar/archetype/set from
+      real engagement), one angle QUOTED from approved sources with its citation
+      (LOCKED knowledge can never appear), one question when data is thin. Proposes,
+      never creates, never schedules; flag AGENT_BRAIN_PROPOSALS_ENABLED OFF
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

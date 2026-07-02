@@ -302,6 +302,15 @@ def trust_ladder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
 
 
+def brain_proposals_enabled() -> bool:
+    """
+    Nightly brain switch. OFF by default. ON, one read-only Slack note per night
+    (the hour after the digest): what is winning, one angle quoted from approved
+    sources, one question when data is thin. Proposes, never creates.
+    """
+    return _truthy(os.environ.get("AGENT_BRAIN_PROPOSALS_ENABLED", "false"))
+
+
 def digest_enabled() -> bool:
     """
     Evening digest switch. OFF by default. ON, one Slack line per day at

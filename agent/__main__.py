@@ -79,6 +79,7 @@ def _status():
     print(f"  autotag        : {config.autotag_enabled()}  (env AGENT_AUTOTAG_ENABLED)")
     print(f"  spend_cap      : {config.spend_cap_enabled()}  (env AGENT_SPEND_CAP_ENABLED)")
     print(f"  digest         : {config.digest_enabled()}  (env AGENT_DIGEST_ENABLED)")
+    print(f"  brain          : {config.brain_proposals_enabled()}  (env AGENT_BRAIN_PROPOSALS_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
     print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "
