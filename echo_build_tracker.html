@@ -166,6 +166,11 @@
         ["Stories draft path: one 9:16 Story per account per day, reuses the day's approved creative, labeled STORY, publish behind BOTH gates (flag OFF)","ready"],
         ["Caption SEO: hook front-loaded, topic-bearing body first, approved lines only (flag OFF)","ready"],
         ["Per-platform variants: IG up to 5 tags, FB at most 2, selection only (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: idempotent daily drafts + card supersede/expire, one draft per account/day/type, stale approve = friendly no-op (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: ops alerts, one ECHO ALERT line per pipeline failure, secrets scrubbed, media_host failures never invisible (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: publish confirmation, Graph read-back + LIVE permalink in the card thread, never re-publishes (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: token watchdog, debug_token expiry check + check-tokens CLI, warns 7 days out, token never printed (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: baseline capture CLI (capture-baseline), 8-week posting history to dated JSON, manual-only by design","done"],
         ["Run master ON, publish OFF, watch drafts","ready"],
         ["Run the full 30-day loop once","todo"],
         ["Arm publishing once drafts look right","todo"],
@@ -418,7 +423,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-01 (overnight: document intake seed built (client PDF to approval-held draft posts, no fabrication, flag OFF), infographics now 4:5 portrait, personal FB dropped; approval gate + publishing still OFF; next: run the 30 day loop, then arm publishing) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-01 (Fable 5 review - Tier 1 hardening: idempotent drafts + supersede/expire, ops alerts, publish confirm, token watchdog all built behind flags OFF; baseline CLI done, manual-only; suite 175 green; approval gate + publishing still OFF) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 

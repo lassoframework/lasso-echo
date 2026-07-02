@@ -18,6 +18,7 @@ from enum import Enum
 from . import config
 from . import content_planner
 from . import media_host
+from . import ops_alerts
 from .accounts import Platform
 from .voice import load_voice
 
@@ -27,6 +28,14 @@ class DraftStatus(Enum):
     BLOCKED = "blocked"      # cannot draft (e.g. no voice doc)
     APPROVED = "approved"
     SKIPPED = "skipped"
+    # Replaced by a newer draft for the same account + day + type (idempotent
+    # re-run whose content changed). Its card is edited to a superseded state and
+    # approving it does nothing (see approvals.handle_action).
+    SUPERSEDED = "superseded"
+    # A PENDING draft whose posting day has passed (idempotent flag ON only): the
+    # next daily run flips it here, edits its card to an expired state, and
+    # approving it does nothing (see approvals.handle_action).
+    EXPIRED = "expired"
 
 
 @dataclass
@@ -53,6 +62,14 @@ class Draft:
     # Stories: True for a 9:16 Story draft so the card and the publisher can never
     # confuse it with a feed post. Feed drafts leave this False.
     is_story: bool = False
+    # Idempotent daily drafts (flag AGENT_IDEMPOTENT_DRAFTS_ENABLED, default OFF):
+    # the (account, day, type) identity of the draft plus the Slack message that
+    # carries its card, so a re-run can find it and a superseding run can edit the
+    # old card in place. All four stay empty while the flag is OFF.
+    day_key: str = ""
+    draft_type: str = ""       # "feed" or "story" (empty while the flag is OFF)
+    slack_channel: str = ""
+    slack_ts: str = ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -231,6 +248,8 @@ def draft_post(account, creative, scheduled_for, voice=None,
     if config.content_brain_enabled() and account.key.startswith("lasso"):
         plan = content_planner.plan_for(date.today().isoformat())
         if plan.get("blocked"):
+            # Surfaced on the Slack card AND (flag ON) as one ops alert.
+            ops_alerts.alert(f"content plan blocked for {account.key}: {plan['reason']}")
             return Draft(
                 draft_id=draft_id,
                 account_key=account.key,

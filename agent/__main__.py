@@ -4,6 +4,8 @@ CLI entrypoint.
   python -m agent run-daily             # draft one post per account, post cards to Slack
   python -m agent dry-run               # run the whole Stage 1 loop OFFLINE, no tokens
   python -m agent intake-doc <path>     # turn a client PDF into draft posts (held for approval)
+  python -m agent check-tokens          # manual token watchdog run (needs the flag armed)
+  python -m agent capture-baseline      # MANUAL, read-only: pre-Echo posting baseline to /data
   python -m agent status                # show flag + gate state
 
 Approval actions are handled by your Slack listener calling
@@ -69,6 +71,11 @@ def _status():
     print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
     print(f"  caption_seo    : {config.caption_seo_enabled()}  (env AGENT_CAPTION_SEO_ENABLED)")
     print(f"  platform_var   : {config.platform_variants_enabled()}  (env AGENT_PLATFORM_VARIANTS_ENABLED)")
+    print(f"  idempotent     : {config.idempotent_drafts_enabled()}  (env AGENT_IDEMPOTENT_DRAFTS_ENABLED)")
+    print(f"  ops_alerts     : {config.ops_alerts_enabled()}  (env AGENT_OPS_ALERTS_ENABLED)")
+    print(f"  publish_confirm: {config.publish_confirm_enabled()}  (env AGENT_PUBLISH_CONFIRM_ENABLED)")
+    print(f"  token_watchdog : {config.token_watchdog_enabled()}  (env AGENT_TOKEN_WATCHDOG_ENABLED, "
+          f"warn at {config.token_warn_days()} days)")
     # posting schedule (2026 cadence)
     print("  -- posting schedule --")
     print(f"  primary time   : {config.POSTING_PRIMARY_TIME}")
@@ -141,6 +148,31 @@ def _intake_doc(args):
         poster.post_approval_card(d)
 
 
+def _check_tokens():
+    """python -m agent check-tokens: manual token watchdog run. Prints which
+    credential and days remaining ONLY; a token value is never printed."""
+    from .token_watchdog import check_tokens
+    out = check_tokens()
+    if out["status"] == "disabled":
+        print("token watchdog is OFF (set AGENT_TOKEN_WATCHDOG_ENABLED=true to arm it). "
+              "Nothing checked.")
+        return
+    print(f"check-tokens: {len(out['results'])} credential(s) checked "
+          f"(warn at {config.token_warn_days()} days)")
+    for r in out["results"]:
+        days = r["days_remaining"]
+        days_str = f"{days} day(s) remaining" if days is not None else "expiry unknown"
+        print(f"  {r['account']}: {r['status']} ({days_str})")
+
+
+def _capture_baseline():
+    """python -m agent capture-baseline: MANUAL, READ-ONLY pre-Echo baseline.
+    Run by hand once; it is never scheduled and never writes to Meta."""
+    from .baseline import capture_baseline
+    print("capture-baseline: reading recent posting history (READ-ONLY, run by hand)")
+    capture_baseline()
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
@@ -154,6 +186,10 @@ def main(argv=None):
         _dry_run()
     elif cmd == "intake-doc":
         _intake_doc(argv[1:])
+    elif cmd == "check-tokens":
+        _check_tokens()
+    elif cmd == "capture-baseline":
+        _capture_baseline()
     elif cmd == "status":
         _status()
     else:

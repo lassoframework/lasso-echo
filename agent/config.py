@@ -205,3 +205,56 @@ def doc_intake_enabled() -> bool:
     is never treated as approved fact and nothing here publishes.
     """
     return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))
+
+
+def idempotent_drafts_enabled() -> bool:
+    """
+    Idempotent daily drafts switch. OFF by default = run-daily behaves exactly as
+    today (a re-run re-drafts and re-cards). ON, run-daily is idempotent per account
+    per day per draft type (feed, story): an unchanged PENDING draft is returned
+    as-is with no new draft and no new card, and a genuinely changed draft
+    SUPERSEDES the old one (the old Slack card is edited to a superseded state and
+    can no longer be approved). Publishing is untouched either way.
+    """
+    return _truthy(os.environ.get("AGENT_IDEMPOTENT_DRAFTS_ENABLED", "false"))
+
+
+def ops_alerts_enabled() -> bool:
+    """
+    Ops alerts switch. OFF by default = failures keep today's behavior (logged
+    only, nothing posted). ON, each silent fallback in the draft pipeline (hosting
+    failed, creative empty, plan blocked, publish failed, store write failed)
+    posts ONE short "ECHO ALERT:" line to the Slack channel. Alerts never carry
+    tokens or secrets (see ops_alerts.scrub). Publishing is untouched either way.
+    """
+    return _truthy(os.environ.get("AGENT_OPS_ALERTS_ENABLED", "false"))
+
+
+def publish_confirm_enabled() -> bool:
+    """
+    Publish confirmation switch. OFF by default = publish behavior is exactly
+    today's (no read-back). ON, after a real publish Echo reads the post back via
+    the Graph API (by media id, a READ), fetches its permalink, and replies it into
+    the card's Slack thread. A failed verify warns in-thread and emits an ops
+    alert. It NEVER re-publishes and never writes to Meta.
+    """
+    return _truthy(os.environ.get("AGENT_PUBLISH_CONFIRM_ENABLED", "false"))
+
+
+def token_watchdog_enabled() -> bool:
+    """
+    Token watchdog switch. OFF by default = no check, no network. ON, once per
+    daily cycle (and via `python -m agent check-tokens`) Echo reads each active
+    account token's expiry via the Graph debug_token endpoint (a READ) and posts
+    an ops alert when expiry is within token_warn_days(). The token itself is
+    never printed, logged, or included in any alert.
+    """
+    return _truthy(os.environ.get("AGENT_TOKEN_WATCHDOG_ENABLED", "false"))
+
+
+def token_warn_days() -> int:
+    """How many days before token expiry the watchdog starts alerting (default 7)."""
+    try:
+        return int(os.environ.get("AGENT_TOKEN_WARN_DAYS", "7"))
+    except ValueError:
+        return 7

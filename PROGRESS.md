@@ -6,10 +6,11 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-01 (FIRST LIVE CARD SHIPPED — Nano Banana infographic generated
-+ R2-hosted + posted to #echoclaude, approval gate proven, publishing still OFF.
-Cleared today: Gemini billing, model env, /data volume, R2 hosting auth, V3 palette,
-clean house style. Next: drop personal FB, run the 30-day loop, then arm publishing.)
+Last updated: 2026-07-01 (Fable 5 review - Tier 1 hardening landed: idempotent daily
+drafts + supersede/expire, ops alerts, publish confirmation, token watchdog, baseline
+CLI. All four flags OFF; suite 175 green. Earlier today: FIRST LIVE CARD SHIPPED —
+Nano Banana infographic generated + R2-hosted + posted to #echoclaude, approval gate
+proven, publishing still OFF.)
 
 ---
 
@@ -58,6 +59,36 @@ clean house style. Next: drop personal FB, run the 30-day loop, then arm publish
       flag AGENT_CAPTION_SEO_ENABLED OFF
 - [~] Per-platform caption variants: IG keeps up to 5 approved tags, FB Page keeps at most 2 at
       the end; selection only from the approved set; flag AGENT_PLATFORM_VARIANTS_ENABLED OFF
+### Fable 5 review - Tier 1 hardening (2026-07-01)
+- [~] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);
+      a same-content re-run returns the existing draft (no duplicate card); changed content
+      SUPERSEDES the old card (edited in place, buttons removed); a pending card whose day
+      passed EXPIRES the same way; stale approve on either = friendly no-op. Flag
+      AGENT_IDEMPOTENT_DRAFTS_ENABLED OFF
+- [~] Ops alerts: one "ECHO ALERT:" line to #echoclaude on hosting failure, empty
+      generation, blocked plan, publish failure, store write failure; media_host no longer
+      swallows exceptions invisibly; secret env values scrubbed from every alert. Flag
+      AGENT_OPS_ALERTS_ENABLED OFF
+- [~] Publish confirmation: after a real publish, one Graph READ verifies the post and
+      replies "LIVE: <permalink>" in the card's thread; a failed verify warns in-thread +
+      one ops alert; never re-publishes. Flag AGENT_PUBLISH_CONFIRM_ENABLED OFF
+- [~] Token watchdog: debug_token expiry check once per daily cycle + CLI
+      `python -m agent check-tokens`; alerts within AGENT_TOKEN_WARN_DAYS (default 7);
+      token value never printed. Flag AGENT_TOKEN_WATCHDOG_ENABLED OFF
+- [x] Baseline capture CLI `python -m agent capture-baseline`: manual-only BY DESIGN
+      (no flag, never scheduled, nothing in the agent imports it); reads 8 weeks of posting
+      history per account, writes dated JSON to /data, prints a summary. Done.
+
+  Env vars to add to .env.example BY HAND (the file is permission-locked for agents):
+  ```
+  # --- Tier 1 hardening (Fable 5 review). Every flag defaults OFF. ---
+  AGENT_IDEMPOTENT_DRAFTS_ENABLED=false  # one draft per (account, day, type); re-runs reuse, changes supersede, stale cards expire
+  AGENT_OPS_ALERTS_ENABLED=false         # one "ECHO ALERT:" Slack line per pipeline failure (secrets scrubbed)
+  AGENT_PUBLISH_CONFIRM_ENABLED=false    # Graph read-back after a real publish; permalink replied in the card thread
+  AGENT_TOKEN_WATCHDOG_ENABLED=false     # daily debug_token expiry check; token value never printed
+  AGENT_TOKEN_WARN_DAYS=7                # days before token expiry the watchdog starts alerting
+  ```
+
 - [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
 - [~] Run master ON / publish OFF, watch daily drafts
 - [ ] Run the full 30-day loop once (see the 30-day IG plan below)

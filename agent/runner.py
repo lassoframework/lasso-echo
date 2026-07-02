@@ -15,12 +15,83 @@ from datetime import datetime, timezone
 from . import config, schedule
 from .accounts import active_accounts
 from .daily_studio import build_daily_infographic_draft
-from .drafter import draft_post
+from .drafter import DraftStatus, draft_post
 from .library import pick_next
 from .postlog import used_creatives_for
 from .slack_surface import SlackPoster
 from .stories import build_story_draft
 from .voice import load_voice
+
+
+def _same_content(a, b):
+    """True when two drafts for the same (account, day, type) carry the same
+    content, i.e. a re-run produced nothing genuinely new."""
+    return (a.caption == b.caption
+            and list(a.hashtags or []) == list(b.hashtags or [])
+            and a.creative_path == b.creative_path
+            and a.creative_public_url == b.creative_public_url
+            and list(a.slides or []) == list(b.slides or [])
+            and list(a.slide_urls or []) == list(b.slide_urls or []))
+
+
+def _reconcile(draft, day_key, draft_type, store, poster):
+    """
+    Idempotency check for one freshly built PENDING draft (flag ON only).
+    Returns (draft_to_post, existing_returned):
+      - no existing PENDING draft for (account, day, type) -> (draft, None): post it.
+      - existing draft with the SAME content -> (None, existing): zero new drafts,
+        zero new cards; the existing draft is the run's result.
+      - existing draft with DIFFERENT content (genuinely new, e.g. flags changed)
+        -> (draft, None) after superseding the old one: its store record flips to
+        SUPERSEDED and its Slack card is edited in place (header rewritten, buttons
+        removed), so only the new card can be approved.
+    """
+    draft.day_key = day_key
+    draft.draft_type = draft_type
+    if draft.status != DraftStatus.PENDING:
+        return draft, None   # blocked drafts surface exactly as today
+    existing = store.find_pending(draft.account_key, day_key, draft_type)
+    if existing is None:
+        return draft, None
+    if _same_content(existing, draft):
+        return None, existing
+    existing.status = DraftStatus.SUPERSEDED
+    store.put(existing)
+    poster.mark_superseded(existing)
+    # Draft ids hash account + creative + schedule, not content, so the superseding
+    # draft can collide with the record it replaces. Suffix until unique so the old
+    # SUPERSEDED record (and its card's buttons) keep pointing at the OLD draft.
+    while store.get(draft.draft_id) is not None:
+        draft.draft_id += "r"
+    return draft, None
+
+
+def _expire_stale(day_key, store, poster):
+    """
+    Expiry sweep (flag ON only): a PENDING draft whose posting day has passed can
+    no longer be approved as that day's post. Flip its record to EXPIRED and edit
+    its Slack card in place (label rewritten, buttons removed), exactly the way a
+    supersede does. Records without a day_key (written before the flag existed)
+    never match and are left untouched.
+    """
+    expired = []
+    for d in store.list_pending():
+        if d.day_key and d.day_key < day_key:
+            d.status = DraftStatus.EXPIRED
+            store.put(d)
+            poster.mark_expired(d)
+            expired.append(d)
+    return expired
+
+
+def _post_and_save(draft, store, poster, idempotent):
+    """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
+    resp = poster.post_approval_card(draft) or {}
+    if idempotent:
+        draft.slack_channel = str(resp.get("channel") or "")
+        draft.slack_ts = str(resp.get("ts") or "")
+    if draft.status.value != "blocked":
+        store.put(draft)
 
 
 def run_daily(poster=None, voice_path=None, library_path=None,
@@ -52,6 +123,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     day_key = when[:10]  # YYYY-MM-DD, the day this post is for
     lib = library_path or config.LIBRARY_PATH
 
+    # Idempotent daily drafts: OFF by default = behavior below is exactly today's.
+    idempotent = config.idempotent_drafts_enabled()
+    if idempotent:
+        # Expire yesterday's still-pending cards before drafting today's.
+        _expire_stale(day_key, store, poster)
+
     for account in (accounts or active_accounts()):
         # Cadence gate FIRST: a skip day (default Saturday) produces no draft and no
         # card for this account.
@@ -68,18 +145,40 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             creative = pick_next(account, lib, used_creatives_for(account.key))
             # Schedule the fallback draft to the same cadence slot.
             draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=voice)
-        poster.post_approval_card(draft)
-        if draft.status.value != "blocked":
-            store.put(draft)
-        results.append(draft)
+
+        existing = None
+        if idempotent:
+            draft, existing = _reconcile(draft, day_key, "feed", store, poster)
+            if draft is None:
+                # Re-run, nothing new: the existing PENDING draft IS the result.
+                # No new draft, no new card.
+                results.append(existing)
+        if draft is not None:
+            _post_and_save(draft, store, poster, idempotent)
+            results.append(draft)
+        feed_draft = draft if draft is not None else existing
 
         # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one
         # 9:16 Story per account reusing the day's creative; PENDING, its own
         # approval card, clearly labeled STORY. Nothing publishes here.
-        story = build_story_draft(account, day_key, feed_draft=draft)
+        story = build_story_draft(account, day_key, feed_draft=feed_draft)
         if story is not None:
-            poster.post_approval_card(story)
-            store.put(story)
-            results.append(story)
+            if idempotent:
+                story, existing_story = _reconcile(story, day_key, "story", store, poster)
+                if story is None:
+                    results.append(existing_story)
+            if story is not None:
+                _post_and_save(story, store, poster, idempotent)
+                results.append(story)
+
+    # Token watchdog: dormant unless AGENT_TOKEN_WATCHDOG_ENABLED. Armed, one
+    # READ-ONLY expiry check per daily cycle; a near-expiry token posts one ops
+    # alert. A watchdog error never takes the draft run down.
+    if config.token_watchdog_enabled():
+        from .token_watchdog import check_tokens
+        try:
+            check_tokens(poster=poster)
+        except Exception as e:
+            print(f"[token-watchdog] check failed: {type(e).__name__}: {e}")
 
     return {"status": "drafted", "drafts": results}

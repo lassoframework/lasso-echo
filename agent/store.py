@@ -13,7 +13,7 @@ backs up, separate from the git-tracked voice doc and config.
 import json
 import os
 
-from . import config
+from . import config, ops_alerts
 from .drafter import Draft, DraftStatus
 
 STORE_PATH_DEFAULT = os.environ.get("AGENT_PENDING_PATH", "pending_drafts.json")
@@ -34,6 +34,11 @@ def _to_dict(d: Draft):
         "source_fragments": d.source_fragments,
         "slides": d.slides,
         "slide_urls": d.slide_urls,
+        "is_story": d.is_story,
+        "day_key": d.day_key,
+        "draft_type": d.draft_type,
+        "slack_channel": d.slack_channel,
+        "slack_ts": d.slack_ts,
     }
 
 
@@ -52,6 +57,11 @@ def _from_dict(r):
         source_fragments=r.get("source_fragments", []),
         slides=r.get("slides", []),
         slide_urls=r.get("slide_urls", []),
+        is_story=bool(r.get("is_story", False)),
+        day_key=r.get("day_key", ""),
+        draft_type=r.get("draft_type", ""),
+        slack_channel=r.get("slack_channel", ""),
+        slack_ts=r.get("slack_ts", ""),
     )
 
 
@@ -69,8 +79,16 @@ class PendingStore:
             return {}
 
     def _save(self, data):
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            # Behavior unchanged (the error still raises); it is just never silent:
+            # logged always, plus one ops alert when the flag is armed.
+            msg = f"store write failed for {self.path}: {type(e).__name__}: {e}"
+            print(f"[store] {ops_alerts.scrub(msg)}")
+            ops_alerts.alert(msg)
+            raise
 
     def put(self, draft: Draft):
         data = self._load()
@@ -95,3 +113,19 @@ class PendingStore:
         data = self._load()
         return [_from_dict(r) for r in data.values()
                 if r.get("status") == DraftStatus.PENDING.value]
+
+    def find_pending(self, account_key, day_key, draft_type):
+        """
+        The PENDING draft for (account, day, type), or None. This is the idempotency
+        lookup: run-daily uses it to return an existing draft instead of creating a
+        duplicate. Only drafts written with the idempotent flag ON carry day_key and
+        draft_type, so older records simply never match.
+        """
+        data = self._load()
+        for r in data.values():
+            if (r.get("status") == DraftStatus.PENDING.value
+                    and r.get("account_key") == account_key
+                    and r.get("day_key") == day_key
+                    and r.get("draft_type") == draft_type):
+                return _from_dict(r)
+        return None

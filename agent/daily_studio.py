@@ -13,7 +13,7 @@ blocked plan returns a BLOCKED Draft. Nothing here publishes — publishing stay
 the approver gate and AGENT_PUBLISH_ENABLED.
 """
 
-from . import config, content_planner, creative_studio, media_host, schedule
+from . import config, content_planner, creative_studio, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id, variant_hashtags
 
 
@@ -28,6 +28,8 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     draft_id = _make_id(account.key, "daily_infographic", day_key)
 
     def _blocked(reason):
+        # A blocked plan surfaces on the Slack card AND (flag ON) as an ops alert.
+        ops_alerts.alert(f"content plan blocked for {account.key}: {reason}")
         return Draft(
             draft_id=draft_id, account_key=account.key, platform=account.platform,
             caption="", hashtags=[], creative_path="", creative_public_url="",
@@ -60,13 +62,18 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
 
     art = creative_studio.generate(headline, facts, client=nano_client)
     if not art:
-        # Acceptable library fallback for now, but make it VISIBLE in run-daily output.
+        # Acceptable library fallback for now, but make it VISIBLE: run-daily output
+        # always, plus one ops alert when AGENT_OPS_ALERTS_ENABLED is armed.
         print(f"[daily-studio] {account.key}: image generation produced nothing; "
               "falling back to library creative.")
+        ops_alerts.alert(f"creative generation returned empty for {account.key}; "
+                         "fell back to a library creative.")
         return None
 
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)
     if not hosted:
+        # media_host already alerted with the exception detail; this line keeps the
+        # existing run-daily visibility for the fallback itself.
         print(f"[daily-studio] {account.key}: media hosting failed (no public URL); "
               "falling back to library creative.")
         return None

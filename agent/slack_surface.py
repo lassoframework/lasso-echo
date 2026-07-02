@@ -37,11 +37,59 @@ class SlackPoster:
         """Plain notice, e.g. 'voice doc missing, not drafting'."""
         return self._chat_post(text=text, blocks=None)
 
-    def _chat_post(self, text, blocks):
+    def post_thread_reply(self, channel, ts, text):
+        """Plain reply inside a card's thread (e.g. the LIVE permalink after a
+        confirmed publish). Falls back to a channel notice when no thread ref."""
+        if not ts:
+            return self.post_notice(text)
+        return self._chat_post(text=text, blocks=None, channel=channel, thread_ts=ts)
+
+    def update_card(self, channel, ts, text, blocks):
+        """Edit an existing card in place via chat.update (e.g. to a SUPERSEDED
+        state). Returns the Slack response dict; {"ok": False} without a ts."""
+        if not ts:
+            return {"ok": False, "error": "no_message_ref"}
         client = self._http or _requests()
-        payload = {"channel": self._channel, "text": text}
+        payload = {"channel": channel or self._channel, "ts": ts, "text": text}
         if blocks:
             payload["blocks"] = blocks
+        resp = client.post(
+            "https://slack.com/api/chat.update",
+            headers={"Authorization": f"Bearer {self._token}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        try:
+            return resp.json()
+        except Exception:
+            return {"ok": False}
+
+    def mark_superseded(self, draft):
+        """Rewrite a superseded draft's card in place: header flipped to SUPERSEDED,
+        buttons gone, one line saying which card to use instead."""
+        return self.update_card(
+            draft.slack_channel, draft.slack_ts,
+            text=f"SUPERSEDED: {draft.account_key} draft {draft.draft_id}",
+            blocks=build_superseded_blocks(draft),
+        )
+
+    def mark_expired(self, draft):
+        """Rewrite an expired draft's card in place: header flipped to EXPIRED,
+        buttons gone, same edit-in-place path as a supersede."""
+        return self.update_card(
+            draft.slack_channel, draft.slack_ts,
+            text=f"EXPIRED: {draft.account_key} draft {draft.draft_id}",
+            blocks=build_expired_blocks(draft),
+        )
+
+    def _chat_post(self, text, blocks, channel=None, thread_ts=None):
+        client = self._http or _requests()
+        payload = {"channel": channel or self._channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
         resp = client.post(
             "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {self._token}",
@@ -152,6 +200,43 @@ def build_card_blocks(draft):
         {"type": "context", "elements": [{"type": "mrkdwn",
          "text": ("Or reply:  `approve " + draft.draft_id + "`  |  `edit " +
                   draft.draft_id + " <your note>`  |  `skip " + draft.draft_id + "`")}]},
+    ]
+
+
+def build_superseded_blocks(draft):
+    """
+    The SUPERSEDED card state: header rewritten, NO buttons (nothing left to tap),
+    one clear line pointing at the newest card. Approving via the reply protocol
+    still hits the approvals gate, which refuses a superseded draft.
+    """
+    kind = "STORY" if getattr(draft, "is_story", False) else "post"
+    return [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": f"SUPERSEDED: {draft.account_key}"}},
+        {"type": "section",
+         "text": {"type": "mrkdwn",
+                  "text": (f":no_entry_sign: This {kind} draft ({draft.draft_id}) was "
+                           "replaced by a newer draft for the same account and day. "
+                           "Use the newest card; this one can no longer be approved.")}},
+    ]
+
+
+def build_expired_blocks(draft):
+    """
+    The EXPIRED card state: header rewritten, NO buttons (nothing left to tap),
+    one clear line saying the posting day passed. Approving via the reply protocol
+    still hits the approvals gate, which refuses an expired draft.
+    """
+    kind = "STORY" if getattr(draft, "is_story", False) else "post"
+    day = getattr(draft, "day_key", "") or "its posting day"
+    return [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": f"EXPIRED: {draft.account_key}"}},
+        {"type": "section",
+         "text": {"type": "mrkdwn",
+                  "text": (f":hourglass: This {kind} draft ({draft.draft_id}) was for "
+                           f"{day} and that day has passed, so it can no longer be "
+                           "approved. Use today's card instead.")}},
     ]
 
 

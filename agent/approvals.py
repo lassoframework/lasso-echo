@@ -12,7 +12,7 @@ from the right person AND (b) the publish flag armed. Both. Always.
 
 from dataclasses import dataclass
 
-from . import config, meta_publisher, gbp_publisher, postlog
+from . import config, meta_publisher, gbp_publisher, ops_alerts, postlog, publish_confirm
 from .accounts import get_account, Platform
 from .drafter import Draft, DraftStatus
 
@@ -39,7 +39,8 @@ def _is_approver(actor_slack_id):
 
 
 def handle_action(action, draft, actor_slack_id, note="",
-                  redraft_fn=None, publisher=None, logger=None, account=None):
+                  redraft_fn=None, publisher=None, logger=None, account=None,
+                  confirmer=None):
     """
     Apply an approval action.
 
@@ -47,6 +48,8 @@ def handle_action(action, draft, actor_slack_id, note="",
     publisher.publish(draft, account)      (injectable; defaults to meta_publisher)
     logger.log_post(...)                   (injectable; defaults to postlog)
     account                                (optional; falls back to registry lookup)
+    confirmer(draft, account, result)      (injectable; defaults to publish_confirm,
+                                            which is a no-op unless its flag is armed)
     """
     # --- approver gate ---
     if not _is_approver(actor_slack_id):
@@ -56,6 +59,19 @@ def handle_action(action, draft, actor_slack_id, note="",
     if draft.status == DraftStatus.BLOCKED:
         return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
                             detail="Draft is blocked; nothing to act on.")
+
+    if draft.status == DraftStatus.SUPERSEDED:
+        # A superseded draft can never publish. One clear line, nothing else happens.
+        return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
+                            detail="This draft was superseded by a newer draft for the "
+                                   "same account and day, so nothing was published. "
+                                   "Use the newest card instead.")
+
+    if draft.status == DraftStatus.EXPIRED:
+        # An expired draft can never publish. Same friendly no-op as a supersede.
+        return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
+                            detail="This draft expired (its posting day has passed), "
+                                   "so nothing was published. Use today's card instead.")
 
     action = (action or "").lower()
 
@@ -79,7 +95,14 @@ def handle_action(action, draft, actor_slack_id, note="",
             return ActionResult(ok=False, action="approve", draft_id=draft.draft_id,
                                 detail=f"Unknown account {draft.account_key}.")
         pub = publisher or _publisher_for(acct)
-        result = pub.publish(draft, acct)   # draft-only guard lives inside publish()
+        try:
+            result = pub.publish(draft, acct)   # draft-only guard lives inside publish()
+        except Exception as e:
+            # Behavior unchanged (the error still raises to the caller); with
+            # AGENT_OPS_ALERTS_ENABLED it also posts one loud ops alert first.
+            ops_alerts.alert(f"publish attempt failed for {draft.account_key} draft "
+                             f"{draft.draft_id}: {type(e).__name__}: {e}")
+            raise
         draft.status = DraftStatus.APPROVED
         # Meta returns media_id, GBP returns post_id — log whichever the result carries.
         post_ref = getattr(result, "media_id", "") or getattr(result, "post_id", "")
@@ -92,6 +115,10 @@ def handle_action(action, draft, actor_slack_id, note="",
             mode=result.mode,                  # "published" or "would_publish"
             draft_id=draft.draft_id,
         )
+        # Publish confirmation loop: dormant behind AGENT_PUBLISH_CONFIRM_ENABLED
+        # (returns None immediately when OFF, and only ever READS when ON).
+        confirm = confirmer or publish_confirm.confirm_publish
+        confirm(draft, acct, result)
         return ActionResult(ok=True, action="approve", draft_id=draft.draft_id,
                             detail=f"{result.mode}: media_id={post_ref or '-'}")
 
