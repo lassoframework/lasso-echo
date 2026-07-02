@@ -108,6 +108,11 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       (in-style, unposted, gate-clean only), one daily line with green/amber/red +
       projected zero date, debounced low-runway ops alert asking for raw material;
       flag AGENT_RUNWAY_ENABLED OFF, threshold AGENT_RUNWAY_ALERT_DAYS (7)
+- [~] Trust ladder as data: per account levels (0 full approval forever by default,
+      1 routine calendar auto AFTER a human approved the monthly calendar), levels
+      hand-edited config only, typos fail safe to 0; DOUBLE GATE via
+      AGENT_TRUST_LADDER_ENABLED (OFF) so nothing changes today; the auto-publish
+      wiring itself stays a deliberate by-hand step. Enforcement unchanged
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

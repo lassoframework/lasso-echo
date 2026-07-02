@@ -291,6 +291,17 @@ def summit_campaign_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SUMMIT_CAMPAIGN_ENABLED", "false"))
 
 
+def trust_ladder_enabled() -> bool:
+    """
+    The trust ladder DOUBLE GATE. OFF by default: every account cards every
+    draft regardless of its configured level (a level typo changes nothing).
+    ON, a level 1 account's drafts inside a human-approved monthly calendar may
+    skip the card WHEN the by-hand publish wiring is also done. Level changes
+    are hand-edited config only, never code.
+    """
+    return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
+
+
 def runway_enabled() -> bool:
     """
     Creative runway switch. OFF by default. ON, one line per account per day:
