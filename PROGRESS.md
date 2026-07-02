@@ -133,6 +133,14 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
 - [~] Social Grade client report card: grade-card CLI renders the computed grade
       (A to F + six area rubric + before/after posting frequency) as one page V3
       HTML + PDF from live store data; respects AGENT_GRADE_ENABLED; drafts nothing
+- [~] DAM v1: consent guard (fail safe: people=true needs consent=granted, unknown
+      excluded; absolute in rotation + runway; flag AGENT_CONSENT_GUARD_ENABLED OFF;
+      arming an untagged library excludes everything until tagged, by design),
+      perceptual near-dupe collapse (dam-scan marks dupe_group sidecars; rotation
+      keys on the group so the window blocks near-identical reposts), auto-tag (one
+      Gemini vision call per new asset: tags + people flag + description; low
+      confidence marks review=true; counts against the spend cap; flag
+      AGENT_AUTOTAG_ENABLED OFF)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

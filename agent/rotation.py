@@ -251,6 +251,7 @@ def choose(account_key, day_key, library_path, poster=None):
     off_style = style_exclusions(library_path)
     candidates = []  # (key, pillar, kind, payload)
     excluded_dirty = 0
+    from . import dam
     for c in list_creatives(library_path):
         base = os.path.basename(c.path)
         if base in off_style:
@@ -258,10 +259,13 @@ def choose(account_key, day_key, library_path, poster=None):
         if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
             continue  # a generated 9:16 story VARIANT (regen convention) is never a
             # feed candidate; a topic card that merely ends in "story" still rotates
+        if dam.consent_blocked(c.path):
+            continue  # consent guard (fail safe): the card path never sees it
         if not is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded_dirty += 1
             continue
-        candidates.append((base, pillar_of(c.path), "library", c))
+        # near-dupes share a rotation key, so the window blocks the whole group
+        candidates.append((dam.rotation_key(c.path), pillar_of(c.path), "library", c))
 
     gen_pillar = None
     plan = content_planner.plan_for(day_key)
@@ -344,7 +348,8 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
         from . import schedule
         draft = draft_post(account, payload, schedule.scheduled_for(day_key), voice=voice)
         if draft.status.value != "blocked":
-            record_served(account.key, os.path.basename(payload.path),
+            from . import dam
+            record_served(account.key, dam.rotation_key(payload.path),
                           pillar_of(payload.path), day_key,
                           archetype=sidecar_archetype(payload.path),
                           set_name=sidecar_set(payload.path))

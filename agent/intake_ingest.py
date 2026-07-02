@@ -186,6 +186,13 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 manifest["phash"].append(ph)
             r2.delete(key)
             stats["accepted"] += 1
+            # DAM auto-tag on the freshly filed asset (AGENT_AUTOTAG_ENABLED,
+            # OFF by default; errors are contained inside autotag)
+            try:
+                from . import dam
+                dam.autotag(os.path.join(lib_dir, name))
+            except Exception:
+                pass
         except Exception as e:
             stats["deadlettered"] += 1
             try:

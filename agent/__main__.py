@@ -75,6 +75,8 @@ def _status():
     print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")
     print(f"  trust_ladder   : {config.trust_ladder_enabled()}  (env AGENT_TRUST_LADDER_ENABLED)")
     print(f"  ocr_check      : {config.ocr_check_enabled()}  (env AGENT_OCR_CHECK_ENABLED)")
+    print(f"  consent_guard  : {config.consent_guard_enabled()}  (env AGENT_CONSENT_GUARD_ENABLED)")
+    print(f"  autotag        : {config.autotag_enabled()}  (env AGENT_AUTOTAG_ENABLED)")
     print(f"  spend_cap      : {config.spend_cap_enabled()}  (env AGENT_SPEND_CAP_ENABLED)")
     print(f"  digest         : {config.digest_enabled()}  (env AGENT_DIGEST_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
@@ -249,6 +251,24 @@ def main(argv=None):
         else:
             from .onboard import add_client
             add_client(key, name)
+    elif cmd == "dam-scan":
+        # MANUAL DAM pass over the library: mark perceptual near-dupe groups in
+        # sidecars, and (when AGENT_AUTOTAG_ENABLED) tag untagged assets.
+        from . import config as _cfg
+        from .dam import autotag, mark_near_dupes, read_sidecar
+        lib = _cfg.LIBRARY_PATH
+        groups = mark_near_dupes(lib)
+        print(f"dam-scan: {len(groups)} near-dupe group(s) marked")
+        if _cfg.autotag_enabled():
+            import os as _os
+            tagged = 0
+            for name in sorted(_os.listdir(lib)):
+                path = _os.path.join(lib, name)
+                if (_os.path.splitext(name)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")
+                        and "people" not in read_sidecar(path)):
+                    if autotag(path):
+                        tagged += 1
+            print(f"dam-scan: {tagged} asset(s) tagged")
     elif cmd == "grade-card":
         # One page Social Grade card (HTML + PDF) from live store data. Respects
         # AGENT_GRADE_ENABLED; drafts nothing, posts nothing.

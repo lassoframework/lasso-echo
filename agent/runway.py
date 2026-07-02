@@ -55,6 +55,9 @@ def eligible_creatives(account_key, library_path):
             continue
         if not rotation.is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             continue
+        from . import dam
+        if dam.consent_blocked(c.path):
+            continue  # consent guard counts against runway too
         out.append(c)
     return out
 

@@ -311,6 +311,25 @@ def digest_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DIGEST_ENABLED", "false"))
 
 
+def consent_guard_enabled() -> bool:
+    """
+    Consent guard switch. OFF by default. ON, FAIL SAFE: an asset is selectable
+    only when its sidecar says people=false, or people=true with
+    consent="granted". Unknown = excluded. Arming on an untagged library
+    excludes everything until assets are tagged; that is the guard working.
+    """
+    return _truthy(os.environ.get("AGENT_CONSENT_GUARD_ENABLED", "false"))
+
+
+def autotag_enabled() -> bool:
+    """
+    Auto-tag switch. OFF by default. ON, one lowest-cost Gemini vision call per
+    new asset writes tags + people flag + description into the sidecar; low
+    confidence marks review=true. Counts against the daily Gemini spend cap.
+    """
+    return _truthy(os.environ.get("AGENT_AUTOTAG_ENABLED", "false"))
+
+
 def ocr_check_enabled() -> bool:
     """
     Headline OCR check switch. OFF by default. ON, a rendered card's headline is
