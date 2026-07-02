@@ -16,6 +16,7 @@ from . import config, schedule
 from .accounts import active_accounts
 from .daily_studio import build_daily_infographic_draft
 from .social_proof import build_social_proof_draft
+from .summit import build_summit_draft
 from .drafter import DraftStatus, draft_post
 from .library import pick_next
 from .postlog import used_creatives_for
@@ -152,6 +153,10 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # dormant otherwise; None -> the normal paths below run untouched.
         if account.key.startswith("lasso"):
             draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
+        # Summit campaign next (its own weekly day, inside the same daily cadence,
+        # never additional). Dormant unless armed; auto-stops after 2026-11-08.
+        if draft is None and account.key.startswith("lasso"):
+            draft = build_summit_draft(account, day_key, voice=acct_voice)
         # For a LASSO account, try the fully-automated infographic path next. It is
         # dormant unless all three flags are armed; None -> fall back to the library
         # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)

@@ -215,6 +215,37 @@ def doc_intake_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))
 
 
+# The LASSO knowledge brain: approved source files under brand_voice/knowledge/.
+KNOWLEDGE_DIR = os.environ.get("AGENT_KNOWLEDGE_DIR", "brand_voice/knowledge")
+
+# Summit campaign constants (04_summit_campaign.md is the only drafting source).
+SUMMIT_CTA = "Claim your seat"
+SUMMIT_URL = "https://lassoframework.com/summit"
+SUMMIT_END_DATE = "2026-11-08"          # campaign auto-stops after this day
+SUMMIT_DAY = os.environ.get("AGENT_SUMMIT_DAY", "tue").lower()  # the weekly slot
+
+
+def knowledge_enabled() -> bool:
+    """
+    Knowledge brain switch. OFF by default. ON, the drafter may draw facts, hooks,
+    pillars, and angles from brand_voice/knowledge/ under hard gates parsed from
+    the files themselves: LOCKED / PENDING / NOT FOUND content and *_pending.md
+    files are NEVER drafting sources; only USE-marked stats may appear in copy,
+    wording matched exactly.
+    """
+    return _truthy(os.environ.get("AGENT_KNOWLEDGE_ENABLED", "false"))
+
+
+def summit_campaign_enabled() -> bool:
+    """
+    Summit campaign switch. OFF by default. ON, one summit post per week enters the
+    plan (inside the daily cadence, never additional), drafted ONLY from the
+    VERIFIED FACTS and APPROVED ANGLES blocks of 04_summit_campaign.md, rotating
+    angles. Auto-stops after SUMMIT_END_DATE.
+    """
+    return _truthy(os.environ.get("AGENT_SUMMIT_CAMPAIGN_ENABLED", "false"))
+
+
 def grade_enabled() -> bool:
     """
     Social Grade switch. OFF by default. ON, the reporting assembler adds a per

@@ -117,6 +117,16 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       flag AGENT_GRADE_ENABLED OFF
 - [x] Meta App Review kit (docs/META_APP_REVIEW_KIT.md, permissions derived from code) +
       Stage 2 onboarding runbook (docs/STAGE2_RUNBOOK.md)
+- [~] Knowledge brain: brand_voice/knowledge/ as gated source material (LOCKED / PENDING /
+      NOT FOUND and *_pending.md never draft; only USE-marked stats in copy, wording exact;
+      03_social_proof_pending.md excluded, proof flows only through social_proof.md);
+      flag AGENT_KNOWLEDGE_ENABLED OFF. BLAKE BY HAND: the echo_brain folder was not found
+      on disk, so brand_voice/knowledge/ is empty; drop the files in and commit
+- [~] Summit campaign: one summit post per week inside the daily cadence (summit day, default
+      Tue), drafted ONLY from 04_summit_campaign.md VERIFIED FACTS + APPROVED ANGLES, angle
+      rotation (no repeat within 3 weeks), CTA "Claim your seat" +
+      https://lassoframework.com/summit, auto-stops after 2026-11-08;
+      flag AGENT_SUMMIT_CAMPAIGN_ENABLED OFF
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
