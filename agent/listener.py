@@ -110,7 +110,9 @@ def _daily_scheduler(store):
     Railway cron service instead and disable this with AGENT_SCHEDULER_ENABLED=false.
     """
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
+    ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
+    last_ingest = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -118,6 +120,15 @@ def _daily_scheduler(store):
             _fire_daily(store, today)
             last_run_date = today
             _write_last_run_date(today)
+        # Intake ingest: dormant unless AGENT_INTAKE_ENABLED. Runs INSIDE this
+        # listener (the one process with /data + R2); an error never kills the loop.
+        if config.intake_enabled() and time.monotonic() - last_ingest >= ingest_every:
+            last_ingest = time.monotonic()
+            try:
+                from . import intake_ingest
+                intake_ingest.process_all()
+            except Exception as e:
+                print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 
