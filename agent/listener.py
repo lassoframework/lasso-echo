@@ -111,8 +111,10 @@ def _daily_scheduler(store):
     """
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
+    opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_ingest = 0.0
+    last_opus = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -129,6 +131,16 @@ def _daily_scheduler(store):
                 intake_ingest.process_all()
             except Exception as e:
                 print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
+        # Opus Clip poll: FULLY INERT unless BOTH AGENT_OPUS_ENABLED and
+        # AGENT_OPUS_POLL_ENABLED are armed. Errors alert (inside pull), never crash.
+        if (config.opus_enabled() and config.opus_poll_enabled()
+                and time.monotonic() - last_opus >= opus_every):
+            last_opus = time.monotonic()
+            try:
+                from . import opus_ingest
+                opus_ingest.pull()
+            except Exception as e:
+                print(f"[opus] poll pass failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 

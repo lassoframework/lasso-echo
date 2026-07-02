@@ -241,6 +241,35 @@ def rotation_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ROTATION_ENABLED", "false"))
 
 
+# ---- Opus Clip ingest (documented API: https://help.opus.pro/api-reference) ----
+# Auth is a Bearer key read lazily by NAME (never logged, never printed); the
+# optional org id header covers multi-org accounts. Discovery: the API has NO bulk
+# project listing, so we pull clips from pinned project ids and/or collections.
+OPUS_API_BASE = os.environ.get("AGENT_OPUS_API_BASE", "https://api.opus.pro")
+OPUS_API_KEY_ENV = "OPUS_API_KEY"  # name of the env var, not the value
+OPUS_ORG_ID = os.environ.get("AGENT_OPUS_ORG_ID", "")
+OPUS_PROJECT_IDS = _csv_list("AGENT_OPUS_PROJECT_IDS", [])
+OPUS_COLLECTION_IDS = _csv_list("AGENT_OPUS_COLLECTION_IDS", [])
+
+
+def opus_enabled() -> bool:
+    """
+    Opus Clip ingest switch. OFF by default: pull-opus is a no-op and nothing is
+    fetched. ON, finished clips are pulled, hosted, and filed as video assets that
+    become Reel DRAFTS through the normal path (held for approval like everything).
+    """
+    return _truthy(os.environ.get("AGENT_OPUS_ENABLED", "false"))
+
+
+def opus_poll_enabled() -> bool:
+    """
+    The scheduled Opus poll switch (listener loop). OFF by default and fully inert.
+    ON (with AGENT_OPUS_ENABLED also on), the listener runs the same ingest every
+    AGENT_OPUS_POLL_MINUTES (default 60).
+    """
+    return _truthy(os.environ.get("AGENT_OPUS_POLL_ENABLED", "false"))
+
+
 def knowledge_enabled() -> bool:
     """
     Knowledge brain switch. OFF by default. ON, the drafter may draw facts, hooks,

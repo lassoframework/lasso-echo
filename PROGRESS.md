@@ -84,6 +84,16 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       daily Nano cards rotate archetypes deterministically; rotation logs the served
       archetype and softly prefers alternation (never overrides the no repeat window or
       the fabrication gate)
+- [~] Opus Clip ingest: pulls finished clips via the documented API (Bearer key
+      OPUS_API_KEY by hand; discovery = pinned AGENT_OPUS_PROJECT_IDS + collections since
+      the API has no bulk project listing; webhooks are outbound only so polling it is).
+      CLI `pull-opus` (manual first): watermark on /data, sha256 dedupe, R2 hosting, video
+      asset + sidecar (source=opus, clip id, title, duration, pulled, note = the clip's
+      own title/words), one URL printed per clip. Clip drafts as a Reel through the normal
+      path, held for approval; video is its own rotation pillar. Dormant poll behind
+      AGENT_OPUS_POLL_ENABLED (interval AGENT_OPUS_POLL_MINUTES, default 60), failed clips
+      retry then dead-letter with one ops alert. Flags AGENT_OPUS_ENABLED +
+      AGENT_OPUS_POLL_ENABLED, both OFF
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

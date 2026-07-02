@@ -85,9 +85,12 @@ def _days_ago(day_key, n):
 
 # ---- candidate metadata ---------------------------------------------------------
 def pillar_of(creative_path):
-    """The pillar family a library asset belongs to (lasso_p1_* .. p4), else the
-    filename stem's first token as a coarse family, else 'misc'."""
+    """The pillar family a library asset belongs to. VIDEO is its own pillar, so a
+    clip day and an infographic day alternate naturally under the pillar rule. Then
+    the lasso_p1_* .. p4 filename families, else the stem's first token, else misc."""
     base = os.path.basename(creative_path or "")
+    if os.path.splitext(base)[1].lower() in (".mp4", ".mov"):
+        return "video"
     m = _PILLAR_RE.search(base)
     if m:
         return m.group(1).lower()

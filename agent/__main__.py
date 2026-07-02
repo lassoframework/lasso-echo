@@ -72,6 +72,8 @@ def _status():
     print(f"  intake         : {config.intake_enabled()}  (env AGENT_INTAKE_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
+    print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
+    print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "
           f"window {config.ROTATION_WINDOW_DAYS}d)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
@@ -226,6 +228,17 @@ def main(argv=None):
             print(err)
         else:
             regen_run(only=only, dry_run=dry_run)
+    elif cmd == "pull-opus":
+        # MANUAL Opus Clip ingest: list new finished clips since the watermark,
+        # host to R2, file as video assets (future Reel DRAFTS via the normal
+        # path). Nothing publishes; the key is env-only and never printed.
+        from .opus_ingest import pull as opus_pull
+        out = opus_pull()
+        if out is None:
+            print("opus ingest is OFF (set AGENT_OPUS_ENABLED=true to arm it). Nothing done.")
+        else:
+            print(f"pull-opus: {out['pulled']} pulled, {out['skipped']} skipped, "
+                  f"{out['failed']} failed")
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
