@@ -76,6 +76,7 @@ def _status():
     print(f"  trust_ladder   : {config.trust_ladder_enabled()}  (env AGENT_TRUST_LADDER_ENABLED)")
     print(f"  ocr_check      : {config.ocr_check_enabled()}  (env AGENT_OCR_CHECK_ENABLED)")
     print(f"  spend_cap      : {config.spend_cap_enabled()}  (env AGENT_SPEND_CAP_ENABLED)")
+    print(f"  digest         : {config.digest_enabled()}  (env AGENT_DIGEST_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
     print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "

@@ -302,6 +302,15 @@ def trust_ladder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
 
 
+def digest_enabled() -> bool:
+    """
+    Evening digest switch. OFF by default. ON, one Slack line per day at
+    AGENT_DIGEST_HOUR_UTC (default 23): drafted / approved / published /
+    blocked / runway. A ten second read; posts nothing else.
+    """
+    return _truthy(os.environ.get("AGENT_DIGEST_ENABLED", "false"))
+
+
 def ocr_check_enabled() -> bool:
     """
     Headline OCR check switch. OFF by default. ON, a rendered card's headline is

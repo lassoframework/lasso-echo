@@ -150,6 +150,15 @@ def _daily_scheduler(store):
                 opus_ingest.pull()
             except Exception as e:
                 print(f"[opus] poll pass failed: {type(e).__name__}: {e}")
+        # Evening digest: one line per day at AGENT_DIGEST_HOUR_UTC, dormant
+        # unless AGENT_DIGEST_ENABLED. Never crashes the loop.
+        if config.digest_enabled():
+            try:
+                from . import digest, ops_alerts
+                poster = ops_alerts._default_poster()
+                digest.maybe_send(poster, now=now, library_path=config.LIBRARY_PATH)
+            except Exception as e:
+                print(f"[digest] pass failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 

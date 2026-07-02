@@ -123,6 +123,9 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       (per day counter in the store, at AGENT_GEMINI_DAILY_CAP default 40 generation
       pauses for the day with one ops alert and library-only selection takes over;
       flag AGENT_SPEND_CAP_ENABLED OFF)
+- [~] Evening digest: one Slack line per day at AGENT_DIGEST_HOUR_UTC (default 23):
+      drafted / approved / published / blocked / runway days, assembled from the /data
+      store; sent mark persisted (restart never double-sends); flag AGENT_DIGEST_ENABLED OFF
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
