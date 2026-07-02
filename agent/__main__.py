@@ -218,16 +218,14 @@ def main(argv=None):
         # MANUAL batch rebuild of the seed library in the v2 house style (never
         # scheduled, no flag arms it into the daily path). Prints one public URL
         # per card for the eyeball pass. Nothing it makes can post on its own.
-        only, dry_run, args = None, False, argv[1:]
-        i = 0
-        while i < len(args):
-            if args[i] == "--only" and i + 1 < len(args):
-                only = args[i + 1]; i += 2; continue
-            if args[i] == "--dry-run":
-                dry_run = True
-            i += 1
-        from .regen_library import run as regen_run
-        regen_run(only=only, dry_run=dry_run)
+        # STRICT parsing: a typo or unsupported form errors out loudly; it can
+        # never silently fall through to the full 10-card batch.
+        from .regen_library import parse_args, run as regen_run
+        only, dry_run, err = parse_args(argv[1:])
+        if err:
+            print(err)
+        else:
+            regen_run(only=only, dry_run=dry_run)
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":

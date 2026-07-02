@@ -90,6 +90,50 @@ def test_unknown_concept_is_a_clear_noop(monkeypatch, tmp_path):
     assert out == {} and os.listdir(lib) == []
 
 
+# ---- the --only bug: CLI parsing must never fall through to the full batch ------
+def test_parse_args_supports_both_only_forms():
+    assert regen_library.parse_args(["--only", "three_step_path"]) == ("three_step_path", False, None)
+    assert regen_library.parse_args(["--only=three_step_path"]) == ("three_step_path", False, None)
+    assert regen_library.parse_args(["--dry-run"]) == (None, True, None)
+    assert regen_library.parse_args([]) == (None, False, None)
+
+
+def test_parse_args_errors_loudly_never_full_batch():
+    # a typo'd flag is an ERROR, not a silent 10-card batch
+    only, dry, err = regen_library.parse_args(["--onyl", "three_step_path"])
+    assert err and "unrecognized" in err
+    # an unknown concept is an ERROR listing the known keys
+    only, dry, err = regen_library.parse_args(["--only=not_a_concept"])
+    assert err and "known concepts" in err
+
+
+def test_only_calls_generator_for_exactly_that_concept(monkeypatch, tmp_path, capsys):
+    lib = _arm(monkeypatch, tmp_path)
+    nano = FakeNano()
+    out = regen_library.run(only="three_step_path", nano_client=nano,
+                            s3_client=FakeS3(), out_dir=lib)
+    # generator called exactly twice: the feed card + its story variant
+    assert nano.calls == 2
+    assert list(out) == ["three_step_path"]
+    pngs = sorted(p for p in os.listdir(lib) if p.endswith(".png"))
+    assert pngs == ["lasso_v2_three_step_path.png", "lasso_v2_three_step_path_story.png"]
+    # output: the ONLY header + only this concept's URLs, no full-library listing
+    printed = capsys.readouterr().out
+    assert "regenerating ONLY three_step_path" in printed
+    assert printed.count("https://cdn.echo.test/") == 2
+    for other in ("one_screen", "built_by_gym_owners", "posting_cadence"):
+        assert other not in printed
+
+
+def test_only_overwrites_the_old_card_fresh(monkeypatch, tmp_path):
+    lib = _arm(monkeypatch, tmp_path)
+    old = tmp_path / "library" / "lasso_v2_three_step_path.png"
+    old.write_bytes(b"OLD BYTES")
+    regen_library.run(only="three_step_path", nano_client=FakeNano(),
+                      s3_client=FakeS3(), out_dir=lib)
+    assert old.read_bytes() != b"OLD BYTES"      # regenerated, not re-listed
+
+
 # ---- --dry-run spends nothing --------------------------------------------------
 def test_dry_run_spends_nothing(monkeypatch, tmp_path, capsys):
     lib = _arm(monkeypatch, tmp_path)

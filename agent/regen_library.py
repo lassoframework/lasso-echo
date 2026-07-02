@@ -94,6 +94,38 @@ CONCEPTS = {
 }
 
 
+def parse_args(args):
+    """
+    STRICT CLI parsing for regen-library. Supports `--only KEY`, `--only=KEY`,
+    and `--dry-run`. Returns (only, dry_run, error). Any unrecognized token is an
+    ERROR, never a silent fall-through: a typo'd --only must NOT quietly run the
+    full 10-card batch (the exact live bug this guards against).
+    """
+    only, dry_run = None, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--only" and i + 1 < len(args):
+            only = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--only="):
+            only = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        return None, False, (f"unrecognized argument: {a}\n"
+                             "usage: python -m agent regen-library "
+                             "[--only <concept>] [--dry-run]")
+    if only is not None and only not in CONCEPTS:
+        return None, False, (f"unknown concept: {only}\n"
+                             "known concepts: " + ", ".join(CONCEPTS))
+    return only, dry_run, None
+
+
 def assemble_prompts(key):
     """[(variant, prompt)] for one concept through the LOCKED house-style spec."""
     spec = CONCEPTS[key]
@@ -130,6 +162,11 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
         print(f"unknown concept(s): {', '.join(unknown)}")
         print("known concepts: " + ", ".join(CONCEPTS))
         return {}
+    if only:
+        # Single-concept mode: regenerate ONLY this concept fresh (its story
+        # variant included) and print only its new URL(s). Never the full library.
+        print(f"regenerating ONLY {only} "
+              f"({'feed + story' if CONCEPTS[only].get('story') else 'feed'})")
 
     out_dir = out_dir or config.LIBRARY_PATH
     results = {}
