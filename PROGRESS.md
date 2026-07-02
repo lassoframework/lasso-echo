@@ -101,6 +101,16 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       service days (never overriding the window, pillar rule, or fabrication gate).
       Unsupported lines swapped for sourced wording; the 30 day review concept was
       dropped entirely (no approved source) and replaced with website_done_for_you
+- [x] Story first cards (the stranger test): every card depicts a concrete gym world
+      scene with a TENSION and a RESOLUTION readable at a glance; meaningful labels
+      (LEADS, BOOKED, MEMBERS), generic process labels banned (STEP N, PLAN, GROW,
+      LEARN, DISCOVER, LAUNCH, START, FINISH); all 16 concept contexts rewritten as
+      Tension/Resolution micro stories modeled on follow_up_problem
+- [x] BE CLEAR, NOT CUTE headline law: headlines state plainly what the card is about
+      or what LASSO does; two second test in the spec; six slogan headlines rewritten
+      to plain statements (three_step_path, posting_cadence, speed_to_lead_concept,
+      system_runs_itself, coach_in_your_corner, one_partner); approved voice framings
+      stay verbatim. BLAKE BY HAND: rerun regen-library for the story first batch
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

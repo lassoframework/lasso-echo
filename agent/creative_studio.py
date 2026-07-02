@@ -110,6 +110,17 @@ STORY_REQUIREMENT = (
     "image alone."
 )
 
+# BE CLEAR, NOT CUTE: the copy law on top of the story requirement. Applies to
+# every headline on every card, both concept sets.
+CLEAR_HEADLINE_LAW = (
+    "Headline law, BE CLEAR, NOT CUTE: the headline states plainly what the card "
+    "is about or what LASSO does. No slogans, no aphorisms, no wordplay, no clever "
+    "compression. If a stranger must decode it, it fails. The two second test: a "
+    "gym owner scrolling at speed understands the card's point from the headline "
+    "plus the image in two seconds. Headline says it plainly, image shows it "
+    "concretely, labels mean something: all three or the card fails."
+)
+
 # The order daily generated cards walk through (rotating, never random).
 ARCHETYPE_ORDER = ["flow", "hero", "split", "path", "headline"]
 
@@ -177,8 +188,8 @@ def _composition_style(archetype="flow", is_story=False):
         surface = STORY_LAYOUT if a == "flow" else STORY_RECOMPOSE
     else:
         surface = FEED_LAYOUT
-    return (f"{_HOUSE_STYLE_LEAD}\n{block}\n{STORY_REQUIREMENT}\n{surface}\n"
-            f"{_HOUSE_STYLE_REST}")
+    return (f"{_HOUSE_STYLE_LEAD}\n{block}\n{STORY_REQUIREMENT}\n"
+            f"{CLEAR_HEADLINE_LAW}\n{surface}\n{_HOUSE_STYLE_REST}")
 
 
 # Kept for compatibility: the default feed composition (FLOW archetype).

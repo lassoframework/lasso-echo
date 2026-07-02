@@ -60,7 +60,7 @@ CONCEPTS = {
         "archetype": "hero",
     },
     "three_step_path": {
-        "headline": "Three steps. One path.",
+        "headline": "How gyms grow with LASSO",
         "concept": ["Tension: at the bottom of the path an empty gym floor with scattered leads, labeled LEADS.",
                     "Resolution: the path climbs through a working follow up system labeled SYSTEM to a full gym floor labeled MEMBERS."],
         "story": True,
@@ -76,7 +76,7 @@ CONCEPTS = {
         "archetype": "split",
     },
     "posting_cadence": {
-        "headline": "Consistency beats intensity.",
+        "headline": "Post every day. Grow every month.",
         "concept": ["Tension: a gym page gone quiet, an empty calendar, nobody watching.",
                     "Resolution: the same page posting daily, the calendar full, people engaging. No counts, no percentages."],
         "story": False,
@@ -84,7 +84,7 @@ CONCEPTS = {
         "archetype": "split",
     },
     "speed_to_lead_concept": {
-        "headline": "Speed to lead wins.",
+        "headline": "Answer leads fast. Close more of them.",
         "concept": ["Tension: a new lead's message sits unanswered while a clock runs and the lead drifts toward another gym.",
                     "Resolution: the gym that answers first welcomes that lead at the door. No hours or minutes claim text."],
         "story": False,
@@ -92,7 +92,7 @@ CONCEPTS = {
         "archetype": "hero",
     },
     "system_runs_itself": {
-        "headline": "The system runs itself.",
+        "headline": "Your follow up runs on autopilot",
         "concept": ["Tension: the owner used to be chained to the front desk, chasing leads instead of coaching.",
                     "Resolution: now they coach members on the floor while behind them a small machine quietly posts, follows up, and books."],
         "story": False,
@@ -100,7 +100,7 @@ CONCEPTS = {
         "archetype": "flow",
     },
     "coach_in_your_corner": {
-        "headline": "A coach in your corner.",
+        "headline": "We coach your sales team",
         "concept": ["Tension: an owner slumped at a messy desk, out of answers.",
                     "Resolution: a guide beside them handing over one simple visible plan, the owner sitting up."],
         "story": False,
@@ -156,7 +156,7 @@ CONCEPTS = {
         "archetype": "split",
     },
     "one_partner": {
-        "headline": "Ads, sales, and social. One place.",
+        "headline": "Ads, sales, and social in one place",
         "concept": ["Tension: an owner juggling separate vendors for ads, for sales, for social, arms full.",
                     "Resolution: three streams labeled ADS, SALES, SOCIAL flowing into one LASSO mark, all in one place, done for you."],
         "story": False,
