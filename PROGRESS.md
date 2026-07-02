@@ -94,6 +94,13 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       AGENT_OPUS_POLL_ENABLED (interval AGENT_OPUS_POLL_MINUTES, default 60), failed clips
       retry then dead-letter with one ops alert. Flags AGENT_OPUS_ENABLED +
       AGENT_OPUS_POLL_ENABLED, both OFF
+- [x] Service concept set for regen-library: 8 source-verified service cards (ads,
+      follow up, lead to member path, sales training, funnel diagnostic, social,
+      all in one place, website), archetypes assigned none more than twice; --set
+      brand|service|all; sidecars record set; rotation softly alternates brand and
+      service days (never overriding the window, pillar rule, or fabrication gate).
+      Unsupported lines swapped for sourced wording; the 30 day review concept was
+      dropped entirely (no approved source) and replaced with website_done_for_you
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

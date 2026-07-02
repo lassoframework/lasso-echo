@@ -58,9 +58,9 @@ def _arm(monkeypatch, tmp_path):
 def test_batch_writes_v2_files_and_sidecars(monkeypatch, tmp_path):
     lib = _arm(monkeypatch, tmp_path)
     out = regen_library.run(nano_client=FakeNano(), s3_client=FakeS3(), out_dir=lib)
-    assert len(out) == 8
+    assert len(out) == 16                                    # brand 8 + service 8
     pngs = sorted(p for p in os.listdir(lib) if p.endswith(".png"))
-    assert len(pngs) == 10                                   # 8 feed + 2 story variants
+    assert len(pngs) == 18                                   # 16 feed + 2 story variants
     assert all(p.startswith("lasso_v2_") for p in pngs)
     assert "lasso_v2_built_by_gym_owners_story.png" in pngs  # the two +STORY concepts
     assert "lasso_v2_three_step_path_story.png" in pngs
@@ -92,19 +92,24 @@ def test_unknown_concept_is_a_clear_noop(monkeypatch, tmp_path):
 
 # ---- the --only bug: CLI parsing must never fall through to the full batch ------
 def test_parse_args_supports_both_only_forms():
-    assert regen_library.parse_args(["--only", "three_step_path"]) == ("three_step_path", False, None)
-    assert regen_library.parse_args(["--only=three_step_path"]) == ("three_step_path", False, None)
-    assert regen_library.parse_args(["--dry-run"]) == (None, True, None)
-    assert regen_library.parse_args([]) == (None, False, None)
+    assert regen_library.parse_args(["--only", "three_step_path"]) == ("three_step_path", "all", False, None)
+    assert regen_library.parse_args(["--only=three_step_path"]) == ("three_step_path", "all", False, None)
+    assert regen_library.parse_args(["--dry-run"]) == (None, "all", True, None)
+    assert regen_library.parse_args([]) == (None, "all", False, None)
+    assert regen_library.parse_args(["--set", "service"]) == (None, "service", False, None)
+    assert regen_library.parse_args(["--set=brand"]) == (None, "brand", False, None)
 
 
 def test_parse_args_errors_loudly_never_full_batch():
-    # a typo'd flag is an ERROR, not a silent 10-card batch
-    only, dry, err = regen_library.parse_args(["--onyl", "three_step_path"])
+    # a typo'd flag is an ERROR, not a silent full batch
+    only, set_name, dry, err = regen_library.parse_args(["--onyl", "three_step_path"])
     assert err and "unrecognized" in err
     # an unknown concept is an ERROR listing the known keys
-    only, dry, err = regen_library.parse_args(["--only=not_a_concept"])
+    only, set_name, dry, err = regen_library.parse_args(["--only=not_a_concept"])
     assert err and "known concepts" in err
+    # an unknown set is an ERROR too
+    only, set_name, dry, err = regen_library.parse_args(["--set=philosophy"])
+    assert err and "unknown set" in err
 
 
 def test_only_calls_generator_for_exactly_that_concept(monkeypatch, tmp_path, capsys):

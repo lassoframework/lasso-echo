@@ -223,11 +223,11 @@ def main(argv=None):
         # STRICT parsing: a typo or unsupported form errors out loudly; it can
         # never silently fall through to the full 10-card batch.
         from .regen_library import parse_args, run as regen_run
-        only, dry_run, err = parse_args(argv[1:])
+        only, set_name, dry_run, err = parse_args(argv[1:])
         if err:
             print(err)
         else:
-            regen_run(only=only, dry_run=dry_run)
+            regen_run(only=only, dry_run=dry_run, set_name=set_name)
     elif cmd == "pull-opus":
         # MANUAL Opus Clip ingest: list new finished clips since the watermark,
         # host to R2, file as video assets (future Reel DRAFTS via the normal

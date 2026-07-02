@@ -67,11 +67,11 @@ def save_served(served):
         print(f"[rotation] could not persist served log: {type(e).__name__}: {e}")
 
 
-def record_served(account_key, key, pillar, day_key, archetype=""):
+def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
     served = load_served()
     entries = served.setdefault(account_key, [])
     entries.append({"key": key, "pillar": pillar, "date": day_key,
-                    "archetype": archetype})
+                    "archetype": archetype, "set": set_name})
     # prune far beyond the window so the file never grows unbounded
     cutoff = _days_ago(day_key, config.ROTATION_WINDOW_DAYS * 3)
     served[account_key] = [e for e in entries if e.get("date", "") >= cutoff]
@@ -130,14 +130,32 @@ def is_gate_clean(note, approved_claims=None):
     return True
 
 
+def _sidecar_field(creative_path, field):
+    try:
+        with open(os.path.splitext(creative_path)[0] + ".json", encoding="utf-8") as fh:
+            return str((json.load(fh) or {}).get(field, ""))
+    except Exception:
+        return ""
+
+
 def sidecar_archetype(creative_path):
     """The layout archetype recorded in a library card's json sidecar ('' when the
     sidecar or field is absent - older cards simply do not vote in alternation)."""
-    try:
-        with open(os.path.splitext(creative_path)[0] + ".json", encoding="utf-8") as fh:
-            return str((json.load(fh) or {}).get("archetype", ""))
-    except Exception:
-        return ""
+    return _sidecar_field(creative_path, "archetype")
+
+
+def sidecar_set(creative_path):
+    """The concept SET (brand | service) from the card's sidecar, '' when absent."""
+    return _sidecar_field(creative_path, "set")
+
+
+def candidate_set(item):
+    """A candidate's concept set: the sidecar's for a library card; the generated
+    Nano card drafts from the brand pillars, so it counts as 'brand'."""
+    _key, _pillar, kind, payload = item
+    if kind == "generate":
+        return "brand"
+    return sidecar_set(getattr(payload, "path", ""))
 
 
 def candidate_archetype(item, day_key, library_path):
@@ -183,12 +201,14 @@ def choose(account_key, day_key, library_path, poster=None):
     recent_keys = {e["key"] for e in recent}
     yesterday_pillar = None
     yesterday_archetype = None
+    yesterday_set = None
     if entries:
         prior = [e for e in entries if e.get("date", "") < day_key]
         if prior:
             last = sorted(prior, key=lambda e: e["date"])[-1]
             yesterday_pillar = last.get("pillar")
             yesterday_archetype = last.get("archetype") or None
+            yesterday_set = last.get("set") or None
 
     approved_claims = _approved_claims()
 
@@ -230,15 +250,22 @@ def choose(account_key, day_key, library_path, poster=None):
 
     pool = [it for it in candidates if _eligible(it)]
     if pool:
-        # SOFT archetype alternation first (prefer a different composition than
-        # yesterday; never blocks - if every eligible candidate shares yesterday's
-        # archetype one still gets picked), then never-served, then
-        # least-recently-served; name-stable tiebreak.
-        def _same_arch(item):
+        # SOFT variety preferences first: a different archetype AND a different
+        # concept set (brand vs service) than yesterday. Both are preferences,
+        # never filters - if every eligible candidate matches yesterday, one still
+        # gets picked. Then never-served, then least-recently-served; name-stable
+        # tiebreak. The hard rules (window, pillar, gate) already filtered above.
+        def _variety_penalty(item):
+            penalty = 0
             arch = candidate_archetype(item, day_key, library_path)
-            return 1 if (yesterday_archetype and arch and arch == yesterday_archetype) else 0
+            if yesterday_archetype and arch and arch == yesterday_archetype:
+                penalty += 1
+            cset = candidate_set(item)
+            if yesterday_set and cset and cset == yesterday_set:
+                penalty += 1
+            return penalty
 
-        pool.sort(key=lambda it: (_same_arch(it), last_served.get(it[0], ""), it[0]))
+        pool.sort(key=lambda it: (_variety_penalty(it), last_served.get(it[0], ""), it[0]))
         key, pillar, kind, payload = pool[0]
         return kind, payload
 
@@ -276,7 +303,7 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
             from .creative_studio import archetype_for_day
             record_served(account.key, content_signature(draft.source_fragments),
                           f"brain:{payload}", day_key,
-                          archetype=archetype_for_day(day_key))
+                          archetype=archetype_for_day(day_key), set_name="brand")
         return draft
     if kind == "library":
         from . import schedule
@@ -284,6 +311,7 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
         if draft.status.value != "blocked":
             record_served(account.key, os.path.basename(payload.path),
                           pillar_of(payload.path), day_key,
-                          archetype=sidecar_archetype(payload.path))
+                          archetype=sidecar_archetype(payload.path),
+                          set_name=sidecar_set(payload.path))
         return draft
     return None
