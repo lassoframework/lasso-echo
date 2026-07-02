@@ -221,7 +221,43 @@ def render_html(report, refresh):
 </body></html>"""
 
 
-def run(account=None, poster=None, now=None, base_dir=None):
+def render_report_pdf(report, refresh, out_path, brand=None):
+    """The same 30 day report as a white label PDF (reportlab rebuild)."""
+    from .pdf_report import build_pdf
+    r = report
+    rows = [("Views", _fmt(r["views"])), ("Reach", _fmt(r["reach"])),
+            ("Likes", _fmt(r["likes"])), ("Comments", _fmt(r["comments"])),
+            ("Saves", _fmt(r["saves"])), ("Shares", _fmt(r["shares"])),
+            ("Engagements", _fmt(r["engagements"])),
+            ("Engagement rate on views", _fmt(r["engagement_rate"])),
+            ("Followers", _fmt(r["followers"])),
+            ("Follower growth net", _fmt(r["follower_net"])),
+            ("Posts published", _fmt(r["posts_published"])),
+            ("Posts per week before Echo", _fmt(r["posting_freq_before"])),
+            ("Posts per week this cycle", _fmt(r["posting_freq_after"])),
+            ("Health read", _fmt(r["health"]))]
+    top = [f"{p['engagement']} engagements: {p['caption']}" for p in r["top_posts"]] or ["no scored posts yet"]
+    bottom = [f"{p['engagement']} engagements: {p['caption']}" for p in r["bottom_posts"]] or ["no scored posts yet"]
+    perf = []
+    for dim, ranked in refresh["performance"].items():
+        if ranked:
+            perf.append(f"{dim}: strongest {ranked[0][0]}, weakest {ranked[-1][0]}")
+    sections = [
+        ("heading", "The numbers"), ("table", rows),
+        ("heading", "Top posts"), ("list", top),
+        ("heading", "Bottom posts"), ("list", bottom),
+        ("heading", "Refresh for next cycle"),
+        ("list", perf or ["not enough scored posts yet"]),
+        ("heading", "Proposed angles (approved sources only)"),
+        ("list", refresh["proposals"] or ["none"]),
+        ("heading", "Raw material to request"), ("list", refresh["asks"]),
+        ("para", "Gaps: " + (", ".join(r["gaps"]) or "none")),
+    ]
+    return build_pdf(out_path, "30 day report", r["account_key"], sections,
+                     brand=brand)
+
+
+def run(account=None, poster=None, now=None, base_dir=None, pdf=False):
     """Build the monthly report per account. Returns {account: html_path} or None
     while AGENT_REPORTING_ENABLED is OFF."""
     if not config.reporting_enabled():
@@ -241,6 +277,12 @@ def run(account=None, poster=None, now=None, base_dir=None):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(html)
         out[acct.key] = path
+        if pdf:
+            from .pdf_report import brand_for
+            pdf_path = os.path.join(_reports_dir(), f"{acct.key}_{month}.pdf")
+            render_report_pdf(report, refresh, pdf_path, brand=brand_for(acct))
+            out[acct.key + ":pdf"] = pdf_path
+            print(f"PDF saved: {pdf_path}")
         summary = (f"LASSO 30 day report for {acct.key}: views {_fmt(report['views'])}, "
                    f"engagement rate {_fmt(report['engagement_rate'])}, followers "
                    f"{_fmt(report['followers'])} (net {_fmt(report['follower_net'])}), "

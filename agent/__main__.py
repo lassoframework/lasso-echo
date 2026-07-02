@@ -261,7 +261,8 @@ def main(argv=None):
                 acct_filter = args[i].split("=", 1)[1]
             i += 1
         from .monthly_report import run as monthly_run
-        monthly_run(account=acct_filter, poster=ConsolePoster())
+        monthly_run(account=acct_filter, poster=ConsolePoster(),
+                    pdf="--pdf" in argv[1:])
     elif cmd == "pull-opus":
         # MANUAL Opus Clip ingest: list new finished clips since the watermark,
         # host to R2, file as video assets (future Reel DRAFTS via the normal
