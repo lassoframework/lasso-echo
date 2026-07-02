@@ -59,6 +59,12 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       flag AGENT_CAPTION_SEO_ENABLED OFF
 - [~] Per-platform caption variants: IG keeps up to 5 approved tags, FB Page keeps at most 2 at
       the end; selection only from the approved set; flag AGENT_PLATFORM_VARIANTS_ENABLED OFF
+- [~] Creative rotation + variety guard: no-repeat window (default 14 days, served log on
+      /data), consecutive days never share a pillar, approved library cycles alongside the
+      Nano card (Nano one source among several), fabrication gate supreme (stat-bearing
+      creatives excluded until their claim is cleared in knowledge USE stats or approved
+      social proof; thin pool falls back to oldest approved + one ops alert);
+      flag AGENT_ROTATION_ENABLED OFF, window env AGENT_ROTATION_WINDOW_DAYS
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

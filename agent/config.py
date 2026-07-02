@@ -225,6 +225,22 @@ SUMMIT_END_DATE = "2026-11-08"          # campaign auto-stops after this day
 SUMMIT_DAY = os.environ.get("AGENT_SUMMIT_DAY", "tue").lower()  # the weekly slot
 
 
+# Creative rotation: the no-repeat window (days) and where the served log lives
+# (/data on the listener service so it survives restarts).
+ROTATION_WINDOW_DAYS = int(os.environ.get("AGENT_ROTATION_WINDOW_DAYS", "14"))
+
+
+def rotation_enabled() -> bool:
+    """
+    Creative rotation + variety guard switch. OFF by default = selection behaves
+    exactly as today. ON: no creative repeats within the window, consecutive days
+    never share a pillar, the approved library is cycled (generated Nano is one
+    source among several), and only gate-clean creatives are ever picked. This
+    changes WHICH approved creative a draft proposes, never whether it needs a tap.
+    """
+    return _truthy(os.environ.get("AGENT_ROTATION_ENABLED", "false"))
+
+
 def knowledge_enabled() -> bool:
     """
     Knowledge brain switch. OFF by default. ON, the drafter may draw facts, hooks,

@@ -157,6 +157,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # never additional). Dormant unless armed; auto-stops after 2026-11-08.
         if draft is None and account.key.startswith("lasso"):
             draft = build_summit_draft(account, day_key, voice=acct_voice)
+        # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
+        # Armed, it picks WHICH approved creative today's draft proposes (window,
+        # pillar alternation, gate-clean only); None -> the paths below run as today.
+        if draft is None and account.key.startswith("lasso"):
+            from .rotation import build_rotated_draft
+            draft = build_rotated_draft(account, day_key, acct_voice, acct_lib, poster=poster)
         # For a LASSO account, try the fully-automated infographic path next. It is
         # dormant unless all three flags are armed; None -> fall back to the library
         # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
