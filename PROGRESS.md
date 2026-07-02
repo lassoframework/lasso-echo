@@ -6,11 +6,12 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-01 (Fable 5 review - Tier 1 hardening landed: idempotent daily
-drafts + supersede/expire, ops alerts, publish confirmation, token watchdog, baseline
-CLI. All four flags OFF; suite 175 green. Earlier today: FIRST LIVE CARD SHIPPED —
-Nano Banana infographic generated + R2-hosted + posted to #echoclaude, approval gate
-proven, publishing still OFF.)
+Last updated: 2026-07-02 (deployed at cd8000b, suite 175 green. PUBLISH + STORIES +
+ALL TIER 1 FLAGS ARMED IN PRODUCTION (Railway env); code defaults stay OFF so a fresh
+checkout is always dormant. Tier 1 hardening live: idempotent daily drafts +
+supersede/expire, ops alerts, publish confirmation, token watchdog, baseline CLI.
+2026-07-01: FIRST LIVE CARD SHIPPED, Nano Banana infographic generated + R2-hosted +
+posted to #echoclaude, approval gate proven.)
 
 ---
 
@@ -18,7 +19,7 @@ proven, publishing still OFF.)
 - [x] Canonical LASSO brand bible (`brand_voice/lasso_voice.md`)
 - [x] Reference repo scaffolded (`lasso-echo`), own body, Ranger spine as pattern
 - [x] Gates baked into code (approval, draft-only, trust ladder, no-fabrication)
-- [x] Test suite green (35 deployed; +5 Creative Studio in sandbox pending push)
+- [x] Test suite green (175, deployed at cd8000b)
 - [x] Stage 1 build prompt for Claude Code
 - [x] Railway + separation plan documented (own project, own service, #echoclaude)
 - [x] Brain hook stubbed (read-only, proposes, never rewrites voice)
@@ -48,33 +49,33 @@ proven, publishing still OFF.)
 - [~] Google Business Profile posting branch (local posts): gbp_publisher, draft-only guard,
       routing (GBP -> gbp_publisher, IG/FB -> meta_publisher), content-brain GBP variant
       (trimmed summary, one image, CTA button, no hashtags); flag AGENT_GBP_ENABLED OFF. See BUILD_SPEC.md Addendum A
-- [~] Stories draft path: one 9:16 (1080x1920) Story per account per day alongside the feed
+- [x] Stories draft path: one 9:16 (1080x1920) Story per account per day alongside the feed
       post, reusing the day's approved creative (9:16 re-render via per-use aspect when the
       studio is armed, else the feed image as is); no caption, PENDING in the same card flow,
       loudly labeled STORY. Publish path (IG STORIES container / FB photo_stories) sits behind
-      BOTH the publish flag AND AGENT_STORIES_ENABLED, default OFF (fully dormant: flag off = no
-      Story drafts at all)
+      BOTH the publish flag AND AGENT_STORIES_ENABLED (code default OFF; ARMED in production)
 - [~] Caption SEO (2026): content brain front-loads the hook and moves a body line carrying the
       hook's topic terms first among the bodies; reorder of APPROVED lines only, never new text;
       flag AGENT_CAPTION_SEO_ENABLED OFF
 - [~] Per-platform caption variants: IG keeps up to 5 approved tags, FB Page keeps at most 2 at
       the end; selection only from the approved set; flag AGENT_PLATFORM_VARIANTS_ENABLED OFF
-### Fable 5 review - Tier 1 hardening (2026-07-01)
-- [~] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);
+### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
+### code default OFF, ARMED in production)
+- [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);
       a same-content re-run returns the existing draft (no duplicate card); changed content
       SUPERSEDES the old card (edited in place, buttons removed); a pending card whose day
       passed EXPIRES the same way; stale approve on either = friendly no-op. Flag
-      AGENT_IDEMPOTENT_DRAFTS_ENABLED OFF
-- [~] Ops alerts: one "ECHO ALERT:" line to #echoclaude on hosting failure, empty
+      AGENT_IDEMPOTENT_DRAFTS_ENABLED (ARMED in production)
+- [x] Ops alerts: one "ECHO ALERT:" line to #echoclaude on hosting failure, empty
       generation, blocked plan, publish failure, store write failure; media_host no longer
       swallows exceptions invisibly; secret env values scrubbed from every alert. Flag
-      AGENT_OPS_ALERTS_ENABLED OFF
-- [~] Publish confirmation: after a real publish, one Graph READ verifies the post and
+      AGENT_OPS_ALERTS_ENABLED (ARMED in production)
+- [x] Publish confirmation: after a real publish, one Graph READ verifies the post and
       replies "LIVE: <permalink>" in the card's thread; a failed verify warns in-thread +
-      one ops alert; never re-publishes. Flag AGENT_PUBLISH_CONFIRM_ENABLED OFF
-- [~] Token watchdog: debug_token expiry check once per daily cycle + CLI
+      one ops alert; never re-publishes. Flag AGENT_PUBLISH_CONFIRM_ENABLED (ARMED in production)
+- [x] Token watchdog: debug_token expiry check once per daily cycle + CLI
       `python -m agent check-tokens`; alerts within AGENT_TOKEN_WARN_DAYS (default 7);
-      token value never printed. Flag AGENT_TOKEN_WATCHDOG_ENABLED OFF
+      token value never printed. Flag AGENT_TOKEN_WATCHDOG_ENABLED (ARMED in production)
 - [x] Baseline capture CLI `python -m agent capture-baseline`: manual-only BY DESIGN
       (no flag, never scheduled, nothing in the agent imports it); reads 8 weeks of posting
       history per account, writes dated JSON to /data, prints a summary. Done.
@@ -89,10 +90,11 @@ proven, publishing still OFF.)
   AGENT_TOKEN_WARN_DAYS=7                # days before token expiry the watchdog starts alerting
   ```
 
-- [ ] Set Gemini key (AGENT_NANO_API_KEY) by hand; leave the flag OFF until output looks right
-- [~] Run master ON / publish OFF, watch daily drafts
+- [x] Set Gemini key (AGENT_NANO_API_KEY) by hand (proven by the first live card, 2026-07-01)
+- [x] Run master ON / publish OFF, watch daily drafts (superseded: publish is now armed)
 - [ ] Run the full 30-day loop once (see the 30-day IG plan below)
-- [ ] Arm publishing once drafts look right
+- [x] Arm publishing: AGENT_PUBLISH_ENABLED ARMED in production (Railway env; code default
+      stays false so a fresh checkout is always draft-only)
 
 ## Stage 2 — One paying client (hand-picked, forgiving)
 - [ ] Brand voice intake template (turn the bible into a client questionnaire)

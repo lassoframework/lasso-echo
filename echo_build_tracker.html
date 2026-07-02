@@ -132,7 +132,7 @@
         ["Canonical LASSO brand bible","done"],
         ["Reference repo scaffolded (own body, Ranger spine as pattern)","done"],
         ["Gates baked into code (approval, draft-only, trust ladder, no-fabrication)","done"],
-        ["Test suite green (44: +5 Creative Studio, +4 card preview)","done"],
+        ["Test suite green (175, deployed at cd8000b)","done"],
         ["Stage 1 build prompt for Claude Code","done"],
         ["Railway and separation plan documented","done"],
         ["Brain hook stubbed (read-only, proposes)","done"],
@@ -163,17 +163,17 @@
         ["Dropped personal FB: blake_personal inactive (Meta ended personal publishing 2018); drafts lasso_ig + lasso_fb only","done"],
         ["Content brain: daily post from source doc across pillars (flag OFF)","ready"],
         ["Google Business Profile posting branch (local posts, draft-only, flag OFF)","ready"],
-        ["Stories draft path: one 9:16 Story per account per day, reuses the day's approved creative, labeled STORY, publish behind BOTH gates (flag OFF)","ready"],
+        ["Stories draft path: one 9:16 Story per account per day, reuses the day's approved creative, labeled STORY, publish behind BOTH gates (ARMED in production)","done"],
         ["Caption SEO: hook front-loaded, topic-bearing body first, approved lines only (flag OFF)","ready"],
         ["Per-platform variants: IG up to 5 tags, FB at most 2, selection only (flag OFF)","ready"],
-        ["Fable 5 review - Tier 1 hardening: idempotent daily drafts + card supersede/expire, one draft per account/day/type, stale approve = friendly no-op (flag OFF)","ready"],
-        ["Fable 5 review - Tier 1 hardening: ops alerts, one ECHO ALERT line per pipeline failure, secrets scrubbed, media_host failures never invisible (flag OFF)","ready"],
-        ["Fable 5 review - Tier 1 hardening: publish confirmation, Graph read-back + LIVE permalink in the card thread, never re-publishes (flag OFF)","ready"],
-        ["Fable 5 review - Tier 1 hardening: token watchdog, debug_token expiry check + check-tokens CLI, warns 7 days out, token never printed (flag OFF)","ready"],
+        ["Fable 5 review - Tier 1 hardening: idempotent daily drafts + card supersede/expire, one draft per account/day/type, stale approve = friendly no-op (ARMED in production)","done"],
+        ["Fable 5 review - Tier 1 hardening: ops alerts, one ECHO ALERT line per pipeline failure, secrets scrubbed, media_host failures never invisible (ARMED in production)","done"],
+        ["Fable 5 review - Tier 1 hardening: publish confirmation, Graph read-back + LIVE permalink in the card thread, never re-publishes (ARMED in production)","done"],
+        ["Fable 5 review - Tier 1 hardening: token watchdog, debug_token expiry check + check-tokens CLI, warns 7 days out, token never printed (ARMED in production)","done"],
         ["Fable 5 review - Tier 1 hardening: baseline capture CLI (capture-baseline), 8-week posting history to dated JSON, manual-only by design","done"],
-        ["Run master ON, publish OFF, watch drafts","ready"],
+        ["Run master ON, publish OFF, watch drafts (superseded: publish now armed)","done"],
         ["Run the full 30-day loop once","todo"],
-        ["Arm publishing once drafts look right","todo"],
+        ["Arm publishing: AGENT_PUBLISH_ENABLED ARMED in production (code default stays false)","done"],
     ]},
     { n:"2", short:"First Client", name:"Stage 2 — One paying client", meta:"Prove the voice holds",
       items:[
@@ -423,7 +423,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-01 (Fable 5 review - Tier 1 hardening: idempotent drafts + supersede/expire, ops alerts, publish confirm, token watchdog all built behind flags OFF; baseline CLI done, manual-only; suite 175 green; approval gate + publishing still OFF) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-02 (deployed at cd8000b, suite 175 green; PUBLISH + STORIES + ALL TIER 1 FLAGS ARMED IN PRODUCTION via Railway env, code defaults stay OFF; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
