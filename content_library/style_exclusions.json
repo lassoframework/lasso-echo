@@ -1,0 +1,20 @@
+{
+  "comment": "OFF-STYLE creatives (pre illustrated-diagram house style). The rotation guard never selects a file listed here. Nothing is deleted: regenerate a card in the house style, then remove its line to bring the slot back. Classified 2026-07-02 by visual review.",
+  "off_style": [
+    "lasso_card_1_final.png",
+    "lasso_card_2_final.png",
+    "lasso_card_3_final.png",
+    "lasso_p1_client_win_x4.png",
+    "lasso_p1_conversion_win.png",
+    "lasso_p1_revenue_milestone.png",
+    "lasso_p2_churn_math.png",
+    "lasso_p2_cpl_stat.png",
+    "lasso_p2_speed_to_lead_stat.png",
+    "lasso_p3_3step_framework.png",
+    "lasso_p3_before_after_final.png",
+    "lasso_p3_funnel_final.png",
+    "lasso_p4_contrast_ads.png",
+    "lasso_p4_contrast_free_trial.png",
+    "speed_to_lead.jpg"
+  ]
+}

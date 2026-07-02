@@ -27,17 +27,16 @@ from . import config
 BRAND_PALETTE = (
     "LOCKED LASSO V3 BRAND PALETTE (apply these exact colors, do not substitute or "
     "invent others):\n"
-    "- Navy #121E3C: the PRIMARY, dominant dark. Use for the main background and the "
-    "structure of the layout.\n"
-    "- Red #FF0000: the accent for emphasis and key highlights. Use SPARINGLY, for the "
-    "single most important element only (one arrow, or one key word), never everywhere.\n"
-    "- Sky Blue #5EB9E6: the secondary accent. Use for supporting icons, lines, and "
-    "highlights.\n"
-    "- Cream #FAF6F0: the light background, negative space, and card fill. Use cream as "
-    "the light background instead of pure white.\n"
-    "Style: clean, flat, modern infographic; high contrast; brand-consistent. Navy is "
-    "the dominant dark, cream is the light background (not white), sky blue carries the "
-    "supporting icons and lines, and red is reserved for one single focal accent."
+    "- Cream #FAF6F0: THE canvas. The card background is always cream / off white with "
+    "generous margins and whitespace. NEVER a full bleed solid color slab (never a solid "
+    "navy or solid red background).\n"
+    "- Navy #121E3C: the headline color and the primary line work / structure of the "
+    "illustration. Bold but not shouting.\n"
+    "- Sky Blue #5EB9E6: the supporting accent for icons, flow lines, and highlights.\n"
+    "- Red #FF0000: the SINGLE accent. Exactly one red element on the card (one arrow "
+    "or one emphasized element), never a red background, never red everywhere.\n"
+    "Style: clean, flat, modern illustrated infographic on a light cream canvas; "
+    "brand-consistent; calm, premium, easy to read."
 )
 
 # Composition: a LOCKED house style (consistent every card so the run reads as one brand
@@ -45,11 +44,14 @@ BRAND_PALETTE = (
 # The house style is shared by every surface; the LAYOUT block is per surface (the 4:5
 # feed card and the 9:16 Story compose differently), selected in build_prompt.
 _HOUSE_STYLE_LEAD = (
-    "House style (keep this CONSISTENT on every card so the whole run reads as one brand "
-    "system): a clean, minimal, modern FLAT infographic with generous negative space, "
-    "uncluttered and premium. Use an icon-driven flow with a few clear, labeled icons in a "
-    "simple line-and-icon illustration style, a consistent stroke weight, and the brand "
-    "palette throughout."
+    "House style, the ILLUSTRATED DIAGRAM concept (keep this CONSISTENT on every card so "
+    "the whole run reads as one brand system): a clean, minimal, modern FLAT infographic "
+    "on a cream canvas with generous negative space, uncluttered and premium. ONE "
+    "headline at the TOP of the card in navy, bold but not shouting; the headline is the "
+    "ONLY large text. The BODY of the card is an ILLUSTRATED DIAGRAM: simple line-icon "
+    "illustrations with small UPPERCASE labels, connected by flow arrows, drawn with a "
+    "consistent stroke weight in the brand palette. The diagram carries the idea "
+    "visually."
 )
 
 # Feed (4:5) layout: the original portrait guidance, unchanged.
@@ -78,10 +80,12 @@ _HOUSE_STYLE_REST = (
     "Do NOT default to a computer, monitor, or dashboard every time; pick the everyday "
     "objects relevant to the subject, rendered in the SAME clean house style and palette. "
     "Avoid a dense collage of many icons and boxes.\n"
-    "Text: render ONLY the one short headline as text on the image; do NOT put body "
-    "sentences, paragraphs, or the caption on the image. Labels on icons are one or two "
-    "words at most. Overall feel: minimal, modern, high end, brand-consistent, easy to "
-    "read at a glance. Think one clean diagram, not a busy poster."
+    "ONE idea per card. No multi panel text blocks, no stacked slogans, no text only "
+    "compositions: the illustration, not typography, carries the card.\n"
+    "Text: render ONLY the one short headline as large text; small UPPERCASE labels on "
+    "icons are one or two words at most; do NOT put body sentences, paragraphs, or the "
+    "caption on the image. Overall feel: minimal, modern, high end, brand-consistent, "
+    "easy to read at a glance. Think one clean illustrated diagram, not a busy poster."
 )
 
 
@@ -161,9 +165,10 @@ QUOTE_CARD_STYLE = (
     "ONE short line of text, set large and centered with generous negative space; "
     "the attribution is rendered SMALL beneath it. No body sentences, no paragraphs, "
     "no other text, no icons competing with the quote. Subtle oversized quotation "
-    "marks are allowed as a graphic element. Navy dominant structure, cream light "
-    "fill, sky blue for one supporting graphic touch, red for exactly ONE focal "
-    "accent (a single underline or one emphasized word). Minimal, modern, premium."
+    "marks are allowed as a graphic element. Cream canvas (never a solid color slab), "
+    "navy text and line work, sky blue for one supporting graphic touch, red for "
+    "exactly ONE focal accent (a single underline or one emphasized word). Minimal, "
+    "modern, premium."
 )
 
 # Number card: one verified stat huge; one short support line; attribution small.
@@ -171,9 +176,10 @@ NUMBER_CARD_STYLE = (
     "Template: SOCIAL PROOF NUMBER CARD in the locked house style. The verified stat "
     "is rendered HUGE as the single dominant element, with ONE short support line "
     "beneath it and the attribution SMALL at the bottom. No body sentences, no "
-    "paragraphs, no other text, no dense graphics. Navy dominant structure, cream "
-    "light fill, sky blue for one supporting graphic touch, red for exactly ONE "
-    "focal accent (the stat itself or a single arrow). Minimal, modern, premium."
+    "paragraphs, no other text, no dense graphics. Cream canvas (never a solid color "
+    "slab), navy text and line work, sky blue for one supporting graphic touch, red "
+    "for exactly ONE focal accent (the stat itself or a single arrow). Minimal, "
+    "modern, premium."
 )
 
 

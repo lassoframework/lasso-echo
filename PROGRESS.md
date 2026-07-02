@@ -65,6 +65,12 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       creatives excluded until their claim is cleared in knowledge USE stats or approved
       social proof; thin pool falls back to oldest approved + one ops alert);
       flag AGENT_ROTATION_ENABLED OFF, window env AGENT_ROTATION_WINDOW_DAYS
+- [x] House style LOCKED to the illustrated-diagram concept: cream canvas (never a solid
+      slab), one navy headline top, body is a line-icon diagram with UPPERCASE labels +
+      flow arrows, red as the single accent, one idea per card; Stories designed 9:16 from
+      scratch. Seed library swept: ALL 14 slab cards classified OFF-STYLE and held out via
+      content_library/style_exclusions.json (nothing deleted; regenerate card by card and
+      remove each line to bring the slot back). BLAKE BY HAND: regenerate replacements
 ### Fable 5 review - Tier 1 hardening (2026-07-01, deployed at cd8000b; all four flags
 ### code default OFF, ARMED in production)
 - [x] Idempotent daily drafts + card supersede/expire: one draft per (account, day, type);

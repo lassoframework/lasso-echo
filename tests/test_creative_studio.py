@@ -155,10 +155,10 @@ def test_prompt_locks_house_style_and_varies_subject():
     p = creative_studio.build_prompt(headline, [body])
     low = p.lower()
 
-    # a locked, consistent house look
+    # a locked, consistent house look (illustrated-diagram concept)
     assert "house style" in low
     assert "minimal" in low
-    assert "icon-driven" in low
+    assert "illustrated diagram" in low
     assert "consistent stroke weight" in low
     assert "negative space" in low
     assert "not a busy poster" in low

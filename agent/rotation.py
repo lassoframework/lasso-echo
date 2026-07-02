@@ -126,6 +126,17 @@ def is_gate_clean(note, approved_claims=None):
     return True
 
 
+def style_exclusions(library_path):
+    """OFF-STYLE creatives (content_library/style_exclusions.json) that rotation must
+    never select. Blake regenerates a card in the house style, then removes its line.
+    Missing/unreadable file = no exclusions."""
+    try:
+        with open(os.path.join(library_path, "style_exclusions.json"), encoding="utf-8") as fh:
+            return set((json.load(fh) or {}).get("off_style", []))
+    except Exception:
+        return set()
+
+
 def content_signature(fragments):
     """The no-repeat key for a generated card: sha1 of its approved fragments."""
     joined = "\n".join(fragments or [])
@@ -154,10 +165,13 @@ def choose(account_key, day_key, library_path, poster=None):
 
     approved_claims = _approved_claims()
 
-    # Candidates: every gate-clean library asset + the generated-Nano option.
+    # Candidates: every gate-clean, IN-STYLE library asset + the generated-Nano option.
+    off_style = style_exclusions(library_path)
     candidates = []  # (key, pillar, kind, payload)
     excluded_dirty = 0
     for c in list_creatives(library_path):
+        if os.path.basename(c.path) in off_style:
+            continue  # OFF-STYLE (pre house-style card): never selected, never deleted
         if not is_gate_clean(getattr(c, "client_note", ""), approved_claims):
             excluded_dirty += 1
             continue
