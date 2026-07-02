@@ -150,6 +150,11 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       real engagement), one angle QUOTED from approved sources with its citation
       (LOCKED knowledge can never appear), one question when data is thin. Proposes,
       never creates, never schedules; flag AGENT_BRAIN_PROPOSALS_ENABLED OFF
+- [~] Store backup + restore: nightly consistent sqlite snapshot to R2
+      (echo/backups/, 14 day retention, one ops alert on failure only; flag
+      AGENT_BACKUP_ENABLED OFF, hour AGENT_BACKUP_HOUR_UTC default 2) and
+      restore-store CLI (staging + verification counts; never touches the live db
+      without --confirm; old db kept as .pre_restore.bak)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

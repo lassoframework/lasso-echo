@@ -80,6 +80,7 @@ def _status():
     print(f"  spend_cap      : {config.spend_cap_enabled()}  (env AGENT_SPEND_CAP_ENABLED)")
     print(f"  digest         : {config.digest_enabled()}  (env AGENT_DIGEST_ENABLED)")
     print(f"  brain          : {config.brain_proposals_enabled()}  (env AGENT_BRAIN_PROPOSALS_ENABLED)")
+    print(f"  backup         : {config.backup_enabled()}  (env AGENT_BACKUP_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
     print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "
@@ -252,6 +253,22 @@ def main(argv=None):
         else:
             from .onboard import add_client
             add_client(key, name)
+    elif cmd == "restore-store":
+        # MANUAL restore: staging + verification counts; NEVER touches the live
+        # db without --confirm (and then keeps it as .pre_restore.bak).
+        from_key, confirm, args = "", False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--from" and i + 1 < len(args):
+                from_key = args[i + 1]; i += 2; continue
+            if args[i] == "--confirm":
+                confirm = True
+            i += 1
+        if not from_key:
+            print("usage: python -m agent restore-store --from <r2 key> [--confirm]")
+        else:
+            from .backup import restore_store
+            restore_store(from_key, confirm=confirm)
     elif cmd == "audit":
         # The readable decision trail. No flag: logging truth is always on.
         day, acct_f, args = None, None, argv[1:]

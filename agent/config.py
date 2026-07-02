@@ -302,6 +302,15 @@ def trust_ladder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
 
 
+def backup_enabled() -> bool:
+    """
+    Nightly store backup switch. OFF by default. ON, a consistent sqlite
+    snapshot of /data/echo.db lands in R2 (echo/backups/) once nightly with a
+    14 day retention sweep. One ops alert on failure only.
+    """
+    return _truthy(os.environ.get("AGENT_BACKUP_ENABLED", "false"))
+
+
 def brain_proposals_enabled() -> bool:
     """
     Nightly brain switch. OFF by default. ON, one read-only Slack note per night

@@ -167,6 +167,14 @@ def _daily_scheduler(store):
                 brain.maybe_send(ops_alerts._default_poster(), now=now)
             except Exception as e:
                 print(f"[brain] pass failed: {type(e).__name__}: {e}")
+        # Nightly store backup: dormant unless AGENT_BACKUP_ENABLED. One ops
+        # alert on failure only; never crashes the loop.
+        if config.backup_enabled():
+            try:
+                from . import backup
+                backup.maybe_backup(now=now)
+            except Exception as e:
+                print(f"[backup] pass failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 
