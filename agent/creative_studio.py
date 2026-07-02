@@ -80,9 +80,9 @@ ARCHETYPES = {
     ),
     "path": (
         "Archetype PATH: an ILLUSTRATED DIAGRAM of a winding journey path with labeled "
-        "stops, START at the BOTTOM of the card and FINISH at the TOP, headline at the "
-        "top. Illustration scale medium; label density normal, one small UPPERCASE "
-        "label per stop; the single red accent is the FINISH marker only."
+        "stops; the journey begins at the BOTTOM of the card and ends at the TOP, "
+        "headline at the top. Illustration scale medium; label density normal, one "
+        "small UPPERCASE label per stop; the single red accent marks the FINAL stop only."
     ),
     "headline": (
         "Archetype HEADLINE, typography forward (use sparingly): the headline IS the "
@@ -91,6 +91,24 @@ ARCHETYPES = {
         "accent is one emphasized word in the headline or the small icon, never both."
     ),
 }
+
+# Story requirement (Blake's stranger test, applied to EVERY concept and EVERY
+# archetype): the benchmark card is follow_up_problem - a stranger reads it with
+# no caption. Abstract symbolism (a path labeled GROW/PLAN/LEARN) fails.
+STORY_REQUIREMENT = (
+    "Story requirement (every card, every archetype): the illustration depicts a "
+    "CONCRETE SCENE from a gym owner's world, never abstract symbolism. Allowed "
+    "subjects: leads and people, phones and messages, calendars, a gym floor or "
+    "front desk, members training, a funnel with people in it, money or growth "
+    "outcomes shown through people. Every card shows a TENSION and a RESOLUTION "
+    "readable at a glance: a problem state and an outcome state (before and after, "
+    "blocked and flowing, empty and full), whatever the archetype. Labels are "
+    "MEANINGFUL words a gym owner uses, like LEADS, NO FOLLOW UP, BOOKED, SHOWED, "
+    "MEMBERS. Banned generic process labels: STEP 1, STEP 2, STEP 3, PLAN, GROW, "
+    "LEARN, DISCOVER, LAUNCH, START, FINISH. The stranger test: someone who has "
+    "never heard of LASSO must be able to say what the card is about from the "
+    "image alone."
+)
 
 # The order daily generated cards walk through (rotating, never random).
 ARCHETYPE_ORDER = ["flow", "hero", "split", "path", "headline"]
@@ -159,7 +177,8 @@ def _composition_style(archetype="flow", is_story=False):
         surface = STORY_LAYOUT if a == "flow" else STORY_RECOMPOSE
     else:
         surface = FEED_LAYOUT
-    return f"{_HOUSE_STYLE_LEAD}\n{block}\n{surface}\n{_HOUSE_STYLE_REST}"
+    return (f"{_HOUSE_STYLE_LEAD}\n{block}\n{STORY_REQUIREMENT}\n{surface}\n"
+            f"{_HOUSE_STYLE_REST}")
 
 
 # Kept for compatibility: the default feed composition (FLOW archetype).

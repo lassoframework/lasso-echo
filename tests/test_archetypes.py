@@ -25,8 +25,8 @@ STRUCTURE_MARKS = {
     "hero": ["archetype hero", "one large central illustration",
              "maximum negative space", "two small uppercase labels",
              "headline at the top"],
-    "path": ["archetype path", "winding journey path", "start at the bottom",
-             "finish at the top", "finish marker"],
+    "path": ["archetype path", "winding journey path", "begins at the bottom",
+             "ends at the top", "final stop"],
     "headline": ["archetype headline", "typography forward", "centered in the middle",
                  "no diagram", "use sparingly"],
 }
