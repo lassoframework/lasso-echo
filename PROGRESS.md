@@ -6,12 +6,12 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-02 (deployed at cd8000b, suite 175 green. PUBLISH + STORIES +
-ALL TIER 1 FLAGS ARMED IN PRODUCTION (Railway env); code defaults stay OFF so a fresh
-checkout is always dormant. Tier 1 hardening live: idempotent daily drafts +
-supersede/expire, ops alerts, publish confirmation, token watchdog, baseline CLI.
-2026-07-01: FIRST LIVE CARD SHIPPED, Nano Banana infographic generated + R2-hosted +
-posted to #echoclaude, approval gate proven.)
+Last updated: 2026-07-02 evening (STAGE 2 BUILDOUT landed, suite 226 green: multi-client
+foundation, texted-link intake web + listener ingest, draft-bible CLI, Social Grade v1,
+social proof cards, Meta App Review kit + Stage 2 runbook. Every new flag defaults OFF
+(AGENT_INTAKE_ENABLED, AGENT_GRADE_ENABLED, AGENT_SOCIAL_PROOF_ENABLED). Morning:
+scheduler hardened (loud no-card alerts + persisted run date). Production armed set
+unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
 
 ---
 
@@ -97,9 +97,27 @@ posted to #echoclaude, approval gate proven.)
       stays false so a fresh checkout is always draft-only)
 
 ## Stage 2 — One paying client (hand-picked, forgiving)
-- [ ] Brand voice intake template (turn the bible into a client questionnaire)
-- [ ] Texted-link intake as the primary path (full-res upload page; MMS is fallback)
-- [ ] Idempotent Railway ingest worker (convert, dedupe, moderate, tag, thumbnail)
+### Built, not armed (2026-07-02 buildout; every flag defaults OFF)
+- [~] Multi-client foundation: per-account voice_doc / social_proof_doc / library_prefix /
+      slack_channel / approvers with global fallback; LASSO = client zero, behavior unchanged.
+      No flag (pure config; enforcement wiring of per-account approvers deliberately deferred,
+      the global approver gate stays the hard gate)
+- [~] Brand voice intake template: brand_voice/BRAND_VOICE_INTAKE.example.md + CLI
+      `python -m agent draft-bible --client <key> --intake <path>` writes DRAFT bible +
+      social_proof to brand_voice/drafts/<client>/ (manual only, never auto-activated)
+- [~] Texted-link intake, client half: tokenized mobile upload page to R2
+      (intake/<client>/incoming/), own Railway service (`python -m agent intake-web`,
+      R2 only, no /data), allowlist + size caps + rate limit; flag AGENT_INTAKE_ENABLED OFF
+- [~] Texted-link intake, processing half: ingest INSIDE the listener (HEIC to JPG,
+      orientation, SHA-256 + phash dedupe, moderation hook to review/ + notice, note filed
+      as the drafter's .txt sidecar), idempotent manifest, dead-letter + one ops alert;
+      same AGENT_INTAKE_ENABLED flag
+- [~] Social Grade v1: honest A to F + subscores (consistency, mix, engagement, growth,
+      verified proof) + baseline before/after posts per week; rubric docs/SOCIAL_GRADE.md;
+      flag AGENT_GRADE_ENABLED OFF
+- [x] Meta App Review kit (docs/META_APP_REVIEW_KIT.md, permissions derived from code) +
+      Stage 2 onboarding runbook (docs/STAGE2_RUNBOOK.md)
+### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
 - [ ] Prove the 30-day refresh lands for a real client

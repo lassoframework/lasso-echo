@@ -178,9 +178,12 @@
     { n:"2", short:"First Client", name:"Stage 2 — One paying client", meta:"Prove the voice holds",
       items:[
         ["Document intake seed: client PDF (texts + email) to N approval-held draft posts, no fabrication (flag OFF)","ready"],
-        ["Brand voice intake template","todo"],
-        ["Texted link intake (primary path, full-res upload)","todo"],
-        ["Idempotent Railway ingest worker (convert, dedupe, moderate, tag, thumbnail)","todo"],
+        ["Multi-client foundation: per-account voice/proof/library/channel/approvers, LASSO = client zero unchanged","ready"],
+        ["Brand voice intake template + draft-bible CLI (drafts to brand_voice/drafts/<client>/, never auto-activated)","ready"],
+        ["Texted link intake, client half: tokenized upload page to R2, own service, caps + rate limit (flag OFF)","ready"],
+        ["Texted link intake, ingest half: in-listener convert/dedupe/moderate/file with note sidecar, idempotent + dead-letter (flag OFF)","ready"],
+        ["Social Grade v1: honest A to F + subscores + baseline before/after (flag OFF, rubric in docs/SOCIAL_GRADE.md)","ready"],
+        ["Meta App Review kit + Stage 2 onboarding runbook (docs)","done"],
         ["Client approval flow via portal","todo"],
         ["Prove the voice holds for a non-Blake client","todo"],
         ["Prove the 30-day refresh lands","todo"],
@@ -423,7 +426,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-02 (deployed at cd8000b, suite 175 green; PUBLISH + STORIES + ALL TIER 1 FLAGS ARMED IN PRODUCTION via Railway env, code defaults stay OFF; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-02 evening (STAGE 2 BUILDOUT: multi-client foundation, texted-link intake web + ingest, draft-bible CLI, Social Grade v1, review kit + runbook; suite 226 green; new flags AGENT_INTAKE_ENABLED / AGENT_GRADE_ENABLED / AGENT_SOCIAL_PROOF_ENABLED all OFF; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
