@@ -68,6 +68,7 @@ def _status():
     print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
     print(f"  comments       : {config.comments_enabled()}  (env AGENT_COMMENTS_ENABLED)")
     print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
+    print(f"  social_proof   : {config.social_proof_enabled()}  (env AGENT_SOCIAL_PROOF_ENABLED)")
     print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
     print(f"  caption_seo    : {config.caption_seo_enabled()}  (env AGENT_CAPTION_SEO_ENABLED)")
     print(f"  platform_var   : {config.platform_variants_enabled()}  (env AGENT_PLATFORM_VARIANTS_ENABLED)")

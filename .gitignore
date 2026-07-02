@@ -17,6 +17,8 @@ brand_voice/*
 !brand_voice/.gitkeep
 !brand_voice/lasso_voice.example.md
 !brand_voice/lasso_voice.md
+!brand_voice/social_proof.example.md
+!brand_voice/social_proof.md
 
 # claude-flow tooling state
 .claude-flow/

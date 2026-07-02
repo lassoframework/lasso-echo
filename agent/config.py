@@ -26,6 +26,14 @@ LIBRARY_PATH = os.environ.get("AGENT_LIBRARY_PATH", "content_library")
 # CTAs, and hashtags the daily content brain may draw from. Missing -> brain blocks.
 SOURCE_DOC_PATH = os.environ.get("AGENT_SOURCE_DOC_PATH", "brand_voice/lasso_now.md")
 
+# Social proof source: verified quotes/stats WITH permission, beside the voice doc.
+# Per-account convention: brand_voice/social_proof.<account_key>.md wins when present.
+# Missing/empty file = the feature is silently absent (normal drafting unaffected).
+SOCIAL_PROOF_PATH = os.environ.get("AGENT_SOCIAL_PROOF_PATH", "brand_voice/social_proof.md")
+# The one weekday a social proof card may enter the plan (proof converts but repels
+# when spammed): at most ONE per account per week, structurally.
+SOCIAL_PROOF_DAY = os.environ.get("AGENT_SOCIAL_PROOF_DAY", "wed").lower()
+
 # Append-only log of every post we publish (or "would publish" in draft-only).
 POST_LOG_PATH = os.environ.get("AGENT_POST_LOG_PATH", "post_log.jsonl")
 
@@ -205,6 +213,16 @@ def doc_intake_enabled() -> bool:
     is never treated as approved fact and nothing here publishes.
     """
     return _truthy(os.environ.get("AGENT_DOC_INTAKE_ENABLED", "false"))
+
+
+def social_proof_enabled() -> bool:
+    """
+    Social proof cards switch. OFF by default (every new capability ships behind a
+    flag that defaults OFF). ON, at most one verified, permissioned quote/stat card
+    per account per week enters the plan; entries without permission or a verified
+    date are SKIPPED with a notice, never rendered.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIAL_PROOF_ENABLED", "false"))
 
 
 def idempotent_drafts_enabled() -> bool:

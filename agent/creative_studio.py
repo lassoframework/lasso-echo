@@ -154,6 +154,93 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None):
     return _scrub_dashes(prompt)
 
 
+# ---- Social proof cards: two templates in the locked V3 house style -----------
+# Quote card: the verified quote IS the one short line; attribution small.
+QUOTE_CARD_STYLE = (
+    "Template: SOCIAL PROOF QUOTE CARD in the locked house style. The quote is the "
+    "ONE short line of text, set large and centered with generous negative space; "
+    "the attribution is rendered SMALL beneath it. No body sentences, no paragraphs, "
+    "no other text, no icons competing with the quote. Subtle oversized quotation "
+    "marks are allowed as a graphic element. Navy dominant structure, cream light "
+    "fill, sky blue for one supporting graphic touch, red for exactly ONE focal "
+    "accent (a single underline or one emphasized word). Minimal, modern, premium."
+)
+
+# Number card: one verified stat huge; one short support line; attribution small.
+NUMBER_CARD_STYLE = (
+    "Template: SOCIAL PROOF NUMBER CARD in the locked house style. The verified stat "
+    "is rendered HUGE as the single dominant element, with ONE short support line "
+    "beneath it and the attribution SMALL at the bottom. No body sentences, no "
+    "paragraphs, no other text, no dense graphics. Navy dominant structure, cream "
+    "light fill, sky blue for one supporting graphic touch, red for exactly ONE "
+    "focal accent (the stat itself or a single arrow). Minimal, modern, premium."
+)
+
+
+def build_social_proof_prompt(kind, main_line, support_line="", attribution="",
+                              aspect=None, pixels=None, surface=None):
+    """
+    Build a social proof card prompt from a VERIFIED, PERMISSIONED entry only (the
+    caller enforces permission + verification; nothing here invents text). kind is
+    "quote" or "stat". Aspect is per use exactly like build_prompt: default is the
+    4:5 feed target; a Story variant passes 9:16 + a story surface label.
+    """
+    use_aspect = aspect or config.IMAGE_ASPECT
+    use_pixels = pixels or config.IMAGE_PIXELS
+    use_surface = surface or "feed post"
+    is_story = "story" in use_surface.lower()
+    template = NUMBER_CARD_STYLE if kind == "stat" else QUOTE_CARD_STYLE
+    canvas = (
+        f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
+        f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the "
+        "entire composition inside this tall portrait frame with generous margins; "
+        "nothing is cut off at the edges."
+        + (" Keep empty safe zones at the very top and bottom of the frame."
+           if is_story else "")
+    )
+    lines = [
+        canvas,
+        "Design a clean, minimal, premium LASSO-branded social proof card.",
+        f"Main line (render exactly this text): {_scrub_dashes(main_line)}",
+    ]
+    if kind == "stat" and support_line:
+        lines.append(f"Support line (render small, beneath the stat): {_scrub_dashes(support_line)}")
+    if attribution:
+        lines.append(f"Attribution (render SMALL): {_scrub_dashes(attribution)}")
+    lines.extend([template, BRAND_PALETTE, NO_DASH_RULE])
+    return _scrub_dashes("\n".join(lines))
+
+
+def generate_social_proof(kind, main_line, support_line="", attribution="",
+                          client=None, out_path=None,
+                          aspect=None, pixels=None, surface=None):
+    """
+    Generate a social proof card. Same gates as generate(): flag OFF -> None with no
+    API call; an empty main line -> None (nothing to render honestly); no client and
+    no key -> None. Returns {"path", "prompt"} on success.
+    """
+    if not config.creative_studio_enabled():
+        return None
+    if not str(main_line or "").strip():
+        return None
+
+    prompt = build_social_proof_prompt(kind, main_line, support_line, attribution,
+                                       aspect=aspect, pixels=pixels, surface=surface)
+    client = client or _default_client()
+    if client is None:
+        return None
+
+    image_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
+
+    if out_path is None:
+        slug = re.sub(r"[^a-z0-9]+", "_", str(main_line).lower()).strip("_")[:60] or "proof"
+        out_path = os.path.join(config.LIBRARY_PATH, f"nano_proof_{slug}.png")
+    with open(out_path, "wb") as fh:
+        fh.write(image_bytes)
+
+    return {"path": out_path, "prompt": prompt}
+
+
 class _GeminiImageClient:
     """
     Thin wrapper over the Gemini image API. Constructed only with a present key;

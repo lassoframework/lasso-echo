@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from . import config, schedule
 from .accounts import active_accounts
 from .daily_studio import build_daily_infographic_draft
+from .social_proof import build_social_proof_draft
 from .drafter import DraftStatus, draft_post
 from .library import pick_next
 from .postlog import used_creatives_for
@@ -136,10 +137,15 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             continue
 
         draft = None
-        # For a LASSO account, try the fully-automated infographic path FIRST. It is
+        # Social proof card FIRST, but only on the weekly proof day and only when
+        # its flag is armed with approved (permissioned + verified) entries. It is
+        # dormant otherwise; None -> the normal paths below run untouched.
+        if account.key.startswith("lasso"):
+            draft = build_social_proof_draft(account, day_key, voice=voice, poster=poster)
+        # For a LASSO account, try the fully-automated infographic path next. It is
         # dormant unless all three flags are armed; None -> fall back to the library
         # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
-        if account.key.startswith("lasso"):
+        if draft is None and account.key.startswith("lasso"):
             draft = build_daily_infographic_draft(account, day_key)
         if draft is None:
             creative = pick_next(account, lib, used_creatives_for(account.key))
