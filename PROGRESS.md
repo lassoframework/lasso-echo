@@ -155,6 +155,9 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       AGENT_BACKUP_ENABLED OFF, hour AGENT_BACKUP_HOUR_UTC default 2) and
       restore-store CLI (staging + verification counts; never touches the live db
       without --confirm; old db kept as .pre_restore.bak)
+- [~] Client welcome kit: welcome-kit CLI renders one V3 page (HTML + PDF) per
+      client: how approval works, texting creative in, what the report covers, the
+      trust rules in plain language; fixed template copy only, no pricing, no dashes
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

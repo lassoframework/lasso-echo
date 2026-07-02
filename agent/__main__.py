@@ -253,6 +253,22 @@ def main(argv=None):
         else:
             from .onboard import add_client
             add_client(key, name)
+    elif cmd == "welcome-kit":
+        # MANUAL client welcome kit (HTML + PDF): fixed template language only,
+        # no pricing, no dashes. Renders to /data/reports/.
+        key, args = "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                key = args[i + 1]; i += 2; continue
+            if args[i].startswith("--account="):
+                key = args[i].split("=", 1)[1]
+            i += 1
+        if not key:
+            print("usage: python -m agent welcome-kit --account <key>")
+        else:
+            from .welcome_kit import run as kit_run
+            kit_run(key)
     elif cmd == "restore-store":
         # MANUAL restore: staging + verification counts; NEVER touches the live
         # db without --confirm (and then keeps it as .pre_restore.bak).
