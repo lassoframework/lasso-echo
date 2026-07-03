@@ -369,6 +369,25 @@ def main(argv=None):
                     if autotag(path):
                         tagged += 1
             print(f"dam-scan: {tagged} asset(s) tagged")
+    elif cmd == "seed-calendar":
+        # Build the human-approved monthly calendar for the trust ladder from
+        # approval evidence only. --write stores it in kv; default prints.
+        acct_f, month, write, args = "", "", False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            if args[i] == "--month" and i + 1 < len(args):
+                month = args[i + 1]; i += 2; continue
+            if args[i] == "--write":
+                write = True
+            i += 1
+        if not acct_f or not month:
+            print("usage: python -m agent seed-calendar --account <key> "
+                  "--month YYYY-MM [--write]")
+        else:
+            from .seed_calendar import run as seed_run
+            seed_run(acct_f, month, write=write)
     elif cmd == "backfill-insights":
         # By-hand per-post metrics backfill from the store's publish records
         # (views, never impressions). --dry lists work, touches nothing.

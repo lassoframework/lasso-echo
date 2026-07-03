@@ -175,3 +175,37 @@ def test_autopublish_fires_only_when_eligible(monkeypatch):
     d2.draft_id = "d2"
     _post_and_save(d2, store, poster, idempotent=True)
     assert d2 in poster.cards and len(calls) == 1
+
+
+# ---- seed-calendar: approval evidence only ------------------------------------------
+def test_seed_calendar_unapproved_never_enters_and_roundtrips(monkeypatch):
+    from agent import seed_calendar
+    from agent.store import PendingStore
+    # an APPROVED queued draft, a PENDING one, a BLOCKED one
+    store = Store2 = PendingStore()
+    for did, status, creative in (("a1", DraftStatus.APPROVED, "cal_ok.png"),
+                                  ("p1", DraftStatus.PENDING, "sneaky.png"),
+                                  ("b1", DraftStatus.BLOCKED, "broken.png")):
+        store.put(Draft(draft_id=did, account_key="lasso_ig", platform="instagram",
+                        caption="c", hashtags=[], creative_path=f"/lib/{creative}",
+                        creative_public_url="", scheduled_for="t", status=status,
+                        day_key="2026-07-08", draft_type="feed"))
+    # a really-published post (went through the tap)
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO posts (draft_id, account_key, platform, caption, media_id, "
+            "mode, published_at, creative_key) VALUES ('x','lasso_ig','instagram',"
+            "'c','M','published','2026-07-06T18:30:00','tapped.png')")
+        conn.commit()
+    cal = seed_calendar.build_calendar("lasso_ig", "2026-07")
+    assert sorted(cal["keys"]) == ["cal_ok.png", "tapped.png"]
+    assert "sneaky.png" not in cal["keys"]                # ADVERSARIAL: pending out
+    assert "broken.png" not in cal["keys"]
+    # gaps = posting days with nothing approved (Saturdays excluded by cadence)
+    assert "2026-07-06" not in cal["gaps"] and "2026-07-08" not in cal["gaps"]
+    assert "2026-07-07" in cal["gaps"]
+    assert "2026-07-11" not in cal["gaps"]                # a Saturday: skip day
+    # write then read round-trips through the exact key trust reads
+    seed_calendar.run("lasso_ig", "2026-07", write=True)
+    assert trust.approved_calendar("lasso_ig", "2026-07") == {"cal_ok.png",
+                                                              "tapped.png"}
