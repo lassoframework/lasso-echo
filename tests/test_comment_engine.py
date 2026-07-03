@@ -136,3 +136,43 @@ def test_graph_read_uses_comment_edge_only(monkeypatch):
     graph = FakeGraph({"M9": []})
     comments.fetch_recent_comments(acct, http=graph)
     assert all(u.endswith("/comments") for u in graph.requests)
+
+
+# ---- first-poll flood guard ---------------------------------------------------------
+def test_pre_arm_comments_never_carded_even_when_only_comments(monkeypatch):
+    """ADVERSARIAL: the whole backlog predates arming; ZERO cards, one dash-free
+    guard line with the count."""
+    monkeypatch.setenv("AGENT_COMMENTS_ENABLED", "true")
+    db.kv_set("comments_armed_at", "2026-07-06T00:00:00+00:00")
+    acct = _acct(monkeypatch)
+    _seed_post("M1")
+    graph = FakeGraph({"M1": [
+        {"id": "old1", "text": "Love this!", "timestamp": "2026-07-01T10:00:00+0000"},
+        {"id": "old2", "text": "price?", "timestamp": "2026-07-05T10:00:00+0000"},
+    ]})
+    poster = RecordingPoster()
+    cards = comments.process_comments(acct, http=graph, poster=poster)
+    held = [c for c in cards if "HELD" in c]
+    assert held == []                                     # NOTHING carded
+    guard = [c for c in cards if "COMMENT GUARD" in c]
+    assert len(guard) == 1 and "skipped 2" in guard[0]
+    for ch in ("—", "–"):
+        assert ch not in guard[0]                         # dash free
+    # the guard note fires once, not every poll
+    graph2 = FakeGraph({"M1": [
+        {"id": "old3", "text": "old again", "timestamp": "2026-07-02T10:00:00+0000"},
+    ]})
+    cards2 = comments.process_comments(acct, http=graph2, poster=poster)
+    assert cards2 == []
+
+
+def test_post_arm_comments_card_normally(monkeypatch):
+    monkeypatch.setenv("AGENT_COMMENTS_ENABLED", "true")
+    db.kv_set("comments_armed_at", "2026-07-06T00:00:00+00:00")
+    acct = _acct(monkeypatch)
+    _seed_post("M2")
+    graph = FakeGraph({"M2": [
+        {"id": "new1", "text": "Love this!", "timestamp": "2026-07-07T10:00:00+0000"},
+    ]})
+    cards = comments.process_comments(acct, http=graph, poster=RecordingPoster())
+    assert len(cards) == 1 and "TIER 1 HELD" in cards[0]

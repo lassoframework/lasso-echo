@@ -123,12 +123,13 @@ def fetch_recent_comments(account, http=None, limit_posts=5):
         media_id = row["media_id"]
         try:
             r = http.get(f"{config.GRAPH_API_BASE}/{media_id}/comments",
-                         params={"fields": "id,text,message",
+                         params={"fields": "id,text,message,timestamp,created_time",
                                  "access_token": token},
                          timeout=30)
             for c in (r.json() or {}).get("data", []) or []:
                 out.append({"media_id": media_id, "comment_id": c.get("id", ""),
-                            "text": c.get("text") or c.get("message") or ""})
+                            "text": c.get("text") or c.get("message") or "",
+                            "created": c.get("timestamp") or c.get("created_time") or ""})
         except Exception as e:
             print(f"[comments] read failed for {media_id}: {type(e).__name__}: {e}")
     return out
@@ -143,11 +144,24 @@ def process_comments(account, http=None, poster=None):
     """
     if not config.comments_enabled():
         return None
+    from datetime import datetime, timezone
     from . import db
+    # FIRST-POLL FLOOD GUARD: the first time the flag is seen true, stamp the
+    # moment. Only comments created AFTER arming are ever carded; the backlog
+    # is counted once and reported in one line, never carded.
+    armed_at = db.kv_get("comments_armed_at", "")
+    if not armed_at:
+        armed_at = datetime.now(timezone.utc).isoformat()
+        db.kv_set("comments_armed_at", armed_at)
     cards = []
+    skipped_pre_arm = 0
     for c in fetch_recent_comments(account, http=http):
         if not c["comment_id"]:
             continue
+        created = (c.get("created") or "").replace("+0000", "+00:00")
+        if created and created[:19] < armed_at[:19]:
+            skipped_pre_arm += 1
+            continue  # pre-arm backlog: never carded
         seen_key = f"comment_seen_{c['comment_id']}"
         if db.kv_get(seen_key):
             continue
@@ -167,4 +181,11 @@ def process_comments(account, http=None, poster=None):
             poster.post_notice(card)
         db.audit("comment", c["comment_id"],
                  f"{decision['tier']} held for approval", account.key)
+    if skipped_pre_arm and not db.kv_get(f"comments_flood_note_{account.key}"):
+        db.kv_set(f"comments_flood_note_{account.key}", "1")
+        note = (f"COMMENT GUARD {account.key}: skipped {skipped_pre_arm} "
+                "comment(s) from before arming. Only new comments get cards.")
+        if poster is not None:
+            poster.post_notice(note)
+        cards.append(note)
     return cards
