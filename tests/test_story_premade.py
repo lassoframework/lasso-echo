@@ -38,7 +38,7 @@ def _acct():
 
 
 def _feed_draft(tmp_path):
-    feed = tmp_path / "lasso_v2_one_screen.png"
+    feed = tmp_path / "nano_one_screen.png"
     feed.write_bytes(b"feed image")
     return Draft(draft_id="f1", account_key="lasso_ig", platform="instagram",
                  caption="c", hashtags=[], creative_path=str(feed),
@@ -59,7 +59,7 @@ def test_flag_off_ignores_premade_and_rerenders(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     monkeypatch.delenv("AGENT_STORY_PREMADE_ENABLED", raising=False)
     feed = _feed_draft(tmp_path)
-    (tmp_path / "lasso_v2_one_screen_story.png").write_bytes(b"premade story")
+    (tmp_path / "nano_one_screen_story.png").write_bytes(b"premade story")
     nano = FakeNano()
     d = stories.build_story_draft(_acct(), "2026-07-06", feed_draft=feed,
                                   nano_client=nano, s3_client=FakeS3())
@@ -72,7 +72,7 @@ def test_flag_on_prefers_premade_zero_generation(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
     feed = _feed_draft(tmp_path)
-    premade = tmp_path / "lasso_v2_one_screen_story.png"
+    premade = tmp_path / "nano_one_screen_story.png"
     premade.write_bytes(b"premade story")
     nano = FakeNano()
     d = stories.build_story_draft(_acct(), "2026-07-06", feed_draft=feed,
@@ -99,7 +99,7 @@ def test_cadence_untouched_story_is_additional(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
     feed = _feed_draft(tmp_path)
-    (tmp_path / "lasso_v2_one_screen_story.png").write_bytes(b"premade")
+    (tmp_path / "nano_one_screen_story.png").write_bytes(b"premade")
     d = stories.build_story_draft(_acct(), "2026-07-06", feed_draft=feed,
                                   nano_client=FakeNano(), s3_client=FakeS3())
     assert feed.status == DraftStatus.PENDING           # feed draft untouched
