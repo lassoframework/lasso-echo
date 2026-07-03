@@ -446,6 +446,16 @@ def grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
 
 
+def connect_grade_enabled() -> bool:
+    """
+    Connect-to-grade switch. OFF by default: /connect behavior is byte
+    identical to today. ON, completing the connect page selection queues ONE
+    Social Grade baseline read for that page and posts an informational
+    BASELINE card line to the approval channel. No publish path involved.
+    """
+    return _truthy(os.environ.get("AGENT_CONNECT_GRADE_ENABLED", "false"))
+
+
 def connect_tokens_enabled() -> bool:
     """
     Connect-token resolution switch. OFF by default: account tokens come ONLY

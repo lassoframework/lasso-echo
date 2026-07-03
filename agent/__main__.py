@@ -72,6 +72,7 @@ def _status():
     print(f"  intake         : {config.intake_enabled()}  (env AGENT_INTAKE_ENABLED)")
     print(f"  connect        : {config.connect_enabled()}  (env AGENT_CONNECT_ENABLED)")
     print(f"  connect_tokens : {config.connect_tokens_enabled()}  (env AGENT_CONNECT_TOKENS_ENABLED)")
+    print(f"  connect_grade  : {config.connect_grade_enabled()}  (env AGENT_CONNECT_GRADE_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
     print(f"  monthly_review : {config.monthly_review_enabled()}  (env AGENT_MONTHLY_REVIEW_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")

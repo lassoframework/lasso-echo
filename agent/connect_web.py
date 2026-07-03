@@ -136,7 +136,7 @@ Connect this Page</button></form>"""
     return 200, _PAGE_SHELL.format(body=body)
 
 
-def handle_select(params, http=None):
+def handle_select(params, http=None, poster=None):
     """Resolve the linked IG account, store the page token, confirm."""
     if not config.connect_enabled():
         return 404, "not found"
@@ -170,6 +170,11 @@ def handle_select(params, http=None):
              "ig_id": ig.get("id", "")}))
         db.audit("connect", page_name or page_id,
                  f"page connected; ig={ig_username or 'none linked'}")
+        # Social Grade baseline (AGENT_CONNECT_GRADE_ENABLED, OFF: byte
+        # identical connect). ON: queue exactly one baseline read per connect
+        # and post one informational BASELINE line. No publish path.
+        if config.connect_grade_enabled():
+            _queue_grade_baseline(page_id, page_name, ig_username, poster=poster)
     _sessions.pop(state, None)  # single use
 
     ig_line = (f"Instagram: <b>@{ig_username}</b>" if ig_username
@@ -217,3 +222,33 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
     port = int(port or os.environ.get("AGENT_CONNECT_PORT", "8090"))
     print(f"[connect] serving on :{port}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+def _queue_grade_baseline(page_id, page_name, ig_username, poster=None):
+    """Queue ONE Social Grade baseline read for a freshly connected page and
+    post the informational BASELINE line. Dash free, informational only."""
+    from . import db
+    import json as _json
+    try:
+        queue = _json.loads(db.kv_get("grade_baseline_queue", "") or "[]")
+    except Exception:
+        queue = []
+    queue.append({"page_id": page_id, "page_name": page_name,
+                  "ig_username": ig_username})
+    db.kv_set("grade_baseline_queue", _json.dumps(queue))
+    ig_bit = f" and @{ig_username}" if ig_username else ""
+    note = (f"BASELINE queued: Social Grade baseline read for {page_name}"
+            f"{ig_bit}. The first grade card lands after the first snapshot "
+            "cycle. Informational only; nothing publishes from this.")
+    if poster is None:
+        try:
+            from .ops_alerts import _default_poster
+            poster = _default_poster()
+        except Exception:
+            poster = None
+    if poster is not None:
+        try:
+            poster.post_notice(note)
+        except Exception:
+            pass
+    db.audit("connect_grade", page_name or page_id, "baseline queued")

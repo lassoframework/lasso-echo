@@ -136,3 +136,52 @@ def test_select_resolves_ig_and_stores_token(monkeypatch, capsys):
     status2, _ = connect_web.handle_select({"state": state, "page_id": "PAGE1"},
                                            http=graph)
     assert status2 == 400
+
+
+# ---- connect -> Social Grade baseline (AGENT_CONNECT_GRADE_ENABLED) ---------------
+def test_flag_off_connect_is_byte_identical(monkeypatch):
+    monkeypatch.delenv("AGENT_CONNECT_GRADE_ENABLED", raising=False)
+    state = _start_flow(monkeypatch)
+    graph = FakeGraph()
+    connect_web.handle_callback({"code": "C0DE", "state": state}, http=graph)
+
+    class ExplodingPoster:
+        def post_notice(self, text):
+            raise AssertionError("baseline note posted while OFF")
+
+    status, html = connect_web.handle_select({"state": state, "page_id": "PAGE1"},
+                                             http=graph, poster=ExplodingPoster())
+    assert status == 200 and "Connected" in html          # same flow as today
+    assert db.kv_get("grade_baseline_queue", "") == ""    # no queue entry
+    assert [r for r in db.audit_rows() if r["kind"] == "connect_grade"] == []
+
+
+def test_flag_on_queues_exactly_one_baseline_per_connect(monkeypatch):
+    monkeypatch.setenv("AGENT_CONNECT_GRADE_ENABLED", "true")
+    state = _start_flow(monkeypatch)
+    graph = FakeGraph()
+    connect_web.handle_callback({"code": "C0DE", "state": state}, http=graph)
+
+    class Rec:
+        notices = []
+
+        def post_notice(self, text):
+            Rec.notices.append(text)
+            return {"ok": True}
+
+    status, html = connect_web.handle_select({"state": state, "page_id": "PAGE1"},
+                                             http=graph, poster=Rec())
+    assert status == 200
+    queue = json.loads(db.kv_get("grade_baseline_queue"))
+    assert len(queue) == 1                                 # exactly one per connect
+    assert queue[0]["page_id"] == "PAGE1"
+    assert queue[0]["ig_username"] == "ironpathgym"
+    baseline = [n for n in Rec.notices if "BASELINE" in n]
+    assert len(baseline) == 1
+    assert "Informational only" in baseline[0]
+    assert "nothing publishes" in baseline[0]              # no publish path
+    for ch in ("—", "–"):
+        assert ch not in baseline[0]                       # dash free
+    # the token still never leaks anywhere new
+    assert PAGE_TOKEN not in baseline[0]
+    assert PAGE_TOKEN not in json.dumps(db.audit_rows())
