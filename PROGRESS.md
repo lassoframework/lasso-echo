@@ -211,6 +211,12 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       builder feeds both the backfill and the daily snapshot; every skip line and
       audit row now carries the Graph error code/subcode/message (token scrubbed) and
       names the missing permission when it is one
+- [x] Micro patch (2026-07-04 pm): FB photo-node metrics (bare photo ids resolve
+      their owning post via page_story_id, then read reactions/comments/shares; the
+      field likes is never requested on any FB node) and Opus collection id
+      extraction made shape tolerant (collectionId/string/anything-Id; an
+      extracted-vs-returned mismatch warns loudly with the keys seen, never a
+      silent zero)
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
