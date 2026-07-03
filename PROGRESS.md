@@ -202,6 +202,15 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       ONCE; empty-caption drafts block instead of growing buttons). FB verify-400:
       already fixed Jul 3 (Photo node field set); both observed events predate the
       deploy; no Meta-side action needed
+- [x] backfill-insights 400 patch (2026-07-04): root cause was the metric list, not
+      access. IG MEDIA insights metric is saved not saves (every IG media read 400d);
+      FB Page posts use a different insights namespace entirely (every lasso_fb read
+      400d) and now read likes/comments/shares via object fields; stories get their
+      own metric set with a graceful "story insights expired" skip past 24h; Graph pin
+      bumped v21.0 to v23.0 (past the views migration). ONE media-type-aware metric
+      builder feeds both the backfill and the daily snapshot; every skip line and
+      audit row now carries the Graph error code/subcode/message (token scrubbed) and
+      names the missing permission when it is one
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
