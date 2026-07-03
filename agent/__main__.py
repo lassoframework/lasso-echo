@@ -462,6 +462,10 @@ def main(argv=None):
         else:
             print(f"pull-opus: {out['pulled']} pulled, {out['skipped']} skipped, "
                   f"{out['failed']} failed")
+    elif cmd == "gbp-check":
+        # READ-ONLY Google Business Profile probe: one honest status line.
+        from .gbp_check import gbp_check
+        gbp_check()
     elif cmd == "opus-check":
         # READ-ONLY connectivity probe: HTTP status + collection count, and the
         # truncated key-scrubbed body when the account looks empty to this key.
