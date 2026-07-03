@@ -36,7 +36,8 @@ def _fetch_with_backoff(media_id, token, http, sleeper=time.sleep):
             sleeper(2 ** attempt)
             continue
         if status >= 400:
-            raise RuntimeError(f"HTTP {status} reading {media_id}")
+            from .reporting_live import graph_error_detail
+            raise RuntimeError(f"reading {media_id}: {graph_error_detail(r)}")
         out = {}
         for item in (r.json() or {}).get("data", []) or []:
             name = item.get("name")
@@ -87,7 +88,10 @@ def backfill_insights(account_key, since, dry=False, http=None, sleeper=time.sle
             pm = _fetch_with_backoff(row["media_id"], token, http, sleeper=sleeper)
         except Exception as e:
             summary["skipped"] += 1
-            print(f"  skipped {row['media_id']}: {e}")
+            from . import ops_alerts
+            reason = ops_alerts.scrub(str(e))
+            print(f"  skipped {row['media_id']}: {reason}")
+            db.audit("insights_skip", row["media_id"], reason, account_key)
             continue
         with db.connect() as conn:
             # UPSERT IN PLACE on the existing publish row: idempotent by design,

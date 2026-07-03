@@ -21,6 +21,39 @@ IG_ACCOUNT_METRICS = "views,reach,likes,comments,saves,shares"
 IG_POST_METRICS = "views,reach,likes,comments,saves,shares"
 
 
+def graph_error_detail(resp):
+    """The HONEST error line for a failed Graph read: code, subcode, type, and
+    message from the response body, token scrubbed. A bare "HTTP 400" with no
+    reason is banned; this is what every skip line and audit row carries."""
+    from . import ops_alerts
+    status = getattr(resp, "status_code", "?")
+    try:
+        err = (resp.json() or {}).get("error", {}) or {}
+    except Exception:
+        err = {}
+    code = err.get("code", "?")
+    sub = err.get("error_subcode", "")
+    msg = err.get("message", "") or getattr(resp, "text", "")[:200]
+    detail = (f"HTTP {status}, code {code}"
+              + (f", subcode {sub}" if sub else "")
+              + f": {msg}")
+    return ops_alerts.scrub(detail)
+
+
+def permission_hint(detail, platform):
+    """When the Graph error smells like a permissions problem, NAME the missing
+    permission so the fix is obvious from the terminal."""
+    low = (detail or "").lower()
+    if ("permission" in low or "oauth" in low or "code 10:" in low
+            or "code 200" in low or "code 190" in low or "(#10)" in low):
+        from .accounts import Platform
+        if platform == Platform.INSTAGRAM or platform == "instagram":
+            return " Likely missing permission: instagram_manage_insights."
+        return (" Likely missing permission: pages_read_engagement or "
+                "read_insights.")
+    return ""
+
+
 def _requests():
     import requests  # lazy
     return requests
@@ -121,8 +154,14 @@ def snapshot_all(http=None, poster=None, now=None):
                             (pm.get("likes"), pm.get("comments"), pm.get("saves"),
                              pm.get("shares"), pm.get("views"), pm.get("reach"),
                              row["id"]))
-                    except Exception:
-                        pass  # one bad post read never sinks the account snapshot
+                    except Exception as e:
+                        # one bad post read never sinks the snapshot, but it is
+                        # never silent either: the WHY prints and lands in audit.
+                        reason = ops_alerts.scrub(str(e))
+                        print(f"[reporting] post read skipped "
+                              f"{row['media_id']}: {reason}")
+                        db.audit("insights_skip", row["media_id"], reason,
+                                 account.key, today)
                 conn.commit()
             results[account.key] = True
         except Exception as e:
