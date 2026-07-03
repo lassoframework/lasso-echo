@@ -320,6 +320,28 @@ def summit_campaign_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SUMMIT_CAMPAIGN_ENABLED", "false"))
 
 
+def trust_dryrun_enabled() -> bool:
+    """
+    Trust DRY RUN switch. OFF by default. ON, every draft that WOULD have
+    auto-published under the account's trust level is audited and marked on its
+    Slack card, but STILL requires the tap. Nothing publishes without approval
+    in dry run, ever.
+    """
+    return _truthy(os.environ.get("AGENT_TRUST_DRYRUN", "false"))
+
+
+def trust_autopublish_enabled() -> bool:
+    """
+    Trust AUTOPUBLISH switch. OFF by default; a startup warning prints when
+    armed. Only queue-verbatim / calendar-routine posts inside a human-approved
+    monthly calendar are eligible, and only for a level 1+ account. Anything
+    off template, any first post to a new audience or surface, any story, any
+    comment, and any book campaign post ALWAYS cards regardless of trust.
+    Trust is per account and never transfers.
+    """
+    return _truthy(os.environ.get("AGENT_TRUST_AUTOPUBLISH", "false"))
+
+
 def trust_ladder_enabled() -> bool:
     """
     The trust ladder DOUBLE GATE. OFF by default: every account cards every

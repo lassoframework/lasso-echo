@@ -88,12 +88,51 @@ def _expire_stale(day_key, store, poster):
 
 def _post_and_save(draft, store, poster, idempotent):
     """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
+    # Trust ladder wiring (both flags default OFF; nothing changes while off).
+    if draft.status.value == "pending" and (
+            config.trust_dryrun_enabled() or config.trust_autopublish_enabled()):
+        from . import db
+        from .accounts import get_account
+        from .trust import auto_eligibility
+        acct = get_account(draft.account_key)
+        eligible, why = auto_eligibility(acct, draft) if acct else (False, "no account")
+        if eligible and config.trust_autopublish_enabled():
+            # GATED AUTOPUBLISH: calendar-routine only, level 1+, never a first
+            # post, never book/comments/stories. The publisher's own draft-only
+            # guard (AGENT_PUBLISH_ENABLED) still applies inside publish().
+            from . import postlog
+            from .meta_publisher import publish
+            result = publish(draft, acct)
+            draft.status = DraftStatus.APPROVED
+            postlog.log_post(account_key=draft.account_key, platform=draft.platform,
+                             caption=draft.caption,
+                             media_id=getattr(result, "media_id", ""),
+                             mode=result.mode, draft_id=draft.draft_id)
+            db.audit("trust_autopublish", draft.draft_id, why, draft.account_key,
+                     draft.day_key)
+            poster.post_notice(
+                f"AUTO PUBLISHED under trust for {draft.account_key} "
+                f"({result.mode}): {why}. Draft {draft.draft_id}.")
+            store.put(draft)
+            return
+        if eligible and config.trust_dryrun_enabled():
+            draft.warnings = list(getattr(draft, "warnings", []) or []) + [
+                "would auto-publish at current trust (dry run: still needs your tap)"]
+            db.audit("trust_dryrun", draft.draft_id, why, draft.account_key,
+                     draft.day_key)
     resp = poster.post_approval_card(draft) or {}
     if idempotent:
         draft.slack_channel = str(resp.get("channel") or "")
         draft.slack_ts = str(resp.get("ts") or "")
     if draft.status.value != "blocked":
         store.put(draft)
+
+
+def _trust_startup_warning():
+    if config.trust_autopublish_enabled():
+        print("[trust] WARNING: AGENT_TRUST_AUTOPUBLISH is ARMED. Calendar routine "
+              "posts on level 1+ accounts publish without a tap. Everything else "
+              "still cards.")
 
 
 def run_daily(poster=None, voice_path=None, library_path=None,
@@ -103,6 +142,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     blocked marker). Side effects: posts approval cards to Slack AND saves each
     non-blocked draft to the pending store so the listener can act on it later.
     """
+    _trust_startup_warning()
     results = []
 
     if not config.master_enabled():

@@ -82,3 +82,45 @@ def requires_approval(account, draft) -> bool:
     if not creative_key:
         return True
     return creative_key not in approved_calendar(account.key, month)
+
+
+def _has_published_before(account_key):
+    """The FIRST-POST GATE data read: has this account EVER really published?"""
+    try:
+        from . import db
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE account_key=? AND mode='published'",
+                (account_key,)).fetchone()
+            return (row[0] or 0) > 0
+    except Exception:
+        return False  # unknown history reads as NO history: fail safe
+
+
+def auto_eligibility(account, draft):
+    """
+    (eligible, reason) for trust auto-publish. HARD EXCLUSIONS, regardless of
+    level or calendar: book campaign posts, comments, stories, any first post to
+    a new audience (an account with zero real publishes), anything off template.
+    Per account, never global.
+    """
+    if effective_level(account) < TrustLevel.ROUTINE_AUTO:
+        return False, "account is level 0: full approval on everything"
+    draft_type = getattr(draft, "draft_type", "") or ""
+    if draft_type == "book":
+        return False, "book campaign posts always card for approval"
+    if draft_type.startswith("comment"):
+        return False, "comment replies always card for approval"
+    if getattr(draft, "is_story", False):
+        return False, "stories are not calendar routine; always card"
+    if not _has_published_before(account.key):
+        return False, ("first post to this audience is never automated; "
+                       "a human sends the first one")
+    month = (getattr(draft, "day_key", "") or "")[:7]
+    if not month:
+        return False, "no day context; card it"
+    creative_key = os.path.basename(getattr(draft, "creative_path", "") or "")
+    if not creative_key or creative_key not in approved_calendar(account.key, month):
+        return False, "off template: not in the human-approved monthly calendar"
+    return True, ("calendar routine inside the approved monthly calendar "
+                  f"for {month}, account level {int(effective_level(account))}")
