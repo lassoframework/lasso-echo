@@ -405,6 +405,16 @@ def runway_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_RUNWAY_ENABLED", "false"))
 
 
+def monthly_review_enabled() -> bool:
+    """
+    Monthly review loop switch. OFF by default. ON, the 30 day per account
+    cycle: top and bottom posts, health read, before vs after posting frequency,
+    citation-gated angle proposals, and the raw material ask; one Slack digest
+    plus a white label PDF. Reads only; drafts nothing, publishes nothing.
+    """
+    return _truthy(os.environ.get("AGENT_MONTHLY_REVIEW_ENABLED", "false"))
+
+
 def grade_enabled() -> bool:
     """
     Social Grade switch. OFF by default. ON, the reporting assembler adds a per

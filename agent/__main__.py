@@ -73,6 +73,7 @@ def _status():
     print(f"  connect        : {config.connect_enabled()}  (env AGENT_CONNECT_ENABLED)")
     print(f"  connect_tokens : {config.connect_tokens_enabled()}  (env AGENT_CONNECT_TOKENS_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
+    print(f"  monthly_review : {config.monthly_review_enabled()}  (env AGENT_MONTHLY_REVIEW_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
     print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")
     print(f"  trust_ladder   : {config.trust_ladder_enabled()}  (env AGENT_TRUST_LADDER_ENABLED)")
@@ -324,6 +325,21 @@ def main(argv=None):
                     if autotag(path):
                         tagged += 1
             print(f"dam-scan: {tagged} asset(s) tagged")
+    elif cmd == "monthly-review":
+        # The 30 day loop: digest + PDF per account (AGENT_MONTHLY_REVIEW_ENABLED).
+        # --dry prints everything and posts/writes nothing.
+        acct_f, dry, args = None, False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            if args[i].startswith("--account="):
+                acct_f = args[i].split("=", 1)[1]
+            if args[i] == "--dry":
+                dry = True
+            i += 1
+        from .monthly_review import run as review_run
+        review_run(account=acct_f, dry=dry, poster=ConsolePoster())
     elif cmd == "grade-card":
         # One page Social Grade card (HTML + PDF) from live store data. Respects
         # AGENT_GRADE_ENABLED; drafts nothing, posts nothing.
