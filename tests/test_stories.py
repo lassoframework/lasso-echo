@@ -18,7 +18,7 @@ from agent.drafter import Draft, DraftStatus  # noqa: E402
 from agent.runner import run_daily  # noqa: E402
 from agent.slack_surface import build_card_blocks, _fallback_text  # noqa: E402
 
-DAY = "2026-07-01"  # a Wednesday: a posting day under the default cadence
+DAY = "2027-07-07"  # a Wednesday: a posting day under the default cadence
 
 
 class CaptureNano:
@@ -72,7 +72,7 @@ def _feed_draft(**kw):
         caption="Leads go cold in minutes.", hashtags=["#LASSOFramework"],
         creative_path="nano_leads_go_cold.png",
         creative_public_url="https://cdn.echo.test/echo/lasso_ig/feed.png",
-        scheduled_for="2026-07-01T18:30:00-04:00", status=DraftStatus.PENDING,
+        scheduled_for="2027-07-07T18:30:00-04:00", status=DraftStatus.PENDING,
         source_fragments=["Leads go cold in minutes.",
                           "Answer inside five minutes and you book three times more."],
     )

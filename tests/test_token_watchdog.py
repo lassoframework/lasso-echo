@@ -191,7 +191,7 @@ def test_run_daily_survives_watchdog_exception(monkeypatch, tmp_path, capsys):
     acct = Account(key="gym_ig", display_name="Gym", platform=Platform.INSTAGRAM,
                    token_env="WD_TEST_TOKEN", target_id_env="WD_TEST_TARGET")
     out = run_daily(poster=RecordingPoster(), voice_path=str(voice),
-                    library_path=str(lib), scheduled_for="2026-07-01T18:30:00+00:00",
+                    library_path=str(lib), scheduled_for="2027-07-07T18:30:00+00:00",
                     accounts=[acct], store=_Store())
     assert out["status"] == "drafted"              # the run completed anyway
     assert "[token-watchdog] check failed" in capsys.readouterr().out

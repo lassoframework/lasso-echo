@@ -68,22 +68,56 @@ def _reconcile(draft, day_key, draft_type, store, poster):
     return draft, None
 
 
-def _expire_stale(day_key, store, poster):
+def expire_past_due(store, poster, now=None):
     """
-    Expiry sweep (flag ON only): a PENDING draft whose posting day has passed can
-    no longer be approved as that day's post. Flip its record to EXPIRED and edit
-    its Slack card in place (label rewritten, buttons removed), exactly the way a
-    supersede does. Records without a day_key (written before the flag existed)
-    never match and are left untouched.
+    CARD SELF-EXPIRY (no flag: queue hygiene, always on, like the heartbeat).
+    Any PENDING draft whose scheduled post time has passed can no longer be
+    approved as that slot's post: it flips to EXPIRED, its Slack card is edited
+    in place (label rewritten, buttons removed), and it drops from the pending
+    queue with one log line. This kills the zombie-queue class permanently and
+    retroactively: the first sweep after deploy expires every stale card already
+    in the store. Safety direction is one way only: expiry can never publish,
+    and approvals already refuse an EXPIRED draft.
     """
+    from datetime import datetime as _dt, timezone as _tz
+    now = now or _dt.now(_tz.utc)
+    today = now.date().isoformat()
     expired = []
-    for d in store.list_pending():
-        if d.day_key and d.day_key < day_key:
-            d.status = DraftStatus.EXPIRED
-            store.put(d)
+    pending = getattr(store, "list_pending", None)
+    if pending is None:
+        return expired  # a store without a queue has nothing to expire
+    for d in pending():
+        past_due = False
+        sched = (d.scheduled_for or "").strip()
+        if sched:
+            try:
+                when = _dt.fromisoformat(sched)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_tz.utc)
+                past_due = when < now
+            except ValueError:
+                past_due = bool(d.day_key and d.day_key < today)
+        elif d.day_key:
+            past_due = d.day_key < today
+        if not past_due:
+            continue
+        d.status = DraftStatus.EXPIRED
+        store.put(d)
+        try:
             poster.mark_expired(d)
-            expired.append(d)
+        except Exception:
+            pass  # a missing Slack ref never blocks the sweep
+        print(f"[expiry] {d.draft_id} ({d.account_key}, scheduled "
+              f"{sched or d.day_key}) EXPIRED: past its slot, dropped from the queue")
+        expired.append(d)
+    if expired:
+        print(f"[expiry] sweep expired {len(expired)} past-due card(s)")
     return expired
+
+
+def _expire_stale(day_key, store, poster):
+    """Kept for the existing call site; the real sweep is expire_past_due."""
+    return expire_past_due(store, poster)
 
 
 def _post_and_save(draft, store, poster, idempotent):
@@ -165,11 +199,18 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     day_key = when[:10]  # YYYY-MM-DD, the day this post is for
     lib = library_path or config.LIBRARY_PATH
 
+    # Card self-expiry (no flag): past-due pending cards drop before drafting.
+    # Anchored to THIS run's reference time so simulated/scheduled runs agree.
+    try:
+        run_now = datetime.fromisoformat(when)
+        if run_now.tzinfo is None:
+            run_now = run_now.replace(tzinfo=timezone.utc)
+    except ValueError:
+        run_now = datetime.now(timezone.utc)
+    expire_past_due(store, poster, now=run_now)
+
     # Idempotent daily drafts: OFF by default = behavior below is exactly today's.
     idempotent = config.idempotent_drafts_enabled()
-    if idempotent:
-        # Expire yesterday's still-pending cards before drafting today's.
-        _expire_stale(day_key, store, poster)
 
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,

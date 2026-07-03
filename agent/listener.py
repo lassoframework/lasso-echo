@@ -150,6 +150,14 @@ def _daily_scheduler(store):
                 opus_ingest.pull()
             except Exception as e:
                 print(f"[opus] poll pass failed: {type(e).__name__}: {e}")
+        # Card self-expiry sweep (no flag, queue hygiene): hourly, cheap.
+        if now.minute == 0:
+            try:
+                from . import ops_alerts as _oa
+                from .runner import expire_past_due
+                expire_past_due(store, _oa._default_poster(), now=now)
+            except Exception as e:
+                print(f"[expiry] sweep failed: {type(e).__name__}: {e}")
         # Heartbeat morning check (no flag, honest observability): one alert
         # per enabled account per day when the daily run missed its window.
         try:

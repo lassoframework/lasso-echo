@@ -22,8 +22,8 @@ from agent.slack_surface import (SlackPoster, build_expired_blocks,  # noqa: E40
                                  build_superseded_blocks)
 from agent.store import PendingStore  # noqa: E402
 
-DAY = "2026-07-01"   # Wednesday: a posting day under the default cadence
-DAY2 = "2026-07-02"  # Thursday: also a posting day
+DAY = "2027-07-07"   # Wednesday: a posting day under the default cadence
+DAY2 = "2027-07-08"  # Thursday: also a posting day
 
 VOICE_V1 = "We help gym owners grow.\n\n## Hashtags\n#LASSOFramework"
 VOICE_V2 = "We help gym owners grow.\n\n## Hashtags\n#LASSOFramework #SpeedToLead"
@@ -170,17 +170,24 @@ def test_flag_on_expires_stale_pending_drafts(monkeypatch, tmp_path):
     assert [d.draft_id for d in store.list_pending()] == [new.draft_id]
 
 
-def test_flag_off_no_expiry_sweep(monkeypatch, tmp_path):
-    _setup_env(monkeypatch)
+def test_expiry_sweep_is_flagless_now(monkeypatch, tmp_path):
+    """CHANGED 2026-07-04 (queue triage): past-due PENDING cards self-expire
+    even with the idempotency flag OFF. Retroactive zombie-queue kill."""
     monkeypatch.delenv("AGENT_IDEMPOTENT_DRAFTS_ENABLED", raising=False)
-    poster, store = FakePoster(), _store(tmp_path)
-    _run(tmp_path, poster, store, day=DAY)
-    _run(tmp_path, poster, store, day=DAY2)
-    assert poster.expired == []                   # OFF = old behavior exactly
-    assert all(d.status == DraftStatus.PENDING for d in store.list_pending())
+    store = _store(tmp_path)
+    stale = Draft(draft_id="old1", account_key="lasso_ig", platform="instagram",
+                  caption="stale", hashtags=[], creative_path="a.png",
+                  creative_public_url="", scheduled_for="2026-07-01T18:30:00+00:00",
+                  status=DraftStatus.PENDING, day_key="2026-07-01",
+                  draft_type="feed")
+    store.put(stale)
+    from agent.runner import expire_past_due
+    poster = FakePoster()
+    out = expire_past_due(store, poster)
+    assert [d.draft_id for d in out] == ["old1"]
+    assert store.get("old1").status == DraftStatus.EXPIRED
+    assert store.list_pending() == []                     # dropped from the queue
 
-
-# ---- 6. stale approve = friendly no-op, never publishes -----------------------
 def _stale_draft(status):
     return Draft(draft_id="stale1", account_key="gym_ig", platform="instagram",
                  caption="x", hashtags=[], creative_path="a.png",
