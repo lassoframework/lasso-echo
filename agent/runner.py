@@ -152,6 +152,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # its flag is armed with approved (permissioned + verified) entries. It is
         # dormant otherwise; None -> the normal paths below run untouched.
         if account.key.startswith("lasso"):
+            # BOOK CAMPAIGN LEADS THE CALENDAR (AGENT_BOOK_CAMPAIGN_ENABLED, OFF):
+            # armed, the day's book post takes posting priority and the normal
+            # pillars below fill around it. Every draft still cards to Blake.
+            from .book_campaign import build_book_draft
+            draft = build_book_draft(account, day_key)
+        if draft is None and account.key.startswith("lasso"):
             draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
         # Summit campaign next (its own weekly day, inside the same daily cadence,
         # never additional). Dormant unless armed; auto-stops after 2026-11-08.

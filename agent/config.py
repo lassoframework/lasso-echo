@@ -270,6 +270,24 @@ def opus_poll_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPUS_POLL_ENABLED", "false"))
 
 
+# The Full Gym book campaign: approved source docs at the repo-root knowledge/
+# folder (env override for tests). The book file is the MASTER source.
+BOOK_DIR = os.environ.get("AGENT_BOOK_DIR", "knowledge")
+BOOK_SOURCE_FILES = ("full_gym_book.md", "full_gym_case_studies.md",
+                     "full_gym_launch_campaign.md")
+BOOK_QUEUE_FILE = "BOOK_LAUNCH_QUEUE_WEEK1.md"
+
+
+def book_campaign_enabled() -> bool:
+    """
+    Book launch campaign switch. OFF by default. ON, the campaign LEADS the
+    calendar: one book post per day takes posting priority (queue verbatim
+    first, then angles 1 to 8 rotate; 9 to 11 stay dark until their LOCKED
+    blanks fill in full_gym_book.md). Every draft still cards to Blake.
+    """
+    return _truthy(os.environ.get("AGENT_BOOK_CAMPAIGN_ENABLED", "false"))
+
+
 def knowledge_enabled() -> bool:
     """
     Knowledge brain switch. OFF by default. ON, the drafter may draw facts, hooks,

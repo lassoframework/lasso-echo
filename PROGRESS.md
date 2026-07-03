@@ -158,6 +158,17 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
 - [~] Client welcome kit: welcome-kit CLI renders one V3 page (HTML + PDF) per
       client: how approval works, texting creative in, what the report covers, the
       trust rules in plain language; fixed template copy only, no pricing, no dashes
+- [~] THE FULL GYM book campaign: knowledge/ book docs registered as approved
+      sources (book = MASTER; its LOCKED section blocks like locked stats: LAUNCH
+      DATE, BUY LINK, PRICE, subtitle of record never guessed). Armed, the campaign
+      LEADS the calendar: week 1 queue posts VERBATIM in order one per day, then
+      angles 1 to 8 rotate (9 to 11 dark until blanks fill). Case study numbers
+      character exact or the draft blocks; numbers pending studies unselectable;
+      first person voice law enforced; cover style (black canvas, red and white
+      type) is the ONE documented exception to the cream house spec, scoped to book
+      cards only; premade cards in content_library/book_campaign/ used before
+      generating. Known conflicts (subtitle, author bio figure) flag as card
+      warnings. Flag AGENT_BOOK_CAMPAIGN_ENABLED OFF
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

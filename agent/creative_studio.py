@@ -195,6 +195,17 @@ def _composition_style(archetype="flow", is_story=False):
 # Kept for compatibility: the default feed composition (FLOW archetype).
 COMPOSITION_STYLE = _composition_style("flow", False)
 
+# THE ONE documented exception to the cream house spec: The Full Gym BOOK
+# campaign cards mirror the book cover (black canvas, red and white type, the
+# cover's red accent squares). Scoped ONLY to book campaign cards: nothing else
+# may pass this palette; the house spec is untouched everywhere else.
+BOOK_COVER_PALETTE = (
+    "BOOK COVER STYLE (The Full Gym campaign only, mirrors the cover art): a "
+    "BLACK canvas with red and white type and the cover's red accent squares. "
+    "Red #FF0000 and white are the only type colors; bold, high contrast, "
+    "minimal. This card intentionally does not use the cream house canvas."
+)
+
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
 NO_DASH_RULE = (
     "Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered "
@@ -213,7 +224,7 @@ def _scrub_dashes(text):
 
 
 def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
-                 archetype=None):
+                 archetype=None, palette=None):
     """
     Build the image prompt from APPROVED input only. The single on-image headline is
     the approved pillar hook (kept short); the approved body lines are passed as CONCEPT
@@ -252,7 +263,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
         "image; the caption carries the words):\n"
         f"{fact_lines}\n"
         f"{composition}\n"
-        f"{BRAND_PALETTE}\n"
+        f"{palette or BRAND_PALETTE}\n"
         f"{NO_DASH_RULE}"
     )
     return _scrub_dashes(prompt)
@@ -390,7 +401,8 @@ def _default_client():
 
 
 def generate(headline, facts, client=None, out_path=None,
-             aspect=None, pixels=None, surface=None, archetype=None):
+             aspect=None, pixels=None, surface=None, archetype=None,
+             palette=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -424,7 +436,7 @@ def generate(headline, facts, client=None, out_path=None,
         _db.counter_bump("gemini_calls", day)
 
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
-                          surface=surface, archetype=archetype)
+                          surface=surface, archetype=archetype, palette=palette)
 
     client = client or _default_client()
     if client is None:

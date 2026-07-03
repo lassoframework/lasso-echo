@@ -111,22 +111,29 @@ def load_corpus(knowledge_dir=None):
     if not config.knowledge_enabled():
         return {}
     knowledge_dir = knowledge_dir or config.KNOWLEDGE_DIR
-    if not os.path.isdir(knowledge_dir):
-        return {}
     corpus = {}
-    for name in sorted(os.listdir(knowledge_dir)):
-        if not _is_source_file(name):
-            continue
-        path = os.path.join(knowledge_dir, name)
+
+    def _ingest(path, name):
         if not os.path.isfile(path):
-            continue
+            return
         try:
             with open(path, encoding="utf-8") as fh:
                 lines = _usable_lines(fh.read())
         except OSError:
-            continue
+            return
         if any(ln.strip() for ln in lines):
             corpus[name] = lines
+
+    if os.path.isdir(knowledge_dir):
+        for name in sorted(os.listdir(knowledge_dir)):
+            if _is_source_file(name):
+                _ingest(os.path.join(knowledge_dir, name), name)
+    # The Full Gym book docs are registered approved sources with the same
+    # citation mechanics; the book's LOCKED section is excluded by the marker
+    # gate exactly like locked stats. The launch QUEUE is campaign ops, not a
+    # general source, so it is deliberately not registered here.
+    for name in config.BOOK_SOURCE_FILES:
+        _ingest(os.path.join(config.BOOK_DIR, name), name)
     return corpus
 
 
