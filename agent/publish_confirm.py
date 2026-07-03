@@ -34,13 +34,29 @@ def _reply(poster, draft, text):
         getattr(draft, "slack_channel", ""), getattr(draft, "slack_ts", ""), text)
 
 
-def _fail(poster, draft, account, detail):
-    """A failed verify: warn in the thread + one ops alert. NEVER re-publish."""
+def _audit(kind_detail, draft, reason):
+    try:
+        from datetime import datetime, timezone
+        from . import db as _db
+        _db.audit("publish_confirm", draft.draft_id, f"{kind_detail}: {reason}",
+                  draft.account_key, datetime.now(timezone.utc).date().isoformat())
+    except Exception:
+        pass
+
+
+def _unconfirmed(poster, draft, account, detail):
+    """PUBLISHED BUT UNVERIFIED: the publish call itself SUCCEEDED (we only run
+    after mode=="published"), so the post is live; only the read back failed.
+    Honest, softer wording: never the same alarm as a real publish failure
+    (that loud alert lives in approvals and is unchanged). NEVER re-publish."""
     _reply(poster, draft,
-           f"WARNING: could not confirm draft {draft.draft_id} is live on "
-           f"{account.key} ({detail}). Check Meta by hand before acting again.")
-    ops_alerts.alert(f"publish verify failed for {account.key} draft "
-                     f"{draft.draft_id}: {detail}")
+           f"NOTE: draft {draft.draft_id} published to {account.key} (post is "
+           f"live), but verification could not confirm it ({detail}). Check the "
+           "page manually when convenient.")
+    ops_alerts.alert(f"published but verify read failed for {account.key} draft "
+                     f"{draft.draft_id}: {detail}. The post itself is live; "
+                     "check manually.")
+    _audit("published, verify unconfirmed", draft, detail)
     return {"verified": False, "permalink": ""}
 
 
@@ -59,14 +75,23 @@ def confirm_publish(draft, account, result, http=None, poster=None):
 
     media_id = getattr(result, "media_id", "")
     if not media_id:
-        return _fail(poster, draft, account, "publish returned no media id")
+        return _unconfirmed(poster, draft, account, "publish returned no media id")
 
     token = account.get_token()
     if not token:
-        return _fail(poster, draft, account, "no token available for the read back")
+        return _unconfirmed(poster, draft, account,
+                            "no token available for the read back")
 
-    # IG media objects carry `permalink`; FB Page posts carry `permalink_url`.
-    fields = "permalink" if account.platform == Platform.INSTAGRAM else "permalink_url"
+    # MINIMAL existence read. A FB /photos publish can return the PHOTO node id
+    # (not the pageid_postid PagePost id), and a Photo node has no permalink_url
+    # field: requesting it 400s while the post is perfectly live (the 2026-07-03
+    # lasso_fb false alarm). id + created_time exist on Photo AND PagePost nodes
+    # and prove existence with the page token alone. IG media additionally
+    # carries permalink, so IG keeps the LIVE link.
+    if account.platform == Platform.INSTAGRAM:
+        fields = "id,permalink"
+    else:
+        fields = "id,created_time"
     client = http or _requests()
     try:
         r = client.get(
@@ -75,24 +100,22 @@ def confirm_publish(draft, account, result, http=None, poster=None):
             timeout=30,
         )
         if getattr(r, "status_code", 200) >= 400:
-            return _fail(poster, draft, account,
-                         f"read back returned HTTP {r.status_code}")
+            return _unconfirmed(poster, draft, account,
+                                f"read back returned HTTP {r.status_code}")
         body = r.json() or {}
     except Exception as e:
-        return _fail(poster, draft, account,
-                     f"read back errored: {type(e).__name__}: {e}")
+        return _unconfirmed(poster, draft, account,
+                            f"read back errored: {type(e).__name__}: {e}")
+
+    if not body.get("id"):
+        return _unconfirmed(poster, draft, account,
+                            "read back returned no id for the post")
 
     permalink = body.get("permalink") or body.get("permalink_url") or ""
-    if not permalink:
-        return _fail(poster, draft, account,
-                     "post found but no permalink was returned")
-
-    _reply(poster, draft, f"LIVE: {permalink}")
-    try:
-        from datetime import datetime, timezone
-        from . import db as _db
-        _db.audit("publish_confirm", draft.draft_id, f"verified live: {permalink}",
-                  draft.account_key, datetime.now(timezone.utc).date().isoformat())
-    except Exception:
-        pass
+    if permalink:
+        _reply(poster, draft, f"LIVE: {permalink}")
+    else:
+        _reply(poster, draft,
+               f"LIVE on {account.key}: post verified (id {media_id}).")
+    _audit("verified live", draft, permalink or f"id {media_id}")
     return {"verified": True, "permalink": permalink}
