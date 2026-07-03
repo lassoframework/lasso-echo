@@ -12,7 +12,7 @@ later, only on a human Approve, and only if the publish flag is armed.
 
 from datetime import datetime, timezone
 
-from . import config, schedule
+from . import config, ops_alerts, schedule
 from .accounts import active_accounts
 from .daily_studio import build_daily_infographic_draft
 from .social_proof import build_social_proof_draft
@@ -172,78 +172,94 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         _expire_stale(day_key, store, poster)
 
     for account in (accounts or active_accounts()):
-        # Cadence gate FIRST: a skip day (default Saturday) produces no draft and no
-        # card for this account.
-        if not schedule.should_post_on(day_key):
-            continue
+        # FLEET ISOLATION (flagless hardening): one account's API error,
+        # missing token, or empty library never blocks another account's
+        # cycle. An exception logs, alerts once, audits, and moves on.
+        try:
+            # Cadence gate FIRST: a skip day (default Saturday) produces no draft and no
+            # card for this account.
+            if not schedule.should_post_on(day_key):
+                continue
 
-        # Multi-client resolution: an account with its own voice doc or library uses
-        # them; empty fields (client zero, the LASSO accounts) fall back to the
-        # globals above, so existing behavior is byte-for-byte identical.
-        acct_voice = load_voice(account.voice_doc) if account.voice_doc else voice
-        if acct_voice is None:
-            poster.post_notice(f":warning: Voice doc missing for {account.key}. "
-                               "Drafting nothing for this account.")
-            continue
-        acct_lib = account.library_prefix or lib
+            # Multi-client resolution: an account with its own voice doc or library uses
+            # them; empty fields (client zero, the LASSO accounts) fall back to the
+            # globals above, so existing behavior is byte-for-byte identical.
+            acct_voice = load_voice(account.voice_doc) if account.voice_doc else voice
+            if acct_voice is None:
+                poster.post_notice(f":warning: Voice doc missing for {account.key}. "
+                                   "Drafting nothing for this account.")
+                continue
+            acct_lib = account.library_prefix or lib
 
-        draft = None
-        # Social proof card FIRST, but only on the weekly proof day and only when
-        # its flag is armed with approved (permissioned + verified) entries. It is
-        # dormant otherwise; None -> the normal paths below run untouched.
-        if account.key.startswith("lasso"):
-            # BOOK CAMPAIGN LEADS THE CALENDAR (AGENT_BOOK_CAMPAIGN_ENABLED, OFF):
-            # armed, the day's book post takes posting priority and the normal
-            # pillars below fill around it. Every draft still cards to Blake.
-            from .book_campaign import build_book_draft
-            draft = build_book_draft(account, day_key)
-        if draft is None and account.key.startswith("lasso"):
-            draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
-        # Summit campaign next (its own weekly day, inside the same daily cadence,
-        # never additional). Dormant unless armed; auto-stops after 2026-11-08.
-        if draft is None and account.key.startswith("lasso"):
-            draft = build_summit_draft(account, day_key, voice=acct_voice)
-        # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
-        # Armed, it picks WHICH approved creative today's draft proposes (window,
-        # pillar alternation, gate-clean only); None -> the paths below run as today.
-        if draft is None and account.key.startswith("lasso"):
-            from .rotation import build_rotated_draft
-            draft = build_rotated_draft(account, day_key, acct_voice, acct_lib, poster=poster)
-        # For a LASSO account, try the fully-automated infographic path next. It is
-        # dormant unless all three flags are armed; None -> fall back to the library
-        # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
-        if draft is None and account.key.startswith("lasso"):
-            draft = build_daily_infographic_draft(account, day_key)
-        if draft is None:
-            creative = pick_next(account, acct_lib, used_creatives_for(account.key))
-            # Schedule the fallback draft to the same cadence slot.
-            draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
-
-        existing = None
-        if idempotent:
-            draft, existing = _reconcile(draft, day_key, "feed", store, poster)
+            draft = None
+            # Social proof card FIRST, but only on the weekly proof day and only when
+            # its flag is armed with approved (permissioned + verified) entries. It is
+            # dormant otherwise; None -> the normal paths below run untouched.
+            if account.key.startswith("lasso"):
+                # BOOK CAMPAIGN LEADS THE CALENDAR (AGENT_BOOK_CAMPAIGN_ENABLED, OFF):
+                # armed, the day's book post takes posting priority and the normal
+                # pillars below fill around it. Every draft still cards to Blake.
+                from .book_campaign import build_book_draft
+                draft = build_book_draft(account, day_key)
+            if draft is None and account.key.startswith("lasso"):
+                draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
+            # Summit campaign next (its own weekly day, inside the same daily cadence,
+            # never additional). Dormant unless armed; auto-stops after 2026-11-08.
+            if draft is None and account.key.startswith("lasso"):
+                draft = build_summit_draft(account, day_key, voice=acct_voice)
+            # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
+            # Armed, it picks WHICH approved creative today's draft proposes (window,
+            # pillar alternation, gate-clean only); None -> the paths below run as today.
+            if draft is None and account.key.startswith("lasso"):
+                from .rotation import build_rotated_draft
+                draft = build_rotated_draft(account, day_key, acct_voice, acct_lib, poster=poster)
+            # For a LASSO account, try the fully-automated infographic path next. It is
+            # dormant unless all three flags are armed; None -> fall back to the library
+            # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
+            if draft is None and account.key.startswith("lasso"):
+                draft = build_daily_infographic_draft(account, day_key)
             if draft is None:
-                # Re-run, nothing new: the existing PENDING draft IS the result.
-                # No new draft, no new card.
-                results.append(existing)
-        if draft is not None:
-            _post_and_save(draft, store, poster, idempotent)
-            results.append(draft)
-        feed_draft = draft if draft is not None else existing
+                creative = pick_next(account, acct_lib, used_creatives_for(account.key))
+                # Schedule the fallback draft to the same cadence slot.
+                draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
 
-        # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one
-        # 9:16 Story per account reusing the day's creative; PENDING, its own
-        # approval card, clearly labeled STORY. Nothing publishes here.
-        story = build_story_draft(account, day_key, feed_draft=feed_draft)
-        if story is not None:
+            existing = None
             if idempotent:
-                story, existing_story = _reconcile(story, day_key, "story", store, poster)
-                if story is None:
-                    results.append(existing_story)
-            if story is not None:
-                _post_and_save(story, store, poster, idempotent)
-                results.append(story)
+                draft, existing = _reconcile(draft, day_key, "feed", store, poster)
+                if draft is None:
+                    # Re-run, nothing new: the existing PENDING draft IS the result.
+                    # No new draft, no new card.
+                    results.append(existing)
+            if draft is not None:
+                _post_and_save(draft, store, poster, idempotent)
+                results.append(draft)
+            feed_draft = draft if draft is not None else existing
 
+            # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one
+            # 9:16 Story per account reusing the day's creative; PENDING, its own
+            # approval card, clearly labeled STORY. Nothing publishes here.
+            story = build_story_draft(account, day_key, feed_draft=feed_draft)
+            if story is not None:
+                if idempotent:
+                    story, existing_story = _reconcile(story, day_key, "story", store, poster)
+                    if story is None:
+                        results.append(existing_story)
+                if story is not None:
+                    _post_and_save(story, store, poster, idempotent)
+                    results.append(story)
+
+        except Exception as e:
+            print(f"[runner] {account.key} failed this cycle: "
+                  f"{type(e).__name__}: {e}")
+            ops_alerts.alert(f"account {account.key} failed its draft cycle: "
+                             f"{type(e).__name__}: {e}. Other accounts continue.")
+            try:
+                from . import db as _db
+                _db.audit("account_error", account.key,
+                          f"{type(e).__name__}: {e}", account.key, day_key)
+            except Exception:
+                pass
+            continue
     # Creative runway: dormant unless AGENT_RUNWAY_ENABLED. Armed, one line per
     # account with the day's cards (days of approved content left + projected
     # zero date); a runway error never takes the draft run down.

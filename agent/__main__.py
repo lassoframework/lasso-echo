@@ -310,6 +310,29 @@ def main(argv=None):
         else:
             from .backup import restore_store
             restore_store(from_key, confirm=confirm)
+    elif cmd == "fleet-status":
+        # One line per account: name, trust level, runway days, last publish,
+        # last error. Fixed-width so it reads clean at 100 accounts. No flag.
+        from . import config as _cfg, db as _db
+        from .accounts import active_accounts as _actives
+        from .runway import runway_days as _runway
+        from .trust import effective_level as _level
+        with _db.connect() as conn:
+            for a in _actives():
+                try:
+                    rw = _runway(a.key, a.library_prefix or _cfg.LIBRARY_PATH)
+                except Exception:
+                    rw = "?"
+                row = conn.execute(
+                    "SELECT MAX(published_at) AS lp FROM posts WHERE account_key=? "
+                    "AND mode='published'", (a.key,)).fetchone()
+                last_pub = (row["lp"] or "never")[:16]
+                err = conn.execute(
+                    "SELECT reason FROM audit WHERE kind='account_error' AND "
+                    "account_key=? ORDER BY id DESC LIMIT 1", (a.key,)).fetchone()
+                last_err = (err["reason"][:40] if err else "none")
+                print(f"{a.key:<16} trust L{int(_level(a))}  runway {str(rw):>6}d  "
+                      f"last publish {last_pub:<16}  last error {last_err}")
     elif cmd == "audit":
         # The readable decision trail. No flag: logging truth is always on.
         day, acct_f, args = None, None, argv[1:]
