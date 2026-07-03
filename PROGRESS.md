@@ -186,6 +186,14 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       always cards); one command onboarding (onboard-client + intake_template.md);
       fleet hardening (per account isolation + fleet-status). .env.example now the
       complete flag reference. All new flags OFF
+- [~] EVIDENCE AND ARMING PREP (2026-07-03 overnight): monthly-review --dry runs read
+      only without the flag; backfill-insights CLI (idempotent, 429 aware, views never
+      impressions); scheduler heartbeat + missed run alert (no flag, observability);
+      comments first poll flood guard (pre arm backlog never carded); connect queues a
+      Social Grade baseline (AGENT_CONNECT_GRADE_ENABLED, OFF); seed-calendar CLI from
+      approval evidence only; Opus discovery fixed (pinned ids honored, collections
+      paginated, honest empty messaging + exact remediation in opus-check); gbp-check
+      readiness probe. All new flags OFF
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
