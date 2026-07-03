@@ -42,8 +42,23 @@ class Account:
     approvers: list = field(default_factory=list)  # per-client approver Slack ids
 
     def get_token(self):
-        """Read the token from env at call time. Returns None if unset. Never logged."""
-        return os.environ.get(self.token_env)
+        """Read the token at call time. Never logged, never surfaced.
+        Order: the hand-set env var ALWAYS WINS when present; with
+        AGENT_CONNECT_TOKENS_ENABLED armed, a /connect-stored kv page token
+        (keyed by this account's page id) is the fallback. Flag OFF = env only,
+        byte-identical to before."""
+        env_token = os.environ.get(self.token_env)
+        if env_token:
+            return env_token
+        from . import config as _config
+        if _config.connect_tokens_enabled():
+            page_id = self.get_target_id()
+            if page_id:
+                from . import db as _db
+                kv_token = _db.kv_get(f"connect_page_token_{page_id}", "")
+                if kv_token:
+                    return kv_token
+        return env_token
 
     def get_target_id(self):
         return os.environ.get(self.target_id_env)

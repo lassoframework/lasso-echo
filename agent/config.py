@@ -403,6 +403,16 @@ def grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
 
 
+def connect_tokens_enabled() -> bool:
+    """
+    Connect-token resolution switch. OFF by default: account tokens come ONLY
+    from hand-set env vars, exactly as today. ON, an account whose page id has
+    a /connect-stored kv token may use it, but an env token ALWAYS WINS when
+    both exist. The kv token is never logged and never surfaced.
+    """
+    return _truthy(os.environ.get("AGENT_CONNECT_TOKENS_ENABLED", "false"))
+
+
 def connect_enabled() -> bool:
     """
     Facebook connect page switch. OFF by default: the /connect surface 404s and
