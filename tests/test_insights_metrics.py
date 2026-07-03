@@ -69,10 +69,10 @@ def test_each_kind_requests_only_valid_metrics():
 
 def test_fb_page_post_never_touches_insights_namespace():
     rec = Recorder(FakeResp(200, {
-        "likes": {"summary": {"total_count": 12}},
+        "reactions": {"summary": {"total_count": 12}},
         "comments": {"summary": {"total_count": 3}},
         "shares": {"count": 2}}))
-    out = reporting_live.fetch_post_metrics("FBPOST1", TOKEN, http=rec,
+    out = reporting_live.fetch_post_metrics("111_222", TOKEN, http=rec,
                                             platform=Platform.FACEBOOK_PAGE)
     assert "/insights" not in rec.requests[0]["url"]        # object fields only
     assert "metric" not in rec.requests[0]["params"]
@@ -168,3 +168,61 @@ def test_backfill_and_snapshot_share_the_builder(monkeypatch):
     for kind in ("feed", "reel", "story"):
         assert reporting_live.media_metrics_for(Platform.INSTAGRAM, kind) == \
             reporting_live.MEDIA_METRICS[("instagram", kind)]
+
+
+# ---- FB node types: no invalid field, ever (the 1861436475266813 class) -----------
+FB_ALLOWED = {
+    "photo": {"page_story_id"},
+    "pagepost": {"reactions.summary(true)", "comments.summary(true)", "shares"},
+}
+
+
+def test_fb_photo_node_resolves_owner_then_reads_post():
+    """A bare photo id first asks ONLY for page_story_id, then reads the owning
+    post with ONLY the pagepost-valid fields. 'likes' is never requested."""
+    class PhotoGraph:
+        def __init__(self):
+            self.requests = []
+
+        def get(self, url, params=None, timeout=None):
+            self.requests.append({"url": url, "params": dict(params or {})})
+            if url.endswith("/1861436475266813"):
+                return FakeResp(200, {"page_story_id": "222_333"})
+            return FakeResp(200, {
+                "reactions": {"summary": {"total_count": 21}},
+                "comments": {"summary": {"total_count": 4}},
+                "shares": {"count": 1}})
+
+    g = PhotoGraph()
+    out = reporting_live.fetch_post_metrics("1861436475266813", TOKEN, http=g,
+                                            platform=Platform.FACEBOOK_PAGE)
+    assert out == {"likes": 21, "comments": 4, "shares": 1}
+    photo_fields = set(g.requests[0]["params"]["fields"].split(","))
+    post_fields = set(g.requests[1]["params"]["fields"].split(","))
+    assert photo_fields <= FB_ALLOWED["photo"]
+    assert post_fields <= FB_ALLOWED["pagepost"]
+    for req in g.requests:                                 # ADVERSARIAL
+        assert "likes" not in req["params"].get("fields", "").replace(
+            "likes.summary", "")  # the bare field never
+        assert "insights" not in req["url"]
+    assert g.requests[1]["url"].endswith("/222_333")       # the owning post
+
+
+def test_fb_pagepost_id_reads_directly_valid_fields_only():
+    rec = Recorder(FakeResp(200, {
+        "reactions": {"summary": {"total_count": 5}},
+        "comments": {"summary": {"total_count": 2}},
+        "shares": {"count": 0}}))
+    out = reporting_live.fetch_post_metrics("222_333", TOKEN, http=rec,
+                                            platform=Platform.FACEBOOK_PAGE)
+    assert out["likes"] == 5
+    assert len(rec.requests) == 1                          # no resolve hop needed
+    fields = set(rec.requests[0]["params"]["fields"].split(","))
+    assert fields <= FB_ALLOWED["pagepost"]
+
+
+def test_fb_photo_without_owner_skips_gracefully():
+    rec = Recorder(FakeResp(200, {}))                      # no page_story_id
+    with pytest.raises(reporting_live.SkipRead, match="no owning post"):
+        reporting_live.fetch_post_metrics("1861436475266813", TOKEN, http=rec,
+                                          platform=Platform.FACEBOOK_PAGE)

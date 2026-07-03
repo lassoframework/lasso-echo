@@ -181,19 +181,39 @@ def fetch_post_metrics(media_id, token, http=None, platform="instagram",
             pass  # unparseable timestamp: attempt the read
 
     if metrics is None:
-        # Facebook Page post: object-fields read, no insights metric namespace
-        r = client.get(f"{config.GRAPH_API_BASE}/{media_id}",
-                       params={"fields": "likes.summary(true),"
+        # Facebook: NODE-TYPE AWARE object-fields read (no insights namespace,
+        # and the field "likes" is never requested on any FB node).
+        #   pageid_postid (underscore) = a PagePost node: read reactions/
+        #   comments/shares directly.
+        #   a bare id = a PHOTO/media node (the /photos publish return): first
+        #   resolve the OWNING post via page_story_id, then read the post.
+        post_id = media_id
+        if "_" not in media_id:
+            r0 = client.get(f"{config.GRAPH_API_BASE}/{media_id}",
+                            params={"fields": "page_story_id",
+                                    "access_token": token},
+                            timeout=30)
+            if getattr(r0, "status_code", 200) >= 400:
+                detail = graph_error_detail(r0)
+                raise RuntimeError(f"resolving owner of photo {media_id}: {detail}"
+                                   + permission_hint(detail, "facebook"))
+            post_id = (r0.json() or {}).get("page_story_id") or ""
+            if not post_id:
+                raise SkipRead("photo node has no owning post to read metrics from")
+        r = client.get(f"{config.GRAPH_API_BASE}/{post_id}",
+                       params={"fields": "reactions.summary(true),"
                                          "comments.summary(true),shares",
                                "access_token": token},
                        timeout=30)
         if getattr(r, "status_code", 200) >= 400:
             detail = graph_error_detail(r)
-            raise RuntimeError(f"reading {media_id}: {detail}"
+            raise RuntimeError(f"reading {post_id}: {detail}"
                                + permission_hint(detail, "facebook"))
         body = r.json() or {}
         return {
-            "likes": ((body.get("likes") or {}).get("summary") or {}).get("total_count"),
+            # reactions total (likes plus love/wow etc) lands on our likes
+            # column: the honest closest equivalent the node exposes.
+            "likes": ((body.get("reactions") or {}).get("summary") or {}).get("total_count"),
             "comments": ((body.get("comments") or {}).get("summary") or {}).get("total_count"),
             "shares": (body.get("shares") or {}).get("count"),
         }
