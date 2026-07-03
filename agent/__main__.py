@@ -368,6 +368,25 @@ def main(argv=None):
                     if autotag(path):
                         tagged += 1
             print(f"dam-scan: {tagged} asset(s) tagged")
+    elif cmd == "backfill-insights":
+        # By-hand per-post metrics backfill from the store's publish records
+        # (views, never impressions). --dry lists work, touches nothing.
+        acct_f, since, dry, args = "", "", False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            if args[i] == "--since" and i + 1 < len(args):
+                since = args[i + 1]; i += 2; continue
+            if args[i] == "--dry":
+                dry = True
+            i += 1
+        if not acct_f or not since:
+            print("usage: python -m agent backfill-insights --account <key> "
+                  "--since YYYY-MM-DD [--dry]")
+        else:
+            from .backfill import backfill_insights
+            backfill_insights(acct_f, since, dry=dry)
     elif cmd == "monthly-review":
         # The 30 day loop: digest + PDF per account (AGENT_MONTHLY_REVIEW_ENABLED).
         # --dry is READ ONLY: prints everything, posts/writes nothing, and runs
