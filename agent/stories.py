@@ -65,6 +65,18 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     creative_public_url = feed_draft.creative_public_url
     fragments = list(feed_draft.source_fragments or [])
 
+    # PREMADE story variant first (AGENT_STORY_PREMADE_ENABLED, OFF): a *_story
+    # render next to the day's creative (the regen-library convention) is used
+    # as-is, nothing generated. Flag OFF = behavior byte-identical to today.
+    if config.story_premade_enabled():
+        premade = _premade_story_variant(feed_draft)
+        if premade is not None:
+            hosted = media_host.host_media(premade, account.key, client=s3_client)
+            if hosted:
+                creative_path, creative_public_url = premade, hosted
+                return _story_draft(account, day_key, draft_id, feed_draft,
+                                    creative_path, creative_public_url, fragments)
+
     # Purpose-built 9:16 variant from the SAME approved text, when available. Aspect
     # is passed per-use so the feed's 4:5 target is untouched. Any unavailable step
     # (flags off, no key, hosting down) falls back to reusing the feed image as-is.
@@ -83,6 +95,27 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                 if hosted:
                     creative_path, creative_public_url = art["path"], hosted
 
+    return _story_draft(account, day_key, draft_id, feed_draft,
+                        creative_path, creative_public_url, fragments)
+
+
+def _premade_story_variant(feed_draft):
+    """A *_story render next to the day's creative (regen-library convention),
+    or None. Only ever a sibling of the APPROVED creative, never a new asset."""
+    import os as _os
+    path = feed_draft.creative_path or ""
+    if not path:
+        return None
+    stem, ext = _os.path.splitext(path)
+    for cand_ext in dict.fromkeys([ext, ".png", ".jpg", ".webp"]):
+        cand = f"{stem}_story{cand_ext}"
+        if cand_ext and _os.path.exists(cand):
+            return cand
+    return None
+
+
+def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
+                 creative_public_url, fragments):
     return Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
         # Stories carry minimal or no caption; Echo ships none and never invents one.

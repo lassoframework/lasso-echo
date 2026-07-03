@@ -288,6 +288,17 @@ def book_campaign_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_BOOK_CAMPAIGN_ENABLED", "false"))
 
 
+def story_premade_enabled() -> bool:
+    """
+    Story premade-variant switch. OFF by default: Stories keep today's exact
+    behavior (9:16 re-render of the day's approved creative, else the feed
+    image). ON, a premade *_story render sitting next to the day's creative
+    (the regen-library convention) is preferred over generating. Draft flow,
+    labels, cadence, and publish gates untouched.
+    """
+    return _truthy(os.environ.get("AGENT_STORY_PREMADE_ENABLED", "false"))
+
+
 def knowledge_enabled() -> bool:
     """
     Knowledge brain switch. OFF by default. ON, the drafter may draw facts, hooks,
