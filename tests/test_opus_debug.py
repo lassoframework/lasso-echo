@@ -186,3 +186,48 @@ def test_opus_check_remediation_per_case(monkeypatch, capsys):
     opus_ingest.opus_check(http=_Http(_Resp(200, text='{"data":[{"id":"C1"}]}',
                                             json_body={"data": [{"id": "C1"}]})))
     assert "READY" in capsys.readouterr().out
+
+
+# ---- id extraction: shape tolerant, loud on mismatch --------------------------------
+def test_collection_id_extraction_real_shapes(monkeypatch, capsys):
+    """The live failure: 3 collection objects, 0 ids extracted. The extractor
+    now handles collectionId keys, string items, and *Id-suffixed fallbacks."""
+    key_shapes = [
+        [{"collectionId": "C1", "name": "week one"},
+         {"collectionId": "C2", "name": "reels"},
+         {"collectionId": "C3", "name": "summit"}],          # the suspected live shape
+        ["C1", "C2", "C3"],                                   # bare string ids
+        [{"uuid": "C1"}, {"_id": "C2"}, {"exportCollectionId": "C3"}],
+    ]
+    _key(monkeypatch)
+    for shape in key_shapes:
+        class ShapedApi:
+            def _get(self, path, params=None):
+                return {"data": shape} if (params or {}).get("pageNum", 1) == 1 else {"data": []}
+
+        api = opus_ingest.OpusAPI("k")
+        api._get = ShapedApi()._get
+        ids = api.list_collections()
+        assert ids == ["C1", "C2", "C3"], shape
+    printed = capsys.readouterr().out
+    assert "3 id(s) from 3 object(s)" in printed              # the honest count line
+
+
+def test_extraction_mismatch_warns_loudly(monkeypatch, capsys):
+    _key(monkeypatch)
+
+    class WeirdApi:
+        def _get(self, path, params=None):
+            if (params or {}).get("pageNum", 1) == 1:
+                return {"data": [{"title": "no id here"}, {"title": "none"},
+                                 {"title": "nada"}]}
+            return {"data": []}
+
+    api = opus_ingest.OpusAPI("k")
+    api._get = WeirdApi()._get
+    ids = api.list_collections()
+    assert ids == []
+    printed = capsys.readouterr().out
+    assert "WARNING" in printed
+    assert "0 id(s) from 3 collection object(s)" in printed   # never a silent zero
+    assert "title" in printed                                  # names the keys seen

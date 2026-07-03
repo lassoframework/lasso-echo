@@ -78,18 +78,35 @@ class OpusAPI:
         return r.json()
 
     def list_collections(self):
-        """GET /api/collections?q=mine -> [collection ids], PAGINATED properly
-        (the earlier single read could miss collections past page one)."""
-        ids, page = [], 1
+        """GET /api/collections?q=mine -> [collection ids], paginated. ID
+        EXTRACTION IS SHAPE-TOLERANT: the live response carried objects whose
+        id key is not top-level "id" (opus-check saw 3 objects, the old parse
+        extracted 0). Every plausible key is tried; a string item is its own
+        id; and an extraction mismatch is a LOUD warning naming the keys seen,
+        never a silent zero."""
+        ids, total_objects, page = [], 0, 1
         while True:
             body = self._get("/api/collections",
                              {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
             items = body if isinstance(body, list) else body.get("data", []) or []
-            ids.extend(c.get("id") for c in items
-                       if isinstance(c, dict) and c.get("id"))
+            total_objects += len(items)
+            for c in items:
+                cid = _extract_id(c)
+                if cid:
+                    ids.append(cid)
             if len(items) < 50:
-                return ids
+                break
             page += 1
+        if total_objects and len(ids) != total_objects:
+            sample_keys = sorted((items[0] or {}).keys()) if items and isinstance(
+                items[0], dict) else type(items[0]).__name__ if items else "?"
+            print(f"[opus] WARNING: extracted {len(ids)} id(s) from "
+                  f"{total_objects} collection object(s). Response keys seen: "
+                  f"{sample_keys}. Fix _extract_id for this shape.")
+        elif total_objects:
+            print(f"[opus] collections: {len(ids)} id(s) from "
+                  f"{total_objects} object(s)")
+        return ids
 
     def list_exportable_clips(self, q, source_id):
         """GET /api/exportable-clips, paginated. q = findByProjectId|findByCollectionId."""
@@ -111,6 +128,23 @@ class OpusAPI:
         if r.status_code >= 400:
             raise RuntimeError(f"clip download failed: {r.status_code}")
         return r.content
+
+
+def _extract_id(item):
+    """A collection object's id, whatever the shape: string items are their own
+    id; dicts are tried across every plausible key, then any *Id-suffixed key."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return ""
+    for key in ("id", "collectionId", "collection_id", "uuid", "_id"):
+        v = item.get(key)
+        if v:
+            return str(v)
+    for key, v in item.items():
+        if key.lower().endswith("id") and isinstance(v, (str, int)) and v:
+            return str(v)
+    return ""
 
 
 def _default_api():
