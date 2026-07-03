@@ -16,9 +16,59 @@ from datetime import datetime, timezone
 from . import config, db, ops_alerts
 from .accounts import Platform, active_accounts
 
-# The account-level metric set. VIEWS, not impressions, by design.
+# The ACCOUNT-level (user insights edge) metric set. VIEWS, not impressions.
+# NOTE the Meta asymmetry: the USER edge metric is "saves" (plural) while the
+# MEDIA edge metric is "saved" (singular). Do not "fix" one to match the other.
 IG_ACCOUNT_METRICS = "views,reach,likes,comments,saves,shares"
-IG_POST_METRICS = "views,reach,likes,comments,saves,shares"
+
+# MEDIA-level metric sets, PER MEDIA TYPE, verified against the current Graph
+# docs for the pinned version. Feed/reel/story each have DIFFERENT valid sets;
+# requesting the wrong set is exactly the 400 this patch kills ("saves" is not
+# a media metric, and FB Page posts use a different namespace entirely).
+MEDIA_METRICS = {
+    ("instagram", "feed"): "views,reach,likes,comments,saved,shares,total_interactions",
+    ("instagram", "reel"): "views,reach,likes,comments,saved,shares,total_interactions",
+    ("instagram", "story"): "views,reach,replies,shares,navigation",
+}
+# kept as the feed set for older callers/tests; the builder is the real API
+IG_POST_METRICS = MEDIA_METRICS[("instagram", "feed")]
+
+STORY_INSIGHTS_WINDOW_HOURS = 24
+
+
+class SkipRead(Exception):
+    """A graceful skip (not an error): e.g. story insights expired."""
+
+
+def media_metrics_for(platform, kind):
+    """The ONE metric builder both the backfill and the daily snapshot use.
+    Returns the metric CSV for IG kinds, or None for Facebook (FB Page posts
+    are read via object fields, never the insights metric namespace)."""
+    plat = "instagram" if str(platform).lower().startswith("insta") else "facebook"
+    if plat == "facebook":
+        return None
+    return MEDIA_METRICS.get(("instagram", kind), MEDIA_METRICS[("instagram", "feed")])
+
+
+def media_kind_for_post(post_row):
+    """feed | reel | story from the store's publish records: the draft record's
+    is_story wins; a video creative reads as a reel; else feed."""
+    draft_id = post_row.get("draft_id") or ""
+    if draft_id:
+        try:
+            with db.connect() as conn:
+                row = conn.execute("SELECT data FROM drafts WHERE draft_id=?",
+                                   (draft_id,)).fetchone()
+            if row:
+                rec = json.loads(row["data"] or "{}")
+                if rec.get("is_story"):
+                    return "story"
+        except Exception:
+            pass
+    key = (post_row.get("creative_key") or "").lower()
+    if key.endswith((".mp4", ".mov")):
+        return "reel"
+    return "feed"
 
 
 def graph_error_detail(resp):
@@ -103,18 +153,66 @@ def fetch_account_snapshot(account, token, http=None):
     return out
 
 
-def fetch_post_metrics(media_id, token, http=None):
-    """Per-post insight read (VIEWS, never impressions)."""
+def fetch_post_metrics(media_id, token, http=None, platform="instagram",
+                       kind="feed", published_at=""):
+    """
+    Per-post metric read, MEDIA-TYPE AWARE (views, never impressions):
+      - IG feed/reel/story request only that type's valid metric set
+      - a story past its 24h insights window SKIPS gracefully ("story insights
+        expired"), never an error
+      - FB Page posts skip the insights namespace entirely: likes/comments/
+        shares come from object fields the page token always reads
+      - a Graph error raises with the honest detail (code/subcode/message,
+        scrubbed) plus the missing permission named when it smells like one
+    Returns a dict on our column names (the media "saved" maps to our "saves").
+    """
     client = http or _requests()
+    metrics = media_metrics_for(platform, kind)
+
+    if kind == "story" and published_at:
+        try:
+            when = datetime.fromisoformat(published_at.replace("+0000", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - when
+            if age.total_seconds() > STORY_INSIGHTS_WINDOW_HOURS * 3600:
+                raise SkipRead("story insights expired")
+        except ValueError:
+            pass  # unparseable timestamp: attempt the read
+
+    if metrics is None:
+        # Facebook Page post: object-fields read, no insights metric namespace
+        r = client.get(f"{config.GRAPH_API_BASE}/{media_id}",
+                       params={"fields": "likes.summary(true),"
+                                         "comments.summary(true),shares",
+                               "access_token": token},
+                       timeout=30)
+        if getattr(r, "status_code", 200) >= 400:
+            detail = graph_error_detail(r)
+            raise RuntimeError(f"reading {media_id}: {detail}"
+                               + permission_hint(detail, "facebook"))
+        body = r.json() or {}
+        return {
+            "likes": ((body.get("likes") or {}).get("summary") or {}).get("total_count"),
+            "comments": ((body.get("comments") or {}).get("summary") or {}).get("total_count"),
+            "shares": (body.get("shares") or {}).get("count"),
+        }
+
     r = client.get(f"{config.GRAPH_API_BASE}/{media_id}/insights",
-                   params={"metric": IG_POST_METRICS, "access_token": token},
+                   params={"metric": metrics, "access_token": token},
                    timeout=30)
+    if getattr(r, "status_code", 200) >= 400:
+        detail = graph_error_detail(r)
+        raise RuntimeError(f"reading {media_id}: {detail}"
+                           + permission_hint(detail, platform))
     out = {}
     for item in (r.json() or {}).get("data", []):
         name = item.get("name")
         value = (item.get("values") or [{}])[-1].get("value")
         if name:
             out[name] = value
+    if "saved" in out:
+        out["saves"] = out.pop("saved")  # media metric name -> our column name
     return out
 
 
@@ -141,13 +239,18 @@ def snapshot_all(http=None, poster=None, now=None):
                     (account.key, today, json.dumps(metrics)))
                 # refresh per-post metrics for this account's recent published posts
                 rows = conn.execute(
-                    "SELECT id, media_id FROM posts WHERE account_key=? "
+                    "SELECT id, media_id, draft_id, creative_key, published_at "
+                    "FROM posts WHERE account_key=? "
                     "AND mode='published' AND media_id != '' "
                     "AND published_at >= date(?, '-35 day')",
                     (account.key, today)).fetchall()
                 for row in rows:
                     try:
-                        pm = fetch_post_metrics(row["media_id"], token, http=http)
+                        pm = fetch_post_metrics(
+                            row["media_id"], token, http=http,
+                            platform=account.platform,
+                            kind=media_kind_for_post(dict(row)),
+                            published_at=row["published_at"] or "")
                         conn.execute(
                             "UPDATE posts SET likes=?, comments=?, saves=?, "
                             "shares=?, views=?, reach=? WHERE id=?",

@@ -59,7 +59,9 @@ POSTING_SKIP_DAYS = _csv_list("AGENT_POSTING_SKIP_DAYS", ["sat"])
 POSTING_PRIORITY_DAYS = _csv_list("AGENT_POSTING_PRIORITY_DAYS", ["tue", "wed", "thu"])
 
 # ---- Meta Graph API ----------------------------------------------------------
-GRAPH_API_VERSION = os.environ.get("AGENT_GRAPH_API_VERSION", "v21.0")
+# v23.0: past the views migration (impressions deprecated for media created
+# after July 2 2024; the media insights metric set is the views-era one).
+GRAPH_API_VERSION = os.environ.get("AGENT_GRAPH_API_VERSION", "v23.0")
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 # ---- Creative studio (Nano Banana infographic generation) --------------------

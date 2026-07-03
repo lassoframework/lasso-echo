@@ -18,33 +18,33 @@ from datetime import datetime, timezone
 
 from . import config, db
 from .accounts import get_account
-from .reporting_live import IG_POST_METRICS
+from .reporting_live import fetch_post_metrics, media_kind_for_post
 
 MAX_TRIES = 5
 
 
-def _fetch_with_backoff(media_id, token, http, sleeper=time.sleep):
-    """One per-post insights read; 429 backs off 1, 2, 4, 8 seconds and retries."""
+class _RateLimited(Exception):
+    pass
+
+
+def _fetch_with_backoff(row, token, http, platform, sleeper=time.sleep):
+    """ONE metric builder, both callers: this delegates to the same media-type
+    aware fetch the daily snapshot uses; 429 backs off 1, 2, 4, 8 and retries."""
+    media_id = row["media_id"]
     for attempt in range(MAX_TRIES):
-        r = http.get(f"{config.GRAPH_API_BASE}/{media_id}/insights",
-                     params={"metric": IG_POST_METRICS, "access_token": token},
-                     timeout=30)
-        status = getattr(r, "status_code", 200)
-        if status == 429:
-            if attempt == MAX_TRIES - 1:
-                raise RuntimeError(f"rate limited on {media_id} after {MAX_TRIES} tries")
-            sleeper(2 ** attempt)
-            continue
-        if status >= 400:
-            from .reporting_live import graph_error_detail
-            raise RuntimeError(f"reading {media_id}: {graph_error_detail(r)}")
-        out = {}
-        for item in (r.json() or {}).get("data", []) or []:
-            name = item.get("name")
-            value = (item.get("values") or [{}])[-1].get("value")
-            if name:
-                out[name] = value
-        return out
+        try:
+            return fetch_post_metrics(
+                media_id, token, http=http, platform=platform,
+                kind=media_kind_for_post(dict(row)),
+                published_at=row.get("published_at") or "")
+        except RuntimeError as e:
+            if "HTTP 429" in str(e):
+                if attempt == MAX_TRIES - 1:
+                    raise RuntimeError(
+                        f"rate limited on {media_id} after {MAX_TRIES} tries")
+                sleeper(2 ** attempt)
+                continue
+            raise
     return {}
 
 
@@ -62,7 +62,8 @@ def backfill_insights(account_key, since, dry=False, http=None, sleeper=time.sle
 
     with db.connect() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, media_id, published_at FROM posts WHERE account_key=? "
+            "SELECT id, media_id, published_at, draft_id, creative_key "
+            "FROM posts WHERE account_key=? "
             "AND mode='published' AND media_id != '' AND published_at >= ? "
             "ORDER BY published_at", (account_key, since)).fetchall()]
     summary = {"posts": len(rows), "updated": 0, "skipped": 0}
@@ -85,7 +86,8 @@ def backfill_insights(account_key, since, dry=False, http=None, sleeper=time.sle
 
     for row in rows:
         try:
-            pm = _fetch_with_backoff(row["media_id"], token, http, sleeper=sleeper)
+            pm = _fetch_with_backoff(row, token, http, acct.platform,
+                                     sleeper=sleeper)
         except Exception as e:
             summary["skipped"] += 1
             from . import ops_alerts
