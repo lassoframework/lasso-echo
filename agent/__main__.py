@@ -244,6 +244,24 @@ def main(argv=None):
             print(err)
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name)
+    elif cmd == "onboard-client":
+        # ONE-COMMAND Stage 3 onboarding from a completed intake. Missing fields
+        # block with the list; touches no env, arms nothing.
+        intake, key, name, args = "", "", "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--intake" and i + 1 < len(args):
+                intake = args[i + 1]; i += 2; continue
+            if args[i] == "--key" and i + 1 < len(args):
+                key = args[i + 1]; i += 2; continue
+            if args[i] == "--name" and i + 1 < len(args):
+                name = args[i + 1]; i += 2; continue
+            i += 1
+        if not intake or not key:
+            print("usage: python -m agent onboard-client --intake <file> --key <k> [--name <n>]")
+        else:
+            from .onboard_pipeline import onboard
+            onboard(intake, key, name or None)
     elif cmd == "add-client":
         # MANUAL onboarding scaffold: config entry + voice/proof templates +
         # library folder + the by-hand checklist. Touches no env, arms nothing.
