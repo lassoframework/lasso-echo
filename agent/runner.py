@@ -180,6 +180,10 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # card for this account.
             if not schedule.should_post_on(day_key):
                 continue
+            # Heartbeat (no flag, honest observability): this account's daily
+            # run happened today. The morning check alerts on its absence.
+            from .heartbeat import record_heartbeat
+            record_heartbeat(account.key, day_key)
 
             # Multi-client resolution: an account with its own voice doc or library uses
             # them; empty fields (client zero, the LASSO accounts) fall back to the

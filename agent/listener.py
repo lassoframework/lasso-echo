@@ -150,6 +150,13 @@ def _daily_scheduler(store):
                 opus_ingest.pull()
             except Exception as e:
                 print(f"[opus] poll pass failed: {type(e).__name__}: {e}")
+        # Heartbeat morning check (no flag, honest observability): one alert
+        # per enabled account per day when the daily run missed its window.
+        try:
+            from . import heartbeat
+            heartbeat.check_heartbeats(now=now)
+        except Exception as e:
+            print(f"[heartbeat] check failed: {type(e).__name__}: {e}")
         # Evening digest: one line per day at AGENT_DIGEST_HOUR_UTC, dormant
         # unless AGENT_DIGEST_ENABLED. Never crashes the loop.
         if config.digest_enabled():
