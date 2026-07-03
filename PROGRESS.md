@@ -176,6 +176,16 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       logged, never rendered, audit scrubbed). Whole surface 404s while
       AGENT_CONNECT_ENABLED is OFF. Publish gates untouched: connecting changes
       nothing about posting
+- [~] OVERNIGHT STAGES BUILD (2026-07-03): publish verify 400 fixed with honest alert
+      split; connect kv tokens into account resolution (AGENT_CONNECT_TOKENS_ENABLED);
+      premade story variants (AGENT_STORY_PREMADE_ENABLED); two tier comment engine
+      hardened (conservative tiering, Graph reads, held cards, DMs structurally
+      untouchable); monthly review loop (AGENT_MONTHLY_REVIEW_ENABLED: digest + PDF +
+      citation gated proposals); trust ladder WIRED (AGENT_TRUST_DRYRUN +
+      AGENT_TRUST_AUTOPUBLISH, both OFF; first post never automated, off template
+      always cards); one command onboarding (onboard-client + intake_template.md);
+      fleet hardening (per account isolation + fleet-status). .env.example now the
+      complete flag reference. All new flags OFF
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
