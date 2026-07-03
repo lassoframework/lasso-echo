@@ -127,6 +127,19 @@ def test_queue_verbatim_and_ordered(monkeypatch, tmp_path):
     assert "You are stuck." in d2.caption                        # verbatim body line
 
 
+def test_real_week1_cards_resolve_from_repo_folder():
+    """The shipped content_library/book_campaign/ files match the drafter's
+    day<N> lookup. Day 1 (the cover itself) is NOT in the repo yet: Blake adds
+    day1_cover.<ext>; until then day 1 generates in cover style. Update the
+    day-1 assertion when the file lands."""
+    for n, stem in [(2, "who_its_for"), (3, "three_levers"), (4, "quote_math"),
+                    (5, "halo_effect"), (6, "surgeon_story"), (7, "pat_case_study")]:
+        found = book_campaign._existing_card(n)
+        assert found is not None, f"day {n} card missing"
+        assert found.endswith(f"day{n}_{stem}.png"), found
+    assert book_campaign._existing_card(1) is None       # cover pending from Blake
+
+
 def test_existing_card_used_instead_of_generating(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     card_dir = tmp_path / "book_cards"
