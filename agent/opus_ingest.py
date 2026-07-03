@@ -78,10 +78,18 @@ class OpusAPI:
         return r.json()
 
     def list_collections(self):
-        """GET /api/collections?q=mine -> [collection ids]."""
-        body = self._get("/api/collections", {"q": "mine"}) or {}
-        items = body if isinstance(body, list) else body.get("data", []) or []
-        return [c.get("id") for c in items if isinstance(c, dict) and c.get("id")]
+        """GET /api/collections?q=mine -> [collection ids], PAGINATED properly
+        (the earlier single read could miss collections past page one)."""
+        ids, page = [], 1
+        while True:
+            body = self._get("/api/collections",
+                             {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
+            items = body if isinstance(body, list) else body.get("data", []) or []
+            ids.extend(c.get("id") for c in items
+                       if isinstance(c, dict) and c.get("id"))
+            if len(items) < 50:
+                return ids
+            page += 1
 
     def list_exportable_clips(self, q, source_id):
         """GET /api/exportable-clips, paginated. q = findByProjectId|findByCollectionId."""
@@ -165,7 +173,9 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
     out_dir = out_dir or config.LIBRARY_PATH
     summary = {"pulled": 0, "skipped": 0, "failed": 0}
 
+    sources_scanned = []
     for q, source_id in _sources(api, vprint):
+        sources_scanned.append(f"{q}:{source_id}")
         source_key = f"{q}:{source_id}"
         watermark = watermarks.get(source_key, "")
         try:
@@ -261,6 +271,17 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
     state["hashes"] = sorted(hashes)
     state["deadletter"] = sorted(dead)
     save_state(state)
+    if summary == {"pulled": 0, "skipped": 0, "failed": 0}:
+        if not sources_scanned:
+            print("pull-opus: ZERO sources to scan. Projects are not collections "
+                  "and auto discovery only sees collections. Either add your "
+                  "clips to a collection in the OpusClip dashboard, or set "
+                  "AGENT_OPUS_PROJECT_IDS=P1,P2,... (ids from each project URL) "
+                  "on the listener service. Run opus-check for the probe.")
+        else:
+            print(f"pull-opus: scanned {len(sources_scanned)} source(s), zero "
+                  "new clips. Nothing matched the watermark window; use "
+                  "--verbose to see per clip reasons.")
     return summary
 
 
@@ -305,6 +326,26 @@ def opus_check(http=None):
         print(f"opus-check: {count} collection(s) returned")
     else:
         print("opus-check: response body is not JSON")
+    pinned = config.OPUS_PROJECT_IDS
+    print(f"opus-check: AGENT_OPUS_PROJECT_IDS pinned: "
+          f"{', '.join(pinned) if pinned else 'none'}")
+    # EXACT remediation per detected case
+    if status in (401, 403):
+        print("opus-check: REMEDIATION: the key was rejected. Regenerate "
+              "OPUS_API_KEY in the OpusClip dashboard (lower left) and set it "
+              "on the listener service; multi org accounts also need "
+              "AGENT_OPUS_ORG_ID.")
+    elif status < 400 and count == 0 and not pinned:
+        print("opus-check: REMEDIATION: your key sees NO collections and no "
+              "project ids are pinned. Projects are not collections. Either "
+              "add the clips to a collection in the OpusClip dashboard, or set "
+              "AGENT_OPUS_PROJECT_IDS=P1,P2,... (ids from each project URL).")
+    elif status < 400 and count == 0 and pinned:
+        print("opus-check: pinned project ids will be scanned directly; the "
+              "empty collection list is fine. Run pull-opus --verbose.")
+    elif status < 400 and (count or 0) > 0:
+        print("opus-check: READY: collections are visible; pull-opus will scan "
+              "them (plus any pinned project ids).")
     if status >= 400 or not count:
         from .ops_alerts import scrub  # key-scrub anything echoed back
         snippet = scrub(body_text)[:500]

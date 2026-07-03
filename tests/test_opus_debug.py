@@ -115,3 +115,74 @@ def test_opus_check_without_key(monkeypatch, capsys):
     out = opus_ingest.opus_check(http=_Http(_Resp(200)))
     assert out == {"status": None, "collections": None}
     assert "not set" in capsys.readouterr().out
+
+
+# ---- part G: discovery paths + honest empty messaging ------------------------------
+def test_pinned_project_ids_path(monkeypatch, tmp_path, capsys):
+    lib = _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", ["P1", "P2"])
+    monkeypatch.setattr(config, "OPUS_COLLECTION_IDS", [])
+
+    class PinnedApi(FakeOpus):
+        def list_collections(self):
+            raise AssertionError("collections listed despite pinned ids")
+
+        def list_exportable_clips(self, q, source_id):
+            assert q == "findByProjectId" and source_id in ("P1", "P2")
+            return []
+
+    opus_ingest.pull(api=PinnedApi(), s3_client=FakeS3(), out_dir=lib, verbose=True)
+    out = capsys.readouterr().out
+    assert "PINNED ids (2 project" in out
+    assert "scanned 2 source(s), zero new clips" in out    # clear, never silent
+
+
+def test_collection_discovery_path(monkeypatch, tmp_path, capsys):
+    lib = _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", [])
+    monkeypatch.setattr(config, "OPUS_COLLECTION_IDS", [])
+    api = FakeOpus()                                       # one collection, two clips
+    out = opus_ingest.pull(api=api, s3_client=FakeS3(), out_dir=lib)
+    assert out["pulled"] == 2                              # collections path pulls
+
+
+def test_zero_sources_prints_remediation(monkeypatch, tmp_path, capsys):
+    lib = _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", [])
+    monkeypatch.setattr(config, "OPUS_COLLECTION_IDS", [])
+
+    class EmptyApi(FakeOpus):
+        def list_collections(self):
+            return []
+
+    opus_ingest.pull(api=EmptyApi(), s3_client=FakeS3(), out_dir=lib)
+    out = capsys.readouterr().out
+    assert "ZERO sources" in out
+    assert "Projects are not collections" in out
+    assert "AGENT_OPUS_PROJECT_IDS" in out                 # the exact env var named
+
+
+def test_opus_check_remediation_per_case(monkeypatch, capsys):
+    _key(monkeypatch)
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", [])
+    # case: 200 empty, nothing pinned -> the projects-are-not-collections fix
+    opus_ingest.opus_check(http=_Http(_Resp(200, text='{"data": []}',
+                                            json_body={"data": []})))
+    out = capsys.readouterr().out
+    assert "REMEDIATION" in out and "AGENT_OPUS_PROJECT_IDS" in out
+    # case: 200 empty but ids pinned -> fine, scan directly
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", ["P1"])
+    opus_ingest.opus_check(http=_Http(_Resp(200, text='{"data": []}',
+                                            json_body={"data": []})))
+    out = capsys.readouterr().out
+    assert "pinned project ids will be scanned" in out
+    # case: 401 -> key remediation naming the env vars
+    opus_ingest.opus_check(http=_Http(_Resp(401, text='{"error":"x"}',
+                                            json_body={"error": "x"})))
+    out = capsys.readouterr().out
+    assert "OPUS_API_KEY" in out and "AGENT_OPUS_ORG_ID" in out
+    # case: collections visible -> READY
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", [])
+    opus_ingest.opus_check(http=_Http(_Resp(200, text='{"data":[{"id":"C1"}]}',
+                                            json_body={"data": [{"id": "C1"}]})))
+    assert "READY" in capsys.readouterr().out
