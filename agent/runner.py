@@ -50,8 +50,24 @@ def _reconcile(draft, day_key, draft_type, store, poster):
     """
     draft.day_key = day_key
     draft.draft_type = draft_type
+    # EMPTY CAPTION GUARD (the 39ceaaf63d class): a feed draft with nothing to
+    # say is not approvable material; it blocks instead of growing buttons.
+    if (draft.status == DraftStatus.PENDING and not getattr(draft, "is_story", False)
+            and not (draft.caption or "").strip()):
+        draft.status = DraftStatus.BLOCKED
+        draft.blocked_reason = "empty caption: nothing approved to say"
     if draft.status != DraftStatus.PENDING:
-        return draft, None   # blocked drafts surface exactly as today
+        # BLOCKED DEDUPE (retry-storm root): the same failing slot cards ONCE.
+        # A repeat of an already-recorded block for (account, day, type) posts
+        # no new card; recovery to PENDING supersedes normally below.
+        finder = getattr(store, "find_for_day", None)
+        existing = finder(draft.account_key, day_key, draft_type) if finder else None
+        if (existing is not None and existing.status == DraftStatus.BLOCKED
+                and existing.blocked_reason == draft.blocked_reason):
+            print(f"[reconcile] {draft.account_key} {day_key} {draft_type}: "
+                  "same block repeated; no new card")
+            return None, existing
+        return draft, None
     existing = store.find_pending(draft.account_key, day_key, draft_type)
     if existing is None:
         return draft, None
@@ -158,8 +174,9 @@ def _post_and_save(draft, store, poster, idempotent):
     if idempotent:
         draft.slack_channel = str(resp.get("channel") or "")
         draft.slack_ts = str(resp.get("ts") or "")
-    if draft.status.value != "blocked":
-        store.put(draft)
+    # Blocked drafts are stored too (terminal records): that is what lets the
+    # blocked dedupe stop a retry storm from re-carding the same failure.
+    store.put(draft)
 
 
 def _trust_startup_warning():

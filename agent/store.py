@@ -131,6 +131,19 @@ class PendingStore:
                                 (DraftStatus.PENDING.value,)).fetchall()
         return [_from_dict(json.loads(r["data"])) for r in rows]
 
+    def find_for_day(self, account_key, day_key, draft_type):
+        """The most recent record for (account, day, type), ANY status. The
+        blocked-draft dedupe uses this so a failing slot cards ONCE, not once
+        per scheduler fire (the Jul 1 retry-storm class)."""
+        if not day_key or not draft_type:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT data FROM drafts WHERE account_key=? AND day_key=? "
+                "AND draft_type=? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                (account_key, day_key, draft_type)).fetchone()
+        return _from_dict(json.loads(row["data"])) if row else None
+
     def find_pending(self, account_key, day_key, draft_type):
         """The PENDING draft for (account, day, type), or None: the idempotency
         lookup, exactly as before. Older records without day_key never match."""

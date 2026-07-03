@@ -80,6 +80,7 @@ def _run(tmp_path, poster, store, day=DAY, voice_text=VOICE_V1):
     lib = tmp_path / "lib"
     lib.mkdir(exist_ok=True)
     (lib / "asset.png").write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+    (lib / "asset.txt").write_text("A plain approved note.", encoding="utf-8")
     return run_daily(poster=poster, voice_path=str(voice), library_path=str(lib),
                      scheduled_for=f"{day}T18:30:00+00:00",
                      accounts=[_acct()], store=store)
