@@ -115,3 +115,35 @@ def test_dry_posts_and_writes_nothing(monkeypatch, tmp_path):
     assert "pdf" not in out["lasso_ig"]                  # nothing written
     assert poster.notices == []                          # nothing posted
     assert not (tmp_path / "reports").exists()
+
+
+# ---- --dry runs WITHOUT the flag (read only, zero side effects) --------------------
+def test_dry_runs_with_flag_off_and_writes_nothing(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("AGENT_MONTHLY_REVIEW_ENABLED", raising=False)
+    monkeypatch.setenv("AGENT_REPORTS_DIR", str(tmp_path / "reports"))
+    src = tmp_path / "empty_now.md"
+    src.write_text("", encoding="utf-8")
+    monkeypatch.setattr(config, "SOURCE_DOC_PATH", str(src))
+    _seed()
+    # snapshot the store BEFORE (adversarial: dry must not add a single row)
+    with db.connect() as conn:
+        before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("posts", "snapshots", "audit", "kv")}
+    poster = RecordingPoster()
+    out = monthly_review.run(account="lasso_ig", dry=True, poster=poster, now=NOW,
+                             base_dir=str(tmp_path))
+    assert out is not None                                # it RAN without the flag
+    printed = capsys.readouterr().out
+    assert "MONTHLY REVIEW lasso_ig" in printed           # full review to stdout
+    assert poster.notices == []                           # no Slack
+    assert not (tmp_path / "reports").exists()            # no PDF
+    with db.connect() as conn:                            # no store writes
+        after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                 for t in ("posts", "snapshots", "audit", "kv")}
+    assert after == before
+
+
+def test_non_dry_with_flag_off_still_refuses(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_MONTHLY_REVIEW_ENABLED", raising=False)
+    assert monthly_review.run(account="lasso_ig", dry=False) is None
+    assert "OFF" in capsys.readouterr().out

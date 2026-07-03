@@ -102,9 +102,14 @@ def digest_lines(report, proposals, dropped, asks):
 
 
 def run(account=None, dry=False, poster=None, now=None, base_dir=None):
-    """The 30 day loop per account. None while the flag is OFF."""
-    if not config.monthly_review_enabled():
-        print("monthly-review: AGENT_MONTHLY_REVIEW_ENABLED is OFF. Nothing built.")
+    """The 30 day loop per account.
+
+    --dry is READ ONLY and runs even while the flag is OFF: it prints the full
+    review to stdout and produces ZERO side effects (no Slack, no PDF, no store
+    writes). Without --dry the enable check stands exactly as before."""
+    if not dry and not config.monthly_review_enabled():
+        print("monthly-review: AGENT_MONTHLY_REVIEW_ENABLED is OFF. Nothing built. "
+              "(--dry runs read only without the flag.)")
         return None
     now = now or datetime.now(timezone.utc)
     month = now.strftime("%Y-%m")

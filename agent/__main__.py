@@ -370,7 +370,8 @@ def main(argv=None):
             print(f"dam-scan: {tagged} asset(s) tagged")
     elif cmd == "monthly-review":
         # The 30 day loop: digest + PDF per account (AGENT_MONTHLY_REVIEW_ENABLED).
-        # --dry prints everything and posts/writes nothing.
+        # --dry is READ ONLY: prints everything, posts/writes nothing, and runs
+        # even while the flag is OFF (evidence gathering without arming).
         acct_f, dry, args = None, False, argv[1:]
         i = 0
         while i < len(args):
