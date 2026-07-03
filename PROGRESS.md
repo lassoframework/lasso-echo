@@ -169,6 +169,13 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       cards only; premade cards in content_library/book_campaign/ used before
       generating. Known conflicts (subtitle, author bio figure) flag as card
       warnings. Flag AGENT_BOOK_CAMPAIGN_ENABLED OFF
+- [~] Facebook connect page: /connect on the listener (small HTTP thread, needs the
+      /data store for the page token), cream V3 single page, Facebook Login for
+      Business with exactly the five publish scopes, callback picks the Page and
+      resolves the linked IG professional account, page token kv-stored (never
+      logged, never rendered, audit scrubbed). Whole surface 404s while
+      AGENT_CONNECT_ENABLED is OFF. Publish gates untouched: connecting changes
+      nothing about posting
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set

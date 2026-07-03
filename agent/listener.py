@@ -179,6 +179,13 @@ def _daily_scheduler(store):
 
 
 def run_listener():
+    # Facebook connect page: a small HTTP surface INSIDE this process (it needs
+    # the /data store for the page token). Dormant unless AGENT_CONNECT_ENABLED;
+    # while off, no thread starts and the routes would 404 anyway.
+    if config.connect_enabled():
+        import threading as _threading
+        from . import connect_web
+        _threading.Thread(target=connect_web.serve, daemon=True).start()
     import os
     try:
         from slack_bolt import App

@@ -70,6 +70,7 @@ def _status():
     print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
     print(f"  social_proof   : {config.social_proof_enabled()}  (env AGENT_SOCIAL_PROOF_ENABLED)")
     print(f"  intake         : {config.intake_enabled()}  (env AGENT_INTAKE_ENABLED)")
+    print(f"  connect        : {config.connect_enabled()}  (env AGENT_CONNECT_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
     print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")

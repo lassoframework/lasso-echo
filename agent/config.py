@@ -403,6 +403,16 @@ def grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
 
 
+def connect_enabled() -> bool:
+    """
+    Facebook connect page switch. OFF by default: the /connect surface 404s and
+    the server thread never starts. ON, clients can link their Page + IG via
+    Facebook Login for Business; the page token lands in the /data store. It
+    changes NOTHING about posting: every post still cards for approval.
+    """
+    return _truthy(os.environ.get("AGENT_CONNECT_ENABLED", "false"))
+
+
 def intake_enabled() -> bool:
     """
     Texted-link intake switch (upload page + listener ingest). OFF by default: the
