@@ -194,6 +194,14 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       approval evidence only; Opus discovery fixed (pinned ids honored, collections
       paginated, honest empty messaging + exact remediation in opus-check); gbp-check
       readiness probe. All new flags OFF
+- [x] Queue triage maintenance (2026-07-04, from Scout's findings): flagless card
+      self-expiry (past-due PENDING cards flip EXPIRED, buttons removed, one log line;
+      hourly listener sweep + at every daily run; retroactively clears the 22 stale
+      cards and 4 dead loopers on first production cycle) and the retry-storm root fix
+      (blocked drafts stored + deduped per account/day/type so a failing slot cards
+      ONCE; empty-caption drafts block instead of growing buttons). FB verify-400:
+      already fixed Jul 3 (Photo node field set); both observed events predate the
+      deploy; no Meta-side action needed
 - [x] Service concept set for regen-library: 8 source-verified service cards (ads,
       follow up, lead to member path, sales training, funnel diagnostic, social,
       all in one place, website), archetypes assigned none more than twice; --set
