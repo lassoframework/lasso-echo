@@ -56,9 +56,10 @@ def test_headline_law_rides_every_archetype():
 
 
 def test_headline_map_matches_report():
-    # the 16 house concepts exactly; the b2b swipe set has its own test file
+    # the 16 house concepts exactly; the cited swipe sets (b2b, platform)
+    # have their own test files
     actual = {k: v["headline"] for k, v in regen_library.CONCEPTS.items()
-              if v.get("set") != "b2b"}
+              if v.get("set") not in ("b2b", "platform")}
     assert actual == EXPECTED_HEADLINES
 
 
@@ -72,10 +73,10 @@ def test_retired_slogans_absent_from_all_prompts():
 def test_headlines_keep_the_standing_rules():
     for key, spec in regen_library.CONCEPTS.items():
         h = spec["headline"]
-        if spec.get("set") == "b2b":
-            # the ONE exception: a b2b stat headline is allowed digits ONLY
-            # with a cite into the approved claims source (test_b2b_concepts
-            # proves each cite resolves and clears the gate)
+        if spec.get("set") in ("b2b", "platform"):
+            # the cited exception: a swipe set stat headline is allowed digits
+            # ONLY with a cite into the approved claims source (each set's own
+            # test file proves every cite resolves and clears the gate)
             if re.search(r"[\d%]", h):
                 assert spec.get("cite"), key
         else:

@@ -414,6 +414,142 @@ CONCEPTS = {
         "canvas": "navy",
         "archetype": "path",
     },
+    # ---- PLATFORM set (LASSO Platform Overview 2026; source 08_platform_2026.md).
+    # Copy is VERBATIM from the approved brief; every stat carries a `cite`
+    # that resolves against a platform_2026 USE line. Canvas + layout are the
+    # brief's explicit assignments through the locked variant system.
+    "platform_stuck_lasso": {
+        "headline": "Revenue stuck for months?",
+        "concept": ["Tension: the STUCK zone, five vendors, leads dying in handoffs, gut feel numbers.",
+                    "Resolution: the WITH LASSO zone, one platform, every lead worked, honest numbers.",
+                    "CTA copy (caption, never rendered): Your only job is signing people up."],
+        "story": False,
+        "set": "platform",
+        "layout": "contrast",
+        "canvas": "split",
+        "archetype": "split",
+    },
+    "platform_719_booking": {
+        "headline": "71.9% booked",
+        "cite": ["71.9% booked vs an 18.5% industry average."],
+        "concept": ["Tension: the industry books 18.5% of its leads; most never hear back at all.",
+                    "Resolution: the same leads at a LASSO gym, 71.9% booked onto the calendar.",
+                    "Support copy (caption, never rendered): vs an 18.5% industry average. Same leads. Very different outcomes.",
+                    "CTA copy (caption, never rendered): We chase. You close."],
+        "story": False,
+        "set": "platform",
+        "layout": "stat_hero",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "platform_six_engines": {
+        "headline": "Six engines. One job: your MRR.",
+        "concept": ["Tension: an owner running six separate tools that never talk to each other.",
+                    "Resolution: six engines in one system, each feeding the next, one login, labeled ADS, GOOGLE, NURTURE, WEBSITE, SOCIAL, PORTAL.",
+                    "List copy (caption, never rendered): Paid ads, Google, AI nurture + live bookers, Website, Social, Portal",
+                    "CTA copy (caption, never rendered): One platform. Every lead. Zero blind spots."],
+        "story": False,
+        "set": "platform",
+        "layout": "framework",
+        "canvas": "cream",
+        "archetype": "flow",
+    },
+    "platform_nurture_proof": {
+        "headline": "What happens to every lead at a LASSO gym",
+        "cite": ["297 nurtured, 141 responded, 100+ appointments across four gyms.",
+                 "71.9% top booking rate vs the 18.5% industry average."],
+        "concept": ["Tension: leads arriving and going quiet, nobody following up.",
+                    "Resolution: the nurture rail carrying them down, stops labeled NURTURED, RESPONDED, BOOKED.",
+                    "List copy (caption, never rendered): 297 nurtured, 141 responded, 100+ booked, 71.9% top booking rate",
+                    "Support copy (caption, never rendered): Nearly four times the intros from the exact same leads.",
+                    "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
+        "story": False,
+        "set": "platform",
+        "layout": "framework",
+        "canvas": "navy",
+        "archetype": "flow",
+    },
+    "platform_8_of_10": {
+        "headline": "8 of 10",
+        "cite": ["8 of 10 paid leads never even reach the average gym calendar."],
+        "concept": ["Tension: ten paid leads arriving, eight of them evaporating before the calendar.",
+                    "Resolution: the LASSO path where every lead is worked to the calendar.",
+                    "Support copy (caption, never rendered): paid leads never even reach the average gym calendar.",
+                    "CTA copy (caption, never rendered): Stop paying for leads nobody calls."],
+        "story": False,
+        "set": "platform",
+        "layout": "stat_hero",
+        "canvas": "red",
+        "archetype": "hero",
+    },
+    "platform_fit_mamas": {
+        "headline": "$19K to $47K",
+        "cite": ["Fit Mamas Tribe took monthly revenue from $19K to $47K on the "
+                 "LASSO system. Average client value up from $99 to $167 at the "
+                 "same time."],
+        "concept": ["Tension: a gym stuck at its old monthly number.",
+                    "Resolution: the same gym on the LASSO system at more than double, the owner reading honest numbers.",
+                    "Support copy (caption, never rendered): Fit Mamas Tribe monthly revenue on the LASSO system. Average client value up from $99 to $167 at the same time.",
+                    "CTA copy (caption, never rendered): Real gyms. Real receipts."],
+        "story": False,
+        "set": "platform",
+        "layout": "stat_hero",
+        "canvas": "cream",
+        "archetype": "hero",
+    },
+    "platform_courage_million": {
+        "headline": "First $1M year",
+        "cite": ["Courage Fitness: First $1M year. $84K MRR.",
+                 "Courage Fitness: 30 to 80+ leads per month and $84K MRR, "
+                 "evenings back included."],
+        "concept": ["Tension: a strong gym that could never crack the next revenue level.",
+                    "Resolution: Courage Fitness over the line, the calendar full, the owner off the front desk.",
+                    "Support copy (caption, never rendered): Courage Fitness: 30 to 80+ leads per month and $84K MRR, evenings back included.",
+                    "CTA copy (caption, never rendered): Real gyms. Real receipts."],
+        "story": False,
+        "set": "platform",
+        "layout": "stat_hero",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "platform_cockpit": {
+        "headline": "Agencies send reports. LASSO hands you the cockpit.",
+        "concept": ["Tension: a monthly PDF report the owner cannot act on, already out of date.",
+                    "Resolution: a live cockpit view, every lead, every dollar, every booking on one screen.",
+                    "Support copy (caption, never rendered): Every lead, every dollar, every booking. One login, updated live.",
+                    "CTA copy (caption, never rendered): Honest numbers or no numbers."],
+        "story": False,
+        "set": "platform",
+        "layout": "poster",
+        "canvas": "navy",
+        "archetype": "headline",
+    },
+    "platform_handoffs": {
+        "headline": "Leads do not die in your ads. They die in the handoffs.",
+        "concept": ["Tension: a lead passed between vendors, falling through the crack between two hands.",
+                    "Resolution: one team carrying the same lead straight to the calendar, no handoff, no crack.",
+                    "Support copy (caption, never rendered): Every vendor you add creates another crack for a lead to fall through.",
+                    "CTA copy (caption, never rendered): One team. One system. One number to call."],
+        "story": False,
+        "set": "platform",
+        "layout": "poster",
+        "canvas": "red",
+        "archetype": "headline",
+    },
+    "platform_close_first": {
+        "headline": "More leads never fix a broken sales conversation.",
+        "cite": ["Diagnose in order: close 70%+, show 50%+, book 50%+, leads 40%+."],
+        "concept": ["Tension: an owner pouring more leads into a funnel that leaks at the close.",
+                    "Resolution: the funnel diagnosed from the close upward, the failing leg flagged, labeled CLOSE, SHOW, BOOK, LEADS.",
+                    "List copy (caption, never rendered): 1 Close 70%+, 2 Show 50%+, 3 Book 50%+, 4 Leads 40%+",
+                    "Support copy (caption, never rendered): The first leg that fails is where your revenue hides.",
+                    "CTA copy (caption, never rendered): Free 20 minute funnel diagnosis"],
+        "story": False,
+        "set": "platform",
+        "layout": "framework",
+        "canvas": "split",
+        "archetype": "path",
+    },
 }
 
 
@@ -494,9 +630,9 @@ def parse_args(args):
                                     "usage: python -m agent regen-library "
                                     "[--only <concept>] [--set brand|service|all] "
                                     "[--dry-run]")
-    if set_name not in ("brand", "service", "b2b", "all"):
+    if set_name not in ("brand", "service", "b2b", "platform", "all"):
         return None, "all", False, (f"unknown set: {set_name} "
-                                    "(brand, service, b2b, or all)")
+                                    "(brand, service, b2b, platform, or all)")
     if only is not None and only not in CONCEPTS:
         return None, "all", False, (f"unknown concept: {only}\n"
                                     "known concepts: " + ", ".join(CONCEPTS))
@@ -548,7 +684,7 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
     """
     if only:
         keys = [only]
-    elif set_name in ("brand", "service", "b2b"):
+    elif set_name in ("brand", "service", "b2b", "platform"):
         keys = [k for k, v in CONCEPTS.items() if v.get("set") == set_name]
     else:
         keys = list(CONCEPTS)

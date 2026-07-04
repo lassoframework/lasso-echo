@@ -107,7 +107,7 @@ def test_invented_stat_still_blocked(monkeypatch):
 # ---- the 16 existing house concepts are byte untouched ------------------------------
 def test_existing_house_concepts_byte_untouched():
     house = {k: v for k, v in regen_library.CONCEPTS.items()
-             if v.get("set") != "b2b"}
+             if v.get("set") not in ("b2b", "platform")}
     assert len(house) == 16
     blob = json.dumps(house, sort_keys=True).encode()
     assert hashlib.sha256(blob).hexdigest() == HOUSE_SNAPSHOT_SHA256

@@ -53,9 +53,9 @@ def test_every_concept_context_has_tension_and_resolution():
         assert any(l.startswith("Tension:") for l in lines), key
         assert any(l.startswith("Resolution:") for l in lines), key
         # still clean: no dash characters anywhere; digits stay banned in the
-        # house sets (the b2b swipe copy may carry cited digits, own test file)
+        # house sets (the cited swipe sets may carry cited digits, own files)
         for line in lines:
-            if spec.get("set") != "b2b":
+            if spec.get("set") not in ("b2b", "platform"):
                 assert "%" not in line and not re.search(r"\d", line), key
             assert not re.search(r"[—–]", line), key
 
