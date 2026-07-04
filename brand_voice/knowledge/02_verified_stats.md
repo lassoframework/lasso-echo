@@ -27,6 +27,16 @@ Rule: only lines marked USE are postable. Wording must match exactly.
 - USE: 10-20 touchpoints per lead over about 36 days. (Ep 105; aligns with RAIN
   Group research. Cite as industry benchmark.)
 
+## USE — LASSO B2B Ad Swipe File, July 2026, Blake approved
+- USE: "$16 blended cost per lead. Blended across the LASSO portfolio, roughly
+  half typical industry cost."
+- USE: "The Ad Engine has caught more than $35,000 in wasted gym ad spend. One
+  recent audit cycle flagged over $17,000."
+- USE: "Ad billing reconciled line by line twice a month."
+- USE: "A recent gym website audit found 7 dead buttons including the primary CTA."
+- 500+ gym owners: already a USE claim above (current homepage claims section).
+  Cite that exact line, do not add a duplicate here.
+
 ## LOCKED — conflicts, do not post until Blake resolves
 - LOCKED: gyms served appears as 200+ (media kit), 400+ (old site), 500+
   (current homepage), 700+ (a third party review). DEFAULT: 500+ only.
