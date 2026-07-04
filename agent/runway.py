@@ -41,29 +41,79 @@ def _used_keys(account_key):
     return used
 
 
-def eligible_creatives(account_key, library_path):
-    """The assets runway may count: in-style, gate-clean, unposted."""
+def classify_creatives(account_key, library_path):
+    """
+    (eligible, excluded) for one account: THE single implementation both the
+    digest's runway_days and the runway --explain CLI read (never two copies
+    of the rules). `eligible` is the creative list; `excluded` maps each
+    excluded basename to its one reason, first rule that hit.
+    """
     off_style = rotation.style_exclusions(library_path)
     used = _used_keys(account_key)
     approved_claims = rotation._approved_claims()
-    out = []
+    eligible, excluded = [], {}
     for c in list_creatives(library_path):
         base = os.path.basename(c.path)
-        if base in off_style or base in used:
+        if base in off_style:
+            excluded[base] = "off style (style exclusion list)"
+            continue
+        if base in used:
+            excluded[base] = "already used (served or posted)"
             continue
         if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
+            excluded[base] = "story variant (never a feed candidate)"
             continue
         if not rotation.is_gate_clean(getattr(c, "client_note", ""), approved_claims):
+            excluded[base] = "fabrication gate (uncleared claim in the note)"
             continue
         from . import dam
         if dam.consent_blocked(c.path):
-            continue  # consent guard counts against runway too
-        out.append(c)
-    return out
+            excluded[base] = "consent blocked"
+            continue
+        eligible.append(c)
+    return eligible, excluded
+
+
+def eligible_creatives(account_key, library_path):
+    """The assets runway may count: in-style, gate-clean, unposted."""
+    return classify_creatives(account_key, library_path)[0]
 
 
 def runway_days(account_key, library_path):
     return round(len(eligible_creatives(account_key, library_path)) / _posts_per_day(), 1)
+
+
+def explain(account_key, library_path=None):
+    """
+    runway --account <key> --explain: the math in plain lines, READ ONLY.
+    Eligible concepts by name, excluded counts with reasons summarized, the
+    consumption assumption, and the resulting days from the SAME runway_days
+    the digest reads. Output is dash free.
+    """
+    library_path = library_path or config.LIBRARY_PATH
+    eligible, excluded = classify_creatives(account_key, library_path)
+    per_day = _posts_per_day()
+    days = runway_days(account_key, library_path)
+    lines = [f"runway explain for {account_key}:",
+             f"  eligible: {len(eligible)} creative(s)"]
+    for c in sorted(os.path.basename(c.path) for c in eligible):
+        lines.append(f"    {c}")
+    lines.append(f"  excluded: {len(excluded)} creative(s)")
+    reasons = {}
+    for reason in excluded.values():
+        reasons[reason] = reasons.get(reason, 0) + 1
+    for reason in sorted(reasons):
+        lines.append(f"    {reasons[reason]} x {reason}")
+    posting_days = 7 - len(config.POSTING_SKIP_DAYS)
+    lines.append(f"  consumption: {posting_days} posting day(s) per week = "
+                 f"{per_day:.2f} post(s) per day")
+    lines.append(f"  runway: {len(eligible)} / {per_day:.2f} = {days} day(s), "
+                 "the same number the digest prints")
+    out = "\n".join(lines)
+    print(out)
+    return {"eligible": [os.path.basename(c.path) for c in eligible],
+            "excluded": excluded, "posts_per_day": per_day, "days": days,
+            "text": out}
 
 
 def _color(days, threshold):

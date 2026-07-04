@@ -529,6 +529,23 @@ def main(argv=None):
             i += 1
         from .podcast_learn import learn_cli
         learn_cli(episode, count)
+    elif cmd == "runway":
+        # READ ONLY runway math in plain lines: eligible concepts by name,
+        # exclusions with reasons, the consumption assumption, and the same
+        # days number the digest prints. No digest change, no store writes.
+        account, want_explain, args = None, False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                account = args[i + 1]; i += 2; continue
+            if args[i] == "--explain":
+                want_explain = True; i += 1; continue
+            i += 1
+        if not account or not want_explain:
+            print("usage: python -m agent runway --account <key> --explain")
+        else:
+            from .runway import explain as runway_explain
+            runway_explain(account)
     elif cmd == "podcast-status":
         # READ ONLY probe: feed reachable, items seen, latest episode parsed,
         # the armed watermark, and an honest forecast of the next poll.
