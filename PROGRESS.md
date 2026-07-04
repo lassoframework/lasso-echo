@@ -317,6 +317,30 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       behind book priority, same house builder with no style overrides, 18 existing
       concepts untouched. Every card held for approval; nothing publishes;
       flag AGENT_PODCAST_ENABLED OFF
+- [~] Podcast release templates (B2): four LOCKED navy poster templates
+      (podcast_release_a classic poster / _b bold split / _c on air studio /
+      _e podcast player), scoped palette exception like the book cover;
+      deterministic rotation episode mod 4 over A B C E (131=E, 132=A, 133=B,
+      134=C), 3-digit episode slot, 2-line word-boundary title (~40 chars/line),
+      dash-free about line, chosen template logged in the audit row
+- [~] Podcast memory (2 parts, one commit each): (E) episode learnings (CLI
+      podcast-learn --episode N, also rides podcast-cards): 3-7 VERBATIM
+      takeaway+quote learnings with podcast_ep<N> citations and pillar taxonomy
+      tags into brand_voice/knowledge/podcast/ep<N>_learnings.md + rolling
+      INDEX.md; additive only, paraphrases refused, the global gate never reads
+      the subfolder; (F) standing claim promotion PROPOSE ONLY: quantitative /
+      named-framework learnings card PROPOSED STANDING CLAIM (quote, citation,
+      the exact USE line); the approver tap is the ONLY write path into
+      02_verified_stats.md, citation attached on landing; book conflicts named,
+      blocked, rechecked at tap time. Rides AGENT_PODCAST_ENABLED (OFF)
+- [~] B2B swipe file (2 commits): (A) four receipts in 02_verified_stats.md
+      ("LASSO B2B Ad Swipe File, July 2026, Blake approved": $16 blended CPL,
+      $35,000 caught / $17,000 flagged, twice-monthly reconciliation, 7 dead
+      buttons; 500+ referenced not duplicated), gate clears cited receipts and
+      still blocks uncited claims; (B) 10 b2b_* concepts in the house library
+      (set "b2b", pillars verbatim, stat headlines carry cites), same locked
+      builder, 16 house concepts byte untouched (frozen hash),
+      regen-library --only/--set b2b per key. Render by hand via regen-library
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
