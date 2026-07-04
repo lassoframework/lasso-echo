@@ -120,7 +120,9 @@ def test_opus_check_without_key(monkeypatch, capsys):
 # ---- part G: discovery paths + honest empty messaging ------------------------------
 def test_pinned_project_ids_path(monkeypatch, tmp_path, capsys):
     lib = _arm(monkeypatch, tmp_path)
-    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", ["P1", "P2"])
+    # real-looking ids (placeholder-shaped values like P1 are now rejected)
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS",
+                        ["proj_8f3k2m9q", "proj_7walnut2"])
     monkeypatch.setattr(config, "OPUS_COLLECTION_IDS", [])
 
     class PinnedApi(FakeOpus):
@@ -128,7 +130,8 @@ def test_pinned_project_ids_path(monkeypatch, tmp_path, capsys):
             raise AssertionError("collections listed despite pinned ids")
 
         def list_exportable_clips(self, q, source_id):
-            assert q == "findByProjectId" and source_id in ("P1", "P2")
+            assert q == "findByProjectId" and source_id in ("proj_8f3k2m9q",
+                                                            "proj_7walnut2")
             return []
 
     opus_ingest.pull(api=PinnedApi(), s3_client=FakeS3(), out_dir=lib, verbose=True)
@@ -171,7 +174,7 @@ def test_opus_check_remediation_per_case(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "REMEDIATION" in out and "AGENT_OPUS_PROJECT_IDS" in out
     # case: 200 empty but ids pinned -> fine, scan directly
-    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", ["P1"])
+    monkeypatch.setattr(config, "OPUS_PROJECT_IDS", ["proj_8f3k2m9q"])
     opus_ingest.opus_check(http=_Http(_Resp(200, text='{"data": []}',
                                             json_body={"data": []})))
     out = capsys.readouterr().out

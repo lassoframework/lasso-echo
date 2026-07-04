@@ -13,9 +13,14 @@ OpenAPI at /api-reference/openapi.json):
   - Auth: Authorization Bearer key (env OPUS_API_KEY, read lazily, NEVER logged
     or printed) plus optional x-opus-org-id.
 
-Watermarks (last createdAt per source), ingested clip ids, content hashes, and
-failure counts persist to /data so re-pulls are idempotent and restarts forget
-nothing. Dedupe is by sha256 of the clip bytes: the library filename carries the
+Watermarks (last createdAt per source), ingested clip ids, content hashes,
+failure counts, and the daily alert stamps persist to /data so re-pulls are
+idempotent and restarts forget nothing.
+
+ALERT HYGIENE: pinned project ids that look like placeholders (P1 pattern or
+under 6 chars) are warned about once and never sent to the API, at startup and
+at every ingest pass. Ingest failure alerts debounce to ONE Slack line per
+source per day; repeats the same day go to the audit log only. Dedupe is by sha256 of the clip bytes: the library filename carries the
 hash (opus_<sha16>.mp4), so the rotation no-repeat window keys on content.
 
 GATES UNCHANGED: nothing here publishes. A clip reaches Meta only through the
@@ -34,6 +39,40 @@ from . import config, media_host, ops_alerts
 STATE_FILE = "opus_state.json"
 FAILURE_DEADLETTER_AT = 3
 HOST_TENANT = "lasso_library"
+
+# A pinned AGENT_OPUS_PROJECT_IDS value that is really the docs' example
+# (P1, p2, ...) or too short to be a real OpusClip project id. Such a value
+# must NEVER reach the API: it is warned about once and skipped.
+_PLACEHOLDER_ID_RE = re.compile(r"^[Pp]\d+$")
+_MIN_PROJECT_ID_LEN = 6
+
+
+def split_placeholder_project_ids(ids):
+    """(real, placeholders) from a pinned project id list. A placeholder is the
+    example pattern P<digits> (any length) or any value under 6 characters."""
+    real, bad = [], []
+    for pid in ids:
+        pid = str(pid).strip()
+        if not pid:
+            continue
+        if _PLACEHOLDER_ID_RE.match(pid) or len(pid) < _MIN_PROJECT_ID_LEN:
+            bad.append(pid)
+        else:
+            real.append(pid)
+    return real, bad
+
+
+def validated_project_ids(ids=None):
+    """The pinned project ids that are safe to call the API with. Placeholders
+    are skipped with ONE warning line naming every bad value (printed once per
+    validation pass: listener startup and each ingest pass, never per call)."""
+    real, bad = split_placeholder_project_ids(
+        config.OPUS_PROJECT_IDS if ids is None else ids)
+    if bad:
+        print("[opus] WARNING: AGENT_OPUS_PROJECT_IDS value(s) look like "
+              f"placeholders and were SKIPPED: {', '.join(bad)}. Set the real "
+              "id from each project URL; the API is never called with these.")
+    return real
 
 
 # ---- state (/data) --------------------------------------------------------------
@@ -156,11 +195,14 @@ def _default_api():
 
 def _sources(api, vprint=lambda *a, **k: None):
     """(q, id) pairs to scan: pinned project ids + pinned collections, else every
-    collection the account owns (the documented discovery path)."""
-    sources = [("findByProjectId", pid) for pid in config.OPUS_PROJECT_IDS]
+    collection the account owns (the documented discovery path). Placeholder
+    project ids (P1 pattern / under 6 chars) are warned about and never scanned;
+    a pin list that is ALL placeholders behaves like no pin list at all."""
+    project_ids = validated_project_ids()
+    sources = [("findByProjectId", pid) for pid in project_ids]
     collections = config.OPUS_COLLECTION_IDS
-    if config.OPUS_PROJECT_IDS or collections:
-        vprint(f"[opus] discovery: PINNED ids ({len(config.OPUS_PROJECT_IDS)} project, "
+    if project_ids or collections:
+        vprint(f"[opus] discovery: PINNED ids ({len(project_ids)} project, "
                f"{len(collections)} collection)")
     if not collections and not sources:
         try:
@@ -177,6 +219,27 @@ def _sources(api, vprint=lambda *a, **k: None):
 
 def _slug(text, limit=40):
     return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")[:limit]
+
+
+def _alert_failure(state, source_key, message):
+    """Debounced ingest failure alert: ONE Slack alert per source (project or
+    collection) per day, not per hourly run. Repeat failures within the same
+    day keep the same honest message but land in the audit log only. The
+    dead-letter escalation does NOT pass through here: it fires at most once
+    per clip ever (the clip enters the dead set), so it is never spam and a
+    terminal give-up must stay visible. The stamp persists in opus_state.json,
+    so restarts within the day do not re-alert."""
+    from datetime import datetime, timezone
+    day = datetime.now(timezone.utc).date().isoformat()
+    alerted = state.setdefault("alert_days", {})
+    if alerted.get(source_key) == day:
+        from . import db
+        db.audit("ops_alert", "debounced", message, day=day)  # audit scrubs
+        return
+    for k in [k for k, v in alerted.items() if v != day]:  # drop stale days
+        alerted.pop(k)
+    alerted[source_key] = day
+    ops_alerts.alert(message)
 
 
 def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
@@ -216,8 +279,9 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
             clips = api.list_exportable_clips(q, source_id)
         except Exception as e:
             summary["failed"] += 1
-            ops_alerts.alert(f"opus ingest could not list clips for {source_id}: "
-                             f"{type(e).__name__}: {e}")
+            _alert_failure(state, source_key,
+                           f"opus ingest could not list clips for {source_id}: "
+                           f"{type(e).__name__}: {e}")
             continue
         vprint(f"[opus] {source_key}: {len(clips)} clip(s) listed "
                f"(watermark: {watermark or 'none'})")
@@ -297,8 +361,9 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
                                      f"{failures[clip_id]} failures: {type(e).__name__}: {e}")
                 else:
                     stalled = True  # retry next pull; watermark must not pass it
-                    ops_alerts.alert(f"opus ingest failed for clip {clip_id} "
-                                     f"(attempt {failures[clip_id]}): {type(e).__name__}: {e}")
+                    _alert_failure(state, source_key,
+                                   f"opus ingest failed for clip {clip_id} "
+                                   f"(attempt {failures[clip_id]}): {type(e).__name__}: {e}")
         watermarks[source_key] = newest
 
     state["ingested_ids"] = sorted(ingested)
@@ -310,8 +375,9 @@ def pull(api=None, s3_client=None, poster=None, out_dir=None, verbose=False):
             print("pull-opus: ZERO sources to scan. Projects are not collections "
                   "and auto discovery only sees collections. Either add your "
                   "clips to a collection in the OpusClip dashboard, or set "
-                  "AGENT_OPUS_PROJECT_IDS=P1,P2,... (ids from each project URL) "
-                  "on the listener service. Run opus-check for the probe.")
+                  "AGENT_OPUS_PROJECT_IDS to the real ids copied from each "
+                  "project URL (comma separated; example tokens like P1 are "
+                  "rejected) on the listener service. Run opus-check for the probe.")
         else:
             print(f"pull-opus: scanned {len(sources_scanned)} source(s), zero "
                   "new clips. Nothing matched the watermark window; use "
@@ -373,7 +439,8 @@ def opus_check(http=None):
         print("opus-check: REMEDIATION: your key sees NO collections and no "
               "project ids are pinned. Projects are not collections. Either "
               "add the clips to a collection in the OpusClip dashboard, or set "
-              "AGENT_OPUS_PROJECT_IDS=P1,P2,... (ids from each project URL).")
+              "AGENT_OPUS_PROJECT_IDS to the real ids copied from each project "
+              "URL (comma separated; example tokens like P1 are rejected).")
     elif status < 400 and count == 0 and pinned:
         print("opus-check: pinned project ids will be scanned directly; the "
               "empty collection list is fine. Run pull-opus --verbose.")

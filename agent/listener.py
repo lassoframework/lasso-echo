@@ -209,6 +209,12 @@ def _daily_scheduler(store):
 
 
 def run_listener():
+    # Startup config hygiene: placeholder AGENT_OPUS_PROJECT_IDS values (P1
+    # pattern / under 6 chars) get ONE warning naming each bad value and are
+    # never sent to the API. Ingest revalidates on every pass; this line only
+    # makes the misconfiguration visible the moment the service boots.
+    from . import opus_ingest
+    opus_ingest.validated_project_ids()
     # Facebook connect page: a small HTTP surface INSIDE this process (it needs
     # the /data store for the page token). Dormant unless AGENT_CONNECT_ENABLED;
     # while off, no thread starts and the routes would 404 anyway.
