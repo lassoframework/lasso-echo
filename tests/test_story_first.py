@@ -52,9 +52,11 @@ def test_every_concept_context_has_tension_and_resolution():
         lines = spec["concept"]
         assert any(l.startswith("Tension:") for l in lines), key
         assert any(l.startswith("Resolution:") for l in lines), key
-        # still clean: no digits, no percent, no dash characters
+        # still clean: no dash characters anywhere; digits stay banned in the
+        # house sets (the b2b swipe copy may carry cited digits, own test file)
         for line in lines:
-            assert "%" not in line and not re.search(r"\d", line), key
+            if spec.get("set") != "b2b":
+                assert "%" not in line and not re.search(r"\d", line), key
             assert not re.search(r"[—–]", line), key
 
 

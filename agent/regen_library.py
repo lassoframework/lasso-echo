@@ -19,9 +19,13 @@ a matching .json sidecar, hosts through the existing R2 pipeline, and PRINTS the
 public URL per card so Blake can eyeball each one in the browser.
 
 GATES UNCHANGED, stated plainly:
-  - fabrication gate: every concept below is NON STAT by design (no numbers, no
-    percent claims); captions are NOT generated here. Cards enter the normal
-    drafter flow where captions come only from approved sources.
+  - fabrication gate: the brand and service concepts are NON STAT by design (no
+    numbers, no percent claims); captions are NOT generated here. Cards enter
+    the normal drafter flow where captions come only from approved sources.
+    The b2b swipe set is the ONE exception: a b2b concept may carry a stat ONLY
+    with a `cite` naming its receipt in the approved claims source
+    (02_verified_stats.md, LASSO B2B Ad Swipe File); every cited stat clears
+    rotation.is_gate_clean against that source and an uncited stat never ships.
   - approval gate + publish flag: nothing this command makes posts anywhere.
     A card can only reach Meta through the daily draft plus Blake's tap.
   - rotation guard: this command never touches style_exclusions.json. Old cards
@@ -171,13 +175,141 @@ CONCEPTS = {
         "set": "service",
         "archetype": "headline",
     },
+    # ---- B2B swipe set (July 2026 brief). Copy is VERBATIM from the approved
+    # brief; "Support/Kicker/List/CTA copy" lines are caption copy the builder
+    # never renders (the one-headline law). A stat headline carries `cite`, the
+    # exact receipt line(s) in the approved claims source (02_verified_stats.md,
+    # LASSO B2B Ad Swipe File section) that clear it through the gate.
+    "b2b_five_vendors": {
+        "headline": "Five vendors. Five invoices. Zero answers.",
+        "concept": ["Tension: an owner buried at the front desk under five separate vendor invoices, five app windows open, none of them agreeing.",
+                    "Resolution: the same owner reading one calm platform screen where every lead lands in one place, labeled ADS, SALES, SOCIAL.",
+                    "Support copy (caption, never rendered): One platform. Every lead. Zero blind spots.",
+                    "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "All in one offer",
+        "archetype": "split",
+    },
+    "b2b_speed_to_lead": {
+        "headline": "The gym that answers first wins the member.",
+        "concept": ["Tension: a fresh lead's message glowing unanswered on a phone while a rival gym's reply already lands.",
+                    "Resolution: this gym answers in seconds and a live person books the appointment on the calendar, labeled ANSWERED, BOOKED.",
+                    "Support copy (caption, never rendered): AI follows up in seconds. A live person books the appointment.",
+                    "Kicker copy (caption, never rendered): We chase. You close.",
+                    "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "Sales are now",
+        "archetype": "hero",
+    },
+    "b2b_35k_caught": {
+        "headline": "$35,000 in wasted gym ad spend. Found. Named. Fixed.",
+        "cite": ["The Ad Engine has caught more than $35,000 in wasted gym ad "
+                 "spend. One recent audit cycle flagged over $17,000."],
+        "concept": ["Tension: ad spend leaking out of a campaign dashboard nobody reads, money dripping away unnoticed.",
+                    "Resolution: the engine reading every campaign line and flagging the leak, the waste caught and named.",
+                    "Support copy (caption, never rendered): Our engine reads every campaign every single day.",
+                    "CTA copy (caption, never rendered): Receipts, not reports"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "The AI agents",
+        "archetype": "headline",
+    },
+    "b2b_dynamic_spend": {
+        "headline": "Your ad budget should follow signups.",
+        "concept": ["Tension: a budget stuck on yesterday's habits, spend flowing to ads nobody signs up from.",
+                    "Resolution: budget moving on its own toward the campaigns producing signups, labeled SIGNUPS, BUDGET MOVES.",
+                    "Support copy (caption, never rendered): Not habits. Not hunches. Signups.",
+                    "Kicker copy (caption, never rendered): Money moves automatically. In near real time.",
+                    "CTA copy (caption, never rendered): Dynamic ad spend, standard on every account"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "The AI agents",
+        "archetype": "flow",
+    },
+    "b2b_16_cpl": {
+        "headline": "$16 blended cost per lead. Verified.",
+        "cite": ["$16 blended cost per lead. Blended across the LASSO "
+                 "portfolio, roughly half typical industry cost.",
+                 "Trusted by 500+ gym owners"],
+        "concept": ["Tension: most gyms overpaying for every single lead and never checking the math.",
+                    "Resolution: the blended portfolio number verified line by line, the owner reading it calm at a glance.",
+                    "Support copy (caption, never rendered): Most of the industry pays double.",
+                    "CTA copy (caption, never rendered): Trusted by 500+ gym owners"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "All in one offer",
+        "archetype": "headline",
+    },
+    "b2b_diagnosed_in_order": {
+        "headline": "More leads will not fix a broken sales conversation.",
+        "concept": ["Tension: an owner pouring more leads into a funnel while the sales conversation at the bottom stays broken.",
+                    "Resolution: the journey diagnosed in order from the close upward, stops labeled CLOSE RATE, SHOW RATE, BOOKING BEHAVIOR, LEAD VOLUME, the bottleneck flagged.",
+                    "List copy (caption, never rendered): 1 Close rate, 2 Show rate, 3 Booking behavior, 4 Lead volume",
+                    "Support copy (caption, never rendered): We find the bottleneck before we spend a dollar.",
+                    "CTA copy (caption, never rendered): Free 20 minute funnel diagnosis"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "Sales are now",
+        "archetype": "path",
+    },
+    "b2b_ai_search": {
+        "headline": "Last night someone asked AI which gym to join.",
+        "concept": ["Tension: a future member typing the question into an AI chat at night, your gym nowhere in the answer.",
+                    "Resolution: your gym written into the answer before the question is asked, the seeker heading to your door.",
+                    "Kicker copy (caption, never rendered): Were you the answer?",
+                    "Support copy (caption, never rendered): We write the answer before your future member asks the question.",
+                    "CTA copy (caption, never rendered): Free website audit"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "The AI agents",
+        "archetype": "hero",
+    },
+    "b2b_dead_buttons": {
+        "headline": "7 dead buttons on one gym website. The main one went nowhere.",
+        "cite": ["A recent gym website audit found 7 dead buttons including "
+                 "the primary CTA."],
+        "concept": ["Tension: a visitor tapping the main call to action on a gym website and nothing happening, the lead walking away in silence.",
+                    "Resolution: every button checked and wired, each tap landing on a working booking page, labeled TAP, BOOKED.",
+                    "Support copy (caption, never rendered): Silent lead loss on every single visit.",
+                    "CTA copy (caption, never rendered): Get your free website audit"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "All in one offer",
+        "archetype": "split",
+    },
+    "b2b_500_gyms": {
+        "headline": "500+ gym owners deep. We know exactly why gyms stall.",
+        "cite": ["Trusted by 500+ gym owners"],
+        "concept": ["Tension: a stalled gym owner assuming the coaching is the problem.",
+                    "Resolution: across hundreds of gyms the same pattern, the gaps between the leads and the floor, found and closed.",
+                    "Support copy (caption, never rendered): It is almost never the coaching. It is the gaps.",
+                    "CTA copy (caption, never rendered): One platform. Every lead. Zero blind spots."],
+        "story": False,
+        "set": "b2b",
+        "pillar": "All in one offer",
+        "archetype": "hero",
+    },
+    "b2b_ninety_days": {
+        "headline": "Picture your gym ninety days from now.",
+        "concept": ["Tension: today's owner buried in follow up, evenings gone, the numbers a mystery.",
+                    "Resolution: ninety days on the journey ends at a full intro calendar and every lead worked in seconds, labeled FULL CALENDAR, EVENINGS BACK.",
+                    "List copy (caption, never rendered): Full intro calendar, Numbers you trust at a glance, Every lead worked in seconds, Your evenings back",
+                    "Support copy (caption, never rendered): The only thing left on your plate is signing people up.",
+                    "CTA copy (caption, never rendered): You coach. We fill the room."],
+        "story": False,
+        "set": "b2b",
+        "pillar": "Sales are now",
+        "archetype": "path",
+    },
 }
 
 
 def parse_args(args):
     """
     STRICT CLI parsing for regen-library. Supports `--only KEY`, `--only=KEY`,
-    `--set brand|service|all` (both forms), and `--dry-run`. Returns
+    `--set brand|service|b2b|all` (both forms), and `--dry-run`. Returns
     (only, set_name, dry_run, error). Any unrecognized token is an ERROR, never a
     silent fall-through: a typo'd flag must NOT quietly run the full batch (the
     exact live bug this guards against).
@@ -210,8 +342,9 @@ def parse_args(args):
                                     "usage: python -m agent regen-library "
                                     "[--only <concept>] [--set brand|service|all] "
                                     "[--dry-run]")
-    if set_name not in ("brand", "service", "all"):
-        return None, "all", False, f"unknown set: {set_name} (brand, service, or all)"
+    if set_name not in ("brand", "service", "b2b", "all"):
+        return None, "all", False, (f"unknown set: {set_name} "
+                                    "(brand, service, b2b, or all)")
     if only is not None and only not in CONCEPTS:
         return None, "all", False, (f"unknown concept: {only}\n"
                                     "known concepts: " + ", ".join(CONCEPTS))
@@ -255,7 +388,7 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
     """
     if only:
         keys = [only]
-    elif set_name in ("brand", "service"):
+    elif set_name in ("brand", "service", "b2b"):
         keys = [k for k, v in CONCEPTS.items() if v.get("set") == set_name]
     else:
         keys = list(CONCEPTS)
@@ -297,6 +430,10 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
                 "archetype": spec.get("archetype", "flow"),
                 "set": spec.get("set", "brand"),
             }
+            if spec.get("pillar"):
+                sidecar["pillar"] = spec["pillar"]
+            if spec.get("cite"):
+                sidecar["cite"] = list(spec["cite"])
             if hosted:
                 sidecar["public_url"] = hosted
             sidecar_path = os.path.splitext(art["path"])[0] + ".json"

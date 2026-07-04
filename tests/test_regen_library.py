@@ -58,9 +58,9 @@ def _arm(monkeypatch, tmp_path):
 def test_batch_writes_v2_files_and_sidecars(monkeypatch, tmp_path):
     lib = _arm(monkeypatch, tmp_path)
     out = regen_library.run(nano_client=FakeNano(), s3_client=FakeS3(), out_dir=lib)
-    assert len(out) == 16                                    # brand 8 + service 8
+    assert len(out) == 26                          # brand 8 + service 8 + b2b 10
     pngs = sorted(p for p in os.listdir(lib) if p.endswith(".png"))
-    assert len(pngs) == 18                                   # 16 feed + 2 story variants
+    assert len(pngs) == 28                         # 26 feed + 2 story variants
     assert all(p.startswith("lasso_v2_") for p in pngs)
     assert "lasso_v2_built_by_gym_owners_story.png" in pngs  # the two +STORY concepts
     assert "lasso_v2_three_step_path_story.png" in pngs
