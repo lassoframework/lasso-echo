@@ -110,7 +110,7 @@ def test_prior_sets_byte_untouched():
     h = lambda d: hashlib.sha256(  # noqa: E731
         json.dumps(d, sort_keys=True).encode()).hexdigest()
     house = {k: v for k, v in regen_library.CONCEPTS.items()
-             if v.get("set") not in ("b2b", "platform")}
+             if v.get("set") not in ("b2b", "platform", "platform_ads")}
     b2b = {k: v for k, v in regen_library.CONCEPTS.items()
            if v.get("set") == "b2b"}
     assert len(house) == 16 and h(house) == HOUSE_SHA256
@@ -124,7 +124,7 @@ def test_variance_still_spread_across_36_and_guard_green(monkeypatch, tmp_path):
     for key in regen_library.CONCEPTS:
         canvas, _layout = regen_library.variant_for(key)
         counts[canvas or "cream"] += 1
-    assert len(regen_library.CONCEPTS) == 36
+    assert len(regen_library.CONCEPTS) == 46
     for canvas, n in counts.items():
         assert n >= 3, counts
     # and the guard itself still alternates on a mixed canvas library

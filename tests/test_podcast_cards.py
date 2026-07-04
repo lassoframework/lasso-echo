@@ -159,9 +159,9 @@ def test_studio_unavailable_never_consumes_the_queue(monkeypatch, tmp_path):
 # ---- the 18 existing concepts are byte untouched --------------------------------------------
 def test_existing_18_concepts_byte_untouched(monkeypatch, tmp_path):
     snapshot = json.dumps(CONCEPTS, sort_keys=True)
-    assert len(CONCEPTS) == 36                     # 16 house + 10 b2b + 10 platform
+    assert len(CONCEPTS) == 46         # 16 house + 10 b2b + 10 platform + 10 ads
     house = {k: v for k, v in CONCEPTS.items()
-             if v.get("set") not in ("b2b", "platform")}
+             if v.get("set") not in ("b2b", "platform", "platform_ads")}
     renders = len(house) + sum(1 for v in house.values() if v.get("story"))
     assert renders == 18                           # the original 18 renders
     assert all("podcast" not in k for k in CONCEPTS)               # nothing added there

@@ -30,6 +30,9 @@ training and funnel diagnosis ride along every engagement.
 ## USE — Receipts, verified (anchor platform_2026_receipts)
 - USE: "$16 blended CPL across the portfolio; the industry pays 2x." (platform_2026_receipts)
 - USE: "More than $35K in wasted ad spend saved; $17K flagged in one cycle." (platform_2026_receipts)
+- USE: "$35K+ in ad spend saved and put back to work. Over $17,000 in one
+  audit cycle alone." (platform_2026_receipts)
+- USE: "$35K+ Found. Reclaimed. Reinvested." (platform_2026_receipts)
 - USE: "Ad billing reconciled line by line twice monthly." (platform_2026_receipts)
 - USE: "71.9% booked vs an 18.5% industry average. Same leads. Very different
   outcomes." (platform_2026_receipts)

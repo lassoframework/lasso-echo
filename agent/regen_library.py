@@ -550,6 +550,155 @@ CONCEPTS = {
         "canvas": "split",
         "archetype": "path",
     },
+    # ---- PLATFORM_ADS set (grammar V2; source 08_platform_2026.md). Copy is
+    # VERBATIM from the approved brief. Every concept cites a platform_2026
+    # USE line; every CTA routes the quiz (the shared destination line).
+    # Dashboard/mockup numerals inside a VISUAL line are illustrative device
+    # content from the approved brief, never caption copy.
+    "platform_ads_stuck": {
+        "headline": "Revenue stuck? It is not you.",
+        "cite": ["One platform. Every lead. Zero blind spots."],
+        "concept": ["Tension: a flat gray revenue line labeled STUCK, months of it.",
+                    "Resolution: a red line bending up labeled WITH LASSO, axis label MONTHLY REVENUE.",
+                    "CTA copy (caption, never rendered): Find the leak in 2 minutes",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "chart",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "platform_ads_handoffs": {
+        "headline": "Your leads are dying in the handoffs.",
+        "cite": ["Leads do not die in your ads. They die in the handoffs."],
+        "concept": ["Tension: a vertical funnel LEADS, BOOKED, SHOWED, SIGNED with red leaks escaping between every stage, label EVERY GAP = LOST MEMBERS.",
+                    "Resolution: the same funnel sealed by one team, every stage handing off clean.",
+                    "CTA copy (caption, never rendered): One team. One system. One login.",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "diagram",
+        "canvas": "navy",
+        "archetype": "flow",
+    },
+    "platform_ads_booking_bars": {
+        "headline": "Same leads. Four times the intros.",
+        "cite": ["71.9% booked vs an 18.5% industry average.",
+                 "71.9% top booking rate vs the 18.5% industry average."],
+        "concept": ["Tension: a short gray bar labeled INDUSTRY 18.5%, leads going nowhere.",
+                    "Resolution: a tall red bar labeled LASSO GYMS 71.9% beside it, the gap unmistakable.",
+                    "CTA copy (caption, never rendered): Top lead booking rate, real LASSO gyms",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "chart",
+        "canvas": "split",
+        "archetype": "split",
+    },
+    "platform_ads_six_engines": {
+        "headline": "Six engines. One job: your MRR.",
+        "cite": ["Six engines. One job: your MRR.",
+                 "Paid ads, Google, AI nurture plus live bookers, a website "
+                 "built to book, done for you social, and the LASSO Portal. "
+                 "One login."],
+        "concept": ["Tension: six disconnected tools pulling in six directions.",
+                    "Resolution: a hub and spoke with a red center YOUR MRR and nodes ADS, GOOGLE, AI + BOOK, WEB, SOCIAL, PORTAL.",
+                    "CTA copy (caption, never rendered): One platform. Every lead. Zero blind spots.",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "diagram",
+        "canvas": "cream",
+        "archetype": "hero",
+    },
+    "platform_ads_watched": {
+        "headline": "Who watched your ad account yesterday?",
+        "cite": ["$16 blended CPL across the portfolio; the industry pays 2x.",
+                 "Honest numbers or no numbers."],
+        "concept": ["Tension: an ad account running for weeks with nobody looking at it.",
+                    "Resolution: a dashboard of four KPI tiles with red live dots: LEADS 214, BOOKED 61%, SPEND $4,120, CPL $16 (illustrative device content from the approved brief).",
+                    "Kicker copy (caption, never rendered): Ours gets reviewed every single day.",
+                    "CTA copy (caption, never rendered): Honest numbers or no numbers",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "device",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "platform_ads_35k": {
+        "headline": "$35K+ Found. Reclaimed. Reinvested.",
+        "cite": ["$35K+ in ad spend saved and put back to work. Over $17,000 "
+                 "in one audit cycle alone."],
+        "concept": ["Tension: ad spend quietly leaking out of unwatched campaigns.",
+                    "Resolution: the colossal figure front and center, the waste found and put back to work.",
+                    "Support copy (caption, never rendered): in ad spend saved and put back to work. Over $17,000 in one audit cycle alone.",
+                    "CTA copy (caption, never rendered): Watched daily. Receipts included.",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "stat_hero",
+        "canvas": "red",
+        "archetype": "headline",
+    },
+    "platform_ads_budget_flow": {
+        "headline": "Your ad budget should follow signups.",
+        "cite": ["Paid ads, Google, AI nurture plus live bookers, a website "
+                 "built to book, done for you social, and the LASSO Portal. "
+                 "One login."],
+        "concept": ["Tension: budget parked by habit in channels that stopped producing.",
+                    "Resolution: FACEBOOK + IG and GOOGLE boxes joined to a red SIGNUPS circle at center by two way red arrows, money moving toward what signs people up.",
+                    "Kicker copy (caption, never rendered): Not habits. Not hunches. Signups.",
+                    "CTA copy (caption, never rendered): Money moves in near real time",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "diagram",
+        "canvas": "split",
+        "archetype": "flow",
+    },
+    "platform_ads_five_minutes": {
+        "headline": "Answer in seconds or lose them forever.",
+        "cite": ["297 nurtured, 141 responded, 100+ appointments across four gyms."],
+        "concept": ["Tension: a fresh lead cooling in an unanswered inbox.",
+                    "Resolution: a phone SMS mockup, bubbles: Hey! Saw you want to get started. When works? / Tomorrow after work? / a red bubble: Booked you 5:30pm with Coach Sam!",
+                    "Kicker copy (caption, never rendered): AI in seconds. A live person books.",
+                    "CTA copy (caption, never rendered): No lead ever sits cold",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "device",
+        "canvas": "cream",
+        "archetype": "hero",
+    },
+    "platform_ads_quiet_page": {
+        "headline": "The gym is packed. Your page should prove it.",
+        "cite": ["Paid ads, Google, AI nurture plus live bookers, a website "
+                 "built to book, done for you social, and the LASSO Portal. "
+                 "One login."],
+        "concept": ["Tension: a thriving gym floor next to a social page that went quiet weeks ago.",
+                    "Resolution: a phone IG profile grid mockup, handle @yourgym, a red banner POSTED FOR YOU across it.",
+                    "CTA copy (caption, never rendered): Every post created and published for you",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "device",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "platform_ads_websites": {
+        "headline": "Most gym websites describe. Ours convert.",
+        "cite": ["A 25 point website launch audit on every build."],
+        "concept": ["Tension: a pretty gym website that tells the story and books nobody.",
+                    "Resolution: a browser mockup with a red BOOK YOUR INTRO button and a label row STORY . SEO . AI READY . BOOKING.",
+                    "CTA copy (caption, never rendered): Verified with a 25 point launch audit",
+                    "CTA destination (caption, never rendered): quiz.lassoframework.com"],
+        "story": False,
+        "set": "platform_ads",
+        "layout": "device",
+        "canvas": "split",
+        "archetype": "headline",
+    },
 }
 
 
@@ -630,9 +779,10 @@ def parse_args(args):
                                     "usage: python -m agent regen-library "
                                     "[--only <concept>] [--set brand|service|all] "
                                     "[--dry-run]")
-    if set_name not in ("brand", "service", "b2b", "platform", "all"):
-        return None, "all", False, (f"unknown set: {set_name} "
-                                    "(brand, service, b2b, platform, or all)")
+    if set_name not in ("brand", "service", "b2b", "platform",
+                        "platform_ads", "all"):
+        return None, "all", False, (f"unknown set: {set_name} (brand, service, "
+                                    "b2b, platform, platform_ads, or all)")
     if only is not None and only not in CONCEPTS:
         return None, "all", False, (f"unknown concept: {only}\n"
                                     "known concepts: " + ", ".join(CONCEPTS))
@@ -684,7 +834,7 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
     """
     if only:
         keys = [only]
-    elif set_name in ("brand", "service", "b2b", "platform"):
+    elif set_name in ("brand", "service", "b2b", "platform", "platform_ads"):
         keys = [k for k, v in CONCEPTS.items() if v.get("set") == set_name]
     else:
         keys = list(CONCEPTS)
