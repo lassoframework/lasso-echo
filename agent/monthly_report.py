@@ -145,8 +145,14 @@ def refresh_section(account_key, posts):
         rows.sort(key=lambda x: x[1], reverse=True)
         return rows
 
-    # three proposed angles, ONLY from approved sources, each with its citation
+    # three proposed angles, ONLY from approved sources, each LABELED by its
+    # source: the platform doctrine leads (citation hierarchy: book, then
+    # 08_platform_2026.md, then lasso_now), lasso_now still contributes (it
+    # stays the home of time sensitive angles).
     proposals = []
+    from . import doctrine
+    for copy, anchor in doctrine.platform_angles()[:2]:
+        proposals.append(f"Angle from {doctrine.PLATFORM_FILE} ({anchor}): {copy}")
     doc = content_planner.load_source_doc()
     if doc is not None:
         for pillar in doc.pillars_with_copy():

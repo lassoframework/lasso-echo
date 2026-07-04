@@ -260,6 +260,24 @@ def plan_for(day_key, path=None):
     cta = pick_cta(doc, seed=f"{day_key}|{pillar}")
 
     hook_line = hooks[_day_seq(day_key) % len(hooks)] if hooks else None
+    citation = ""
+    # CITATION HIERARCHY (doctrine.py): the platform doctrine resolves the
+    # hook FIRST (verbatim USE copy, citation attached); lasso_now stays the
+    # fallback and the body/CTA source. Dormant while AGENT_KNOWLEDGE_ENABLED
+    # is OFF (angle_for_pillar returns None and this block never runs). A
+    # doctrine angle that fails citation verification is DROPPED with its
+    # reason; the lasso_now hook then ships exactly as before.
+    from . import doctrine
+    angle = doctrine.angle_for_pillar(pillar, day_key)
+    if angle is not None:
+        if doctrine.verify_citation(angle["copy"], angle["anchor"]):
+            hook_line = angle["copy"]
+            citation = angle["anchor"]
+        else:
+            from . import db
+            db.audit("doctrine_drop", pillar,
+                     f"angle citation did not verify ({angle['anchor']}); "
+                     "dropped, lasso_now hook used instead")
     # Caption SEO (flag OFF -> order unchanged): the caption stays front-loaded with
     # the hook as the first line, and a body line carrying the hook's topic terms is
     # moved first among the bodies. Reorder of approved lines only; nothing new.
@@ -276,6 +294,7 @@ def plan_for(day_key, path=None):
         "summary": "\n\n".join(summary_lines).strip(),
         "cta": cta,
         "hashtags": list(doc.hashtags[:5]),
-        "fragments": list(caption_lines),
+        "fragments": list(caption_lines) + ([f"cite:{citation}"] if citation else []),
         "summary_fragments": list(summary_lines),
+        "citation": citation or "lasso_now",
     }
