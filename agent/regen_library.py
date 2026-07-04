@@ -33,15 +33,105 @@ GATES UNCHANGED, stated plainly:
     are gate-clean. Story variants (*_story.png) are never feed candidates.
 """
 
+import hashlib
 import json
 import os
-from datetime import date
+import time
+from datetime import date, datetime, timezone
 
 from . import config, creative_studio, media_host
 
 V2_PREFIX = "lasso_v2_"
 STORY_ASPECT = ("9:16", "1080x1920", "story post")
 HOST_TENANT = "lasso_library"
+
+# ---- the regen lock: one live batch at a time (a second invocation refuses) ----
+# Stale safe: the lock clears itself when its holder pid is gone or the lock is
+# older than LOCK_STALE_SECONDS (a crashed run never wedges the next one).
+LOCK_FILE = ".regen_lock.json"
+LOCK_STALE_SECONDS = 2 * 60 * 60
+LAST_RUN_FILE = ".regen_last.json"
+
+
+def _lock_path(out_dir):
+    return os.path.join(out_dir, LOCK_FILE)
+
+
+def _holder_is_stale(holder):
+    try:
+        os.kill(int(holder.get("pid", -1)), 0)
+    except (OSError, ValueError, TypeError):
+        return True  # the holder process is gone
+    return time.time() - float(holder.get("ts", 0)) > LOCK_STALE_SECONDS
+
+
+def _acquire_lock(out_dir):
+    """(acquired, holder). Refuses while a live run holds the lock; a stale
+    lock (dead pid or too old) auto clears with a printed note."""
+    path = _lock_path(out_dir)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            holder = json.load(fh) or {}
+    except (OSError, ValueError):
+        holder = None
+    if holder is not None:
+        if not _holder_is_stale(holder):
+            return False, holder
+        print(f"[regen] clearing stale lock (holder pid {holder.get('pid')} "
+              f"since {holder.get('started', 'unknown')})")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"pid": os.getpid(), "ts": time.time(),
+                   "started": datetime.now(timezone.utc).isoformat(
+                       timespec="seconds")}, fh)
+    return True, None
+
+
+def _release_lock(out_dir):
+    try:
+        os.remove(_lock_path(out_dir))
+    except OSError:
+        pass
+
+
+def _sha16(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError:
+        return "unavailable"
+
+
+def _print_summary(out_dir, results):
+    """The end of batch table: concept, final content hash, url, one row per
+    concept. A re-run notes that the prior run's hashes are superseded."""
+    rows = {k: v for k, v in results.items() if "files" in v}
+    if not rows:
+        return
+    last_path = os.path.join(out_dir, LAST_RUN_FILE)
+    prior = {}
+    try:
+        with open(last_path, encoding="utf-8") as fh:
+            prior = json.load(fh) or {}
+    except (OSError, ValueError):
+        pass
+    superseded = sorted(set(prior) & set(rows))
+    print("\nregen summary (concept, final hash, url):")
+    stamped = dict(prior)
+    for key, out in sorted(rows.items()):
+        f = out["files"][0] if out["files"] else ""
+        h = _sha16(os.path.join(out_dir, f)) if f else "not rendered"
+        url = out["urls"][0] if out["urls"] else "(hosting unavailable)"
+        print(f"  {key}  {h}  {url}")
+        stamped[key] = h
+    if superseded:
+        print(f"note: this run supersedes prior hashes for {len(superseded)} "
+              f"concept(s): {', '.join(superseded)}")
+    try:
+        with open(last_path, "w", encoding="utf-8") as fh:
+            json.dump(stamped, fh)
+    except OSError as e:
+        print(f"[regen] could not persist run hashes: {type(e).__name__}: {e}")
 
 # The starter batch: 8 concepts, NON STAT only. Headlines are short LASSO voice
 # with no em dashes, no en dashes, no hyphens. The concept lines are diagram
@@ -404,6 +494,27 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
               f"({'feed + story' if CONCEPTS[only].get('story') else 'feed'})")
 
     out_dir = out_dir or config.LIBRARY_PATH
+    # One live batch at a time (dry runs spend nothing and never lock): a
+    # second invocation refuses instead of double rendering the library.
+    locked = False
+    if not dry_run:
+        locked, holder = _acquire_lock(out_dir)
+        if not locked:
+            print(f"regen already running since {holder.get('started', 'unknown')} "
+                  f"(pid {holder.get('pid', '?')}). Nothing started.")
+            return {}
+    results = {}
+    try:
+        results = _run_batch(keys, dry_run, nano_client, s3_client, out_dir)
+        if not dry_run and len(keys) > 1:
+            _print_summary(out_dir, results)
+    finally:
+        if locked:
+            _release_lock(out_dir)
+    return results
+
+
+def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
     results = {}
     for key in keys:
         spec = CONCEPTS[key]
