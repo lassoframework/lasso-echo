@@ -189,6 +189,14 @@ def _daily_scheduler(store):
                 digest.maybe_send(poster, now=now, library_path=config.LIBRARY_PATH)
             except Exception as e:
                 print(f"[digest] pass failed: {type(e).__name__}: {e}")
+        # Sunday operator report: one weekly card at 6 PM ET, dormant unless
+        # AGENT_WEEKLY_REPORT_ENABLED. Never crashes the loop.
+        if config.weekly_report_enabled():
+            try:
+                from . import ops_alerts as _oa2, weekly_report
+                weekly_report.maybe_send(_oa2._default_poster(), now=now)
+            except Exception as e:
+                print(f"[weekly] pass failed: {type(e).__name__}: {e}")
         # Nightly brain: one read-only proposal note, dormant unless
         # AGENT_BRAIN_PROPOSALS_ENABLED. Never crashes the loop.
         if config.brain_proposals_enabled():

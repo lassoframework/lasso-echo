@@ -272,6 +272,19 @@ def opus_poll_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPUS_POLL_ENABLED", "false"))
 
 
+def weekly_report_enabled() -> bool:
+    """
+    Sunday operator report switch. OFF by default = ZERO behavior change
+    anywhere: no build, no Slack post, no kv stamp. ON, ONE Slack card lands
+    in the approval channel Sundays at 6:00 PM ET: the week's posts per
+    account, approvals pending, the views based engagement rollup (IG framed
+    on engagement only, never frequency), runway days, the flags delta vs
+    last week, and the single most important by hand item. Honest: missing
+    data says no data, never a fabricated number.
+    """
+    return _truthy(os.environ.get("AGENT_WEEKLY_REPORT_ENABLED", "false"))
+
+
 # ---- Podcast pipeline (feed watcher -> release card -> transcript sources) ----
 # The show's RSS feed url, set by hand in env. Empty while the flag is armed =
 # the poll STOPS LOUD (missing data is reported, never guessed).
