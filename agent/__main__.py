@@ -529,6 +529,12 @@ def main(argv=None):
             i += 1
         from .podcast_learn import learn_cli
         learn_cli(episode, count)
+    elif cmd == "contact-sheet":
+        # Review sheet: one self contained HTML grid of the CURRENT library
+        # renders per set, from library state (read only), uploaded to R2 under
+        # echo/contact_sheets/<set>_<date>.html with the public URL printed.
+        from .contact_sheet import cli as sheet_cli
+        sheet_cli(argv[1:])
     elif cmd == "gbp-check":
         # READ-ONLY Google Business Profile probe: one honest status line.
         from .gbp_check import gbp_check
