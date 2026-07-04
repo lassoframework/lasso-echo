@@ -529,6 +529,20 @@ def main(argv=None):
             i += 1
         from .podcast_learn import learn_cli
         learn_cli(episode, count)
+    elif cmd == "report":
+        # Day 30 report, per account framing (frequency story for FB, the
+        # engagement story for IG, frequency never published there). --dry
+        # prints the exact Slack text, watermarked, and writes NOTHING.
+        account, dry, args = None, False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                account = args[i + 1]; i += 2; continue
+            if args[i] == "--dry":
+                dry = True; i += 1; continue
+            i += 1
+        from .day30 import report_cli
+        report_cli(account, dry)
     elif cmd == "runway":
         # READ ONLY runway math in plain lines: eligible concepts by name,
         # exclusions with reasons, the consumption assumption, and the same

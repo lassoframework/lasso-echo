@@ -40,6 +40,11 @@ class Account:
     library_prefix: str = ""      # per-client content library directory
     slack_channel: str = ""       # per-client approval channel id
     approvers: list = field(default_factory=list)  # per-client approver Slack ids
+    # Day 30 narrative framing: "frequency" leads with the posting cadence
+    # story (before vs after); "engagement" NEVER ships a frequency comparison
+    # (it may appear only in an internal do not publish appendix). Empty falls
+    # back to "engagement", the safe framing.
+    report_framing: str = ""
 
     def get_token(self):
         """Read the token at call time. Never logged, never surfaced.
@@ -103,6 +108,9 @@ ACCOUNTS = [
         platform=Platform.INSTAGRAM,
         token_env="AGENT_LASSO_IG_TOKEN",
         target_id_env="AGENT_LASSO_IG_USER_ID",
+        # IG regressed on posts per week: the Day 30 story is engagement per
+        # post and consistency; a frequency comparison NEVER ships for IG.
+        report_framing="engagement",
     ),
     Account(
         key="lasso_fb",
@@ -110,6 +118,9 @@ ACCOUNTS = [
         platform=Platform.FACEBOOK_PAGE,
         token_env="AGENT_LASSO_FB_TOKEN",
         target_id_env="AGENT_LASSO_FB_PAGE_ID",
+        # FB went from ~0.25 posts per week to daily: the frequency before vs
+        # after story IS the headline for this account.
+        report_framing="frequency",
     ),
     # Kept as an INACTIVE record for history. Meta ended personal-profile publishing
     # in 2018 (Graph API cannot post to a personal profile), so this account can never
