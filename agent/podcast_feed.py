@@ -28,6 +28,10 @@ _ITUNES = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
 _PODCAST_NS = "{https://podcastindex.org/namespace/1.0}"
 _EP_IN_TITLE = re.compile(r"\b(?:episode|ep\.?)\s*(\d+)\b", re.IGNORECASE)
 
+# A poll detecting more new episodes than this is a backfill: transcripts
+# auto ingest for the newest episode only (detection still stores them all).
+AUTO_INGEST_BACKLOG_LIMIT = 3
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS podcast_episodes (
   guid TEXT PRIMARY KEY,
@@ -158,20 +162,31 @@ def poll(fetch=None, transcript_fetch=None):
                  f"episode {n}: {ep['title'][:120]}")
         print(f"[podcast] new episode detected: {n} {ep['title']!r}")
     # Auto ingest a transcript the feed exposes for a NEW numbered episode.
-    # Loud on failure (log + one ops alert) but the detection stands; the
-    # by-hand podcast-transcript CLI can ingest it later.
-    for ep in new:
-        if ep["transcript_url"] and ep["episode"] is not None:
-            try:
-                from . import podcast_transcripts
-                podcast_transcripts.ingest_url(ep["episode"], ep["transcript_url"],
-                                               fetch=transcript_fetch)
-            except Exception as e:
-                from . import ops_alerts
-                print(f"[podcast] transcript ingest failed for episode "
-                      f"{ep['episode']}: {type(e).__name__}: {e}")
-                ops_alerts.alert(f"podcast transcript ingest failed for episode "
-                                 f"{ep['episode']}: {type(e).__name__}: {e}")
+    # BACKLOG GUARD: the first poll against a feed with history detects the
+    # whole backlog at once; past AUTO_INGEST_BACKLOG_LIMIT new episodes only
+    # the NEWEST one's transcript auto ingests (arming must never fire one
+    # fetch per back episode; the rest stay one CLI call away). Loud on
+    # failure (log + one ops alert) but the detection stands; the by-hand
+    # podcast-transcript CLI can ingest any of them later.
+    to_ingest = [ep for ep in new
+                 if ep["transcript_url"] and ep["episode"] is not None]
+    if len(new) > AUTO_INGEST_BACKLOG_LIMIT and to_ingest:
+        newest = to_ingest[-1]  # `new` is oldest first: the last is newest
+        print(f"[podcast] backlog: {len(new)} new episodes in one poll; auto "
+              f"ingesting ONLY episode {newest['episode']}'s transcript. Back "
+              "episodes: podcast-transcript --episode N (--file|--url) by hand.")
+        to_ingest = [newest]
+    for ep in to_ingest:
+        try:
+            from . import podcast_transcripts
+            podcast_transcripts.ingest_url(ep["episode"], ep["transcript_url"],
+                                           fetch=transcript_fetch)
+        except Exception as e:
+            from . import ops_alerts
+            print(f"[podcast] transcript ingest failed for episode "
+                  f"{ep['episode']}: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"podcast transcript ingest failed for episode "
+                             f"{ep['episode']}: {type(e).__name__}: {e}")
     return new
 
 
@@ -190,3 +205,85 @@ def list_episodes():
         rows = conn.execute(
             "SELECT * FROM podcast_episodes ORDER BY detected_at, rowid").fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- podcast-status: the READ ONLY probe ------------------------------------------------
+def _stored_readonly():
+    """Stored episodes WITHOUT creating the episodes table (a probe on a virgin
+    store must not even add schema)."""
+    try:
+        with db.connect() as conn:
+            rows = conn.execute("SELECT * FROM podcast_episodes "
+                                "ORDER BY detected_at, rowid").fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _carded_anywhere(guid):
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT key FROM kv WHERE key LIKE ?",
+                (f"podcast_release_carded_{guid}_%",)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def status_cli(fetch=None):
+    """
+    podcast-status: READ ONLY, zero side effects (nothing inserted, nothing
+    carded, no kv writes, no schema added). Prints: feed reachable yes/no, the
+    item count seen, the latest episode number + title as parsed, the armed
+    watermark (episodes already in the store), and ONE honest forecast line:
+    exactly what the next poll would do.
+    """
+    if not config.podcast_enabled():
+        print("podcast-status: pipeline is OFF (AGENT_PODCAST_ENABLED); the "
+              "poll never runs while dark.")
+        return {"reachable": None}
+    try:
+        text = (fetch or _default_fetch)()
+    except Exception as e:
+        print(f"podcast-status: feed reachable: NO ({type(e).__name__}: {e})")
+        return {"reachable": False}
+    try:
+        episodes = parse_feed(text)
+    except ValueError as e:
+        print(f"podcast-status: feed reachable: yes, but MALFORMED: {e}")
+        return {"reachable": True, "parsed": False}
+    stored = _stored_readonly()
+    stored_guids = {e["guid"] for e in stored}
+    new = [e for e in episodes if e["guid"] not in stored_guids]
+    latest = episodes[-1] if episodes else None
+    print("podcast-status: feed reachable: yes")
+    print(f"podcast-status: {len(episodes)} item(s) in the feed; "
+          f"{len(stored)} already stored (the armed watermark); "
+          f"{len(new)} new to the store")
+    if latest is None:
+        print("podcast-status: the feed carries no items; the next poll would "
+              "store nothing and draft nothing.")
+        return {"reachable": True, "items": 0, "new": 0}
+    n = latest["episode"]
+    print(f"podcast-status: latest episode: "
+          f"{n if n is not None else '(no number in feed)'} {latest['title']!r}")
+    # the forecast mirrors the slot's own rules: newest only, once, mod 4
+    if n is None:
+        forecast = (f"next poll: stores {len(new)} new episode(s); NO release "
+                    "card (the latest episode has no number in the feed; "
+                    "numbering is never guessed).")
+    elif _carded_anywhere(latest["guid"]):
+        forecast = (f"next poll: backlog, would skip (episode {n} was already "
+                    "carded; a re poll never re cards).")
+    else:
+        from .podcast_release import template_for_episode
+        t = template_for_episode(n)
+        note = (f"stores {len(new)} new episode(s) first; " if new else "")
+        forecast = (f"next poll: {note}the release card drafts ONLY episode "
+                    f"{n} using template podcast_release_{t} (episode mod 4 "
+                    "rotation), once per account, held for the tap. Back "
+                    "episodes never draft.")
+    print(f"podcast-status: {forecast}")
+    return {"reachable": True, "items": len(episodes), "stored": len(stored),
+            "new": len(new), "latest": n, "forecast": forecast}

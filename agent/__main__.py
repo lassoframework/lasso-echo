@@ -529,6 +529,11 @@ def main(argv=None):
             i += 1
         from .podcast_learn import learn_cli
         learn_cli(episode, count)
+    elif cmd == "podcast-status":
+        # READ ONLY probe: feed reachable, items seen, latest episode parsed,
+        # the armed watermark, and an honest forecast of the next poll.
+        from .podcast_feed import status_cli as podcast_status
+        podcast_status()
     elif cmd == "contact-sheet":
         # Review sheet: one self contained HTML grid of the CURRENT library
         # renders per set, from library state (read only), uploaded to R2 under
