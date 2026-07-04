@@ -13,6 +13,31 @@ rest of Echo:
 
 Publishing is unaffected: this module never posts and never touches the publish
 flag. It only draws an image a human then reviews through the normal approval gate.
+
+THE VARIANT SYSTEM (locked). Brand grammar is CONSTANT on every card: one
+typography family (bold condensed headlines, two fonts max), the LASSO logo
+lockup, red #E03131 as the single accent, and the footer line. What varies is
+one CANVAS token and one LAYOUT token per card:
+
+  CANVASES (4): cream (the current light canvas, the default feel), navy
+  (deep navy #1A2340, white type, subtle vignette), red (bold red field,
+  white and navy type, the highest urgency energy), split (a diagonal or
+  vertical navy and cream split with a red rule line).
+
+  LAYOUTS (5): stat_hero (one colossal number fills half the card, support
+  line under it), framework (a numbered or stepped list as pills, rails, or a
+  simple decision path), contrast (a two zone myth vs fact split with strong
+  visual opposition), checklist (outcome rows with check marks), poster
+  (headline dominant editorial, the current default look).
+
+Every canvas and layout combination passes the same READABILITY BAR: high
+contrast, mobile legible, the headline readable at thumbnail size. Selection:
+a concept may declare `layout` and `canvas` (explicit override); otherwise the
+canvas hashes deterministically from the concept key (regen_library.canvas_for)
+so re-renders are stable, and concepts WITHOUT variant fields render through
+the original path byte for byte (zero change to approved cards). The daily
+selector never serves the same canvas two days running when an alternative
+exists (rotation's canvas guard).
 """
 
 import os
@@ -206,6 +231,91 @@ BOOK_COVER_PALETTE = (
     "minimal. This card intentionally does not use the cream house canvas."
 )
 
+# ---- THE VARIANT SYSTEM: locked canvas + layout tokens (see module docstring) ----
+VARIANT_GRAMMAR = (
+    "LOCKED BRAND GRAMMAR (constant on every card, never varies with canvas or "
+    "layout): ONE typography family only, bold condensed headlines, two fonts "
+    "maximum on the whole card. The LASSO logo lockup present once, small and "
+    "consistent. Red #E03131 is THE accent color: exactly one red element or "
+    "emphasis, never red everywhere. Footer line, small and letterspaced: "
+    "LASSOFRAMEWORK.COM."
+)
+
+CANVASES = {
+    "cream": (
+        "Canvas token CREAM: the light house canvas. Cream #FAF6F0 background "
+        "with generous margins and whitespace, navy #121E3C type and line work, "
+        "sky blue #5EB9E6 supporting touches. Calm, premium, the default feel."
+    ),
+    "navy": (
+        "Canvas token NAVY: deep navy #1A2340 field with a subtle dark "
+        "vignette. White type, red #E03131 accents. Moody, cinematic, premium."
+    ),
+    "red": (
+        "Canvas token RED: a bold red field. White and navy #1A2340 type only. "
+        "The highest urgency energy in the system; keep the composition simple "
+        "so the energy reads clean, never chaotic."
+    ),
+    "split": (
+        "Canvas token SPLIT: a diagonal or vertical split, one zone deep navy "
+        "#1A2340 and one zone cream #FAF6F0, divided by a thin red #E03131 "
+        "rule line. Type flips color per zone: white on the navy zone, navy on "
+        "the cream zone."
+    ),
+}
+
+LAYOUTS = {
+    "stat_hero": (
+        "Layout token STAT_HERO: ONE colossal number or stat fills half the "
+        "card as the dominant element, with its support line set small "
+        "directly under it. A single stat insight card; nothing competes with "
+        "the number."
+    ),
+    "framework": (
+        "Layout token FRAMEWORK: the content renders as a clean visual system "
+        "for an ordered list: numbered pills, a vertical rail with stops, or a "
+        "simple decision path. Each step short, one small label per step, "
+        "clear top to bottom order."
+    ),
+    "contrast": (
+        "Layout token CONTRAST: two zones in strong visual opposition, myth vs "
+        "fact or problem vs fix. One zone muted and faded, one zone alive; the "
+        "single red accent marks the winning zone only."
+    ),
+    "checklist": (
+        "Layout token CHECKLIST: outcome rows, each with a check mark, for "
+        "future state and benefit lists. Rows short and parallel; the check "
+        "marks are the repeating graphic element."
+    ),
+    "poster": (
+        "Layout token POSTER: headline dominant editorial card, the current "
+        "default look. The headline is the hero with maximum negative space "
+        "and at most one supporting graphic element."
+    ),
+}
+
+READABILITY_BAR = (
+    "READABILITY BAR (every canvas and layout combination, no exceptions): "
+    "high contrast between type and field, mobile legible, and the headline "
+    "readable at THUMBNAIL size in a feed. If a combination would compromise "
+    "any of these, simplify the composition, never the contrast."
+)
+
+CANVAS_ORDER = ["cream", "navy", "red", "split"]
+
+
+def variant_block(canvas, layout):
+    """The composed variant directive for one card: locked grammar + the one
+    canvas token + the one layout token + the readability bar. LOUD on an
+    unknown token (a typo must never silently render off system)."""
+    if canvas not in CANVASES:
+        raise ValueError(f"unknown canvas: {canvas} ({', '.join(CANVAS_ORDER)})")
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout: {layout} ({', '.join(sorted(LAYOUTS))})")
+    return (f"{VARIANT_GRAMMAR}\n{CANVASES[canvas]}\n{LAYOUTS[layout]}\n"
+            f"{READABILITY_BAR}")
+
+
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
 NO_DASH_RULE = (
     "Copy mechanics: no em dashes, no en dashes, avoid hyphens in the rendered "
@@ -224,7 +334,7 @@ def _scrub_dashes(text):
 
 
 def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
-                 archetype=None, palette=None):
+                 archetype=None, palette=None, canvas=None, layout=None):
     """
     Build the image prompt from APPROVED input only. The single on-image headline is
     the approved pillar hook (kept short); the approved body lines are passed as CONCEPT
@@ -240,6 +350,11 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
     headline; default flow, the original look). The archetype varies the card's
     STRUCTURE; the brand system (canvas, palette, line-icon language) never varies.
     A Story surface recomposes the SAME archetype for 9:16 with the safe zones.
+
+    `canvas` + `layout` select the LOCKED VARIANT SYSTEM instead (module
+    docstring): the variant block replaces the archetype composition and the
+    palette for this one card. Both None (the default everywhere) = the
+    original path, byte for byte.
     """
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
     # Aspect first and prominent. Config-tunable; per-use overridable.
@@ -247,7 +362,17 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
     use_pixels = pixels or config.IMAGE_PIXELS
     use_surface = surface or "feed post"
     is_story = "story" in use_surface.lower()
-    composition = _composition_style(archetype, is_story)
+    if canvas is not None or layout is not None:
+        # the variant system: grammar + canvas + layout + readability bar
+        # carry the whole brand directive (the canvas token IS the palette);
+        # the story requirement and headline law still ride (they are copy and
+        # story rules, not palette rules)
+        composition = (f"{variant_block(canvas or 'cream', layout or 'poster')}\n"
+                       f"{STORY_REQUIREMENT}\n{CLEAR_HEADLINE_LAW}")
+        style_tail = composition
+    else:
+        composition = _composition_style(archetype, is_story)
+        style_tail = f"{composition}\n{palette or BRAND_PALETTE}"
     aspect = (
         f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
         f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the entire "
@@ -262,8 +387,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
         "Concept context for the single focal graphic (do NOT render this text on the "
         "image; the caption carries the words):\n"
         f"{fact_lines}\n"
-        f"{composition}\n"
-        f"{palette or BRAND_PALETTE}\n"
+        f"{style_tail}\n"
         f"{NO_DASH_RULE}"
     )
     return _scrub_dashes(prompt)
@@ -402,7 +526,7 @@ def _default_client():
 
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
-             palette=None):
+             palette=None, canvas=None, layout=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -436,7 +560,8 @@ def generate(headline, facts, client=None, out_path=None,
         _db.counter_bump("gemini_calls", day)
 
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
-                          surface=surface, archetype=archetype, palette=palette)
+                          surface=surface, archetype=archetype, palette=palette,
+                          canvas=canvas, layout=layout)
 
     client = client or _default_client()
     if client is None:
