@@ -125,13 +125,16 @@ def _default_fetch():
     return resp.text
 
 
-def poll(fetch=None):
+def poll(fetch=None, transcript_fetch=None):
     """
     One poll pass. Flag OFF -> None: nothing fetched, nothing written (the
     zero-behavior-change guarantee). Armed: parse the feed, store episodes not
     yet in the table, and return ONLY the newly detected ones. A re-poll of an
     unchanged feed returns []. Malformed feeds raise (loud, never silent); the
-    listener's poll block catches, logs, and alerts.
+    listener's poll block catches, logs, and alerts. A NEW numbered episode
+    whose feed entry exposes a transcript url is auto-ingested as that
+    episode's approved source (podcast_transcripts); an ingest failure is loud
+    but never un-detects the episode.
     """
     if not config.podcast_enabled():
         return None
@@ -154,6 +157,21 @@ def poll(fetch=None):
         db.audit("podcast_detected", ep["guid"],
                  f"episode {n}: {ep['title'][:120]}")
         print(f"[podcast] new episode detected: {n} {ep['title']!r}")
+    # Auto ingest a transcript the feed exposes for a NEW numbered episode.
+    # Loud on failure (log + one ops alert) but the detection stands; the
+    # by-hand podcast-transcript CLI can ingest it later.
+    for ep in new:
+        if ep["transcript_url"] and ep["episode"] is not None:
+            try:
+                from . import podcast_transcripts
+                podcast_transcripts.ingest_url(ep["episode"], ep["transcript_url"],
+                                               fetch=transcript_fetch)
+            except Exception as e:
+                from . import ops_alerts
+                print(f"[podcast] transcript ingest failed for episode "
+                      f"{ep['episode']}: {type(e).__name__}: {e}")
+                ops_alerts.alert(f"podcast transcript ingest failed for episode "
+                                 f"{ep['episode']}: {type(e).__name__}: {e}")
     return new
 
 

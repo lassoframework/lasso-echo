@@ -463,6 +463,26 @@ def main(argv=None):
         else:
             print(f"pull-opus: {out['pulled']} pulled, {out['skipped']} skipped, "
                   f"{out['failed']} failed")
+    elif cmd == "podcast-transcript":
+        # Podcast transcript ingest (AGENT_PODCAST_ENABLED): store one episode's
+        # transcript as its APPROVED SOURCE (citation id podcast_ep<N>), from a
+        # file or a url. Prints a short preview at most, never the transcript.
+        episode, fpath, furl, args = None, "", "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--episode" and i + 1 < len(args):
+                try:
+                    episode = int(args[i + 1])
+                except ValueError:
+                    episode = None
+                i += 2; continue
+            if args[i] == "--file" and i + 1 < len(args):
+                fpath = args[i + 1]; i += 2; continue
+            if args[i] == "--url" and i + 1 < len(args):
+                furl = args[i + 1]; i += 2; continue
+            i += 1
+        from .podcast_transcripts import ingest_cli
+        ingest_cli(episode, fpath, furl)
     elif cmd == "gbp-check":
         # READ-ONLY Google Business Profile probe: one honest status line.
         from .gbp_check import gbp_check
