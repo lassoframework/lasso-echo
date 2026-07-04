@@ -24,11 +24,15 @@ one CANVAS token and one LAYOUT token per card:
   white and navy type, the highest urgency energy), split (a diagonal or
   vertical navy and cream split with a red rule line).
 
-  LAYOUTS (5): stat_hero (one colossal number fills half the card, support
+  LAYOUTS (8): stat_hero (one colossal number fills half the card, support
   line under it), framework (a numbered or stepped list as pills, rails, or a
   simple decision path), contrast (a two zone myth vs fact split with strong
   visual opposition), checklist (outcome rows with check marks), poster
-  (headline dominant editorial, the current default look).
+  (headline dominant editorial, the current default look), and the V2
+  additions: chart (one clean data visual, big labeled numbers), diagram
+  (funnel / hub and spoke / flow arrows in thin line art, labeled nodes),
+  device (a phone, browser, or profile grid mockup in thin outline as the
+  hero visual). Every layout, one headline above.
 
 Every canvas and layout combination passes the same READABILITY BAR: high
 contrast, mobile legible, the headline readable at thumbnail size. Selection:
@@ -291,6 +295,24 @@ LAYOUTS = {
         "Layout token POSTER: headline dominant editorial card, the current "
         "default look. The headline is the hero with maximum negative space "
         "and at most one supporting graphic element."
+    ),
+    # ---- grammar V2 layouts: same brand grammar, same readability bar ----
+    "chart": (
+        "Layout token CHART: a single clean data visual dominates the card, "
+        "comparison bars or a trend line, with BIG labeled numbers and the "
+        "one headline above it. No gridlines clutter; the data shape itself "
+        "is the graphic."
+    ),
+    "diagram": (
+        "Layout token DIAGRAM: a funnel, hub and spoke, or flow of arrows "
+        "drawn in thin line art with clearly labeled nodes, the one headline "
+        "above it. Few nodes, short labels, one obvious reading order."
+    ),
+    "device": (
+        "Layout token DEVICE: a phone, browser window, or profile grid "
+        "mockup drawn in thin outline is the hero visual, the one headline "
+        "above it. The mockup content is simple and readable; nothing "
+        "outside the device frame competes with it."
     ),
 }
 

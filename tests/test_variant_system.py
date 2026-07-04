@@ -185,6 +185,44 @@ def test_house_16_unchanged_and_render_original_path():
     assert "LOCKED BRAND GRAMMAR" not in prompt                  # variant path unused
 
 
+# ---- grammar V2 layouts (chart, diagram, device) -------------------------------------------
+V1_LAYOUTS_SHA256 = (
+    "b4d3c6c1404ba72a2d5a3c9d745bc106be25feee08c0cd190ff4cf62d50c3de0")
+
+
+def test_v2_layouts_present_five_originals_byte_unchanged():
+    import hashlib
+    assert set(creative_studio.LAYOUTS) == {
+        "stat_hero", "framework", "contrast", "checklist", "poster",
+        "chart", "diagram", "device"}
+    five = {k: creative_studio.LAYOUTS[k]
+            for k in ("stat_hero", "framework", "contrast", "checklist", "poster")}
+    blob = json.dumps(five, sort_keys=True).encode()
+    assert hashlib.sha256(blob).hexdigest() == V1_LAYOUTS_SHA256
+
+
+def test_v2_layouts_render_with_every_canvas(tmp_path):
+    # thumbnail legibility smoke for the V2 tokens specifically (the full
+    # 8 x 4 sweep runs in test_every_layout_renders_with_every_canvas)
+    for layout, marker in (("chart", "data visual"),
+                           ("diagram", "labeled nodes"),
+                           ("device", "mockup")):
+        for canvas in creative_studio.CANVAS_ORDER:
+            prompt = creative_studio.build_prompt(
+                "H.", ["Tension: x.", "Resolution: y."],
+                canvas=canvas, layout=layout)
+            low = prompt.lower()
+            assert marker in low, (canvas, layout)
+            assert "one headline above" in low, (canvas, layout)
+            assert "readability bar" in low and "thumbnail" in low
+            assert "—" not in prompt and "–" not in prompt
+
+
+def test_unknown_layout_still_raises_loudly():
+    with pytest.raises(ValueError, match="unknown layout"):
+        creative_studio.variant_block("navy", "carousel")
+
+
 # ---- copy law -----------------------------------------------------------------------------
 def test_token_blocks_dash_free():
     blocks = ([creative_studio.VARIANT_GRAMMAR, creative_studio.READABILITY_BAR]
