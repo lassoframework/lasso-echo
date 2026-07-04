@@ -89,6 +89,7 @@ def _status():
     print(f"  backup         : {config.backup_enabled()}  (env AGENT_BACKUP_ENABLED)")
     print(f"  opus           : {config.opus_enabled()}  (env AGENT_OPUS_ENABLED)")
     print(f"  opus_poll      : {config.opus_poll_enabled()}  (env AGENT_OPUS_POLL_ENABLED)")
+    print(f"  podcast        : {config.podcast_enabled()}  (env AGENT_PODCAST_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "
           f"window {config.ROTATION_WINDOW_DAYS}d)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")

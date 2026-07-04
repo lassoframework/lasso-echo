@@ -112,9 +112,11 @@ def _daily_scheduler(store):
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
     opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
+    podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_ingest = 0.0
     last_opus = 0.0
+    last_podcast = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -150,6 +152,19 @@ def _daily_scheduler(store):
                 opus_ingest.pull()
             except Exception as e:
                 print(f"[opus] poll pass failed: {type(e).__name__}: {e}")
+        # Podcast feed poll: FULLY INERT unless AGENT_PODCAST_ENABLED. A new
+        # episode is stored exactly once (idempotent by guid); a malformed feed
+        # or missing feed url fails LOUD here (log + one ops alert), never
+        # silent, and never crashes the loop. Detection only; drafting stays in
+        # the daily run's priority chain.
+        if config.podcast_enabled() and time.monotonic() - last_podcast >= podcast_every:
+            last_podcast = time.monotonic()
+            try:
+                from . import podcast_feed
+                podcast_feed.poll()
+            except Exception as e:
+                print(f"[podcast] poll pass failed: {type(e).__name__}: {e}")
+                ops_alerts.alert(f"podcast feed poll failed: {type(e).__name__}: {e}")
         # Card self-expiry sweep (no flag, queue hygiene): hourly, cheap.
         if now.minute == 0:
             try:

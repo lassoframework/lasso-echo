@@ -272,6 +272,24 @@ def opus_poll_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPUS_POLL_ENABLED", "false"))
 
 
+# ---- Podcast pipeline (feed watcher -> release card -> transcript sources) ----
+# The show's RSS feed url, set by hand in env. Empty while the flag is armed =
+# the poll STOPS LOUD (missing data is reported, never guessed).
+PODCAST_FEED_URL = os.environ.get("AGENT_PODCAST_FEED_URL", "")
+
+
+def podcast_enabled():
+    """
+    Podcast pipeline switch. OFF by default = ZERO behavior change anywhere: no
+    feed fetch, no episode records, no release cards, no transcript sources, and
+    the podcast CLIs refuse to run. ON, the listener polls the RSS feed on the
+    existing scheduler cadence and a new episode is stored exactly once
+    (idempotent by guid). Every draft this pipeline ever produces still cards
+    for approval; nothing here publishes.
+    """
+    return _truthy(os.environ.get("AGENT_PODCAST_ENABLED", "false"))
+
+
 # The Full Gym book campaign: approved source docs at the repo-root knowledge/
 # folder (env override for tests). The book file is the MASTER source.
 BOOK_DIR = os.environ.get("AGENT_BOOK_DIR", "knowledge")
