@@ -93,18 +93,34 @@ def release_concept(episode):
 def build_podcast_slot_draft(account, day_key, nano_client=None, s3_client=None):
     """
     The podcast slot in the daily chain: the release card for the NEWEST
-    detected episode, once per account. A release announcement is time
-    sensitive, so ONLY the latest episode is ever a candidate: arming the flag
-    on a feed with history can never blast a backlog of stale release cards.
-    None while the flag is OFF, when the latest episode already carded, when
-    this account already drafted a podcast card today (max one per day), or
-    when the studio/hosting is unavailable (the episode stays waiting; the
-    normal path takes the day).
+    detected episode first, else one queued episode infographic (Part D,
+    podcast_cards). At most ONE podcast draft per account per day (the spacing
+    law), once per episode for releases, held for the tap always. None while
+    the flag is OFF or nothing is waiting or the studio/hosting is unavailable
+    (content stays queued; the normal path takes the day).
     """
     if not config.podcast_enabled():
         return None
     if db.kv_get(f"podcast_served_{account.key}_{day_key}"):
         return None  # spacing law: at most one podcast draft per account per day
+    draft = _next_release_draft(account, day_key, nano_client, s3_client)
+    if draft is None:
+        from . import podcast_cards
+        draft = podcast_cards.build_card_draft(account, day_key,
+                                               nano_client, s3_client)
+    if draft is None:
+        return None
+    db.kv_set(f"podcast_served_{account.key}_{day_key}", draft.draft_id)
+    return draft
+
+
+def _next_release_draft(account, day_key, nano_client, s3_client):
+    """
+    The release card for the newest detected episode, once per account. A
+    release announcement is time sensitive, so ONLY the latest episode is ever
+    a candidate: arming the flag on a feed with history can never blast a
+    backlog of stale release cards.
+    """
     episodes = podcast_feed.list_episodes()
     if not episodes:
         return None
@@ -124,7 +140,6 @@ def build_podcast_slot_draft(account, day_key, nano_client=None, s3_client=None)
     if draft is None:
         return None
     db.kv_set(f"podcast_release_carded_{latest['guid']}_{account.key}", day_key)
-    db.kv_set(f"podcast_served_{account.key}_{day_key}", latest["guid"])
     db.audit("podcast_release", draft.draft_id,
              f"episode {latest['episode']} release card drafted (held for approval)",
              account.key, day_key)

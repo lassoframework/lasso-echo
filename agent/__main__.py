@@ -483,6 +483,29 @@ def main(argv=None):
             i += 1
         from .podcast_transcripts import ingest_cli
         ingest_cli(episode, fpath, furl)
+    elif cmd == "podcast-cards":
+        # Episode infographics (AGENT_PODCAST_ENABLED): extract 2 or 3 card
+        # concepts VERBATIM from the stored transcript, every card citing
+        # podcast_ep<N>, queued max one per day behind book priority, all held
+        # for approval. Renders through the same house builder at serve time.
+        episode, count, args = None, 2, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--episode" and i + 1 < len(args):
+                try:
+                    episode = int(args[i + 1])
+                except ValueError:
+                    episode = None
+                i += 2; continue
+            if args[i] == "--count" and i + 1 < len(args):
+                try:
+                    count = int(args[i + 1])
+                except ValueError:
+                    count = 0
+                i += 2; continue
+            i += 1
+        from .podcast_cards import cards_cli
+        cards_cli(episode, count)
     elif cmd == "gbp-check":
         # READ-ONLY Google Business Profile probe: one honest status line.
         from .gbp_check import gbp_check
