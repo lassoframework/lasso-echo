@@ -371,6 +371,20 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       contrast, 2 poster across navy / cream / red / split); (C) full test
       coverage incl. adversarial guard + 20 combo render smoke; 16 house
       concepts unchanged
+- [~] Platform doctrine + concept set (2 parts, one commit each): (A)
+      brand_voice/knowledge/08_platform_2026.md, the PRIMARY POSTING SOURCE
+      ("LASSO Platform Overview 2026, Blake approved July 2026"; book stays
+      top of the citation hierarchy, this ranks under it above lasso_now):
+      positioning lines, six engines + funnel order, verified receipts
+      ($16 CPL, $35K+ saved, 71.9% vs 18.5%, 297/141/100+, 8 of 10, 70%+
+      close, 25 point audit, 7+ dead buttons), eight named case studies
+      (Fit Mamas, Courage, North Naples, Old Glory, Granite Forged, Loup,
+      Hoosier, Liminal), all USE lines with platform_2026 anchors, NO
+      pricing; (B) 10 platform_* concepts (set "platform") through the
+      variant system with per key canvas/layout from the brief, stat
+      headlines cited, house 16 + b2b 10 frozen, variance guard green
+      across the 36 concept library, regen-library --set platform. Render
+      by hand via regen-library
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
