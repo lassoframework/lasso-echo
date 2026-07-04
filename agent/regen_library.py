@@ -36,6 +36,7 @@ GATES UNCHANGED, stated plainly:
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import date, datetime, timezone
 
@@ -279,6 +280,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
+        "layout": "contrast",
+        "canvas": "split",
         "archetype": "split",
     },
     "b2b_speed_to_lead": {
@@ -291,6 +294,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "Sales are now",
+        "layout": "poster",
+        "canvas": "red",
         "archetype": "hero",
     },
     "b2b_35k_caught": {
@@ -304,6 +309,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "The AI agents",
+        "layout": "stat_hero",
+        "canvas": "navy",
         "archetype": "headline",
     },
     "b2b_dynamic_spend": {
@@ -316,6 +323,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "The AI agents",
+        "layout": "framework",
+        "canvas": "split",
         "archetype": "flow",
     },
     "b2b_16_cpl": {
@@ -330,6 +339,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
+        "layout": "stat_hero",
+        "canvas": "cream",
         "archetype": "headline",
     },
     "b2b_diagnosed_in_order": {
@@ -342,6 +353,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "Sales are now",
+        "layout": "framework",
+        "canvas": "cream",
         "archetype": "path",
     },
     "b2b_ai_search": {
@@ -354,6 +367,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "The AI agents",
+        "layout": "poster",
+        "canvas": "navy",
         "archetype": "hero",
     },
     "b2b_dead_buttons": {
@@ -367,6 +382,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
+        "layout": "stat_hero",
+        "canvas": "red",
         "archetype": "split",
     },
     "b2b_500_gyms": {
@@ -379,6 +396,8 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
+        "layout": "stat_hero",
+        "canvas": "navy",
         "archetype": "hero",
     },
     "b2b_ninety_days": {
@@ -391,9 +410,52 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "Sales are now",
+        "layout": "checklist",
+        "canvas": "navy",
         "archetype": "path",
     },
 }
+
+
+# ---- variant assignment (the LOCKED variant system, creative_studio docstring) ----
+def canvas_for(key):
+    """The concept's canvas: an explicit `canvas` field wins; otherwise the
+    key hashes deterministically over CANVAS_ORDER, so a re-render always
+    lands on the same canvas and the library distributes roughly evenly."""
+    from .creative_studio import CANVAS_ORDER
+    spec = CONCEPTS.get(key, {})
+    if spec.get("canvas"):
+        return spec["canvas"]
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return CANVAS_ORDER[int(digest, 16) % len(CANVAS_ORDER)]
+
+
+def preferred_layout(spec):
+    """The concept's layout: an explicit `layout` field wins; else stat
+    concepts (a cite) take stat_hero, ordered lists take framework, outcome
+    lists take checklist, opposition hooks take contrast, everything else
+    poster (the current default look)."""
+    if spec.get("layout"):
+        return spec["layout"]
+    if spec.get("cite"):
+        return "stat_hero"
+    joined = " ".join(spec.get("concept", []))
+    if "List copy" in joined:
+        # a numbered list is a framework; an outcome/benefit list a checklist
+        return "framework" if re.search(r"List copy[^:]*: 1 ", joined) else "checklist"
+    if " vs " in joined.lower() or " vs " in spec.get("headline", "").lower():
+        return "contrast"
+    return "poster"
+
+
+def variant_for(key):
+    """(canvas, layout) for one concept, or (None, None) while the concept
+    declares NO variant field: such a concept renders through the ORIGINAL
+    path byte for byte (zero visual change to already approved cards)."""
+    spec = CONCEPTS.get(key, {})
+    if not (spec.get("canvas") or spec.get("layout")):
+        return None, None
+    return canvas_for(key), preferred_layout(spec)
 
 
 def parse_args(args):
@@ -442,13 +504,17 @@ def parse_args(args):
 
 
 def assemble_prompts(key):
-    """[(variant, prompt)] for one concept through the LOCKED house-style spec,
-    composed by the concept's assigned layout ARCHETYPE (story variants inherit the
-    archetype, recomposed for 9:16 with the safe zones)."""
+    """[(variant, prompt)] for one concept. A concept with variant fields
+    (canvas/layout) composes through the LOCKED VARIANT SYSTEM; one without
+    renders through the original archetype path byte for byte (zero visual
+    change to already approved cards). Story variants inherit the archetype,
+    recomposed for 9:16 with the safe zones."""
     spec = CONCEPTS[key]
     arch = spec.get("archetype", "flow")
+    canvas, layout = variant_for(key)
     out = [("feed", creative_studio.build_prompt(spec["headline"], spec["concept"],
-                                                 archetype=arch))]
+                                                 archetype=arch,
+                                                 canvas=canvas, layout=layout))]
     if spec.get("story"):
         aspect, pixels, surface = STORY_ASPECT
         out.append(("story", creative_studio.build_prompt(
@@ -462,6 +528,10 @@ def _generate_one(key, variant, nano_client, out_dir):
     suffix = "" if variant == "feed" else "_story"
     out_path = os.path.join(out_dir, f"{V2_PREFIX}{key}{suffix}.png")
     kwargs = {"archetype": spec.get("archetype", "flow")}
+    if variant == "feed":
+        canvas, layout = variant_for(key)
+        if canvas:
+            kwargs.update({"canvas": canvas, "layout": layout})
     if variant == "story":
         aspect, pixels, surface = STORY_ASPECT
         kwargs.update({"aspect": aspect, "pixels": pixels, "surface": surface})
@@ -545,6 +615,10 @@ def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
                 sidecar["pillar"] = spec["pillar"]
             if spec.get("cite"):
                 sidecar["cite"] = list(spec["cite"])
+            v_canvas, v_layout = variant_for(key)
+            if v_canvas and variant == "feed":
+                sidecar["canvas"] = v_canvas
+                sidecar["layout"] = v_layout
             if hosted:
                 sidecar["public_url"] = hosted
             sidecar_path = os.path.splitext(art["path"])[0] + ".json"

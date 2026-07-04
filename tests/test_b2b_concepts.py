@@ -122,11 +122,15 @@ def test_regen_only_works_for_every_new_key():
         assert [v for v, _ in variants] == ["feed"], key    # no story variants
         prompt = variants[0][1]
         low = prompt.lower()
-        # the locked house style, straight from the shared builder
-        assert f"archetype {_b2b(key)['archetype']}" in low, key
-        assert "cream #faf6f0: the canvas" in low, key
+        # the b2b set now composes through the LOCKED VARIANT SYSTEM (its
+        # assigned canvas + layout tokens), still from the shared builder
+        spec = _b2b(key)
+        assert f"canvas token {spec['canvas']}".lower() in low, key
+        assert f"layout token {spec['layout']}".lower() in low, key
+        assert "locked brand grammar" in low, key
+        assert "readability bar" in low, key
         assert "be clear, not cute" in low, key
-        assert _b2b(key)["headline"] in prompt, key         # slots filled verbatim
+        assert spec["headline"] in prompt, key              # slots filled verbatim
         assert "—" not in prompt and "–" not in prompt, key
 
 

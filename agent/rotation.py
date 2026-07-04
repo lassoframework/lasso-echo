@@ -184,6 +184,44 @@ def sidecar_set(creative_path):
     return _sidecar_field(creative_path, "set")
 
 
+def sidecar_canvas(creative_path):
+    """The card's CANVAS token from its sidecar. Every card without one (the
+    whole pre variant library, and the generated Nano card) is the cream house
+    canvas by construction."""
+    return _sidecar_field(creative_path, "canvas") or "cream"
+
+
+def candidate_canvas(item):
+    """A candidate's canvas: the sidecar's for a library card; the generated
+    Nano card always renders on the cream house canvas."""
+    _key, _pillar, kind, payload = item
+    if kind == "generate":
+        return "cream"
+    return sidecar_canvas(getattr(payload, "path", ""))
+
+
+def last_canvas(account_key, day_key):
+    """The canvas served most recently BEFORE day_key (the kv stamp written at
+    draft time), or None. Drives the hard canvas guard in choose()."""
+    from . import db
+    try:
+        rec = json.loads(db.kv_get(f"rotation_canvas_{account_key}", "") or "{}")
+    except Exception:
+        return None
+    if rec.get("date", "") and rec["date"] < day_key:
+        return rec.get("canvas") or None
+    return None
+
+
+def record_canvas(account_key, day_key, canvas):
+    from . import db
+    try:
+        db.kv_set(f"rotation_canvas_{account_key}",
+                  json.dumps({"date": day_key, "canvas": canvas}))
+    except Exception as e:
+        print(f"[rotation] could not stamp canvas: {type(e).__name__}: {e}")
+
+
 def candidate_set(item):
     """A candidate's concept set: the sidecar's for a library card; the generated
     Nano card drafts from the brand pillars, so it counts as 'brand'."""
@@ -294,6 +332,17 @@ def choose(account_key, day_key, library_path, poster=None):
         return True
 
     pool = [it for it in candidates if _eligible(it)]
+    # CANVAS GUARD (hard, never starving): the same canvas never serves two
+    # days running WHERE AN ALTERNATIVE EXISTS. A pool with no alternative
+    # (e.g. today's all cream library) behaves exactly as before.
+    prev_canvas = last_canvas(account_key, day_key)
+    if pool and prev_canvas:
+        different = [it for it in pool if candidate_canvas(it) != prev_canvas]
+        if different and len(different) < len(pool):
+            db.audit("selection", "canvas_guard",
+                     f"skipped {len(pool) - len(different)} candidate(s) on "
+                     f"yesterday's canvas '{prev_canvas}'", account_key, day_key)
+            pool = different
     if pool:
         # SOFT variety preferences first: a different archetype AND a different
         # concept set (brand vs service) than yesterday. Both are preferences,
@@ -358,6 +407,7 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
             record_served(account.key, content_signature(draft.source_fragments),
                           f"brain:{payload}", day_key,
                           archetype=archetype_for_day(day_key), set_name="brand")
+            record_canvas(account.key, day_key, "cream")  # Nano = house canvas
         return draft
     if kind == "library":
         from . import schedule
@@ -368,5 +418,6 @@ def build_rotated_draft(account, day_key, voice, library_path, poster=None,
                           pillar_of(payload.path), day_key,
                           archetype=sidecar_archetype(payload.path),
                           set_name=sidecar_set(payload.path))
+            record_canvas(account.key, day_key, sidecar_canvas(payload.path))
         return draft
     return None
