@@ -394,6 +394,24 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       brief, every concept citing platform_2026, every CTA routing
       quiz.lassoframework.com; house 16 + b2b 10 + platform 10 frozen;
       46 concept library; regen-library --set platform_ads
+- [~] Day 30 readiness + doctrine wiring (4 parts, one commit each): (A)
+      per account framed Day 30 assembler (report_framing on the account:
+      lasso_fb leads with the frequency before/after story + multiplier;
+      lasso_ig is engagement and consistency ONLY, frequency confined to an
+      internal do not publish appendix, safe default engagement); backfilled
+      per post insights + snapshots, top/bottom 3, health read, honest gaps;
+      CLI report --account --dry (exact Slack text, watermarked, writes
+      nothing); (B) platform doctrine wired as the primary caption source
+      (book untouched on top, 08_platform_2026.md second, lasso_now
+      fallback), pillar angles resolve doctrine USE lines with citations,
+      dormant behind AGENT_KNOWLEDGE_ENABLED, unverifiable angles dropped
+      with audited reason, monthly review proposals labeled by source; (C)
+      monday-preview read only GO / NO GO preflight (feed forecast, runway,
+      quiet token days, heartbeats, pending approvals, flags snapshot),
+      zero side effects; (D) Sunday operator report behind
+      AGENT_WEEKLY_REPORT_ENABLED (OFF): one card Sundays 6 PM ET, posts /
+      approvals / views based engagement on the Day 30 framing rules /
+      runway / flags delta / by hand item, honest no data gaps
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
