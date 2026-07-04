@@ -357,6 +357,20 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       runway math in plain lines on the digest's own shared implementation
       (eligible by name, exclusion reasons, consumption, days). All read only
       or by hand; no daily behavior change anywhere
+- [~] House style variant system (3 parts, one commit each): (A) locked canvas
+      + layout tokens in the house builder: 4 canvases (cream / navy #1A2340 /
+      red / split) and 5 layouts (stat_hero / framework / contrast / checklist
+      / poster) under a constant brand grammar (one type family, two fonts
+      max, logo lockup, #E03131 single accent, footer) and a shared
+      readability bar (high contrast, mobile legible, thumbnail headline);
+      no variant fields = the original render path byte for byte; (B)
+      deterministic assignment (explicit per concept override wins, else key
+      hash over the canvas order) + rotation canvas guard (same canvas never
+      serves two days running where an alternative exists, never starving);
+      b2b set assigned per brief (4 stat_hero, 2 framework, 1 each checklist /
+      contrast, 2 poster across navy / cream / red / split); (C) full test
+      coverage incl. adversarial guard + 20 combo render smoke; 16 house
+      concepts unchanged
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
