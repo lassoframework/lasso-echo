@@ -560,6 +560,12 @@ def main(argv=None):
         else:
             from .runway import explain as runway_explain
             runway_explain(account)
+    elif cmd == "monday-preview":
+        # READ ONLY preflight: feed forecast, runway, tokens, heartbeats,
+        # pending approvals, flags snapshot; one GO / NO GO verdict. Zero
+        # side effects: the store is byte identical after a run.
+        from .monday_preview import run as monday_run
+        monday_run()
     elif cmd == "podcast-status":
         # READ ONLY probe: feed reachable, items seen, latest episode parsed,
         # the armed watermark, and an honest forecast of the next poll.
