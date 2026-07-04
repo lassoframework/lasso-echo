@@ -341,6 +341,22 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       (set "b2b", pillars verbatim, stat headlines carry cites), same locked
       builder, 16 house concepts byte untouched (frozen hash),
       regen-library --only/--set b2b per key. Render by hand via regen-library
+- [~] Operator hygiene (4 parts, one commit each): (A) regen batch guard: one
+      live regen-library run at a time (stale safe lock, dead pid + age auto
+      clear, second invocation refuses naming the holder) + end of batch
+      summary table (concept, content hash, url) with superseded note on
+      re-runs; (B) contact-sheet CLI (--set <name>|--all [--out PATH]):
+      self contained HTML review grid from live library sidecars (key, pillar,
+      review hints; stat cards get the numeral hint), uploads to
+      echo/contact_sheets/<set>_<date>.html, read only against the library;
+      (C) podcast-status read only probe (feed reachable, items seen, latest
+      parsed, armed watermark, honest next poll forecast per the mod 4
+      rotation) + 139 episode first poll proof (only the newest episode ever
+      drafts) + backlog guard on transcript auto ingest (newest only past 3
+      new episodes in one poll); (D) runway --account <key> --explain: the
+      runway math in plain lines on the digest's own shared implementation
+      (eligible by name, exclusion reasons, consumption, days). All read only
+      or by hand; no daily behavior change anywhere
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
