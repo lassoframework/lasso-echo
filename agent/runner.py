@@ -264,6 +264,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 from .book_campaign import build_book_draft
                 draft = build_book_draft(account, day_key)
             if draft is None and account.key.startswith("lasso"):
+                # PODCAST SLOT (AGENT_PODCAST_ENABLED, OFF): a newly detected
+                # episode's release card takes the day's feed slot AFTER the
+                # book campaign queue and BEFORE pillar rotation. Cards once
+                # per episode, max one podcast draft per day, always held for
+                # the tap. Dormant = None and the chain below runs unchanged.
+                from .podcast_release import build_podcast_slot_draft
+                draft = build_podcast_slot_draft(account, day_key)
+            if draft is None and account.key.startswith("lasso"):
                 draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
             # Summit campaign next (its own weekly day, inside the same daily cadence,
             # never additional). Dormant unless armed; auto-stops after 2026-11-08.
