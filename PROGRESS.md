@@ -302,6 +302,21 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       rotation (no repeat within 3 weeks), CTA "Claim your seat" +
       https://lassoframework.com/summit, auto-stops after 2026-11-08;
       flag AGENT_SUMMIT_CAMPAIGN_ENABLED OFF
+- [~] Podcast pipeline (4 parts, one commit each): (A) RSS feed watcher on the scheduler
+      cadence, idempotent episode records (guid keyed), podcast:transcript namespace,
+      loud on malformed feed or missing AGENT_PODCAST_FEED_URL; (B) podcast_release
+      house-style card (EPISODE <N> / <TITLE> / one-sentence dash-free about line from
+      the feed description only) in the daily slot AFTER the book campaign and BEFORE
+      pillar rotation, newest episode only (no backlog blast), cards once per episode,
+      max one podcast draft per account per day; (C) transcript ingest (CLI
+      podcast-transcript --episode N --file|--url, plus auto ingest from the feed) as an
+      APPROVED SOURCE scoped per episode, citation podcast_ep<N>, episode-tagged drafts
+      only, no transcript text in logs beyond the 120-char CLI preview; (D) episode
+      infographics (CLI podcast-cards --episode N [--count 2|3]), hook + support VERBATIM
+      from the transcript, citations must resolve at queue AND serve time, spread 1/day
+      behind book priority, same house builder with no style overrides, 18 existing
+      concepts untouched. Every card held for approval; nothing publishes;
+      flag AGENT_PODCAST_ENABLED OFF
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
