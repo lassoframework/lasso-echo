@@ -385,6 +385,15 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       headlines cited, house 16 + b2b 10 frozen, variance guard green
       across the 36 concept library, regen-library --set platform. Render
       by hand via regen-library
+- [~] Grammar V2 + platform ad set (2 parts, one commit each): (A) three V2
+      layout tokens (chart: one data visual with big labeled numbers;
+      diagram: funnel / hub and spoke / flow arrows, labeled nodes; device:
+      phone / browser / profile grid mockup in thin outline), same grammar
+      and readability bar, five originals frozen; (B) 10 platform_ads_*
+      concepts through the V2 grammar with per key canvas/layout from the
+      brief, every concept citing platform_2026, every CTA routing
+      quiz.lassoframework.com; house 16 + b2b 10 + platform 10 frozen;
+      46 concept library; regen-library --set platform_ads
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
