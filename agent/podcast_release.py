@@ -6,17 +6,23 @@ runner's podcast slot returns None and the daily chain runs exactly as today).
 Armed, a newly detected episode auto-drafts ONE release card as that day's feed
 post candidate and cards it to the approval channel like every other post.
 
-THE TEMPLATE CONCEPT `podcast_release` lives here in the exact shape the 18
-house-style renders use (headline / concept context / archetype) and renders
-through the SAME locked builder (creative_studio.build_prompt via generate),
-composed per episode from three dynamic text slots:
+FOUR LOCKED TEMPLATES (podcast_release_a/b/c/e) live here in the same
+concept-library shape the house renders use and render through the SAME locked
+builder (creative_studio.generate); each template is a scoped palette
+exception exactly like the book cover (deep navy poster system, never the
+cream house canvas, never applied to anything but release cards). Three
+dynamic text slots per template, encoded faithfully with no drift:
 
-    EPISODE <N>   +   <TITLE>          -> the card headline
-    one line about                     -> concept context + the caption
+    EPISODE <N>     -> the episode number, always 3 digits (007, 131)
+    <TITLE>         -> at most 2 lines, about 40 characters per line,
+                       truncated at the last full word, never mid word
+    one line about  -> derived ONLY from the feed's episode description:
+                       markup stripped, first sentence, DASH FREE (asserted)
 
-The about line is derived ONLY from the feed's episode description: stripped of
-markup, trimmed to its first sentence, and DASH FREE (every dash family
-character removed; asserted at build time, belt and suspenders).
+TEMPLATE ROTATION is deterministic, never random: episode number modulo 4
+over the set A, B, C, E (131 = E, 132 = A, 133 = B, 134 = C, and so on), so
+the pick is stable across re-drafts. The chosen template is logged in the
+audit row.
 
 PRIORITY: the runner calls this slot AFTER the book campaign queue and BEFORE
 pillar rotation. An episode cards exactly ONCE per account (a re-poll changes
@@ -66,26 +72,110 @@ def _title_slot(title):
     return _dash_free(_TITLE_EP_PREFIX.sub("", title or "").strip())
 
 
+def title_lines(title, width=40, max_lines=2):
+    """The 2 line title slot: at most `max_lines` lines of about `width`
+    characters, broken and truncated at the LAST FULL WORD only, never mid
+    word. A single word longer than the width stands alone rather than being
+    cut. Overflow past the second line is dropped at the word boundary."""
+    words = _title_slot(title).split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if len(trial) <= width or not cur:
+            cur = trial
+            continue
+        lines.append(cur)
+        cur = w
+        if len(lines) == max_lines:
+            return lines  # truncated at the last full word that fit
+    if cur:
+        lines.append(cur)
+    return lines[:max_lines]
+
+
+# ---- the four LOCKED templates (encoded faithfully from the brief, no drift) --------
+TEMPLATE_ORDER = ("a", "b", "c", "e")
+
+_FOOTER = "HOSTED BY SHERMAN MERRICKS AND BLAKE RUFF . LASSOFRAMEWORK.COM"
+
+_TEMPLATE_SPECS = {
+    "a": (
+        "LOCKED TEMPLATE podcast_release_a, the CLASSIC POSTER. Canvas: deep "
+        "navy #1A2340, dark vignette, film grain, soft top spotlight. A white "
+        "line art studio microphone with a glowing red horizontal waveform "
+        "behind it. Render EXACTLY these text elements and no other text: a "
+        "white condensed bold masthead GYM MARKETING MADE SIMPLE with red "
+        "letterspaced BY LASSO . NEW EPISODE EVERY MONDAY beneath it. Red "
+        "letterspaced EPISODE {ep}. Then the title in white on at most two "
+        "lines: {title}. Then the about line: {about}. Footer: {footer}"
+    ),
+    "b": (
+        "LOCKED TEMPLATE podcast_release_b, the BOLD SPLIT. Canvas: a diagonal "
+        "split, upper left two thirds deep navy #1A2340, lower right third a "
+        "solid red panel. Render EXACTLY these text elements and no other "
+        "text: top left masthead GYM MARKETING MADE SIMPLE / BY LASSO. "
+        "Colossal white stacked NEW EPISODE IS LIVE. with LIVE in glowing red "
+        "plus a red pulse dot. Red EPISODE {ep}. The title in white on at "
+        "most two lines: {title}. The about line: {about}. On the red panel: "
+        "a white play button in a thin circle, a white waveform, and small "
+        "EVERY MONDAY. Footer: {footer}"
+    ),
+    "c": (
+        "LOCKED TEMPLATE podcast_release_c, the ON AIR STUDIO. Canvas: deep "
+        "navy #1A2340, moody haze, film grain. A glowing red neon ON AIR sign "
+        "in a thin rounded rectangle top center. Render EXACTLY these text "
+        "elements and no other text: masthead GYM MARKETING MADE SIMPLE / BY "
+        "LASSO beneath the sign. Red EPISODE {ep} . NEW EVERY MONDAY. The "
+        "title in white on at most two lines: {title}. The about line: "
+        "{about}. Lower third: white line art headphones beside a small mic "
+        "joined by a thin red waveform. Footer: {footer}"
+    ),
+    "e": (
+        "LOCKED TEMPLATE podcast_release_e, the PODCAST PLAYER. Canvas: deep "
+        "navy #1A2340, dark vignette, film grain. Render EXACTLY these text "
+        "elements and no other text: top center masthead GYM MARKETING MADE "
+        "SIMPLE with red BY LASSO beneath it. Center: a floating dark rounded "
+        "podcast player card, slightly lighter navy with a soft shadow, "
+        "containing red letterspaced NOW PLAYING . EPISODE {ep}, the title in "
+        "white on at most two lines: {title}, a thin white progress bar with "
+        "a glowing red played portion and a round red scrubber dot, small "
+        "white timestamps at each end, and three player icons: previous, a "
+        "large glowing red circular play button center, next. The about line "
+        "sits below the player card: {about}. Footer: NEW EVERY MONDAY . "
+        "{footer}"
+    ),
+}
+
+
+def template_for_episode(n):
+    """Deterministic template pick: episode number modulo 4 over A, B, C, E
+    (131 = E, 132 = A, 133 = B, 134 = C). Stable across re-drafts, never
+    random."""
+    return TEMPLATE_ORDER[int(n) % 4]
+
+
 def release_concept(episode):
     """
-    The `podcast_release` template concept, composed per episode in the exact
-    shape the 18 house-style renders use. The headline is the only on-image
-    text (the locked one-headline law); the about line rides as concept context
-    for the focal graphic, never rendered as image text.
+    The composed LOCKED template for this episode, in the concept-library shape
+    (headline / concept / set), slots filled with real values: the 3 digit
+    episode number, the word boundary 2 line title, and the dash free about
+    line. `template` names the pick; `palette` carries the full locked design
+    spec into the builder (the scoped exception, exactly like the book cover).
     """
-    n = episode["episode"]
-    title = _title_slot(episode["title"])
+    n = int(episode["episode"])
+    t = template_for_episode(n)
+    lines = title_lines(episode["title"])
     about = about_line(episode["description"])
-    concept = [
-        "A new podcast episode announcement: a line icon microphone with "
-        "soundwaves, one small uppercase label NEW EPISODE.",
-    ]
-    if about:
-        concept.append(f"Episode context (never rendered as text): {about}")
+    spec = _TEMPLATE_SPECS[t].format(
+        ep=f"{n:03d}",
+        title=" / ".join(lines),
+        about=about or "(the feed gave no description; render no about line)",
+        footer=_FOOTER)
     return {
-        "headline": f"EPISODE {n}: {title}",
-        "concept": concept,
-        "archetype": "hero",
+        "headline": f"EPISODE {n}: {_title_slot(episode['title'])}",
+        "concept": [spec],
+        "template": f"podcast_release_{t}",
+        "palette": spec,
         "set": "brand",
     }
 
@@ -141,7 +231,8 @@ def _next_release_draft(account, day_key, nano_client, s3_client):
         return None
     db.kv_set(f"podcast_release_carded_{latest['guid']}_{account.key}", day_key)
     db.audit("podcast_release", draft.draft_id,
-             f"episode {latest['episode']} release card drafted (held for approval)",
+             f"episode {latest['episode']} release card drafted via "
+             f"{release_concept(latest)['template']} (held for approval)",
              account.key, day_key)
     return draft
 
@@ -153,8 +244,10 @@ def _build_release_draft(account, day_key, ep, nano_client, s3_client):
     # The about line is dash free BY CONSTRUCTION; assert it anyway (the law).
     assert not _DASH_RE.search(about), "about line carries a dash character"
     spec = release_concept(ep)
+    # The SAME house builder; the template block rides as the scoped palette
+    # exception (like the book cover), never as a style override elsewhere.
     art = creative_studio.generate(spec["headline"], spec["concept"],
-                                   client=nano_client, archetype=spec["archetype"])
+                                   client=nano_client, palette=spec["palette"])
     if art is None:
         return None  # studio unavailable/dark: the caller's normal path runs
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)

@@ -166,7 +166,7 @@ def test_release_card_takes_slot_when_book_dark(monkeypatch, tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0
 
 
-# ---- house style through the same builder ----------------------------------------------
+# ---- the same builder; the LOCKED template rides as the scoped palette -------------------
 def test_release_renders_through_house_builder(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     podcast_feed.poll(fetch=lambda: FEED)
@@ -174,9 +174,66 @@ def test_release_renders_through_house_builder(monkeypatch, tmp_path):
     d = podcast_release.build_podcast_slot_draft(_acct(), "2026-07-06",
                                                  nano_client=nano, s3_client=FakeS3())
     assert d is not None
-    assert any("Cream #FAF6F0: THE canvas" in p for p in nano.prompts)  # house palette
     assert any("EPISODE 7: The follow up problem" in p for p in nano.prompts)
+    # the locked navy poster template replaces the cream palette for release
+    # cards ONLY (a scoped exception, exactly like the book cover)
+    assert any("LOCKED TEMPLATE podcast_release_" in p for p in nano.prompts)
+    assert any("#1A2340" in p for p in nano.prompts)
     assert all("BLACK canvas" not in p for p in nano.prompts)   # no book exception here
+
+
+# ---- locked templates: deterministic rotation, 3 digit slot, word boundary title ---------
+def test_template_rotation_deterministic_mod4():
+    assert podcast_release.template_for_episode(131) == "e"
+    assert podcast_release.template_for_episode(132) == "a"
+    assert podcast_release.template_for_episode(133) == "b"
+    assert podcast_release.template_for_episode(134) == "c"
+    # stable across re-drafts (a pure function of the episode number)
+    for n in (7, 131, 132, 999):
+        assert (podcast_release.template_for_episode(n)
+                == podcast_release.template_for_episode(n))
+    # every episode number lands in the set A, B, C, E; never random
+    assert {podcast_release.template_for_episode(n)
+            for n in range(100, 108)} == {"a", "b", "c", "e"}
+
+
+def test_title_truncates_at_word_boundary_onto_two_lines():
+    long_title = ("Episode 7: The follow up problem every single gym owner "
+                  "keeps ignoring until the calendar goes completely empty")
+    lines = podcast_release.title_lines(long_title)
+    assert len(lines) == 2
+    assert all(len(line) <= 40 for line in lines)
+    stripped = podcast_release._title_slot(long_title)
+    assert stripped.startswith(" ".join(lines))     # a clean word boundary prefix
+    source_words = stripped.split()
+    for line in lines:
+        for word in line.split():
+            assert word in source_words             # never cut mid word
+    # short titles stay one line, untouched
+    assert podcast_release.title_lines("Episode 9: Short and sweet") == [
+        "Short and sweet"]
+
+
+def test_template_slots_filled_and_audit_names_template(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    podcast_feed.poll(fetch=lambda: FEED)
+    nano = FakeNano()
+    d = podcast_release.build_podcast_slot_draft(_acct(), "2026-07-06",
+                                                 nano_client=nano, s3_client=FakeS3())
+    assert d is not None
+    prompt = nano.prompts[0]
+    assert "EPISODE 007" in prompt                  # 3 digit episode slot (ep 7)
+    assert "podcast_release_e" in prompt            # 7 % 4 = 3 -> template E
+    assert "GYM MARKETING MADE SIMPLE" in prompt and "BY LASSO" in prompt
+    assert "NOW PLAYING" in prompt                  # the player card, faithfully
+    assert "HOSTED BY SHERMAN MERRICKS AND BLAKE RUFF" in prompt
+    # every rendered text element lives in the template spec: it is dash free
+    # (the model-facing prompt scaffolding around it may carry hyphens)
+    ep = podcast_feed.get_episode(7)
+    spec = podcast_release.release_concept(ep)
+    assert not podcast_release._DASH_RE.search(spec["palette"])
+    rows = [r for r in db.audit_rows() if r["kind"] == "podcast_release"]
+    assert rows and "podcast_release_e" in rows[0]["reason"]  # the pick is logged
 
 
 # ---- flag off = inert ---------------------------------------------------------------------
