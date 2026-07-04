@@ -175,6 +175,24 @@ def write_learnings(episode, count=None):
              f"{os.path.basename(path)}")  # counts only, never transcript text
     print(f"[podcast] episode {episode}: {len(learnings)} learning(s) written "
           f"(citation {cite})")
+    # Part F rides along, PROPOSE ONLY: a quantitative or named framework
+    # learning cards a promotion proposal held for the tap. A proposal failure
+    # is LOUD but never blocks the learnings; NOTHING here writes a standing
+    # knowledge file (only the tap in podcast_promote does).
+    try:
+        from . import podcast_promote
+        from .store import PendingStore
+        poster = None
+        try:
+            from .slack_surface import SlackPoster
+            poster = SlackPoster()
+        except Exception:
+            pass  # no Slack in this context: proposals still store for later
+        podcast_promote.propose_from_learnings(episode, learnings,
+                                               poster=poster,
+                                               store=PendingStore())
+    except Exception as e:
+        print(f"[podcast] promotion proposal pass failed: {type(e).__name__}: {e}")
     return {"path": path, "learnings": len(learnings), "citation": cite,
             "existed": False}
 

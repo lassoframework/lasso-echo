@@ -250,8 +250,14 @@ def run_listener():
         if not draft:
             client.chat_postMessage(channel=channel, text=f"Draft {draft_id} not found (it may have expired).")
             return
-        res = handle_action(kind, draft, actor_slack_id=actor,
-                            account=get_account(draft.account_key))
+        if getattr(draft, "draft_type", "") == "claim_promotion":
+            # standing claim promotion (podcast Part F): same approver gate,
+            # its own write path; the post approval flow stays untouched
+            from . import podcast_promote
+            res = podcast_promote.handle_promotion_action(kind, draft, actor)
+        else:
+            res = handle_action(kind, draft, actor_slack_id=actor,
+                                account=get_account(draft.account_key))
         if not res.ok:
             client.chat_postMessage(channel=channel, text=f":no_entry: {res.detail}")
             return
