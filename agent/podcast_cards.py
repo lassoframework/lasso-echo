@@ -254,3 +254,11 @@ def cards_cli(episode, count):
         print(f"  hook: {hook}")
     print("  cards spread max one per day, behind book priority, every one "
           "held for approval.")
+    # Part E rides along: episode learnings memory (verbatim, additive only,
+    # episode scoped). A learn failure is LOUD but never blocks the cards.
+    try:
+        from . import podcast_learn
+        podcast_learn.write_learnings(episode)
+    except Exception as e:
+        print(f"[podcast] learnings not written for episode {episode}: "
+              f"{type(e).__name__}: {e}")

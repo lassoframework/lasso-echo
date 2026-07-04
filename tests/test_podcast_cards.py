@@ -57,6 +57,9 @@ def _arm(monkeypatch, tmp_path):
     lib = tmp_path / "lib"
     lib.mkdir(exist_ok=True)
     monkeypatch.setattr(config, "LIBRARY_PATH", str(lib))
+    # cards_cli also writes episode learnings (Part E): keep them in tmp, the
+    # real brand_voice/knowledge is never touched by a test
+    monkeypatch.setattr(config, "KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
 
 
 def _slot(day):

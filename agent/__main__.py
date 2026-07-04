@@ -506,6 +506,29 @@ def main(argv=None):
             i += 1
         from .podcast_cards import cards_cli
         cards_cli(episode, count)
+    elif cmd == "podcast-learn":
+        # Episode learnings memory (AGENT_PODCAST_ENABLED): 3 to 7 verbatim
+        # learnings from the stored transcript into
+        # brand_voice/knowledge/podcast/ep<N>_learnings.md plus the rolling
+        # index. Additive only; episode scoped citations (podcast_ep<N>).
+        episode, count, args = None, None, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--episode" and i + 1 < len(args):
+                try:
+                    episode = int(args[i + 1])
+                except ValueError:
+                    episode = None
+                i += 2; continue
+            if args[i] == "--count" and i + 1 < len(args):
+                try:
+                    count = int(args[i + 1])
+                except ValueError:
+                    count = 0
+                i += 2; continue
+            i += 1
+        from .podcast_learn import learn_cli
+        learn_cli(episode, count)
     elif cmd == "gbp-check":
         # READ-ONLY Google Business Profile probe: one honest status line.
         from .gbp_check import gbp_check
