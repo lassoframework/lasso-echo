@@ -145,3 +145,153 @@ def assemble_month(account_key, month):
         days.append(entry)
     return {"account_key": account_key, "month": month, "days": days,
             "rollup": rollup, "seeded_keys": sorted(set(seeded))}
+# ---- Part B: the HTML artifact ---------------------------------------------------------
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+
+
+def _month_title(month):
+    return f"{_MONTHS[int(month[5:7]) - 1]} {month[:4]}"
+
+
+def render_html(plan):
+    """The self contained navy grid calendar. Visible copy dash free (dates
+    render as day numbers; the month renders as words)."""
+    e = _html.escape
+    days = plan["days"]
+    cells = {d["date"]: d for d in days}
+    year, mon = int(plan["month"][:4]), int(plan["month"][5:7])
+    first_weekday, n_days = monthrange(year, mon)  # Monday = 0
+    rollup = plan["rollup"]
+
+    def cell_html(d):
+        color = STATUS_COLORS[d["status"]]
+        bits = [f"<div style=\"font-weight:bold\">{int(d['date'][8:10])}</div>"]
+        if d["special"]:
+            bits.append(f"<div style=\"color:#E03131;font-size:11px\">"
+                        f"PINNED: {e(d['special'].upper())}</div>")
+        if d["concept"]:
+            bits.append(f"<div style=\"font-size:12px\">{e(d['concept'])}</div>")
+        elif d["status"] == "draft":
+            bits.append("<div style=\"font-size:12px;color:#8A93A6\">open slot"
+                        "</div>")
+        if d["canvas"]:
+            bits.append(
+                "<div style=\"font-size:10px\">"
+                f"<span style=\"background:#2A3452;padding:1px 6px;"
+                f"border-radius:8px\">{e(d['canvas'])}</span> "
+                f"<span style=\"background:#2A3452;padding:1px 6px;"
+                f"border-radius:8px\">{e(d['layout'])}</span></div>")
+        if d["caption"]:
+            bits.append(f"<div style=\"font-size:11px;color:#B9C2D8\">"
+                        f"{e(d['caption'])}</div>")
+        bits.append(f"<div style=\"font-size:10px;color:{color}\">"
+                    f"{e(d['status'].upper())}</div>")
+        return (f"<td style=\"vertical-align:top;padding:8px;width:14%;"
+                f"border:1px solid #2A3452;border-top:4px solid {color}\">"
+                + "".join(bits) + "</td>")
+
+    weeks, week = [], ["<td></td>"] * first_weekday
+    for n in range(1, n_days + 1):
+        week.append(cell_html(cells[f"{plan['month']}-{n:02d}"]))
+        if len(week) == 7:
+            weeks.append("<tr>" + "".join(week) + "</tr>")
+            week = []
+    if week:
+        weeks.append("<tr>" + "".join(week + ["<td></td>"] * (7 - len(week)))
+                     + "</tr>")
+
+    header = "".join(f"<th style=\"padding:6px;color:#B9C2D8\">{w}</th>"
+                     for w in ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"))
+    stats = (f"published {rollup['published']} / approved {rollup['approved']} "
+             f"/ pending {rollup['pending']} / open {rollup['draft']} "
+             f"/ rest {rollup['rest']} / specials {rollup['specials']}")
+    buttons = (
+        "<p style=\"color:#8A93A6\">PREVIEW ONLY: "
+        "<button disabled>Approve</button> <button disabled>Edit</button> "
+        "<button disabled>Kill</button> "
+        "these buttons are display previews; the tap still happens in Slack "
+        "until Stage 3 wires write back.</p>")
+    return (
+        "<html><head><title>"
+        f"LASSO calendar: {e(plan['account_key'])} {e(_month_title(plan['month']))}"
+        "</title></head>"
+        "<body style=\"background:#1A2340;color:#FFFFFF;"
+        "font-family:Helvetica,Arial,sans-serif;padding:24px\">"
+        f"<h1>{e(plan['account_key'])}: {e(_month_title(plan['month']))}</h1>"
+        f"<p>Month rollup: {stats}</p>"
+        f"{buttons}"
+        f"<table style=\"border-collapse:collapse;width:100%\">"
+        f"<tr>{header}</tr>{''.join(weeks)}</table>"
+        "<p style=\"color:#8A93A6\">Statuses read from the same store the "
+        "Slack cards read; an open slot is an honest gap, never an invented "
+        "post.</p></body></html>")
+
+
+def cal_key(account_key, month):
+    return f"{CAL_PREFIX}/{account_key}_{month}.html"
+
+
+def run(account_key, month, upload=False, out_path=None, s3_client=None):
+    """Assemble, render, write the local file, optionally upload. Read only
+    against state; the only writes are the HTML file and the upload."""
+    from .accounts import get_account
+    if get_account(account_key) is None:
+        print(f"calendar-html: unknown account {account_key!r}")
+        return None
+    import re
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        print(f"calendar-html: --month must be YYYY-MM, got {month!r}")
+        return None
+    plan = assemble_month(account_key, month)
+    text = render_html(plan)
+    out_path = out_path or os.path.join(
+        config.LIBRARY_PATH, f"calendar_{account_key}_{month}.html")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    url = ""
+    if upload:
+        client = s3_client
+        if client is None and config.hosting_enabled():
+            from . import media_host
+            client = media_host._default_client()
+        if client is None:
+            print("calendar-html: hosting is dark (flag or credentials); "
+                  "local only.")
+        else:
+            try:
+                client.put(cal_key(account_key, month), out_path)
+                url = (f"{config.S3_PUBLIC_BASE_URL.rstrip('/')}/"
+                       f"{cal_key(account_key, month)}")
+            except Exception as ex:
+                print(f"calendar-html: upload failed ({type(ex).__name__}: "
+                      f"{ex}); the local file below still works.")
+    print(f"calendar-html: {plan['rollup']} on {out_path}")
+    if url:
+        print(f"calendar-html: {url}")
+    return {"plan": plan, "path": out_path, "url": url,
+            "key": cal_key(account_key, month)}
+
+
+def cli(args):
+    account, month, upload, out_path = None, None, False, None
+    i = 0
+    while i < len(args):
+        if args[i] == "--account" and i + 1 < len(args):
+            account = args[i + 1]; i += 2; continue
+        if args[i] == "--month" and i + 1 < len(args):
+            month = args[i + 1]; i += 2; continue
+        if args[i] == "--upload":
+            upload = True; i += 1; continue
+        if args[i] == "--out" and i + 1 < len(args):
+            out_path = args[i + 1]; i += 2; continue
+        print(f"unrecognized argument: {args[i]}\n"
+              "usage: python -m agent calendar-html --account <key> "
+              "--month YYYY-MM [--upload] [--out PATH]")
+        return
+    if not account or not month:
+        print("usage: python -m agent calendar-html --account <key> "
+              "--month YYYY-MM [--upload] [--out PATH]")
+        return
+    run(account, month, upload=upload, out_path=out_path)

@@ -560,6 +560,13 @@ def main(argv=None):
         else:
             from .runway import explain as runway_explain
             runway_explain(account)
+    elif cmd == "calendar-html":
+        # The month calendar artifact: navy grid HTML from the assembled month
+        # (read only against state); --upload posts it to R2 under
+        # echo/calendars/ and prints the public URL. Buttons are previews:
+        # the tap still happens in Slack until Stage 3 wires write back.
+        from .calendar_artifact import cli as calendar_cli
+        calendar_cli(argv[1:])
     elif cmd == "monday-preview":
         # READ ONLY preflight: feed forecast, runway, tokens, heartbeats,
         # pending approvals, flags snapshot; one GO / NO GO verdict. Zero
