@@ -412,6 +412,16 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       AGENT_WEEKLY_REPORT_ENABLED (OFF): one card Sundays 6 PM ET, posts /
       approvals / views based engagement on the Day 30 framing rules /
       runway / flags delta / by hand item, honest no data gaps
+- [~] Month calendar artifact (2 parts, one commit each): (A) read only
+      month assembler from existing state (posts + the same drafts store
+      the Slack cards read, seed calendar keys, schedule skip days,
+      specials from draft evidence + the Monday podcast expectation); per
+      day concept/caption/canvas/layout/status + special, empty days emit
+      an open slot never an invented concept; (B) calendar-html CLI
+      (--account --month [--upload]): navy grid artifact with status
+      colors, chips, pinned specials, month rollup; approve/edit/kill are
+      labeled display only previews (tap stays in Slack until Stage 3);
+      uploads to echo/calendars/<account>_<month>.html
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
