@@ -52,7 +52,7 @@ def test_every_concept_in_set_exactly_once(monkeypatch, tmp_path):
     lib = _seed_library(tmp_path, _b2b_keys())
     out = contact_sheet.run("b2b", s3_client=FakeS3(), library_path=lib)
     text = open(out["path"], encoding="utf-8").read()
-    assert out["count"] == 10
+    assert out["count"] == 20
     for key in _b2b_keys():
         assert text.count(f"<b>{key}</b>") == 1, key
     # --all covers the whole library, one entry per concept
@@ -101,8 +101,8 @@ def test_unrendered_concept_says_so(monkeypatch, tmp_path):
     lib = _seed_library(tmp_path, _b2b_keys()[:1])    # only one sidecar exists
     out = contact_sheet.run("b2b", s3_client=FakeS3(), library_path=lib)
     text = open(out["path"], encoding="utf-8").read()
-    assert out["count"] == 10
-    assert text.count("not rendered yet") == 9        # honest, never a broken image
+    assert out["count"] == 20
+    assert text.count("not rendered yet") == 19       # honest, never a broken image
 
 
 def test_unknown_set_refuses(monkeypatch, tmp_path, capsys):

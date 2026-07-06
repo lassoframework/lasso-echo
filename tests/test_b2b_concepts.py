@@ -25,7 +25,14 @@ B2B_KEYS = [
     "b2b_five_vendors", "b2b_speed_to_lead", "b2b_35k_caught",
     "b2b_dynamic_spend", "b2b_16_cpl", "b2b_diagnosed_in_order",
     "b2b_ai_search", "b2b_dead_buttons", "b2b_500_gyms", "b2b_ninety_days",
+    # July 2026 expansion
+    "b2b_flat_revenue", "b2b_dead_leads", "b2b_monday_numbers",
+    "b2b_owner_brain", "b2b_thirty_day_diagnose", "b2b_duct_tape",
+    "b2b_one_partner", "b2b_done_for_you", "b2b_speed_decay",
+    "b2b_retention_first",
 ]
+
+NEW_B2B_KEYS = B2B_KEYS[10:]  # the July 2026 batch
 PILLARS = {"All in one offer", "Sales are now", "The AI agents"}
 
 # every dash family character: em, en, figure, horizontal bar, minus, hyphen
@@ -63,7 +70,7 @@ def test_all_10_load_with_valid_schema():
         assert any(l.startswith("Tension:") for l in spec["concept"]), key
         assert any(l.startswith("Resolution:") for l in spec["concept"]), key
     assert len([k for k, v in regen_library.CONCEPTS.items()
-                if v.get("set") == "b2b"]) == 10
+                if v.get("set") == "b2b"]) == 20
 
 
 # ---- dash free, adversarially -------------------------------------------------------
@@ -82,7 +89,8 @@ def test_stat_citations_resolve_and_clear_gate(monkeypatch):
     claims = rotation._approved_claims()
     cited = [k for k in B2B_KEYS if _b2b(k).get("cite")]
     assert set(cited) == {"b2b_35k_caught", "b2b_16_cpl",
-                          "b2b_dead_buttons", "b2b_500_gyms"}
+                          "b2b_dead_buttons", "b2b_500_gyms",
+                          "b2b_speed_decay"}
     for key in cited:
         spec = _b2b(key)
         for cite in spec["cite"]:
@@ -134,8 +142,27 @@ def test_regen_only_works_for_every_new_key():
         assert "—" not in prompt and "–" not in prompt, key
 
 
-def test_set_b2b_selects_exactly_the_ten(capsys):
+def test_set_b2b_selects_all_keys(capsys):
     out = regen_library.run(set_name="b2b", dry_run=True)
     assert sorted(out) == sorted(B2B_KEYS)
     _only, set_name, _dry, err = regen_library.parse_args(["--set", "b2b"])
     assert err is None and set_name == "b2b"
+
+
+# ---- July 2026 expansion: each new concept present, dash free, vendor free --
+_VENDOR_RE = re.compile(r"\bvendors?\b", re.IGNORECASE)
+
+
+def test_new_b2b_10_present_dash_free_vendor_free():
+    """Each of the 10 new b2b concepts exists, its headline is dash free and
+    does not contain the word vendor or vendors."""
+    for key in NEW_B2B_KEYS:
+        assert key in regen_library.CONCEPTS, f"missing: {key}"
+        spec = regen_library.CONCEPTS[key]
+        assert spec["set"] == "b2b", key
+        hl = spec["headline"]
+        assert not _DASH_RE.search(hl), f"{key}: dash in headline {hl!r}"
+        assert not _VENDOR_RE.search(hl), f"{key}: vendor in headline {hl!r}"
+        for text in _copy_strings(spec):
+            assert not _DASH_RE.search(text), f"{key}: dash in {text!r}"
+            assert not _VENDOR_RE.search(text), f"{key}: vendor in {text!r}"
