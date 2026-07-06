@@ -122,3 +122,71 @@ def test_cli_validates_input(capsys, tmp_path):
     assert "YYYY-MM" in capsys.readouterr().out
     calendar_artifact.cli([])
     assert "usage" in capsys.readouterr().out
+
+
+# ---- PART A: full-post cells -------------------------------------------------
+
+def test_thumbnail_renders_sidecar_public_url(monkeypatch, tmp_path):
+    """Days with a sidecar public_url render that exact URL in an img tag."""
+    _seed("lasso_ig")
+    test_url = "https://cdn.echo.test/renders/lasso_v2_one_screen.png"
+    monkeypatch.setattr(
+        calendar_artifact, "_public_url_for",
+        lambda key: test_url if key == "lasso_v2_one_screen.png" else "")
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert f'src="{test_url}"' in text
+    assert f'alt="lasso_v2_one_screen.png"' in text
+
+
+def test_thumbnail_placeholder_when_no_url(monkeypatch, tmp_path):
+    """Days with a concept but no public_url show 'image pending', no broken img."""
+    _seed("lasso_ig")
+    # Real sidecars have public_url="" so _public_url_for returns ""
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert "image pending" in text
+    assert '<img src=""' not in text
+
+
+def test_cell_shows_exact_caption_and_hashtags(monkeypatch, tmp_path):
+    """Cell shows the full caption and hashtags exactly as stored in the draft."""
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO drafts (draft_id, account_key, status, day_key, "
+            "draft_type, data) VALUES (?,?,?,?,?,?)",
+            ("cap1", "lasso_ig", "pending", "2026-07-05", "feed",
+             json.dumps({"creative_path": "lib/lasso_v2_built_by_gym_owners.png",
+                         "caption": "Full caption text here.",
+                         "hashtags": ["#gymlife", "#lasso"],
+                         "source_fragments": []})))
+        conn.commit()
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert "Full caption text here." in text
+    assert "#gymlife" in text
+    assert "#lasso" in text
+
+
+def test_creative_public_url_from_draft_data_used(monkeypatch, tmp_path):
+    """creative_public_url in the draft data takes priority over the sidecar."""
+    draft_url = "https://r2.echo.test/renders/built_by_gym_owners_navy_poster.png"
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO drafts (draft_id, account_key, status, day_key, "
+            "draft_type, data) VALUES (?,?,?,?,?,?)",
+            ("url1", "lasso_ig", "approved", "2026-07-02", "feed",
+             json.dumps({"creative_path": "lib/lasso_v2_built_by_gym_owners.png",
+                         "creative_public_url": draft_url,
+                         "caption": "Draft caption.", "hashtags": []})))
+        conn.commit()
+    # Even if sidecar returns a different url, draft's creative_public_url wins
+    monkeypatch.setattr(calendar_artifact, "_public_url_for",
+                        lambda k: "https://sidecar.url/different.png")
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert draft_url in text

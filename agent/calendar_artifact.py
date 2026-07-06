@@ -57,6 +57,21 @@ def _variant_of(concept_key):
     return "", ""
 
 
+def _public_url_for(concept_key):
+    """public_url from the concept sidecar JSON; '' when unavailable."""
+    if not concept_key:
+        return ""
+    stem = os.path.splitext(concept_key)[0]
+    sidecar = os.path.join(config.LIBRARY_PATH, stem + ".json")
+    if not os.path.isfile(sidecar):
+        return ""
+    try:
+        with open(sidecar, encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("public_url", "") or ""
+    except Exception:
+        return ""
+
+
 def _day_records(account_key, month):
     """{day: {"published": [...], "drafts": [...]}} straight from the same
     tables the Slack cards read."""
@@ -119,12 +134,14 @@ def assemble_month(account_key, month):
         special = _special_for(day, rec["drafts"])
         entry = {"date": day, "weekday": schedule.weekday_abbr(day),
                  "concept": "", "caption": "", "canvas": "", "layout": "",
-                 "status": "", "special": special}
+                 "status": "", "special": special,
+                 "public_url": "", "hashtags": "", "source": ""}
         if rec["published"]:
             p = rec["published"][0]
             entry["status"] = "published"
             entry["concept"] = p.get("creative_key") or ""
-            entry["caption"] = (p.get("caption") or "")[:80]
+            entry["caption"] = p.get("caption") or ""
+            entry["public_url"] = _public_url_for(entry["concept"])
         else:
             by_status = {d.get("status"): d for d in reversed(rec["drafts"])}
             for status in ("approved", "pending"):
@@ -132,7 +149,11 @@ def assemble_month(account_key, month):
                     d = by_status[status]
                     entry["status"] = status
                     entry["concept"] = os.path.basename(d.get("creative_path") or "")
-                    entry["caption"] = (d.get("caption") or "")[:80]
+                    entry["caption"] = d.get("caption") or ""
+                    entry["hashtags"] = " ".join(d.get("hashtags") or [])
+                    entry["source"] = " ".join(d.get("source_fragments") or [])
+                    entry["public_url"] = (d.get("creative_public_url") or
+                                           _public_url_for(entry["concept"]))
                     break
         if not entry["status"]:
             # nothing planned: an open slot on a posting day, rest otherwise.
@@ -166,25 +187,44 @@ def render_html(plan):
 
     def cell_html(d):
         color = STATUS_COLORS[d["status"]]
-        bits = [f"<div style=\"font-weight:bold\">{int(d['date'][8:10])}</div>"]
+        bits = []
+        # Visual: rendered image, pending placeholder, or nothing for empty days
+        if d.get("public_url"):
+            bits.append(
+                "<div style=\"height:140px;overflow:hidden;margin-bottom:6px\">"
+                f"<img src=\"{_html.escape(d['public_url'], quote=True)}\" "
+                f"alt=\"{e(d['concept'])}\" "
+                "style=\"width:100%;height:100%;object-fit:cover\"></div>")
+        elif d.get("concept"):
+            bits.append(
+                "<div style=\"background:#2A3452;padding:6px;margin-bottom:4px;"
+                "text-align:center;font-size:10px;color:#8A93A6\">image pending</div>"
+                f"<div style=\"font-size:10px;color:#8A93A6;word-break:break-all;"
+                f"margin-bottom:4px\">{e(d['concept'])}</div>")
+        # Day number + special pin
+        bits.append(f"<div style=\"font-weight:bold;margin:4px 0\">"
+                    f"{int(d['date'][8:10])}</div>")
         if d["special"]:
             bits.append(f"<div style=\"color:#E03131;font-size:11px\">"
                         f"PINNED: {e(d['special'].upper())}</div>")
-        if d["concept"]:
-            bits.append(f"<div style=\"font-size:12px\">{e(d['concept'])}</div>")
-        elif d["status"] == "draft":
-            bits.append("<div style=\"font-size:12px;color:#8A93A6\">open slot"
-                        "</div>")
+        # Full caption and hashtags exactly as the post will appear
+        if d.get("caption"):
+            bits.append(f"<div style=\"font-size:11px;color:#B9C2D8;margin:4px 0;"
+                        f"white-space:pre-wrap\">{e(d['caption'])}</div>")
+        if d.get("hashtags"):
+            bits.append(f"<div style=\"font-size:10px;color:#5EB9E6;"
+                        f"margin-bottom:4px\">{e(d['hashtags'])}</div>")
+        # Open slot label for unplanned posting days
+        if not d.get("concept") and d["status"] == "draft":
+            bits.append("<div style=\"font-size:12px;color:#8A93A6\">open slot</div>")
+        # Canvas / layout chips
         if d["canvas"]:
             bits.append(
-                "<div style=\"font-size:10px\">"
+                "<div style=\"font-size:10px;margin:4px 0\">"
                 f"<span style=\"background:#2A3452;padding:1px 6px;"
                 f"border-radius:8px\">{e(d['canvas'])}</span> "
                 f"<span style=\"background:#2A3452;padding:1px 6px;"
                 f"border-radius:8px\">{e(d['layout'])}</span></div>")
-        if d["caption"]:
-            bits.append(f"<div style=\"font-size:11px;color:#B9C2D8\">"
-                        f"{e(d['caption'])}</div>")
         bits.append(f"<div style=\"font-size:10px;color:{color}\">"
                     f"{e(d['status'].upper())}</div>")
         return (f"<td style=\"vertical-align:top;padding:8px;width:14%;"
