@@ -177,3 +177,76 @@ def test_approve_month_through_filter(monkeypatch, tmp_path):
     result = pm.approve_month("lasso_ig", MONTH, through="2026-09-10")
     for day_key in result["approved"]:
         assert day_key <= "2026-09-10"
+
+
+def test_round_robin_reaches_all_sets(monkeypatch, tmp_path):
+    """Cold-start: a fresh pool with all 46 v2 concepts distributes across all sets."""
+    _arm(monkeypatch)
+    from agent.regen_library import CONCEPTS
+    concepts = [
+        Creative(path=str(tmp_path / f"lasso_v2_{name}.png"), media_type="image")
+        for name in CONCEPTS
+    ]
+    monkeypatch.setattr(pm.runway, "eligible_creatives", lambda acct, lib: concepts)
+    # Neutralise canvas guard so set selection is the only variable
+    monkeypatch.setattr(pm, "_creative_canvas",
+                        lambda c: ["cream", "navy", "red", "split"][
+                            sum(ord(ch) for ch in os.path.basename(c.path)) % 4])
+    out = pm.plan_month("lasso_ig", MONTH, library_path=str(tmp_path), write=False)
+    assert out is not None and len(out["planned"]) >= 8, (
+        f"expected at least 8 planned days, got {len(out['planned'])}")
+    from agent.plan_month import _creative_set
+    concept_map = {f"lasso_v2_{name}.png": c for name, c in zip(CONCEPTS, concepts)}
+    sets_seen = set()
+    for _, key in out["planned"]:
+        c = concept_map.get(key)
+        if c:
+            sets_seen.add(_creative_set(c))
+    assert "platform" in sets_seen, (
+        f"platform never reached; sets seen: {sets_seen}")
+    assert "platform_ads" in sets_seen, (
+        f"platform_ads never reached; sets seen: {sets_seen}")
+
+
+def test_recency_beats_round_robin(monkeypatch, tmp_path):
+    """Concepts with a real served date lose to never-served regardless of set count."""
+    _arm(monkeypatch)
+    from agent.regen_library import CONCEPTS
+    # Pick one concept from each of three sets
+    house_name = next(n for n, m in CONCEPTS.items() if m.get("set") == "brand")
+    b2b_name = next(n for n, m in CONCEPTS.items() if m.get("set") == "b2b")
+    platform_name = next(n for n, m in CONCEPTS.items() if m.get("set") == "platform")
+
+    c_house = Creative(path=str(tmp_path / f"lasso_v2_{house_name}.png"),
+                       media_type="image")
+    c_b2b = Creative(path=str(tmp_path / f"lasso_v2_{b2b_name}.png"),
+                     media_type="image")
+    c_platform = Creative(path=str(tmp_path / f"lasso_v2_{platform_name}.png"),
+                          media_type="image")
+
+    # Platform served long ago — outside the 14-day window but has a real date
+    rotation.record_served("lasso_ig", f"lasso_v2_{platform_name}.png",
+                           "misc", "2026-06-01")
+
+    # Pool order: house, b2b, platform (insertion order)
+    monkeypatch.setattr(pm.runway, "eligible_creatives",
+                        lambda acct, lib: [c_house, c_b2b, c_platform])
+    # Neutralise canvas guard
+    monkeypatch.setattr(pm, "_creative_canvas", lambda c: "cream")
+
+    out = pm.plan_month("lasso_ig", MONTH, library_path=str(tmp_path), write=False)
+    keys = [k for _, k in out["planned"] if k is not None]
+
+    platform_key = f"lasso_v2_{platform_name}.png"
+    house_key = f"lasso_v2_{house_name}.png"
+    b2b_key = f"lasso_v2_{b2b_name}.png"
+
+    # house and b2b (never served, "") must appear before platform ("2026-06-01")
+    assert platform_key in keys, "platform should be planned eventually"
+    p_idx = keys.index(platform_key)
+    if house_key in keys:
+        assert keys.index(house_key) < p_idx, (
+            "house (never served) must appear before platform (served 2026-06-01)")
+    if b2b_key in keys:
+        assert keys.index(b2b_key) < p_idx, (
+            "b2b (never served) must appear before platform (served 2026-06-01)")

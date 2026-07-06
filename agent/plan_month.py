@@ -28,6 +28,19 @@ from datetime import timedelta
 from . import config, db, rotation, schedule
 from . import runway
 
+_SET_MAP = {"brand": "house", "service": "house",
+            "b2b": "b2b", "platform": "platform", "platform_ads": "platform_ads"}
+
+
+def _creative_set(c):
+    """Set label: house / b2b / platform / platform_ads for v2 concepts, library for old."""
+    base = os.path.basename(c.path)
+    if base.startswith("lasso_v2_"):
+        name = os.path.splitext(base)[0][len("lasso_v2_"):]
+        from .regen_library import CONCEPTS
+        return _SET_MAP.get(CONCEPTS.get(name, {}).get("set", ""), "other")
+    return "library"
+
 
 def _creative_canvas(c):
     """Canvas token for one creative: CONCEPTS lookup for v2, sidecar for old format."""
@@ -104,6 +117,9 @@ def plan_month(account_key, month, library_path=None, write=False):
         return max(all_dates) if all_dates else ""
 
     prev_canvas = rotation.last_canvas(account_key, open_days[0])
+    # Tracks how many times each set label has been chosen this pass — used to
+    # round-robin across house/b2b/platform/platform_ads when recency is tied.
+    plan_set_counts: dict = {}
 
     for day_key in open_days:
         candidates = [
@@ -120,9 +136,23 @@ def plan_month(account_key, month, library_path=None, write=False):
             if alt:
                 candidates = alt
 
-        # Least recently served wins; never-served sorts first (date "")
+        # Primary: least recently served (never-served "" sorts before any real date)
         candidates.sort(key=lambda c: _last_served_date(os.path.basename(c.path)))
-        chosen = candidates[0]
+
+        # Tiebreaker within equal-recency tier: prefer the set least represented so
+        # far in this pass. Prevents stable-sort insertion order from exhausting
+        # house+b2b before platform/platform_ads are ever reached on cold-start runs.
+        top_date = _last_served_date(os.path.basename(candidates[0].path))
+        top_tier = [c for c in candidates
+                    if _last_served_date(os.path.basename(c.path)) == top_date]
+        if len(top_tier) > 1:
+            min_count = min(plan_set_counts.get(_creative_set(c), 0) for c in top_tier)
+            top_tier = [c for c in top_tier
+                        if plan_set_counts.get(_creative_set(c), 0) == min_count]
+
+        chosen = top_tier[0]
+        plan_set_counts[_creative_set(chosen)] = plan_set_counts.get(
+            _creative_set(chosen), 0) + 1
         c_key = os.path.basename(chosen.path)
         c_canvas = _creative_canvas(chosen)
 
