@@ -6,12 +6,12 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-02 evening (STAGE 2 BUILDOUT landed, suite 226 green: multi-client
-foundation, texted-link intake web + listener ingest, draft-bible CLI, Social Grade v1,
-social proof cards, Meta App Review kit + Stage 2 runbook. Every new flag defaults OFF
-(AGENT_INTAKE_ENABLED, AGENT_GRADE_ENABLED, AGENT_SOCIAL_PROOF_ENABLED). Morning:
-scheduler hardened (loud no-card alerts + persisted run date). Production armed set
-unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
+Last updated: 2026-07-06 (Calendar V2 + plan-month round-robin. Suite 633 green, 7 pre-existing
+reportlab. Calendar: full post in each cell (image/placeholder + complete caption + hashtags +
+chips + status), tap-to-expand modal per day (full-size image, caption, hashtags, canvas/layout,
+source citation, status; Approve/Edit/Kill display-only). Plan-month round-robin fix: cold-start
+insertion-order bias corrected, all four sets now reachable. Prev: 2026-07-02 evening STAGE 2
+BUILDOUT landed, suite 226 green.)
 
 ---
 
@@ -412,16 +412,17 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       AGENT_WEEKLY_REPORT_ENABLED (OFF): one card Sundays 6 PM ET, posts /
       approvals / views based engagement on the Day 30 framing rules /
       runway / flags delta / by hand item, honest no data gaps
-- [~] Month calendar artifact (2 parts, one commit each): (A) read only
+- [x] Month calendar artifact V2 (2026-07-06, 2 commits): (A) read only
       month assembler from existing state (posts + the same drafts store
       the Slack cards read, seed calendar keys, schedule skip days,
       specials from draft evidence + the Monday podcast expectation); per
       day concept/caption/canvas/layout/status + special, empty days emit
-      an open slot never an invented concept; (B) calendar-html CLI
-      (--account --month [--upload]): navy grid artifact with status
-      colors, chips, pinned specials, month rollup; approve/edit/kill are
-      labeled display only previews (tap stays in Slack until Stage 3);
-      uploads to echo/calendars/<account>_<month>.html
+      an open slot never an invented concept; (B) calendar-html CLI V2:
+      full post per cell (image or placeholder, complete caption,
+      hashtags, canvas/layout chips, status), tap-to-expand modal (full
+      image, complete caption, hashtags, canvas/layout, citation source
+      line, status; Approve/Edit/Kill display-only previews, no write
+      back); uploads to echo/calendars/<account>_<month>.html
 - [x] Runway v2 source + gate fix + plan-month (2026-07-06, 3 commits): (A)
       classify_creatives reads BOTH physical library files (old format, style
       exclusions apply) AND all 46 regen library concept definitions from
