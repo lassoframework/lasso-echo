@@ -227,7 +227,8 @@ def render_html(plan):
                 f"border-radius:8px\">{e(d['layout'])}</span></div>")
         bits.append(f"<div style=\"font-size:10px;color:{color}\">"
                     f"{e(d['status'].upper())}</div>")
-        return (f"<td style=\"vertical-align:top;padding:8px;width:14%;"
+        return (f"<td onclick=\"openDay('{d['date']}')\" "
+                f"style=\"cursor:pointer;vertical-align:top;padding:8px;width:14%;"
                 f"border:1px solid #2A3452;border-top:4px solid {color}\">"
                 + "".join(bits) + "</td>")
 
@@ -252,6 +253,77 @@ def render_html(plan):
         "<button disabled>Kill</button> "
         "these buttons are display previews; the tap still happens in Slack "
         "until Stage 3 wires write back.</p>")
+
+    # Plan data embedded as an HTML attribute so dates inside it are stripped
+    # by the dash-free check (content inside <…> tags is not visible copy).
+    plan_json = _html.escape(json.dumps(days), quote=True)
+
+    # Modal overlay — hidden until openDay() fires.
+    # All element IDs are hyphen-free so no hyphens appear in the JS string
+    # literals (JS body is visible copy after _TAG_RE strips the script tags).
+    modal = (
+        "<div id=\"daymodal\" style=\"display:none;position:fixed;top:0;left:0;"
+        "width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:100;"
+        "align-items:center;justify-content:center\" onclick=\"closeModal()\">"
+        "<div style=\"background:#1A2340;padding:24px;max-width:600px;width:90%;"
+        "max-height:90vh;overflow-y:auto;border:1px solid #2A3452;"
+        "position:relative\" onclick=\"event.stopPropagation()\">"
+        "<button onclick=\"closeModal()\" style=\"position:absolute;top:12px;"
+        "right:12px;background:none;border:none;color:#B9C2D8;font-size:20px;"
+        "cursor:pointer\">x</button>"
+        "<div id=\"modaldate\" style=\"font-weight:bold;font-size:16px;"
+        "margin-bottom:12px\"></div>"
+        "<div id=\"modalstatus\" style=\"font-size:12px;"
+        "margin-bottom:8px\"></div>"
+        "<div id=\"modalthumb\" style=\"margin-bottom:12px\">"
+        "<img id=\"modalimg\" src=\"\" style=\"display:none;max-width:100%;"
+        "max-height:400px\">"
+        "<div id=\"modalph\" style=\"display:none;background:#2A3452;"
+        "padding:12px;text-align:center;color:#8A93A6\">image pending</div>"
+        "</div>"
+        "<div id=\"modalcaption\" style=\"white-space:pre-wrap;color:#B9C2D8;"
+        "margin-bottom:8px;font-size:13px\"></div>"
+        "<div id=\"modalhashtags\" style=\"color:#5EB9E6;font-size:12px;"
+        "margin-bottom:8px\"></div>"
+        "<div id=\"modalchips\" style=\"font-size:11px;"
+        "margin-bottom:8px\"></div>"
+        "<div id=\"modalsource\" style=\"font-size:11px;color:#8A93A6;"
+        "margin-bottom:12px\"></div>"
+        "<p style=\"color:#8A93A6;font-size:12px\">PREVIEW ONLY: "
+        "<button disabled>Approve</button> <button disabled>Edit</button> "
+        "<button disabled>Kill</button> "
+        "tap still happens in Slack until Stage 3.</p>"
+        "</div></div>"
+        f"<div id=\"plandata\" data-plan=\"{plan_json}\"></div>")
+
+    script = (
+        "<script>"
+        "function openDay(k){"
+        "var el=document.getElementById('plandata');"
+        "var days=JSON.parse(el.dataset.plan);"
+        "var d=null;"
+        "for(var i=0;i<days.length;i++){if(days[i].date===k){d=days[i];break;}}"
+        "if(!d)return;"
+        "var num=parseInt(d.date.substring(8),10);"
+        "document.getElementById('modaldate').textContent=d.weekday+' '+num;"
+        "var img=document.getElementById('modalimg');"
+        "var ph=document.getElementById('modalph');"
+        "img.style.display='none';"
+        "ph.style.display='none';"
+        "if(d.public_url){img.src=d.public_url;img.style.display='block';}"
+        "else if(d.concept){ph.style.display='block';}"
+        "document.getElementById('modalcaption').textContent=d.caption||'';"
+        "document.getElementById('modalhashtags').textContent=d.hashtags||'';"
+        "document.getElementById('modalchips').textContent="
+        "d.canvas?d.canvas+' / '+d.layout:'';"
+        "document.getElementById('modalsource').textContent=d.source||'';"
+        "var sc=document.getElementById('modalstatus');"
+        "sc.textContent=d.status?d.status.toUpperCase():'';"
+        "document.getElementById('daymodal').style.display='flex';}"
+        "function closeModal(){"
+        "document.getElementById('daymodal').style.display='none';}"
+        "</script>")
+
     return (
         "<html><head><title>"
         f"LASSO calendar: {e(plan['account_key'])} {e(_month_title(plan['month']))}"
@@ -265,7 +337,10 @@ def render_html(plan):
         f"<tr>{header}</tr>{''.join(weeks)}</table>"
         "<p style=\"color:#8A93A6\">Statuses read from the same store the "
         "Slack cards read; an open slot is an honest gap, never an invented "
-        "post.</p></body></html>")
+        "post.</p>"
+        f"{modal}"
+        f"{script}"
+        "</body></html>")
 
 
 def cal_key(account_key, month):

@@ -72,7 +72,7 @@ def test_visible_copy_dash_free_and_buttons_preview_only(monkeypatch, tmp_path):
     assert not _DASH_RE.search(visible.replace("lasso_v2_", "").replace(
         "b2b_16_cpl.png", "").replace("one_screen.png", "")), visible
     assert "PREVIEW ONLY" in text
-    assert text.count("<button disabled>") == 3       # approve / edit / kill
+    assert text.count("<button disabled>") == 6       # 3 header + 3 modal
     assert "the tap still happens in Slack" in text
 
 
@@ -169,6 +169,66 @@ def test_cell_shows_exact_caption_and_hashtags(monkeypatch, tmp_path):
     assert "Full caption text here." in text
     assert "#gymlife" in text
     assert "#lasso" in text
+
+
+# ---- PART B: lightbox / tap-to-expand ---------------------------------------
+
+def test_lightbox_structure_present(monkeypatch, tmp_path):
+    """Lightbox structural IDs are present in the rendered HTML."""
+    monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    _seed("lasso_ig")
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert 'id="daymodal"' in text
+    assert 'id="modalcaption"' in text
+    assert 'id="modalsource"' in text
+    assert 'id="plandata"' in text
+    assert 'id="modalchips"' in text
+
+
+def test_lightbox_data_embeds_url_and_full_caption(monkeypatch, tmp_path):
+    """Draft creative_public_url and caption appear inside the data-plan attribute."""
+    draft_url = "https://cdn.echo.test/renders/lightbox_test.png"
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO drafts (draft_id, account_key, status, day_key, "
+            "draft_type, data) VALUES (?,?,?,?,?,?)",
+            ("lb1", "lasso_ig", "approved", "2026-07-04", "feed",
+             json.dumps({"creative_path": "lib/lasso_v2_built_by_gym_owners.png",
+                         "creative_public_url": draft_url,
+                         "caption": "Lightbox caption here.",
+                         "hashtags": ["#echo"],
+                         "source_fragments": ["source: internal"]})))
+        conn.commit()
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    # URL and caption are stored in the data-plan attribute (HTML-escaped)
+    assert "lightbox_test.png" in text
+    assert "Lightbox caption here." in text
+
+
+def test_lightbox_buttons_preview_only(monkeypatch, tmp_path):
+    """Modal adds 3 more disabled buttons; total is 6 (3 header + 3 modal)."""
+    monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    _seed("lasso_ig")
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert text.count("<button disabled>") == 6
+
+
+def test_closing_modal_script_present(monkeypatch, tmp_path):
+    """openDay and closeModal JS functions are present in the rendered HTML."""
+    monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    _seed("lasso_ig")
+    out = calendar_artifact.run("lasso_ig", MONTH,
+                                out_path=str(tmp_path / "c.html"))
+    text = open(out["path"], encoding="utf-8").read()
+    assert "function openDay" in text
+    assert "function closeModal" in text
+    assert "dataset.plan" in text
 
 
 def test_creative_public_url_from_draft_data_used(monkeypatch, tmp_path):
