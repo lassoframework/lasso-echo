@@ -37,6 +37,11 @@ Rule: only lines marked USE are postable. Wording must match exactly.
 - 500+ gym owners: already a USE claim above (current homepage claims section).
   Cite that exact line, do not add a duplicate here.
 
+## USE — speed to lead carousel (approved benchmarks)
+- USE: "Contact a new lead within 5 minutes and you can lift conversions up to 80 percent."
+- USE: "The benchmark is 60 percent show rate on cold traffic."
+- USE: "If your close rate is under 70 percent, the system is the problem, not the salesperson."
+
 ## LOCKED — conflicts, do not post until Blake resolves
 - LOCKED: gyms served appears as 200+ (media kit), 400+ (old site), 500+
   (current homepage), 700+ (a third party review). DEFAULT: 500+ only.

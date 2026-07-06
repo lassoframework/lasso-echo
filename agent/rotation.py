@@ -135,8 +135,9 @@ def pillar_of(creative_path):
 
 def _approved_claims():
     """Every cleared claim sentence: USE-marked knowledge stats + approved social
-    proof entry lines. Empty when those sources are off/absent (conservative)."""
-    claims = list(knowledge.usable_stats())
+    proof entry lines. Uses usable_stats_always so that a note citing an approved
+    source is never blocked merely because AGENT_KNOWLEDGE_ENABLED is OFF."""
+    claims = list(knowledge.usable_stats_always())
     approved, _ = social_proof.load_entries(config.SOCIAL_PROOF_PATH)
     for entry in approved:
         claims.extend(entry.approved_lines())

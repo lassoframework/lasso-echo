@@ -151,6 +151,45 @@ def usable_stats(knowledge_dir=None):
     return stats
 
 
+def _load_corpus_always(knowledge_dir=None):
+    """load_corpus but ignores the AGENT_KNOWLEDGE_ENABLED flag.
+    Used exclusively for gate verification (generation != verification)."""
+    knowledge_dir = knowledge_dir or config.KNOWLEDGE_DIR
+    corpus = {}
+
+    def _ingest(path, name):
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = _usable_lines(fh.read())
+        except OSError:
+            return
+        if any(ln.strip() for ln in lines):
+            corpus[name] = lines
+
+    if os.path.isdir(knowledge_dir):
+        for name in sorted(os.listdir(knowledge_dir)):
+            if _is_source_file(name):
+                _ingest(os.path.join(knowledge_dir, name), name)
+    for name in config.BOOK_SOURCE_FILES:
+        _ingest(os.path.join(config.BOOK_DIR, name), name)
+    return corpus
+
+
+def usable_stats_always(knowledge_dir=None):
+    """USE-marked stats regardless of the AGENT_KNOWLEDGE_ENABLED flag.
+    The fabrication gate uses this so that a note already citing an approved
+    source is never blocked just because knowledge generation is OFF."""
+    stats = []
+    for lines in _load_corpus_always(knowledge_dir).values():
+        for item in join_items(lines):
+            m = _USE_RE.match(item)
+            if m:
+                stats.append(m.group(1))
+    return stats
+
+
 def approved_text(knowledge_dir=None):
     """Every usable line joined per file, for hook/pillar/angle parsing downstream.
     The copy-bank parser only lifts explicitly structured lines from this text, so
