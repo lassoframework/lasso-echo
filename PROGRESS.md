@@ -422,6 +422,20 @@ unchanged: publish + stories + Tier 1 via Railway env; code defaults stay OFF.)
       colors, chips, pinned specials, month rollup; approve/edit/kill are
       labeled display only previews (tap stays in Slack until Stage 3);
       uploads to echo/calendars/<account>_<month>.html
+- [x] Runway v2 source + gate fix + plan-month (2026-07-06, 3 commits): (A)
+      classify_creatives reads BOTH physical library files (old format, style
+      exclusions apply) AND all 46 regen library concept definitions from
+      regen_library.CONCEPTS; v2 concepts (lasso_v2_*) are never off-style by
+      default; runway --explain prints per-set breakdown (house/b2b/platform/
+      platform_ads); (B) fabrication gate decoupled from AGENT_KNOWLEDGE_ENABLED:
+      _approved_claims uses usable_stats_always() so USE-line stats clear the gate
+      regardless of flag; three speed_to_lead_carousel sentences added as USE lines
+      to 02_verified_stats.md; adversarial uncited claims still fail; (C) plan-month
+      CLI fills open posting days from the eligible pool (14-day rotation window,
+      canvas guard, schedule skip, no double-booking); approve-month bulk-approves
+      pending plan drafts; first post per account held for the tap; both behind
+      AGENT_PLAN_MONTH_ENABLED (OFF). Suite 623 green (7 pre-existing reportlab).
+
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake
