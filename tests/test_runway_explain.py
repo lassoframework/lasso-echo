@@ -40,6 +40,7 @@ def _arm(monkeypatch, tmp_path):
 
 def test_explain_reconciles_with_digest_math(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN + [
         ("lasso_p2_statcard.jpg", "Convert 80 percent more with speed."),
         ("lasso_v2_x_story.png", "A story variant."),
@@ -64,6 +65,7 @@ def test_explain_reconciles_with_digest_math(monkeypatch, tmp_path):
 
 def test_explain_output_lines_and_dash_free(monkeypatch, tmp_path, capsys):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN)
     runway.explain("lasso_ig", lib)
     printed = capsys.readouterr().out
@@ -77,6 +79,7 @@ def test_explain_output_lines_and_dash_free(monkeypatch, tmp_path, capsys):
 
 def test_explain_is_read_only(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN)
     rotation.record_served("lasso_ig", "lasso_p1_a.jpg", "p1", "2026-07-05")
     with db.connect() as conn:

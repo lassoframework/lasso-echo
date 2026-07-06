@@ -50,6 +50,7 @@ def test_inert_when_flag_off(monkeypatch, tmp_path):
 
 def test_runway_math(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN)
     # default schedule skips Saturday: 6 posting days / 7 -> 4 assets / (6/7)
     assert runway.runway_days("lasso_ig", lib) == round(4 / (6 / 7), 1)
@@ -57,6 +58,7 @@ def test_runway_math(monkeypatch, tmp_path):
 
 def test_filters_used_gate_dirty_and_off_style(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN + [
         ("lasso_p2_statcard.jpg", "Convert 80 percent more with speed."),  # gate-dirty
     ])
@@ -71,6 +73,7 @@ def test_filters_used_gate_dirty_and_off_style(monkeypatch, tmp_path):
 
 def test_status_line_colors_and_zero_date(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     monkeypatch.setenv("AGENT_RUNWAY_ALERT_DAYS", "7")
     lib = _lib(tmp_path, CLEAN)                                # ~4.7 days -> RED
     line, days = runway.status_line("lasso_ig", lib, "2026-07-06")
@@ -83,6 +86,7 @@ def test_status_line_colors_and_zero_date(monkeypatch, tmp_path):
 
 def test_alert_debounce(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
     rec = RecordingPoster()
     monkeypatch.setattr(ops_alerts, "_default_poster", lambda: rec)
