@@ -100,6 +100,8 @@ def test_no_go_names_each_blocker(monkeypatch, tmp_path, capsys):
 
 def test_zero_runway_blocks(monkeypatch, tmp_path):
     _ready(monkeypatch, tmp_path)
+    from agent import runway as _runway
+    monkeypatch.setattr(_runway, "v2_library_concepts", lambda lib: [])
     empty = tmp_path / "empty_lib"
     empty.mkdir()
     monkeypatch.setattr(config, "LIBRARY_PATH", str(empty))

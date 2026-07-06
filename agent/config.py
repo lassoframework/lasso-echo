@@ -460,6 +460,16 @@ def runway_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_RUNWAY_ENABLED", "false"))
 
 
+def plan_month_enabled() -> bool:
+    """
+    Month planner switch. OFF by default. ON, plan-month fills open posting days
+    from the eligible creative pool (rotation window + canvas guard respected),
+    and approve-month bulk-approves the planned drafts. First post per account
+    is always held for the tap; publishing defaults remain OFF.
+    """
+    return _truthy(os.environ.get("AGENT_PLAN_MONTH_ENABLED", "false"))
+
+
 def monthly_review_enabled() -> bool:
     """
     Monthly review loop switch. OFF by default. ON, the 30 day per account

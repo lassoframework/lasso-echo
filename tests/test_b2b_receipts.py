@@ -70,7 +70,15 @@ def test_receipts_carry_no_dash_characters():
         assert not re.search(r"[‐-―−-]", receipt), receipt
 
 
-def test_flag_off_source_silent_gate_conservative(monkeypatch):
+def test_flag_off_generation_silent_gate_still_reads_use_lines(monkeypatch):
     monkeypatch.delenv("AGENT_KNOWLEDGE_ENABLED", raising=False)
+    # usable_stats (generation path) is correctly empty while the flag is OFF
     assert knowledge.usable_stats() == []
-    assert not rotation.is_gate_clean(RECEIPTS[0], rotation._approved_claims())
+    # _approved_claims always reads USE lines so an approved receipt still clears
+    claims = rotation._approved_claims()
+    assert len(claims) > 0, "usable_stats_always must load claims regardless of flag"
+    assert rotation.is_gate_clean(RECEIPTS[0], claims), (
+        "a USE-line receipt must pass the gate even with knowledge flag OFF")
+    # genuinely uncited claims still fail
+    assert not rotation.is_gate_clean(
+        "Guaranteed $99,000 in wasted spend recovered this week.", claims)

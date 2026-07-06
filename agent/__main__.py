@@ -560,6 +560,15 @@ def main(argv=None):
         else:
             from .runway import explain as runway_explain
             runway_explain(account)
+    elif cmd == "plan-month":
+        # Fill open posting days from the eligible pool (AGENT_PLAN_MONTH_ENABLED).
+        # --write saves pending drafts; without it the run is a dry print.
+        from .plan_month import plan_cli
+        plan_cli(argv[1:])
+    elif cmd == "approve-month":
+        # Bulk-approve pending plan drafts; first post per account held for tap.
+        from .plan_month import approve_cli
+        approve_cli(argv[1:])
     elif cmd == "calendar-html":
         # The month calendar artifact: navy grid HTML from the assembled month
         # (read only against state); --upload posts it to R2 under
