@@ -130,9 +130,10 @@ def explain(account_key, library_path=None):
     days = runway_days(account_key, library_path)
     lines = [f"runway explain for {account_key}:",
              f"  eligible: {len(eligible)} creative(s)"]
-    # Per-set breakdown: house (brand+service), b2b, platform, platform_ads, library.
+    # Per-set breakdown: house (brand+service), b2b, platform, platform_ads, summit, library.
     _SET_MAP = {"brand": "house", "service": "house",
-                "b2b": "b2b", "platform": "platform", "platform_ads": "platform_ads"}
+                "b2b": "b2b", "platform": "platform", "platform_ads": "platform_ads",
+                "summit_campaign": "summit_campaign"}
     from .regen_library import CONCEPTS as _CONCEPTS
     set_counts: dict = {}
     for _c in eligible:

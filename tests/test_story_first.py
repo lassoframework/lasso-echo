@@ -55,7 +55,7 @@ def test_every_concept_context_has_tension_and_resolution():
         # still clean: no dash characters anywhere; digits stay banned in the
         # house sets (the cited swipe sets may carry cited digits, own files)
         for line in lines:
-            if spec.get("set") not in ("b2b", "platform", "platform_ads"):
+            if spec.get("set") not in ("b2b", "platform", "platform_ads", "summit_campaign"):
                 assert "%" not in line and not re.search(r"\d", line), key
             assert not re.search(r"[—–]", line), key
 

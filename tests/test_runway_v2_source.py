@@ -24,7 +24,7 @@ def test_v2_concepts_enter_pool(monkeypatch, tmp_path):
     eligible, excluded = runway.classify_creatives("lasso_ig", lib)
     eligible_keys = {os.path.basename(c.path) for c in eligible}
     expected = {f"lasso_v2_{k}.png" for k in CONCEPTS}
-    assert len(expected) == 56
+    assert len(expected) == 66
     missing = expected - eligible_keys
     assert not missing, f"v2 concepts missing from eligible pool: {sorted(missing)}"
 
@@ -69,7 +69,7 @@ def test_off_style_only_excludes_old_format(monkeypatch, tmp_path):
     # All 46 v2 concepts are eligible
     eligible_v2 = [os.path.basename(c.path) for c in eligible
                    if os.path.basename(c.path).startswith("lasso_v2_")]
-    assert len(eligible_v2) == 56
+    assert len(eligible_v2) == 66
 
 
 def test_explain_per_set_breakdown(monkeypatch, tmp_path, capsys):

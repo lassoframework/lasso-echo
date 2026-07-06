@@ -174,7 +174,8 @@ def test_every_layout_renders_with_every_canvas(tmp_path, monkeypatch):
 # ---- the 16 house concepts: unchanged definitions, original path -------------------------
 def test_house_16_unchanged_and_render_original_path():
     house = {k: v for k, v in regen_library.CONCEPTS.items()
-             if v.get("set") not in ("b2b", "platform", "platform_ads")}
+             if v.get("set") not in ("b2b", "platform", "platform_ads",
+                                     "summit_campaign")}
     assert len(house) == 16
     for key, spec in house.items():
         assert "canvas" not in spec and "layout" not in spec, key

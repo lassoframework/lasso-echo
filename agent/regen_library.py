@@ -845,6 +845,171 @@ CONCEPTS = {
         "canvas": "split",
         "archetype": "headline",
     },
+    # ---- SUMMIT_CAMPAIGN set (LASSO Growth Summit Nashville, November 7 and 8, 2026) ----
+    # Source: LASSO Growth Summit Sponsor Promotion Guide + LASSO Email Sequence PDFs.
+    "summit_announce": {
+        "headline": "One room. 100 owners. Nashville is open.",
+        "cite": ["100 seats only. When the room is full there is no waitlist and no encore."],
+        "concept": [
+            "Tension: a gym owner who knows the gap between grinding and scaling is not talent, it is proximity to operators who already solved what they are solving.",
+            "Resolution: a seat claimed at the LASSO Growth Summit, one room with one hundred serious operators and ten industry leaders, two days to build the plan that changes the next year.",
+            "Support copy (caption, never rendered): Capped at 100 on purpose. This is not a stadium event.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The seat",
+        "layout": "poster",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "summit_playbook": {
+        "headline": "You leave with a plan. Not a notebook.",
+        "concept": [
+            "Tension: a gym owner who has done the conferences and bought the courses and filled the notebooks, and come home to the same gym.",
+            "Resolution: two days at the LASSO Growth Summit and you walk out with a complete growth playbook, offer, marketing, sales, retention, and systems, mapped to your gym and ready for January.",
+            "Support copy (caption, never rendered): Most events end in energy. This one ends in a plan.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The playbook",
+        "layout": "poster",
+        "canvas": "cream",
+        "archetype": "headline",
+    },
+    "summit_room": {
+        "headline": "Ten leaders. Ninety nine other serious operators.",
+        "concept": [
+            "Tension: a gym owner trying to solve hard problems alone, without proximity to anyone who has already solved them.",
+            "Resolution: two days at the LASSO Growth Summit, ten leaders at the table answering the questions that decide your next move, and ninety nine serious operators solving exactly what you are solving, close enough to actually learn from each other.",
+            "Support copy (caption, never rendered): Capped at 100. Small enough to actually know the room.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The room",
+        "layout": "contrast",
+        "canvas": "navy",
+        "archetype": "split",
+    },
+    "summit_flat_year": {
+        "headline": "The flat year is the expensive one.",
+        "concept": [
+            "Tension: the gym owner repeating the same year, same revenue, same stress, same effort that never reaches the bank account, and calling it stability.",
+            "Resolution: two days in Nashville where the flat year gets a name and a fix, surrounded by operators who already broke the pattern and built the plan to end it.",
+            "Support copy (caption, never rendered): Staying the same is not free.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The playbook",
+        "layout": "stat_hero",
+        "canvas": "red",
+        "archetype": "headline",
+    },
+    "summit_leaders": {
+        "headline": "10 leaders who built and scaled. One room.",
+        "cite": ["10 industry leaders who have built and scaled at the highest level."],
+        "concept": [
+            "Tension: a gym owner surrounded by advice from people who have never run a gym at the level they are trying to reach.",
+            "Resolution: ten industry leaders who have built and scaled at the highest level, in one room in Nashville, at the table, answering the questions that decide your next move.",
+            "Support copy (caption, never rendered): Not a guru with a slide deck. Operators who already solved it.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The room",
+        "layout": "framework",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "summit_handbook": {
+        "headline": "Walk out with a complete 2027 growth playbook.",
+        "cite": ["Walk out with a complete 2027 growth playbook. Offer, marketing, sales, and systems mapped to your gym."],
+        "concept": [
+            "Tension: a gym owner heading into a new year with the same rough idea and no mapped plan, knowing that intention without a system just repeats the previous year.",
+            "Resolution: two days at the LASSO Growth Summit and you walk out with your 2027 growth playbook in hand, offer, marketing, sales, and systems mapped to your gym and ready to run Monday morning.",
+            "Support copy (caption, never rendered): That is the difference between inspiration and a year that actually changes.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The playbook",
+        "layout": "checklist",
+        "canvas": "cream",
+        "archetype": "path",
+    },
+    "summit_seats_left": {
+        "headline": "When the room is full there is no waitlist.",
+        "concept": [
+            "Tension: a gym owner who has watched the right opportunity close because they waited too long to decide.",
+            "Resolution: the LASSO Growth Summit, one hundred seats, no waitlist and no encore when it fills, the leaders, the plan, and the room happening once and then gone.",
+            "Support copy (caption, never rendered): The room is aiming to be sold out well before the event.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The seat",
+        "layout": "stat_hero",
+        "canvas": "red",
+        "archetype": "headline",
+    },
+    "summit_final_call": {
+        "headline": "Final seats. The next room is a year away.",
+        "concept": [
+            "Tension: a gym owner whose gut has been telling them to be there, and who is watching the last available seats disappear before they act.",
+            "Resolution: one of the final seats claimed at the LASSO Growth Summit, the room that closes for good when it fills, knowing that after this the next chance to be in this room is a year away.",
+            "Support copy (caption, never rendered): 100 owners, ten leaders, two days, a complete plan for your best year yet.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The seat",
+        "layout": "poster",
+        "canvas": "navy",
+        "archetype": "hero",
+    },
+    "summit_sold_out": {
+        "headline": "We built this room to sell out early. On purpose.",
+        "concept": [
+            "Tension: a gym owner who hears the summit is filling fast and assumes it is marketing pressure, the same urgency script every event runs.",
+            "Resolution: the LASSO Growth Summit, a hard one hundred seat cap with no exceptions, built to sell out at least a month before the event so the operators who are in can plan their travel and fall around it.",
+            "Support copy (caption, never rendered): That is the thing about a 100 seat cap. It feels far away until it is suddenly close.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The seat",
+        "layout": "contrast",
+        "canvas": "split",
+        "archetype": "split",
+    },
+    "summit_countdown": {
+        "headline": "Two days in Nashville. The room decides your next year.",
+        "concept": [
+            "Tension: a gym owner who can feel the difference between owners who are growing and owners who are grinding, and knows the gap is not talent but the room they have been in.",
+            "Resolution: two days at Virgin Hotels Nashville, ten leaders and ninety nine other serious operators, the exact environment where the next year gets decided.",
+            "Support copy (caption, never rendered): It is rarely talent. It is the room they are in.",
+            "Support copy (caption, never rendered): Source: LASSO Growth Summit Email Sequence, July 2026.",
+            "Footer (on image): Nashville, November 7 and 8 2026, lassoframework.com",
+        ],
+        "story": False,
+        "set": "summit_campaign",
+        "pillar": "The room",
+        "layout": "poster",
+        "canvas": "cream",
+        "archetype": "hero",
+    },
 }
 
 
@@ -926,7 +1091,7 @@ def parse_args(args):
                                     "[--only <concept>] [--set brand|service|all] "
                                     "[--dry-run]")
     if set_name not in ("brand", "service", "b2b", "platform",
-                        "platform_ads", "all"):
+                        "platform_ads", "summit_campaign", "all"):
         return None, "all", False, (f"unknown set: {set_name} (brand, service, "
                                     "b2b, platform, platform_ads, or all)")
     if only is not None and only not in CONCEPTS:
@@ -980,7 +1145,8 @@ def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None
     """
     if only:
         keys = [only]
-    elif set_name in ("brand", "service", "b2b", "platform", "platform_ads"):
+    elif set_name in ("brand", "service", "b2b", "platform", "platform_ads",
+                      "summit_campaign"):
         keys = [k for k, v in CONCEPTS.items() if v.get("set") == set_name]
     else:
         keys = list(CONCEPTS)

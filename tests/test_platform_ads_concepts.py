@@ -104,7 +104,8 @@ def test_prior_sets_byte_untouched():
     by_set = {}
     for k, v in regen_library.CONCEPTS.items():
         by_set.setdefault(v.get("set", "brand")
-                          if v.get("set") in ("b2b", "platform", "platform_ads")
+                          if v.get("set") in ("b2b", "platform", "platform_ads",
+                                              "summit_campaign")
                           else "house", {})[k] = v
     assert len(by_set["house"]) == 16 and h(by_set["house"]) == HOUSE_SHA256
     assert len(by_set["b2b"]) == 20 and h(by_set["b2b"]) == B2B_SHA256
@@ -116,7 +117,7 @@ def test_variance_spread_across_46_and_guard_green(monkeypatch, tmp_path):
     for key in regen_library.CONCEPTS:
         canvas, _layout = regen_library.variant_for(key)
         counts[canvas or "cream"] += 1
-    assert len(regen_library.CONCEPTS) == 56
+    assert len(regen_library.CONCEPTS) == 66
     for canvas, n in counts.items():
         assert n >= 3, counts                           # every canvas represented
     # the guard still alternates with the V2 sidecar canvases in play

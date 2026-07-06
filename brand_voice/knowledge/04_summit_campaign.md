@@ -37,3 +37,10 @@ Link: https://lassoframework.com/summit
 6. Who it is for: 100 serious operators. Not hobbyists.
 7. Networking: two days with 99 other serious operators. The room is the ROI.
 8. Urgency: 2026 is closing. Build your 2027 plan before your competitors do.
+
+## USE — LASSO Growth Summit 2026 (Sponsor Guide + Email Sequence, PDFs approved July 2026)
+- USE: 100 seats only. When the room is full there is no waitlist and no encore. (LASSO Growth Summit Email Sequence)
+- USE: 10 industry leaders who have built and scaled at the highest level. Two days in Nashville. (LASSO Growth Summit Email Sequence)
+- USE: Walk out with a complete 2027 growth playbook. Offer, marketing, sales, and systems mapped to your gym. (LASSO Growth Summit Email Sequence)
+- USE: The most expensive year is not a bad one. It is a flat one you repeat. (LASSO Growth Summit Email Sequence)
+- USE: 100 serious operators. No stage pitches. Every minute is real strategy from operators who have done it. (LASSO Growth Summit Sponsor Guide)
