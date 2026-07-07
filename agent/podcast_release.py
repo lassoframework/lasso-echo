@@ -228,6 +228,9 @@ def _next_release_draft(account, day_key, nano_client, s3_client):
         return None  # already carded once; a re-poll never re-cards
     draft = _build_release_draft(account, day_key, latest, nano_client, s3_client)
     if draft is None:
+        # State deliberately NOT advanced: episode stays eligible on the next
+        # poll so a transient studio outage is self-healing without operator
+        # intervention.
         return None
     db.kv_set(f"podcast_release_carded_{latest['guid']}_{account.key}", day_key)
     db.audit("podcast_release", draft.draft_id,

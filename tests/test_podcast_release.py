@@ -236,6 +236,26 @@ def test_template_slots_filled_and_audit_names_template(monkeypatch, tmp_path):
     assert rows and "podcast_release_e" in rows[0]["reason"]  # the pick is logged
 
 
+# ---- dark studio: state not advanced, episode stays eligible --------------------------------
+def test_dark_studio_leaves_episode_eligible(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    podcast_feed.poll(fetch=lambda: FEED)
+    monkeypatch.setattr(creative_studio, "generate", lambda *a, **k: None)
+    d = podcast_release._next_release_draft(_acct(), "2026-07-06", FakeNano(), FakeS3())
+    assert d is None
+    # the carding watermark must NOT have been stamped: the episode stays eligible
+    assert db.kv_get("podcast_release_carded_ep7-guid_lasso_ig") == ""
+    # after the studio recovers, the same episode cards normally on the next poll
+    art = tmp_path / "release.png"
+    art.write_bytes(b"PNG")
+    monkeypatch.setattr(creative_studio, "generate",
+                        lambda *a, **k: {"path": str(art), "prompt": "p"})
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda *a, **k: "https://cdn.echo.test/r.png")
+    d = podcast_release._next_release_draft(_acct(), "2026-07-07", FakeNano(), FakeS3())
+    assert d is not None and "EPISODE 7" in d.caption
+
+
 # ---- flag off = inert ---------------------------------------------------------------------
 def test_flag_off_slot_inert(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
