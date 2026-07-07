@@ -284,6 +284,7 @@ CONCEPTS = {
         "layout": "contrast",
         "canvas": "split",
         "archetype": "split",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_speed_to_lead": {
         "headline": "The gym that answers first wins the member.",
@@ -299,6 +300,7 @@ CONCEPTS = {
         "layout": "poster",
         "canvas": "red",
         "archetype": "hero",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_35k_caught": {
         "headline": "$35,000 in wasted gym ad spend. Found. Named. Fixed.",
@@ -314,6 +316,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "navy",
         "archetype": "headline",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_dynamic_spend": {
         "headline": "Your ad budget should follow signups.",
@@ -328,6 +331,7 @@ CONCEPTS = {
         "layout": "framework",
         "canvas": "split",
         "archetype": "flow",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_booking_gap": {
         "headline": "We book 71.9 percent. The industry books 18.5 percent.",
@@ -343,6 +347,7 @@ CONCEPTS = {
         "layout": "framework",
         "canvas": "split",
         "archetype": "flow",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_16_cpl": {
         "headline": "$16 blended cost per lead. Verified.",
@@ -360,6 +365,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "cream",
         "archetype": "headline",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_diagnosed_in_order": {
         "headline": "More leads will not fix a broken sales conversation.",
@@ -374,6 +380,7 @@ CONCEPTS = {
         "layout": "framework",
         "canvas": "cream",
         "archetype": "path",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_ai_search": {
         "headline": "Last night someone asked AI which gym to join.",
@@ -388,6 +395,7 @@ CONCEPTS = {
         "layout": "poster",
         "canvas": "navy",
         "archetype": "hero",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_dead_buttons": {
         "headline": "7 dead buttons on one gym website. The main one went nowhere.",
@@ -403,6 +411,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "red",
         "archetype": "split",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_500_gyms": {
         "headline": "500+ gym owners deep. We know exactly why gyms stall.",
@@ -417,6 +426,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "navy",
         "archetype": "hero",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_ninety_days": {
         "headline": "Picture your gym ninety days from now.",
@@ -431,6 +441,7 @@ CONCEPTS = {
         "layout": "checklist",
         "canvas": "navy",
         "archetype": "path",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     # ---- B2B expansion set (July 2026) -----------------------------------------
     # Ten additional b2b concepts. Specs only; render by hand via regen-library.
@@ -448,6 +459,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "navy",
         "archetype": "headline",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_dead_leads": {
         "headline": "Your old leads were never called.",
@@ -462,6 +474,7 @@ CONCEPTS = {
         "layout": "contrast",
         "canvas": "cream",
         "archetype": "split",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_monday_numbers": {
         "headline": "Every Monday. Every number. Zero blind spots.",
@@ -476,6 +489,7 @@ CONCEPTS = {
         "layout": "device",
         "canvas": "navy",
         "archetype": "hero",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_owner_brain": {
         "headline": "We think like owners, not marketers.",
@@ -490,6 +504,7 @@ CONCEPTS = {
         "layout": "poster",
         "canvas": "cream",
         "archetype": "hero",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_thirty_day_diagnose": {
         "headline": "In thirty days you will know where your funnel leaks.",
@@ -505,6 +520,7 @@ CONCEPTS = {
         "layout": "framework",
         "canvas": "navy",
         "archetype": "flow",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_duct_tape": {
         "headline": "Stop duct taping tools together.",
@@ -519,6 +535,7 @@ CONCEPTS = {
         "layout": "contrast",
         "canvas": "red",
         "archetype": "split",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_one_partner": {
         "headline": "One partner. Ads, sales, nurture, site, social.",
@@ -533,6 +550,7 @@ CONCEPTS = {
         "layout": "diagram",
         "canvas": "navy",
         "archetype": "flow",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_done_for_you": {
         "headline": "Done for you.",
@@ -548,6 +566,7 @@ CONCEPTS = {
         "layout": "checklist",
         "canvas": "cream",
         "archetype": "path",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_speed_decay": {
         "headline": "The lead you call in 5 minutes beats 10 you call tomorrow.",
@@ -563,6 +582,7 @@ CONCEPTS = {
         "layout": "chart",
         "canvas": "navy",
         "archetype": "headline",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     "b2b_retention_first": {
         "headline": "Members you keep beat members you replace.",
@@ -577,6 +597,7 @@ CONCEPTS = {
         "layout": "stat_hero",
         "canvas": "cream",
         "archetype": "headline",
+        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
     },
     # ---- PLATFORM set (LASSO Platform Overview 2026; source 08_platform_2026.md).
     # Copy is VERBATIM from the approved brief; every stat carries a `cite`

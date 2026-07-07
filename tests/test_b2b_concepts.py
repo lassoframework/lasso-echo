@@ -169,3 +169,22 @@ def test_new_b2b_10_present_dash_free_vendor_free():
         for text in _copy_strings(spec):
             assert not _DASH_RE.search(text), f"{key}: dash in {text!r}"
             assert not _VENDOR_RE.search(text), f"{key}: vendor in {text!r}"
+
+
+def test_all_b2b_have_art_directive():
+    """Every b2b spec carries the shared art_directive field."""
+    for key in B2B_KEYS:
+        spec = regen_library.CONCEPTS[key]
+        assert "art_directive" in spec, f"{key}: missing art_directive"
+        d = spec["art_directive"]
+        assert isinstance(d, str) and d.strip(), f"{key}: art_directive empty"
+        assert "realism" in d.lower(), f"{key}: art_directive missing realism keyword"
+        assert "#121E3C" in d, f"{key}: art_directive missing V3 navy"
+
+
+def test_all_b2b_vendor_free():
+    """No b2b concept (including art_directive) contains vendor or vendors."""
+    for key in B2B_KEYS:
+        spec = regen_library.CONCEPTS[key]
+        for text in list(_copy_strings(spec)) + [spec.get("art_directive", "")]:
+            assert not _VENDOR_RE.search(text), f"{key}: vendor in {text!r}"
