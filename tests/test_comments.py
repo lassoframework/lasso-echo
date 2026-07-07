@@ -9,7 +9,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import comments  # noqa: E402
+from agent import comments, db  # noqa: E402
+from agent.accounts import Account, Platform  # noqa: E402
 
 
 def _on(monkeypatch):
@@ -75,3 +76,98 @@ def test_flag_off_holds(monkeypatch):
     assert c["auto_send"] is False and "disabled" in c["action"].lower()
     d = comments.handle_dm("hi", first_contact=True)
     assert d["auto_send"] is False and "disabled" in d["action"].lower()
+
+
+# ---- state-advance discipline: seen_key only after card delivered ------------
+
+def _acct():
+    return Account(key="lasso_ig", display_name="lasso_ig",
+                   platform=Platform.INSTAGRAM,
+                   token_env="T", target_id_env="TI")
+
+
+class _Comment:
+    def __init__(self, comment_id, text):
+        self.d = {"comment_id": comment_id, "text": text, "created": "2099-01-01T12:00:00"}
+
+    def __getitem__(self, k):
+        return self.d[k]
+
+    def get(self, k, default=None):
+        return self.d.get(k, default)
+
+
+class ExplodingPoster:
+    def post_notice(self, text):
+        raise RuntimeError("Slack is down")
+
+
+class RecordingPoster:
+    def __init__(self):
+        self.notices = []
+
+    def post_notice(self, text):
+        self.notices.append(text)
+
+
+def _kv_delete(key):
+    """Remove a kv entry so tests start from a clean state."""
+    try:
+        with db._lock, db.connect() as conn:
+            conn.execute("DELETE FROM kv WHERE key=?", (key,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def test_seen_key_unset_when_poster_raises(monkeypatch):
+    """If the Slack post raises, comment_seen_X must NOT be stamped so the
+    comment remains eligible on the next poll."""
+    monkeypatch.setenv("AGENT_COMMENTS_ENABLED", "true")
+    comment_id = "cid_explode_state_test_001"
+    _kv_delete(f"comment_seen_{comment_id}")
+    monkeypatch.setattr(comments, "fetch_recent_comments",
+                        lambda account, http=None: [
+                            _Comment(comment_id, "Love this!")
+                        ])
+
+    import pytest
+    with pytest.raises(RuntimeError, match="Slack is down"):
+        comments.process_comments(_acct(), poster=ExplodingPoster())
+
+    assert db.kv_get(f"comment_seen_{comment_id}") == ""
+
+
+def test_seen_key_set_after_successful_post(monkeypatch):
+    """Successful post stamps the seen key so the comment is not re-served."""
+    monkeypatch.setenv("AGENT_COMMENTS_ENABLED", "true")
+    comment_id = "cid_success_state_test_002"
+    _kv_delete(f"comment_seen_{comment_id}")
+    monkeypatch.setattr(comments, "fetch_recent_comments",
+                        lambda account, http=None: [
+                            _Comment(comment_id, "Love this!")
+                        ])
+
+    poster = RecordingPoster()
+    cards = comments.process_comments(_acct(), poster=poster)
+
+    assert cards
+    assert db.kv_get(f"comment_seen_{comment_id}") == "1"
+    assert len(poster.notices) == 1
+
+
+def test_seen_key_set_when_no_poster(monkeypatch):
+    """When poster is None the card is in the return list; seen key still stamps
+    (no retry needed since the card is in the return value)."""
+    monkeypatch.setenv("AGENT_COMMENTS_ENABLED", "true")
+    comment_id = "cid_noposter_state_test_003"
+    _kv_delete(f"comment_seen_{comment_id}")
+    monkeypatch.setattr(comments, "fetch_recent_comments",
+                        lambda account, http=None: [
+                            _Comment(comment_id, "Love this!")
+                        ])
+
+    cards = comments.process_comments(_acct(), poster=None)
+
+    assert cards
+    assert db.kv_get(f"comment_seen_{comment_id}") == "1"

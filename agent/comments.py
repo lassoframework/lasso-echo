@@ -165,7 +165,6 @@ def process_comments(account, http=None, poster=None):
         seen_key = f"comment_seen_{c['comment_id']}"
         if db.kv_get(seen_key):
             continue
-        db.kv_set(seen_key, "1")
         decision = handle_comment(c["text"])
         assert decision["auto_send"] is False  # structural: nothing ever auto-sends
         if decision["tier"] == "TIER1":
@@ -178,7 +177,8 @@ def process_comments(account, http=None, poster=None):
                     "this card.")
         cards.append(card)
         if poster is not None:
-            poster.post_notice(card)
+            poster.post_notice(card)  # if this raises, seen_key stays unset (retry next poll)
+        db.kv_set(seen_key, "1")  # stamp ONLY after card is appended + posted
         db.audit("comment", c["comment_id"],
                  f"{decision['tier']} held for approval", account.key)
     if skipped_pre_arm and not db.kv_get(f"comments_flood_note_{account.key}"):
