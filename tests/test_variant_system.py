@@ -30,7 +30,7 @@ BRIEF_ASSIGNMENT = {
     "b2b_500_gyms": ("navy", "stat_hero"),
     "b2b_diagnosed_in_order": ("cream", "framework"),
     "b2b_ninety_days": ("navy", "checklist"),
-    "b2b_five_vendors": ("split", "contrast"),
+    "b2b_five_companies": ("split", "contrast"),
     "b2b_ai_search": ("navy", "poster"),
     "b2b_speed_to_lead": ("red", "poster"),
     "b2b_dynamic_spend": ("split", "framework"),

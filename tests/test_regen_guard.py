@@ -62,16 +62,16 @@ def test_second_concurrent_invocation_refuses(monkeypatch, tmp_path, capsys):
 def test_stale_lock_clears_dead_pid_and_old_age(monkeypatch, tmp_path, capsys):
     lib = _arm(monkeypatch, tmp_path)
     _write_lock(lib, 999999999, time.time())        # holder pid does not exist
-    out = regen_library.run(only="b2b_five_vendors", nano_client=FakeNano(),
+    out = regen_library.run(only="b2b_five_companies", nano_client=FakeNano(),
                             s3_client=FakeS3(), out_dir=lib)
-    assert "files" in out["b2b_five_vendors"]       # the run proceeded
+    assert "files" in out["b2b_five_companies"]       # the run proceeded
     assert "clearing stale lock" in capsys.readouterr().out
     assert not os.path.exists(os.path.join(lib, regen_library.LOCK_FILE))  # released
     # age based staleness: a live pid but an ancient timestamp also clears
     _write_lock(lib, os.getpid(), time.time() - regen_library.LOCK_STALE_SECONDS - 5)
-    out = regen_library.run(only="b2b_five_vendors", nano_client=FakeNano(),
+    out = regen_library.run(only="b2b_five_companies", nano_client=FakeNano(),
                             s3_client=FakeS3(), out_dir=lib)
-    assert "files" in out["b2b_five_vendors"]
+    assert "files" in out["b2b_five_companies"]
     assert "clearing stale lock" in capsys.readouterr().out
 
 

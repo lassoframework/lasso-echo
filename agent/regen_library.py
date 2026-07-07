@@ -271,11 +271,12 @@ CONCEPTS = {
     # never renders (the one-headline law). A stat headline carries `cite`, the
     # exact receipt line(s) in the approved claims source (02_verified_stats.md,
     # LASSO B2B Ad Swipe File section) that clear it through the gate.
-    "b2b_five_vendors": {
-        "headline": "Five vendors. Five invoices. Zero answers.",
-        "concept": ["Tension: an owner buried at the front desk under five separate vendor invoices, five app windows open, none of them agreeing.",
+    "b2b_five_companies": {
+        "headline": "Five companies. Five invoices. Zero answers.",
+        "concept": ["Tension: an owner buried at the front desk under five separate service invoices, five app windows open, none of them agreeing.",
                     "Resolution: the same owner reading one calm platform screen where every lead lands in one place, labeled ADS, SALES, SOCIAL.",
                     "Support copy (caption, never rendered): One platform. Every lead. Zero blind spots.",
+                    "Art note (never rendered): the hand holding the phone is a natural realistic skin tone, not a navy silhouette.",
                     "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
         "story": False,
         "set": "b2b",

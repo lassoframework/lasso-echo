@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from agent import creative_studio, knowledge, regen_library, rotation  # noqa: E402
 
 B2B_KEYS = [
-    "b2b_five_vendors", "b2b_speed_to_lead", "b2b_35k_caught",
+    "b2b_five_companies", "b2b_speed_to_lead", "b2b_35k_caught",
     "b2b_dynamic_spend", "b2b_16_cpl", "b2b_diagnosed_in_order",
     "b2b_ai_search", "b2b_dead_buttons", "b2b_500_gyms", "b2b_ninety_days",
     # July 2026 expansion
