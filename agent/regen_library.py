@@ -351,6 +351,7 @@ CONCEPTS = {
                  "Trusted by 500+ gym owners"],
         "concept": ["Tension: most gyms overpaying for every single lead and never checking the math.",
                     "Resolution: the blended portfolio number verified line by line, the owner reading it calm at a glance.",
+                    "Art note (never rendered): person shown is a GYM OWNER in athletic wear standing in the gym, turf and rig and equipment behind, not a businessman in a suit. This gym owner is the consistent brand person used across every b2b concept that shows a person.",
                     "Support copy (caption, never rendered): Most of the industry pays double.",
                     "CTA copy (caption, never rendered): Trusted by 500+ gym owners"],
         "story": False,

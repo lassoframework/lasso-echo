@@ -37,7 +37,7 @@ CASE_CONCEPTS = ("platform_fit_mamas", "platform_courage_million")
 
 # frozen definitions of the prior sets: any byte moved changes these
 HOUSE_SHA256 = "7ba719559c5244f4998aa269d59b4da81573d3b69bc004af1a03db0c0be13378"
-B2B_SHA256 = "fa0434c42968c9a90bb8e76889c877e7122d363bf919ec920b98e58e053f610d"
+B2B_SHA256 = "2a8debcf21607d933b7559d8a32bdfc32563a4d94b7dfb9354b0a869d4816deb"
 
 
 def _platform(key):
