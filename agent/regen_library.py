@@ -290,6 +290,7 @@ CONCEPTS = {
         "concept": ["Tension: a fresh lead's message glowing unanswered on a phone while a rival gym's reply already lands.",
                     "Resolution: this gym answers in seconds and a live person books the appointment on the calendar, labeled ANSWERED, BOOKED.",
                     "Support copy (caption, never rendered): AI follows up in seconds. A live person books the appointment.",
+                    "Art note (never rendered): hands holding phones are natural realistic skin tone, matched to b2b_five_companies for set consistency.",
                     "Kicker copy (caption, never rendered): We chase. You close.",
                     "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
         "story": False,
