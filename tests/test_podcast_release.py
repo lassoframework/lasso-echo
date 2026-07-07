@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import config, creative_studio, db, media_host, podcast_feed  # noqa: E402
+from agent import config, creative_studio, db, media_host, ops_alerts, podcast_feed  # noqa: E402
 from agent import podcast_release  # noqa: E402
 from agent.accounts import Account, Platform  # noqa: E402
 from agent.drafter import DraftStatus  # noqa: E402
@@ -254,6 +254,20 @@ def test_dark_studio_leaves_episode_eligible(monkeypatch, tmp_path):
                         lambda *a, **k: "https://cdn.echo.test/r.png")
     d = podcast_release._next_release_draft(_acct(), "2026-07-07", FakeNano(), FakeS3())
     assert d is not None and "EPISODE 7" in d.caption
+
+
+# ---- dark studio: ops alert fires on None, names the episode --------------------------------
+def test_dark_studio_fires_ops_alert(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    podcast_feed.poll(fetch=lambda: FEED)
+    monkeypatch.setattr(creative_studio, "generate", lambda *a, **k: None)
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: fired.append(msg))
+    podcast_release._next_release_draft(_acct(), "2026-07-06", FakeNano(), FakeS3())
+    assert len(fired) == 1
+    assert "7" in fired[0]         # episode number present
+    assert "studio" in fired[0].lower() or "unavailable" in fired[0].lower()
+    assert "eligible" in fired[0]  # operator knows the episode will retry
 
 
 # ---- flag off = inert ---------------------------------------------------------------------

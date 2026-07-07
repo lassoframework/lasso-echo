@@ -231,6 +231,11 @@ def _next_release_draft(account, day_key, nano_client, s3_client):
         # State deliberately NOT advanced: episode stays eligible on the next
         # poll so a transient studio outage is self-healing without operator
         # intervention.
+        ops_alerts.alert(
+            f"podcast release card skipped: studio unavailable for episode "
+            f"{latest['episode']} ({latest['title'][:60]!r}); "
+            f"episode stays eligible"
+        )
         return None
     db.kv_set(f"podcast_release_carded_{latest['guid']}_{account.key}", day_key)
     db.audit("podcast_release", draft.draft_id,
