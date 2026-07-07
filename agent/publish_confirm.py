@@ -13,7 +13,7 @@ OFF BY DEFAULT (`config.publish_confirm_enabled()`). Guarantees:
     logged, or included in any message.
 """
 
-from . import config, ops_alerts
+from . import config, db, ops_alerts
 from .accounts import Platform
 
 
@@ -53,9 +53,15 @@ def _unconfirmed(poster, draft, account, detail):
            f"NOTE: draft {draft.draft_id} published to {account.key} (post is "
            f"live), but verification could not confirm it ({detail}). Check the "
            "page manually when convenient.")
-    ops_alerts.alert(f"published but verify read failed for {account.key} draft "
-                     f"{draft.draft_id}: {detail}. The post itself is live; "
-                     "check manually.")
+    # Dedup: one alert per draft per failure. Slack can retry the tap webhook
+    # causing confirm_publish to run twice; without this guard the same alert
+    # fires twice for the same draft (observed: lasso_fb draft 1527038d4e).
+    alert_key = f"verify_alerted_{draft.draft_id}"
+    if not db.kv_get(alert_key):
+        db.kv_set(alert_key, "1")
+        ops_alerts.alert(f"published but verify read failed for {account.key} draft "
+                         f"{draft.draft_id}: {detail}. The post itself is live; "
+                         "check manually.")
     _audit("published, verify unconfirmed", draft, detail)
     return {"verified": False, "permalink": ""}
 

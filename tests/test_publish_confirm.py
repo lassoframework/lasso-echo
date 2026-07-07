@@ -12,9 +12,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import config, ops_alerts, publish_confirm  # noqa: E402
+from agent import config, db, ops_alerts, publish_confirm  # noqa: E402
 from agent.accounts import Account, Platform  # noqa: E402
 from agent.drafter import Draft  # noqa: E402
+
+
+def _kv_delete(key):
+    try:
+        with db._lock, db.connect() as conn:
+            conn.execute("DELETE FROM kv WHERE key=?", (key,))
+            conn.commit()
+    except Exception:
+        pass
 
 TOKEN = "tok_confirm_secret_123"
 
@@ -174,6 +183,7 @@ def _wire_alerts(monkeypatch):
 def test_verify_http_error_warns_and_alerts(monkeypatch):
     _arm(monkeypatch)
     alerts = _wire_alerts(monkeypatch)
+    _kv_delete("verify_alerted_d1")
     poster = RecordingPoster()
     out = publish_confirm.confirm_publish(
         _draft(), _acct(), Result(), http=RecordingHTTP(status=500), poster=poster)
@@ -192,6 +202,7 @@ def test_verify_http_error_warns_and_alerts(monkeypatch):
 def test_verify_empty_body_is_unconfirmed_not_alarmed(monkeypatch):
     _arm(monkeypatch)
     _wire_alerts(monkeypatch)
+    _kv_delete("verify_alerted_d1")
     poster = RecordingPoster()
     out = publish_confirm.confirm_publish(
         _draft(), _acct(), Result(), http=RecordingHTTP({}), poster=poster)
@@ -211,6 +222,7 @@ def test_verified_without_permalink_when_id_present(monkeypatch):
 def test_verify_without_media_id_makes_no_network_call(monkeypatch):
     _arm(monkeypatch)
     _wire_alerts(monkeypatch)
+    _kv_delete("verify_alerted_d1")
     poster = RecordingPoster()
     out = publish_confirm.confirm_publish(
         _draft(), _acct(), Result(media_id=""), http=ExplodingHTTP(), poster=poster)
@@ -222,6 +234,7 @@ def test_verify_without_media_id_makes_no_network_call(monkeypatch):
 def test_token_never_in_any_message(monkeypatch):
     _arm(monkeypatch)
     alerts = _wire_alerts(monkeypatch)
+    _kv_delete("verify_alerted_d1")
     poster = RecordingPoster()
     publish_confirm.confirm_publish(
         _draft(), _acct(), Result(), http=RecordingHTTP(status=500), poster=poster)
@@ -232,8 +245,8 @@ def test_token_never_in_any_message(monkeypatch):
 
 # ---- 5. the audit trail carries the distinction ------------------------------------
 def test_audit_distinguishes_verified_vs_unconfirmed(monkeypatch):
-    from agent import db
     _arm(monkeypatch)
+    _kv_delete("verify_alerted_d1")
     poster = RecordingPoster()
     publish_confirm.confirm_publish(
         _draft(), _acct(), Result(media_id="OK1"),
@@ -244,6 +257,38 @@ def test_audit_distinguishes_verified_vs_unconfirmed(monkeypatch):
     reasons = [r["reason"] for r in db.audit_rows() if r["kind"] == "publish_confirm"]
     assert any(r.startswith("verified live") for r in reasons)
     assert any(r.startswith("published, verify unconfirmed") for r in reasons)
+
+
+# ---- 6. dedup: same draft called twice fires the alert exactly once -------------
+def test_verify_alert_fires_only_once_per_draft(monkeypatch):
+    """Slack can retry the tap webhook, calling confirm_publish twice for the
+    same draft. The ops alert must fire exactly once (the 2026-07-04 lasso_fb
+    draft 1527038d4e double-alert, reproduced here)."""
+    _arm(monkeypatch)
+    alerts = _wire_alerts(monkeypatch)
+    draft_id = "d_dedup_verify_test_001"
+    _kv_delete(f"verify_alerted_{draft_id}")
+
+    d = Draft(draft_id=draft_id, account_key="lasso_fb", platform="facebook",
+              caption="x", hashtags=[], creative_path="a.png",
+              creative_public_url="", scheduled_for="2026-07-01T18:30:00+00:00",
+              slack_channel="C1", slack_ts="ts1")
+
+    poster = RecordingPoster()
+    # First call: alert fires
+    out1 = publish_confirm.confirm_publish(
+        d, _acct(Platform.FACEBOOK_PAGE, "lasso_fb"),
+        Result(media_id="P9"), http=RecordingHTTP(status=503), poster=poster)
+    # Second call (Slack retry): alert must NOT fire again
+    out2 = publish_confirm.confirm_publish(
+        d, _acct(Platform.FACEBOOK_PAGE, "lasso_fb"),
+        Result(media_id="P9"), http=RecordingHTTP(status=503), poster=poster)
+
+    assert out1 == {"verified": False, "permalink": ""}
+    assert out2 == {"verified": False, "permalink": ""}
+    fired = [n for n in alerts.notices if "verify read failed" in n
+             and draft_id in n]
+    assert len(fired) == 1, f"expected 1 alert, got {len(fired)}: {fired}"
 
 
 def test_real_publish_failure_still_alerts_loudly(monkeypatch):
