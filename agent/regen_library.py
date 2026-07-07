@@ -329,6 +329,21 @@ CONCEPTS = {
         "canvas": "split",
         "archetype": "flow",
     },
+    "b2b_booking_gap": {
+        "headline": "We book 71.9 percent. The industry books 18.5 percent.",
+        "cite": ["We book 71.9 percent. The industry books 18.5 percent. Same leads, very different outcomes."],
+        "concept": ["Tension: a gym owner watching leads arrive but only a fraction ever reach the calendar, the gap invisible and unnamed.",
+                    "Resolution: the booking rate compared side by side, LASSO at 71.9 against an 18.5 industry average, the gap closed by a live booker and AI follow up working together, labeled OUR RATE, INDUSTRY.",
+                    "Support copy (caption, never rendered): Same leads. Very different outcomes.",
+                    "Support copy (caption, never rendered): Source: platform_2026_receipts, verified booking rate data.",
+                    "CTA copy (caption, never rendered): Free 20 minute Growth Call"],
+        "story": False,
+        "set": "b2b",
+        "pillar": "Sales are now",
+        "layout": "framework",
+        "canvas": "split",
+        "archetype": "flow",
+    },
     "b2b_16_cpl": {
         "headline": "$16 blended cost per lead. Verified.",
         "cite": ["$16 blended cost per lead. Blended across the LASSO "

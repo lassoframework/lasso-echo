@@ -37,7 +37,7 @@ CASE_CONCEPTS = ("platform_fit_mamas", "platform_courage_million")
 
 # frozen definitions of the prior sets: any byte moved changes these
 HOUSE_SHA256 = "7ba719559c5244f4998aa269d59b4da81573d3b69bc004af1a03db0c0be13378"
-B2B_SHA256 = "d82b1b11da2be7e5f20cb30ca9bc349dfa3c1e54878f1125ea7a1656bcbe35bf"
+B2B_SHA256 = "fa0434c42968c9a90bb8e76889c877e7122d363bf919ec920b98e58e053f610d"
 
 
 def _platform(key):
@@ -115,7 +115,7 @@ def test_prior_sets_byte_untouched():
     b2b = {k: v for k, v in regen_library.CONCEPTS.items()
            if v.get("set") == "b2b"}
     assert len(house) == 16 and h(house) == HOUSE_SHA256
-    assert len(b2b) == 20 and h(b2b) == B2B_SHA256
+    assert len(b2b) == 21 and h(b2b) == B2B_SHA256
 
 
 def test_variance_still_spread_across_36_and_guard_green(monkeypatch, tmp_path):
@@ -125,7 +125,7 @@ def test_variance_still_spread_across_36_and_guard_green(monkeypatch, tmp_path):
     for key in regen_library.CONCEPTS:
         canvas, _layout = regen_library.variant_for(key)
         counts[canvas or "cream"] += 1
-    assert len(regen_library.CONCEPTS) == 66
+    assert len(regen_library.CONCEPTS) == 67
     for canvas, n in counts.items():
         assert n >= 3, counts
     # and the guard itself still alternates on a mixed canvas library

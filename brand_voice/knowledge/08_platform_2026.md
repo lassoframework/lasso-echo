@@ -37,6 +37,7 @@ training and funnel diagnosis ride along every engagement.
 - USE: "71.9% booked vs an 18.5% industry average. Same leads. Very different
   outcomes." (platform_2026_receipts)
 - USE: "71.9% top booking rate vs the 18.5% industry average." (platform_2026_receipts)
+- USE: "We book 71.9 percent. The industry books 18.5 percent. Same leads, very different outcomes." (platform_2026_receipts)
 - USE: "297 nurtured, 141 responded, 100+ appointments across four gyms." (platform_2026_receipts)
 - USE: "8 of 10 paid leads never even reach the average gym calendar." (platform_2026_receipts)
 - USE: "70%+ trained close rates." (platform_2026_receipts)

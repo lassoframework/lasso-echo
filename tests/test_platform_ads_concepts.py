@@ -36,7 +36,7 @@ BRIEF = {
 }
 
 HOUSE_SHA256 = "7ba719559c5244f4998aa269d59b4da81573d3b69bc004af1a03db0c0be13378"
-B2B_SHA256 = "d82b1b11da2be7e5f20cb30ca9bc349dfa3c1e54878f1125ea7a1656bcbe35bf"
+B2B_SHA256 = "fa0434c42968c9a90bb8e76889c877e7122d363bf919ec920b98e58e053f610d"
 PLATFORM_SHA256 = (
     "aec7a52a25aae2d8c9ba202907c623c7b8f5ed43ba26ed69a66142be4a34738b")
 
@@ -108,7 +108,7 @@ def test_prior_sets_byte_untouched():
                                               "summit_campaign")
                           else "house", {})[k] = v
     assert len(by_set["house"]) == 16 and h(by_set["house"]) == HOUSE_SHA256
-    assert len(by_set["b2b"]) == 20 and h(by_set["b2b"]) == B2B_SHA256
+    assert len(by_set["b2b"]) == 21 and h(by_set["b2b"]) == B2B_SHA256
     assert len(by_set["platform"]) == 10 and h(by_set["platform"]) == PLATFORM_SHA256
 
 
@@ -117,7 +117,7 @@ def test_variance_spread_across_46_and_guard_green(monkeypatch, tmp_path):
     for key in regen_library.CONCEPTS:
         canvas, _layout = regen_library.variant_for(key)
         counts[canvas or "cream"] += 1
-    assert len(regen_library.CONCEPTS) == 66
+    assert len(regen_library.CONCEPTS) == 67
     for canvas, n in counts.items():
         assert n >= 3, counts                           # every canvas represented
     # the guard still alternates with the V2 sidecar canvases in play

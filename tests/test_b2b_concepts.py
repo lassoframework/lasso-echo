@@ -30,6 +30,8 @@ B2B_KEYS = [
     "b2b_owner_brain", "b2b_thirty_day_diagnose", "b2b_duct_tape",
     "b2b_one_partner", "b2b_done_for_you", "b2b_speed_decay",
     "b2b_retention_first",
+    # art direction revision (July 2026)
+    "b2b_booking_gap",
 ]
 
 NEW_B2B_KEYS = B2B_KEYS[10:]  # the July 2026 batch
@@ -70,7 +72,7 @@ def test_all_10_load_with_valid_schema():
         assert any(l.startswith("Tension:") for l in spec["concept"]), key
         assert any(l.startswith("Resolution:") for l in spec["concept"]), key
     assert len([k for k, v in regen_library.CONCEPTS.items()
-                if v.get("set") == "b2b"]) == 20
+                if v.get("set") == "b2b"]) == 21
 
 
 # ---- dash free, adversarially -------------------------------------------------------
@@ -90,7 +92,7 @@ def test_stat_citations_resolve_and_clear_gate(monkeypatch):
     cited = [k for k in B2B_KEYS if _b2b(k).get("cite")]
     assert set(cited) == {"b2b_35k_caught", "b2b_16_cpl",
                           "b2b_dead_buttons", "b2b_500_gyms",
-                          "b2b_speed_decay"}
+                          "b2b_speed_decay", "b2b_booking_gap"}
     for key in cited:
         spec = _b2b(key)
         for cite in spec["cite"]:
