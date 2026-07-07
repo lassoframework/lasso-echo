@@ -30,7 +30,7 @@ import json
 import os
 import re
 
-from . import config, creative_studio, db, media_host, schedule
+from . import config, creative_studio, db, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
 FIRST_PERSON_MARKS = ("our book", "we wrote", "in our book", "sherman and i")
@@ -294,6 +294,10 @@ def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
             client=nano_client,
             palette=creative_studio.BOOK_COVER_PALETTE)  # the ONE scoped exception
         if art is None:
+            ops_alerts.alert(
+                f"book campaign: studio returned nothing for {account.key} "
+                "(studio dark or Gemini unavailable); normal draft path takes the day."
+            )
             return None  # studio unavailable: the normal path takes the day
         creative_path = art["path"]
     hosted = media_host.host_media(creative_path, account.key, client=s3_client)

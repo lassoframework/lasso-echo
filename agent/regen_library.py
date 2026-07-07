@@ -40,7 +40,7 @@ import re
 import time
 from datetime import date, datetime, timezone
 
-from . import config, creative_studio, media_host
+from . import config, creative_studio, media_host, ops_alerts
 
 V2_PREFIX = "lasso_v2_"
 STORY_ASPECT = ("9:16", "1080x1920", "story post")
@@ -1238,6 +1238,10 @@ def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
             if art is None:
                 print(f"[regen] {key} ({variant}): generation unavailable "
                       "(arm AGENT_NANO_ENABLED + AGENT_NANO_API_KEY). Stopping.")
+                ops_alerts.alert(
+                    f"regen-library: studio returned nothing for {key} ({variant}); "
+                    "run stopped (studio dark or Gemini unavailable)."
+                )
                 return results
             hosted = media_host.host_media(art["path"], HOST_TENANT, client=s3_client)
             sidecar = {

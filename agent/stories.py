@@ -23,7 +23,7 @@ AGENT_STORIES_ENABLED before any network call.
 import os
 import re
 
-from . import config, creative_studio, media_host, schedule
+from . import config, creative_studio, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
 
@@ -94,6 +94,11 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                                                client=s3_client)
                 if hosted:
                     creative_path, creative_public_url = art["path"], hosted
+            else:
+                ops_alerts.alert(
+                    f"story 9:16 render returned nothing for {account.key} "
+                    f"(studio dark or Gemini unavailable); reusing feed image."
+                )
 
     return _story_draft(account, day_key, draft_id, feed_draft,
                         creative_path, creative_public_url, fragments)

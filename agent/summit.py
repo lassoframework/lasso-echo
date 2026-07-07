@@ -16,7 +16,7 @@ import os
 import re
 from datetime import date
 
-from . import config, creative_studio, knowledge, media_host, schedule
+from . import config, creative_studio, knowledge, media_host, ops_alerts, schedule
 from .drafter import Draft, DraftStatus, _make_id
 
 SUMMIT_FILE = "04_summit_campaign.md"
@@ -104,6 +104,10 @@ def build_summit_draft(account, day_key, *, voice=None, voice_path=None,
     if not art:
         print(f"[summit] {account.key}: card generation unavailable; "
               "normal draft path takes the day.")
+        ops_alerts.alert(
+            f"summit: studio returned nothing for {account.key} "
+            "(studio dark or Gemini unavailable); normal draft path takes the day."
+        )
         return None
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)
     if not hosted:

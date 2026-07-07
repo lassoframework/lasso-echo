@@ -19,7 +19,7 @@ trail (every fragment is verbatim client text). Nothing here publishes.
 
 import re
 
-from . import config, creative_studio, media_host
+from . import config, creative_studio, media_host, ops_alerts
 from .accounts import active_accounts
 from .drafter import Draft, DraftStatus, TemplateGenerator, _make_id
 from .library import Creative
@@ -121,6 +121,10 @@ def _draft_for_idea(index, idea, account, voice, nano_client, s3_client):
         if not art:
             print(f"[doc intake] {acct_key}: idea {index + 1} image generation produced "
                   "nothing; shipping a text only draft for approval.")
+            ops_alerts.alert(
+                f"doc intake: studio returned nothing for {acct_key} idea {index + 1} "
+                "(studio dark or Gemini unavailable); shipping text-only draft."
+            )
         else:
             hosted = media_host.host_media(art["path"], acct_key, client=s3_client)
             if not hosted:

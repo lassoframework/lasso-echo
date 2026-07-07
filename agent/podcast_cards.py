@@ -189,6 +189,10 @@ def build_card_draft(account, day_key, nano_client=None, s3_client=None):
     art = creative_studio.generate(hook, [support], client=nano_client,
                                    archetype=creative_studio.archetype_for_day(day_key))
     if art is None:
+        ops_alerts.alert(
+            f"podcast card: studio returned nothing for {account.key} episode {n} "
+            "(studio dark or Gemini unavailable); card stays queued."
+        )
         return None
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)
     if not hosted:
