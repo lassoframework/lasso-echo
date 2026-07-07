@@ -270,6 +270,33 @@ def test_dark_studio_fires_ops_alert(monkeypatch, tmp_path):
     assert "eligible" in fired[0]  # operator knows the episode will retry
 
 
+# ---- manual podcast-draft command: held for approval, recovers missed episode ---------------
+def test_podcast_draft_cli_recovery(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    podcast_feed.poll(fetch=lambda: FEED)
+    art = tmp_path / "release.png"
+    art.write_bytes(b"PNG")
+    monkeypatch.setattr(creative_studio, "generate",
+                        lambda *a, **k: {"path": str(art), "prompt": "p"})
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda *a, **k: "https://cdn.echo.test/r.png")
+    d = podcast_release.release_draft_for_episode(
+        _acct(), 7, "2026-07-06", FakeNano(), FakeS3())
+    assert d is not None and d.status == DraftStatus.PENDING
+    assert "EPISODE 7" in d.caption
+    assert d.draft_type == "podcast"
+    assert "cite:podcast_ep7" in d.source_fragments
+    assert db.kv_get("podcast_release_carded_ep7-guid_lasso_ig") == "2026-07-06"
+    # flag off: returns None
+    monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    assert podcast_release.release_draft_for_episode(
+        _acct(), 7, "2026-07-07", FakeNano(), FakeS3()) is None
+    # unknown episode: returns None
+    monkeypatch.setenv("AGENT_PODCAST_ENABLED", "true")
+    assert podcast_release.release_draft_for_episode(
+        _acct(), 999, "2026-07-07", FakeNano(), FakeS3()) is None
+
+
 # ---- flag off = inert ---------------------------------------------------------------------
 def test_flag_off_slot_inert(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)

@@ -274,3 +274,35 @@ def _build_release_draft(account, day_key, ep, nano_client, s3_client):
         source_fragments=[f"cite:podcast_ep{n}", ep["title"], about],
         day_key=day_key, draft_type="podcast",
     )
+
+
+def release_draft_for_episode(account, episode_n, day_key, nano_client=None,
+                               s3_client=None):
+    """
+    Manual redraft: build a release card for a specific episode on demand,
+    bypassing the once-per-episode guard. The draft is PENDING and held for
+    approval; nothing publishes. Use when the scheduled poll was skipped due
+    to a dark studio and the episode needs to be recovered by hand.
+
+    Returns the Draft or None (not found / studio unavailable).
+    """
+    if not config.podcast_enabled():
+        return None
+    ep = podcast_feed.get_episode(episode_n)
+    if ep is None:
+        return None
+    if ep["episode"] is None:
+        return None
+    draft = _build_release_draft(account, day_key, ep, nano_client, s3_client)
+    if draft is None:
+        ops_alerts.alert(
+            f"podcast-draft: studio unavailable for episode {episode_n} "
+            f"manual redraft ({account.key})"
+        )
+        return None
+    db.kv_set(f"podcast_release_carded_{ep['guid']}_{account.key}", day_key)
+    db.audit("podcast_release", draft.draft_id,
+             f"episode {episode_n} release card MANUALLY drafted via "
+             f"{release_concept(ep)['template']} (held for approval)",
+             account.key, day_key)
+    return draft

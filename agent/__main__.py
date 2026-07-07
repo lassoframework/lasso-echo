@@ -582,6 +582,52 @@ def main(argv=None):
         # side effects: the store is byte identical after a run.
         from .monday_preview import run as monday_run
         monday_run()
+    elif cmd == "podcast-draft":
+        # Manual release card recovery (AGENT_PODCAST_ENABLED): build a release
+        # card for a specific episode on demand, bypassing the once-per-episode
+        # guard. Held for Blake's tap. Use when the studio was dark on the
+        # scheduled poll and the episode needs to be recovered by hand.
+        episode, account_key, day_key_arg = None, None, None
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--episode" and i + 1 < len(args_rest):
+                try:
+                    episode = int(args_rest[i + 1])
+                except ValueError:
+                    episode = None
+                i += 2; continue
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--day" and i + 1 < len(args_rest):
+                day_key_arg = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if episode is None:
+            print("usage: python -m agent podcast-draft --episode N "
+                  "[--account KEY] [--day YYYY-MM-DD]")
+        else:
+            from datetime import date
+            from .accounts import active_accounts, get_account
+            from .podcast_release import release_draft_for_episode
+            accounts = ([get_account(account_key)] if account_key
+                        else active_accounts())
+            day = day_key_arg or date.today().isoformat()
+            drafted = 0
+            for acct in accounts:
+                if acct is None:
+                    print(f"podcast-draft: account {account_key!r} not found")
+                    continue
+                d = release_draft_for_episode(acct, episode, day)
+                if d is not None:
+                    print(f"podcast-draft: episode {episode} drafted for "
+                          f"{acct.key} ({d.draft_id}) — held for approval")
+                    drafted += 1
+                else:
+                    print(f"podcast-draft: episode {episode} not drafted "
+                          f"for {acct.key} (flag off, episode not found, "
+                          f"or studio unavailable)")
+            if not drafted:
+                print("podcast-draft: nothing drafted")
     elif cmd == "podcast-status":
         # READ ONLY probe: feed reachable, items seen, latest episode parsed,
         # the armed watermark, and an honest forecast of the next poll.
