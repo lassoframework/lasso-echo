@@ -297,6 +297,44 @@ def test_podcast_draft_cli_recovery(monkeypatch, tmp_path):
         _acct(), 999, "2026-07-07", FakeNano(), FakeS3()) is None
 
 
+# ---- manual redraft (podcast-draft CLI) with dark studio: state not advanced, episode recoverable ---
+def test_manual_redraft_dark_studio_leaves_episode_recoverable(monkeypatch, tmp_path):
+    """release_draft_for_episode with a dark studio must: return None, NOT stamp the
+    carded key (so the episode stays eligible for a second attempt once the studio
+    recovers), and fire an ops alert that names the episode number. This is the
+    redraft path end-to-end lock for the podcast silent-miss sweep."""
+    _arm(monkeypatch, tmp_path)
+    podcast_feed.poll(fetch=lambda: FEED)
+    monkeypatch.setattr(creative_studio, "generate", lambda *a, **k: None)
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: fired.append(msg))
+
+    d = podcast_release.release_draft_for_episode(
+        _acct(), 7, "2026-07-06", FakeNano(), FakeS3())
+
+    assert d is None
+    assert db.kv_get("podcast_release_carded_ep7-guid_lasso_ig") == "", (
+        "state must NOT advance when the studio is dark; "
+        "the episode must stay eligible for the next attempt"
+    )
+    assert len(fired) == 1, f"expected exactly 1 ops alert, got {len(fired)}: {fired}"
+    assert "7" in fired[0]         # episode number named in the alert
+    assert "studio" in fired[0].lower() or "unavailable" in fired[0].lower()
+
+    # After the studio recovers, the SAME episode can be manually redrafted:
+    art = tmp_path / "release.png"
+    art.write_bytes(b"PNG")
+    monkeypatch.setattr(creative_studio, "generate",
+                        lambda *a, **k: {"path": str(art), "prompt": "p"})
+    monkeypatch.setattr(media_host, "host_media",
+                        lambda *a, **k: "https://cdn.echo.test/r.png")
+    d2 = podcast_release.release_draft_for_episode(
+        _acct(), 7, "2026-07-07", FakeNano(), FakeS3())
+    assert d2 is not None and d2.status == DraftStatus.PENDING
+    assert "EPISODE 7" in d2.caption
+    assert db.kv_get("podcast_release_carded_ep7-guid_lasso_ig") == "2026-07-07"
+
+
 # ---- flag off = inert ---------------------------------------------------------------------
 def test_flag_off_slot_inert(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
