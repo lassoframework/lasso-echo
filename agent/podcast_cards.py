@@ -218,6 +218,62 @@ def build_card_draft(account, day_key, nano_client=None, s3_client=None):
     return draft
 
 
+def build_episode_card(account, episode_n, day_key, nano_client=None, s3_client=None):
+    """
+    An episode infographic scoped to ONE specific episode (the Sunday podcast
+    touch), built straight from that episode's stored transcript, bypassing the
+    shared daily queue. One VERBATIM hook/support concept, cited podcast_ep<N>,
+    rendered through the SAME house builder as build_card_draft. PENDING, held
+    for the tap.
+
+    None when: the flag is OFF, no transcript is stored (extract raises), no
+    clean concept exists, or the studio/hosting is unavailable (an alert fires
+    for the studio case, mirroring build_card_draft). Nothing here publishes.
+    """
+    if not config.podcast_enabled():
+        return None
+    n = int(episode_n)
+    try:
+        picks = extract_concepts(n, 2)
+    except ValueError:
+        return None  # no transcript stored / no clean pairs: the touch is silently absent
+    if not picks:
+        return None
+    hook, support = picks[0]
+    # Re-verify verbatim at build time (belt and suspenders, like the queue path).
+    if not (podcast_transcripts.contains_verbatim(n, hook)
+            and podcast_transcripts.contains_verbatim(n, support)):
+        return None
+    art = creative_studio.generate(hook, [support], client=nano_client,
+                                   archetype=creative_studio.archetype_for_day(day_key))
+    if art is None:
+        ops_alerts.alert(
+            f"podcast episode infographic: studio returned nothing for "
+            f"{account.key} episode {n} (studio dark or Gemini unavailable); "
+            "the Sunday touch is skipped this week."
+        )
+        return None
+    hosted = media_host.host_media(art["path"], account.key, client=s3_client)
+    if not hosted:
+        return None
+    caption = (f"{hook}\n\n{support}\n\n"
+               f"We break it down in episode {n} of our podcast. Listen now.")
+    assert not _DASH_RE.search(caption), "podcast episode card caption carries a dash"
+    draft = Draft(
+        draft_id=_make_id(account.key, f"podcast_epcard_{n}", day_key),
+        account_key=account.key, platform=account.platform,
+        caption=caption, hashtags=list(RELEASE_HASHTAGS),
+        creative_path=art["path"], creative_public_url=hosted,
+        scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
+        source_fragments=[f"cite:{podcast_transcripts.citation_id(n)}", hook, support],
+        day_key=day_key, draft_type="podcast",
+    )
+    db.audit("podcast_card", draft.draft_id,
+             f"episode {n} infographic (Sunday touch) drafted (held for approval)",
+             account.key, day_key)
+    return draft
+
+
 def resolve_citation(draft):
     """True when the draft carries exactly one cite:podcast_ep<N> fragment and
     every quoted fragment appears verbatim in that episode's stored transcript."""
