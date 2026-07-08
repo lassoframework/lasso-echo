@@ -31,7 +31,11 @@ def weekday_abbr(day_key):
 
 
 def should_post_on(day_key):
-    """False on a configured skip day (default Saturday); True otherwise."""
+    """False on a configured skip day (default Saturday); True otherwise.
+    When AGENT_CATEGORY_ROTATION is ON, Saturday is always a posting day
+    (it is the platform video slot in the seven-day schedule)."""
+    if config.category_rotation_enabled() and weekday_abbr(day_key) == "sat":
+        return True
     skip = [d.lower() for d in config.POSTING_SKIP_DAYS]
     return weekday_abbr(day_key) not in skip
 

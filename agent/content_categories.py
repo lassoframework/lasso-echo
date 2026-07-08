@@ -1,5 +1,5 @@
 """
-Content category taxonomy and platform sub-topic rotation.
+Content category taxonomy, platform sub-topic rotation, and seven-day posting schedule.
 
 Six categories cover every draftable content source:
   podcast   - episode release cards and infographics (podcast_release, podcast_cards)
@@ -22,8 +22,18 @@ Platform wording filter (applied at caption build time when the flag is ON):
   - "vendor"  -> "company"
   - em dash, en dash, hyphen -> space (stripped per the standing dash law)
 
-All exports are pure functions; no state, no I/O. Gated behind
-config.category_rotation_enabled() in the callers.
+Seven-day posting schedule (AGENT_CATEGORY_ROTATION, default OFF):
+  Mon: podcast release card  (infographic)
+  Tue: platform              (video; fallback infographic + ops alert if no clip)
+  Wed: b2b                   (infographic)
+  Thu: podcast clip          (video; fallback infographic + ops alert if no clip)
+  Fri: summit                (infographic)
+  Sat: platform              (video; fallback infographic + ops alert if no clip)
+  Sun: podcast episode       (infographic)
+
+Most exports are pure functions. apply_daily_format() fires an ops alert when a
+video slot has no clip — it is the only function with a side effect.
+All functions are gated behind config.category_rotation_enabled() in the callers.
 """
 
 import re
@@ -125,3 +135,53 @@ def category_for_draft(draft):
             pass
 
     return "doctrine"
+
+
+# Seven-day posting schedule: weekday abbr -> (category, posting_format, fallback_format).
+# posting_format "video" slots pull from Opus; if no clip exists, fallback_format is used.
+_DAILY_SCHEDULE = {
+    "mon": ("podcast",  "infographic", None),
+    "tue": ("platform", "video",       "infographic"),
+    "wed": ("b2b",      "infographic", None),
+    "thu": ("podcast",  "video",       "infographic"),
+    "fri": ("summit",   "infographic", None),
+    "sat": ("platform", "video",       "infographic"),
+    "sun": ("podcast",  "infographic", None),
+}
+
+
+def schedule_for_day(day_key):
+    """
+    Return (category, posting_format, fallback_format) for day_key.
+    Returns None when AGENT_CATEGORY_ROTATION is OFF.
+    posting_format: "video" | "infographic".
+    fallback_format: "infographic" for video slots; None for infographic-only slots.
+    """
+    from . import config as _cfg
+    if not _cfg.category_rotation_enabled():
+        return None
+    from .schedule import weekday_abbr
+    return _DAILY_SCHEDULE.get(weekday_abbr(day_key))
+
+
+def apply_daily_format(day_key, has_clip, account_key=""):
+    """
+    Resolve the posting format for day_key. When a video slot has no clip, fires
+    one ops alert naming the slot and account, then returns the fallback format.
+
+    Returns "infographic" and fires no alert when AGENT_CATEGORY_ROTATION is OFF.
+    """
+    from . import ops_alerts as _ops
+    from .schedule import weekday_abbr
+    entry = schedule_for_day(day_key)
+    if entry is None:
+        return "infographic"
+    category, fmt, fallback = entry
+    if fmt == "video" and not has_clip:
+        slot = weekday_abbr(day_key).upper()
+        msg = f"empty video slot: {slot} ({category}) has no clip"
+        if account_key:
+            msg += f" for {account_key}"
+        _ops.alert(msg)
+        return fallback or "infographic"
+    return fmt
