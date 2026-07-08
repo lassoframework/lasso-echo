@@ -250,3 +250,23 @@ def test_recency_beats_round_robin(monkeypatch, tmp_path):
     if b2b_key in keys:
         assert keys.index(b2b_key) < p_idx, (
             "b2b (never served) must appear before platform (served 2026-06-01)")
+
+
+# ---- category mix summary in plan-month output (category rotation) -----------------------
+def test_plan_cli_shows_category_mix_when_rotation_on(monkeypatch, tmp_path, capsys):
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CATEGORY_ROTATION", "true")
+    _make_eligibles(monkeypatch, tmp_path)
+    pm.plan_cli(["--account", "lasso_ig", "--month", MONTH])
+    text = capsys.readouterr().out
+    assert "Category mix:" in text
+    assert "podcast" in text and "platform" in text
+
+
+def test_plan_cli_no_category_mix_when_rotation_off(monkeypatch, tmp_path, capsys):
+    _arm(monkeypatch)
+    monkeypatch.delenv("AGENT_CATEGORY_ROTATION", raising=False)
+    _make_eligibles(monkeypatch, tmp_path)
+    pm.plan_cli(["--account", "lasso_ig", "--month", MONTH])
+    text = capsys.readouterr().out
+    assert "Category mix:" not in text

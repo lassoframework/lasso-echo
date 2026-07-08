@@ -254,6 +254,12 @@ def plan_cli(args):
         print(f"  {day_key}  {creative_key}")
     for day_key in out["skipped"]:
         print(f"  {day_key}  (no eligible candidate)")
+    # Category rotation ON: show the category mix + platform sub-topic spread for
+    # the month so balance is visible before approval (OFF -> unchanged output).
+    if config.category_rotation_enabled():
+        from . import category_plan
+        print()
+        print(category_plan.format_summary(category_plan.month_plan(month)))
 
 
 def approve_cli(args):
