@@ -108,8 +108,12 @@ def week_plan(week_monday, platform_seq=0):
             days[6]: "podcast"}
 
     counts = _week_counts(week_monday)
+    # Placement preferences keep any count-2 bucket OFF the adjacent Fri/Sat pair
+    # (Tue is isolated by Mon podcast + Wed b2b): a second summit lands on Tue, a
+    # second platform on Sat, so no non-podcast bucket ever falls on two
+    # consecutive days (the Part 5 spacing law).
     prefs = {
-        "summit":   [fri, sat, tue],
+        "summit":   [fri, tue, sat],
         "platform": [tue, sat, fri],
         "book":     [sat, fri, tue],
         "doctrine": [sat, fri, tue],
@@ -179,6 +183,67 @@ def month_plan(month, platform_seq=0):
             subtopic_spread[e["sub_topic"]] = subtopic_spread.get(e["sub_topic"], 0) + 1
     return {"entries": entries, "weeks": weeks,
             "summary": summary, "subtopic_spread": subtopic_spread}
+
+
+# ---- spacing laws (Part 5) --------------------------------------------------------------
+
+# Buckets exempt from the no-consecutive-day rule. The three podcast touches are
+# intentionally Mon/Thu/Sun and cross the week boundary Sun -> Mon; that adjacency
+# is by design, so podcast alone is exempt.
+_CONSECUTIVE_EXEMPT = frozenset({"podcast"})
+
+CONCEPT_SPACING_DAYS = 21
+
+
+def consecutive_bucket_violations(entries):
+    """
+    (day_a, day_b, category) for every pair of CONSECUTIVE calendar days that
+    share a non-exempt bucket. entries is week_plan/month_plan output. An empty
+    list means the plan respects the no-same-bucket-two-days-running law.
+    """
+    out = []
+    prev = None
+    for e in sorted(entries, key=lambda x: x["day"]):
+        if prev is not None:
+            gap = (date.fromisoformat(e["day"]) - date.fromisoformat(prev["day"])).days
+            if (gap == 1 and e["category"] == prev["category"]
+                    and e["category"] not in _CONSECUTIVE_EXEMPT):
+                out.append((prev["day"], e["day"], e["category"]))
+        prev = e
+    return out
+
+
+def concept_spacing_violations(assignments, min_days=CONCEPT_SPACING_DAYS):
+    """
+    (day_a, day_b, concept) for every time the SAME specific concept repeats
+    within min_days. `assignments` is an iterable of {"day": YYYY-MM-DD,
+    "concept": key}; entries with an empty concept are ignored. This is the guard
+    the creative assigner runs before committing a concept to a day: a concept
+    used inside the 21-day window must be swapped for a fresher one.
+    """
+    out = []
+    last_seen = {}
+    for a in sorted(assignments, key=lambda x: x["day"]):
+        concept = a.get("concept", "")
+        if not concept:
+            continue
+        d = date.fromisoformat(a["day"])
+        if concept in last_seen and (d - last_seen[concept]).days < min_days:
+            out.append((last_seen[concept].isoformat(), a["day"], concept))
+        last_seen[concept] = d
+    return out
+
+
+def entry_concept_key(entry):
+    """
+    The plan-level concept identity used for spacing checks. Only platform days
+    carry a plan-level concept (their sub-topic); the other buckets get their
+    specific concept from the creative layer (a different episode/angle/pillar
+    each time), so they return '' here and are spaced by that layer instead.
+    """
+    if entry.get("category") == "platform" and entry.get("sub_topic"):
+        return f"platform:{entry['sub_topic']}"
+    return ""
 
 
 def format_summary(month_result):
