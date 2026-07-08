@@ -126,4 +126,5 @@ def build_summit_draft(account, day_key, *, voice=None, voice_path=None,
         creative_path=art["path"], creative_public_url=hosted,
         scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
         source_fragments=[angle, fact, cta_line],  # audit: approved lines only
+        draft_type="summit",
     )

@@ -71,6 +71,9 @@ class Draft:
     slack_channel: str = ""
     slack_ts: str = ""
     warnings: list = field(default_factory=list)  # card-time notes (e.g. OCR check)
+    # Category rotation (AGENT_CATEGORY_ROTATION, default OFF). Empty while off.
+    category: str = ""    # one of content_categories.CATEGORIES, or "" when not set
+    sub_topic: str = ""   # platform sub-topic (ads, google, nurture, ...) or ""
 
 
 def _make_id(account_key, creative_path, scheduled_for):
@@ -246,6 +249,8 @@ def draft_post(account, creative, scheduled_for, voice=None,
     # Daily content brain: for a LASSO account with the brain armed, compose the
     # caption ONLY from the approved source doc (never the per-creative note, never
     # invented text). A blocked plan blocks the draft. Off / non-LASSO -> unchanged.
+    plan_category = ""
+    plan_sub_topic = ""
     if config.content_brain_enabled() and account.key.startswith("lasso"):
         plan = content_planner.plan_for(date.today().isoformat())
         if plan.get("blocked"):
@@ -269,6 +274,8 @@ def draft_post(account, creative, scheduled_for, voice=None,
             cta_type, cta_url = config.GBP_DEFAULT_CTA, config.GBP_CTA_URL
         else:
             caption, hashtags, fragments = plan["caption"], plan["hashtags"], plan["fragments"]
+        plan_category = plan.get("category", "")
+        plan_sub_topic = plan.get("sub_topic", "")
     else:
         caption, hashtags, fragments = gen.build(voice, creative)
 
@@ -308,4 +315,6 @@ def draft_post(account, creative, scheduled_for, voice=None,
         cta_type=cta_type,
         cta_url=cta_url,
         topic_type=topic_type,
+        category=plan_category,
+        sub_topic=plan_sub_topic,
     )

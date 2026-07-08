@@ -288,13 +288,40 @@ def plan_for(day_key, path=None):
     # GBP summary: hook + body ONLY — no inline CTA text (it becomes a button), no hashtags.
     summary_lines = ([hook_line] if hook_line else []) + body_lines
 
+    raw_caption = "\n\n".join(caption_lines).strip()
+    raw_summary = "\n\n".join(summary_lines).strip()
+    final_citation = citation or "lasso_now"
+
+    # Category and wording filter (AGENT_CATEGORY_ROTATION, default OFF).
+    # When ON: platform angles (cite:platform_2026_*) get the vendor/dash filter
+    # applied and carry a sub-topic for the 10-day rotation.
+    plan_category = ""
+    plan_sub_topic = ""
+    from . import config as _cfg
+    if _cfg.category_rotation_enabled():
+        from . import content_categories as _cc
+        if final_citation.startswith("platform_2026"):
+            plan_category = "platform"
+            raw_caption = _cc.filter_platform_copy(raw_caption)
+            raw_summary = _cc.filter_platform_copy(raw_summary)
+            plan_sub_topic = _cc.platform_subtopic_for_day(day_key)
+        else:
+            plan_category = "doctrine"
+
+    # Fragments: approved copy lines only + the citation anchor when a real
+    # doctrine angle was found (citation is non-empty). The lasso_now fallback
+    # is NOT added to fragments (it is not an approved copy line; it lives in
+    # the "citation" key only). Behaviour unchanged from before this change.
+    frag_cite = f"cite:{citation}" if citation else ""
     return {
         "pillar": pillar,
-        "caption": "\n\n".join(caption_lines).strip(),
-        "summary": "\n\n".join(summary_lines).strip(),
+        "caption": raw_caption,
+        "summary": raw_summary,
         "cta": cta,
         "hashtags": list(doc.hashtags[:5]),
-        "fragments": list(caption_lines) + ([f"cite:{citation}"] if citation else []),
+        "fragments": list(caption_lines) + ([frag_cite] if frag_cite else []),
         "summary_fragments": list(summary_lines),
-        "citation": citation or "lasso_now",
+        "citation": final_citation,
+        "category": plan_category,
+        "sub_topic": plan_sub_topic,
     }

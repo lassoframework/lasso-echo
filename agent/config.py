@@ -589,3 +589,15 @@ def token_warn_days() -> int:
         return int(os.environ.get("AGENT_TOKEN_WARN_DAYS", "7"))
     except ValueError:
         return 7
+
+
+def category_rotation_enabled() -> bool:
+    """
+    Category rotation controller. OFF by default = zero behavior change; drafts
+    are built exactly as today. ON, every content source is tagged with one of the
+    six categories (podcast, platform, b2b, summit, book, doctrine); platform
+    content carries a sub-topic from the 10-item rotation (no repeat within 10
+    days); and the platform wording filter (vendor -> companies/software/tools/
+    logins; dash removal) is applied at caption build time.
+    """
+    return _truthy(os.environ.get("AGENT_CATEGORY_ROTATION", "false"))
