@@ -678,6 +678,12 @@ def main(argv=None):
         # truncated key-scrubbed body when the account looks empty to this key.
         from .opus_ingest import opus_check
         opus_check()
+    elif cmd == "opus-doctor":
+        # READ-ONLY factory preflight (AGENT_OPUS_FACTORY_ENABLED): key prefix,
+        # HTTP status, project count, first project's raw status. Five-second
+        # "is this key actually working?" check before running opus-pull.
+        from .opus_ingest import opus_doctor
+        opus_doctor()
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
