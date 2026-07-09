@@ -762,3 +762,68 @@ def opus_weekly_cap() -> int:
         return max(0, int(os.environ.get("AGENT_OPUS_WEEKLY_CAP", "2")))
     except ValueError:
         return 2
+
+
+# ---- Native clipper (episode video -> 4-5 finished vertical Reels, inside Echo) ----
+# Replaces third-party clip platforms. Phase 1 is SELECTION only (episode intake,
+# word-level transcription, Claude moment picking, dry-run plan). Rendering is a
+# separate Phase 2. Master flag OFF: no intake, no transcription, no LLM call.
+# Secrets (transcription + LLM keys) are read by env var NAME only, never logged.
+CLIPPER_TRANSCRIBE_KEY_ENV = "AGENT_TRANSCRIBE_API_KEY"  # name only, not the value
+CLIPPER_LLM_KEY_ENV = "ANTHROPIC_API_KEY"               # name only, not the value
+
+
+def clipper_enabled() -> bool:
+    """Native clipper master switch. OFF by default = zero behavior change: the CLI
+    refuses, nothing is staged, transcribed, or sent to the LLM. ON, an episode
+    video can be staged, transcribed with word-level timestamps, and fed to Claude
+    for moment selection (Phase 1 stops at the dry-run plan; rendering is Phase 2)."""
+    return _truthy(os.environ.get("AGENT_CLIPPER_ENABLED", "false"))
+
+
+def clipper_score_floor() -> float:
+    """Honest 0-100 strength floor for a candidate moment (env
+    AGENT_CLIPPER_SCORE_FLOOR, default 80). Anything below is dropped."""
+    try:
+        return float(os.environ.get("AGENT_CLIPPER_SCORE_FLOOR", "80"))
+    except ValueError:
+        return 80.0
+
+
+def clipper_min_sec() -> float:
+    """Shortest candidate moment the selector keeps (env AGENT_CLIPPER_MIN_SEC,
+    default 30s)."""
+    try:
+        return float(os.environ.get("AGENT_CLIPPER_MIN_SEC", "30"))
+    except ValueError:
+        return 30.0
+
+
+def clipper_max_sec() -> float:
+    """Longest candidate moment the selector keeps (env AGENT_CLIPPER_MAX_SEC,
+    default 90s)."""
+    try:
+        return float(os.environ.get("AGENT_CLIPPER_MAX_SEC", "90"))
+    except ValueError:
+        return 90.0
+
+
+def clipper_target_count() -> int:
+    """How many candidate moments to ask Claude for (env AGENT_CLIPPER_TARGET_COUNT,
+    default 5; the product target is 4-5 finished Reels per episode)."""
+    try:
+        return max(1, int(os.environ.get("AGENT_CLIPPER_TARGET_COUNT", "5")))
+    except ValueError:
+        return 5
+
+
+def clipper_model() -> str:
+    """The Claude model used for moment selection (judgment work), env
+    AGENT_CLIPPER_MODEL, default Opus 4.8."""
+    return os.environ.get("AGENT_CLIPPER_MODEL", "claude-opus-4-8")
+
+
+def clipper_cache_dir() -> str:
+    """Where episode transcripts are cached so re-runs never re-transcribe (env
+    AGENT_CLIPPER_CACHE_DIR, default /data/clipper on the persistent volume)."""
+    return os.environ.get("AGENT_CLIPPER_CACHE_DIR", "/data/clipper")

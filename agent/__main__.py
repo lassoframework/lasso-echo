@@ -686,6 +686,13 @@ def main(argv=None):
         # is-it-key-or-route test before running opus-pull.
         from .opus_ingest import opus_doctor
         opus_doctor()
+    elif cmd == "clip-episode":
+        # Native clipper (AGENT_CLIPPER_ENABLED): stage a full episode video, get
+        # word-level transcription, and let Claude pick 4-5 candidate Reel moments.
+        # Phase 1 is SELECTION only: with no --render it prints the ranked plan and
+        # writes/renders nothing (the approval checkpoint before any video work).
+        from .clipper import clip_episode_cli
+        clip_episode_cli(argv[1:])
     elif cmd == "opus-organize":
         # Add each pinned project's finished clips to one target collection so the
         # factory scan (collections only) can read them (AGENT_OPUS_FACTORY_ENABLED).

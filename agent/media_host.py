@@ -57,6 +57,18 @@ def _public_url(key):
     return f"{config.S3_PUBLIC_BASE_URL.rstrip('/')}/{key}"
 
 
+def key_for(local_path, tenant):
+    """The tenant-scoped, content-addressed R2 key host_media would use for this
+    file, without uploading. Lets callers (e.g. the clipper) cache work keyed to
+    the same key host_media returns a url for."""
+    return _build_key(local_path, tenant)
+
+
+def public_url_for(key):
+    """The public url for an already-known R2 key (no upload, no client)."""
+    return _public_url(key)
+
+
 class _S3Client:
     """
     Thin wrapper over a boto3 S3 client. Built only with present credentials; the
