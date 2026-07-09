@@ -76,6 +76,11 @@ def classify_creatives(account_key, library_path):
     off_style = rotation.style_exclusions(library_path)
     used = _used_keys(account_key)
     approved_claims = rotation._approved_claims()
+    # Tenant brain (AGENT_TENANT_BRAIN_ENABLED, default OFF -> empty set): a
+    # concept THIS tenant's approver killed never runs again for this tenant.
+    # Per account only; other tenants' rotations never see the kill.
+    from . import tenant_brain
+    killed = tenant_brain.killed_concepts(account_key)
     eligible, excluded = [], {}
     # Both sources: old-format physical files from the library folder AND all
     # v2 regen library concept definitions (which may be R2-only, not on disk).
@@ -93,6 +98,9 @@ def classify_creatives(account_key, library_path):
             continue
         if base in used:
             excluded[base] = "already used (served or posted)"
+            continue
+        if base in killed or os.path.splitext(base)[0] in killed:
+            excluded[base] = "killed by the approver (tenant brain)"
             continue
         if base.startswith("lasso_v2_") and os.path.splitext(base)[0].endswith("_story"):
             excluded[base] = "story variant (never a feed candidate)"

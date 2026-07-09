@@ -659,3 +659,16 @@ def whatsapp_intake_enabled() -> bool:
     same media inbox as every other lane.
     """
     return _truthy(os.environ.get("AGENT_WHATSAPP_INTAKE_ENABLED", "false"))
+
+
+def tenant_brain_enabled() -> bool:
+    """
+    Per-gym tenant brain switch (Stage 2). OFF by default = zero behavior
+    change: no events record, no rotation filtering, prompts untouched. ON,
+    portal learning events (approve streak, edit diff, deny reason, kill)
+    append to brains/<tenant>.md and drafting reads it ALONGSIDE the voice doc:
+    killed concepts excluded from that tenant's rotation only, caption style
+    rules and deny reasons folded into prompts. The brain NEVER adds facts:
+    every prompt line passes the fabrication gate first.
+    """
+    return _truthy(os.environ.get("AGENT_TENANT_BRAIN_ENABLED", "false"))
