@@ -686,6 +686,16 @@ def main(argv=None):
         # is-it-key-or-route test before running opus-pull.
         from .opus_ingest import opus_doctor
         opus_doctor()
+    elif cmd == "opus-organize":
+        # Add each pinned project's finished clips to one target collection so the
+        # factory scan (collections only) can read them (AGENT_OPUS_FACTORY_ENABLED).
+        # Dry-run by default (prints the plan, writes nothing); --write creates the
+        # collection if absent and adds qualifying clips, idempotently. --name
+        # overrides the collection name (default AGENT_OPUS_PODCAST_SHOW or
+        # "LASSO Clips"). Projects come from AGENT_OPUS_PROJECT_IDS (no bulk
+        # project-listing endpoint exists).
+        from .opus_organize import organize_cli
+        organize_cli(argv[1:])
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
