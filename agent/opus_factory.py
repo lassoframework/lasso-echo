@@ -112,6 +112,42 @@ def normalize_clip(clip, project_id, source_title=""):
     )
 
 
+# ---- Part 2: score gate FIRST ----------------------------------------------------------
+def passes_score_gate(record):
+    """
+    (ok, reason). The hard gate that runs BEFORE any tagging, hook check, or
+    caption work: a clip below AGENT_OPUS_SCORE_FLOOR (default 90), or outside
+    the AGENT_OPUS_DURATION_MIN/MAX window (default 15..95s), is dropped. A
+    survivor returns (True, "").
+    """
+    floor = config.opus_score_floor()
+    if record.opus_score < floor:
+        return False, f"score {record.opus_score:g} below floor {floor:g}"
+    lo, hi = config.opus_duration_min(), config.opus_duration_max()
+    if record.duration_s < lo or record.duration_s > hi:
+        return False, (f"duration {record.duration_s:g}s outside window "
+                       f"{lo:g}..{hi:g}s")
+    return True, ""
+
+
+def score_gate(records):
+    """
+    Split scanned records into (survivors, dropped). Dropped records are marked
+    status='drop' with the reason; survivors pass through untouched for the next
+    stage. This is the FIRST filter after the scan (score before everything).
+    """
+    survivors, dropped = [], []
+    for r in records:
+        ok, reason = passes_score_gate(r)
+        if ok:
+            survivors.append(r)
+        else:
+            r.status = "drop"
+            r.reason = reason
+            dropped.append(r)
+    return survivors, dropped
+
+
 def scan(api=None, verbose=False):
     """
     Every finished clip across ALL Opus projects, normalized to ClipRecords.

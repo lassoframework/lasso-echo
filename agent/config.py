@@ -687,3 +687,28 @@ def opus_factory_enabled() -> bool:
     approval. Never publishes.
     """
     return _truthy(os.environ.get("AGENT_OPUS_FACTORY_ENABLED", "false"))
+
+
+def opus_score_floor() -> float:
+    """Opus virality score hard floor (env AGENT_OPUS_SCORE_FLOOR, default 90).
+    A clip below this is dropped BEFORE any other factory work."""
+    try:
+        return float(os.environ.get("AGENT_OPUS_SCORE_FLOOR", "90"))
+    except ValueError:
+        return 90.0
+
+
+def opus_duration_min() -> float:
+    """Shortest Opus clip the factory will consider (default 15s)."""
+    try:
+        return float(os.environ.get("AGENT_OPUS_DURATION_MIN", "15"))
+    except ValueError:
+        return 15.0
+
+
+def opus_duration_max() -> float:
+    """Longest Opus clip the factory will consider (default 95s)."""
+    try:
+        return float(os.environ.get("AGENT_OPUS_DURATION_MAX", "95"))
+    except ValueError:
+        return 95.0

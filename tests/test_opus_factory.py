@@ -106,3 +106,47 @@ def test_scan_dedupes_clip_shared_across_projects(monkeypatch):
 def test_normalize_rejects_unexportable():
     assert opus_factory.normalize_clip({"id": "X"}, "P") is None
     assert opus_factory.normalize_clip({"uriForExport": "http://x/y.mp4"}, "P") is None
+
+
+# ---- Part 2: score gate FIRST -------------------------------------------------------------
+def _rec(clip_id="C", score=95, duration_s=30, transcript="", title="",
+         source_title="", project_id="P"):
+    return opus_factory.ClipRecord(
+        clip_id=clip_id, project_id=project_id, source_title=source_title,
+        title=title, opus_score=score, duration_s=duration_s,
+        transcript=transcript, download_url="http://x/y.mp4")
+
+
+def test_score_89_dropped_90_passes(monkeypatch):
+    monkeypatch.delenv("AGENT_OPUS_SCORE_FLOOR", raising=False)   # default 90
+    ok89, reason = opus_factory.passes_score_gate(_rec(score=89))
+    assert ok89 is False and "below floor" in reason
+    ok90, _ = opus_factory.passes_score_gate(_rec(score=90))
+    assert ok90 is True
+
+
+def test_duration_window_default_15_95(monkeypatch):
+    monkeypatch.delenv("AGENT_OPUS_DURATION_MIN", raising=False)
+    monkeypatch.delenv("AGENT_OPUS_DURATION_MAX", raising=False)
+    assert opus_factory.passes_score_gate(_rec(duration_s=14))[0] is False
+    assert opus_factory.passes_score_gate(_rec(duration_s=15))[0] is True
+    assert opus_factory.passes_score_gate(_rec(duration_s=95))[0] is True
+    ok, reason = opus_factory.passes_score_gate(_rec(duration_s=96))
+    assert ok is False and "duration" in reason
+
+
+def test_score_gate_splits_and_marks(monkeypatch):
+    survivors, dropped = opus_factory.score_gate([
+        _rec(clip_id="keep", score=91, duration_s=30),
+        _rec(clip_id="lowscore", score=80, duration_s=30),
+        _rec(clip_id="tooLong", score=99, duration_s=200),
+    ])
+    assert {r.clip_id for r in survivors} == {"keep"}
+    dmap = {r.clip_id: r for r in dropped}
+    assert dmap["lowscore"].status == "drop" and "below floor" in dmap["lowscore"].reason
+    assert "duration" in dmap["tooLong"].reason
+
+
+def test_score_floor_override(monkeypatch):
+    monkeypatch.setenv("AGENT_OPUS_SCORE_FLOOR", "70")
+    assert opus_factory.passes_score_gate(_rec(score=72))[0] is True
