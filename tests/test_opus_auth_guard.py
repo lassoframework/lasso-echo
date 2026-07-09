@@ -479,3 +479,87 @@ def test_documented_shape_flows_through_scan(monkeypatch):
     records = opus_factory.scan(api=_FakeOpus())
     assert {r.clip_id for r in records} == {"COL1.C1"}
     assert records[0].opus_score == 93.0
+
+
+# ---- Part 4: normalize_list_response handles every wire shape -----------------------
+
+def test_normalize_bare_list():
+    body = [{"id": "C1"}, {"id": "C2"}]
+    assert opus_ingest.normalize_list_response(body) == body
+
+
+def test_normalize_bare_list_drops_none_items():
+    assert opus_ingest.normalize_list_response([{"id": "C1"}, None]) == [{"id": "C1"}]
+
+
+def test_normalize_wrapped_data_list():
+    body = {"data": [{"id": "C1"}, {"id": "C2"}], "total": 2}
+    out = opus_ingest.normalize_list_response(body)
+    assert out == [{"id": "C1"}, {"id": "C2"}]
+
+
+def test_normalize_id_keyed_dict_injects_id():
+    """The LIVE shape: {data: {<id>: {...}}} -> flat list with the key as id."""
+    body = {"data": {"COL1": {"title": "Show"}, "COL2": {"title": "Reels"}}}
+    out = opus_ingest.normalize_list_response(body)
+    by_id = {r["id"]: r for r in out}
+    assert set(by_id) == {"COL1", "COL2"}
+    assert by_id["COL1"]["title"] == "Show"
+
+
+def test_normalize_bare_id_keyed_dict():
+    """No wrapper: a top-level id-keyed dict flattens too."""
+    body = {"AAA": {"title": "x"}, "BBB": {"title": "y"}}
+    out = opus_ingest.normalize_list_response(body)
+    assert {r["id"] for r in out} == {"AAA", "BBB"}
+
+
+def test_normalize_id_keyed_dict_keeps_existing_id():
+    """A record that already carries an id is not overwritten by its key."""
+    body = {"KEY1": {"id": "REAL1", "title": "x"}}
+    out = opus_ingest.normalize_list_response(body)
+    assert out[0]["id"] == "REAL1"
+
+
+def test_normalize_alternate_wrappers():
+    assert opus_ingest.normalize_list_response(
+        {"collections": [{"id": "C1"}]}) == [{"id": "C1"}]
+    assert opus_ingest.normalize_list_response(
+        {"clips": [{"id": "K1"}]}) == [{"id": "K1"}]
+    assert opus_ingest.normalize_list_response(
+        {"items": [{"id": "I1"}]}) == [{"id": "I1"}]
+
+
+def test_normalize_empty_shapes():
+    assert opus_ingest.normalize_list_response(None) == []
+    assert opus_ingest.normalize_list_response([]) == []
+    assert opus_ingest.normalize_list_response({}) == []
+    assert opus_ingest.normalize_list_response({"data": []}) == []
+    assert opus_ingest.normalize_list_response({"data": {}}) == []
+    assert opus_ingest.normalize_list_response({"total": 0}) == []   # metadata only
+    assert opus_ingest.normalize_list_response("nonsense") == []
+
+
+def test_scan_consumes_normalizer_on_id_keyed_dict(monkeypatch):
+    """End to end at the HTTP layer: scan() survives the id-keyed dict shape from
+    both /api/collections and /api/exportable-clips via the normalizer."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-testkey99")
+    monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
+
+    def _fake_get(url, params=None, headers=None, timeout=30):
+        if "/api/collections" in url:
+            return _FakeResponse(200,
+                '{"data": {"COL1": {"title": "Gym Marketing Made Simple"}}}')
+        if "/api/exportable-clips" in url:
+            return _FakeResponse(200,
+                '{"data": {"COL1.C1": {"title": "Clip", "durationMs": 40000,'
+                ' "uriForExport": "https://cdn.opus/c.mp4", "score": 93,'
+                ' "transcript": "we book 71.9 percent of leads"}}}')
+        return _FakeResponse(404, '{"error":"NotFoundException"}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_get)
+    records = opus_factory.scan(api=opus_ingest.OpusAPI("sk-testkey99"))
+    assert {r.clip_id for r in records} == {"COL1.C1"}
+    assert records[0].source_title == "Gym Marketing Made Simple"
