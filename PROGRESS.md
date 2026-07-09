@@ -474,6 +474,27 @@ client, never publishes. New CLI: `python -m agent opus-pull [--write]`.
       AGENT_OPUS_PROJECT_IDS pin are no longer required (the factory scans all
       projects). Both vars remain only for the legacy pull-opus ingest poller.
 
+### Opus scan auth guard (2026-07-09; four parts, built after dry-run returned 0)
+Root cause: OPUS_API_KEY in the live container was `sk-2vtUf...` (rotated/leaked
+key). The scan was swallowing the 401 silently and returning [], which looked like
+a clean zero-results run.
+- [x] Part 1: OpusScanError — typed exception; _get raises it on non-2xx with
+      HTTP status + scrubbed body snippet; scan() re-raises it; opus_pull_cli()
+      catches it and prints "AUTH ERROR (HTTP N)" instead of "0 drafted"
+- [x] Part 2: call-time env reads — config.opus_api_base() and opus_org_id()
+      read from env at each call (no import-time cache); _default_api() uses them
+      and logs the key prefix (first 6 chars) for operator confirmation
+- [x] Part 3: opus-doctor — new `agent opus-doctor` command (behind
+      AGENT_OPUS_FACTORY_ENABLED): key prefix, HTTP status, project count, first
+      project raw status. Five-second "is this key working?" preflight.
+- [x] Part 4: finished-clip filter widened — _FINISHED_STATUSES accepts "done/
+      completed/finished/ready/exported/success/succeeded/published"; exportUrl
+      and export_url key aliases added; verbose scan logs raw status of every
+      excluded clip so the operator can identify new status values
+- Root cause verdict: the key VALUE is stale (sk-2vtUf is the rotated key).
+  BLAKE BY HAND: set the current OPUS_API_KEY in Railway env and redeploy.
+  Run `agent opus-doctor` after redeploy to confirm auth before running opus-pull.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
