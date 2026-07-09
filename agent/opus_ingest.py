@@ -653,8 +653,11 @@ def opus_doctor(http=None):
     # type and key names so the real collections shape is captured for diagnosis.
     print(f"opus-doctor: response shape: {_shape_desc(body)}")
 
-    items = body if isinstance(body, list) else (body or {}).get("data", []) or []
-    total_hint = (body or {}).get("total") or (body or {}).get("totalCount")
+    # Normalize whatever shape the API sent into a flat list (never index a dict).
+    items = normalize_list_response(body)
+    total_hint = (body or {}).get("total") if isinstance(body, dict) else None
+    total_hint = total_hint or ((body or {}).get("totalCount")
+                                if isinstance(body, dict) else None)
     print(f"opus-doctor: {len(items)} collection(s) in this page "
           f"(total hint from API: {total_hint})")
     if items:

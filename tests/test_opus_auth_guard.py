@@ -336,6 +336,46 @@ def test_shape_desc_is_structure_only():
     assert opus_ingest._shape_desc(None) == "NoneType"
 
 
+def test_opus_doctor_survives_id_keyed_dict_shape(monkeypatch, capsys):
+    """The live failure: /api/collections returns {data: {<id>: {...}}}, an
+    id-keyed dict. opus-doctor must report the count + first collection without
+    the old KeyError: 0 crash on items[0]."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        return _FakeResponse(200,
+            '{"data": {"COL1": {"title": "Show", "status": "ready"},'
+            ' "COL2": {"title": "Reels", "status": "ready"},'
+            ' "COL3": {"title": "Summit", "status": "ready"}}}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    result = opus_ingest.opus_doctor()          # must NOT raise
+    printed = capsys.readouterr().out
+    assert result["collections"] == 3
+    assert result["auth_ok"] is True
+    assert "3 collection(s)" in printed
+    assert "COL1" in printed                     # id injected from the dict key
+    assert "ready" in printed                    # first collection raw status
+
+
+def test_opus_doctor_empty_says_so_no_index(monkeypatch, capsys):
+    """An empty collections response reports zero plainly, never indexing."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        return _FakeResponse(200, '{"data": {}}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    result = opus_ingest.opus_doctor()          # must NOT raise
+    printed = capsys.readouterr().out
+    assert result["collections"] == 0
+    assert "NO collections are visible" in printed
+
+
 # ---- Part 4: finished-status filter + verbose raw-status logging --------------------
 
 def test_normalize_clip_accepts_standard_export_url(monkeypatch):
