@@ -323,3 +323,87 @@ def test_ledger_survives_rerun_idempotent():
     for _ in range(3):
         assert opus_factory.already_seen("clipR") is True
     _wipe_ledger("clipR")
+
+
+# ---- Part 7: calendar routing -------------------------------------------------------------
+from agent.accounts import Account, Platform  # noqa: E402
+from agent.drafter import DraftStatus  # noqa: E402
+from agent import trust  # noqa: E402
+
+
+def _eligible(clip_id, bucket, caption="Hook line here.\n\nPayoff.\n\nCTA."):
+    r = _rec(clip_id=clip_id, bucket=bucket)
+    r.caption = caption
+    return r
+
+
+def _clear_ledger(*ids):
+    with _db._lock, _db.connect() as conn:
+        for cid in ids:
+            conn.execute("DELETE FROM kv WHERE key LIKE ?", (f"opus_%{cid}",))
+        conn.commit()
+
+
+def test_route_flag_off_returns_empty(monkeypatch):
+    monkeypatch.delenv("AGENT_OPUS_FACTORY_ENABLED", raising=False)
+    assert opus_factory.route([_eligible("x", "platform")], "2026-08-03") == []
+
+
+def test_route_drafts_are_pending_and_bucket_matched(monkeypatch):
+    _arm(monkeypatch)
+    _clear_ledger("podA", "platA")
+    monkeypatch.setenv("AGENT_OPUS_WEEKLY_CAP", "9")
+    recs = [_eligible("podA", "podcast"), _eligible("platA", "platform")]
+    drafts = opus_factory.route(recs, "2026-08-03", weeks=2)   # 2026-08-03 = Monday
+    assert drafts, "expected drafts"
+    for d in drafts:
+        assert d.status == DraftStatus.PENDING
+        assert d.draft_type == "opus_clip"
+    from agent.schedule import weekday_abbr
+    by_bucket = {d.category: d for d in drafts}
+    # podcast video slot is Thursday; platform video slots are Tue/Sat
+    assert weekday_abbr(by_bucket["podcast"].day_key) == "thu"
+    assert weekday_abbr(by_bucket["platform"].day_key) in ("tue", "sat")
+    _clear_ledger("podA", "platA")
+
+
+def test_route_respects_weekly_cap(monkeypatch):
+    _arm(monkeypatch)
+    ids = [f"c{i}" for i in range(8)]
+    _clear_ledger(*ids)
+    monkeypatch.setenv("AGENT_OPUS_WEEKLY_CAP", "1")
+    # many platform clips; cap = 1 per ISO week
+    recs = [_eligible(cid, "platform") for cid in ids]
+    drafts = opus_factory.route(recs, "2026-08-03", weeks=3)
+    from collections import Counter
+    per_week = Counter(opus_factory._iso_week(d.day_key) for d in drafts)
+    assert per_week and max(per_week.values()) <= 1, per_week
+    _clear_ledger(*ids)
+
+
+def test_route_nothing_auto_publishes(monkeypatch):
+    _arm(monkeypatch)
+    _clear_ledger("trustclip")
+    monkeypatch.setenv("AGENT_TRUST_LADDER_ENABLED", "true")
+    drafts = opus_factory.route([_eligible("trustclip", "platform")], "2026-08-03")
+    assert drafts
+    acct = Account(key="lasso_ig", display_name="IG", platform=Platform.INSTAGRAM,
+                   token_env="X", target_id_env="Y", trust=trust.TrustLevel.ROUTINE_AUTO)
+    d = drafts[0]
+    # even at a raised level, a PENDING opus draft still requires the tap
+    assert trust.requires_approval(acct, d) is True
+    eligible, _reason = trust.auto_eligibility(acct, d)
+    assert eligible is False
+    _clear_ledger("trustclip")
+
+
+def test_route_ledger_prevents_redraft(monkeypatch):
+    _arm(monkeypatch)
+    _clear_ledger("once")
+    monkeypatch.setenv("AGENT_OPUS_WEEKLY_CAP", "9")
+    first = opus_factory.route([_eligible("once", "platform")], "2026-08-03", weeks=2)
+    assert len(first) == 1
+    # re-run after dedupe: the clip is in the ledger, so it is filtered out
+    fresh, seen = opus_factory.dedupe([_eligible("once", "platform")])
+    assert fresh == [] and seen[0].status == "dupe"
+    _clear_ledger("once")

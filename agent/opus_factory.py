@@ -389,6 +389,86 @@ def dedupe(records):
     return fresh, seen
 
 
+# ---- Part 7: calendar routing ----------------------------------------------------------
+def _video_slots(start_day, weeks):
+    """
+    (day, bucket) for every VIDEO-format slot on or after start_day across the
+    horizon, in day order. The bucket is the category the week plan actually
+    assigns that day (so book/doctrine cycling is respected); the format comes
+    from the seven-day schedule. Podcast keeps Thu, platform keeps Tue/Sat.
+    """
+    from datetime import date, timedelta
+    from . import category_plan
+    from .content_categories import _DAILY_SCHEDULE
+    start = str(start_day)[:10]
+    monday = date.fromisoformat(category_plan._monday_of(start))
+    slots, seq = [], 0
+    for w in range(weeks):
+        entries, seq = category_plan.week_plan(
+            (monday + timedelta(days=7 * w)).isoformat(), seq)
+        for e in entries:
+            fmt = _DAILY_SCHEDULE.get(e["weekday"], (None, None, None))[1]
+            if fmt == "video" and e["day"] >= start:
+                slots.append((e["day"], e["category"]))
+    return slots
+
+
+def _iso_week(day):
+    from datetime import date
+    return date.fromisoformat(str(day)[:10]).isocalendar()[:2]
+
+
+def route(records, start_day, account_key="lasso_ig", platform="instagram",
+          weeks=4, store=None):
+    """
+    Place eligible clips (status '', bucketed, captioned) into VIDEO slots on
+    their bucket's cadence and build a DRAFT for each, held for approval.
+
+    Honors: the per-week Opus cap (AGENT_OPUS_WEEKLY_CAP across all buckets),
+    one clip per day (no-repeat spacing), and the bucket cadence (a clip only
+    lands on a day whose plan category is its bucket). Every draft is PENDING
+    and never published; the trust ladder + first-post gate stay the publish
+    path's authority (a PENDING draft can never auto-publish). Placement stamps
+    the ledger so a re-run never re-drafts the clip.
+
+    Returns the list of drafts (empty while the master flag is OFF).
+    """
+    if not config.opus_factory_enabled():
+        return []
+    from .drafter import Draft, DraftStatus, _make_id
+    from . import schedule
+    eligible = [r for r in records if r.status == "" and r.bucket and r.caption]
+    cap = config.opus_weekly_cap()
+    per_week, used_days, drafts = {}, set(), []
+    for day, bucket in _video_slots(start_day, weeks):
+        if day in used_days:
+            continue
+        wk = _iso_week(day)
+        if per_week.get(wk, 0) >= cap:
+            continue
+        clip = next((r for r in eligible
+                     if r.status == "" and r.bucket == bucket), None)
+        if clip is None:
+            continue
+        draft = Draft(
+            draft_id=_make_id(account_key, f"opus_{clip.clip_id}", day),
+            account_key=account_key, platform=platform,
+            caption=clip.caption, hashtags=[],
+            creative_path="", creative_public_url=clip.download_url,
+            scheduled_for=schedule.scheduled_for(day), status=DraftStatus.PENDING,
+            source_fragments=[f"cite:opus_{clip.clip_id}"],
+            day_key=day, draft_type="opus_clip", category=bucket)
+        if store is not None:
+            store.put(draft)
+        mark_drafted(clip.clip_id, day)
+        clip.status = "draft"
+        clip.scheduled_for = draft.scheduled_for
+        used_days.add(day)
+        per_week[wk] = per_week.get(wk, 0) + 1
+        drafts.append(draft)
+    return drafts
+
+
 # ---- Part 2: score gate FIRST ----------------------------------------------------------
 def passes_score_gate(record):
     """

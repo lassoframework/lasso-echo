@@ -729,3 +729,13 @@ def opus_relevance_floor() -> float:
         return float(os.environ.get("AGENT_OPUS_RELEVANCE_FLOOR", "0.65"))
     except ValueError:
         return 0.65
+
+
+def opus_weekly_cap() -> int:
+    """Most Opus factory clips that may be drafted into any one ISO week across
+    all buckets (env AGENT_OPUS_WEEKLY_CAP, default 2). Protects the calendar
+    from a back-catalog flood."""
+    try:
+        return max(0, int(os.environ.get("AGENT_OPUS_WEEKLY_CAP", "2")))
+    except ValueError:
+        return 2
