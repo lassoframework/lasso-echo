@@ -217,6 +217,16 @@ def main(argv=None):
         # SEPARATE web process (own Railway service). R2 only, never /data.
         from .intake_web import serve
         serve()
+    elif cmd == "intake-create":
+        # Tenant scaffold from a completed intake form JSON (AGENT_INTAKE_ENABLED).
+        from .tenants import intake_create_cli
+        payload_path, args = "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--payload" and i + 1 < len(args):
+                payload_path = args[i + 1]; i += 2; continue
+            i += 1
+        intake_create_cli(payload_path)
     elif cmd == "draft-bible":
         # MANUAL onboarding tool: intake doc -> DRAFT bible + social proof under
         # brand_voice/drafts/<client>/. Never auto-activated; a human copies files.
