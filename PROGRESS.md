@@ -556,6 +556,38 @@ lookup for 0.
       this was purely a response-shape parse bug. Fixed for every consumer via
       one normalizer.
 
+### Opus organize (2026-07-09; three parts, built after opus-doctor showed 0 collections)
+Fourth issue: opus-doctor got HTTP 200 but 0 collections. The Opus API docs
+confirm collections are created via POST /api/collections and start empty; the
+account's clips live in PROJECTS and were never added to a collection, so the
+factory scan (collections only) had nothing to read. Routes verified against
+help.opus.pro/api-reference/openapi.json BEFORE coding.
+- [x] Part 1: OpusAPI collection-management methods — _post() helper;
+      create_collection(name) POST /api/collections {collectionName} -> id;
+      list_project_clips(project_id) GET /api/exportable-clips q=findByProjectId;
+      add_clip_to_collection / add_clips_to_collection POST /api/collection-contents
+      {collectionId, contentId} one clip per call (no batch route). Call-time key
+      read + OpusScanError raising reused. NOTE: ExportableClipRepresentation has
+      NO score field, so clip scores are not available from the API.
+- [x] Part 2: `agent opus-organize` (behind AGENT_OPUS_FACTORY_ENABLED). Projects
+      from AGENT_OPUS_PROJECT_IDS (no bulk project-listing endpoint exists).
+      Dry-run (default) prints the plan, writes nothing; --write creates the
+      target collection if absent (name from AGENT_OPUS_PODCAST_SHOW else
+      "LASSO Clips") and adds qualifying finished clips, idempotently (reads the
+      collection's current contents, skips ids already in). --name overrides.
+- [x] Part 3: opus-doctor prints per collection its name + clip count, so after
+      organizing we can confirm clips landed.
+- Routes verdict (exact): CREATE = POST /api/collections body {"collectionName"}
+      -> CollectionDto {collectionId}. ADD = POST /api/collection-contents body
+      {"collectionId","contentId"} where contentId is the clip's composite id
+      {projectId}.{curationId}; ONE clip per call, no batch. LIST PROJECT CLIPS =
+      GET /api/exportable-clips?q=findByProjectId&projectId=. KNOWN GAP: the API
+      returns no clip score, so the factory score gate (floor 90) would bench
+      every clip; scoring is a separate follow-up before opus-pull is useful.
+      BLAKE BY HAND: set OPUS_API_KEY + AGENT_OPUS_PROJECT_IDS (ids from each
+      project URL) in Railway, run `agent opus-organize` (dry-run) then
+      `--write`, then `agent opus-doctor` to confirm the collection clip count.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
