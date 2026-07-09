@@ -6,7 +6,7 @@ approval. It EXTENDS the existing Opus client + poller (opus_ingest.OpusAPI); it
 does not replace them and it never publishes.
 
 Pipeline, one part per stage (this file grows a stage per commit):
-  1. scan        finished clips across ALL projects (no allowlist) -> ClipRecord
+  1. scan        finished clips across ALL collections (no allowlist) -> ClipRecord
   2. score gate  drop anything below the score floor FIRST, and outside the
                  duration window, before any other work
   3. tag         bucket from the transcript (podcast-sourced -> podcast; no
@@ -21,6 +21,22 @@ Everything is read-only until Part 7 builds a draft, and even then a draft is
 PENDING and held for the tap. The fabrication gate stays the sole authority on
 claims: a caption may assert only what the transcript or the approved facts file
 already say.
+
+ROUTE CONTRACT (verified 2026-07-09, source of truth = the legacy pull-opus poller):
+The documented Opus API (https://help.opus.pro/api-reference) has NO bulk
+project-listing endpoint. Discovery is by collection. The proven routes the
+legacy poller (opus_ingest) authenticates and lists with are:
+  - GET /api/collections?q=mine                        -> the account's collections
+  - GET /api/exportable-clips?q=findByCollectionId&collectionId=<id>
+  - GET /api/exportable-clips?q=findByProjectId&projectId=<id>   (pinned ids only)
+  - Auth: Authorization: Bearer <OPUS_API_KEY>  (+ optional x-opus-org-id)
+  - Base: AGENT_OPUS_API_BASE (default https://api.opus.pro)
+The factory originally GUESSED GET /api/projects?q=mine for its "all-project
+scan". That path does not exist and returns 404 NotFoundException, so the scan
+saw zero clips even with a valid key. scan() now discovers via the proven
+collections route (an all-COLLECTION scan, no hand-maintained allowlist), plus
+any pinned AGENT_OPUS_PROJECT_IDS. The base URL and auth header were never the
+problem: both are shared with the legacy poller through OpusAPI._get.
 """
 
 import re
