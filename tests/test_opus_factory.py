@@ -110,11 +110,11 @@ def test_normalize_rejects_unexportable():
 
 # ---- Part 2: score gate FIRST -------------------------------------------------------------
 def _rec(clip_id="C", score=95, duration_s=30, transcript="", title="",
-         source_title="", project_id="P"):
+         source_title="", project_id="P", bucket=""):
     return opus_factory.ClipRecord(
         clip_id=clip_id, project_id=project_id, source_title=source_title,
         title=title, opus_score=score, duration_s=duration_s,
-        transcript=transcript, download_url="http://x/y.mp4")
+        transcript=transcript, download_url="http://x/y.mp4", bucket=bucket)
 
 
 def test_score_89_dropped_90_passes(monkeypatch):
@@ -225,3 +225,56 @@ def test_hook_check_does_not_revive_held():
 
 def test_has_strong_hook_empty_is_false():
     assert opus_factory.has_strong_hook("") is False
+
+
+# ---- Part 5: caption writer ---------------------------------------------------------------
+_DASH_RE = __import__("re").compile(r"[—–‒‐-]")
+
+
+def test_podcast_caption_has_footer_and_soft_cta():
+    r = _rec(bucket="podcast",
+             transcript="Most gyms do not have a lead problem. They have a "
+                        "follow up problem. Fix the follow up and revenue follows.")
+    cap = opus_factory.write_caption(r)
+    assert cap.startswith("Most gyms do not have a lead problem.")
+    assert opus_factory.PODCAST_FOOTER in cap
+    assert "Hear the full conversation" in cap
+    assert "new episode" not in cap.lower()      # evergreen, never "new episode"
+
+
+def test_tier2_caption_bucket_cta_no_footer():
+    r = _rec(bucket="platform",
+             transcript="Your leads do not die in the ads. They die in the "
+                        "handoffs between tools. One platform closes the gap.")
+    cap = opus_factory.write_caption(r)
+    assert opus_factory.PODCAST_FOOTER not in cap          # footer only on podcast
+    assert opus_factory.BUCKET_CTA["platform"] in cap
+
+
+def test_caption_no_claim_absent_from_transcript():
+    transcript = ("We book 71.9 percent of leads. The industry books 18.5 "
+                  "percent. Same leads, very different outcomes.")
+    r = _rec(bucket="platform", transcript=transcript)
+    cap = opus_factory.write_caption(r)
+    assert cap                                              # a caption was written
+    # every claim-bearing sentence in the caption appears in the transcript
+    tl = transcript.lower()
+    for sent in [s.strip() for s in cap.replace("\n", " ").split(".") if s.strip()]:
+        low = sent.lower()
+        if any(ch.isdigit() for ch in low):
+            assert low[:30] in tl or any(low[:20] in t for t in [tl]), sent
+
+
+def test_caption_dash_and_vendor_filters_fire():
+    r = _rec(bucket="platform",
+             transcript="Stop juggling vendors and their logins. One platform "
+                        "replaces the whole stack today.")
+    cap = opus_factory.write_caption(r)
+    assert "vendor" not in cap.lower()
+    assert _DASH_RE.search(cap) is None
+
+
+def test_empty_transcript_held_no_caption():
+    r = _rec(bucket="platform", transcript="")
+    assert opus_factory.write_caption(r) == ""
+    assert r.status == "hold"

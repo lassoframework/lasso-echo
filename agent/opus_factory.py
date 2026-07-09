@@ -263,6 +263,78 @@ def hook_check_all(records):
     return records
 
 
+# ---- Part 5: caption writer from transcript --------------------------------------------
+# Evergreen: these are back-catalog clips, so the podcast CTA points at the full
+# episode, never "new episode is live". The footer rides podcast clips only.
+PODCAST_FOOTER = ("Gym Marketing Made Simple by LASSO. Hosted by Sherman "
+                  "Merricks and Blake Ruff.")
+PODCAST_CTA = "Hear the full conversation on the podcast."
+BUCKET_CTA = {
+    "platform": "See what one platform for your whole gym looks like.",
+    "doctrine": "Save this and put it to work this week.",
+    "b2b": "Send this to a gym owner who needs it.",
+    "summit": "Claim your seat at the summit.",
+    "book": "Get the book.",
+}
+_DEFAULT_CTA = "Save this and put it to work this week."
+
+_SENT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _sentences(text):
+    return [s.strip() for s in _SENT_RE.split((text or "").strip()) if s.strip()]
+
+
+def _sanitize(text):
+    """The standing copy laws on client text: no vendor, no dash characters.
+    Reuses the wording filter (vendor -> company/companies, dashes -> space)."""
+    from .content_categories import filter_platform_copy
+    return filter_platform_copy(text)
+
+
+def write_caption(record):
+    """
+    Build the clip's evergreen caption FROM ITS TRANSCRIPT, in place, and return
+    it. Shape: a hook (the clip's own opening sentence), a one or two line payoff
+    (the next transcript sentences), then the CTA (soft CTA to the full episode +
+    the podcast footer for podcast clips; the bucket CTA and NO footer otherwise).
+
+    Every asserted line is lifted verbatim from the transcript and then
+    sanitized (vendor + dash). The fabrication gate is the sole authority on
+    claims: the caption is checked against the transcript's own sentences plus
+    the approved facts file, so it can assert nothing the transcript or an
+    approved source does not already say. A caption that cannot clear the gate
+    is HELD, never drafted.
+    """
+    from . import rotation
+    sents = _sentences(record.transcript)
+    if not sents:
+        record.status = "hold"
+        record.reason = "no transcript to caption from"
+        return ""
+    hook = sents[0]
+    payoff = " ".join(sents[1:3])
+    cta = (PODCAST_CTA if record.bucket == "podcast"
+           else BUCKET_CTA.get(record.bucket, _DEFAULT_CTA))
+    parts = [hook] + ([payoff] if payoff else []) + [cta]
+    caption = "\n\n".join(parts)
+    if record.bucket == "podcast":
+        caption += "\n\n" + PODCAST_FOOTER
+    caption = _sanitize(caption)
+
+    # Fabrication gate: approved = the (sanitized) transcript sentences + the
+    # approved facts file. A claim-bearing caption line that neither the
+    # transcript nor an approved source clears fails the gate -> HELD.
+    approved = [_sanitize(s) for s in sents] + list(rotation._approved_claims())
+    if not rotation.is_gate_clean(caption, approved_claims=approved):
+        record.status = "hold"
+        record.reason = "caption failed the fabrication gate"
+        record.caption = ""
+        return ""
+    record.caption = caption
+    return caption
+
+
 # ---- Part 2: score gate FIRST ----------------------------------------------------------
 def passes_score_gate(record):
     """
