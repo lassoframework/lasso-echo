@@ -37,6 +37,16 @@ import re
 from . import config, media_host, ops_alerts
 
 STATE_FILE = "opus_state.json"
+
+
+class OpusScanError(Exception):
+    """Non-2xx or transport failure from the Opus API. Carries the HTTP status
+    and a scrubbed body snippet; NEVER the auth token. Raised instead of a
+    silent empty-list return so callers can surface the failure loudly."""
+    def __init__(self, http_status, body_snippet=""):
+        self.http_status = http_status
+        self.body_snippet = body_snippet
+        super().__init__(f"Opus API HTTP {http_status}: {body_snippet}")
 FAILURE_DEADLETTER_AT = 3
 HOST_TENANT = "lasso_library"
 
@@ -110,10 +120,11 @@ class OpusAPI:
 
     def _get(self, path, params=None):
         import requests  # lazy
-        r = requests.get(f"{config.OPUS_API_BASE}{path}", params=params or {},
+        r = requests.get(f"{config.opus_api_base()}{path}", params=params or {},
                          headers=self._headers(), timeout=30)
         if r.status_code >= 400:
-            raise RuntimeError(f"Opus API {r.status_code} on {path}")
+            snippet = ops_alerts.scrub((r.text or "")[:400])
+            raise OpusScanError(r.status_code, snippet)
         return r.json()
 
     def list_collections(self):
@@ -215,7 +226,8 @@ def _default_api():
     key = os.environ.get(config.OPUS_API_KEY_ENV)
     if not key:
         return None
-    return OpusAPI(key, config.OPUS_ORG_ID)
+    print(f"[opus] key prefix: {key[:6]}... (confirm this matches the active key in Railway)")
+    return OpusAPI(key, config.opus_org_id())
 
 
 def _sources(api, vprint=lambda *a, **k: None):
@@ -427,9 +439,10 @@ def opus_check(http=None):
         import requests  # lazy
         http = requests
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
-    if config.OPUS_ORG_ID:
-        headers["x-opus-org-id"] = config.OPUS_ORG_ID
-    url = f"{config.OPUS_API_BASE}/api/collections"
+    org = config.opus_org_id()
+    if org:
+        headers["x-opus-org-id"] = org
+    url = f"{config.opus_api_base()}/api/collections"
     try:
         r = http.get(url, params={"q": "mine"}, headers=headers, timeout=30)
     except Exception as e:
@@ -477,3 +490,91 @@ def opus_check(http=None):
         snippet = scrub(body_text)[:500]
         print(f"opus-check: raw body (truncated, scrubbed): {snippet!r}")
     return {"status": status, "collections": count}
+
+
+def opus_doctor(http=None):
+    """
+    READ-ONLY preflight auth check for the Opus video factory (CLI: opus-doctor).
+    Gated by AGENT_OPUS_FACTORY_ENABLED.  Makes ONE lightweight call (list_projects
+    pageSize=1), prints:
+      • key prefix (first 6 chars only — enough to confirm which key is in use)
+      • HTTP status
+      • project count visible to this key
+      • the first project's raw id and title so you can verify the account looks right
+    Returns a small dict. Never prints the full key or auth headers.
+    """
+    from . import config as _cfg
+    if not _cfg.opus_factory_enabled():
+        print("opus-doctor: AGENT_OPUS_FACTORY_ENABLED is OFF. "
+              "Set it to true to run this check.")
+        return {"enabled": False}
+
+    key = os.environ.get(_cfg.OPUS_API_KEY_ENV)
+    if not key:
+        print("opus-doctor: OPUS_API_KEY is not set in the environment. "
+              "Set it by hand in Railway env vars (never commit it).")
+        return {"enabled": True, "key_present": False}
+
+    prefix = key[:6]
+    print(f"opus-doctor: key prefix {prefix}... "
+          f"(if this is 'sk-2vtU' the key is the rotated/leaked one — "
+          f"set the NEW key in Railway and redeploy)")
+
+    if http is None:
+        import requests
+        http = requests
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    org = _cfg.opus_org_id()
+    if org:
+        headers["x-opus-org-id"] = org
+    url = f"{_cfg.opus_api_base()}/api/projects"
+    try:
+        r = http.get(url, params={"q": "mine", "pageNum": 1, "pageSize": 1},
+                     headers=headers, timeout=30)
+    except Exception as e:
+        print(f"opus-doctor: request failed: {type(e).__name__}: {e}")
+        return {"enabled": True, "key_present": True, "status": None}
+
+    status = getattr(r, "status_code", 0)
+    body_text = getattr(r, "text", "") or ""
+    print(f"opus-doctor: GET /api/projects?q=mine -> HTTP {status}")
+
+    if status in (401, 403):
+        print("opus-doctor: AUTH FAILED. The key was rejected by the Opus API.")
+        print("  Fix: generate a new API key in the OpusClip dashboard (Settings "
+              "> API Keys) and set OPUS_API_KEY in Railway, then redeploy.")
+        snippet = ops_alerts.scrub(body_text)[:400]
+        print(f"opus-doctor: raw body (scrubbed): {snippet!r}")
+        return {"enabled": True, "key_present": True, "status": status,
+                "projects": None, "auth_ok": False}
+
+    if status >= 400:
+        snippet = ops_alerts.scrub(body_text)[:400]
+        print(f"opus-doctor: unexpected HTTP {status}. Body: {snippet!r}")
+        return {"enabled": True, "key_present": True, "status": status,
+                "projects": None, "auth_ok": False}
+
+    try:
+        body = r.json()
+    except Exception:
+        print(f"opus-doctor: response is not JSON. Body: "
+              f"{ops_alerts.scrub(body_text)[:200]!r}")
+        return {"enabled": True, "key_present": True, "status": status,
+                "projects": None, "auth_ok": True}
+
+    items = body if isinstance(body, list) else (body or {}).get("data", []) or []
+    total_hint = (body or {}).get("total") or (body or {}).get("totalCount")
+    print(f"opus-doctor: {len(items)} project(s) in this page "
+          f"(total hint from API: {total_hint})")
+    if items:
+        first = items[0] if isinstance(items[0], dict) else {}
+        pid = first.get("id") or first.get("projectId") or "(no id field)"
+        ptitle = first.get("title") or first.get("name") or first.get("projectName") or ""
+        pstatus = first.get("status") or first.get("projectStatus") or "(no status field)"
+        print(f"opus-doctor: first project  id={pid!r}  title={ptitle!r}  "
+              f"raw status={pstatus!r}")
+    else:
+        print("opus-doctor: NO projects visible to this key. "
+              "Either the account is empty or org-id scoping is wrong.")
+    return {"enabled": True, "key_present": True, "status": status,
+            "projects": len(items), "auth_ok": True}

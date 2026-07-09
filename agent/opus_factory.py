@@ -89,14 +89,34 @@ def _transcript_text(clip):
     return ""
 
 
+# Status values the live Opus API uses to signal a clip is ready for export.
+# Widened from the original uriForExport-only check so minor API variation is
+# tolerated. A clip is EXCLUDED when it has NO export URL AND its status (if
+# present) is not in this set — verbose mode prints the raw status so the
+# operator can identify any new value and add it here.
+_FINISHED_STATUSES = frozenset({
+    "done", "completed", "finished", "ready", "exported",
+    "success", "succeeded", "published",
+})
+
+
 def normalize_clip(clip, project_id, source_title=""):
     """One raw Opus clip dict -> a ClipRecord, or None when it is not a finished,
-    exportable clip (no id or no export url)."""
+    exportable clip. A clip is excluded when it has no usable export URL AND its
+    status field (if present) is not in _FINISHED_STATUSES."""
     clip_id = str(clip.get("id", "") or "")
     download_url = str(clip.get("uriForExport", "") or clip.get("downloadUrl", "")
-                       or clip.get("download_url", "") or "")
-    if not clip_id or not download_url:
-        return None  # unfinished / not exportable: excluded
+                       or clip.get("download_url", "") or clip.get("exportUrl", "")
+                       or clip.get("export_url", "") or "")
+    if not clip_id:
+        return None
+    if not download_url:
+        raw_status = clip.get("status") or clip.get("clipStatus") or ""
+        if raw_status and str(raw_status).lower() not in _FINISHED_STATUSES:
+            return None  # still processing / failed
+        # status is "done" or equivalent but URL is missing — exclude and let
+        # verbose mode show the raw status so the operator can investigate
+        return None
     duration_ms = _first_num(clip, ("durationMs", "duration_ms"))
     duration_s = duration_ms / 1000.0 if duration_ms else _first_num(
         clip, ("durationSeconds", "duration_s", "duration"))
@@ -523,8 +543,11 @@ def scan(api=None, verbose=False):
         return []
     vprint = print if verbose else (lambda *a, **k: None)
 
+    from .opus_ingest import OpusScanError
     try:
         projects = api.list_projects()
+    except OpusScanError:
+        raise  # auth / transport error — let the caller surface it loudly
     except Exception as e:
         vprint(f"[opus-factory] list_projects failed: {type(e).__name__}: {e}")
         return []
@@ -538,16 +561,27 @@ def scan(api=None, verbose=False):
             continue
         try:
             clips = api.list_exportable_clips("findByProjectId", pid)
+        except OpusScanError:
+            raise  # auth / transport error — propagate
         except Exception as e:
             vprint(f"[opus-factory] list clips failed for {pid}: "
                    f"{type(e).__name__}: {e}")
             continue
+        included, excluded_status = 0, []
         for clip in clips:
             rec = normalize_clip(clip, pid, title)
-            if rec is None or rec.clip_id in seen:
+            if rec is None:
+                raw_st = clip.get("status") or clip.get("clipStatus") or "(no status)"
+                excluded_status.append(str(raw_st))
+                continue
+            if rec.clip_id in seen:
                 continue
             seen.add(rec.clip_id)
             records.append(rec)
+            included += 1
+        vprint(f"[opus-factory] project {pid}: {included} clip(s) included, "
+               f"{len(excluded_status)} excluded (raw statuses seen: "
+               f"{sorted(set(excluded_status)) or 'none'})")
     return records
 
 
@@ -624,8 +658,15 @@ def opus_pull_cli(write=False, api=None, start_day=None, poster=None, store=None
     if not config.opus_factory_enabled():
         print("opus-pull: OFF (set AGENT_OPUS_FACTORY_ENABLED=true). Nothing done.")
         return None
-    plan = run_pipeline(api=api, start_day=start_day, dry=not write,
-                        account_key=account_key, platform=platform, store=store)
+    from .opus_ingest import OpusScanError
+    try:
+        plan = run_pipeline(api=api, start_day=start_day, dry=not write,
+                            account_key=account_key, platform=platform, store=store)
+    except OpusScanError as exc:
+        print(f"opus-pull: AUTH ERROR (HTTP {exc.http_status}) — the scan could not "
+              f"complete. Run 'agent opus-doctor' to diagnose. "
+              f"Body: {exc.body_snippet}")
+        return None
     for line in _plan_lines(plan):
         print(line)
     if not write:
