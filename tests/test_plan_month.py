@@ -270,3 +270,31 @@ def test_plan_cli_no_category_mix_when_rotation_off(monkeypatch, tmp_path, capsy
     pm.plan_cli(["--account", "lasso_ig", "--month", MONTH])
     text = capsys.readouterr().out
     assert "Category mix:" not in text
+
+
+# ---- Saturday fix: rotation ON plans all seven days (Stage 2 Part 1) ----------------------
+def test_august_plan_yields_31_days_when_rotation_on(monkeypatch, tmp_path):
+    """With AGENT_CATEGORY_ROTATION on, the planner posts all seven days: every
+    one of August 2026's 31 days is planned (Saturdays included)."""
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CATEGORY_ROTATION", "true")
+    _make_eligibles(monkeypatch, tmp_path, n=60)
+    out = pm.plan_month("aug31_probe_ig", "2026-08", library_path=str(tmp_path),
+                        write=False)
+    days = [d for d, _k in out["planned"]] + list(out["skipped"])
+    assert len(days) == 31, f"expected 31 days, got {len(days)}"
+    assert len(out["planned"]) == 31, "every day should carry a creative"
+    # Saturdays are in
+    assert "2026-08-01" in days and "2026-08-08" in days and "2026-08-29" in days
+
+
+def test_august_plan_skips_saturdays_when_rotation_off(monkeypatch, tmp_path):
+    """Flag OFF = yesterday's behavior: Saturdays stay skipped (26 days)."""
+    _arm(monkeypatch)
+    monkeypatch.delenv("AGENT_CATEGORY_ROTATION", raising=False)
+    _make_eligibles(monkeypatch, tmp_path, n=60)
+    out = pm.plan_month("aug26_probe_ig", "2026-08", library_path=str(tmp_path),
+                        write=False)
+    days = [d for d, _k in out["planned"]] + list(out["skipped"])
+    assert len(days) == 26  # 31 minus 5 Saturdays
+    assert "2026-08-01" not in days and "2026-08-08" not in days
