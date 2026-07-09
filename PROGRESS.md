@@ -6,12 +6,11 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-06 (Calendar V2 + plan-month round-robin. Suite 633 green, 7 pre-existing
-reportlab. Calendar: full post in each cell (image/placeholder + complete caption + hashtags +
-chips + status), tap-to-expand modal per day (full-size image, caption, hashtags, canvas/layout,
-source citation, status; Approve/Edit/Kill display-only). Plan-month round-robin fix: cold-start
-insertion-order bias corrected, all four sets now reachable. Prev: 2026-07-02 evening STAGE 2
-BUILDOUT landed, suite 226 green.)
+Last updated: 2026-07-09 (Native clipper end to end shipped dark: all 4 phases
+complete. Phase 0 prereq detection + render flag. Phase 1 selection (prior session).
+Phase 2 render (cut, 9:16 frame, karaoke captions, brand frame). Phase 3 wire into
+Echo (held drafts + Slack cards + cost log). Suite 961 green, 7 pre-existing reportlab.
+All flags default OFF. Prev: 2026-07-06 Calendar V2 + plan-month round-robin, suite 633.)
 
 ---
 
@@ -588,42 +587,80 @@ help.opus.pro/api-reference/openapi.json BEFORE coding.
       project URL) in Railway, run `agent opus-organize` (dry-run) then
       `--write`, then `agent opus-doctor` to confirm the collection clip count.
 
-### Native clipper, Phase 1: episode -> selection (2026-07-09; four parts, flag default OFF)
-Abandoning third-party clip platforms (Opus API is gated + capped; Riverside has
-no pull API). New durable path: episode video in, 4-5 finished vertical Reels
-out, entirely inside Echo, zero external clip-library dependency. Claude selects
-the moments; mechanical layers cut + caption (Phase 2). Master flag
-AGENT_CLIPPER_ENABLED, default OFF. Phase 1 proves the SELECTION and STOPS at the
-dry-run plan; rendering is a separate Phase 2 session after the picks are proven
-on a real episode. New CLI: `agent clip-episode --source <path-or-R2-key>`.
-- [x] Part 1: episode intake — stage a full episode video to a tenant-scoped R2
-      key via the existing media_host (read-only on the source); a local video
-      uploads once, an existing R2 key is verified and reused, a non-video or
-      unresolvable source raises ClipperError. Added media_host.key_for /
-      public_url_for.
-- [x] Part 2: transcription with WORD-LEVEL timestamps — transcribe() returns
-      {words:[{word,start,end}], segments:[...]}, cached under
-      AGENT_CLIPPER_CACHE_DIR keyed by the R2 key so re-runs never re-transcribe;
-      word timestamps validated (loud on malformed). Default backend local
-      faster-whisper; API-key backend read by env NAME (AGENT_TRANSCRIBE_API_KEY);
-      transcriber injectable.
-- [x] Part 3: Claude moment selection (THE CORE) — select_moments() feeds the
-      timestamped transcript to Claude (model AGENT_CLIPPER_MODEL, default Opus
-      4.8; key ANTHROPIC_API_KEY by NAME), returns 4-5 candidates each with
-      start/end, hook, rationale, LASSO bucket, and an honest 0-100 score. Every
-      candidate checked: duration window (AGENT_CLIPPER_MIN/MAX_SEC 30-90s), score
-      floor (AGENT_CLIPPER_SCORE_FLOOR default 80), and the fabrication gate on
-      the hook AND rationale (assert only transcript/approved facts). Off-transcript
-      claims are dropped with an honest reason.
-- [x] Part 4: dry-run plan — clip-episode with no --render prints the ranked plan
-      (timestamps, duration, score, hook, bucket, rationale, exact transcript
-      text) + a dropped list; renders nothing, writes nothing (only the transcript
-      cache). This is the approval checkpoint before any video work.
-- STOP: rendering is NOT built. Phase 2 is a separate session once the selection
-      is proven on a real episode. BLAKE BY HAND: set AGENT_CLIPPER_ENABLED,
-      AGENT_HOSTING_ENABLED (+ R2), ANTHROPIC_API_KEY, and a transcriber
-      (faster-whisper or AGENT_TRANSCRIBE_API_KEY), then run
-      `agent clip-episode --source <episode.mp4>` and read the plan.
+### Native clipper, end to end (2026-07-09; all phases, every flag defaults OFF)
+Abandoning third-party clip platforms. Durable path: episode video in, 4-5
+finished vertical Reels out, entirely inside Echo. Claude selects moments;
+mechanical layers cut, caption, frame. Zero external dependency. All flags OFF.
+
+Phase 0 (prereq + scaffold, SHA 81f1546):
+- [x] detect_prereqs() — reports HAS_FFMPEG / HAS_FASTER_WHISPER /
+      HAS_TRANSCRIBE_API_KEY at call time, never logs a key value.
+      ffmpeg 8.1.2 present on this machine; faster-whisper NOT installed.
+- [x] clipper_render_enabled() — AGENT_CLIPPER_RENDER_ENABLED, second flag
+      under master so selection ships independently of rendering.
+- [x] clipper_render_output_dir() — AGENT_CLIPPER_RENDER_DIR.
+  BLAKE BY HAND (if ffmpeg absent on Railway): apt-get install ffmpeg
+
+Phase 1 (selection, SHA 0db3223; four parts, flag AGENT_CLIPPER_ENABLED OFF):
+- [x] Part 1: episode intake — stage to tenant-scoped R2 key (read-only src).
+- [x] Part 2: word-level transcription, cached on R2 key (faster-whisper or
+      AGENT_TRANSCRIBE_API_KEY). BLAKE BY HAND: install faster-whisper or set
+      AGENT_TRANSCRIBE_API_KEY in Railway.
+- [x] Part 3: Claude moment selection (THE CORE) — scored, duration-gated,
+      fabrication-gated candidates (hook + rationale each checked separately).
+- [x] Part 4: dry-run plan printed; nothing rendered, nothing written.
+
+Phase 2 (render, SHA 261a718; behind AGENT_CLIPPER_RENDER_ENABLED=false):
+- [x] Part 5: cut_segment — stream-copy lossless cut of the selected moment.
+- [x] Part 6: frame_vertical — 9:16 fill-scale + center crop (video) or
+      audiogram (audio: navy canvas, red showwaves); output 1080x1920.
+- [x] Part 7: burn_captions — ASS word-by-word karaoke from word timestamps;
+      only words in [start_ts, end_ts] included (fabrication-safe); 220px
+      margin above the lower-third brand frame.
+- [x] Part 8: add_brand_frame — navy lower-third bar (LOWER_H=180px) with
+      LASSO logo + red social handle burned via ffmpeg drawbox + drawtext.
+      render_clip() is the 4-stage orchestrator (cut → frame → captions → brand).
+  BLAKE BY HAND: set AGENT_CLIPPER_RENDER_ENABLED=true when ready to render.
+
+Phase 3 (wire into Echo, SHA 9397de2; held drafts, never auto-post):
+- [x] Part 9: save_clip_draft() — creates a PENDING Draft (never auto-publishes
+      regardless of trust ladder), posts Slack approval card, saves Slack
+      ts/channel for edit-in-place. source_fragments carry source=clipper /
+      kind=reel / score / bucket / rationale for audit. Evergreen check flags
+      captions that imply recency. Always full-approval.
+- [x] Part 10: log_episode_cost() — writes per-episode token cost + transcribe_sec
+      + estimated USD to db kv under clipper_cost_{day}_{key}. Visible for the
+      $99 SKU margin check.
+- clip_episode orchestrator extended: calls render_clip() per accepted moment
+      when render flag is armed; clip_episode_cli updated with --render flag.
+
+MORNING REPORT (2026-07-09):
+Checkpoint reached: CHECKPOINT 3 (full pipeline shipped dark).
+SHAs: Phase 0 = 81f1546, Phase 2 = 261a718, Phase 3 = 9397de2.
+  (Phase 1 = 0db3223, built previous session.)
+
+Transcription backend: faster-whisper NOT installed. HAS_FFMPEG=true
+  (/opt/homebrew/bin/ffmpeg 8.1.2).
+
+BLAKE BY HAND to arm this pipeline:
+  1. Set AGENT_CLIPPER_ENABLED=true in Railway.
+  2. Set AGENT_HOSTING_ENABLED=true + R2 credentials (already deployed?).
+  3. Set ANTHROPIC_API_KEY in Railway (name only; never print).
+  4. Install transcriber: `pip install faster-whisper` in the Railway service,
+     OR set AGENT_TRANSCRIBE_API_KEY to an API-backed transcription key.
+  5. Set AGENT_CLIPPER_SCORE_FLOOR=80 (or leave default).
+  6. Run: `agent clip-episode --source <episode.mp4>` and read the plan.
+  7. Confirm the picks look right on a real episode.
+  8. Then: set AGENT_CLIPPER_RENDER_ENABLED=true and re-run with --render.
+  9. Rendered Reels appear as HELD PENDING drafts in the Slack approval queue.
+  10. Approve each Reel individually via the Slack card tap.
+
+Parts that self-skipped: none (all phases built). Rendering is ARMED but
+  AGENT_CLIPPER_RENDER_ENABLED defaults OFF — will self-skip silently.
+
+Pipeline ready for a real Gym Marketing Made Simple episode dry-run: YES,
+  AFTER steps 1-6 above are done by hand. All flags default OFF; nothing
+  runs in production until Blake arms them.
 
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
