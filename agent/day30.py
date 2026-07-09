@@ -27,10 +27,16 @@ dash free.
 import json
 from datetime import datetime, timedelta, timezone
 
-from . import db, reporting
+from . import config, db, reporting
 from .accounts import get_account
 
+# Legacy name kept for callers/tests that import it; the live window now comes
+# from config.review_window_days() (env AGENT_REVIEW_WINDOW_DAYS, default 14).
 WINDOW_DAYS = 30
+# The pre-Echo posting-cadence comparison ALWAYS uses this fixed basis, whatever
+# the review window is, so the before/after multiplier stays apples to apples
+# with the monthly baseline file.
+BASELINE_WINDOW_DAYS = 30
 DO_NOT_PUBLISH = "INTERNAL APPENDIX, do not publish:"
 
 
@@ -45,11 +51,13 @@ def framing_for(account):
     return f if f in ("frequency", "engagement") else "engagement"
 
 
-def gather(account_key, now=None):
+def gather(account_key, now=None, window_days=None):
     """(posts, snapshots) for the trailing window, oldest first. Posts are the
-    published rows carrying backfilled insights."""
+    published rows carrying backfilled insights. window_days defaults to the
+    configured review cycle (AGENT_REVIEW_WINDOW_DAYS, default 14)."""
     now = now or datetime.now(timezone.utc)
-    since = (now - timedelta(days=WINDOW_DAYS)).date().isoformat()
+    window = window_days or config.review_window_days()
+    since = (now - timedelta(days=window)).date().isoformat()
     with db.connect() as conn:
         posts = [dict(r) for r in conn.execute(
             "SELECT * FROM posts WHERE account_key=? AND mode='published' "
@@ -63,9 +71,12 @@ def gather(account_key, now=None):
     return posts, snaps
 
 
-def assemble(account_key, now=None, base_dir=None):
-    """The Day 30 report dict from backfilled per post insights + snapshots."""
-    posts, snaps = gather(account_key, now=now)
+def assemble(account_key, now=None, base_dir=None, window_days=None):
+    """The cycle report dict from backfilled per post insights + snapshots.
+    window_days defaults to config.review_window_days() (14). The pre-Echo
+    posting-cadence comparison stays on the fixed 30-day basis regardless."""
+    window = window_days or config.review_window_days()
+    posts, snaps = gather(account_key, now=now, window_days=window)
     gaps = []
 
     def post_engagement(p):
@@ -116,12 +127,20 @@ def assemble(account_key, now=None, base_dir=None):
     month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
     freq_before = reporting.load_posting_baseline(account_key, month,
                                                   base_dir=base_dir)
-    freq_after = round(len(posts) / (WINDOW_DAYS / 7), 2) if posts else 0.0
+    # The 30-DAY BASELINE COMPARISON, kept whatever the review window is: the
+    # after cadence is measured over the fixed baseline basis so the multiplier
+    # against the pre-Echo monthly baseline never shrinks with a shorter cycle.
+    baseline_posts = (posts if window == BASELINE_WINDOW_DAYS
+                      else gather(account_key, now=now,
+                                  window_days=BASELINE_WINDOW_DAYS)[0])
+    freq_after = (round(len(baseline_posts) / (BASELINE_WINDOW_DAYS / 7), 2)
+                  if baseline_posts else 0.0)
 
     ranked_desc = sorted(ranked, key=lambda r: r["engagement"], reverse=True)
     report = {
         "account_key": account_key,
-        "window_days": WINDOW_DAYS,
+        "window_days": window,
+        "baseline_window_days": BASELINE_WINDOW_DAYS,
         "posts_published": len(posts),
         "engagement_rate": engagement_rate,
         "engagements": engagements,
@@ -171,7 +190,10 @@ def render_text(account, report):
     Dash free by construction and asserted."""
     r = report
     framing = framing_for(account)
-    lines = [f"DAY 30 REPORT: {account.display_name} ({r['account_key']})"]
+    window = r.get("window_days", WINDOW_DAYS)
+    title = ("DAY 30 REPORT" if window == 30
+             else f"CYCLE REPORT ({window} DAYS)")
+    lines = [f"{title}: {account.display_name} ({r['account_key']})"]
     if framing == "frequency":
         lines.append(_frequency_headline(r))
     else:
@@ -215,6 +237,38 @@ def publishable_text(account, report):
     text = render_text(account, report)
     return "\n".join(l for l in text.splitlines()
                      if not l.startswith(DO_NOT_PUBLISH))
+
+
+def cycle_index(now=None, window_days=None):
+    """Which review cycle a moment falls in: days-since-epoch // window. Stable
+    within a cycle, advances by one when the window rolls over."""
+    now = now or datetime.now(timezone.utc)
+    window = window_days or config.review_window_days()
+    return now.date().toordinal() // window
+
+
+def maybe_refresh_ask(account_key, now=None, poster=None):
+    """
+    The per-cycle creative refresh ask (AGENT_REVIEW_CYCLE_ENABLED, default OFF
+    = never fires). Armed, ONE ops alert per account per review cycle asking for
+    fresh photos and clips, kv-stamped AFTER the alert posts so a failed post
+    retries next pass (the silent-miss law). Returns True when the ask fired.
+    """
+    if not config.review_cycle_enabled():
+        return False
+    idx = cycle_index(now=now)
+    key = f"refresh_ask_{account_key}_{idx}"
+    if db.kv_get(key):
+        return False  # already asked this cycle
+    from . import ops_alerts
+    ops_alerts.alert(
+        f"creative refresh: review cycle {idx} for {account_key}. Ask the "
+        "client for fresh photos and clips before the next cycle report.",
+        poster=poster, force=True,
+    )
+    db.kv_set(key, datetime.now(timezone.utc).isoformat())
+    db.audit("refresh_ask", account_key, f"cycle {idx} creative refresh ask fired")
+    return True
 
 
 def report_cli(account_key, dry):

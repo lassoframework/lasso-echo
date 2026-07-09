@@ -352,4 +352,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         except Exception as e:
             print(f"[token-watchdog] check failed: {type(e).__name__}: {e}")
 
+    # Review cycle refresh ask: dormant unless AGENT_REVIEW_CYCLE_ENABLED. Armed,
+    # one creative refresh ask per account per review cycle (kv deduped inside).
+    # An ask error never takes the draft run down.
+    if config.review_cycle_enabled():
+        from .day30 import maybe_refresh_ask
+        for account in accounts:
+            try:
+                maybe_refresh_ask(account.key, poster=poster)
+            except Exception as e:
+                print(f"[review-cycle] refresh ask failed for {account.key}: "
+                      f"{type(e).__name__}: {e}")
+
     return {"status": "drafted", "drafts": results}

@@ -601,3 +601,26 @@ def category_rotation_enabled() -> bool:
     logins; dash removal) is applied at caption build time.
     """
     return _truthy(os.environ.get("AGENT_CATEGORY_ROTATION", "false"))
+
+
+def review_window_days() -> int:
+    """
+    The review cycle length in days (env AGENT_REVIEW_WINDOW_DAYS, default 14).
+    The cycle report (day30.py assembler) windows its metrics on this; the
+    pre-Echo posting-cadence baseline comparison stays on its own fixed 30-day
+    basis so the before/after story remains apples to apples.
+    """
+    try:
+        return max(1, int(os.environ.get("AGENT_REVIEW_WINDOW_DAYS", "14")))
+    except ValueError:
+        return 14
+
+
+def review_cycle_enabled() -> bool:
+    """
+    Review cycle automation switch. OFF by default = zero behavior change (the
+    cycle report stays an on-demand read-only CLI; no ask ever fires). ON, the
+    creative refresh ask fires once per review cycle per account (an ops alert
+    asking for fresh photos/clips), stamped in kv so a re-run never re-asks.
+    """
+    return _truthy(os.environ.get("AGENT_REVIEW_CYCLE_ENABLED", "false"))

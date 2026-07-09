@@ -128,7 +128,9 @@ def test_dry_writes_nothing_and_watermarks(tmp_path, capsys, monkeypatch):
     day30.report_cli("lasso_ig", dry=True)
     printed = capsys.readouterr().out
     assert "DRY" in printed and "nothing was written" in printed
-    assert "DAY 30 REPORT" in printed
+    # the report title names the review cycle (default window 14; a 30 day
+    # window keeps the DAY 30 REPORT title, see test_review_cycle.py)
+    assert "CYCLE REPORT (14 DAYS)" in printed or "DAY 30 REPORT" in printed
     with db.connect() as conn:
         assert "\n".join(conn.iterdump()) == before  # store byte identical
     assert sorted(os.listdir(tmp_path)) == files_before
