@@ -647,3 +647,15 @@ def ghl_intake_enabled() -> bool:
     verified BEFORE the payload is parsed; the public key env is read lazily.
     """
     return _truthy(os.environ.get("AGENT_GHL_INTAKE_ENABLED", "false"))
+
+
+def whatsapp_intake_enabled() -> bool:
+    """
+    WhatsApp (WABA) intake adapter switch (Stage 2). OFF by default = the
+    webhook handler refuses everything. DO NOT ARM until Meta App Review grants
+    whatsapp_business_messaging for this use (see whatsapp_intake.py header).
+    ON, a signed WABA webhook (X-Hub-Signature-256, HMAC-SHA256 with the app
+    secret) downloads media to the 16MB WABA ceiling and queues it through the
+    same media inbox as every other lane.
+    """
+    return _truthy(os.environ.get("AGENT_WHATSAPP_INTAKE_ENABLED", "false"))
