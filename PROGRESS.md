@@ -437,6 +437,51 @@ BUILDOUT landed, suite 226 green.)
       pending plan drafts; first post per account held for the tap; both behind
       AGENT_PLAN_MONTH_ENABLED (OFF). Suite 623 green (7 pre-existing reportlab).
 
+### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
+- [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
+      seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
+- [~] 14-day review cycle: AGENT_REVIEW_WINDOW_DAYS (default 14) windows the
+      day30 assembler (now the cycle report; 30-day window keeps the DAY 30
+      title); pre-Echo cadence baseline comparison stays on the fixed 30-day
+      basis; creative refresh ask once per account per cycle behind
+      AGENT_REVIEW_CYCLE_ENABLED (OFF), wired into run_daily
+- [~] intake-create: one intake JSON scaffolds a tenant under
+      brand_voice/tenants/<key>/ (voice.md, avatar.md, verified_facts.md USE
+      lines feeding the fabrication gate, tenant.json with approver + sender
+      phones + media lanes + trust 0 + quota fields); blocks loud on missing
+      fields, all-or-nothing; AGENT_INTAKE_ENABLED
+- [~] Trust ladder wired to tenants: level_for_tenant reads only the named
+      tenant's record, fail-safe to FULL_APPROVAL; a new tenant can never
+      auto-publish (level 0 + double gate + first-post gate, adversarially locked)
+- [~] Media inbox core: provider-agnostic queue behind AGENT_MEDIA_INBOX_ENABLED;
+      sender phone -> tenant (never guessed; unknown = HELD + one masked alert
+      per sender per day), idempotent by sha256, texted sentence = caption note
+- [~] Ingest worker: perceptual dedupe per tenant, consent + autotag hooks,
+      thumbnail, tenant-scoped R2 keys via media_host isolation; CAPTION GATE:
+      no sentence = not filed + one auto-ask; attach_caption releases
+- [~] GHL adapter: Ed25519 X-GHL-Signature verified BEFORE parsing; photos
+      captured immediately (carrier URLs expire); video MIME auto-replies with
+      the tenant's tokenized upload link; AGENT_GHL_INTAKE_ENABLED
+- [~] WhatsApp adapter: X-Hub-Signature-256 (HMAC) verified before parsing,
+      16MB WABA ceiling (refused, never truncated), same queue;
+      AGENT_WHATSAPP_INTAKE_ENABLED. DO NOT ARM before the
+      whatsapp_business_messaging App Review addition is granted
+- [~] Upload quotas + tenant token watchdog: per-tenant storage cap enforced at
+      the upload endpoint (413 over a MEASURED total; unmeasurable or legacy
+      never blocks), monthly recreate budget kv-counted per month; the token
+      watchdog flags upload-lane tenants with no AGENT_INTAKE_TOKEN_<KEY> set
+- [~] Per-gym tenant brain: brains/<tenant>.md append-only learning events
+      (approve_streak / edit_diff / deny_reason / kill); killed concepts
+      excluded from THAT tenant's rotation only; style rules + deny reasons
+      fold into prompts THROUGH the fabrication gate (the brain never adds
+      facts); AGENT_TENANT_BRAIN_ENABLED
+- [x] July 16-31 replanned for both accounts (plan-month --from 2026-07-16,
+      days 1-15 structurally untouched), 16 pending drafts per account held
+      for approval in the LOCAL sandbox store. BLAKE BY HAND: run the same two
+      plan-month commands on the deployed listener with AGENT_CATEGORY_ROTATION
+      + AGENT_PLAN_MONTH_ENABLED armed in Railway env (the sandbox store is not
+      the deployed store)
+
 ### Still open
 - [ ] Client / team approval flow via the portal
 - [ ] Prove the voice holds for someone who is not Blake

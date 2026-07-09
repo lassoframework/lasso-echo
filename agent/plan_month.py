@@ -52,11 +52,12 @@ def _creative_canvas(c):
     return rotation.sidecar_canvas(c.path)
 
 
-def plan_month(account_key, month, library_path=None, write=False):
+def plan_month(account_key, month, library_path=None, write=False, from_day=None):
     """
     Fill open posting days for one account from the eligible creative pool.
     Returns {"planned": [(day_key, creative_key)], "skipped": [day_key], "wrote": int}
-    or None when the flag is OFF.
+    or None when the flag is OFF. from_day (YYYY-MM-DD, optional) plans only
+    days >= it, so a mid-month replan never touches the days before it.
     """
     if not config.plan_month_enabled():
         return None
@@ -83,6 +84,7 @@ def plan_month(account_key, month, library_path=None, write=False):
         for n in range(1, n_days + 1)
         if schedule.should_post_on(f"{month}-{n:02d}")
         and f"{month}-{n:02d}" not in existing
+        and (not from_day or f"{month}-{n:02d}" >= from_day)
     ]
 
     if not open_days:
@@ -228,23 +230,26 @@ def approve_month(account_key, month, through=None):
 
 
 def plan_cli(args):
-    account, month, write = None, None, False
+    account, month, write, from_day = None, None, False, None
     i = 0
     while i < len(args):
         if args[i] == "--account" and i + 1 < len(args):
             account = args[i + 1]; i += 2; continue
         if args[i] == "--month" and i + 1 < len(args):
             month = args[i + 1]; i += 2; continue
+        if args[i] == "--from" and i + 1 < len(args):
+            from_day = args[i + 1]; i += 2; continue
         if args[i] == "--write":
             write = True; i += 1; continue
         print(f"unrecognized: {args[i]}\n"
               "usage: python -m agent plan-month --account <key> "
-              "--month YYYY-MM [--write]")
+              "--month YYYY-MM [--from YYYY-MM-DD] [--write]")
         return
     if not account or not month:
-        print("usage: python -m agent plan-month --account <key> --month YYYY-MM [--write]")
+        print("usage: python -m agent plan-month --account <key> --month YYYY-MM "
+              "[--from YYYY-MM-DD] [--write]")
         return
-    out = plan_month(account, month, write=write)
+    out = plan_month(account, month, write=write, from_day=from_day)
     if out is None:
         print("plan-month: OFF (set AGENT_PLAN_MONTH_ENABLED=true). Nothing done.")
         return

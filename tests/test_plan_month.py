@@ -298,3 +298,17 @@ def test_august_plan_skips_saturdays_when_rotation_off(monkeypatch, tmp_path):
     days = [d for d, _k in out["planned"]] + list(out["skipped"])
     assert len(days) == 26  # 31 minus 5 Saturdays
     assert "2026-08-01" not in days and "2026-08-08" not in days
+
+
+# ---- mid-month replan: --from never touches earlier days ----------------------------------
+def test_plan_from_day_never_touches_earlier_days(monkeypatch, tmp_path):
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CATEGORY_ROTATION", "true")
+    _make_eligibles(monkeypatch, tmp_path, n=60)
+    out = pm.plan_month("fromday_probe_ig", "2026-07", library_path=str(tmp_path),
+                        write=False, from_day="2026-07-16")
+    days = [d for d, _k in out["planned"]] + list(out["skipped"])
+    assert days, "the back half of July should plan"
+    assert min(days) == "2026-07-16"
+    assert all(d >= "2026-07-16" for d in days)
+    assert len(days) == 16                          # Jul 16 through 31 inclusive
