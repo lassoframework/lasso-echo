@@ -415,6 +415,147 @@ def print_plan(selection):
           f"{len(dropped)} dropped.")
 
 
+# ---- Part 9: save each finished Reel as a HELD draft --------------------------------
+_NEWNESS_PHRASES = (
+    "new episode", "out now", "just dropped", "just released",
+    "new podcast", "new video", "listen now", "watch now", "tune in",
+)
+
+
+def _evergreen_warning(caption):
+    """Return a warning string if the caption implies recency, else empty string."""
+    low = caption.lower()
+    for phrase in _NEWNESS_PHRASES:
+        if phrase in low:
+            return f"caption may imply recency ('{phrase}') — review before approving"
+    return ""
+
+
+def save_clip_draft(moment, reel_path, reel_url, account_key,
+                    scheduled_for="", platform="instagram",
+                    episode_title="", store=None, poster=None):
+    """
+    Save a rendered Reel as a HELD draft in the approval store, then post its
+    Slack approval card.
+
+    Always PENDING regardless of account trust ladder; clipper drafts never
+    auto-publish. Caption = moment.hook (verbatim opening line from transcript).
+    Extra metadata (source, kind, score, bucket, rationale, timestamps) stored in
+    source_fragments for the no-fabrication audit trail and visible in warnings.
+    Returns the saved Draft.
+    """
+    import hashlib
+    import datetime
+    from .drafter import Draft, DraftStatus
+
+    if not account_key:
+        raise ClipperError("save_clip_draft: account_key is required.")
+
+    day = scheduled_for or datetime.date.today().isoformat()
+    draft_id = hashlib.sha1(
+        f"clipper|{account_key}|{reel_path}|{day}".encode()
+    ).hexdigest()[:10]
+
+    caption = (moment.hook or f"[Clip: {episode_title or 'episode'}]").strip()
+
+    frags = [
+        f"source=clipper kind=reel score={moment.score} bucket={moment.bucket}",
+        f"clip={moment.start_ts:.1f}-{moment.end_ts:.1f}s duration={moment.duration:.0f}s",
+        moment.rationale or "",
+    ]
+    if episode_title:
+        frags.append(f"episode={episode_title}")
+
+    warn = []
+    ew = _evergreen_warning(caption)
+    if ew:
+        warn.append(ew)
+    warn.append(
+        f"source=clipper score={moment.score} bucket={moment.bucket or '(none)'} "
+        f"[{_fmt_ts(moment.start_ts)}-{_fmt_ts(moment.end_ts)}]"
+    )
+
+    draft = Draft(
+        draft_id=draft_id,
+        account_key=account_key,
+        platform=platform,
+        caption=caption,
+        hashtags=[],
+        creative_path=reel_path or "",
+        creative_public_url=reel_url or "",
+        scheduled_for=day,
+        status=DraftStatus.PENDING,
+        blocked_reason="",
+        source_fragments=frags,
+        is_story=False,
+        day_key=f"clipper_{account_key}_{draft_id[:8]}",
+        draft_type="clipper_reel",
+        warnings=warn,
+        category=moment.bucket,
+    )
+
+    from .store import PendingStore
+    _store = store or PendingStore()
+    _store.put(draft)
+
+    if poster is None:
+        try:
+            from .slack_surface import SlackPoster
+            poster = SlackPoster()
+        except Exception:
+            poster = None
+
+    if poster is not None:
+        try:
+            resp = poster.post_approval_card(draft) or {}
+            ts = str(resp.get("ts") or "")
+            channel = str(resp.get("channel") or "")
+            if ts:
+                draft.slack_ts = ts
+                draft.slack_channel = channel
+                _store.put(draft)   # save ts/channel for future edit-in-place
+        except Exception as exc:
+            print(f"[clipper] Slack card failed: {exc}")
+
+    return draft
+
+
+# ---- Part 10: per-episode cost logging ----------------------------------------------
+# Opus 4.8 pricing as of 2026 (approximate; update when pricing changes).
+_COST_PER_1K_IN = 0.015   # USD per 1 000 input tokens
+_COST_PER_1K_OUT = 0.075  # USD per 1 000 output tokens
+
+
+def _estimate_cost(tokens_in, tokens_out):
+    return round(
+        (int(tokens_in or 0) / 1000.0) * _COST_PER_1K_IN
+        + (int(tokens_out or 0) / 1000.0) * _COST_PER_1K_OUT,
+        6)
+
+
+def log_episode_cost(episode_key, tokens_in=0, tokens_out=0, transcribe_sec=0.0):
+    """
+    Write per-episode processing cost to the db kv store.
+    Key format: clipper_cost_{day}_{episode_key[:20]}
+    Returns the cost dict (safe to print — no key values).
+    """
+    import datetime
+    from . import db
+
+    day = datetime.date.today().isoformat()
+    cost = {
+        "day": day,
+        "episode_key": episode_key,
+        "tokens_in": int(tokens_in or 0),
+        "tokens_out": int(tokens_out or 0),
+        "transcribe_sec": float(transcribe_sec or 0),
+        "estimated_usd": _estimate_cost(tokens_in, tokens_out),
+    }
+    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(episode_key or ""))[:20]
+    db.kv_set(f"clipper_cost_{day}_{safe_key}", json.dumps(cost))
+    return cost
+
+
 # ---- orchestrator (grows one stage per part; Phase 1 ends at the dry-run plan) --------
 def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
                  transcriber=None, llm=None, account_key=None):
@@ -426,9 +567,6 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
     if not config.clipper_enabled():
         print("clip-episode: OFF (set AGENT_CLIPPER_ENABLED=true). Nothing done.")
         return None
-    if render:
-        print("clip-episode: rendering is Phase 2 and not built yet; producing the "
-              "selection plan only.")
 
     staged = stage_episode(source, tenant, client=client)
     print(f"clip-episode: staged episode -> {staged['r2_key']} "
@@ -444,7 +582,25 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
     print(f"clip-episode: {len(selection['accepted'])} moment(s) pass, "
           f"{len(selection['dropped'])} dropped")
     print_plan(selection)
-    return {"staged": staged, "transcript": transcript, "selection": selection}
+
+    reels = []
+    if render and config.clipper_render_enabled():
+        from . import clipper_render
+        render_dir = config.clipper_render_output_dir()
+        for m in selection["accepted"]:
+            try:
+                result = clipper_render.render_clip(m, media_path, transcript, render_dir)
+                if result:
+                    reels.append({"moment": m, "reel_path": result["reel_path"]})
+                    print(f"clip-episode: rendered {result['reel_path']}")
+            except clipper_render.RenderError as exc:
+                print(f"clip-episode: render skipped for [{_fmt_ts(m.start_ts)}]: {exc}")
+    elif render:
+        print("clip-episode: --render given but AGENT_CLIPPER_RENDER_ENABLED is OFF "
+              "or Phase 2 is not armed. Producing the selection plan only.")
+
+    return {"staged": staged, "transcript": transcript,
+            "selection": selection, "reels": reels}
 
 
 def clip_episode_cli(argv):
