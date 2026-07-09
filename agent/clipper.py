@@ -355,6 +355,39 @@ def select_moments(transcript, llm=None, approved_claims=None, account_key=None,
     return {"accepted": accepted, "dropped": dropped}
 
 
+# ---- Part 4: dry-run plan (the approval checkpoint; renders nothing, writes nothing) -
+def _fmt_ts(seconds):
+    try:
+        s = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return "0:00"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def print_plan(selection):
+    """Print the ranked selection plan for Blake to confirm the picks BEFORE any
+    video work: per pick the timestamps, duration, score, hook, bucket, rationale,
+    and the exact transcript text. Renders nothing, writes nothing."""
+    accepted = selection.get("accepted", [])
+    dropped = selection.get("dropped", [])
+    print("\nclip-episode PLAN (SELECTION ONLY, nothing rendered, nothing written):")
+    if not accepted:
+        print("  no moments passed the score floor + fabrication gate.")
+    for i, m in enumerate(accepted, 1):
+        print(f"  #{i}  score {m.score}  {m.bucket or '(no bucket)':10s}  "
+              f"[{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}]  {m.duration:g}s")
+        print(f"      hook : {m.hook}")
+        print(f"      why  : {m.rationale}")
+        print(f"      text : {m.transcript_text}")
+    if dropped:
+        print("  dropped:")
+        for m in dropped:
+            print(f"    [{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] score {m.score}: "
+                  f"{m.reason}")
+    print(f"  summary: {len(accepted)} pick(s) held for confirmation, "
+          f"{len(dropped)} dropped.")
+
+
 # ---- orchestrator (grows one stage per part; Phase 1 ends at the dry-run plan) --------
 def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
                  transcriber=None, llm=None, account_key=None):
@@ -383,7 +416,7 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
     selection = select_moments(transcript, llm=llm, account_key=account_key)
     print(f"clip-episode: {len(selection['accepted'])} moment(s) pass, "
           f"{len(selection['dropped'])} dropped")
-    # Part 4 adds: the dry-run plan print.
+    print_plan(selection)
     return {"staged": staged, "transcript": transcript, "selection": selection}
 
 

@@ -262,3 +262,64 @@ def test_select_accepts_verbatim_transcript_claim(monkeypatch):
          "score": 90}])
     out = clipper.select_moments(t, llm=llm, approved_claims=[clipper.transcript_text(t)])
     assert len(out["accepted"]) == 1                    # 71 percent is in transcript
+
+
+# ---- Part 4: dry-run plan output ----------------------------------------------------
+
+def test_dry_run_prints_full_plan(monkeypatch, tmp_path, capsys):
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    ep = tmp_path / "e.mp4"
+    ep.write_bytes(b"FAKE")
+
+    def _transcriber(_p):
+        return _long_transcript()
+
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 40.0, "hook": "most gyms",
+         "rationale": "opens on a strong claim, self contained payoff",
+         "bucket": "doctrine", "score": 92},
+        {"start_ts": 5.0, "end_ts": 12.0, "hook": "too short",
+         "rationale": "tiny", "bucket": "doctrine", "score": 95},
+    ])
+    out = clipper.clip_episode(str(ep), client=_FakeClient(),
+                               transcriber=_transcriber, llm=llm)
+    printed = capsys.readouterr().out
+    # the plan shows timestamps, duration, score, hook, bucket, rationale, text
+    assert "PLAN (SELECTION ONLY" in printed
+    assert "score 92" in printed and "doctrine" in printed
+    assert "[0:00-0:40]" in printed and "40s" in printed
+    assert "hook : most gyms" in printed
+    assert "why  : opens on a strong claim" in printed
+    assert "text :" in printed
+    assert "dropped:" in printed and "outside window" in printed  # short pick dropped
+    assert len(out["selection"]["accepted"]) == 1
+
+
+def test_dry_run_renders_and_writes_nothing(monkeypatch, tmp_path):
+    """Phase 1 dry-run: no store, no render artifact, only the transcript cache."""
+    _arm(monkeypatch)
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(cache))
+    ep = tmp_path / "e.mp4"
+    ep.write_bytes(b"FAKE")
+    client = _FakeClient()
+    clipper.clip_episode(str(ep), client=client, transcriber=_fake_transcriber(),
+                         llm=_llm_returning([]))
+    # nothing rendered: the only artifacts are the staged upload (via fake client,
+    # no local file) and the transcript cache json. No .mp4 clips written locally.
+    produced = list(tmp_path.rglob("*.mp4"))
+    assert produced == [ep]                              # only the source episode
+    cache_files = list(cache.rglob("*.transcript.json"))
+    assert len(cache_files) == 1                          # transcript cache only
+
+
+def test_render_flag_says_phase_two(monkeypatch, tmp_path, capsys):
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    ep = tmp_path / "e.mp4"
+    ep.write_bytes(b"FAKE")
+    clipper.clip_episode(str(ep), render=True, client=_FakeClient(),
+                         transcriber=_fake_transcriber(), llm=_llm_returning([]))
+    assert "Phase 2" in capsys.readouterr().out
