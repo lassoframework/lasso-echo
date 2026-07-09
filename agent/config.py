@@ -250,6 +250,10 @@ def rotation_enabled() -> bool:
 OPUS_API_BASE = os.environ.get("AGENT_OPUS_API_BASE", "https://api.opus.pro")
 OPUS_API_KEY_ENV = "OPUS_API_KEY"  # name of the env var, not the value
 OPUS_ORG_ID = os.environ.get("AGENT_OPUS_ORG_ID", "")
+# DEPRECATED for the video factory: the factory enumerates ALL projects via
+# OpusAPI.list_projects (opus_factory.scan), so no pinned allowlist and no
+# hand-built "Echo Export" collection is required. These two vars remain ONLY
+# for the legacy pull-opus ingest poller (opus_ingest); new work uses opus-pull.
 OPUS_PROJECT_IDS = _csv_list("AGENT_OPUS_PROJECT_IDS", [])
 OPUS_COLLECTION_IDS = _csv_list("AGENT_OPUS_COLLECTION_IDS", [])
 

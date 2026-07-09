@@ -437,6 +437,43 @@ BUILDOUT landed, suite 226 green.)
       pending plan drafts; first post per account held for the tap; both behind
       AGENT_PLAN_MONTH_ENABLED (OFF). Suite 623 green (7 pre-existing reportlab).
 
+### Opus video factory (2026-07-09 buildout; eight parts, master flag OFF)
+Master flag AGENT_OPUS_FACTORY_ENABLED (default OFF). Turns the back catalogue of
+finished Opus clips into DRAFTS held for approval; extends the existing Opus
+client, never publishes. New CLI: `python -m agent opus-pull [--write]`.
+- [~] All-project scan: OpusAPI.list_projects enumerates EVERY project (no
+      allowlist, no collection id); opus_factory.scan normalizes each finished
+      clip (clip_id, project_id, source_title, title, opus_score, duration_s,
+      transcript, download_url); unfinished clips excluded
+- [~] Score gate FIRST: AGENT_OPUS_SCORE_FLOOR (default 90) drops a clip before
+      any other work; AGENT_OPUS_DURATION_MIN/MAX (15-95s)
+- [~] Bucket tagger: podcast-sourced clips (source title = the show,
+      AGENT_OPUS_PODCAST_SHOW) tag podcast; others classify from the transcript
+      against the 6 buckets + the LASSO theme lexicon; below
+      AGENT_OPUS_RELEVANCE_FLOOR (0.65) or no theme => HOLD + ops alert, never
+      drafted; transcript only, never invents
+- [~] Hook check: the opening ~2s must carry a claim, number, or question, else
+      demote to shortlist not draft
+- [~] Caption writer: evergreen (back-catalog, never "new episode is live"),
+      hook + payoff from the clip's own words, soft CTA to the full episode +
+      podcast footer on podcast clips, bucket CTA and no footer otherwise; no
+      dashes, never vendor; the fabrication gate stays sole authority (caption
+      asserts only what the transcript or the approved facts file already say)
+- [~] Dedupe + no-repost ledger: clip_id ledger in the volume kv (opus_drafted_
+      / opus_posted_); a clip is drafted at most once; posted clips tracked for
+      reporting before/after; a re-run never re-drafts
+- [~] Calendar routing: drafted clips fill VIDEO slots on their bucket's cadence
+      (podcast Thu, platform Tue/Sat), respecting weekly quotas, no-repeat
+      spacing, and a per-week Opus cap AGENT_OPUS_WEEKLY_CAP (default 2); every
+      draft PENDING and held; draft-only + trust ladder + first-post gate honored
+- [~] opus-pull CLI: dry-run prints the ranked plan (score, bucket, hook line) +
+      the held/rejected list with reasons (below floor, off-topic, weak hook,
+      dupe) and writes nothing; --write builds the held drafts, posts each to
+      the ops channel for the tap + one digest line
+- RETIRED: the hand-built "Echo Export" Opus collection step and the
+      AGENT_OPUS_PROJECT_IDS pin are no longer required (the factory scans all
+      projects). Both vars remain only for the legacy pull-opus ingest poller.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
