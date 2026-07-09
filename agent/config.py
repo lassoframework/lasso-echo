@@ -635,3 +635,15 @@ def media_inbox_enabled() -> bool:
     unknown senders are held with one ops alert), idempotent by content hash.
     """
     return _truthy(os.environ.get("AGENT_MEDIA_INBOX_ENABLED", "false"))
+
+
+def ghl_intake_enabled() -> bool:
+    """
+    GHL intake adapter switch (Stage 2). OFF by default = the webhook handler
+    refuses everything: nothing verified, fetched, staged, or replied. ON, a
+    signed GHL message webhook captures photo attachments immediately (carrier
+    URLs expire) into the media inbox, and a video MIME auto-replies with the
+    tenant's tokenized upload link. Signature (Ed25519, X-GHL-Signature) is
+    verified BEFORE the payload is parsed; the public key env is read lazily.
+    """
+    return _truthy(os.environ.get("AGENT_GHL_INTAKE_ENABLED", "false"))
