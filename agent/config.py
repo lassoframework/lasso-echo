@@ -672,3 +672,18 @@ def tenant_brain_enabled() -> bool:
     every prompt line passes the fabrication gate first.
     """
     return _truthy(os.environ.get("AGENT_TENANT_BRAIN_ENABLED", "false"))
+
+
+# ---- Opus video factory (back-catalog clip pipeline) -------------------------
+def opus_factory_enabled() -> bool:
+    """
+    Opus video factory master switch. OFF by default = zero behavior change:
+    the scan returns nothing, the CLI refuses, nothing is score-gated, tagged,
+    captioned, or drafted. ON, the factory enumerates finished Opus clips across
+    ALL projects (no allowlist), drops anything below the score floor first,
+    tags survivors to a bucket from their transcript, checks the hook, writes an
+    evergreen caption from the transcript + approved facts only, dedupes against
+    a ledger, and routes each survivor to a calendar slot as a DRAFT held for
+    approval. Never publishes.
+    """
+    return _truthy(os.environ.get("AGENT_OPUS_FACTORY_ENABLED", "false"))

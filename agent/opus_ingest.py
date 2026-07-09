@@ -147,6 +147,31 @@ class OpusAPI:
                   f"{total_objects} object(s)")
         return ids
 
+    def list_projects(self):
+        """
+        GET /api/projects?q=mine -> [{"id", "title"}], paginated. The all-project
+        enumeration the video factory scans (no pinned allowlist required). Id
+        and title extraction are shape-tolerant like list_collections; a project
+        with no resolvable id is skipped, never guessed.
+        """
+        projects, page = [], 1
+        while True:
+            body = self._get("/api/projects",
+                             {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
+            items = body if isinstance(body, list) else body.get("data", []) or []
+            for p in items:
+                pid = _extract_id(p)
+                if not pid:
+                    continue
+                title = ""
+                if isinstance(p, dict):
+                    title = str(p.get("title", "") or p.get("name", "")
+                                or p.get("projectName", "") or "")
+                projects.append({"id": pid, "title": title})
+            if len(items) < 50:
+                return projects
+            page += 1
+
     def list_exportable_clips(self, q, source_id):
         """GET /api/exportable-clips, paginated. q = findByProjectId|findByCollectionId."""
         id_param = "projectId" if q == "findByProjectId" else "collectionId"
