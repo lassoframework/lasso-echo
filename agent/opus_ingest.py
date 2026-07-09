@@ -731,6 +731,24 @@ def opus_doctor(http=None):
         print("opus-doctor: endpoint + key OK, but NO collections are visible to "
               "this key. Organize the clips into a collection in the OpusClip "
               "dashboard, or check org-id scoping (AGENT_OPUS_ORG_ID).")
+
+    # Per-collection detail: name + clip count, so after opus-organize we can
+    # confirm clips landed. Full (paginated) list, then one clip-count call each.
+    api = OpusAPI(key, org)
+    collections = []
+    try:
+        collections = api.list_collections_detailed()
+    except OpusScanError as exc:
+        print(f"opus-doctor: could not enumerate collections for detail: "
+              f"HTTP {exc.http_status}")
+    for c in collections:
+        ccid, cname = c.get("id", ""), c.get("title", "")
+        try:
+            count = len(api.list_exportable_clips("findByCollectionId", ccid))
+        except OpusScanError as exc:
+            count = f"error HTTP {exc.http_status}"
+        print(f"opus-doctor: collection id={ccid!r} name={cname!r} clips={count}")
+    collections_total = len(collections) if collections else len(items)
     return {"enabled": True, "key_present": True, "status": status,
             "base_url": base, "endpoint_ok": True, "auth_ok": True,
-            "collections": len(items)}
+            "collections": collections_total}

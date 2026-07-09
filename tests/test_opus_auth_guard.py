@@ -376,6 +376,34 @@ def test_opus_doctor_empty_says_so_no_index(monkeypatch, capsys):
     assert "NO collections are visible" in printed
 
 
+def test_opus_doctor_prints_per_collection_name_and_count(monkeypatch, capsys):
+    """Part 3: opus-doctor prints each collection's name + clip count so we can
+    confirm clips landed after opus-organize. Routes clips per collection id."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        params = params or {}
+        if "/api/collections" in url:
+            return _FakeResponse(200,
+                '{"data": {"COLA": {"title": "LASSO Clips"},'
+                ' "COLB": {"title": "Summit"}}}')
+        if "/api/exportable-clips" in url:
+            if params.get("collectionId") == "COLA":
+                return _FakeResponse(200,
+                    '{"data": [{"id": "p.c1"}, {"id": "p.c2"}]}')   # 2 clips
+            return _FakeResponse(200, '{"data": []}')               # COLB empty
+        return _FakeResponse(404, "{}")
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    result = opus_ingest.opus_doctor()
+    printed = capsys.readouterr().out
+    assert result["collections"] == 2
+    assert "name='LASSO Clips' clips=2" in printed
+    assert "name='Summit' clips=0" in printed
+
+
 # ---- Part 4: finished-status filter + verbose raw-status logging --------------------
 
 def test_normalize_clip_accepts_standard_export_url(monkeypatch):
