@@ -27,18 +27,21 @@ UNFINISHED = {"id": "PROJ2.C2", "title": "still rendering", "durationMs": 30000}
 
 
 class FakeOpus:
-    """Mirrors the OpusAPI surface the factory uses: list_projects +
-    list_exportable_clips(q, project_id)."""
+    """Mirrors the OpusAPI surface the factory uses: list_collections_detailed +
+    list_exportable_clips(q, source_id). Discovery is by COLLECTION (the proven
+    documented route); there is no list_projects (that path 404s)."""
 
-    def __init__(self, projects, clips_by_project):
-        self._projects = projects                   # [{"id","title"}]
-        self._clips = clips_by_project              # {project_id: [clip,...]}
+    def __init__(self, collections, clips_by_source):
+        self._collections = collections             # [{"id","title"}]
+        self._clips = clips_by_source               # {source_id: [clip,...]}
+        self.q_calls = []                           # (q, source_id) seen
 
-    def list_projects(self):
-        return list(self._projects)
+    def list_collections_detailed(self):
+        return list(self._collections)
 
     def list_exportable_clips(self, q, source_id):
-        assert q == "findByProjectId"
+        assert q in ("findByCollectionId", "findByProjectId")
+        self.q_calls.append((q, source_id))
         return list(self._clips.get(source_id, []))
 
     def download(self, url):
@@ -51,9 +54,9 @@ def _arm(monkeypatch):
 
 def _fake():
     return FakeOpus(
-        projects=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"},
-                  {"id": "PROJ2", "title": "Client Webinars"}],
-        clips_by_project={"PODPROJ": [POD_CLIP], "PROJ2": [BIZ_CLIP, UNFINISHED]})
+        collections=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"},
+                     {"id": "PROJ2", "title": "Client Webinars"}],
+        clips_by_source={"PODPROJ": [POD_CLIP], "PROJ2": [BIZ_CLIP, UNFINISHED]})
 
 
 # ---- flag gate -----------------------------------------------------------------------------
@@ -63,15 +66,15 @@ def test_scan_flag_off_returns_empty(monkeypatch):
     assert opus_factory.scan(api=_fake()) == []
 
 
-# ---- all-project scan, no allowlist ---------------------------------------------------------
+# ---- all-collection scan, no allowlist ------------------------------------------------------
 
-def test_scan_returns_clips_across_projects(monkeypatch):
+def test_scan_returns_clips_across_collections(monkeypatch):
     _arm(monkeypatch)
     records = opus_factory.scan(api=_fake())
     by_id = {r.clip_id: r for r in records}
-    assert set(by_id) == {"PODPROJ.C1", "PROJ2.C1"}    # both projects, finished only
+    assert set(by_id) == {"PODPROJ.C1", "PROJ2.C1"}    # both sources, finished only
     pod = by_id["PODPROJ.C1"]
-    assert pod.project_id == "PODPROJ"
+    assert pod.project_id == "PODPROJ"                  # source id (collection id)
     assert pod.source_title == "Gym Marketing Made Simple"
     assert pod.opus_score == 92.0
     assert pod.duration_s == 38.0
@@ -79,6 +82,35 @@ def test_scan_returns_clips_across_projects(monkeypatch):
     biz = by_id["PROJ2.C1"]
     assert biz.source_title == "Client Webinars"
     assert biz.opus_score == 72.0                       # string coerced
+
+
+def test_scan_uses_find_by_collection(monkeypatch):
+    """The scan queries clips with findByCollectionId (not the 404 project path)."""
+    _arm(monkeypatch)
+    monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
+    fake = _fake()
+    opus_factory.scan(api=fake)
+    assert all(q == "findByCollectionId" for q, _ in fake.q_calls)
+    assert {sid for _, sid in fake.q_calls} == {"PODPROJ", "PROJ2"}
+
+
+def test_scan_honors_pinned_project_ids(monkeypatch):
+    """A pinned AGENT_OPUS_PROJECT_IDS is scanned with findByProjectId on top of
+    the collections (the documented manual escape hatch). Read at call time via
+    config.opus_project_ids(), so no module reload is needed."""
+    _arm(monkeypatch)
+    # config._csv_list lowercases entries (legacy behaviour), so the pinned id
+    # reaches the API lowercased; use a lowercase id to match what is sent.
+    monkeypatch.setenv("AGENT_OPUS_PROJECT_IDS", "realproj123")
+    pinned_clip = {"id": "realproj123.c1", "title": "pinned",
+                   "durationMs": 30000, "uriForExport": "https://cdn.opus/p.mp4",
+                   "score": 91, "transcript": "pinned clip"}
+    fake = FakeOpus(
+        collections=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"}],
+        clips_by_source={"PODPROJ": [POD_CLIP], "realproj123": [pinned_clip]})
+    ids = {r.clip_id for r in opus_factory.scan(api=fake)}
+    assert "realproj123.c1" in ids
+    assert ("findByProjectId", "realproj123") in fake.q_calls
 
 
 def test_scan_excludes_unfinished(monkeypatch):
@@ -89,17 +121,17 @@ def test_scan_excludes_unfinished(monkeypatch):
 
 def test_scan_needs_no_allowlist(monkeypatch):
     """No AGENT_OPUS_PROJECT_IDS / collection id set: the scan still finds every
-    project's clips via list_projects."""
+    collection's clips via list_collections_detailed."""
     _arm(monkeypatch)
     monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
     monkeypatch.delenv("AGENT_OPUS_COLLECTION_IDS", raising=False)
     assert len(opus_factory.scan(api=_fake())) == 2
 
 
-def test_scan_dedupes_clip_shared_across_projects(monkeypatch):
+def test_scan_dedupes_clip_shared_across_collections(monkeypatch):
     _arm(monkeypatch)
-    fake = FakeOpus(projects=[{"id": "A", "title": "A"}, {"id": "B", "title": "B"}],
-                    clips_by_project={"A": [POD_CLIP], "B": [POD_CLIP]})
+    fake = FakeOpus(collections=[{"id": "A", "title": "A"}, {"id": "B", "title": "B"}],
+                    clips_by_source={"A": [POD_CLIP], "B": [POD_CLIP]})
     assert len(opus_factory.scan(api=fake)) == 1
 
 
@@ -432,7 +464,7 @@ class FakePoster:
 
 
 def _factory_fake():
-    """A project set exercising every outcome: a strong podcast clip, a strong
+    """A collection set exercising every outcome: a strong podcast clip, a strong
     platform clip, an off-topic clip, a low-score clip."""
     strong_pod = {"id": "PF.pod", "title": "Follow up",
                   "durationMs": 40000, "uriForExport": "https://cdn/pf_pod.mp4",
@@ -451,10 +483,10 @@ def _factory_fake():
                 "durationMs": 30000, "uriForExport": "https://cdn/pf_low.mp4",
                 "score": 60, "transcript": "We book 71.9 percent on the calendar."}
     return FakeOpus(
-        projects=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"},
-                  {"id": "BIZ", "title": "Client Webinars"}],
-        clips_by_project={"PODPROJ": [strong_pod],
-                          "BIZ": [strong_plat, offtopic, lowscore]})
+        collections=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"},
+                     {"id": "BIZ", "title": "Client Webinars"}],
+        clips_by_source={"PODPROJ": [strong_pod],
+                         "BIZ": [strong_plat, offtopic, lowscore]})
 
 
 def test_dry_run_never_writes(monkeypatch):

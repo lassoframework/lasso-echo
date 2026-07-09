@@ -260,12 +260,21 @@ def opus_api_base() -> str:
 def opus_org_id() -> str:
     """Opus org-id header value, read from env at each call."""
     return os.environ.get("AGENT_OPUS_ORG_ID", "")
-# DEPRECATED for the video factory: the factory enumerates ALL projects via
-# OpusAPI.list_projects (opus_factory.scan), so no pinned allowlist and no
-# hand-built "Echo Export" collection is required. These two vars remain ONLY
-# for the legacy pull-opus ingest poller (opus_ingest); new work uses opus-pull.
+# The video factory discovers via the account's COLLECTIONS (the documented API
+# has no bulk project-listing endpoint), so no hand-maintained allowlist is
+# required for the common case. AGENT_OPUS_PROJECT_IDS remains an optional manual
+# escape hatch, honored by BOTH the factory (opus_factory.scan) and the legacy
+# pull-opus poller (opus_ingest). AGENT_OPUS_COLLECTION_IDS is used by the legacy
+# poller only.
 OPUS_PROJECT_IDS = _csv_list("AGENT_OPUS_PROJECT_IDS", [])
 OPUS_COLLECTION_IDS = _csv_list("AGENT_OPUS_COLLECTION_IDS", [])
+
+
+def opus_project_ids():
+    """Pinned Opus project ids, read from env at each call (the factory reads
+    them live so no module reload is needed). The legacy poller still uses the
+    import-time OPUS_PROJECT_IDS constant."""
+    return _csv_list("AGENT_OPUS_PROJECT_IDS", [])
 
 
 def opus_enabled() -> bool:

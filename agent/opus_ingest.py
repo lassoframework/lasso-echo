@@ -158,29 +158,32 @@ class OpusAPI:
                   f"{total_objects} object(s)")
         return ids
 
-    def list_projects(self):
+    def list_collections_detailed(self):
         """
-        GET /api/projects?q=mine -> [{"id", "title"}], paginated. The all-project
-        enumeration the video factory scans (no pinned allowlist required). Id
-        and title extraction are shape-tolerant like list_collections; a project
-        with no resolvable id is skipped, never guessed.
+        GET /api/collections?q=mine -> [{"id", "title"}], paginated. The PROVEN
+        discovery route for the video factory (the documented Opus API has NO
+        bulk project-listing endpoint, so /api/projects does not exist). Id
+        extraction reuses the shape-tolerant _extract_id; the title falls back
+        across title/name/collectionName. A collection with no resolvable id is
+        skipped, never guessed. Parallel to list_collections (ids only), which
+        the legacy poller still uses.
         """
-        projects, page = [], 1
+        out, page = [], 1
         while True:
-            body = self._get("/api/projects",
+            body = self._get("/api/collections",
                              {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
             items = body if isinstance(body, list) else body.get("data", []) or []
-            for p in items:
-                pid = _extract_id(p)
-                if not pid:
+            for c in items:
+                cid = _extract_id(c)
+                if not cid:
                     continue
                 title = ""
-                if isinstance(p, dict):
-                    title = str(p.get("title", "") or p.get("name", "")
-                                or p.get("projectName", "") or "")
-                projects.append({"id": pid, "title": title})
+                if isinstance(c, dict):
+                    title = str(c.get("title", "") or c.get("name", "")
+                                or c.get("collectionName", "") or "")
+                out.append({"id": cid, "title": title})
             if len(items) < 50:
-                return projects
+                return out
             page += 1
 
     def list_exportable_clips(self, q, source_id):

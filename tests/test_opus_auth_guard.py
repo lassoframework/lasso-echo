@@ -83,7 +83,7 @@ def test_scan_propagates_opus_scan_error(monkeypatch):
     _arm_factory(monkeypatch)
 
     class _FailingAPI:
-        def list_projects(self):
+        def list_collections_detailed(self):
             raise opus_ingest.OpusScanError(403, "forbidden")
 
     try:
@@ -99,7 +99,7 @@ def test_scan_still_returns_empty_on_non_auth_error(monkeypatch):
     _arm_factory(monkeypatch)
 
     class _BrokenAPI:
-        def list_projects(self):
+        def list_collections_detailed(self):
             raise ValueError("unexpected json shape")
 
     result = opus_factory.scan(api=_BrokenAPI())
@@ -162,8 +162,42 @@ def test_get_uses_current_api_base(monkeypatch):
 
     import requests as _req
     monkeypatch.setattr(_req, "get", _fake_get)
-    api._get("/api/projects")
+    api._get("/api/collections")
     assert captured_urls[0].startswith("https://custom.opus.test")
+
+
+# ---- Part 2: the scan hits the PROVEN routes (not the 404 /api/projects) ------------
+
+def test_scan_hits_collections_route_not_projects(monkeypatch):
+    """At the HTTP layer, the factory scan queries /api/collections and
+    /api/exportable-clips, and NEVER the non-existent /api/projects path."""
+    _arm_factory(monkeypatch)
+    monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
+    captured = []
+
+    def _fake_get(url, params=None, headers=None, timeout=30):
+        captured.append((url, dict(params or {})))
+        if "/api/collections" in url:
+            return _FakeResponse(200, '{"data":[{"id":"COL1","title":"Show"}]}')
+        if "/api/exportable-clips" in url:
+            return _FakeResponse(
+                200,
+                '{"data":[{"id":"COL1.C1","title":"Clip","durationMs":30000,'
+                '"uriForExport":"https://cdn.opus/c1.mp4","score":91,'
+                '"transcript":"a clip"}]}')
+        return _FakeResponse(404, '{"error":"NotFoundException"}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_get)
+    records = opus_factory.scan(api=opus_ingest.OpusAPI("sk-testkey"))
+    paths = [u for u, _ in captured]
+    assert any("/api/collections" in p for p in paths)
+    assert any("/api/exportable-clips" in p for p in paths)
+    assert not any("/api/projects" in p for p in paths)   # the 404 route is gone
+    # the clip route used findByCollectionId
+    clip_calls = [prm for u, prm in captured if "/api/exportable-clips" in u]
+    assert clip_calls and clip_calls[0].get("q") == "findByCollectionId"
+    assert {r.clip_id for r in records} == {"COL1.C1"}
 
 
 # ---- Part 3: opus-doctor output -----------------------------------------------------
@@ -266,12 +300,14 @@ def test_normalize_clip_excludes_processing_status(monkeypatch):
 def test_scan_verbose_logs_excluded_raw_statuses(monkeypatch, capsys):
     """Verbose scan prints the raw status values of clips that were excluded."""
     monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
 
     class _FakeOpus:
-        def list_projects(self):
-            return [{"id": "PROJ1", "title": "Test"}]
+        def list_collections_detailed(self):
+            return [{"id": "COL1", "title": "Test"}]
 
         def list_exportable_clips(self, q, source_id):
+            assert q == "findByCollectionId"
             return [
                 {"id": "C_DONE", "uriForExport": "https://cdn.opus/done.mp4",
                  "durationMs": 30000, "score": 91},

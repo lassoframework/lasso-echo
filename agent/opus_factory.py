@@ -179,8 +179,11 @@ THEME_LEXICON = {
 
 
 def is_podcast_sourced(record):
-    """True when a clip's project title names the podcast show (case-insensitive).
-    Podcast-sourced clips tag bucket=podcast without the lexicon."""
+    """True when a clip's source title names the podcast show (case-insensitive).
+    The source title is the clip's collection name (or pinned project id), set at
+    scan time; organize the show's clips into a collection named after the show
+    (AGENT_OPUS_PODCAST_SHOW). Podcast-sourced clips tag bucket=podcast without
+    the lexicon."""
     show = config.opus_podcast_show().strip().lower()
     return bool(show) and show in (record.source_title or "").lower()
 
@@ -546,46 +549,61 @@ def score_gate(records):
 
 def scan(api=None, verbose=False):
     """
-    Every finished clip across ALL Opus projects, normalized to ClipRecords.
-    Read only: enumerates projects (api.list_projects), lists each project's
-    exportable clips, normalizes, downloads nothing. NO pinned allowlist is
-    required or consulted. Returns [] while AGENT_OPUS_FACTORY_ENABLED is OFF.
+    Every finished clip the account can reach, normalized to ClipRecords.
+
+    Discovery uses the PROVEN documented routes (see ROUTE CONTRACT at the top of
+    this module): GET /api/collections?q=mine (api.list_collections_detailed) for
+    the account's collections, plus any pinned AGENT_OPUS_PROJECT_IDS (the
+    documented manual escape hatch). There is NO bulk project-listing endpoint,
+    so this is an all-COLLECTION scan, not an all-project one, and it needs no
+    hand-maintained allowlist. For each source it lists clips via
+    GET /api/exportable-clips. Read only: normalizes, downloads nothing. An auth
+    or transport failure (OpusScanError) propagates so the caller surfaces it
+    loudly instead of returning a misleading empty list. Returns [] while
+    AGENT_OPUS_FACTORY_ENABLED is OFF.
     """
     if not config.opus_factory_enabled():
         return []
     from . import opus_ingest
+    from .opus_ingest import OpusScanError
     api = api or opus_ingest._default_api()
     if api is None:
         return []
     vprint = print if verbose else (lambda *a, **k: None)
 
-    from .opus_ingest import OpusScanError
+    # (q, {"id","title"}) sources: collections (proven discovery) + pinned projects.
+    sources = []
     try:
-        projects = api.list_projects()
+        for c in api.list_collections_detailed():
+            sources.append(("findByCollectionId", c))
     except OpusScanError:
-        raise  # auth / transport error — let the caller surface it loudly
+        raise  # auth / transport / wrong-endpoint error — surface it loudly
     except Exception as e:
-        vprint(f"[opus-factory] list_projects failed: {type(e).__name__}: {e}")
+        vprint(f"[opus-factory] list_collections_detailed failed: "
+               f"{type(e).__name__}: {e}")
         return []
-    vprint(f"[opus-factory] scanning {len(projects)} project(s)")
+    for pid in opus_ingest.validated_project_ids(config.opus_project_ids()):
+        sources.append(("findByProjectId", {"id": pid, "title": ""}))
+    vprint(f"[opus-factory] scanning {len(sources)} source(s) "
+           f"(collections + pinned projects)")
 
     records, seen = [], set()
-    for proj in projects:
-        pid = proj.get("id") if isinstance(proj, dict) else str(proj)
-        title = proj.get("title", "") if isinstance(proj, dict) else ""
-        if not pid:
+    for q, src in sources:
+        sid = src.get("id") if isinstance(src, dict) else str(src)
+        title = src.get("title", "") if isinstance(src, dict) else ""
+        if not sid:
             continue
         try:
-            clips = api.list_exportable_clips("findByProjectId", pid)
+            clips = api.list_exportable_clips(q, sid)
         except OpusScanError:
             raise  # auth / transport error — propagate
         except Exception as e:
-            vprint(f"[opus-factory] list clips failed for {pid}: "
+            vprint(f"[opus-factory] list clips failed for {q}:{sid}: "
                    f"{type(e).__name__}: {e}")
             continue
         included, excluded_status = 0, []
         for clip in clips:
-            rec = normalize_clip(clip, pid, title)
+            rec = normalize_clip(clip, sid, title)
             if rec is None:
                 raw_st = clip.get("status") or clip.get("clipStatus") or "(no status)"
                 excluded_status.append(str(raw_st))
@@ -595,7 +613,7 @@ def scan(api=None, verbose=False):
             seen.add(rec.clip_id)
             records.append(rec)
             included += 1
-        vprint(f"[opus-factory] project {pid}: {included} clip(s) included, "
+        vprint(f"[opus-factory] source {q}:{sid}: {included} clip(s) included, "
                f"{len(excluded_status)} excluded (raw statuses seen: "
                f"{sorted(set(excluded_status)) or 'none'})")
     return records
