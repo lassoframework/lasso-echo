@@ -473,6 +473,26 @@ def main(argv=None):
         else:
             print(f"pull-opus: {out['pulled']} pulled, {out['skipped']} skipped, "
                   f"{out['failed']} failed")
+    elif cmd == "opus-pull":
+        # Opus video factory (AGENT_OPUS_FACTORY_ENABLED): scan ALL projects,
+        # score-gate, tag, hook-check, caption, dedupe, route to DRAFTS held for
+        # the tap. Dry-run by default (prints the ranked plan, writes nothing);
+        # --write builds the held drafts and posts them to the ops channel.
+        from .opus_factory import opus_pull_cli
+        start = None
+        args = argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--start" and i + 1 < len(args):
+                start = args[i + 1]; i += 2; continue
+            i += 1
+        poster = ConsolePoster() if "--write" in args else None
+        store = None
+        if "--write" in args:
+            from .store import PendingStore
+            store = PendingStore()
+        opus_pull_cli(write="--write" in args, start_day=start,
+                      poster=poster, store=store)
     elif cmd == "podcast-transcript":
         # Podcast transcript ingest (AGENT_PODCAST_ENABLED): store one episode's
         # transcript as its APPROVED SOURCE (citation id podcast_ep<N>), from a

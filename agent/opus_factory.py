@@ -419,7 +419,7 @@ def _iso_week(day):
 
 
 def route(records, start_day, account_key="lasso_ig", platform="instagram",
-          weeks=4, store=None):
+          weeks=4, store=None, commit=True):
     """
     Place eligible clips (status '', bucketed, captioned) into VIDEO slots on
     their bucket's cadence and build a DRAFT for each, held for approval.
@@ -458,9 +458,12 @@ def route(records, start_day, account_key="lasso_ig", platform="instagram",
             scheduled_for=schedule.scheduled_for(day), status=DraftStatus.PENDING,
             source_fragments=[f"cite:opus_{clip.clip_id}"],
             day_key=day, draft_type="opus_clip", category=bucket)
-        if store is not None:
-            store.put(draft)
-        mark_drafted(clip.clip_id, day)
+        # commit=False (dry-run) plans the placement in memory only: no ledger
+        # stamp, no store write, so a dry-run is truly side-effect free.
+        if commit:
+            if store is not None:
+                store.put(draft)
+            mark_drafted(clip.clip_id, day)
         clip.status = "draft"
         clip.scheduled_for = draft.scheduled_for
         used_days.add(day)
@@ -546,3 +549,102 @@ def scan(api=None, verbose=False):
             seen.add(rec.clip_id)
             records.append(rec)
     return records
+
+
+# ---- Part 8: pipeline + opus-pull CLI + ops surface ------------------------------------
+def run_pipeline(api=None, start_day=None, dry=True, account_key="lasso_ig",
+                 platform="instagram", store=None):
+    """
+    The whole factory in order: scan -> dedupe -> score gate -> tag -> hook ->
+    caption -> route. Returns a plan dict:
+      {"drafts": [Draft], "drafted": [rec], "held": [rec], "shortlist": [rec],
+       "dropped": [rec], "dupes": [rec]}
+    dry=True plans without any side effect (no ledger stamp, no store, no post).
+    Returns None while the master flag is OFF.
+    """
+    if not config.opus_factory_enabled():
+        return None
+    from datetime import date, timedelta
+    if start_day is None:
+        # next Monday from an env-provided anchor, or fall back to a fixed plan
+        # start; callers (the CLI) pass the real day. Never uses Date.now here.
+        start_day = "2026-08-03"
+    records = scan(api=api)
+    fresh, dupes = dedupe(records)
+    survivors, dropped = score_gate(fresh)
+    tag_all(survivors)
+    hook_check_all(survivors)
+    for r in survivors:
+        if r.status == "":
+            write_caption(r)
+    drafts = route([r for r in survivors if r.status == ""], start_day,
+                   account_key=account_key, platform=platform,
+                   store=store, commit=not dry)
+    return {
+        "drafts": drafts,
+        "drafted": [r for r in survivors if r.status == "draft"],
+        "held": [r for r in survivors if r.status == "hold"],
+        "shortlist": [r for r in survivors if r.status == "shortlist"],
+        "dropped": dropped,
+        "dupes": dupes,
+    }
+
+
+def _plan_lines(plan):
+    """The ranked plan + held/rejected list as printable lines (dry-run output)."""
+    lines = ["opus-pull PLAN (ranked, held for approval):"]
+    for r in sorted(plan["drafted"], key=lambda r: r.opus_score, reverse=True):
+        hook = hook_opening(r.transcript) or r.title
+        lines.append(f"  score {r.opus_score:g}  {r.bucket:9s}  {r.scheduled_for[:10]}  "
+                     f"{hook[:60]}")
+    rejected = ([("dupe", r) for r in plan["dupes"]]
+                + [("dropped", r) for r in plan["dropped"]]
+                + [("held", r) for r in plan["held"]]
+                + [("shortlist", r) for r in plan["shortlist"]])
+    if rejected:
+        lines.append("held / rejected:")
+        for kind, r in rejected:
+            lines.append(f"  [{kind}] {r.clip_id}: {r.reason}")
+    lines.append(f"summary: {len(plan['drafted'])} drafted, "
+                 f"{len(plan['shortlist'])} shortlisted, {len(plan['held'])} held, "
+                 f"{len(plan['dropped'])} dropped, {len(plan['dupes'])} dupe(s)")
+    return lines
+
+
+def opus_pull_cli(write=False, api=None, start_day=None, poster=None, store=None,
+                  account_key="lasso_ig", platform="instagram"):
+    """
+    python -m agent opus-pull [--write]
+
+    Dry-run (default): prints the ranked plan + the held/rejected list with
+    reasons; writes NOTHING (no ledger, no store, no Slack). --write: builds the
+    held drafts, posts each to the ops channel with its preview/caption/bucket/
+    score for the tap, and one digest line. Behind the master flag.
+    """
+    if not config.opus_factory_enabled():
+        print("opus-pull: OFF (set AGENT_OPUS_FACTORY_ENABLED=true). Nothing done.")
+        return None
+    plan = run_pipeline(api=api, start_day=start_day, dry=not write,
+                        account_key=account_key, platform=platform, store=store)
+    for line in _plan_lines(plan):
+        print(line)
+    if not write:
+        print("opus-pull: DRY RUN, nothing was written or posted.")
+        return plan
+    if poster is not None:
+        for d, r in zip(plan["drafts"], sorted(plan["drafted"],
+                                               key=lambda r: r.scheduled_for)):
+            try:
+                poster.post_approval_card(d)
+            except Exception as e:
+                print(f"[opus-pull] card post failed for {d.draft_id}: "
+                      f"{type(e).__name__}: {e}")
+        try:
+            poster.post_notice(
+                f"opus-pull: {len(plan['drafted'])} clip(s) drafted and held for "
+                f"the tap; {len(plan['shortlist'])} shortlisted, "
+                f"{len(plan['held'])} held, {len(plan['dropped'])} below bar, "
+                f"{len(plan['dupes'])} already seen.")
+        except Exception as e:
+            print(f"[opus-pull] digest post failed: {type(e).__name__}: {e}")
+    return plan

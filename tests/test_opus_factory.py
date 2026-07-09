@@ -407,3 +407,94 @@ def test_route_ledger_prevents_redraft(monkeypatch):
     fresh, seen = opus_factory.dedupe([_eligible("once", "platform")])
     assert fresh == [] and seen[0].status == "dupe"
     _clear_ledger("once")
+
+
+# ---- Part 8: opus-pull CLI + ops surface --------------------------------------------------
+class FakeStore:
+    def __init__(self):
+        self.drafts = []
+
+    def put(self, draft):
+        self.drafts.append(draft)
+
+
+class FakePoster:
+    def __init__(self):
+        self.cards, self.notices = [], []
+
+    def post_approval_card(self, draft):
+        self.cards.append(draft)
+        return {"ok": True}
+
+    def post_notice(self, text):
+        self.notices.append(text)
+        return {"ok": True}
+
+
+def _factory_fake():
+    """A project set exercising every outcome: a strong podcast clip, a strong
+    platform clip, an off-topic clip, a low-score clip."""
+    strong_pod = {"id": "PF.pod", "title": "Follow up",
+                  "durationMs": 40000, "uriForExport": "https://cdn/pf_pod.mp4",
+                  "score": 95,
+                  "transcript": "Most gyms do not have a lead problem. They have "
+                                "a follow up problem. Fix follow up and win."}
+    strong_plat = {"id": "PF.plat", "title": "Booking",
+                   "durationMs": 42000, "uriForExport": "https://cdn/pf_plat.mp4",
+                   "score": 93,
+                   "transcript": "We book 71.9 percent of leads on the calendar. "
+                                 "The industry books far less. Same leads."}
+    offtopic = {"id": "PF.beach", "title": "Vacation",
+                "durationMs": 30000, "uriForExport": "https://cdn/pf_beach.mp4",
+                "score": 96, "transcript": "I went to the beach and ate ice cream today."}
+    lowscore = {"id": "PF.low", "title": "Meh",
+                "durationMs": 30000, "uriForExport": "https://cdn/pf_low.mp4",
+                "score": 60, "transcript": "We book 71.9 percent on the calendar."}
+    return FakeOpus(
+        projects=[{"id": "PODPROJ", "title": "Gym Marketing Made Simple"},
+                  {"id": "BIZ", "title": "Client Webinars"}],
+        clips_by_project={"PODPROJ": [strong_pod],
+                          "BIZ": [strong_plat, offtopic, lowscore]})
+
+
+def test_dry_run_never_writes(monkeypatch):
+    _arm(monkeypatch)
+    _clear_ledger("PF.pod", "PF.plat", "PF.beach", "PF.low")
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: None)
+    monkeypatch.setenv("AGENT_OPUS_WEEKLY_CAP", "9")
+    store = FakeStore()
+    plan = opus_factory.run_pipeline(api=_factory_fake(), start_day="2026-08-03",
+                                     dry=True, store=store)
+    assert plan["drafted"], "expected a plan"
+    assert store.drafts == []                       # dry run wrote nothing
+    # the low-score clip dropped, the beach clip held, the strong ones drafted
+    assert opus_factory.is_drafted("PF.pod") is False   # ledger untouched by dry run
+    dropped_ids = {r.clip_id for r in plan["dropped"]}
+    held_ids = {r.clip_id for r in plan["held"]}
+    assert "PF.low" in dropped_ids and "PF.beach" in held_ids
+    _clear_ledger("PF.pod", "PF.plat", "PF.beach", "PF.low")
+
+
+def test_write_mode_creates_held_drafts_only(monkeypatch):
+    _arm(monkeypatch)
+    _clear_ledger("PF.pod", "PF.plat", "PF.beach", "PF.low")
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: None)
+    monkeypatch.setenv("AGENT_OPUS_WEEKLY_CAP", "9")
+    store, poster = FakeStore(), FakePoster()
+    plan = opus_factory.opus_pull_cli(write=True, api=_factory_fake(),
+                                      start_day="2026-08-03", poster=poster,
+                                      store=store)
+    assert store.drafts, "write mode should create drafts"
+    for d in store.drafts:
+        assert d.status == DraftStatus.PENDING       # held, never published
+    assert len(poster.cards) == len(plan["drafted"])  # one card per drafted clip
+    assert len(poster.notices) == 1                   # one digest line
+    # the ledger now blocks a re-draft
+    assert opus_factory.is_drafted("PF.pod") is True
+    _clear_ledger("PF.pod", "PF.plat", "PF.beach", "PF.low")
+
+
+def test_cli_flag_off_does_nothing(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_OPUS_FACTORY_ENABLED", raising=False)
+    assert opus_factory.opus_pull_cli(write=True, api=_factory_fake()) is None
+    assert "OFF" in capsys.readouterr().out
