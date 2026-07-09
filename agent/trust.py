@@ -84,6 +84,27 @@ def requires_approval(account, draft) -> bool:
     return creative_key not in approved_calendar(account.key, month)
 
 
+def level_for_tenant(key, base_dir=None) -> TrustLevel:
+    """
+    The trust level for a Stage 2 tenant, read from its tenant.json AS DATA and
+    coerced FAIL-SAFE exactly like effective_level: a missing tenant, a missing
+    field, a typo, or any unknown value reads as level 0 (FULL_APPROVAL).
+
+    PER ACCOUNT, NEVER GLOBAL: this reads ONLY the named tenant's own record, so
+    a brand new tenant starts at full approval no matter what any other account
+    or tenant has earned. intake_create writes trust 0 explicitly; nothing in
+    code ever raises a level (hand-edited config only).
+    """
+    from . import tenants
+    rec = tenants.load_tenant(key, base_dir=base_dir)
+    if not rec:
+        return TrustLevel.FULL_APPROVAL
+    try:
+        return TrustLevel(int(rec.get("trust", 0)))
+    except (ValueError, TypeError):
+        return TrustLevel.FULL_APPROVAL
+
+
 def _has_published_before(account_key):
     """The FIRST-POST GATE data read: has this account EVER really published?"""
     try:
