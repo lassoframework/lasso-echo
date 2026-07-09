@@ -138,7 +138,7 @@ class OpusAPI:
         while True:
             body = self._get("/api/collections",
                              {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
-            items = body if isinstance(body, list) else body.get("data", []) or []
+            items = normalize_list_response(body)
             total_objects += len(items)
             for c in items:
                 cid = _extract_id(c)
@@ -172,7 +172,7 @@ class OpusAPI:
         while True:
             body = self._get("/api/collections",
                              {"q": "mine", "pageNum": page, "pageSize": 50}) or {}
-            items = body if isinstance(body, list) else body.get("data", []) or []
+            items = normalize_list_response(body)
             for c in items:
                 cid = _extract_id(c)
                 if not cid:
@@ -194,7 +194,7 @@ class OpusAPI:
             body = self._get("/api/exportable-clips",
                              {"q": q, id_param: source_id,
                               "pageNum": page, "pageSize": 50}) or {}
-            items = body if isinstance(body, list) else body.get("data", []) or []
+            items = normalize_list_response(body)
             clips.extend(i for i in items if isinstance(i, dict))
             if len(items) < 50:
                 return clips
@@ -238,6 +238,54 @@ def _extract_id(item):
         if key.lower().endswith("id") and isinstance(v, (str, int)) and v:
             return str(v)
     return ""
+
+
+# Wrapper keys a list-style Opus response may nest its records under.
+_LIST_WRAPPER_KEYS = ("data", "collections", "clips", "items", "results", "docs")
+
+
+def _dict_to_records(d):
+    """A bare dict container -> a flat list of record dicts. When the dict is an
+    id-keyed map ({<id>: {..record..}}) each key is injected as the record's id
+    (only if the record has none); non-dict values are skipped. A scalar-only
+    dict (e.g. metadata like {"total": 0}) yields [], never a fabricated record."""
+    if not d:
+        return []
+    dict_items = [(k, v) for k, v in d.items() if isinstance(v, dict)]
+    if not dict_items:
+        return []
+    out = []
+    for k, v in dict_items:
+        rec = dict(v)
+        rec.setdefault("id", k)
+        out.append(rec)
+    return out
+
+
+def normalize_list_response(body):
+    """
+    THE single normalizer for Opus list-style responses (collections and clips),
+    used by both the client list methods (so scan() is covered) and opus-doctor.
+
+    Returns a plain list of record dicts regardless of the wire shape:
+      - a bare list                          -> the list (None items dropped)
+      - a wrapper {data|collections|clips|items|results|docs: <list or dict>}
+                                             -> the unwrapped, normalized container
+      - a bare id-keyed dict {<id>: {...}}   -> [{"id": <id>, ...}, ...]
+      - a single record dict                 -> [that record]
+      - None / empty / unknown               -> []
+    NEVER indexes and never assumes a list; safe on any shape.
+    """
+    if body is None:
+        return []
+    if isinstance(body, list):
+        return [x for x in body if x is not None]
+    if isinstance(body, dict):
+        for key in _LIST_WRAPPER_KEYS:
+            if key in body:
+                return normalize_list_response(body[key])
+        return _dict_to_records(body)
+    return []
 
 
 def _default_api():
