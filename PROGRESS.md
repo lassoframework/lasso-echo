@@ -528,6 +528,34 @@ pull-opus poller is the source of truth (it lists via collections).
       with a collection count. Podcast clips must live in a collection named
       after the show (AGENT_OPUS_PODCAST_SHOW) for podcast tagging.
 
+### Opus response shape fix (2026-07-09; four parts, built after opus-doctor 200 then crashed)
+Third issue in the chain: with the key + route correct, opus-doctor got HTTP 200
+and reported 3 collections, then crashed KeyError: 0 on items[0]. The live
+/api/collections response wraps its records as an ID-KEYED DICT, not a list:
+the actual shape is {"data": {"<collection id>": {...}, ...}}. The old parse did
+body.get("data", []) which returned that dict, and items[0] then did a dict-key
+lookup for 0.
+- [x] Part 1: captured the real shape — _shape_desc(body) logs the top-level
+      type and key NAMES only (capped, never values that could carry tokens/PII);
+      opus-doctor prints it right after the JSON parse.
+- [x] Part 2: single normalizer — normalize_list_response(body) returns a flat
+      list of record dicts for any shape: a bare list; a wrapper {data|collections
+      |clips|items|results|docs: <list or dict>}; a bare id-keyed dict (the key is
+      injected as the record id, existing ids preserved); or empty -> []. Wired
+      into list_collections, list_collections_detailed, list_exportable_clips (so
+      scan is covered), preserving the legacy list_collections WARNING contract.
+- [x] Part 3: opus-doctor robust — consumes the normalizer instead of items[0];
+      reports collection count + first collection id/status on any shape; empty
+      says so plainly and never indexes.
+- [x] Part 4: tests feed the normalizer every shape (list, wrapped list, id-keyed
+      dict, bare id-keyed dict, alternate wrappers, empty/None/metadata/non-JSON)
+      and assert a correct flat list; scan + doctor both proven to consume it end
+      to end at the HTTP layer.
+- Shape verdict: the live /api/collections returns an ID-KEYED DICT under "data"
+      ({"data": {"<id>": {...}}}), not a list. The route and auth were correct;
+      this was purely a response-shape parse bug. Fixed for every consumer via
+      one normalizer.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
