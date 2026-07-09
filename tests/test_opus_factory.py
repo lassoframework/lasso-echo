@@ -150,3 +150,49 @@ def test_score_gate_splits_and_marks(monkeypatch):
 def test_score_floor_override(monkeypatch):
     monkeypatch.setenv("AGENT_OPUS_SCORE_FLOOR", "70")
     assert opus_factory.passes_score_gate(_rec(score=72))[0] is True
+
+
+# ---- Part 3: bucket tagger ----------------------------------------------------------------
+from agent import ops_alerts  # noqa: E402
+
+
+def test_podcast_sourced_tags_podcast(monkeypatch):
+    monkeypatch.delenv("AGENT_OPUS_PODCAST_SHOW", raising=False)  # default show
+    r = _rec(clip_id="pod", source_title="Gym Marketing Made Simple",
+             transcript="anything at all here")
+    opus_factory.tag_clip(r)
+    assert r.bucket == "podcast" and r.confidence == 1.0 and r.status == ""
+
+
+def test_on_topic_nonpodcast_tagged_to_bucket(monkeypatch):
+    r = _rec(clip_id="biz", source_title="Client Webinars",
+             transcript="We book 71.9 percent and the no shows vanish once "
+                        "booking is on the calendar.")
+    opus_factory.tag_clip(r)
+    assert r.bucket == "platform"
+    assert r.confidence >= config.opus_relevance_floor()
+    assert r.status == ""
+
+
+def test_off_topic_held_with_alert(monkeypatch):
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: fired.append(msg))
+    r = _rec(clip_id="beach", source_title="Random Vlog",
+             transcript="Yesterday I went to the beach and ate ice cream.")
+    opus_factory.tag_clip(r)
+    assert r.status == "hold" and r.bucket == ""
+    assert len(fired) == 1 and "beach" in fired[0]
+
+
+def test_low_confidence_held(monkeypatch):
+    monkeypatch.setenv("AGENT_OPUS_RELEVANCE_FLOOR", "0.9")
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: None)
+    r = _rec(clip_id="weak", source_title="Webinars",
+             transcript="A quick word on follow up.")
+    opus_factory.tag_clip(r)
+    assert r.status == "hold" and "below floor" in r.reason
+
+
+def test_classify_empty_invents_nothing():
+    assert opus_factory.classify_transcript("") == {
+        "bucket": "", "confidence": 0.0, "themes": []}

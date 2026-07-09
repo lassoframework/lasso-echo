@@ -112,6 +112,106 @@ def normalize_clip(clip, project_id, source_title=""):
     )
 
 
+# ---- Part 3: bucket tagger -------------------------------------------------------------
+# The LASSO theme lexicon: theme -> (word-boundary keywords, the bucket it routes
+# to). Buckets are from content_categories.CATEGORIES. A non-podcast clip never
+# routes to podcast (that bucket is reserved for podcast-sourced clips).
+# Classification reads the transcript ONLY and never invents a topic.
+THEME_LEXICON = {
+    "follow_up_problem": (
+        ["follow up", "follow-up", "followup", "chase", "chasing", "nurture",
+         "dead lead", "dead leads", "ghost", "ghosted"], "doctrine"),
+    "speed_to_lead": (
+        ["speed to lead", "five minutes", "5 minutes", "respond fast",
+         "first to respond", "within minutes", "response time"], "doctrine"),
+    "diagnostic_order": (
+        ["close rate", "show rate", "booking rate", "diagnose", "diagnosis",
+         "funnel", "the first leg", "in order"], "platform"),
+    "six_engines": (
+        ["six engines", "ad engine", "google ads", "one platform", "one login",
+         "the portal", "done for you"], "platform"),
+    "booking_gap": (
+        ["booked", "booking", "appointments", "on the calendar", "71.9", "18.5",
+         "no shows", "no-shows"], "platform"),
+    "retention": (
+        ["retention", "churn", "cancellations", "cancel", "stay longer",
+         "lifetime value", "ltv", "member for"], "doctrine"),
+    "positioning": (
+        ["positioning", "your message", "message clarity", "stand out",
+         "differentiate", "who you serve", "your avatar"], "platform"),
+}
+
+
+def is_podcast_sourced(record):
+    """True when a clip's project title names the podcast show (case-insensitive).
+    Podcast-sourced clips tag bucket=podcast without the lexicon."""
+    show = config.opus_podcast_show().strip().lower()
+    return bool(show) and show in (record.source_title or "").lower()
+
+
+def classify_transcript(transcript):
+    """
+    Classify a transcript against the theme lexicon. Returns
+    {"bucket", "confidence" (0..1), "themes": [matched theme names]}. Pure and
+    transcript-only: no theme match -> empty bucket, 0 confidence (nothing
+    invented). Confidence rises with keyword coverage; one clean theme hit lands
+    exactly at the default relevance floor (0.65).
+    """
+    text = (transcript or "").lower()
+    theme_hits = {}
+    for theme, (keywords, bucket) in THEME_LEXICON.items():
+        hits = 0
+        for kw in keywords:
+            hits += len(re.findall(r"\b" + re.escape(kw) + r"\b", text))
+        if hits:
+            theme_hits[theme] = (hits, bucket)
+    if not theme_hits:
+        return {"bucket": "", "confidence": 0.0, "themes": []}
+    total = sum(h for h, _b in theme_hits.values())
+    top = max(sorted(theme_hits.items()), key=lambda kv: kv[1][0])
+    confidence = min(1.0, 0.5 + 0.15 * total)
+    return {"bucket": top[1][1], "confidence": round(confidence, 3),
+            "themes": sorted(theme_hits)}
+
+
+def tag_clip(record, poster=None):
+    """
+    Tag ONE score-gate survivor with its bucket, in place. Podcast-sourced clips
+    tag bucket=podcast directly. Otherwise classify from the transcript: no
+    theme, or confidence below AGENT_OPUS_RELEVANCE_FLOOR, sets status='hold'
+    with a reason and ONE ops alert; it is never drafted. On-topic clips get
+    their bucket + confidence and stay eligible.
+    """
+    if is_podcast_sourced(record):
+        record.bucket = "podcast"
+        record.confidence = 1.0
+        return record
+    result = classify_transcript(record.transcript)
+    floor = config.opus_relevance_floor()
+    record.confidence = result["confidence"]
+    if not result["bucket"] or result["confidence"] < floor:
+        record.status = "hold"
+        record.reason = ("off topic (no LASSO theme in the transcript)"
+                         if not result["bucket"]
+                         else f"relevance {result['confidence']:.2f} below floor "
+                              f"{floor:.2f}")
+        from . import ops_alerts
+        ops_alerts.alert(
+            f"opus factory: clip {record.clip_id} HELD, {record.reason}. "
+            f"Title: {record.title[:60]!r}. Not drafted; a human decides.",
+            poster=poster)
+        return record
+    record.bucket = result["bucket"]
+    return record
+
+
+def tag_all(records, poster=None):
+    """Tag every score-gate survivor; returns the same list (mutated in place)."""
+    for r in records:
+        tag_clip(r, poster=poster)
+    return records
+
+
 # ---- Part 2: score gate FIRST ----------------------------------------------------------
 def passes_score_gate(record):
     """

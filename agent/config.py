@@ -712,3 +712,20 @@ def opus_duration_max() -> float:
         return float(os.environ.get("AGENT_OPUS_DURATION_MAX", "95"))
     except ValueError:
         return 95.0
+
+
+def opus_podcast_show() -> str:
+    """The podcast show name used to recognize podcast-sourced Opus clips by
+    their project title (env AGENT_OPUS_PODCAST_SHOW, default the LASSO show).
+    A clip whose source_title contains this is tagged bucket=podcast directly."""
+    return os.environ.get("AGENT_OPUS_PODCAST_SHOW", "Gym Marketing Made Simple")
+
+
+def opus_relevance_floor() -> float:
+    """Tier the bucket tagger uses: a non-podcast clip whose transcript relevance
+    is below this (env AGENT_OPUS_RELEVANCE_FLOOR, default 0.65) or matches no
+    theme is HELD, never drafted."""
+    try:
+        return float(os.environ.get("AGENT_OPUS_RELEVANCE_FLOOR", "0.65"))
+    except ValueError:
+        return 0.65
