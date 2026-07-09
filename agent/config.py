@@ -624,3 +624,14 @@ def review_cycle_enabled() -> bool:
     asking for fresh photos/clips), stamped in kv so a re-run never re-asks.
     """
     return _truthy(os.environ.get("AGENT_REVIEW_CYCLE_ENABLED", "false"))
+
+
+def media_inbox_enabled() -> bool:
+    """
+    Media inbox switch (Stage 2). OFF by default = zero behavior change: no
+    adapter payload is accepted, nothing is staged, no table is touched. ON,
+    provider adapters (GHL, WhatsApp, the upload endpoint) queue client media
+    through the one inbox: sender phone resolved to a tenant (never guessed;
+    unknown senders are held with one ops alert), idempotent by content hash.
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_INBOX_ENABLED", "false"))
