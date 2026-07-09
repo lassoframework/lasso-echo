@@ -208,6 +208,21 @@ class OpusAPI:
         return r.content
 
 
+def _shape_desc(body):
+    """A short STRUCTURE-ONLY description of a parsed JSON body: its top-level
+    type and (for a dict) its key names, capped. Never prints values, so it is
+    safe to log even when the body could carry tokens or PII. Used to diagnose
+    the real response shape (list vs id-keyed dict vs wrapper)."""
+    if isinstance(body, list):
+        return f"list[{len(body)}]"
+    if isinstance(body, dict):
+        keys = list(body.keys())
+        shown = keys[:10]
+        more = "" if len(keys) <= 10 else f" (+{len(keys) - 10} more)"
+        return f"dict keys={shown}{more}"
+    return type(body).__name__
+
+
 def _extract_id(item):
     """A collection object's id, whatever the shape: string items are their own
     id; dicts are tried across every plausible key, then any *Id-suffixed key."""
@@ -585,6 +600,10 @@ def opus_doctor(http=None):
         return {"enabled": True, "key_present": True, "status": status,
                 "base_url": base, "endpoint_ok": True, "auth_ok": True,
                 "collections": None}
+
+    # STRUCTURE ONLY (never values that could carry tokens/PII): log the top-level
+    # type and key names so the real collections shape is captured for diagnosis.
+    print(f"opus-doctor: response shape: {_shape_desc(body)}")
 
     items = body if isinstance(body, list) else (body or {}).get("data", []) or []
     total_hint = (body or {}).get("total") or (body or {}).get("totalCount")

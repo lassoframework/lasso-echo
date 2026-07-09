@@ -310,6 +310,32 @@ def test_opus_doctor_success(monkeypatch, capsys):
     assert "key99" not in printed
 
 
+def test_opus_doctor_logs_response_shape(monkeypatch, capsys):
+    """opus-doctor logs the STRUCTURE (type + keys) of the parsed response, so the
+    real shape is captured; it must not print field values."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        return _FakeResponse(200, '{"data": [], "total": 0}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    opus_ingest.opus_doctor()
+    printed = capsys.readouterr().out
+    assert "response shape:" in printed
+    assert "data" in printed and "total" in printed      # key NAMES logged
+
+
+def test_shape_desc_is_structure_only():
+    """_shape_desc reports type + keys, never values (no token/PII leak)."""
+    assert opus_ingest._shape_desc([1, 2, 3]) == "list[3]"
+    assert "keys=" in opus_ingest._shape_desc({"data": "SECRETVALUE"})
+    # the value must not appear in the description
+    assert "SECRETVALUE" not in opus_ingest._shape_desc({"data": "SECRETVALUE"})
+    assert opus_ingest._shape_desc(None) == "NoneType"
+
+
 # ---- Part 4: finished-status filter + verbose raw-status logging --------------------
 
 def test_normalize_clip_accepts_standard_export_url(monkeypatch):
