@@ -3,6 +3,7 @@ Native clipper tests (Phase 1: selection). Fully OFFLINE: fake R2 client, fake
 transcriber, fake LLM. No network, no spend, no key value ever printed.
 """
 
+import json
 import os
 import sys
 
@@ -89,9 +90,12 @@ def test_clip_episode_stages_when_on(monkeypatch, tmp_path, capsys):
     ep = tmp_path / "e.mp4"
     ep.write_bytes(b"FAKE")
     client = _FakeClient()
-    out = clipper.clip_episode(str(ep), client=client, transcriber=_fake_transcriber())
+    out = clipper.clip_episode(str(ep), client=client,
+                               transcriber=_fake_transcriber(),
+                               llm=_llm_returning([]))
     assert out["staged"]["staged"] is True
     assert out["transcript"]["words"]
+    assert "selection" in out
     assert "staged episode" in capsys.readouterr().out
 
 
@@ -158,3 +162,103 @@ def test_transcribe_rejects_missing_word_timestamps(monkeypatch, tmp_path):
 
     with pytest.raises(clipper.ClipperError):
         clipper.transcribe("echo/ep/bad/e.mp4", media_path=str(media), transcriber=_bad)
+
+
+# ---- Part 3: Claude moment selection ------------------------------------------------
+
+# A transcript where every word carries a timestamp, long enough to slice 30-90s.
+def _long_transcript():
+    words, t = [], 0.0
+    sentence = ("most gyms do not have a lead problem they have a follow up "
+                "problem fix your follow up and you win more members").split()
+    for i in range(120):                       # ~ enough words spanning >120s
+        w = sentence[i % len(sentence)]
+        words.append({"word": w, "start": round(t, 2), "end": round(t + 1.0, 2)})
+        t += 1.0
+    return {"words": words, "segments": [
+        {"speaker": "S0", "start": 0.0, "end": t, "text": " ".join(
+            w["word"] for w in words)}]}
+
+
+def _llm_returning(moments):
+    def _llm(system, user):
+        return json.dumps({"moments": moments})
+    return _llm
+
+
+def test_select_returns_structured_candidates(monkeypatch):
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    t = _long_transcript()
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 40.0, "hook": "most gyms",
+         "rationale": "opens on a strong claim about follow up; scored high because "
+                      "it stands alone", "bucket": "doctrine", "score": 92},
+        {"start_ts": 45.0, "end_ts": 100.0, "hook": "fix your follow up",
+         "rationale": "clear payoff, self contained", "bucket": "platform",
+         "score": 85},
+    ])
+    out = clipper.select_moments(t, llm=llm)
+    assert len(out["accepted"]) == 2
+    top = out["accepted"][0]
+    assert top.score == 92 and top.bucket == "doctrine"
+    assert top.duration == 40.0
+    assert top.transcript_text                         # exact segment text attached
+    assert out["accepted"][0].score >= out["accepted"][1].score   # ranked
+
+
+def test_select_drops_below_score_floor(monkeypatch):
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    t = _long_transcript()
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 40.0, "hook": "most gyms",
+         "rationale": "weak, marginal moment", "bucket": "doctrine", "score": 71}])
+    out = clipper.select_moments(t, llm=llm)
+    assert out["accepted"] == []
+    assert out["dropped"][0].reason.startswith("score 71 below floor")
+
+
+def test_select_drops_out_of_duration_window(monkeypatch):
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    monkeypatch.setenv("AGENT_CLIPPER_MIN_SEC", "30")
+    monkeypatch.setenv("AGENT_CLIPPER_MAX_SEC", "90")
+    t = _long_transcript()
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 8.0, "hook": "too short",
+         "rationale": "great but tiny", "bucket": "doctrine", "score": 95}])
+    out = clipper.select_moments(t, llm=llm)
+    assert out["accepted"] == []
+    assert "outside window" in out["dropped"][0].reason
+
+
+def test_select_rejects_off_transcript_claim(monkeypatch):
+    """A moment whose rationale asserts a stat NOT in the transcript is rejected by
+    the fabrication gate."""
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    t = _long_transcript()                              # says nothing about body fat
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 40.0, "hook": "most gyms",
+         "rationale": "This clip proves members lose 20% body fat in 6 weeks.",
+         "bucket": "doctrine", "score": 96}])
+    out = clipper.select_moments(t, llm=llm, approved_claims=[clipper.transcript_text(t)])
+    assert out["accepted"] == []
+    assert "not in the transcript" in out["dropped"][0].reason
+
+
+def test_select_accepts_verbatim_transcript_claim(monkeypatch):
+    """A hook/rationale that only restates transcript wording passes the gate."""
+    monkeypatch.setenv("AGENT_CLIPPER_SCORE_FLOOR", "80")
+    t = {"words": [
+        {"word": "we", "start": 0.0, "end": 0.4},
+        {"word": "book", "start": 0.4, "end": 0.8},
+        {"word": "71", "start": 0.8, "end": 1.1},
+        {"word": "percent", "start": 1.1, "end": 1.6},
+        {"word": "of", "start": 1.6, "end": 1.8},
+        {"word": "leads", "start": 1.8, "end": 2.2},
+    ] + [{"word": "x", "start": 2.2 + i, "end": 3.2 + i} for i in range(40)],
+        "segments": []}
+    llm = _llm_returning([
+        {"start_ts": 0.0, "end_ts": 40.0, "hook": "we book 71 percent of leads",
+         "rationale": "strong number that is spoken in the clip", "bucket": "platform",
+         "score": 90}])
+    out = clipper.select_moments(t, llm=llm, approved_claims=[clipper.transcript_text(t)])
+    assert len(out["accepted"]) == 1                    # 71 percent is in transcript

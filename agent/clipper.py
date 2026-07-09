@@ -21,6 +21,7 @@ Hard lines:
 import json
 import os
 import re
+from dataclasses import dataclass
 
 from . import config, media_host
 
@@ -154,9 +155,209 @@ def transcript_text(transcript):
                     if str(w.get("word", "")).strip())
 
 
+def text_between(transcript, start, end):
+    """The exact spoken words whose start time falls in [start, end)."""
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError):
+        return ""
+    return " ".join(
+        w["word"].strip() for w in transcript.get("words", [])
+        if str(w.get("word", "")).strip()
+        and start <= float(w.get("start", 0) or 0) < end)
+
+
+def _timestamped_transcript(transcript):
+    """A compact, timestamped rendering for the LLM prompt: one line per segment
+    (or per word when there are no segments), so Claude can choose start/end."""
+    segs = transcript.get("segments") or []
+    if segs:
+        return "\n".join(
+            f"[{float(s.get('start', 0)):.1f}-{float(s.get('end', 0)):.1f}] "
+            f"{str(s.get('text', '')).strip()}" for s in segs)
+    return "\n".join(
+        f"[{float(w.get('start', 0)):.1f}] {str(w.get('word', '')).strip()}"
+        for w in transcript.get("words", []))
+
+
+# ---- Part 3: Claude moment selection (THE CORE) --------------------------------------
+@dataclass
+class Moment:
+    start_ts: float
+    end_ts: float
+    duration: float
+    hook: str
+    rationale: str
+    bucket: str
+    score: int
+    transcript_text: str
+    status: str = ""        # "" accepted | drop
+    reason: str = ""
+
+
+_SYSTEM_PROMPT = (
+    "You are the moment selector for LASSO, a gym-marketing agency. You are given "
+    "a timestamped transcript of one podcast/video episode. Choose the {n} strongest "
+    "self-contained moments to cut into vertical Reels.\n\n"
+    "Each pick MUST:\n"
+    "- open on a claim, number, or question in the first ~2 seconds\n"
+    "- be one complete idea that stands alone out of context\n"
+    "- contain a payoff or emotional peak\n"
+    "- map to something LASSO actually teaches (lead follow-up, speed to lead, the "
+    "funnel diagnostic order, the six growth engines, retention, positioning, the "
+    "podcast, the book, the summit, b2b/agency lessons)\n"
+    "- target {lo:.0f}-{hi:.0f} seconds\n"
+    "- assert NO claim, number, or stat that is not spoken in the transcript\n\n"
+    "Return ONLY JSON: a list under the key \"moments\". Each moment is an object "
+    "with: start_ts (seconds, number), end_ts (seconds, number), hook (the opening "
+    "line, verbatim from the transcript), rationale (why it will perform, and WHY "
+    "you gave the score), bucket (one of: {buckets}), score (honest integer 0-100; "
+    "NOT decorative). Do not invent facts. Do not use em dashes or the word vendor."
+)
+
+
+def _build_prompts(transcript, count):
+    from .content_categories import CATEGORIES
+    system = _SYSTEM_PROMPT.format(
+        n=count, lo=config.clipper_min_sec(), hi=config.clipper_max_sec(),
+        buckets=", ".join(CATEGORIES))
+    user = ("Transcript (timestamps in seconds):\n\n"
+            + _timestamped_transcript(transcript)
+            + f"\n\nReturn the {count} strongest moments as JSON.")
+    return system, user
+
+
+def _default_llm(system, user):
+    """Default Claude backend: reads the key by env NAME (never logged), calls the
+    configured model. Injected/mocked in tests."""
+    key = os.environ.get(config.CLIPPER_LLM_KEY_ENV)
+    if not key:
+        raise ClipperError(
+            f"no LLM key: set the env var named {config.CLIPPER_LLM_KEY_ENV}.")
+    try:
+        import anthropic
+    except Exception:
+        raise ClipperError(
+            "anthropic SDK not installed; pass an llm callable or install anthropic.")
+    client = anthropic.Anthropic(api_key=key)
+    resp = client.messages.create(
+        model=config.clipper_model(), max_tokens=2000,
+        system=system, messages=[{"role": "user", "content": user}])
+    parts = getattr(resp, "content", []) or []
+    return "".join(getattr(p, "text", "") or "" for p in parts)
+
+
+def _parse_moments(raw):
+    """Parse the LLM's JSON, tolerant of a ```json fence and of a bare list or a
+    {"moments": [...]} wrapper. Raises ClipperError on unparseable output."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
+        if not m:
+            raise ClipperError("moment selection returned no parseable JSON.")
+        data = json.loads(m.group(1))
+    if isinstance(data, dict):
+        data = data.get("moments") or data.get("data") or []
+    if not isinstance(data, list):
+        raise ClipperError("moment selection JSON is not a list of moments.")
+    return data
+
+
+def _approved_claims_for(transcript, account_key=None):
+    """What a hook/rationale may assert: the transcript itself + the approved facts
+    file + (if given) the tenant's approved claims."""
+    claims = [transcript_text(transcript)]
+    try:
+        from . import rotation
+        claims += list(rotation._approved_claims() or [])
+    except Exception:
+        pass
+    if account_key:
+        try:
+            from . import tenants
+            claims += list(tenants.tenant_approved_claims(account_key) or [])
+        except Exception:
+            pass
+    return [c for c in claims if c]
+
+
+def select_moments(transcript, llm=None, approved_claims=None, account_key=None,
+                   count=None):
+    """
+    THE CORE. Feed the transcript to Claude and return scored, gated candidate
+    moments. Returns {"accepted": [Moment sorted by score desc], "dropped": [Moment]}.
+
+    Every candidate is checked: duration must sit in the configured window; score
+    must reach AGENT_CLIPPER_SCORE_FLOOR; and the hook + rationale must pass the
+    fabrication gate (assert only what the transcript or the approved facts say).
+    A candidate failing any check is dropped with an honest reason, never silently.
+    """
+    from . import rotation
+    from .content_categories import CATEGORIES
+    count = count or config.clipper_target_count()
+    if approved_claims is None:
+        approved_claims = _approved_claims_for(transcript, account_key)
+    floor = config.clipper_score_floor()
+    lo, hi = config.clipper_min_sec(), config.clipper_max_sec()
+
+    system, user = _build_prompts(transcript, count)
+    raw = (llm or _default_llm)(system, user)
+    candidates = _parse_moments(raw)
+
+    accepted, dropped = [], []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        try:
+            start = float(c.get("start_ts"))
+            end = float(c.get("end_ts"))
+        except (TypeError, ValueError):
+            continue
+        duration = round(end - start, 2)
+        seg_text = text_between(transcript, start, end)
+        hook = str(c.get("hook", "") or "").strip()
+        rationale = str(c.get("rationale", "") or "").strip()
+        bucket = str(c.get("bucket", "") or "").strip().lower()
+        if bucket not in CATEGORIES:
+            bucket = ""     # invalid/absent bucket is not guessed here
+        try:
+            score = int(round(float(c.get("score", 0))))
+        except (TypeError, ValueError):
+            score = 0
+
+        m = Moment(start_ts=start, end_ts=end, duration=duration, hook=hook,
+                   rationale=rationale, bucket=bucket, score=score,
+                   transcript_text=seg_text)
+
+        if duration <= 0 or duration < lo or duration > hi:
+            m.status, m.reason = "drop", (
+                f"duration {duration:g}s outside window {lo:g}..{hi:g}s")
+            dropped.append(m); continue
+        if score < floor:
+            m.status, m.reason = "drop", f"score {score} below floor {floor:g}"
+            dropped.append(m); continue
+        # Fabrication gate: the hook and the rationale each may assert only what the
+        # transcript or the approved facts say. Checked SEPARATELY so we never
+        # introduce punctuation that would break a verbatim substring match.
+        if not (rotation.is_gate_clean(hook, approved_claims)
+                and rotation.is_gate_clean(rationale, approved_claims)):
+            m.status, m.reason = "drop", (
+                "asserts a claim not in the transcript or approved facts")
+            dropped.append(m); continue
+        accepted.append(m)
+
+    accepted.sort(key=lambda x: x.score, reverse=True)
+    return {"accepted": accepted, "dropped": dropped}
+
+
 # ---- orchestrator (grows one stage per part; Phase 1 ends at the dry-run plan) --------
 def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
-                 transcriber=None, llm=None):
+                 transcriber=None, llm=None, account_key=None):
     """
     Phase 1 pipeline: stage -> (transcribe -> select -> plan land in later parts).
     Returns a result dict. Renders nothing (Phase 2). Returns None while the master
@@ -178,8 +379,12 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
                             transcriber=transcriber)
     print(f"clip-episode: transcript {len(transcript['words'])} word(s), "
           f"{len(transcript.get('segments', []))} segment(s)")
-    # Parts 3-4 add: moment selection and the dry-run plan.
-    return {"staged": staged, "transcript": transcript}
+
+    selection = select_moments(transcript, llm=llm, account_key=account_key)
+    print(f"clip-episode: {len(selection['accepted'])} moment(s) pass, "
+          f"{len(selection['dropped'])} dropped")
+    # Part 4 adds: the dry-run plan print.
+    return {"staged": staged, "transcript": transcript, "selection": selection}
 
 
 def clip_episode_cli(argv):
