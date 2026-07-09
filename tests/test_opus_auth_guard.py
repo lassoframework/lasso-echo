@@ -221,8 +221,44 @@ def test_opus_doctor_no_key(monkeypatch, capsys):
     assert "OPUS_API_KEY" in printed
 
 
-def test_opus_doctor_auth_failure(monkeypatch, capsys):
-    """opus-doctor reports auth failure loudly on 401 from /api/projects."""
+def test_opus_doctor_hits_collections_not_projects(monkeypatch):
+    """opus-doctor calls the proven /api/collections route, never /api/projects."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-testkey99")
+    captured = []
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        captured.append(url)
+        return _FakeResponse(200, '{"data":[]}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    opus_ingest.opus_doctor()
+    assert any("/api/collections" in u for u in captured)
+    assert not any("/api/projects" in u for u in captured)
+
+
+def test_opus_doctor_404_is_endpoint_wrong_not_auth(monkeypatch, capsys):
+    """A 404 must read as ENDPOINT WRONG, never as an auth problem."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+
+    def _fake_http_get(url, params=None, headers=None, timeout=30):
+        return _FakeResponse(404, '{"error":"NotFoundException"}')
+
+    import requests as _req
+    monkeypatch.setattr(_req, "get", _fake_http_get)
+    result = opus_ingest.opus_doctor()
+    printed = capsys.readouterr().out
+    assert result["status"] == 404
+    assert result["endpoint_ok"] is False
+    assert result["auth_ok"] is None            # not collapsed into auth
+    assert "ENDPOINT WRONG" in printed
+    assert "AUTH" not in printed.split("ENDPOINT WRONG")[0]  # not called auth
+
+
+def test_opus_doctor_401_is_auth_wrong_not_endpoint(monkeypatch, capsys):
+    """A 401 must read as AUTH WRONG, distinct from the 404 endpoint case."""
     monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
     monkeypatch.setenv("OPUS_API_KEY", "sk-2vtUfBADKEY")
 
@@ -234,23 +270,27 @@ def test_opus_doctor_auth_failure(monkeypatch, capsys):
     result = opus_ingest.opus_doctor()
     printed = capsys.readouterr().out
     assert result["auth_ok"] is False
+    assert result["endpoint_ok"] is True        # the route exists
     assert result["status"] == 401
-    assert "AUTH FAILED" in printed
+    assert "AUTH WRONG" in printed
+    assert "ENDPOINT WRONG" not in printed
     # key prefix shown but full key not printed
     assert "sk-2vtU" in printed
     assert "BADKEY" not in printed
 
 
 def test_opus_doctor_success(monkeypatch, capsys):
-    """opus-doctor prints project count and first project fields on 200."""
+    """opus-doctor prints base URL, collection count, and first collection fields
+    on 200 with a real-shape response."""
     monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
     monkeypatch.setenv("OPUS_API_KEY", "sk-goodkey99")
+    monkeypatch.setenv("AGENT_OPUS_API_BASE", "https://api.opus.pro")
 
     import json as _json
 
     def _fake_http_get(url, params=None, headers=None, timeout=30):
-        body = _json.dumps({"data": [{"id": "PROJ1", "title": "Gym Marketing Made Simple",
-                                      "status": "active"}]})
+        body = _json.dumps({"data": [{"id": "COL1", "title": "Gym Marketing Made Simple",
+                                      "status": "ready"}]})
         return _FakeResponse(200, body)
 
     import requests as _req
@@ -258,9 +298,13 @@ def test_opus_doctor_success(monkeypatch, capsys):
     result = opus_ingest.opus_doctor()
     printed = capsys.readouterr().out
     assert result["auth_ok"] is True
-    assert result["projects"] == 1
-    assert "PROJ1" in printed
+    assert result["endpoint_ok"] is True
+    assert result["collections"] == 1
+    assert result["base_url"] == "https://api.opus.pro"
+    assert "COL1" in printed
     assert "Gym Marketing Made Simple" in printed
+    assert "https://api.opus.pro" in printed          # resolved base URL shown
+    assert "ready" in printed                          # first collection raw status
     # first 6 chars shown; rest not printed
     assert "sk-goo" in printed        # "sk-goodkey99"[:6] == "sk-goo"
     assert "key99" not in printed

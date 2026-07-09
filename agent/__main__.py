@@ -679,9 +679,11 @@ def main(argv=None):
         from .opus_ingest import opus_check
         opus_check()
     elif cmd == "opus-doctor":
-        # READ-ONLY factory preflight (AGENT_OPUS_FACTORY_ENABLED): key prefix,
-        # HTTP status, project count, first project's raw status. Five-second
-        # "is this key actually working?" check before running opus-pull.
+        # READ-ONLY factory preflight (AGENT_OPUS_FACTORY_ENABLED): hits the
+        # proven /api/collections route and prints key prefix, base URL, HTTP
+        # status, collection count, first collection's raw status. Separates
+        # 404 (endpoint wrong) from 401 (auth wrong) — the operator's
+        # is-it-key-or-route test before running opus-pull.
         from .opus_ingest import opus_doctor
         opus_doctor()
     elif cmd == "check-tokens":

@@ -497,13 +497,18 @@ def opus_check(http=None):
 
 def opus_doctor(http=None):
     """
-    READ-ONLY preflight auth check for the Opus video factory (CLI: opus-doctor).
-    Gated by AGENT_OPUS_FACTORY_ENABLED.  Makes ONE lightweight call (list_projects
-    pageSize=1), prints:
-      • key prefix (first 6 chars only — enough to confirm which key is in use)
+    READ-ONLY preflight for the Opus video factory (CLI: opus-doctor). Gated by
+    AGENT_OPUS_FACTORY_ENABLED. Makes ONE lightweight call to the PROVEN discovery
+    route GET /api/collections?q=mine (pageSize=1) and reports:
+      • key prefix (first 6 chars only — which key is in use, never the value)
+      • resolved base URL
       • HTTP status
-      • project count visible to this key
-      • the first project's raw id and title so you can verify the account looks right
+      • collection count visible to this key
+      • the first collection's raw id, title, and status field
+
+    This is the operator's is-it-key-or-route test. It NEVER collapses the two:
+      - 404  -> ENDPOINT WRONG (the route/base URL is bad, not the key)
+      - 401/403 -> AUTH WRONG (the route exists, the key was rejected)
     Returns a small dict. Never prints the full key or auth headers.
     """
     from . import config as _cfg
@@ -518,10 +523,11 @@ def opus_doctor(http=None):
               "Set it by hand in Railway env vars (never commit it).")
         return {"enabled": True, "key_present": False}
 
-    prefix = key[:6]
-    print(f"opus-doctor: key prefix {prefix}... "
+    base = _cfg.opus_api_base()
+    print(f"opus-doctor: key prefix {key[:6]}... "
           f"(if this is 'sk-2vtU' the key is the rotated/leaked one — "
           f"set the NEW key in Railway and redeploy)")
+    print(f"opus-doctor: resolved base URL {base}")
 
     if http is None:
         import requests
@@ -530,32 +536,46 @@ def opus_doctor(http=None):
     org = _cfg.opus_org_id()
     if org:
         headers["x-opus-org-id"] = org
-    url = f"{_cfg.opus_api_base()}/api/projects"
+    url = f"{base}/api/collections"   # the PROVEN discovery route (not /api/projects)
     try:
         r = http.get(url, params={"q": "mine", "pageNum": 1, "pageSize": 1},
                      headers=headers, timeout=30)
     except Exception as e:
         print(f"opus-doctor: request failed: {type(e).__name__}: {e}")
-        return {"enabled": True, "key_present": True, "status": None}
+        return {"enabled": True, "key_present": True, "status": None,
+                "base_url": base, "endpoint_ok": None, "auth_ok": None,
+                "collections": None}
 
     status = getattr(r, "status_code", 0)
     body_text = getattr(r, "text", "") or ""
-    print(f"opus-doctor: GET /api/projects?q=mine -> HTTP {status}")
+    print(f"opus-doctor: GET /api/collections?q=mine -> HTTP {status}")
+
+    if status == 404:
+        print("opus-doctor: ENDPOINT WRONG (404). The route does not exist at "
+              f"{base}. This is NOT the key. Check AGENT_OPUS_API_BASE and that "
+              "the /api/collections path matches the current Opus API docs.")
+        snippet = ops_alerts.scrub(body_text)[:400]
+        print(f"opus-doctor: raw body (scrubbed): {snippet!r}")
+        return {"enabled": True, "key_present": True, "status": 404,
+                "base_url": base, "endpoint_ok": False, "auth_ok": None,
+                "collections": None}
 
     if status in (401, 403):
-        print("opus-doctor: AUTH FAILED. The key was rejected by the Opus API.")
-        print("  Fix: generate a new API key in the OpusClip dashboard (Settings "
-              "> API Keys) and set OPUS_API_KEY in Railway, then redeploy.")
+        print("opus-doctor: AUTH WRONG. The endpoint exists but the key was "
+              "rejected. This is NOT the route. Generate a new API key in the "
+              "OpusClip dashboard and set OPUS_API_KEY in Railway, then redeploy.")
         snippet = ops_alerts.scrub(body_text)[:400]
         print(f"opus-doctor: raw body (scrubbed): {snippet!r}")
         return {"enabled": True, "key_present": True, "status": status,
-                "projects": None, "auth_ok": False}
+                "base_url": base, "endpoint_ok": True, "auth_ok": False,
+                "collections": None}
 
     if status >= 400:
         snippet = ops_alerts.scrub(body_text)[:400]
         print(f"opus-doctor: unexpected HTTP {status}. Body: {snippet!r}")
         return {"enabled": True, "key_present": True, "status": status,
-                "projects": None, "auth_ok": False}
+                "base_url": base, "endpoint_ok": None, "auth_ok": None,
+                "collections": None}
 
     try:
         body = r.json()
@@ -563,21 +583,26 @@ def opus_doctor(http=None):
         print(f"opus-doctor: response is not JSON. Body: "
               f"{ops_alerts.scrub(body_text)[:200]!r}")
         return {"enabled": True, "key_present": True, "status": status,
-                "projects": None, "auth_ok": True}
+                "base_url": base, "endpoint_ok": True, "auth_ok": True,
+                "collections": None}
 
     items = body if isinstance(body, list) else (body or {}).get("data", []) or []
     total_hint = (body or {}).get("total") or (body or {}).get("totalCount")
-    print(f"opus-doctor: {len(items)} project(s) in this page "
+    print(f"opus-doctor: {len(items)} collection(s) in this page "
           f"(total hint from API: {total_hint})")
     if items:
         first = items[0] if isinstance(items[0], dict) else {}
-        pid = first.get("id") or first.get("projectId") or "(no id field)"
-        ptitle = first.get("title") or first.get("name") or first.get("projectName") or ""
-        pstatus = first.get("status") or first.get("projectStatus") or "(no status field)"
-        print(f"opus-doctor: first project  id={pid!r}  title={ptitle!r}  "
-              f"raw status={pstatus!r}")
+        cid = _extract_id(items[0]) or "(no id field)"
+        ctitle = (first.get("title") or first.get("name")
+                  or first.get("collectionName") or "")
+        cstatus = (first.get("status") or first.get("collectionStatus")
+                   or "(no status field)")
+        print(f"opus-doctor: first collection  id={cid!r}  title={ctitle!r}  "
+              f"raw status={cstatus!r}")
     else:
-        print("opus-doctor: NO projects visible to this key. "
-              "Either the account is empty or org-id scoping is wrong.")
+        print("opus-doctor: endpoint + key OK, but NO collections are visible to "
+              "this key. Organize the clips into a collection in the OpusClip "
+              "dashboard, or check org-id scoping (AGENT_OPUS_ORG_ID).")
     return {"enabled": True, "key_present": True, "status": status,
-            "projects": len(items), "auth_ok": True}
+            "base_url": base, "endpoint_ok": True, "auth_ok": True,
+            "collections": len(items)}
