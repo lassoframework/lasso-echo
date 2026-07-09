@@ -18,14 +18,41 @@ Hard lines:
   - Secrets (transcription + LLM keys) are read by env var NAME only, never logged.
 """
 
+import importlib
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 
 from . import config, media_host
 
 HOST_TENANT = "lasso_episodes"
+
+
+def detect_prereqs():
+    """Detect Phase 2 prerequisites at call time (never module-level so tests can
+    monkeypatch). Returns a plain dict; safe to print or log — never reads a key value.
+
+    Keys:
+      HAS_FFMPEG              bool  — ffmpeg found on PATH
+      FFMPEG_PATH             str|None
+      HAS_FASTER_WHISPER      bool  — faster_whisper importable
+      HAS_TRANSCRIBE_API_KEY  bool  — env var AGENT_TRANSCRIBE_API_KEY is non-empty
+    """
+    ffmpeg_path = shutil.which("ffmpeg")
+    has_whisper = False
+    try:
+        importlib.import_module("faster_whisper")
+        has_whisper = True
+    except Exception:
+        pass
+    return {
+        "HAS_FFMPEG": bool(ffmpeg_path),
+        "FFMPEG_PATH": ffmpeg_path,
+        "HAS_FASTER_WHISPER": has_whisper,
+        "HAS_TRANSCRIBE_API_KEY": bool(os.environ.get(config.CLIPPER_TRANSCRIBE_KEY_ENV)),
+    }
 
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
 

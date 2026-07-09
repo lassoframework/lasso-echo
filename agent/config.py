@@ -827,3 +827,16 @@ def clipper_cache_dir() -> str:
     """Where episode transcripts are cached so re-runs never re-transcribe (env
     AGENT_CLIPPER_CACHE_DIR, default /data/clipper on the persistent volume)."""
     return os.environ.get("AGENT_CLIPPER_CACHE_DIR", "/data/clipper")
+
+
+def clipper_render_enabled() -> bool:
+    """Second flag under the master clipper switch. Phase 2 rendering (cut, caption,
+    brand frame) is OFF even when the master AGENT_CLIPPER_ENABLED is ON. Requires
+    ffmpeg on PATH. Set AGENT_CLIPPER_RENDER_ENABLED=true to arm."""
+    return _truthy(os.environ.get("AGENT_CLIPPER_RENDER_ENABLED", "false"))
+
+
+def clipper_render_output_dir() -> str:
+    """Where rendered Reels are written (env AGENT_CLIPPER_RENDER_DIR, default
+    /data/clipper/render on the persistent volume)."""
+    return os.environ.get("AGENT_CLIPPER_RENDER_DIR", "/data/clipper/render")
