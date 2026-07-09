@@ -62,18 +62,49 @@ def _check_one(client, account, now, warn_days, poster):
     return result
 
 
-def check_tokens(http=None, poster=None, accounts=None, now=None):
+def check_tenant_tokens(poster=None, base_dir=None):
     """
-    Check every active account's token expiry. Returns
-    {"status": "disabled"|"checked", "results": [...]}; flag OFF -> disabled,
-    no network, no client touched.
+    Stage 2 tenant upload tokens (Part 9): for every tenant whose media lanes
+    include the upload endpoint, warn when AGENT_INTAKE_TOKEN_<KEY> is not set
+    (its texted link would be a dead URL). READS env presence only; the token
+    VALUE is never printed, logged, or included in an alert. Returns one result
+    dict per upload-lane tenant.
+    """
+    import os as _os
+    from . import tenants
+    results = []
+    for key in tenants.list_tenants(base_dir=base_dir):
+        rec = tenants.load_tenant(key, base_dir=base_dir) or {}
+        if "upload" not in (rec.get("media_lanes") or []):
+            continue
+        present = bool(_os.environ.get(f"AGENT_INTAKE_TOKEN_{key.upper()}"))
+        results.append({"tenant": key,
+                        "status": "ok" if present else "missing_token"})
+        if not present:
+            ops_alerts.alert(
+                f"upload token for tenant {key} is NOT set "
+                f"(AGENT_INTAKE_TOKEN_{key.upper()}): its upload link is dead. "
+                "Set the token by hand in env.",
+                poster=poster, force=True,
+            )
+    return results
+
+
+def check_tokens(http=None, poster=None, accounts=None, now=None, base_dir=None):
+    """
+    Check every active account's token expiry, plus every upload-lane tenant's
+    upload token presence (Part 9). Returns {"status": "disabled"|"checked",
+    "results": [...], "tenant_results": [...]}; flag OFF -> disabled, no
+    network, no client touched.
     """
     if not config.token_watchdog_enabled():
-        return {"status": "disabled", "results": []}
+        return {"status": "disabled", "results": [], "tenant_results": []}
 
     client = http or _requests()
     now = now if now is not None else time.time()
     warn_days = config.token_warn_days()
     results = [_check_one(client, a, now, warn_days, poster)
                for a in (accounts if accounts is not None else active_accounts())]
-    return {"status": "checked", "results": results}
+    tenant_results = check_tenant_tokens(poster=poster, base_dir=base_dir)
+    return {"status": "checked", "results": results,
+            "tenant_results": tenant_results}

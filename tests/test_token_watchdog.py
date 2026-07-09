@@ -90,7 +90,7 @@ def test_warn_days_defaults_to_7(monkeypatch):
 def test_disabled_means_no_check_no_client(monkeypatch):
     monkeypatch.delenv("AGENT_TOKEN_WATCHDOG_ENABLED", raising=False)
     out = token_watchdog.check_tokens(http=ExplodingHTTP(), accounts=[_acct()])
-    assert out == {"status": "disabled", "results": []}
+    assert out == {"status": "disabled", "results": [], "tenant_results": []}
 
 
 # ---- 2. expiry inside the warn window fires ONE alert ----------------------------

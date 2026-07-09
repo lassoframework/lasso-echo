@@ -115,6 +115,22 @@ def handle_upload(token, files, note="", r2=None, now=None):
     if r2 is None:
         return 503, {"error": "storage unavailable"}
 
+    # Per-tenant storage quota (Part 9): a MEASURED total over the tenant's cap
+    # refuses the upload (413); storage that cannot report a total, or a client
+    # with no tenant record (legacy env-token clients), never blocks. Originals
+    # are streamed to R2 unmodified below (HEIC/MOV allowed, EXIF kept).
+    from . import quotas
+    incoming = sum(len(data) for _f, _c, data in files)
+    used = None
+    try:
+        used = r2.total_bytes(f"intake/{client}/")
+    except AttributeError:
+        pass  # this wrapper cannot measure; quota unenforceable, never guessed
+    except Exception:
+        pass  # a flaky listing never blocks an upload
+    if quotas.over_quota(client, used, incoming):
+        return 413, {"error": "storage quota exceeded; ask us to raise it"}
+
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     stored = []
     for filename, ctype, data in files:
@@ -145,6 +161,19 @@ class _R2:
     def put_bytes(self, key, data, content_type="application/octet-stream"):
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data,
                             ContentType=content_type)
+
+    def total_bytes(self, prefix):
+        """Measured bytes under a prefix (the quota gate's input), paginated."""
+        total, token = 0, None
+        while True:
+            kw = {"Bucket": self._bucket, "Prefix": prefix}
+            if token:
+                kw["ContinuationToken"] = token
+            resp = self._s3.list_objects_v2(**kw)
+            total += sum(o.get("Size", 0) for o in resp.get("Contents", []))
+            token = resp.get("NextContinuationToken")
+            if not token:
+                return total
 
 
 def _default_r2():
