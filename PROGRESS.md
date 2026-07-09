@@ -495,6 +495,39 @@ a clean zero-results run.
   BLAKE BY HAND: set the current OPUS_API_KEY in Railway env and redeploy.
   Run `agent opus-doctor` after redeploy to confirm auth before running opus-pull.
 
+### Opus route fix (2026-07-09; four parts, built after opus-doctor returned 404)
+Second root cause, SEPARATE from the key: the factory scan was built against a
+GUESSED endpoint, GET /api/projects?q=mine, which does not exist and returns 404
+NotFoundException. A correct key against the wrong route still saw zero clips.
+The documented Opus API has NO bulk project-listing endpoint; the legacy
+pull-opus poller is the source of truth (it lists via collections).
+- [x] Part 1: route contract documented — proven routes are
+      GET /api/collections?q=mine (discovery) and GET /api/exportable-clips
+      (findByCollectionId / findByProjectId); base URL + auth header were never
+      wrong (shared with the legacy poller via OpusAPI._get). No behavior change.
+- [x] Part 2: client corrected — OpusAPI.list_collections_detailed() lists via
+      the proven /api/collections route; the dead list_projects (/api/projects)
+      is removed; opus_factory.scan discovers via collections (all-collection
+      scan, no allowlist) plus pinned AGENT_OPUS_PROJECT_IDS (read at call time
+      via config.opus_project_ids); clips queried with findByCollectionId; the
+      call-time key read and OpusScanError propagation kept. Tests assert the
+      scan hits /api/collections + /api/exportable-clips and NEVER /api/projects.
+- [x] Part 3: opus-doctor made definitive — calls the corrected /api/collections
+      route; 404 => "ENDPOINT WRONG" (route/base URL bad), 401/403 => "AUTH
+      WRONG" (key rejected), never collapsed; reports key prefix, resolved base
+      URL, HTTP status, collection count, first collection raw status.
+- [x] Part 4: finished-clip filter confirmed against the documented
+      exportable-clips shape (uriForExport present = finished by contract); test
+      flows the documented field set end to end through the corrected scan.
+- Routes verdict: the discovery route was wrong. WAS GET /api/projects?q=mine
+      (404); NOW GET /api/collections?q=mine. The legacy pull-opus poller was
+      the source of the correct contract. Base URL + auth header were correct
+      all along. NOTE: this is separate from the stale-key issue above; both
+      must be right for opus-pull to see clips. BLAKE BY HAND: after setting the
+      current OPUS_API_KEY, run `agent opus-doctor` — it should print HTTP 200
+      with a collection count. Podcast clips must live in a collection named
+      after the show (AGENT_OPUS_PODCAST_SHOW) for podcast tagging.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
