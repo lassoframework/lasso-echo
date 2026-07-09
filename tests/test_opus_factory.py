@@ -278,3 +278,48 @@ def test_empty_transcript_held_no_caption():
     r = _rec(bucket="platform", transcript="")
     assert opus_factory.write_caption(r) == ""
     assert r.status == "hold"
+
+
+# ---- Part 6: dedupe + no-repost ledger ----------------------------------------------------
+from agent import db as _db  # noqa: E402
+
+
+def _wipe_ledger(*clip_ids):
+    with _db._lock, _db.connect() as conn:
+        for cid in clip_ids:
+            conn.execute("DELETE FROM kv WHERE key IN (?,?)",
+                         (f"{opus_factory._LEDGER_DRAFTED}{cid}",
+                          f"{opus_factory._LEDGER_POSTED}{cid}"))
+        conn.commit()
+
+
+def test_drafted_clip_not_redrafted():
+    _wipe_ledger("clipA", "clipB")
+    recs = [_rec(clip_id="clipA"), _rec(clip_id="clipB")]
+    fresh, seen = opus_factory.dedupe(recs)
+    assert {r.clip_id for r in fresh} == {"clipA", "clipB"}   # first run: both fresh
+    opus_factory.mark_drafted("clipA")
+    fresh2, seen2 = opus_factory.dedupe([_rec(clip_id="clipA"), _rec(clip_id="clipB")])
+    assert {r.clip_id for r in fresh2} == {"clipB"}           # A already drafted
+    dmap = {r.clip_id: r for r in seen2}
+    assert dmap["clipA"].status == "dupe"
+    _wipe_ledger("clipA", "clipB")
+
+
+def test_posted_clip_not_redrafted():
+    _wipe_ledger("clipP")
+    opus_factory.mark_posted("clipP", when="2026-07-01")
+    assert opus_factory.is_posted("clipP") is True
+    fresh, seen = opus_factory.dedupe([_rec(clip_id="clipP")])
+    assert fresh == []
+    assert seen[0].reason.startswith("already drafted or posted")
+    _wipe_ledger("clipP")
+
+
+def test_ledger_survives_rerun_idempotent():
+    _wipe_ledger("clipR")
+    opus_factory.mark_drafted("clipR")
+    # a re-run sees it every time
+    for _ in range(3):
+        assert opus_factory.already_seen("clipR") is True
+    _wipe_ledger("clipR")

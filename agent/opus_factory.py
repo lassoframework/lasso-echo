@@ -335,6 +335,60 @@ def write_caption(record):
     return caption
 
 
+# ---- Part 6: dedupe + no-repost ledger -------------------------------------------------
+# The clip_id ledger lives in the volume-backed kv store (like every other
+# "seen" ledger: comment_seen, podcast_release_carded). A clip is pulled and
+# drafted at most once; a posted clip is tracked so reporting can measure
+# before/after and it is never re-drafted.
+_LEDGER_DRAFTED = "opus_drafted_"
+_LEDGER_POSTED = "opus_posted_"
+
+
+def is_drafted(clip_id):
+    from . import db
+    return bool(db.kv_get(f"{_LEDGER_DRAFTED}{clip_id}"))
+
+
+def is_posted(clip_id):
+    from . import db
+    return bool(db.kv_get(f"{_LEDGER_POSTED}{clip_id}"))
+
+
+def already_seen(clip_id):
+    """True once a clip has been drafted OR posted: it never enters the plan again."""
+    return is_drafted(clip_id) or is_posted(clip_id)
+
+
+def mark_drafted(clip_id, when="1"):
+    """Stamp a clip as drafted (called when a draft is actually built, Part 7)."""
+    from . import db
+    db.kv_set(f"{_LEDGER_DRAFTED}{clip_id}", when or "1")
+
+
+def mark_posted(clip_id, when="1"):
+    """Stamp a clip as posted for the reporting before/after ledger."""
+    from . import db
+    db.kv_set(f"{_LEDGER_POSTED}{clip_id}", when or "1")
+    db.audit("opus_factory", clip_id, "clip posted (ledger)")
+
+
+def dedupe(records):
+    """
+    Split records into (fresh, seen). A clip already in the ledger (drafted or
+    posted) is marked status='dupe' and never re-drafted; fresh clips pass
+    through untouched. Records already dropped/held/shortlisted keep their state.
+    """
+    fresh, seen = [], []
+    for r in records:
+        if already_seen(r.clip_id):
+            r.status = "dupe"
+            r.reason = "already drafted or posted (ledger)"
+            seen.append(r)
+        else:
+            fresh.append(r)
+    return fresh, seen
+
+
 # ---- Part 2: score gate FIRST ----------------------------------------------------------
 def passes_score_gate(record):
     """
