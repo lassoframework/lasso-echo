@@ -127,6 +127,15 @@ class OpusAPI:
             raise OpusScanError(r.status_code, snippet)
         return r.json()
 
+    def _post(self, path, json_body=None):
+        import requests  # lazy
+        r = requests.post(f"{config.opus_api_base()}{path}", json=json_body or {},
+                          headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            snippet = ops_alerts.scrub((r.text or "")[:400])
+            raise OpusScanError(r.status_code, snippet)
+        return r.json()
+
     def list_collections(self):
         """GET /api/collections?q=mine -> [collection ids], paginated. ID
         EXTRACTION IS SHAPE-TOLERANT: the live response carried objects whose
@@ -199,6 +208,41 @@ class OpusAPI:
             if len(items) < 50:
                 return clips
             page += 1
+
+    def list_project_clips(self, project_id):
+        """The finished clips in one project, via the proven exportable-clips
+        route (GET /api/exportable-clips?q=findByProjectId&projectId=). NOTE: the
+        documented ExportableClipRepresentation carries NO score/virality/rank
+        field, so clip scores are not available from the API; clips arrive in the
+        curation ranking order. Returns the raw clip dicts (each 'id' is the
+        composite {projectId}.{curationId} used as the collection contentId)."""
+        return self.list_exportable_clips("findByProjectId", project_id)
+
+    def create_collection(self, name):
+        """POST /api/collections {collectionName} -> the new collection id (str).
+        Raises OpusScanError on any non-2xx (the key is never logged)."""
+        body = self._post("/api/collections", {"collectionName": name})
+        return _collection_id_from_response(body)
+
+    def add_clip_to_collection(self, collection_id, content_id):
+        """POST /api/collection-contents {collectionId, contentId}. The API adds
+        ONE clip per call (there is no batch route). contentId is the clip's
+        composite id {projectId}.{curationId}. Returns the raw response."""
+        return self._post("/api/collection-contents",
+                          {"collectionId": collection_id, "contentId": content_id})
+
+    def add_clips_to_collection(self, collection_id, clip_ids):
+        """Add each clip id to the collection with one POST per clip (the
+        documented add route takes a single contentId; there is no batch). The
+        caller is responsible for skipping ids already in the collection. Returns
+        the list of ids that were POSTed."""
+        added = []
+        for cid in clip_ids:
+            if not cid:
+                continue
+            self.add_clip_to_collection(collection_id, cid)
+            added.append(cid)
+        return added
 
     def download(self, url):
         import requests  # lazy; export URLs are signed CDN links (no auth header)
@@ -286,6 +330,20 @@ def normalize_list_response(body):
                 return normalize_list_response(body[key])
         return _dict_to_records(body)
     return []
+
+
+def _collection_id_from_response(body):
+    """The collectionId from a POST /api/collections response (CollectionDto),
+    tolerant of a {data: {...}} wrapper and of the id key name. Returns "" when
+    no id is resolvable (never guesses)."""
+    if not isinstance(body, dict):
+        return ""
+    inner = body.get("data") if isinstance(body.get("data"), dict) else body
+    for key in ("collectionId", "collection_id", "id", "_id", "uuid"):
+        v = inner.get(key)
+        if v:
+            return str(v)
+    return ""
 
 
 def _default_api():
