@@ -196,3 +196,32 @@ def test_low_confidence_held(monkeypatch):
 def test_classify_empty_invents_nothing():
     assert opus_factory.classify_transcript("") == {
         "bucket": "", "confidence": 0.0, "themes": []}
+
+
+# ---- Part 4: hook check -------------------------------------------------------------------
+def test_strong_hook_stays_eligible():
+    for t in ("Most gyms do not have a lead problem, they have follow up.",
+              "We book 71.9 percent of leads while the industry books far less.",
+              "Are you still chasing dead leads every single night after close?"):
+        r = _rec(transcript=t)
+        opus_factory.hook_check(r)
+        assert r.status == "", f"strong hook demoted: {t!r}"
+
+
+def test_weak_hook_shortlisted():
+    r = _rec(transcript="So anyway today we sat down and chatted about things.")
+    opus_factory.hook_check(r)
+    assert r.status == "shortlist"
+    assert "weak hook" in r.reason
+
+
+def test_hook_check_does_not_revive_held():
+    r = _rec(transcript="weak opening here about nothing much")
+    r.status = "hold"
+    r.reason = "off topic"
+    opus_factory.hook_check(r)
+    assert r.status == "hold"           # a held clip is never demoted/revived
+
+
+def test_has_strong_hook_empty_is_false():
+    assert opus_factory.has_strong_hook("") is False

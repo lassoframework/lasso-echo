@@ -212,6 +212,57 @@ def tag_all(records, poster=None):
     return records
 
 
+# ---- Part 4: hook check ----------------------------------------------------------------
+# ~2 seconds of speech is roughly the first 10 words; a strong hook lands a
+# claim, a number, or a question inside that opening.
+_HOOK_WORDS = 10
+_HOOK_NUM_RE = re.compile(r"[\d$%]")
+_HOOK_CLAIM_WORDS = (
+    "most", "every", "never", "always", "nobody", "everyone", "stop",
+    "biggest", "truth", "reason", "secret", "why", "how", "what", "if you",
+    "you need", "here is", "the problem", "no one",
+)
+
+
+def hook_opening(transcript, words=_HOOK_WORDS):
+    """The clip's opening ~2s: the first `words` words of the transcript."""
+    return " ".join((transcript or "").split()[:words])
+
+
+def has_strong_hook(transcript):
+    """True when the opening carries a claim, a number, or a question. Reads the
+    transcript's own words only; nothing is inferred beyond them."""
+    opening = hook_opening(transcript).lower()
+    if not opening:
+        return False
+    if "?" in opening:
+        return True
+    if _HOOK_NUM_RE.search(opening):
+        return True
+    return any(w in opening for w in _HOOK_CLAIM_WORDS)
+
+
+def hook_check(record):
+    """
+    Demote an otherwise-eligible clip to the shortlist when its opening ~2s
+    carries no claim, number, or question. Only acts on still-eligible records
+    (status == ''); dropped/held records are left as they are. A strong hook
+    leaves the record eligible to draft.
+    """
+    if record.status:
+        return record  # already dropped or held; the hook check does not revive it
+    if not has_strong_hook(record.transcript):
+        record.status = "shortlist"
+        record.reason = "weak hook (opening carries no claim, number, or question)"
+    return record
+
+
+def hook_check_all(records):
+    for r in records:
+        hook_check(r)
+    return records
+
+
 # ---- Part 2: score gate FIRST ----------------------------------------------------------
 def passes_score_gate(record):
     """
