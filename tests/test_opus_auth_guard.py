@@ -362,3 +362,54 @@ def test_scan_verbose_logs_excluded_raw_statuses(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "1 clip(s) included" in out
     assert "processing" in out
+
+
+# ---- Part 4: filter matches the DOCUMENTED exportable-clips response shape ----------
+# Ground truth (no live call available): the documented Opus API endpoint is
+# /api/exportable-clips and, by its name and contract, returns ONLY exportable
+# (finished) clips, each carrying id/title/description/durationMs/uriForExport/
+# createdAt (see the legacy poller docstring). So the presence of uriForExport IS
+# the finished signal; the status-alias branch in normalize_clip is a defensive
+# fallback for shapes that omit the URL. If a live run ever returns a different
+# shape, opus-doctor + the scan's raw-status logging surface it.
+
+def test_documented_exportable_clip_shape_passes_filter(monkeypatch):
+    """A clip with the exact documented field set normalizes and survives the
+    finished-clip filter."""
+    documented = {
+        "id": "COL1.C1",
+        "title": "The follow up problem",
+        "description": "Most gyms have a follow up problem.",
+        "durationMs": 38000,
+        "uriForExport": "https://cdn.opus/col1c1.mp4",
+        "createdAt": "2026-07-01T10:00:00Z",
+        "score": 92,
+        "transcript": "Most gyms do not have a lead problem.",
+    }
+    rec = opus_factory.normalize_clip(documented, "COL1", "Gym Marketing Made Simple")
+    assert rec is not None
+    assert rec.clip_id == "COL1.C1"
+    assert rec.duration_s == 38.0
+    assert rec.source_title == "Gym Marketing Made Simple"
+
+
+def test_documented_shape_flows_through_scan(monkeypatch):
+    """End to end: a collection of documented-shape clips scans into records."""
+    monkeypatch.setenv("AGENT_OPUS_FACTORY_ENABLED", "true")
+    monkeypatch.delenv("AGENT_OPUS_PROJECT_IDS", raising=False)
+
+    class _FakeOpus:
+        def list_collections_detailed(self):
+            return [{"id": "COL1", "title": "Gym Marketing Made Simple"}]
+
+        def list_exportable_clips(self, q, source_id):
+            return [{
+                "id": "COL1.C1", "title": "Clip", "description": "d",
+                "durationMs": 40000, "uriForExport": "https://cdn.opus/c.mp4",
+                "createdAt": "2026-07-01T10:00:00Z", "score": 93,
+                "transcript": "We book 71.9 percent of leads.",
+            }]
+
+    records = opus_factory.scan(api=_FakeOpus())
+    assert {r.clip_id for r in records} == {"COL1.C1"}
+    assert records[0].opus_score == 93.0

@@ -105,11 +105,14 @@ def _transcript_text(clip):
     return ""
 
 
-# Status values the live Opus API uses to signal a clip is ready for export.
-# Widened from the original uriForExport-only check so minor API variation is
-# tolerated. A clip is EXCLUDED when it has NO export URL AND its status (if
-# present) is not in this set — verbose mode prints the raw status so the
-# operator can identify any new value and add it here.
+# The documented discovery endpoint is /api/exportable-clips: by its name and
+# contract it returns ONLY exportable (finished) clips, each carrying a
+# uriForExport (id/title/description/durationMs/uriForExport/createdAt). So the
+# presence of an export URL IS the finished signal, and that is the primary
+# filter below. This set is a DEFENSIVE fallback for any shape that omits the
+# URL but carries an explicit status: a clip with no URL AND a status not in
+# this set is excluded. Verbose scan prints the raw status of every excluded
+# clip so the operator can spot and add a new live value here.
 _FINISHED_STATUSES = frozenset({
     "done", "completed", "finished", "ready", "exported",
     "success", "succeeded", "published",
