@@ -18,7 +18,9 @@ Hard lines:
   - Secrets (transcription + LLM keys) are read by env var NAME only, never logged.
 """
 
+import json
 import os
+import re
 
 from . import config, media_host
 
@@ -73,6 +75,85 @@ def stage_episode(source, tenant=HOST_TENANT, client=None):
         f"clip-episode: source not found as a local video file or an R2 key: {source}")
 
 
+# ---- Part 2: transcription with word-level timestamps (cached on the R2 key) ---------
+def _cache_path(r2_key, cache_dir=None):
+    cache_dir = cache_dir or config.clipper_cache_dir()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(r2_key or "")).strip("_") or "episode"
+    return os.path.join(cache_dir, safe + ".transcript.json")
+
+
+def _validate_transcript(t):
+    """A transcript must carry a list of words each with start/end times (word-level
+    timestamps are required for precise cuts and Phase 2 karaoke captions). Loud on
+    malformed data, never a silent empty."""
+    if not isinstance(t, dict) or not isinstance(t.get("words"), list) or not t["words"]:
+        raise ClipperError("transcription returned no word-level timestamps.")
+    for w in t["words"]:
+        if not isinstance(w, dict) or "start" not in w or "end" not in w \
+                or not str(w.get("word", "")).strip():
+            raise ClipperError(
+                "transcription word is missing word/start/end; word-level "
+                "timestamps are required.")
+    t.setdefault("segments", [])
+    return t
+
+
+def _default_transcriber(media_path):
+    """Local faster-whisper backend with word timestamps. Raises ClipperError when
+    it is not installed, naming the env-var key for an API backend (value never
+    read here). Injected/mocked in tests."""
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        raise ClipperError(
+            "no transcriber available: install faster-whisper, or pass a "
+            "transcriber that returns word-level timestamps. An API backend's key "
+            f"is read from the env var named {config.CLIPPER_TRANSCRIBE_KEY_ENV}.")
+    model = WhisperModel(os.environ.get("AGENT_WHISPER_MODEL", "base"))
+    segments, _info = model.transcribe(media_path, word_timestamps=True)
+    words, segs = [], []
+    for seg in segments:
+        segs.append({"speaker": "", "start": seg.start, "end": seg.end,
+                     "text": seg.text})
+        for w in (seg.words or []):
+            words.append({"word": w.word, "start": w.start, "end": w.end})
+    return {"words": words, "segments": segs}
+
+
+def transcribe(r2_key, media_path=None, transcriber=None, cache_dir=None):
+    """
+    Word-level transcript for a staged episode, cached on the R2 key so re-runs
+    never re-transcribe. Returns {"words":[{word,start,end}], "segments":[...]}.
+    Needs the local media file on a cache miss; raises ClipperError when neither a
+    cache nor a local file is available, or when the result has no word timestamps.
+    """
+    cache = _cache_path(r2_key, cache_dir)
+    if os.path.isfile(cache):
+        try:
+            with open(cache, encoding="utf-8") as fh:
+                return _validate_transcript(json.load(fh))
+        except ClipperError:
+            raise
+        except Exception:
+            pass  # unreadable cache: fall through and re-transcribe
+    if not media_path or not os.path.isfile(media_path):
+        raise ClipperError(
+            "transcription needs the local episode file on a cache miss; re-run "
+            "clip-episode with the local video path.")
+    transcriber = transcriber or _default_transcriber
+    result = _validate_transcript(transcriber(media_path))
+    os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as fh:
+        json.dump(result, fh)
+    return result
+
+
+def transcript_text(transcript):
+    """The plain spoken text of a transcript (words joined), for the LLM prompt."""
+    return " ".join(w["word"].strip() for w in transcript.get("words", [])
+                    if str(w.get("word", "")).strip())
+
+
 # ---- orchestrator (grows one stage per part; Phase 1 ends at the dry-run plan) --------
 def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
                  transcriber=None, llm=None):
@@ -91,8 +172,14 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
     staged = stage_episode(source, tenant, client=client)
     print(f"clip-episode: staged episode -> {staged['r2_key']} "
           f"({'uploaded' if staged['staged'] else 'already in R2'})")
-    # Parts 2-4 add: transcription, moment selection, and the dry-run plan.
-    return {"staged": staged}
+
+    media_path = staged["source"] if staged["staged"] else None
+    transcript = transcribe(staged["r2_key"], media_path=media_path,
+                            transcriber=transcriber)
+    print(f"clip-episode: transcript {len(transcript['words'])} word(s), "
+          f"{len(transcript.get('segments', []))} segment(s)")
+    # Parts 3-4 add: moment selection and the dry-run plan.
+    return {"staged": staged, "transcript": transcript}
 
 
 def clip_episode_cli(argv):

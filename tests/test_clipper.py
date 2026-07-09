@@ -85,9 +85,76 @@ def test_clip_episode_flag_off(monkeypatch, tmp_path):
 
 def test_clip_episode_stages_when_on(monkeypatch, tmp_path, capsys):
     _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
     ep = tmp_path / "e.mp4"
     ep.write_bytes(b"FAKE")
     client = _FakeClient()
-    out = clipper.clip_episode(str(ep), client=client)
+    out = clipper.clip_episode(str(ep), client=client, transcriber=_fake_transcriber())
     assert out["staged"]["staged"] is True
+    assert out["transcript"]["words"]
     assert "staged episode" in capsys.readouterr().out
+
+
+# ---- Part 2: transcription with word-level timestamps + caching ---------------------
+
+def _fake_transcriber(calls=None):
+    """A transcriber returning word-level timestamps; counts invocations if a list
+    is passed in (to prove caching)."""
+    def _t(media_path):
+        if calls is not None:
+            calls.append(media_path)
+        return {
+            "words": [
+                {"word": "Most", "start": 0.0, "end": 0.3},
+                {"word": "gyms", "start": 0.3, "end": 0.7},
+                {"word": "have", "start": 0.7, "end": 1.0},
+                {"word": "a", "start": 1.0, "end": 1.1},
+                {"word": "follow", "start": 1.1, "end": 1.5},
+                {"word": "up", "start": 1.5, "end": 1.8},
+                {"word": "problem", "start": 1.8, "end": 2.4},
+            ],
+            "segments": [{"speaker": "SPEAKER_0", "start": 0.0, "end": 2.4,
+                          "text": "Most gyms have a follow up problem"}],
+        }
+    return _t
+
+
+def test_transcribe_returns_word_timestamps(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    media = tmp_path / "e.mp4"
+    media.write_bytes(b"FAKE")
+    t = clipper.transcribe("echo/ep/abc/e.mp4", media_path=str(media),
+                           transcriber=_fake_transcriber())
+    assert t["words"][0] == {"word": "Most", "start": 0.0, "end": 0.3}
+    assert all("start" in w and "end" in w for w in t["words"])
+    assert t["segments"][0]["speaker"] == "SPEAKER_0"
+
+
+def test_transcribe_caches_on_r2_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    media = tmp_path / "e.mp4"
+    media.write_bytes(b"FAKE")
+    calls = []
+    tr = _fake_transcriber(calls)
+    clipper.transcribe("echo/ep/abc/e.mp4", media_path=str(media), transcriber=tr)
+    clipper.transcribe("echo/ep/abc/e.mp4", media_path=str(media), transcriber=tr)
+    assert len(calls) == 1                            # second run hit the cache
+
+
+def test_transcribe_needs_media_on_cache_miss(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    with pytest.raises(clipper.ClipperError):
+        clipper.transcribe("echo/ep/none/e.mp4", media_path=None,
+                           transcriber=_fake_transcriber())
+
+
+def test_transcribe_rejects_missing_word_timestamps(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CLIPPER_CACHE_DIR", str(tmp_path / "cache"))
+    media = tmp_path / "e.mp4"
+    media.write_bytes(b"FAKE")
+
+    def _bad(media_path):
+        return {"words": [{"word": "hi"}], "segments": []}   # no start/end
+
+    with pytest.raises(clipper.ClipperError):
+        clipper.transcribe("echo/ep/bad/e.mp4", media_path=str(media), transcriber=_bad)
