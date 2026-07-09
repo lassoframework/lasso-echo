@@ -588,6 +588,43 @@ help.opus.pro/api-reference/openapi.json BEFORE coding.
       project URL) in Railway, run `agent opus-organize` (dry-run) then
       `--write`, then `agent opus-doctor` to confirm the collection clip count.
 
+### Native clipper, Phase 1: episode -> selection (2026-07-09; four parts, flag default OFF)
+Abandoning third-party clip platforms (Opus API is gated + capped; Riverside has
+no pull API). New durable path: episode video in, 4-5 finished vertical Reels
+out, entirely inside Echo, zero external clip-library dependency. Claude selects
+the moments; mechanical layers cut + caption (Phase 2). Master flag
+AGENT_CLIPPER_ENABLED, default OFF. Phase 1 proves the SELECTION and STOPS at the
+dry-run plan; rendering is a separate Phase 2 session after the picks are proven
+on a real episode. New CLI: `agent clip-episode --source <path-or-R2-key>`.
+- [x] Part 1: episode intake — stage a full episode video to a tenant-scoped R2
+      key via the existing media_host (read-only on the source); a local video
+      uploads once, an existing R2 key is verified and reused, a non-video or
+      unresolvable source raises ClipperError. Added media_host.key_for /
+      public_url_for.
+- [x] Part 2: transcription with WORD-LEVEL timestamps — transcribe() returns
+      {words:[{word,start,end}], segments:[...]}, cached under
+      AGENT_CLIPPER_CACHE_DIR keyed by the R2 key so re-runs never re-transcribe;
+      word timestamps validated (loud on malformed). Default backend local
+      faster-whisper; API-key backend read by env NAME (AGENT_TRANSCRIBE_API_KEY);
+      transcriber injectable.
+- [x] Part 3: Claude moment selection (THE CORE) — select_moments() feeds the
+      timestamped transcript to Claude (model AGENT_CLIPPER_MODEL, default Opus
+      4.8; key ANTHROPIC_API_KEY by NAME), returns 4-5 candidates each with
+      start/end, hook, rationale, LASSO bucket, and an honest 0-100 score. Every
+      candidate checked: duration window (AGENT_CLIPPER_MIN/MAX_SEC 30-90s), score
+      floor (AGENT_CLIPPER_SCORE_FLOOR default 80), and the fabrication gate on
+      the hook AND rationale (assert only transcript/approved facts). Off-transcript
+      claims are dropped with an honest reason.
+- [x] Part 4: dry-run plan — clip-episode with no --render prints the ranked plan
+      (timestamps, duration, score, hook, bucket, rationale, exact transcript
+      text) + a dropped list; renders nothing, writes nothing (only the transcript
+      cache). This is the approval checkpoint before any video work.
+- STOP: rendering is NOT built. Phase 2 is a separate session once the selection
+      is proven on a real episode. BLAKE BY HAND: set AGENT_CLIPPER_ENABLED,
+      AGENT_HOSTING_ENABLED (+ R2), ANTHROPIC_API_KEY, and a transcriber
+      (faster-whisper or AGENT_TRANSCRIBE_API_KEY), then run
+      `agent clip-episode --source <episode.mp4>` and read the plan.
+
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
       seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
