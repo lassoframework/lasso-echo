@@ -115,9 +115,13 @@ class PendingStore:
 
     def get(self, draft_id):
         with self._conn() as conn:
-            row = conn.execute("SELECT data FROM drafts WHERE draft_id=?",
+            row = conn.execute("SELECT draft_id, data FROM drafts WHERE draft_id=?",
                                (draft_id,)).fetchone()
-        return _from_dict(json.loads(row["data"])) if row else None
+        if row is None:
+            return None
+        data = json.loads(row["data"])
+        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
+        return _from_dict(data)
 
     def remove(self, draft_id):
         with self._conn() as conn:
@@ -127,9 +131,14 @@ class PendingStore:
 
     def list_pending(self):
         with self._conn() as conn:
-            rows = conn.execute("SELECT data FROM drafts WHERE status=?",
+            rows = conn.execute("SELECT draft_id, data FROM drafts WHERE status=?",
                                 (DraftStatus.PENDING.value,)).fetchall()
-        return [_from_dict(json.loads(r["data"])) for r in rows]
+        result = []
+        for r in rows:
+            data = json.loads(r["data"])
+            data.setdefault("draft_id", r["draft_id"])  # rescue: col is authoritative
+            result.append(_from_dict(data))
+        return result
 
     def find_for_day(self, account_key, day_key, draft_type):
         """The most recent record for (account, day, type), ANY status. The
@@ -139,10 +148,14 @@ class PendingStore:
             return None
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT data FROM drafts WHERE account_key=? AND day_key=? "
+                "SELECT draft_id, data FROM drafts WHERE account_key=? AND day_key=? "
                 "AND draft_type=? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                 (account_key, day_key, draft_type)).fetchone()
-        return _from_dict(json.loads(row["data"])) if row else None
+        if row is None:
+            return None
+        data = json.loads(row["data"])
+        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
+        return _from_dict(data)
 
     def find_pending(self, account_key, day_key, draft_type):
         """The PENDING draft for (account, day, type), or None: the idempotency
@@ -151,10 +164,14 @@ class PendingStore:
             return None
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT data FROM drafts WHERE status=? AND account_key=? "
+                "SELECT draft_id, data FROM drafts WHERE status=? AND account_key=? "
                 "AND day_key=? AND draft_type=?",
                 (DraftStatus.PENDING.value, account_key, day_key, draft_type)).fetchone()
-        return _from_dict(json.loads(row["data"])) if row else None
+        if row is None:
+            return None
+        data = json.loads(row["data"])
+        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
+        return _from_dict(data)
 
 
 def _is_sqlite(path):
