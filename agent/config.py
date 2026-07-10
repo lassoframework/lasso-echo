@@ -198,6 +198,43 @@ def caption_seo_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CAPTION_SEO_ENABLED", "false"))
 
 
+def episode_inbox_enabled() -> bool:
+    """
+    Episode inbox watcher switch. OFF by default. When ON, the listener polls
+    AGENT_EPISODE_INBOX_PREFIX every AGENT_EPISODE_INBOX_POLL_MINUTES for new
+    episode files, runs Phase 1 clip selection, and posts the ranked plan to
+    Slack. Nothing renders and nothing posts automatically.
+    """
+    return _truthy(os.environ.get("AGENT_EPISODE_INBOX_ENABLED", "false"))
+
+
+def episode_inbox_prefix() -> str:
+    """Watched R2 prefix. Default: echo/episode_inbox/<tenant>/."""
+    tenant = episode_inbox_tenant()
+    return os.environ.get("AGENT_EPISODE_INBOX_PREFIX",
+                          f"echo/episode_inbox/{tenant}/")
+
+
+def episode_inbox_tenant() -> str:
+    """Tenant slug scoping the inbox prefix. Default: lasso_episodes."""
+    return os.environ.get("AGENT_EPISODE_INBOX_TENANT", "lasso_episodes")
+
+
+def episode_inbox_poll_minutes() -> int:
+    """How often to poll the inbox prefix. Default: 5 minutes."""
+    return max(1, int(os.environ.get("AGENT_EPISODE_INBOX_POLL_MINUTES", "5")))
+
+
+def episode_nudge_time() -> str:
+    """Wall-clock HH:MM (America/New_York) when the Monday nudge fires. Default: 09:00."""
+    return os.environ.get("AGENT_EPISODE_NUDGE_TIME", "09:00")
+
+
+def episode_nudge_window_days() -> int:
+    """Days back from today the nudge considers an episode 'recent'. Default: 2."""
+    return max(1, int(os.environ.get("AGENT_EPISODE_NUDGE_WINDOW_DAYS", "2")))
+
+
 def platform_variants_enabled() -> bool:
     """
     Per-platform caption variant switch. OFF by default = one identical caption and

@@ -89,6 +89,19 @@ class _S3Client:
     def put(self, key, local_path):
         self._s3.upload_file(local_path, self._bucket, key)
 
+    def list_prefix(self, prefix):
+        """List objects under prefix. Returns [{key, size, last_modified}]."""
+        paginator = self._s3.get_paginator("list_objects_v2")
+        items = []
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                items.append({
+                    "key": obj["Key"],
+                    "size": obj["Size"],
+                    "last_modified": obj["LastModified"].isoformat(),
+                })
+        return items
+
 
 def _default_client():
     """
