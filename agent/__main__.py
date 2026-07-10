@@ -686,6 +686,11 @@ def main(argv=None):
         # is-it-key-or-route test before running opus-pull.
         from .opus_ingest import opus_doctor
         opus_doctor()
+    elif cmd == "inbox-status":
+        # READ ONLY episode inbox watcher state: prefix, poll interval,
+        # files seen/claimed/processed/failed, last run time.
+        from .episode_inbox import inbox_status_cli
+        inbox_status_cli()
     elif cmd == "clip-episode":
         # Native clipper (AGENT_CLIPPER_ENABLED): stage a full episode video, get
         # word-level transcription, and let Claude pick 4-5 candidate Reel moments.

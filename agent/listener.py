@@ -113,10 +113,12 @@ def _daily_scheduler(store):
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
     opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
     podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
+    inbox_every = config.episode_inbox_poll_minutes() * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_ingest = 0.0
     last_opus = 0.0
     last_podcast = 0.0
+    last_inbox = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -165,6 +167,28 @@ def _daily_scheduler(store):
             except Exception as e:
                 print(f"[podcast] poll pass failed: {type(e).__name__}: {e}")
                 ops_alerts.alert(f"podcast feed poll failed: {type(e).__name__}: {e}")
+        # Episode inbox watcher: FULLY INERT unless AGENT_EPISODE_INBOX_ENABLED.
+        # On each pass: list the watched R2 prefix, guard against in-progress
+        # uploads (size stability), claim + Phase 1 clip selection, post ranked
+        # plan to Slack #echoclaude. Also runs the Monday 9am nudge check when
+        # the flag is armed. Errors alert (inside poll/check_monday_nudge) and
+        # never crash the loop.
+        if config.episode_inbox_enabled():
+            if time.monotonic() - last_inbox >= inbox_every:
+                last_inbox = time.monotonic()
+                try:
+                    from . import episode_inbox
+                    episode_inbox.poll()
+                except Exception as e:
+                    print(f"[inbox] poll pass failed: {type(e).__name__}: {e}")
+                    ops_alerts.alert(
+                        f"episode inbox poll failed: {type(e).__name__}: {e}"
+                    )
+            try:
+                from . import episode_inbox
+                episode_inbox.check_monday_nudge(now=now)
+            except Exception as e:
+                print(f"[inbox] nudge check failed: {type(e).__name__}: {e}")
         # Card self-expiry sweep (no flag, queue hygiene): hourly, cheap.
         if now.minute == 0:
             try:
