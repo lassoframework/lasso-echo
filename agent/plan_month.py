@@ -260,11 +260,26 @@ def plan_cli(args):
     for day_key in out["skipped"]:
         print(f"  {day_key}  (no eligible candidate)")
     # Category rotation ON: show the category mix + platform sub-topic spread for
-    # the month so balance is visible before approval (OFF -> unchanged output).
+    # the NEWLY PLANNED days so the summary always matches the day list shown above.
+    # (month_plan covers all 31 days; this filters to only the days we just planned
+    # so the count in the summary equals the count in the day list — no discrepancy.)
     if config.category_rotation_enabled():
         from . import category_plan
+        full = category_plan.month_plan(month)
+        planned_set = {d for d, _ in out["planned"]}
+        if planned_set:
+            _entries = [e for e in full["entries"] if e["day"] in planned_set]
+            _summary = {}
+            _spread = {}
+            for e in _entries:
+                _summary[e["category"]] = _summary.get(e["category"], 0) + 1
+                if e["sub_topic"]:
+                    _spread[e["sub_topic"]] = _spread.get(e["sub_topic"], 0) + 1
+            filtered = {**full, "summary": _summary, "subtopic_spread": _spread}
+        else:
+            filtered = full
         print()
-        print(category_plan.format_summary(category_plan.month_plan(month)))
+        print(category_plan.format_summary(filtered))
 
 
 def approve_cli(args):
