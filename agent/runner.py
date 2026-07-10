@@ -254,29 +254,34 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             acct_lib = account.library_prefix or lib
 
             draft = None
-            # Social proof card FIRST, but only on the weekly proof day and only when
-            # its flag is armed with approved (permissioned + verified) entries. It is
-            # dormant otherwise; None -> the normal paths below run untouched.
+            # Category frequency + consecutive caps (category_cap.py, both OFF by
+            # default). Campaign builders are gated; the fallback never blocks.
+            from .category_cap import is_allowed as _cap_allowed, record_win as _record_cap
+            _book_n = config.book_campaign_every_n_days()
+            _max_consec = config.category_max_consecutive()
             if account.key.startswith("lasso"):
-                # BOOK CAMPAIGN LEADS THE CALENDAR (AGENT_BOOK_CAMPAIGN_ENABLED, OFF):
-                # armed, the day's book post takes posting priority and the normal
-                # pillars below fill around it. Every draft still cards to Blake.
+                # BOOK CAMPAIGN (AGENT_BOOK_CAMPAIGN_ENABLED, OFF): participates in
+                # rotation via frequency cap (AGENT_BOOK_CAMPAIGN_EVERY_N_DAYS,
+                # default 1=uncapped) and consecutive cap (AGENT_CATEGORY_MAX_CONSECUTIVE,
+                # default 0=off). Capped -> chain falls through to the next builder.
                 from .book_campaign import build_book_draft
-                draft = build_book_draft(account, day_key)
+                if _cap_allowed(account.key, "book", day_key,
+                                every_n_days=_book_n, max_consecutive=_max_consec):
+                    draft = build_book_draft(account, day_key)
             if draft is None and account.key.startswith("lasso"):
-                # PODCAST SLOT (AGENT_PODCAST_ENABLED, OFF): a newly detected
-                # episode's release card takes the day's feed slot AFTER the
-                # book campaign queue and BEFORE pillar rotation. Cards once
-                # per episode, max one podcast draft per day, always held for
-                # the tap. Dormant = None and the chain below runs unchanged.
+                # PODCAST SLOT (AGENT_PODCAST_ENABLED, OFF): consecutive cap applied;
+                # no frequency cap (episode queue naturally limits cadence).
                 from .podcast_release import build_podcast_slot_draft
-                draft = build_podcast_slot_draft(account, day_key)
+                if _cap_allowed(account.key, "podcast", day_key,
+                                max_consecutive=_max_consec):
+                    draft = build_podcast_slot_draft(account, day_key)
             if draft is None and account.key.startswith("lasso"):
                 draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
-            # Summit campaign next (its own weekly day, inside the same daily cadence,
-            # never additional). Dormant unless armed; auto-stops after 2026-11-08.
+            # Summit campaign next (its own weekly day). Consecutive cap applied.
             if draft is None and account.key.startswith("lasso"):
-                draft = build_summit_draft(account, day_key, voice=acct_voice)
+                if _cap_allowed(account.key, "summit", day_key,
+                                max_consecutive=_max_consec):
+                    draft = build_summit_draft(account, day_key, voice=acct_voice)
             # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
             # Armed, it picks WHICH approved creative today's draft proposes (window,
             # pillar alternation, gate-clean only); None -> the paths below run as today.
@@ -290,8 +295,11 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 draft = build_daily_infographic_draft(account, day_key)
             if draft is None:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
-                # Schedule the fallback draft to the same cadence slot.
                 draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
+            # Record the category win for cap history (idempotent by day_key, before
+            # idempotent reconcile so a same-content re-run still counts correctly).
+            if draft is not None:
+                _record_cap(account.key, draft.draft_type or "feed", day_key)
 
             existing = None
             if idempotent:

@@ -686,6 +686,29 @@ def review_cycle_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_REVIEW_CYCLE_ENABLED", "false"))
 
 
+def book_campaign_every_n_days() -> int:
+    """Book campaign frequency cap. At most one book post every N calendar days per
+    account. N=1 means uncapped (arms the same every-day behavior as before). Arm by
+    setting AGENT_BOOK_CAMPAIGN_EVERY_N_DAYS (e.g. 3) alongside the book campaign flag.
+    Default: 1 (off — no change to existing behavior)."""
+    try:
+        return max(1, int(os.environ.get("AGENT_BOOK_CAMPAIGN_EVERY_N_DAYS", "1")))
+    except ValueError:
+        return 1
+
+
+def category_max_consecutive() -> int:
+    """Hard consecutive cap for campaign categories (book, podcast, summit). No
+    campaign category may post more than this many days in a row per account.
+    0 means no cap. The fallback (feed) is never gated.
+    Arm by setting AGENT_CATEGORY_MAX_CONSECUTIVE (e.g. 2).
+    Default: 0 (off — no change to existing behavior)."""
+    try:
+        return max(0, int(os.environ.get("AGENT_CATEGORY_MAX_CONSECUTIVE", "0")))
+    except ValueError:
+        return 0
+
+
 def media_inbox_enabled() -> bool:
     """
     Media inbox switch (Stage 2). OFF by default = zero behavior change: no
