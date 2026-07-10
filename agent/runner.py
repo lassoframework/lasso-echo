@@ -259,29 +259,60 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             from .category_cap import is_allowed as _cap_allowed, record_win as _record_cap
             _book_n = config.book_campaign_every_n_days()
             _max_consec = config.category_max_consecutive()
-            if account.key.startswith("lasso"):
-                # BOOK CAMPAIGN (AGENT_BOOK_CAMPAIGN_ENABLED, OFF): participates in
-                # rotation via frequency cap (AGENT_BOOK_CAMPAIGN_EVERY_N_DAYS,
-                # default 1=uncapped) and consecutive cap (AGENT_CATEGORY_MAX_CONSECUTIVE,
-                # default 0=off). Capped -> chain falls through to the next builder.
-                from .book_campaign import build_book_draft
-                if _cap_allowed(account.key, "book", day_key,
-                                every_n_days=_book_n, max_consecutive=_max_consec):
-                    draft = build_book_draft(account, day_key)
-            if draft is None and account.key.startswith("lasso"):
-                # PODCAST SLOT (AGENT_PODCAST_ENABLED, OFF): consecutive cap applied;
-                # no frequency cap (episode queue naturally limits cadence).
-                from .podcast_release import build_podcast_slot_draft
-                if _cap_allowed(account.key, "podcast", day_key,
-                                max_consecutive=_max_consec):
-                    draft = build_podcast_slot_draft(account, day_key)
-            if draft is None and account.key.startswith("lasso"):
-                draft = build_social_proof_draft(account, day_key, voice=acct_voice, poster=poster)
-            # Summit campaign next (its own weekly day). Consecutive cap applied.
-            if draft is None and account.key.startswith("lasso"):
-                if _cap_allowed(account.key, "summit", day_key,
-                                max_consecutive=_max_consec):
-                    draft = build_summit_draft(account, day_key, voice=acct_voice)
+
+            # CATEGORY ROTATION CONTROLLER (AGENT_CATEGORY_ROTATION, OFF by default).
+            # When armed, content_categories.schedule_for_day is the sole authority:
+            # only the builder whose category matches today's scheduled slot fires.
+            # Campaign builders (book, podcast, summit) never pre-empt the schedule.
+            # platform / b2b / doctrine days fall through to the creative layer below.
+            if config.category_rotation_enabled() and account.key.startswith("lasso"):
+                from .content_categories import schedule_for_day as _sched_for_day
+                _day_sched = _sched_for_day(day_key)
+                if _day_sched is not None:
+                    _cat = _day_sched[0]
+                    if _cat == "podcast":
+                        from .podcast_release import build_podcast_slot_draft
+                        if _cap_allowed(account.key, "podcast", day_key,
+                                        max_consecutive=_max_consec):
+                            draft = build_podcast_slot_draft(account, day_key)
+                    elif _cat == "book":
+                        from .book_campaign import build_book_draft
+                        if _cap_allowed(account.key, "book", day_key,
+                                        every_n_days=_book_n,
+                                        max_consecutive=_max_consec):
+                            draft = build_book_draft(account, day_key)
+                    elif _cat == "summit":
+                        if _cap_allowed(account.key, "summit", day_key,
+                                        max_consecutive=_max_consec):
+                            draft = build_summit_draft(account, day_key,
+                                                       voice=acct_voice)
+                    # _cat in ("platform", "b2b", "doctrine"): draft stays None;
+                    # the creative rotation / infographic / fallback below fills.
+            else:
+                # LEGACY PRIORITY CHAIN (rotation OFF; behavior byte-for-byte identical
+                # to what shipped before AGENT_CATEGORY_ROTATION existed).
+                if account.key.startswith("lasso"):
+                    # BOOK CAMPAIGN (AGENT_BOOK_CAMPAIGN_ENABLED, OFF): participates in
+                    # rotation via frequency cap and consecutive cap (both default off).
+                    from .book_campaign import build_book_draft
+                    if _cap_allowed(account.key, "book", day_key,
+                                    every_n_days=_book_n, max_consecutive=_max_consec):
+                        draft = build_book_draft(account, day_key)
+                if draft is None and account.key.startswith("lasso"):
+                    # PODCAST SLOT (AGENT_PODCAST_ENABLED, OFF): consecutive cap applied;
+                    # no frequency cap (episode queue naturally limits cadence).
+                    from .podcast_release import build_podcast_slot_draft
+                    if _cap_allowed(account.key, "podcast", day_key,
+                                    max_consecutive=_max_consec):
+                        draft = build_podcast_slot_draft(account, day_key)
+                if draft is None and account.key.startswith("lasso"):
+                    draft = build_social_proof_draft(account, day_key,
+                                                     voice=acct_voice, poster=poster)
+                # Summit campaign next (its own weekly day). Consecutive cap applied.
+                if draft is None and account.key.startswith("lasso"):
+                    if _cap_allowed(account.key, "summit", day_key,
+                                    max_consecutive=_max_consec):
+                        draft = build_summit_draft(account, day_key, voice=acct_voice)
             # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
             # Armed, it picks WHICH approved creative today's draft proposes (window,
             # pillar alternation, gate-clean only); None -> the paths below run as today.
