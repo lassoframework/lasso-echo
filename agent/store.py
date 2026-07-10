@@ -42,12 +42,27 @@ def _to_dict(d: Draft):
     }
 
 
+_SELECT = "draft_id, account_key, status, day_key, draft_type, data"
+
+
+def _rescue_from_row(data, row):
+    """Back-fill data with DB column values when the JSON blob is missing them.
+    Applies to all five column-backed fields; setdefault never overwrites a key
+    that the JSON already provides, so existing values are preserved."""
+    data.setdefault("draft_id", row["draft_id"] or "")
+    data.setdefault("account_key", row["account_key"] or "")
+    data.setdefault("status", row["status"] or "pending")
+    data.setdefault("day_key", row["day_key"] or "")
+    data.setdefault("draft_type", row["draft_type"] or "")
+    return data
+
+
 def _from_dict(r):
     return Draft(
-        draft_id=r["draft_id"],
-        account_key=r["account_key"],
-        platform=r["platform"],
-        caption=r["caption"],
+        draft_id=r.get("draft_id", ""),
+        account_key=r.get("account_key", ""),
+        platform=r.get("platform", ""),
+        caption=r.get("caption", ""),
         hashtags=r.get("hashtags", []),
         creative_path=r.get("creative_path", ""),
         creative_public_url=r.get("creative_public_url", ""),
@@ -115,13 +130,11 @@ class PendingStore:
 
     def get(self, draft_id):
         with self._conn() as conn:
-            row = conn.execute("SELECT draft_id, data FROM drafts WHERE draft_id=?",
+            row = conn.execute(f"SELECT {_SELECT} FROM drafts WHERE draft_id=?",
                                (draft_id,)).fetchone()
         if row is None:
             return None
-        data = json.loads(row["data"])
-        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
-        return _from_dict(data)
+        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
 
     def remove(self, draft_id):
         with self._conn() as conn:
@@ -131,14 +144,9 @@ class PendingStore:
 
     def list_pending(self):
         with self._conn() as conn:
-            rows = conn.execute("SELECT draft_id, data FROM drafts WHERE status=?",
+            rows = conn.execute(f"SELECT {_SELECT} FROM drafts WHERE status=?",
                                 (DraftStatus.PENDING.value,)).fetchall()
-        result = []
-        for r in rows:
-            data = json.loads(r["data"])
-            data.setdefault("draft_id", r["draft_id"])  # rescue: col is authoritative
-            result.append(_from_dict(data))
-        return result
+        return [_from_dict(_rescue_from_row(json.loads(r["data"]), r)) for r in rows]
 
     def find_for_day(self, account_key, day_key, draft_type):
         """The most recent record for (account, day, type), ANY status. The
@@ -148,14 +156,12 @@ class PendingStore:
             return None
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT draft_id, data FROM drafts WHERE account_key=? AND day_key=? "
+                f"SELECT {_SELECT} FROM drafts WHERE account_key=? AND day_key=? "
                 "AND draft_type=? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                 (account_key, day_key, draft_type)).fetchone()
         if row is None:
             return None
-        data = json.loads(row["data"])
-        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
-        return _from_dict(data)
+        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
 
     def find_pending(self, account_key, day_key, draft_type):
         """The PENDING draft for (account, day, type), or None: the idempotency
@@ -164,14 +170,12 @@ class PendingStore:
             return None
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT draft_id, data FROM drafts WHERE status=? AND account_key=? "
+                f"SELECT {_SELECT} FROM drafts WHERE status=? AND account_key=? "
                 "AND day_key=? AND draft_type=?",
                 (DraftStatus.PENDING.value, account_key, day_key, draft_type)).fetchone()
         if row is None:
             return None
-        data = json.loads(row["data"])
-        data.setdefault("draft_id", row["draft_id"])  # rescue: col is authoritative
-        return _from_dict(data)
+        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
 
 
 def _is_sqlite(path):
