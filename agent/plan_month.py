@@ -229,8 +229,88 @@ def approve_month(account_key, month, through=None):
     return {"approved": approved, "held": held}
 
 
+def replan_month(account_key, month, from_day=None, write=False):
+    """
+    Replan pending posting days for one month: delete every pending draft whose
+    day >= from_day, then run plan_month for those open slots. Approved and
+    published days are NEVER touched.
+
+    Returns {"days": [{"date", "action", "category"}], "wrote": int, ...}
+    or None when the flag is OFF.
+    action: "replanned" | "kept-approved" | "open" (no eligible content found).
+    category: the scheduled bucket when AGENT_CATEGORY_ROTATION is on, else "".
+    """
+    if not config.plan_month_enabled():
+        return None
+
+    from_day_eff = from_day or f"{month}-01"
+
+    # Delete pending drafts in range — approved and published are never touched.
+    with db.connect() as conn:
+        conn.execute(
+            "DELETE FROM drafts WHERE account_key=? AND "
+            "substr(day_key, 1, 7)=? AND status='pending' AND day_key >= ?",
+            (account_key, month, from_day_eff))
+        conn.commit()
+
+    # Replan: plan_month now sees the deleted days as open.
+    result = plan_month(account_key, month, write=write, from_day=from_day_eff)
+    if result is None:
+        return None
+
+    # Approved days in range survive untouched.
+    with db.connect() as conn:
+        kept_rows = conn.execute(
+            "SELECT DISTINCT day_key FROM drafts WHERE account_key=? AND "
+            "substr(day_key, 1, 7)=? AND status='approved' AND day_key >= ?",
+            (account_key, month, from_day_eff)).fetchall()
+    kept_approved = sorted(r["day_key"] for r in kept_rows)
+
+    # Category lookup (rotation ON only).
+    cat_lookup = {}
+    if config.category_rotation_enabled():
+        from . import category_plan
+        for e in category_plan.month_plan(month)["entries"]:
+            cat_lookup[e["day"]] = e["category"]
+
+    days_out = []
+    for day_key, _ in result["planned"]:
+        days_out.append({"date": day_key, "action": "replanned",
+                         "category": cat_lookup.get(day_key, "")})
+    for day_key in result["skipped"]:
+        days_out.append({"date": day_key, "action": "open",
+                         "category": cat_lookup.get(day_key, "")})
+    for day_key in kept_approved:
+        days_out.append({"date": day_key, "action": "kept-approved",
+                         "category": cat_lookup.get(day_key, "")})
+    days_out.sort(key=lambda x: x["date"])
+
+    return {"days": days_out, "wrote": result["wrote"],
+            "replanned_count": len(result["planned"]),
+            "kept_approved_count": len(kept_approved),
+            "planned": result["planned"], "skipped": result["skipped"]}
+
+
+def _print_category_summary(month, planned_set):
+    """Print category mix for a set of newly planned day_keys (rotation ON only)."""
+    if not config.category_rotation_enabled() or not planned_set:
+        return
+    from . import category_plan
+    full = category_plan.month_plan(month)
+    _entries = [e for e in full["entries"] if e["day"] in planned_set]
+    _summary = {}
+    _spread = {}
+    for e in _entries:
+        _summary[e["category"]] = _summary.get(e["category"], 0) + 1
+        if e["sub_topic"]:
+            _spread[e["sub_topic"]] = _spread.get(e["sub_topic"], 0) + 1
+    filtered = {**full, "summary": _summary, "subtopic_spread": _spread}
+    print()
+    print(category_plan.format_summary(filtered))
+
+
 def plan_cli(args):
-    account, month, write, from_day = None, None, False, None
+    account, month, write, from_day, replan = None, None, False, None, False
     i = 0
     while i < len(args):
         if args[i] == "--account" and i + 1 < len(args):
@@ -241,13 +321,28 @@ def plan_cli(args):
             from_day = args[i + 1]; i += 2; continue
         if args[i] == "--write":
             write = True; i += 1; continue
+        if args[i] == "--replan":
+            replan = True; i += 1; continue
         print(f"unrecognized: {args[i]}\n"
               "usage: python -m agent plan-month --account <key> "
-              "--month YYYY-MM [--from YYYY-MM-DD] [--write]")
+              "--month YYYY-MM [--from YYYY-MM-DD] [--write] [--replan]")
         return
     if not account or not month:
         print("usage: python -m agent plan-month --account <key> --month YYYY-MM "
-              "[--from YYYY-MM-DD] [--write]")
+              "[--from YYYY-MM-DD] [--write] [--replan]")
+        return
+    if replan:
+        out = replan_month(account, month, from_day=from_day, write=write)
+        if out is None:
+            print("plan-month: OFF (set AGENT_PLAN_MONTH_ENABLED=true). Nothing done.")
+            return
+        print(f"plan-month --replan: {out['replanned_count']} replanned, "
+              f"{out['kept_approved_count']} kept-approved, {out['wrote']} written")
+        for d in out["days"]:
+            cat = f"  {d['category']}" if d["category"] else ""
+            print(f"  {d['date']}  {d['action']}{cat}")
+        _print_category_summary(month, {d["date"] for d in out["days"]
+                                        if d["action"] == "replanned"})
         return
     out = plan_month(account, month, write=write, from_day=from_day)
     if out is None:
@@ -263,23 +358,7 @@ def plan_cli(args):
     # the NEWLY PLANNED days so the summary always matches the day list shown above.
     # (month_plan covers all 31 days; this filters to only the days we just planned
     # so the count in the summary equals the count in the day list — no discrepancy.)
-    if config.category_rotation_enabled():
-        from . import category_plan
-        full = category_plan.month_plan(month)
-        planned_set = {d for d, _ in out["planned"]}
-        if planned_set:
-            _entries = [e for e in full["entries"] if e["day"] in planned_set]
-            _summary = {}
-            _spread = {}
-            for e in _entries:
-                _summary[e["category"]] = _summary.get(e["category"], 0) + 1
-                if e["sub_topic"]:
-                    _spread[e["sub_topic"]] = _spread.get(e["sub_topic"], 0) + 1
-            filtered = {**full, "summary": _summary, "subtopic_spread": _spread}
-        else:
-            filtered = full
-        print()
-        print(category_plan.format_summary(filtered))
+    _print_category_summary(month, {d for d, _ in out["planned"]})
 
 
 def approve_cli(args):
