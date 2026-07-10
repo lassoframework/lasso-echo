@@ -6,11 +6,12 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-09 (Native clipper end to end shipped dark: all 4 phases
-complete. Phase 0 prereq detection + render flag. Phase 1 selection (prior session).
-Phase 2 render (cut, 9:16 frame, karaoke captions, brand frame). Phase 3 wire into
-Echo (held drafts + Slack cards + cost log). Suite 961 green, 7 pre-existing reportlab.
-All flags default OFF. Prev: 2026-07-06 Calendar V2 + plan-month round-robin, suite 633.)
+Last updated: 2026-07-10 (Episode inbox watcher + Monday nudge shipped dark: Parts 1-5
+complete. Polling watcher in existing listener, exactly-once claim markers, size-stability
+guard, Phase 1 clip selection on arrival, ranked plan to Slack, RSS episode matching,
+evergreen guard, Monday 9am nudge (idempotent, window-gated). `agent inbox-status` CLI.
+39 tests green. Master flag AGENT_EPISODE_INBOX_ENABLED OFF. Suite 1000 green, 7
+pre-existing reportlab. Prev: 2026-07-09 Native clipper end to end shipped dark.)
 
 ---
 
@@ -661,6 +662,63 @@ Parts that self-skipped: none (all phases built). Rendering is ARMED but
 Pipeline ready for a real Gym Marketing Made Simple episode dry-run: YES,
   AFTER steps 1-6 above are done by hand. All flags default OFF; nothing
   runs in production until Blake arms them.
+
+### Episode inbox watcher + Monday nudge (2026-07-10; 5 parts, master flag OFF)
+Human workflow: export from Riverside, drop file in the inbox prefix. Echo takes
+it from there. Polling watcher inside the existing listener; no new infra.
+Master flag AGENT_EPISODE_INBOX_ENABLED (default OFF, all flags OFF).
+
+Part 1 (inbox convention + state, SHA 990d81f):
+- [x] Watched prefix AGENT_EPISODE_INBOX_PREFIX (default echo/episode_inbox/<tenant>/).
+      Tenant AGENT_EPISODE_INBOX_TENANT (default lasso_episodes).
+- [x] Accept mp4/mov/mp3/wav only (extension filter).
+- [x] Exactly-once claim: kv marker claimed before processing; re-poll skips
+      claimed keys; marker survives restarts (persistent SQLite kv).
+- [x] _S3Client.list_prefix() added to media_host — paginated R2 prefix listing.
+
+Part 2 (watcher loop, SHA 990d81f):
+- [x] poll() every AGENT_EPISODE_INBOX_POLL_MINUTES (default 5) in _daily_scheduler.
+- [x] Size-stability guard: file must have same size across two consecutive polls
+      before it is claimed (guards against in-progress uploads from Riverside).
+- [x] Claim + invoke Phase 1 clip selection; post ranked plan to Slack #echoclaude
+      as a held plan message. NOTHING renders, NOTHING posts.
+- [x] Exception in processing marks file FAILED, alerts via ops_alerts, loop
+      continues uninterrupted.
+
+Part 3 (ops surface, SHA 43a3653):
+- [x] inbox_status() returns enabled, prefix, poll interval, last run, counts.
+- [x] `agent inbox-status` CLI prints the full status (read only, no side effects).
+
+Part 4 (RSS episode matching, SHA 990d81f):
+- [x] _latest_episode_from_db() queries podcast_episodes table for newest episode.
+- [x] Plan Slack message header includes episode number, title, publish date.
+- [x] _evergreen_check() rejects banned recency phrases in plan output; guard fires
+      in header construction (replaces title, alerts via ops_alerts).
+- [x] _mark_ep_matched() / _is_ep_matched() track inbox file -> episode linkage.
+
+Part 5 (Monday 9am nudge, SHA 43a3653):
+- [x] check_monday_nudge(): Monday gate, nudge-time gate (America/New_York), recency
+      window (AGENT_EPISODE_NUDGE_WINDOW_DAYS, default 2 days), episode match check.
+- [x] Idempotent: nudge key ep_guid + date stored in kv; second call same day is
+      a no-op (status: already_sent).
+- [x] Already-matched episode is silent (no nudge).
+- [x] Stale episode outside window is silent.
+- [x] Nudge slot added to _daily_scheduler (never crashes loop).
+
+39 tests, all green. Suite 1000 passed, 7 pre-existing reportlab failures.
+
+BLAKE BY HAND to arm this pipeline:
+  1. Set AGENT_EPISODE_INBOX_ENABLED=true in Railway.
+  2. Ensure AGENT_HOSTING_ENABLED=true + R2 credentials set (for list_prefix).
+  3. Ensure AGENT_CLIPPER_ENABLED=true (Phase 1 clip selection).
+  4. Set AGENT_PODCAST_FEED_URL (for RSS episode matching in the plan header).
+  5. Set AGENT_EPISODE_INBOX_PREFIX if the default is wrong
+     (default: echo/episode_inbox/lasso_episodes/).
+  6. Optional: AGENT_EPISODE_INBOX_POLL_MINUTES (default 5),
+     AGENT_EPISODE_NUDGE_TIME (default 09:00),
+     AGENT_EPISODE_NUDGE_WINDOW_DAYS (default 2).
+  7. Export a finished episode from Riverside, drop it in the inbox prefix.
+  8. Within one poll cycle, a ranked clip plan appears in #echoclaude.
 
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
