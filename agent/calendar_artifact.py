@@ -42,6 +42,16 @@ STATUS_COLORS = {
     "rest": "#2A3452",
 }
 
+# category -> tile background (shown when no rendered image is available)
+CATEGORY_COLORS = {
+    "podcast":  "#5EB9E6",
+    "platform": "#3AA76D",
+    "b2b":      "#E0A800",
+    "summit":   "#E03131",
+    "book":     "#8A5CF6",
+    "doctrine": "#8A93A6",
+}
+
 
 def _variant_of(concept_key):
     """(canvas, layout) for a library concept key like lasso_v2_<name>.png,
@@ -125,6 +135,17 @@ def assemble_month(account_key, month):
             db.kv_get(f"approved_calendar_{account_key}_{month}", "") or "[]")
     except Exception:
         seeded = []
+
+    # Category lookup: rotation plan when flag is ON; keyed by day.
+    cat_lookup = {}
+    if config.category_rotation_enabled():
+        try:
+            from . import category_plan
+            for e in category_plan.month_plan(month)["entries"]:
+                cat_lookup[e["day"]] = e["category"]
+        except Exception:
+            pass
+
     days = []
     rollup = {"published": 0, "approved": 0, "pending": 0, "draft": 0,
               "rest": 0, "specials": 0}
@@ -134,7 +155,7 @@ def assemble_month(account_key, month):
         special = _special_for(day, rec["drafts"])
         entry = {"date": day, "weekday": schedule.weekday_abbr(day),
                  "concept": "", "caption": "", "canvas": "", "layout": "",
-                 "status": "", "special": special,
+                 "status": "", "special": special, "category": "",
                  "public_url": "", "hashtags": "", "source": ""}
         if rec["published"]:
             p = rec["published"][0]
@@ -154,11 +175,18 @@ def assemble_month(account_key, month):
                     entry["source"] = " ".join(d.get("source_fragments") or [])
                     entry["public_url"] = (d.get("creative_public_url") or
                                            _public_url_for(entry["concept"]))
+                    # derive category from draft_type first
+                    dt = (d.get("draft_type") or "").lower()
+                    if dt in ("podcast", "book", "summit", "b2b"):
+                        entry["category"] = dt
                     break
         if not entry["status"]:
             # nothing planned: an open slot on a posting day, rest otherwise.
             # NOTHING is invented; the concept stays empty.
             entry["status"] = "draft" if schedule.should_post_on(day) else "rest"
+        # Category from rotation plan overrides draft_type when rotation is ON.
+        if cat_lookup.get(day):
+            entry["category"] = cat_lookup[day]
         entry["canvas"], entry["layout"] = _variant_of(entry["concept"])
         rollup[entry["status"]] += 1
         if special:
@@ -187,14 +215,26 @@ def render_html(plan):
 
     def cell_html(d):
         color = STATUS_COLORS[d["status"]]
+        cat = d.get("category", "")
+        cat_color = CATEGORY_COLORS.get(cat, "#2A3452")
         bits = []
-        # Visual: rendered image, pending placeholder, or nothing for empty days
+        # Visual: rendered image; category tile when planned but no image yet;
+        # nothing for empty days. Category tile replaces the "image pending" stub.
         if d.get("public_url"):
             bits.append(
                 "<div style=\"height:140px;overflow:hidden;margin-bottom:6px\">"
                 f"<img src=\"{_html.escape(d['public_url'], quote=True)}\" "
                 f"alt=\"{e(d['concept'])}\" "
                 "style=\"width:100%;height:100%;object-fit:cover\"></div>")
+        elif d.get("concept") and cat:
+            bits.append(
+                f"<div style=\"background:{cat_color};height:52px;display:flex;"
+                "align-items:center;justify-content:center;margin-bottom:4px;"
+                "border-radius:4px\">"
+                f"<span style=\"color:#fff;font-weight:bold;font-size:11px;"
+                f"text-transform:uppercase\">{e(cat)}</span></div>"
+                f"<div style=\"font-size:10px;color:#8A93A6;word-break:break-all;"
+                f"margin-bottom:4px\">{e(d['concept'])}</div>")
         elif d.get("concept"):
             bits.append(
                 "<div style=\"background:#2A3452;padding:6px;margin-bottom:4px;"
@@ -214,8 +254,14 @@ def render_html(plan):
         if d.get("hashtags"):
             bits.append(f"<div style=\"font-size:10px;color:#5EB9E6;"
                         f"margin-bottom:4px\">{e(d['hashtags'])}</div>")
-        # Open slot label for unplanned posting days
+        # Open slot label for unplanned posting days; category tile when known.
         if not d.get("concept") and d["status"] == "draft":
+            if cat:
+                bits.append(
+                    f"<div style=\"background:{cat_color};padding:4px 8px;"
+                    "border-radius:4px;display:inline-block;margin-bottom:4px\">"
+                    f"<span style=\"color:#fff;font-size:11px;"
+                    f"text-transform:uppercase\">{e(cat)}</span></div>")
             bits.append("<div style=\"font-size:12px;color:#8A93A6\">open slot</div>")
         # Canvas / layout chips
         if d["canvas"]:
@@ -318,7 +364,8 @@ def render_html(plan):
         "d.canvas?d.canvas+' / '+d.layout:'';"
         "document.getElementById('modalsource').textContent=d.source||'';"
         "var sc=document.getElementById('modalstatus');"
-        "sc.textContent=d.status?d.status.toUpperCase():'';"
+        "sc.textContent=(d.status?d.status.toUpperCase():'')+"
+        "(d.category?' · '+d.category.toUpperCase():'');"
         "document.getElementById('daymodal').style.display='flex';}"
         "function closeModal(){"
         "document.getElementById('daymodal').style.display='none';}"

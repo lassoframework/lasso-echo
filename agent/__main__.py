@@ -92,6 +92,8 @@ def _status():
     print(f"  podcast        : {config.podcast_enabled()}  (env AGENT_PODCAST_ENABLED)")
     print(f"  rotation       : {config.rotation_enabled()}  (env AGENT_ROTATION_ENABLED, "
           f"window {config.ROTATION_WINDOW_DAYS}d)")
+    print(f"  category_rotation: {config.category_rotation_enabled()}  "
+          f"(env AGENT_CATEGORY_ROTATION)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
@@ -599,11 +601,10 @@ def main(argv=None):
         # Bulk-approve pending plan drafts; first post per account held for tap.
         from .plan_month import approve_cli
         approve_cli(argv[1:])
-    elif cmd == "calendar-html":
-        # The month calendar artifact: navy grid HTML from the assembled month
-        # (read only against state); --upload posts it to R2 under
-        # echo/calendars/ and prints the public URL. Buttons are previews:
-        # the tap still happens in Slack until Stage 3 wires write back.
+    elif cmd in ("calendar", "calendar-html"):
+        # Month calendar HTML from real draft store data. --out <path> writes
+        # locally; --upload posts to R2. Cells show real image, category tile,
+        # and full caption. Read only against state; buttons are display previews.
         from .calendar_artifact import cli as calendar_cli
         calendar_cli(argv[1:])
     elif cmd == "monday-preview":
