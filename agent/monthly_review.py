@@ -115,6 +115,11 @@ def run(account=None, dry=False, poster=None, now=None, base_dir=None):
     month = now.strftime("%Y-%m")
     out_dir = os.environ.get("AGENT_REPORTS_DIR", "/data/reports")
     out = {}
+    known = [a.key for a in active_accounts()]
+    if account and account not in known:
+        print(f"monthly-review: no account matches '{account}' "
+              f"(known: {', '.join(known)}). Nothing built.")
+        return out
     for acct in [a for a in active_accounts() if account in (None, a.key)]:
         snaps, posts = monthly_report.gather(acct.key, now=now)
         report = monthly_report.assemble(acct.key, snaps, posts,

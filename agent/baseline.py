@@ -143,6 +143,9 @@ def capture_baseline(http=None, accounts=None, now=None, out_dir=None):
         json.dump(summary, f, indent=2)
 
     print(f"\nPre Echo posting baseline (trailing {WINDOW_WEEKS} weeks)")
+    if not summary["accounts"]:
+        print("  capture-baseline: 0 accounts produced a baseline (none "
+              "active, or none resolved). The file below is an empty shell.")
     for key, rec in summary["accounts"].items():
         if "error" in rec:
             print(f"  {key}: SKIPPED ({rec['error']})")

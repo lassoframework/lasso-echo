@@ -62,6 +62,10 @@ def run(account_key, month, write=False):
     cal = build_calendar(account_key, month)
     print(f"seed-calendar {account_key} {month}: {len(cal['keys'])} approved "
           f"creative(s) across {len(cal['by_day'])} day(s)")
+    if not cal["keys"]:
+        print(f"seed-calendar: no approval evidence for {account_key} in {month} "
+              "— the calendar is built only from approved cards, and none exist "
+              "for this month yet.")
     for day in sorted(cal["by_day"]):
         for key in cal["by_day"][day]:
             print(f"  {day}  {key}")

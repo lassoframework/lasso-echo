@@ -269,6 +269,11 @@ def run(account=None, poster=None, now=None, base_dir=None, pdf=False):
     if not config.reporting_enabled():
         print("monthly-report: AGENT_REPORTING_ENABLED is OFF. Nothing built.")
         return None
+    known = [a.key for a in active_accounts()]
+    if account and account not in known:
+        print(f"monthly-report: no account matches '{account}' "
+              f"(known: {', '.join(known)}). Nothing built.")
+        return {}
     out = {}
     accounts = [a for a in active_accounts() if account in (None, a.key)]
     os.makedirs(_reports_dir(), exist_ok=True)

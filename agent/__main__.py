@@ -203,6 +203,9 @@ def _check_tokens():
         return
     print(f"check-tokens: {len(out['results'])} credential(s) checked "
           f"(warn at {config.token_warn_days()} days)")
+    if not out["results"]:
+        print("check-tokens: no accounts with tokens to check (no active "
+              "accounts, or none has its token env set).")
     for r in out["results"]:
         days = r["days_remaining"]
         days_str = f"{days} day(s) remaining" if days is not None else "expiry unknown"

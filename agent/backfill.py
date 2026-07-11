@@ -69,6 +69,11 @@ def backfill_insights(account_key, since, dry=False, http=None, sleeper=time.sle
     summary = {"posts": len(rows), "updated": 0, "skipped": 0}
     print(f"backfill-insights: {len(rows)} published post(s) for {account_key} "
           f"since {since}")
+    if not rows:
+        print("backfill-insights: nothing to backfill in this window (no "
+              f"published posts for {account_key} since {since}). Widen --since "
+              "or check the account has published.")
+        return summary
 
     if dry:
         for r in rows:

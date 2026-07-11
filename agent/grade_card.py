@@ -100,6 +100,11 @@ def run(account=None, now=None, base_dir=None):
     month = now.strftime("%Y-%m")
     out_dir = os.environ.get("AGENT_REPORTS_DIR", "/data/reports")
     out = {}
+    known = [a.key for a in active_accounts()]
+    if account and account not in known:
+        print(f"grade-card: no account matches '{account}' "
+              f"(known: {', '.join(known)}). Nothing rendered.")
+        return out
     for acct in [a for a in active_accounts() if account in (None, a.key)]:
         report_for_grade, planned, pillar_counts, _r = _grade_inputs(acct.key, now=now)
         grade = reporting.compute_grade(report_for_grade, planned_posts=planned,

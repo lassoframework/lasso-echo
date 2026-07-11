@@ -138,6 +138,11 @@ def explain(account_key, library_path=None):
     days = runway_days(account_key, library_path)
     lines = [f"runway explain for {account_key}:",
              f"  eligible: {len(eligible)} creative(s)"]
+    if not eligible:
+        lines.append(f"  WARNING: 0 days of approved content left for "
+                     f"{account_key}. No eligible creatives (all served inside "
+                     "the rotation window, or none approved). This account "
+                     "will run dry.")
     # Per-set breakdown: house (brand+service), b2b, platform, platform_ads, summit, library.
     _SET_MAP = {"brand": "house", "service": "house",
                 "b2b": "b2b", "platform": "platform", "platform_ads": "platform_ads",
