@@ -366,8 +366,9 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 from . import db as _db
                 _db.audit("account_error", account.key,
                           f"{type(e).__name__}: {e}", account.key, day_key)
-            except Exception:
-                pass
+            except Exception as audit_err:
+                print(f"[runner] audit write failed (audit table broken?): "
+                      f"{type(audit_err).__name__}")
             continue
     # Creative runway: dormant unless AGENT_RUNWAY_ENABLED. Armed, one line per
     # account with the day's cards (days of approved content left + projected

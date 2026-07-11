@@ -120,8 +120,11 @@ def _latest_episode_from_db() -> dict:
                 "published": row["published"] or "",
                 "guid": row["guid"] or "",
             }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[inbox] episode table unreadable: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"episode inbox: podcast_episodes table unreadable "
+                         f"({type(e).__name__}); plans will show Episode ? "
+                         "until this is fixed")
     return {}
 
 

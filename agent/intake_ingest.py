@@ -199,9 +199,13 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 r2.put_bytes(f"intake/{client}/deadletter/{os.path.basename(key)}",
                              r2.get_bytes(key))
                 r2.delete(key)
-                manifest["processed"].append(key)
-            except Exception:
-                pass  # even dead-lettering must never crash the loop
+            except Exception as dl_err:
+                # even dead-lettering must never crash the loop, but a failed
+                # dead-letter is LOUD, and the key is still marked processed
+                # below so the same bad file is never re-picked forever.
+                print(f"[intake] dead-letter itself failed for {client}/"
+                      f"{os.path.basename(key)}: {type(dl_err).__name__}")
+            manifest["processed"].append(key)
             ops_alerts.alert(f"intake ingest dead-lettered {client}/{os.path.basename(key)}: "
                              f"{type(e).__name__}: {e}")
 
