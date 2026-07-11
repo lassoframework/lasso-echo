@@ -52,12 +52,16 @@ def _creative_canvas(c):
     return rotation.sidecar_canvas(c.path)
 
 
-def plan_month(account_key, month, library_path=None, write=False, from_day=None):
+def plan_month(account_key, month, library_path=None, write=False, from_day=None,
+               treat_as_open=None):
     """
     Fill open posting days for one account from the eligible creative pool.
     Returns {"planned": [(day_key, creative_key)], "skipped": [day_key], "wrote": int}
     or None when the flag is OFF. from_day (YYYY-MM-DD, optional) plans only
     days >= it, so a mid-month replan never touches the days before it.
+    treat_as_open (set of day_keys, optional): days planned as if their existing
+    pending drafts were gone — the replan PREVIEW uses this so it can show what
+    a replan would do without deleting anything.
     """
     if not config.plan_month_enabled():
         return None
@@ -78,6 +82,8 @@ def plan_month(account_key, month, library_path=None, write=False, from_day=None
                 "substr(day_key, 1, 7)=? AND status IN ('approved', 'pending')",
                 (account_key, month)).fetchall():
             existing.add(r["day_key"])
+    if treat_as_open:
+        existing -= set(treat_as_open)
 
     open_days = [
         f"{month}-{n:02d}"
@@ -239,22 +245,38 @@ def replan_month(account_key, month, from_day=None, write=False):
     or None when the flag is OFF.
     action: "replanned" | "kept-approved" | "open" (no eligible content found).
     category: the scheduled bucket when AGENT_CATEGORY_ROTATION is on, else "".
+
+    Without write this is a PREVIEW: nothing is deleted and nothing is written.
+    Only --write deletes the pending drafts in range and rebuilds those days.
     """
     if not config.plan_month_enabled():
         return None
 
     from_day_eff = from_day or f"{month}-01"
 
-    # Delete pending drafts in range — approved and published are never touched.
+    # The pending days in range are what a replan rebuilds.
     with db.connect() as conn:
-        conn.execute(
-            "DELETE FROM drafts WHERE account_key=? AND "
+        pend_rows = conn.execute(
+            "SELECT DISTINCT day_key FROM drafts WHERE account_key=? AND "
             "substr(day_key, 1, 7)=? AND status='pending' AND day_key >= ?",
-            (account_key, month, from_day_eff))
-        conn.commit()
+            (account_key, month, from_day_eff)).fetchall()
+    pending_days = {r["day_key"] for r in pend_rows}
 
-    # Replan: plan_month now sees the deleted days as open.
-    result = plan_month(account_key, month, write=write, from_day=from_day_eff)
+    if write:
+        # Delete pending drafts in range — approved and published are never
+        # touched. plan_month then sees the deleted days as open.
+        with db.connect() as conn:
+            conn.execute(
+                "DELETE FROM drafts WHERE account_key=? AND "
+                "substr(day_key, 1, 7)=? AND status='pending' AND day_key >= ?",
+                (account_key, month, from_day_eff))
+            conn.commit()
+        result = plan_month(account_key, month, write=True, from_day=from_day_eff)
+    else:
+        # Preview: the pending days are shown as they would look after the
+        # delete, but the store is not touched at all.
+        result = plan_month(account_key, month, write=False, from_day=from_day_eff,
+                            treat_as_open=pending_days)
     if result is None:
         return None
 
@@ -288,6 +310,8 @@ def replan_month(account_key, month, from_day=None, write=False):
     return {"days": days_out, "wrote": result["wrote"],
             "replanned_count": len(result["planned"]),
             "kept_approved_count": len(kept_approved),
+            "deleted_pending": len(pending_days) if write else 0,
+            "preview": not write,
             "planned": result["planned"], "skipped": result["skipped"]}
 
 
@@ -336,8 +360,11 @@ def plan_cli(args):
         if out is None:
             print("plan-month: OFF (set AGENT_PLAN_MONTH_ENABLED=true). Nothing done.")
             return
+        mode = ("PREVIEW (nothing deleted, nothing written — add --write to apply)"
+                if out.get("preview") else
+                f"{out['deleted_pending']} pending deleted, {out['wrote']} written")
         print(f"plan-month --replan: {out['replanned_count']} replanned, "
-              f"{out['kept_approved_count']} kept-approved, {out['wrote']} written")
+              f"{out['kept_approved_count']} kept-approved — {mode}")
         for d in out["days"]:
             cat = f"  {d['category']}" if d["category"] else ""
             print(f"  {d['date']}  {d['action']}{cat}")

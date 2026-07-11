@@ -64,9 +64,37 @@ def test_approved_day_survives_replan(monkeypatch, tmp_path):
         f"approved day should be kept-approved; got {actions.get('2026-08-04')!r}")
 
 
-def test_pending_day_is_replaced(monkeypatch, tmp_path):
-    """A pending draft for a future day must be deleted and the day marked
-    replanned (or open if no eligible content remains)."""
+def test_preview_replan_deletes_nothing(monkeypatch, tmp_path):
+    """Without --write a replan is a PREVIEW: the pending draft must survive,
+    but the day must still show as replanned in the report. (The delete used
+    to run unconditionally — a destructive dry run.)"""
+    from agent.plan_month import replan_month
+    db_path, _ = _setup(monkeypatch, tmp_path)
+
+    out = replan_month(ACCOUNT, MONTH, from_day="2026-08-04", write=False)
+    assert out is not None
+    assert out["preview"] is True
+    assert out["deleted_pending"] == 0
+    assert out["wrote"] == 0
+
+    # The old pending draft is still there — preview touched nothing.
+    with _db.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM drafts WHERE draft_id=?",
+            ("pending_2026-08-05",)).fetchone()
+    assert row is not None and row["status"] == "pending", (
+        "preview replan must never delete pending drafts")
+
+    # The report still shows what WOULD happen to that day.
+    actions = {d["date"]: d["action"] for d in out["days"]}
+    assert actions.get("2026-08-05") in ("replanned", "open"), (
+        f"2026-08-05 should preview as replanned or open; "
+        f"got {actions.get('2026-08-05')!r}")
+
+
+def test_write_replan_deletes_pending_and_rebuilds(monkeypatch, tmp_path):
+    """With --write the pending draft in range is deleted and the day is
+    rebuilt (or left open when no eligible content remains)."""
     from agent.plan_month import replan_month
     db_path, _ = _setup(monkeypatch, tmp_path)
 
@@ -77,15 +105,17 @@ def test_pending_day_is_replaced(monkeypatch, tmp_path):
             ("pending_2026-08-05",)).fetchone()
     assert row is not None and row["status"] == "pending"
 
-    out = replan_month(ACCOUNT, MONTH, from_day="2026-08-04", write=False)
+    out = replan_month(ACCOUNT, MONTH, from_day="2026-08-04", write=True)
     assert out is not None
+    assert out["preview"] is False
+    assert out["deleted_pending"] == 1
 
     # The old pending draft should be gone
     with _db.connect(db_path) as conn:
         row = conn.execute(
             "SELECT status FROM drafts WHERE draft_id=?",
             ("pending_2026-08-05",)).fetchone()
-    assert row is None, "old pending draft should have been deleted by --replan"
+    assert row is None, "old pending draft should have been deleted by --replan --write"
 
     # 2026-08-05 should appear as replanned or open (never kept-approved)
     actions = {d["date"]: d["action"] for d in out["days"]}
