@@ -187,6 +187,7 @@ def build_card_draft(account, day_key, nano_client=None, s3_client=None):
     # SAME house style daily studio builder, no style overrides: default
     # palette, default archetype rotation, the hook as the one on-image line.
     art = creative_studio.generate(hook, [support], client=nano_client,
+                                   account_key=account.key,
                                    archetype=creative_studio.archetype_for_day(day_key))
     if art is None:
         ops_alerts.alert(
@@ -245,6 +246,7 @@ def build_episode_card(account, episode_n, day_key, nano_client=None, s3_client=
             and podcast_transcripts.contains_verbatim(n, support)):
         return None
     art = creative_studio.generate(hook, [support], client=nano_client,
+                                   account_key=account.key,
                                    archetype=creative_studio.archetype_for_day(day_key))
     if art is None:
         ops_alerts.alert(

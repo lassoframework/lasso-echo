@@ -291,7 +291,7 @@ def _finish_draft(account, day_key, headline, caption, hashtags, existing_card,
     if creative_path is None:
         art = creative_studio.generate(
             headline, [card_note or "The Full Gym book campaign card."],
-            client=nano_client,
+            client=nano_client, account_key=account.key,
             palette=creative_studio.BOOK_COVER_PALETTE)  # the ONE scoped exception
         if art is None:
             ops_alerts.alert(

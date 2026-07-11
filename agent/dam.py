@@ -144,18 +144,10 @@ def _default_reader():
 
 
 def _spend_allowed(day):
-    """Shares the Gemini daily cap with creative_studio.generate."""
-    if not config.spend_cap_enabled():
-        return True
-    cap = int(os.environ.get("AGENT_GEMINI_DAILY_CAP", "40"))
-    if db.counter_get("gemini_calls", day) >= cap:
-        if db.kv_get(f"spend_cap_alerted_{day}") != "1":
-            db.kv_set(f"spend_cap_alerted_{day}", "1")
-            ops_alerts.alert(f"Gemini daily cap reached ({cap} calls). Generation "
-                             "paused for today; library-only selection takes over.")
-        return False
-    db.counter_bump("gemini_calls", day)
-    return True
+    """Shares the Gemini spend gate with creative_studio (global bucket:
+    DAM autotag is maintenance work, not client-driven generation)."""
+    from .creative_studio import spend_allowed
+    return spend_allowed(account_key=None, day=day)
 
 
 def autotag(creative_path, reader=None, day=None):

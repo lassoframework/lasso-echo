@@ -117,7 +117,8 @@ def _draft_for_idea(index, idea, account, voice, nano_client, s3_client):
     headline, facts = lines[0], lines[1:]
     creative_path, creative_public_url = "", ""
     if facts:
-        art = creative_studio.generate(headline, facts, client=nano_client)
+        art = creative_studio.generate(headline, facts, client=nano_client,
+                                       account_key=acct_key)
         if not art:
             print(f"[doc intake] {acct_key}: idea {index + 1} image generation produced "
                   "nothing; shipping a text only draft for approval.")

@@ -63,6 +63,7 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     # The daily card draws a layout archetype on a deterministic rotation, so the
     # generated run varies in composition day to day (the brand never varies).
     art = creative_studio.generate(headline, facts, client=nano_client,
+                                   account_key=account.key,
                                    archetype=creative_studio.archetype_for_day(day_key))
     if not art:
         # Acceptable library fallback for now, but make it VISIBLE: run-daily output

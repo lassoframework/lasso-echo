@@ -100,7 +100,8 @@ def build_summit_draft(account, day_key, *, voice=None, voice_path=None,
     week = date.fromisoformat(day_key).isocalendar()[1]
     fact = facts[week % len(facts)]  # facts rotate on the same clock
 
-    art = creative_studio.generate(angle, facts, client=nano_client)
+    art = creative_studio.generate(angle, facts, client=nano_client,
+                                   account_key=account.key)
     if not art:
         print(f"[summit] {account.key}: card generation unavailable; "
               "normal draft path takes the day.")

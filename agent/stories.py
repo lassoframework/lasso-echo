@@ -85,6 +85,7 @@ def build_story_draft(account, day_key, *, feed_draft=None,
         if facts:
             art = creative_studio.generate(
                 headline, facts, client=nano_client,
+                account_key=account.key,
                 out_path=_story_out_path(headline),
                 aspect=config.STORY_ASPECT, pixels=config.STORY_PIXELS,
                 surface="Story",

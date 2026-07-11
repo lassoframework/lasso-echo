@@ -546,9 +546,36 @@ def _default_client():
     return _GeminiImageClient(key)
 
 
+def spend_allowed(account_key=None, day=None):
+    """One shared Gemini spend gate. True bumps the counter and allows the
+    call; False means the day's cap for this bucket is spent (one ops alert
+    per bucket per day). Buckets: per account when account_key is given —
+    one client's volume never starves another — else the global bucket for
+    account-less work (DAM autotag, library regen). Flag OFF allows all."""
+    if not config.spend_cap_enabled():
+        return True
+    from datetime import date as _date
+    from . import db as _db, ops_alerts as _ops
+    day = day or _date.today().isoformat()
+    bucket = f"gemini_calls:{account_key}" if account_key else "gemini_calls"
+    cap = int(os.environ.get("AGENT_GEMINI_DAILY_CAP", "40"))
+    if _db.counter_get(bucket, day) >= cap:
+        alert_key = (f"spend_cap_alerted_{account_key}_{day}" if account_key
+                     else f"spend_cap_alerted_{day}")
+        if _db.kv_get(alert_key) != "1":
+            _db.kv_set(alert_key, "1")
+            who = f"account {account_key}" if account_key else "the shared pool"
+            _ops.alert(f"Gemini daily cap reached for {who} ({cap} calls). "
+                       "Generation paused for today; library-only selection "
+                       "takes over.")
+        return False
+    _db.counter_bump(bucket, day)
+    return True
+
+
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
-             palette=None, canvas=None, layout=None):
+             palette=None, canvas=None, layout=None, account_key=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -568,18 +595,11 @@ def generate(headline, facts, client=None, out_path=None,
     # Gemini spend cap (AGENT_SPEND_CAP_ENABLED, default OFF): at the daily cap
     # generation stops for the day (returning None makes every caller fall back
     # to library-only selection) with ONE ops alert. Counter resets by date key.
-    if config.spend_cap_enabled():
-        from datetime import date as _date
-        from . import db as _db, ops_alerts as _ops
-        day = _date.today().isoformat()
-        cap = int(os.environ.get("AGENT_GEMINI_DAILY_CAP", "40"))
-        if _db.counter_get("gemini_calls", day) >= cap:
-            if _db.kv_get(f"spend_cap_alerted_{day}") != "1":
-                _db.kv_set(f"spend_cap_alerted_{day}", "1")
-                _ops.alert(f"Gemini daily cap reached ({cap} calls). Generation "
-                           "paused for today; library-only selection takes over.")
-            return None
-        _db.counter_bump("gemini_calls", day)
+    # The cap is PER ACCOUNT when the caller passes account_key, so one client's
+    # volume can never starve another client's creative; account-less calls
+    # (DAM autotag, library regen) share the global bucket.
+    if not spend_allowed(account_key=account_key):
+        return None
 
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                           surface=surface, archetype=archetype, palette=palette,

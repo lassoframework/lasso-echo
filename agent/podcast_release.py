@@ -255,7 +255,8 @@ def _build_release_draft(account, day_key, ep, nano_client, s3_client):
     # The SAME house builder; the template block rides as the scoped palette
     # exception (like the book cover), never as a style override elsewhere.
     art = creative_studio.generate(spec["headline"], spec["concept"],
-                                   client=nano_client, palette=spec["palette"])
+                                   client=nano_client, palette=spec["palette"],
+                                   account_key=account.key)
     if art is None:
         return None  # studio unavailable/dark: the caller's normal path runs
     hosted = media_host.host_media(art["path"], account.key, client=s3_client)
