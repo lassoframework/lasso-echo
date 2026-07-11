@@ -396,7 +396,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # An ask error never takes the draft run down.
     if config.review_cycle_enabled():
         from .day30 import maybe_refresh_ask
-        for account in accounts:
+        for account in (accounts or active_accounts()):
             try:
                 maybe_refresh_ask(account.key, poster=poster)
             except Exception as e:

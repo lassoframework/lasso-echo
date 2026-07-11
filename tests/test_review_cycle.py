@@ -135,6 +135,59 @@ def test_refresh_ask_fires_again_next_cycle(monkeypatch):
         _kv_delete(f"refresh_ask_{acct}_{day30.cycle_index(now=t)}")
 
 
+def test_refresh_ask_survives_accounts_none(monkeypatch, tmp_path):
+    """Production calls run_daily(store=store) with accounts=None (the
+    scheduler path). The review-cycle loop must fall back to active_accounts()
+    like the daily loop does — `for account in None` was a TypeError that
+    crashed the run tail for every account whenever the flag was armed."""
+    from agent.accounts import Account, Platform
+    from agent.runner import run_daily
+    from agent.store import PendingStore
+
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_REVIEW_CYCLE_ENABLED", "true")
+
+    voice = tmp_path / "voice.md"
+    voice.write_text("# Voice\nWe help gym owners grow.\n## CTAs\n- Save this."
+                     "\n## Hashtags\n#LASSO\n", encoding="utf-8")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "asset.png").write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+    (lib / "asset.txt").write_text("An approved note.", encoding="utf-8")
+
+    acct = Account(key="lasso_ig", display_name="LASSO IG",
+                   platform=Platform.INSTAGRAM,
+                   token_env="DUMMY_TOK", target_id_env="DUMMY_TGT")
+    monkeypatch.setattr("agent.runner.active_accounts", lambda: [acct])
+
+    asked = []
+    monkeypatch.setattr("agent.day30.maybe_refresh_ask",
+                        lambda key, poster=None, **kw: asked.append(key))
+
+    class _Poster:
+        def post_approval_card(self, draft):
+            return {"channel": "C1", "ts": "ts1"}
+
+        def post_notice(self, text):
+            return {"ok": True}
+
+        def mark_superseded(self, draft):
+            pass
+
+        def mark_expired(self, draft):
+            pass
+
+    out = run_daily(poster=_Poster(), voice_path=str(voice),
+                    library_path=str(lib),
+                    scheduled_for="2026-07-08T14:00:00+00:00",
+                    accounts=None,
+                    store=PendingStore(path=db_path))
+    assert out["status"] == "drafted"
+    assert asked == ["lasso_ig"]
+
+
 def test_refresh_ask_stamp_after_post(monkeypatch):
     """Silent-miss law: a failed alert post leaves the cycle un-stamped so the
     next pass retries the ask."""
