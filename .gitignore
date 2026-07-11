@@ -4,6 +4,12 @@ __pycache__/
 .venv/
 post_log.jsonl
 .pytest_cache/
+# runtime SQLite store (drafts are client data — never committed)
+*.db
+*.db-wal
+*.db-shm
+pending_drafts.json
+pending_drafts.json.migrated.bak
 content_library/
 !content_library/
 content_library/**
