@@ -123,10 +123,14 @@ def receive(payload, base_dir=None):
             conn.commit()
             out["ids"].append(cur.lastrowid)
         out["held" if held else "staged"] += 1
-    if out["staged"] or out["held"] or out["duplicates"]:
-        db.audit("media_inbox", tenant_key or "(held)",
-                 f"{provider}: {out['staged']} staged, {out['held']} held, "
-                 f"{out['duplicates']} duplicate(s) from {_mask(sender)}")
+    # Audit EVERY webhook fire, including the all-zero case — an operator
+    # debugging "my photo never showed up" needs evidence the hook fired at
+    # all (empty payload, zero media, or every item blank).
+    detail = (f"{provider}: {out['staged']} staged, {out['held']} held, "
+              f"{out['duplicates']} duplicate(s) from {_mask(sender)}")
+    if not (out["staged"] or out["held"] or out["duplicates"]):
+        detail += " (empty or all-blank payload; nothing written)"
+    db.audit("media_inbox", tenant_key or "(held)", detail)
     return out
 
 

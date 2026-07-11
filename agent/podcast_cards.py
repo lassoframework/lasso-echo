@@ -310,8 +310,14 @@ def cards_cli(episode, count):
         if enqueue(episode, hook, support) is not None:
             queued += 1
     cite = podcast_transcripts.citation_id(episode)
-    print(f"podcast-cards: {queued} card(s) queued for episode {episode} "
-          f"(citation {cite}), {len(picks) - queued} duplicate(s) skipped.")
+    if queued == 0:
+        cause = ("every candidate was already enqueued for this episode"
+                 if picks else "no clean hook and support pairs were found")
+        print(f"podcast-cards: 0 queued for episode {episode} — {cause} "
+              f"({len(picks) - queued} duplicate(s)).")
+    else:
+        print(f"podcast-cards: {queued} card(s) queued for episode {episode} "
+              f"(citation {cite}), {len(picks) - queued} duplicate(s) skipped.")
     for hook, _support in picks:
         print(f"  hook: {hook}")
     print("  cards spread max one per day, behind book priority, every one "

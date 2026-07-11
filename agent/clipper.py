@@ -411,8 +411,13 @@ def print_plan(selection):
         for m in dropped:
             print(f"    [{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] score {m.score}: "
                   f"{m.reason}")
-    print(f"  summary: {len(accepted)} pick(s) held for confirmation, "
-          f"{len(dropped)} dropped.")
+    if not accepted:
+        print(f"  summary: 0 of {len(accepted) + len(dropped)} candidate "
+              "moment(s) passed the score, duration, and fabrication gates — "
+              "nothing to render. See the dropped reasons above.")
+    else:
+        print(f"  summary: {len(accepted)} pick(s) held for confirmation, "
+              f"{len(dropped)} dropped.")
 
 
 # ---- Part 9: save each finished Reel as a HELD draft --------------------------------
