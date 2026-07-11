@@ -358,9 +358,15 @@ def run_listener():
     @app.view("edit_submit")
     def on_edit_submit(ack, body, view, client):
         ack()
-        draft_id = view["private_metadata"]
-        note = view["state"]["values"]["note"]["v"]["value"]
+        # A malformed or replayed modal payload must not 500 the socket
+        # handler: missing blocks read as empty and the submit no-ops below.
+        draft_id = (view or {}).get("private_metadata", "")
+        note = (((view or {}).get("state", {}).get("values", {})
+                 .get("note", {}).get("v", {}) or {}).get("value") or "")
         actor = body.get("user", {}).get("id", "")
+        if not draft_id or not note:
+            print("[listener] edit_submit payload missing draft_id or note; ignored")
+            return
         old = store.get(draft_id)
         if not old:
             return

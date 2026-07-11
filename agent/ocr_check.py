@@ -31,7 +31,7 @@ def _default_reader():
     if not config.creative_studio_enabled():
         return None
     import os
-    key = os.environ.get("AGENT_NANO_API_KEY")
+    key = os.environ.get(config.NANO_API_KEY_ENV)
     if not key:
         return None
     from google import genai  # lazy

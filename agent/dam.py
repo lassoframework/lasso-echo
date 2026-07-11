@@ -126,7 +126,7 @@ def _default_reader():
     """Gemini vision (lazy). None when the studio is unarmed or keyless."""
     if not config.creative_studio_enabled():
         return None
-    key = os.environ.get("AGENT_NANO_API_KEY")
+    key = os.environ.get(config.NANO_API_KEY_ENV)
     if not key:
         return None
     from google import genai  # lazy
