@@ -6,3 +6,6 @@ pypdf>=4.0  # Document intake PDF text extraction; imported lazily in doc_intake
 Pillow>=10.0  # Intake ingest image convert/orientation/phash; imported lazily in intake_ingest.py
 pillow-heif>=0.16  # HEIC to JPG for intake ingest; imported lazily in intake_ingest.py
 reportlab>=4.0  # White label PDF reports; imported lazily in pdf_report.py
+cryptography>=42.0  # GHL webhook Ed25519 signature verify; imported lazily in ghl_intake.py
+faster-whisper>=1.0  # Clipper transcription; imported lazily in clipper.py
+anthropic>=0.40  # Clipper moment scoring; imported lazily in clipper.py
