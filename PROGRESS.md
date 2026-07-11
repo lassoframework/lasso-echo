@@ -6,12 +6,81 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-10 (Episode inbox watcher + Monday nudge shipped dark: Parts 1-5
-complete. Polling watcher in existing listener, exactly-once claim markers, size-stability
-guard, Phase 1 clip selection on arrival, ranked plan to Slack, RSS episode matching,
-evergreen guard, Monday 9am nudge (idempotent, window-gated). `agent inbox-status` CLI.
-39 tests green. Master flag AGENT_EPISODE_INBOX_ENABLED OFF. Suite 1000 green, 7
-pre-existing reportlab. Prev: 2026-07-09 Native clipper end to end shipped dark.)
+Last updated: 2026-07-11 (FULL HARDENING PASS pre 10-client launch: 16 fix commits,
+suite 1091 green with ZERO reds — the famous 7 reportlab reds were the suite being
+run with the wrong interpreter, never code. See the hardening section below for the
+fixes, the honest readiness grade, and the ranked remaining gaps. Prev: 2026-07-10
+episode inbox watcher + Monday nudge shipped dark.)
+
+---
+
+## Hardening pass — 2026-07-11 (pre 10-client launch)
+
+Suite: 1091 passed, 0 failed, run with `.venv/bin/python -m pytest`. The
+7 "reportlab reds" were an interpreter problem (system python has no
+reportlab); those suites now SKIP with the reason named when run wrong.
+
+### Fixes shipped (each its own commit, all pushed)
+- Store read funnel survives NULL/malformed data blobs and unknown statuses:
+  one legacy row can no longer kill the daily run or the Approve tap.
+- Review-cycle loop no longer crashes the run tail when the scheduler calls
+  run_daily with accounts=None (guaranteed TypeError whenever armed, fixed).
+- Slack transport errors degrade to a failed post instead of aborting the
+  whole run (the pre-loop voice notice was a single point of fleet failure).
+- plan-month --replan without --write is a TRUE preview: it deleted pending
+  drafts even in preview mode (destructive dry run, fixed + tested).
+- Per-client approval isolation: cards route to each account's own Slack
+  channel; each account's own approvers can act (global approver still can).
+- Gemini spend cap is per account: one client's volume can no longer starve
+  every other client's creative for the day.
+- Book queue items are consumed only after the draft is confirmed built; a
+  studio/hosting outage no longer silently eats a verbatim queue post.
+- requirements.txt now declares cryptography, faster-whisper, anthropic
+  (GHL webhook verify and clipper crashed on a clean deploy when armed).
+- status shows all 43 capability flags (11 were invisible) + source paths;
+  a guard test derives the flag list from config.py so it can never rot.
+- Honest CLI everywhere: run-daily states its reason and splits
+  pending/blocked; `help` lists all ~40 commands; unknown commands print
+  usage; every bare-zero command states WHY (backfill, seed-calendar,
+  check-tokens, runway, capture-baseline, report account-filter misses,
+  podcast-cards, clip plan); scheduler announces every lane armed/dormant.
+- Silent swallows are loud: failed dead-letter no longer reprocesses the
+  same bad file forever; unreadable episode table alerts; audit-write
+  failures print.
+- Runtime SQLite store gitignored (client draft data was one git add -A
+  from being committed).
+- 12-account launch simulation lives in the suite: 3 corrupt-row gyms,
+  1 token-less, 1 empty library — run completes, healthy accounts draft,
+  the empty library cards BLOCKED with the reason, nothing publishes,
+  a crashing account alerts and skips while the rest continue.
+
+### Multi-client readiness grade: C+ (honest)
+- Safety and isolation: B+. Approval gates, per-account trust ladder,
+  token isolation, draft-ID isolation, per-client channels/approvers/spend
+  all verified or fixed this pass. Nothing publishes without a tap.
+- Client content depth: D. Every campaign and brain feature is LASSO-only
+  by design; a client gym only ever gets the plain library-pick draft. A
+  gym with a thin library gets a BLOCKED card every day. Launchable ONLY
+  if each gym ships day 1 with a stocked content library.
+- Operations: C. Onboarding is manual (paste the Account entry, hand-set
+  tokens/channel/approvers) with no preflight validator; intake-web has no
+  deploy target; fan-out is serial with no Slack 429 backoff.
+
+### Ranked remaining gaps for the 10-client launch
+1. (L) Client content engine: per-account source docs + brain plumbing, or
+   an explicit "library-only product" decision + stocked libraries per gym.
+2. (S-M) Deploy intake-web as its own Railway web service (client photo
+   uploads are dead until it exists; the command and code are ready).
+3. (S) Onboarding preflight: refuse/warn when an active account is missing
+   slack_channel, approvers, or tokens before it starts drafting.
+4. (M) Fan-out hardening at 12+ accounts: Slack 429 backoff/retry; consider
+   chunking. (Per-client channels shipped this pass reduce the burst risk.)
+5. (S) Document the ~40 undocumented env vars incl. META_APP_ID/SECRET;
+   single-owner constants for GEMINI_DAILY_CAP, REPORTS_DIR, BASELINE_DIR.
+
+### Podcast / clipper status
+Phase 1 selection only. Ranked clip plans post to Slack; nothing renders.
+AGENT_CLIPPER_ENABLED off. Blocked on the first Riverside export drop.
 
 ---
 

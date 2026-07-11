@@ -197,6 +197,9 @@
         ["Client approval flow via portal","todo"],
         ["Prove the voice holds for a non-Blake client","todo"],
         ["Prove the 30-day refresh lands","todo"],
+        ["HARDENING PASS 2026-07-11: store reads survive any legacy row (NULL/garbage/unknown status quarantined, never fatal); review-cycle accounts=None crash fixed; Slack transport errors degrade instead of killing the run; replan preview no longer deletes (true dry run)","done"],
+        ["HARDENING PASS 2026-07-11: per-client isolation — cards route to each account's own channel, per-account approvers honored, Gemini spend cap per account, book queue survives outages; 12-account launch simulation in the suite (corrupt rows + dead token + empty library, run completes, nothing publishes)","done"],
+        ["HARDENING PASS 2026-07-11: honest CLI — status shows all 43 flags (guard-tested), help lists every command, run-daily and every bare-zero command state WHY, scheduler announces armed/dormant lanes; requirements gaps (cryptography/faster-whisper/anthropic) declared; suite 1091 green ZERO reds (the 7 reportlab reds were the wrong interpreter, now skip with reason)","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -237,8 +240,13 @@
   ]};
 
   // Open risks / watch items
-  const RISKS={ name:"Open risks & watch items", meta:"Track these, do not let them drift",
+  const RISKS={ name:"Open risks & watch items", meta:"Track these, do not let them drift. 10-CLIENT READINESS GRADE (2026-07-11 hardening pass): C+ — safety and isolation B+ (gates, trust ladder, per-client channel/approver/spend all verified or fixed); client content depth D (clients get library-pick drafts only; a thin library means a BLOCKED card every day — stock every gym's library before day 1); operations C (manual onboarding, no preflight, intake-web not deployed, serial fan-out).",
     items:[
+      ["LAUNCH GAP 1 — client content engine (L)","campaigns and the brain are LASSO-only by design; client gyms draft only from their own library. Decide: per-account source docs + brain plumbing, or explicitly a library-only product with stocked libraries per gym."],
+      ["LAUNCH GAP 2 — intake-web has no deploy target (S-M)","the upload page code and command exist but no Railway web service starts them; client photo uploads are dead until it is deployed."],
+      ["LAUNCH GAP 3 — onboarding preflight (S)","nothing refuses an active account missing slack_channel, approvers, or tokens; an empty channel silently routes that client's cards to LASSO's internal channel."],
+      ["LAUNCH GAP 4 — fan-out at 12+ accounts (M)","serial run, no Slack 429 backoff/retry. Per-client channels (shipped) reduce burst risk; add backoff before scale."],
+      ["LAUNCH GAP 5 — undocumented env surface (S)","~40 env vars incl. META_APP_ID/SECRET documented nowhere; GEMINI_DAILY_CAP, REPORTS_DIR, BASELINE_DIR have copy-pasted defaults with no single owner."],
       ["Repo divergence","deployed repo has commits from other agents (ruvnet, Manus); the reference sandbox may differ. Code ships as a behavior-described Claude Code prompt, never a wholesale push."],
       ["Rotate secrets by hand","Meta app secret + long-lived token, Slack tokens, and the client Page tokens that were exposed. Explorer tokens are short-lived; rotate on principle."],
       ["Verify one caption line","confirm \"That difference is your revenue\" was Blake's own note edit (fabrication gate intact), not a generator writing text."],
@@ -438,7 +446,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-02 evening (STAGE 2 BUILDOUT: multi-client foundation, texted-link intake web + ingest, draft-bible CLI, Social Grade v1, review kit + runbook; suite 226 green; new flags AGENT_INTAKE_ENABLED / AGENT_GRADE_ENABLED / AGENT_SOCIAL_PROOF_ENABLED all OFF; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-11 (FULL HARDENING PASS pre 10-client launch: 16 fix commits, suite 1091 green ZERO reds, 12-account launch simulation in the suite, readiness grade C+ with ranked gaps in the risks card; podcast/clipper = Phase 1 selection only, renders nothing, AGENT_CLIPPER_ENABLED off, blocked on first Riverside export drop; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
