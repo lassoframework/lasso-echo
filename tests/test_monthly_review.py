@@ -13,6 +13,14 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import pytest
+
+pytest.importorskip(
+    "reportlab",
+    reason="reportlab not installed — run tests with .venv/bin/python "
+           "(requirements.txt declares it); a missing dep must read as "
+           "SKIPPED with this reason, never as red test debt")
+
 from agent import config, db, monthly_review, pdf_report  # noqa: E402
 
 NOW = datetime(2026, 7, 30, tzinfo=timezone.utc)

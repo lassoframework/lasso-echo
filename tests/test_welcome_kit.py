@@ -10,6 +10,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import pytest
+
+pytest.importorskip(
+    "reportlab",
+    reason="reportlab not installed — run tests with .venv/bin/python "
+           "(requirements.txt declares it); a missing dep must read as "
+           "SKIPPED with this reason, never as red test debt")
+
 from agent import pdf_report, welcome_kit  # noqa: E402
 
 
