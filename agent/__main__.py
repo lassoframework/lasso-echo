@@ -1,12 +1,10 @@
 """
 CLI entrypoint.
 
+  python -m agent help                  # the FULL command list (all ~40 commands, grouped)
   python -m agent run-daily             # draft one post per account, post cards to Slack
   python -m agent dry-run               # run the whole Stage 1 loop OFFLINE, no tokens
-  python -m agent intake-doc <path>     # turn a client PDF into draft posts (held for approval)
-  python -m agent check-tokens          # manual token watchdog run (needs the flag armed)
-  python -m agent capture-baseline      # MANUAL, read-only: pre-Echo posting baseline to /data
-  python -m agent status                # show flag + gate state
+  python -m agent status                # show every flag, gate, source path, and the schedule
 
 Approval actions are handled by your Slack listener calling
 agent.approvals.handle_action(...). A minimal manual hook is included for
@@ -219,12 +217,98 @@ def _capture_baseline():
     capture_baseline()
 
 
+_COMMANDS = {
+    "daily loop": [
+        ("run-daily", "draft one post per account, card each for approval"),
+        ("listen", "start the Slack listener + scheduler (the deployed worker)"),
+        ("dry-run", "the whole Stage 1 loop OFFLINE, no tokens"),
+        ("status", "flag + gate + schedule state"),
+        ("help", "this list"),
+    ],
+    "planning & calendar": [
+        ("plan-month", "fill open days for a month (--replan previews/rebuilds)"),
+        ("approve-month", "approve a planned month through a date"),
+        ("calendar / calendar-html", "client-facing month calendar HTML"),
+        ("seed-calendar", "seed a month from approval evidence"),
+        ("monday-preview", "the week-ahead preview card"),
+        ("runway", "days of approved content left per account"),
+    ],
+    "onboarding & intake": [
+        ("onboard-client / add-client", "scaffold a new client account"),
+        ("welcome-kit", "client welcome kit PDF"),
+        ("draft-bible", "draft a brand bible from an intake doc"),
+        ("intake-doc", "turn a client PDF into held draft posts"),
+        ("intake-web", "the upload web surface (own service)"),
+        ("intake-create", "create drafts from an intake payload"),
+    ],
+    "content & library": [
+        ("regen-library", "regenerate the creative library"),
+        ("dam-scan", "scan/tag the library"),
+        ("contact-sheet", "creative contact sheet"),
+        ("backfill-insights", "pull insights for published posts"),
+    ],
+    "podcast & opus": [
+        ("podcast-draft / podcast-status / podcast-transcript / podcast-cards "
+         "/ podcast-learn", "podcast pipeline"),
+        ("pull-opus / opus-pull / opus-check / opus-doctor / opus-organize",
+         "Opus clip factory"),
+        ("clip-episode", "score one episode's clip moments"),
+        ("inbox-status", "episode inbox state"),
+    ],
+    "reporting": [
+        ("report", "one account report"),
+        ("monthly-report / monthly-review / grade-card", "month-end artifacts"),
+        ("audit / fleet-status", "cross-account state"),
+        ("gbp-check", "Google Business Profile check"),
+    ],
+    "ops": [
+        ("check-tokens", "token watchdog run (flag must be armed)"),
+        ("capture-baseline", "pre-Echo posting baseline (read-only)"),
+        ("restore-store", "restore the draft store from a backup"),
+    ],
+}
+
+
+def _usage():
+    print("usage: python -m agent <command> [args]\n")
+    for group, cmds in _COMMANDS.items():
+        print(f"  -- {group} --")
+        for name, desc in cmds:
+            print(f"  {name:<28} {desc}")
+    print("\n  run a command with missing args to see its own usage line")
+
+
+def _print_run_daily(out):
+    """One honest line per run: the status word, the reason, and the
+    pending/blocked split — 'drafted, 0 draft(s)' with no cause was
+    indistinguishable from a clean skip day or an all-blocked run."""
+    status = (out or {}).get("status", "unknown")
+    drafts = (out or {}).get("drafts") or []
+    if status == "disabled":
+        print("run-daily: disabled (set AGENT_ENABLED=true to arm the daily "
+              "run). Nothing drafted.")
+        return
+    if status == "no_voice":
+        print("run-daily: brand voice doc missing or empty; drafted nothing "
+              "(see the Slack notice).")
+        return
+    pending = sum(1 for d in drafts
+                  if getattr(getattr(d, "status", None), "value", "") == "pending")
+    blocked = sum(1 for d in drafts
+                  if getattr(getattr(d, "status", None), "value", "") == "blocked")
+    line = (f"run-daily -> {status}, {len(drafts)} draft(s): "
+            f"{pending} pending, {blocked} blocked")
+    if not drafts:
+        line += " (skip day, every account off-cadence, or nothing eligible)"
+    print(line)
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
     if cmd == "run-daily":
         out = run_daily()
-        print(f"run-daily -> {out['status']}, {len(out['drafts'])} draft(s)")
+        _print_run_daily(out)
     elif cmd == "listen":
         from .listener import run_listener
         run_listener()
@@ -732,9 +816,11 @@ def main(argv=None):
         _capture_baseline()
     elif cmd == "status":
         _status()
+    elif cmd in ("help", "--help", "-h"):
+        _usage()
     else:
         print(f"unknown command: {cmd}")
-        _status()
+        _usage()
 
 
 if __name__ == "__main__":
