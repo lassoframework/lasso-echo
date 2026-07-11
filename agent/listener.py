@@ -103,12 +103,39 @@ def _fire_daily(store, today, run=run_daily):
     return out
 
 
+def _print_scheduled_lanes():
+    """One startup line per scheduled lane, armed or dormant. A lane whose
+    flag is off used to be INVISIBLE — it simply never fired and never said
+    so (the plan-month silence class). Now the log shows what is and is not
+    armed the moment the scheduler starts."""
+    lanes = [
+        ("intake ingest", config.intake_enabled(), "AGENT_INTAKE_ENABLED"),
+        ("opus poll", config.opus_enabled() and config.opus_poll_enabled(),
+         "AGENT_OPUS_ENABLED + AGENT_OPUS_POLL_ENABLED"),
+        ("podcast feed", config.podcast_enabled(), "AGENT_PODCAST_ENABLED"),
+        ("episode inbox", config.episode_inbox_enabled(),
+         "AGENT_EPISODE_INBOX_ENABLED"),
+        ("reporting snapshot", config.reporting_enabled(),
+         "AGENT_REPORTING_ENABLED"),
+        ("evening digest", config.digest_enabled(), "AGENT_DIGEST_ENABLED"),
+        ("weekly report", config.weekly_report_enabled(),
+         "AGENT_WEEKLY_REPORT_ENABLED"),
+        ("nightly brain", config.brain_proposals_enabled(),
+         "AGENT_BRAIN_PROPOSALS_ENABLED"),
+        ("nightly backup", config.backup_enabled(), "AGENT_BACKUP_ENABLED"),
+    ]
+    for name, armed, env in lanes:
+        state = "ARMED" if armed else f"dormant ({env} off)"
+        print(f"[scheduler] {name}: {state}")
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
     UTC hour. Simple by design. For stricter reliability, run `run-daily` as a
     Railway cron service instead and disable this with AGENT_SCHEDULER_ENABLED=false.
     """
+    _print_scheduled_lanes()
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
     opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
