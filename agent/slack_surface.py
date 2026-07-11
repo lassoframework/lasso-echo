@@ -53,13 +53,19 @@ class SlackPoster:
         payload = {"channel": channel or self._channel, "ts": ts, "text": text}
         if blocks:
             payload["blocks"] = blocks
-        resp = client.post(
-            "https://slack.com/api/chat.update",
-            headers={"Authorization": f"Bearer {self._token}",
-                     "Content-Type": "application/json; charset=utf-8"},
-            data=json.dumps(payload),
-            timeout=30,
-        )
+        try:
+            resp = client.post(
+                "https://slack.com/api/chat.update",
+                headers={"Authorization": f"Bearer {self._token}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                data=json.dumps(payload),
+                timeout=30,
+            )
+        except Exception as e:
+            # A Slack outage must degrade to a failed edit, never raise into
+            # the caller — card updates run inside sweeps that serve everyone.
+            print(f"[slack] chat.update transport error: {type(e).__name__}")
+            return {"ok": False, "error": "transport"}
         try:
             return resp.json()
         except Exception:
@@ -90,13 +96,20 @@ class SlackPoster:
             payload["blocks"] = blocks
         if thread_ts:
             payload["thread_ts"] = thread_ts
-        resp = client.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {self._token}",
-                     "Content-Type": "application/json; charset=utf-8"},
-            data=json.dumps(payload),
-            timeout=30,
-        )
+        try:
+            resp = client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {self._token}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                data=json.dumps(payload),
+                timeout=30,
+            )
+        except Exception as e:
+            # A Slack timeout on one notice/card must never abort the daily
+            # run: the pre-loop voice notice and every per-account card share
+            # this path. Callers already treat a not-ok dict as a failed post.
+            print(f"[slack] chat.postMessage transport error: {type(e).__name__}")
+            return {"ok": False, "error": "transport"}
         try:
             return resp.json()
         except Exception:
