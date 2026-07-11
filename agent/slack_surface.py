@@ -29,9 +29,23 @@ class SlackPoster:
         self._channel = channel or config.SLACK_CHANNEL_ID
 
     def post_approval_card(self, draft):
-        """Post one approval card. Returns the Slack API response dict."""
+        """Post one approval card. Returns the Slack API response dict.
+        The card routes to the draft account's own approval channel when the
+        account sets one (per-client channels); otherwise this poster's
+        default channel. Ops notices stay on the default channel."""
         blocks = build_card_blocks(draft)
-        return self._chat_post(text=_fallback_text(draft), blocks=blocks)
+        return self._chat_post(text=_fallback_text(draft), blocks=blocks,
+                               channel=self._channel_for(draft))
+
+    def _channel_for(self, draft):
+        try:
+            from .accounts import get_account
+            acct = get_account(getattr(draft, "account_key", "") or "")
+            if acct is not None and acct.slack_channel:
+                return acct.slack_channel
+        except Exception:
+            pass
+        return self._channel
 
     def post_notice(self, text):
         """Plain notice, e.g. 'voice doc missing, not drafting'."""

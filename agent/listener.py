@@ -337,7 +337,9 @@ def run_listener():
         old = store.get(draft_id)
         if not old:
             return
-        if actor != config.APPROVER_SLACK_ID:
+        from .accounts import get_account as _get_account
+        from .approvals import _is_approver as _gate
+        if not _gate(actor, account=_get_account(old.account_key or "")):
             return
         new = _redraft_with_note(old, note)
         store.remove(draft_id)

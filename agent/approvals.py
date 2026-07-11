@@ -34,8 +34,20 @@ class ActionResult:
     redraft: object = None  # a new Draft to re-post (Edit path)
 
 
-def _is_approver(actor_slack_id):
-    return actor_slack_id == config.APPROVER_SLACK_ID
+def _is_approver(actor_slack_id, account=None):
+    """The global approver can act on every account; an account's own
+    approvers (per-client, from the Account record) can act on theirs.
+    account.approver_ids() already falls back to the global approver when
+    the per-account list is empty, so today's behavior is unchanged until a
+    client account sets its approvers."""
+    if actor_slack_id == config.APPROVER_SLACK_ID:
+        return True
+    if account is not None:
+        try:
+            return actor_slack_id in account.approver_ids()
+        except Exception:
+            return False
+    return False
 
 
 def handle_action(action, draft, actor_slack_id, note="",
@@ -51,8 +63,9 @@ def handle_action(action, draft, actor_slack_id, note="",
     confirmer(draft, account, result)      (injectable; defaults to publish_confirm,
                                             which is a no-op unless its flag is armed)
     """
-    # --- approver gate ---
-    if not _is_approver(actor_slack_id):
+    # --- approver gate: global approver, or this account's own approvers ---
+    gate_acct = account or get_account(getattr(draft, "account_key", "") or "")
+    if not _is_approver(actor_slack_id, account=gate_acct):
         return ActionResult(ok=False, action=action, draft_id=getattr(draft, "draft_id", ""),
                             detail=f"Denied: {actor_slack_id} is not the approver.")
 
