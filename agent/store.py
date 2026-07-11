@@ -57,6 +57,38 @@ def _rescue_from_row(data, row):
     return data
 
 
+def _row_to_draft(row):
+    """Build a Draft from a stored row without ever crashing the caller.
+
+    Legacy and partial rows are real in this store: `data` can be NULL,
+    malformed JSON, or carry a status string the enum no longer knows. Any of
+    those used to raise out of the read path and take down the whole daily run
+    (and the Approve tap). Here they degrade instead: bad JSON falls back to
+    the column values alone, an unknown status quarantines the draft as
+    BLOCKED (a blocked draft can never publish), and a row that cannot produce
+    a Draft at all returns None with a log line so the caller skips it.
+    """
+    try:
+        data = json.loads(row["data"] or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data = _rescue_from_row(data, row)
+    try:
+        return _from_dict(data)
+    except (ValueError, TypeError):
+        data["status"] = DraftStatus.BLOCKED.value
+        data["blocked_reason"] = data.get("blocked_reason") or (
+            "legacy row: unreadable status, quarantined (will never publish)")
+        try:
+            return _from_dict(data)
+        except Exception as e:
+            print("[store] unreadable row skipped: "
+                  f"{row['draft_id']!r} ({type(e).__name__})")
+            return None
+
+
 def _from_dict(r):
     return Draft(
         draft_id=r.get("draft_id", ""),
@@ -134,7 +166,7 @@ class PendingStore:
                                (draft_id,)).fetchone()
         if row is None:
             return None
-        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
+        return _row_to_draft(row)
 
     def remove(self, draft_id):
         with self._conn() as conn:
@@ -146,7 +178,8 @@ class PendingStore:
         with self._conn() as conn:
             rows = conn.execute(f"SELECT {_SELECT} FROM drafts WHERE status=?",
                                 (DraftStatus.PENDING.value,)).fetchall()
-        return [_from_dict(_rescue_from_row(json.loads(r["data"]), r)) for r in rows]
+        drafts = (_row_to_draft(r) for r in rows)
+        return [d for d in drafts if d is not None]
 
     def find_for_day(self, account_key, day_key, draft_type):
         """The most recent record for (account, day, type), ANY status. The
@@ -161,7 +194,7 @@ class PendingStore:
                 (account_key, day_key, draft_type)).fetchone()
         if row is None:
             return None
-        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
+        return _row_to_draft(row)
 
     def find_pending(self, account_key, day_key, draft_type):
         """The PENDING draft for (account, day, type), or None: the idempotency
@@ -175,7 +208,7 @@ class PendingStore:
                 (DraftStatus.PENDING.value, account_key, day_key, draft_type)).fetchone()
         if row is None:
             return None
-        return _from_dict(_rescue_from_row(json.loads(row["data"]), row))
+        return _row_to_draft(row)
 
 
 def _is_sqlite(path):

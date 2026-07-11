@@ -173,6 +173,93 @@ def test_run_daily_no_crash_with_minimal_row(monkeypatch, tmp_path):
     assert all(d.draft_id != "" for d in pending)
 
 
+# ---------------------------------------------------------------------------
+# Hardening round 2: rows whose data blob is NULL, malformed, non-dict JSON,
+# or carries a status the enum no longer knows. json.loads / DraftStatus()
+# used to raise straight out of the read funnel.
+# ---------------------------------------------------------------------------
+
+def _seed_raw_row(db_path, draft_id, data, status="pending",
+                  day_key="2026-07-01", draft_type="feed"):
+    from agent import db
+    with db.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO drafts "
+            "(draft_id, account_key, status, day_key, draft_type, data) "
+            "VALUES (?,?,?,?,?,?)",
+            (draft_id, "lasso_ig", status, day_key, draft_type, data))
+        conn.commit()
+
+
+def test_null_data_blob_survives(monkeypatch, tmp_path):
+    """data == NULL: json.loads(None) used to raise TypeError."""
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    _seed_raw_row(db_path, "null-001", None)
+    store = PendingStore(path=db_path)
+    drafts = store.list_pending()
+    assert len(drafts) == 1
+    assert drafts[0].draft_id == "null-001"
+    assert drafts[0].account_key == "lasso_ig"
+
+
+def test_malformed_json_survives(monkeypatch, tmp_path):
+    """data == broken JSON: JSONDecodeError used to kill list_pending."""
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    _seed_raw_row(db_path, "garbage-001", "{not json at all")
+    store = PendingStore(path=db_path)
+    drafts = store.list_pending()
+    assert len(drafts) == 1
+    assert drafts[0].draft_id == "garbage-001"
+
+
+def test_non_dict_json_survives(monkeypatch, tmp_path):
+    """data == a JSON list: .setdefault on a list used to raise."""
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    _seed_raw_row(db_path, "list-001", '["a", "b"]')
+    store = PendingStore(path=db_path)
+    drafts = store.list_pending()
+    assert len(drafts) == 1
+    assert drafts[0].draft_id == "list-001"
+
+
+def test_unknown_status_quarantines_as_blocked(monkeypatch, tmp_path):
+    """A retired/unknown status string maps to BLOCKED (can never publish),
+    instead of raising ValueError out of store.get on the Approve tap."""
+    from agent.drafter import DraftStatus
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    _seed_raw_row(db_path, "status-001",
+                  '{"draft_id": "status-001", "status": "shipped_v1"}')
+    store = PendingStore(path=db_path)
+    d = store.get("status-001")
+    assert d is not None
+    assert d.status == DraftStatus.BLOCKED
+    assert d.blocked_reason
+
+
+def test_healthy_rows_unaffected_alongside_bad(monkeypatch, tmp_path):
+    """One corrupt row must not hide the healthy rows around it."""
+    from agent.drafter import DraftStatus
+    db_path = str(tmp_path / "echo.db")
+    monkeypatch.setenv("AGENT_DB_PATH", db_path)
+    _seed_raw_row(db_path, "bad-001", "{broken", day_key="2026-07-03")
+    _seed_raw_row(
+        db_path, "good-001",
+        json.dumps({"draft_id": "good-001", "account_key": "lasso_ig",
+                    "caption": "Fine.", "status": "pending",
+                    "day_key": "2026-07-04", "draft_type": "feed"}),
+        day_key="2026-07-04")
+    store = PendingStore(path=db_path)
+    drafts = store.list_pending()
+    assert {d.draft_id for d in drafts} == {"bad-001", "good-001"}
+    good = next(d for d in drafts if d.draft_id == "good-001")
+    assert good.caption == "Fine."
+    assert good.status == DraftStatus.PENDING
+
+
 def test_column_values_win_over_json_for_backed_fields(monkeypatch, tmp_path):
     """If the JSON blob has a stale value for a column-backed field but the
     column has the authoritative value, setdefault only fills when MISSING,
