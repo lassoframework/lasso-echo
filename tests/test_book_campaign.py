@@ -127,6 +127,44 @@ def test_queue_verbatim_and_ordered(monkeypatch, tmp_path):
     assert "You are stuck." in d2.caption                        # verbatim body line
 
 
+def test_failed_build_does_not_consume_queue_item(monkeypatch, tmp_path):
+    """A transient studio/hosting outage must NOT burn the day's queue item.
+    The item used to be marked done at selection time, so a build failure
+    silently lost that verbatim post forever. Now consumption happens only
+    after a draft is confirmed built, and the item re-serves next book day."""
+    _arm(monkeypatch, tmp_path)
+
+    hosting = {"down": True}
+
+    def _flaky_host(path, account_key, client=None, **kw):
+        return None if hosting["down"] else "https://cdn.echo.test/x.png"
+
+    monkeypatch.setattr(book_campaign.media_host, "host_media", _flaky_host)
+
+    # hosting down: the build fails and returns None
+    d = book_campaign.build_book_draft(_acct(), "2026-07-06",
+                                       nano_client=FakeNano(), s3_client=FakeS3())
+    assert d is None
+
+    # hosting back the NEXT day: the SAME queue item (day 1 verbatim) serves
+    hosting["down"] = False
+    d2 = book_campaign.build_book_draft(_acct(), "2026-07-07",
+                                        nano_client=FakeNano(), s3_client=FakeS3())
+    assert d2 is not None and d2.status == DraftStatus.PENDING
+    assert d2.caption.startswith("We wrote a book."), (
+        "queue day 1 must re-serve after a failed build, not be skipped")
+
+
+def test_successful_build_consumes_queue_item(monkeypatch, tmp_path):
+    """The happy path still advances the queue exactly as before."""
+    _arm(monkeypatch, tmp_path)
+    d1 = _draft(tmp_path, "2026-07-06")
+    assert d1.status == DraftStatus.PENDING
+    assert d1.caption.startswith("We wrote a book.")
+    d2 = _draft(tmp_path, "2026-07-07")
+    assert "The Full Gym was written to get you unstuck." in d2.caption
+
+
 def test_real_week1_cards_resolve_from_repo_folder():
     """ALL SEVEN shipped content_library/book_campaign/ files resolve through the
     drafter's day<N> lookup: the real cover art (day 1, jpg) plus the six cards.

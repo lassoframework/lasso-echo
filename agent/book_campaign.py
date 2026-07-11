@@ -168,7 +168,12 @@ def _queue_progress():
 
 def queue_item_for(day_key):
     """One queue item per day, in order, shared by every account on that day.
-    None once the queue is exhausted."""
+    None once the queue is exhausted.
+
+    Selection only: the item is NOT consumed here. queue_mark_done(n) consumes
+    it once a draft is confirmed built — a transient studio or hosting outage
+    used to burn the item permanently before any card existed, silently losing
+    one verbatim queue post. Un-consumed items re-serve on the next book day."""
     queue = load_queue()
     state = _queue_progress()
     done = state.get("done", [])
@@ -180,8 +185,19 @@ def queue_item_for(day_key):
         return None
     item = remaining[0]
     db.kv_set("book_queue_progress", json.dumps(
-        {"done": done + [item["n"]], "day": day_key, "current": item["n"]}))
+        {"done": done, "day": day_key, "current": item["n"]}))
     return item
+
+
+def queue_mark_done(n):
+    """Consume queue item n: called only after its draft is confirmed built.
+    Idempotent."""
+    state = _queue_progress()
+    done = state.get("done", [])
+    if n not in done:
+        done = done + [n]
+    db.kv_set("book_queue_progress", json.dumps(
+        {"done": done, "day": state.get("day"), "current": state.get("current")}))
 
 
 def _existing_card(n):
@@ -248,12 +264,17 @@ def build_book_draft(account, day_key, nano_client=None, s3_client=None):
                             f"queue day {item['n']} carries numbers not found "
                             f"character exact in the sources: {mismatches}. Blocked, "
                             "never guessed.")
-        return _finish_draft(account, day_key,
-                             item["title"] or "The Full Gym", caption,
-                             item["hashtags"], _existing_card(item["n"]),
-                             nano_client, s3_client,
-                             fragments=[f"queue day {item['n']} verbatim"],
-                             card_note=item["card_note"])
+        draft = _finish_draft(account, day_key,
+                              item["title"] or "The Full Gym", caption,
+                              item["hashtags"], _existing_card(item["n"]),
+                              nano_client, s3_client,
+                              fragments=[f"queue day {item['n']} verbatim"],
+                              card_note=item["card_note"])
+        if draft is not None:
+            # Confirmed built: only now is the queue item consumed. A studio
+            # or hosting outage leaves it un-consumed to re-serve next book day.
+            queue_mark_done(item["n"])
+        return draft
     # queue exhausted: rotate the READY angles 1 to 8 (9 to 11 stay dark)
     angles = load_angles()
     ready = [n for n in sorted(angles) if n <= 8 and not angles[n]["blocked"]]
