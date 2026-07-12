@@ -217,8 +217,9 @@ DONE = ("<!doctype html><html><body style='font-family:sans-serif;background:#12
         "<p>Your content is in. We will take it from here.</p></body></html>")
 
 
-def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure core
-    """Run the intake web service (its OWN process/service; R2 only, no /data)."""
+def build_server(port=None):
+    """Build the HTTP server (bound, not serving). serve() runs it; tests bind
+    port 0 and drive real requests against it without blocking."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from email.parser import BytesParser
     from email.policy import default as email_default
@@ -237,6 +238,19 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
             self.wfile.write(body)
 
         def do_GET(self):
+            # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
+            # the SERVICE being up and the FEATURE being armed are different
+            # facts, and Railway's health check must not kill a dark service.
+            # Reveals liveness + flag state only, never tokens or clients.
+            if self.path.split("?")[0] == "/healthz":
+                body = json.dumps({"ok": True,
+                                   "intake_enabled": config.intake_enabled()}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             token = self._token()
             if not config.intake_enabled() or not token or client_for_token(token) is None:
                 return self._deny()
@@ -285,6 +299,13 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
             # Never log the path: it carries the token. Method + status only.
             print(f"[intake-web] {self.command} -> done")
 
-    port = int(port or os.environ.get("PORT", "8080"))
-    print(f"Intake web online on :{port} (enabled: {config.intake_enabled()})")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    port = int(port if port is not None else os.environ.get("PORT", "8080"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"Intake web online on :{server.server_address[1]} "
+          f"(enabled: {config.intake_enabled()})")
+    return server
+
+
+def serve(port=None):  # pragma: no cover - blocking loop over build_server
+    """Run the intake web service (its OWN process/service; R2 only, no /data)."""
+    build_server(port).serve_forever()
