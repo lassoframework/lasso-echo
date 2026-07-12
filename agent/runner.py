@@ -238,6 +238,28 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # card for this account.
             if not schedule.should_post_on(day_key):
                 continue
+            # Channel ownership guard: a client account with no slack_channel
+            # would route its approval cards to the shared default — LASSO's
+            # internal channel — silently. That never happens: the account
+            # skips its day with one loud alert instead. Fires only when a
+            # shared channel is actually configured to leak into
+            # (SLACK_CHANNEL_ID set); LASSO accounts (client zero) own the
+            # default channel by design and are exempt.
+            if (not account.key.startswith("lasso")
+                    and not account.slack_channel
+                    and config.SLACK_CHANNEL_ID):
+                msg = (f"account {account.key} has no slack_channel: its cards "
+                       "would route to the shared internal channel. Skipping "
+                       "this account; set Account.slack_channel and run "
+                       "`python -m agent preflight --account "
+                       f"{account.key}`.")
+                print(f"[runner] {msg}")
+                ops_alerts.alert(msg)
+                from . import db as _db
+                _db.audit("channel_guard_skip", account.key, msg,
+                          account.key, day_key)
+                continue
+
             # Heartbeat (no flag, honest observability): this account's daily
             # run happened today. The morning check alerts on its absence.
             from .heartbeat import record_heartbeat

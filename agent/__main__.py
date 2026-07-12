@@ -238,6 +238,7 @@ _COMMANDS = {
     ],
     "onboarding & intake": [
         ("onboard-client / add-client", "scaffold a new client account"),
+        ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -813,6 +814,9 @@ def main(argv=None):
         # project-listing endpoint exists).
         from .opus_organize import organize_cli
         organize_cli(argv[1:])
+    elif cmd == "preflight":
+        from .preflight import cli as preflight_cli
+        preflight_cli(argv[1:])
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
