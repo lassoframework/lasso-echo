@@ -18,7 +18,7 @@ from agent.accounts import Account, Platform  # noqa: E402
 # 2026-07-06 is a Monday (posting day). 15:00 UTC = 11:00 ET (past the deadline).
 LATE = datetime(2026, 7, 6, 15, 0, tzinfo=timezone.utc)
 EARLY = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)   # 08:00 ET
-SATURDAY = datetime(2026, 7, 11, 15, 0, tzinfo=timezone.utc)  # default skip day
+SATURDAY = datetime(2026, 7, 11, 15, 0, tzinfo=timezone.utc)  # manually configured skip day
 
 
 def _accts():
@@ -66,7 +66,9 @@ def test_before_deadline_never_fires(monkeypatch):
 
 
 def test_skip_day_and_disarmed_agent_stay_silent(monkeypatch):
+    from agent import config as _config
     notices = _wire(monkeypatch)
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
     assert heartbeat.check_heartbeats(now=SATURDAY, accounts=_accts()) == []
     monkeypatch.delenv("AGENT_ENABLED", raising=False)
     assert heartbeat.check_heartbeats(now=LATE, accounts=_accts()) == []

@@ -1,7 +1,8 @@
 """
-Posting-schedule tests (2026 cadence). Pure timing: Saturday is skipped, Tue-Thu are
-priority, the primary slot is 18:30 New York (with correct EDT/EST offsets), the
-morning slot is 07:30, and a config/env override retunes the time. No publishing.
+Posting-schedule tests (2026 cadence). Pure timing: 7 days a week (no skip days by
+default), Tue-Thu are priority, the primary slot is 18:30 New York (with correct
+EDT/EST offsets), the morning slot is 07:30, and a config/env override retunes the
+time or re-adds skip days. No publishing.
 """
 
 import os
@@ -21,11 +22,19 @@ def test_weekday_abbr():
     assert schedule.weekday_abbr("2026-07-01T18:30:00-04:00") == "wed"  # ISO prefix ok
 
 
-def test_saturday_skipped_other_days_post():
-    assert schedule.should_post_on("2026-07-04") is False   # Saturday
+def test_all_seven_days_post_by_default():
+    """Default cadence: 7 days a week, no skip days. Saturday is a posting day."""
+    assert schedule.should_post_on("2026-07-04") is True    # Saturday — posts now
     assert schedule.should_post_on("2026-07-01") is True    # Wednesday
-    assert schedule.should_post_on("2026-07-05") is True    # Sunday (not skipped by default)
+    assert schedule.should_post_on("2026-07-05") is True    # Sunday
     assert schedule.should_post_on("2026-07-03") is True    # Friday
+
+
+def test_skip_days_env_override(monkeypatch):
+    """AGENT_POSTING_SKIP_DAYS=sat re-enables the old Saturday-skip behavior."""
+    monkeypatch.setattr(config, "POSTING_SKIP_DAYS", ["sat"])
+    assert schedule.should_post_on("2026-07-04") is False   # Saturday now skipped
+    assert schedule.should_post_on("2026-07-01") is True    # Wednesday unaffected
 
 
 def test_priority_days_tue_wed_thu():

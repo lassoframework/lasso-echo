@@ -70,13 +70,16 @@ def test_assembler_matches_store_state(monkeypatch):
 
 
 def test_rest_days_honor_schedule(monkeypatch):
+    """When sat is in the skip list the assembler marks those days rest."""
+    from agent import config as _config
     monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
     plan = calendar_artifact.assemble_month("lasso_ig", MONTH)
     for d in plan["days"]:
         from datetime import date
         is_saturday = date.fromisoformat(d["date"]).weekday() == 5
         if is_saturday:
-            assert d["status"] == "rest", d["date"]    # the Saturday skip
+            assert d["status"] == "rest", d["date"]
         else:
             assert d["status"] != "rest", d["date"]
 

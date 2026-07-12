@@ -234,8 +234,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # missing token, or empty library never blocks another account's
         # cycle. An exception logs, alerts once, audits, and moves on.
         try:
-            # Cadence gate FIRST: a skip day (default Saturday) produces no draft and no
-            # card for this account.
+            # Cadence gate FIRST: a configured skip day produces no draft and no
+            # card for this account (default 7 days/week, no skip days).
             if not schedule.should_post_on(day_key):
                 continue
             # Channel ownership guard: a client account with no slack_channel

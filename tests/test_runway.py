@@ -52,8 +52,8 @@ def test_runway_math(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     monkeypatch.setattr(runway, "v2_library_concepts", lambda lib: [])
     lib = _lib(tmp_path, CLEAN)
-    # default schedule skips Saturday: 6 posting days / 7 -> 4 assets / (6/7)
-    assert runway.runway_days("lasso_ig", lib) == round(4 / (6 / 7), 1)
+    # default schedule: 7 posting days / 7 -> 4 assets / (7/7) = 4.0
+    assert runway.runway_days("lasso_ig", lib) == round(4 / (7 / 7), 1)
 
 
 def test_filters_used_gate_dirty_and_off_style(monkeypatch, tmp_path):

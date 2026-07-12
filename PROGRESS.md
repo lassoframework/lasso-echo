@@ -6,11 +6,47 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-11 (FULL HARDENING PASS pre 10-client launch: 16 fix commits,
-suite 1091 green with ZERO reds — the famous 7 reportlab reds were the suite being
-run with the wrong interpreter, never code. See the hardening section below for the
-fixes, the honest readiness grade, and the ranked remaining gaps. Prev: 2026-07-10
-episode inbox watcher + Monday nudge shipped dark.)
+Last updated: 2026-07-12
+
+Commits since last update:
+- `171f488` — intake-web deployable: `/healthz` route, `build_server(port=0)`, Procfile
+  `web:` entry, `docs/INTAKE_DEPLOY.md` Railway runbook, 5 tests.
+- `da0fb16` — preflight command (`python -m agent preflight --account <key> [--live]`),
+  8 checks (PASS/WARN/FAIL), READY/NOT READY verdict, exit nonzero on FAIL; channel
+  ownership guard in run-daily skips (with alert) any client account missing
+  `slack_channel` when a shared channel is configured. Suite: **1107 passed, 0 failed**.
+- `[this commit]` — 7-day cadence: `POSTING_SKIP_DAYS` default changed from `["sat"]`
+  to `[]`. Saturday is now a posting day by default. `AGENT_POSTING_SKIP_DAYS`
+  env override still works. Tests updated to monkeypatch `POSTING_SKIP_DAYS=["sat"]`
+  where they need the old behavior; new `test_all_seven_days_post_by_default` +
+  `test_skip_days_env_override` assert the new default.
+
+---
+
+## Posting cadence — 2026-07-12 (current live rotation)
+
+7 days a week, one post per account per day. `AGENT_CATEGORY_ROTATION=true` must be
+set in Railway env. `AGENT_POSTING_SKIP_DAYS` defaults to empty (no skip days).
+
+| Day | Slot |
+|-----|------|
+| Mon | podcast release |
+| Tue | platform |
+| Wed | b2b |
+| Thu | podcast clip |
+| Fri | summit (doctrine fills until the summit ramp starts in Sept) |
+| Sat | platform |
+| Sun | podcast infographic |
+
+Book campaign leads the calendar when armed (`AGENT_BOOK_CAMPAIGN_ENABLED`), capped
+at 1 post/week. Slots above describe the fallback pillar when the book is not running.
+
+Clipper status: **Phase 1 SELECTION ONLY** — selection logic, ranked plan, Slack post
+of the plan. Renders no video. `AGENT_CLIPPER_ENABLED` defaults OFF. Blocked on the
+first Riverside export dropped into the R2 episode inbox
+(`echo/episode_inbox/lasso_episodes/`). Phase 2 (FFmpeg render, captions, audiogram)
+and Phase 3 (wire into Echo as held drafts) are **built but dark** behind
+`AGENT_CLIPPER_RENDER_ENABLED`.
 
 ---
 
@@ -69,10 +105,12 @@ reportlab); those suites now SKIP with the reason named when run wrong.
 ### Ranked remaining gaps for the 10-client launch
 1. (L) Client content engine: per-account source docs + brain plumbing, or
    an explicit "library-only product" decision + stocked libraries per gym.
-2. (S-M) Deploy intake-web as its own Railway web service (client photo
-   uploads are dead until it exists; the command and code are ready).
-3. (S) Onboarding preflight: refuse/warn when an active account is missing
-   slack_channel, approvers, or tokens before it starts drafting.
+2. (DONE — da0fb16) intake-web deployable: `/healthz`, Procfile `web:` entry,
+   `docs/INTAKE_DEPLOY.md` runbook. Still needs: Blake creates the Railway web
+   service and sets env vars per the runbook.
+3. (DONE — da0fb16) Onboarding preflight: `python -m agent preflight --account
+   <key>` runs 8 checks, prints READY/NOT READY, exits nonzero on FAIL. Channel
+   ownership guard prevents silent cross-client routing.
 4. (M) Fan-out hardening at 12+ accounts: Slack 429 backoff/retry; consider
    chunking. (Per-client channels shipped this pass reduce the burst risk.)
 5. (S) Document the ~40 undocumented env vars incl. META_APP_ID/SECRET;
@@ -790,8 +828,9 @@ BLAKE BY HAND to arm this pipeline:
   8. Within one poll cycle, a ranked clip plan appears in #echoclaude.
 
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
-- [~] Saturday fix locked: with AGENT_CATEGORY_ROTATION on the planner posts all
-      seven days (August plans 31/31; flag off keeps the Saturday skip, 26)
+- [x] 7-day cadence: POSTING_SKIP_DAYS default is now empty (no skip days); Saturday
+      is a posting day by default. AGENT_POSTING_SKIP_DAYS env override re-enables
+      any custom skip list. With AGENT_CATEGORY_ROTATION on, August plans 31/31.
 - [~] 14-day review cycle: AGENT_REVIEW_WINDOW_DAYS (default 14) windows the
       day30 assembler (now the cycle report; 30-day window keeps the DAY 30
       title); pre-Echo cadence baseline comparison stays on the fixed 30-day

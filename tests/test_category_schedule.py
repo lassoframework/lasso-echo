@@ -199,7 +199,10 @@ def test_saturday_not_skipped_when_rotation_on(monkeypatch):
 
 
 def test_saturday_still_skipped_when_rotation_off(monkeypatch):
+    """With rotation OFF and sat manually added to skip list, Saturday is skipped."""
+    from agent import config as _config
     monkeypatch.setenv("AGENT_CATEGORY_ROTATION", "false")
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
     assert schedule.should_post_on(_SAT) is False
 
 

@@ -201,10 +201,14 @@ def test_seed_calendar_unapproved_never_enters_and_roundtrips(monkeypatch):
     assert sorted(cal["keys"]) == ["cal_ok.png", "tapped.png"]
     assert "sneaky.png" not in cal["keys"]                # ADVERSARIAL: pending out
     assert "broken.png" not in cal["keys"]
-    # gaps = posting days with nothing approved (Saturdays excluded by cadence)
+    # gaps = posting days with nothing approved (configured skip days excluded)
     assert "2026-07-06" not in cal["gaps"] and "2026-07-08" not in cal["gaps"]
     assert "2026-07-07" in cal["gaps"]
-    assert "2026-07-11" not in cal["gaps"]                # a Saturday: skip day
+    # 2026-07-11 is a Saturday; with sat in the skip list it is not a gap
+    from agent import config as _config
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
+    cal2 = seed_calendar.build_calendar("lasso_ig", "2026-07")
+    assert "2026-07-11" not in cal2["gaps"]
     # write then read round-trips through the exact key trust reads
     seed_calendar.run("lasso_ig", "2026-07", write=True)
     assert trust.approved_calendar("lasso_ig", "2026-07") == {"cal_ok.png",

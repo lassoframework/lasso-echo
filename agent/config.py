@@ -55,7 +55,7 @@ POSTING_TIMEZONE = os.environ.get("AGENT_POSTING_TZ", "America/New_York")
 POSTING_PRIMARY_TIME = os.environ.get("AGENT_POSTING_PRIMARY_TIME", "18:30")
 POSTING_MORNING_TIME = os.environ.get("AGENT_POSTING_MORNING_TIME", "07:30")
 POSTS_PER_DAY = int(os.environ.get("AGENT_POSTS_PER_DAY", "1"))
-POSTING_SKIP_DAYS = _csv_list("AGENT_POSTING_SKIP_DAYS", ["sat"])
+POSTING_SKIP_DAYS = _csv_list("AGENT_POSTING_SKIP_DAYS", [])
 POSTING_PRIORITY_DAYS = _csv_list("AGENT_POSTING_PRIORITY_DAYS", ["tue", "wed", "thu"])
 
 # ---- Meta Graph API ----------------------------------------------------------

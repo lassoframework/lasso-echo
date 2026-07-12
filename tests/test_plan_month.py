@@ -289,9 +289,10 @@ def test_august_plan_yields_31_days_when_rotation_on(monkeypatch, tmp_path):
 
 
 def test_august_plan_skips_saturdays_when_rotation_off(monkeypatch, tmp_path):
-    """Flag OFF = yesterday's behavior: Saturdays stay skipped (26 days)."""
+    """Flag OFF + sat in skip list: Saturdays stay skipped (26 days)."""
     _arm(monkeypatch)
     monkeypatch.delenv("AGENT_CATEGORY_ROTATION", raising=False)
+    monkeypatch.setattr(config, "POSTING_SKIP_DAYS", ["sat"])
     _make_eligibles(monkeypatch, tmp_path, n=60)
     out = pm.plan_month("aug26_probe_ig", "2026-08", library_path=str(tmp_path),
                         write=False)

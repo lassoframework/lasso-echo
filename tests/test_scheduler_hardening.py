@@ -37,7 +37,7 @@ def _alerts(rec):
 
 
 THURSDAY = "2026-07-02"   # posting day
-SATURDAY = "2026-07-04"   # skip day
+SATURDAY = "2026-07-04"   # manually configured skip day
 
 
 # ---- 1. alert fires on each non-drafted branch --------------------------------
@@ -79,7 +79,9 @@ def test_no_alert_on_successful_drafted_run(monkeypatch):
 
 
 def test_no_alert_on_skip_day_zero_drafts(monkeypatch):
+    from agent import config as _config
     rec = _wire(monkeypatch)
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
     listener._fire_daily(store=None, today=SATURDAY,
                          run=lambda store=None: {"status": "drafted", "drafts": []})
     assert _alerts(rec) == []

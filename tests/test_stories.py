@@ -171,9 +171,11 @@ def test_story_card_labeled(monkeypatch):
     assert "STORY" not in build_card_blocks(_feed_draft())[0]["text"]["text"]
 
 
-# ---- 5. schedule respected: a skip day drafts no Story ------------------------
+# ---- 5. schedule respected: a configured skip day drafts no Story -------------
 def test_skip_day_drafts_no_story(monkeypatch):
+    from agent import config as _config
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.setattr(_config, "POSTING_SKIP_DAYS", ["sat"])
     assert stories.build_story_draft(_acct(), "2026-07-04",  # a Saturday
                                      feed_draft=_feed_draft()) is None
 

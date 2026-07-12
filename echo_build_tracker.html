@@ -200,6 +200,9 @@
         ["HARDENING PASS 2026-07-11: store reads survive any legacy row (NULL/garbage/unknown status quarantined, never fatal); review-cycle accounts=None crash fixed; Slack transport errors degrade instead of killing the run; replan preview no longer deletes (true dry run)","done"],
         ["HARDENING PASS 2026-07-11: per-client isolation — cards route to each account's own channel, per-account approvers honored, Gemini spend cap per account, book queue survives outages; 12-account launch simulation in the suite (corrupt rows + dead token + empty library, run completes, nothing publishes)","done"],
         ["HARDENING PASS 2026-07-11: honest CLI — status shows all 43 flags (guard-tested), help lists every command, run-daily and every bare-zero command state WHY, scheduler announces armed/dormant lanes; requirements gaps (cryptography/faster-whisper/anthropic) declared; suite 1091 green ZERO reds (the 7 reportlab reds were the wrong interpreter, now skip with reason)","done"],
+        ["da0fb16 intake-web deployable: /healthz answers 200 while dark (Railway health check safe), build_server(port=0) is testable, Procfile web: entry, docs/INTAKE_DEPLOY.md click-by-click Railway runbook with every env var. BLAKE BY HAND: create the second Railway service following the runbook.","done"],
+        ["da0fb16 preflight command: python -m agent preflight --account <key> [--live] runs 8 checks (slack_channel, approvers, meta_token, target_id, library depth, voice_doc, spend_cap, category_rotation), prints READY/NOT READY, exits nonzero on any FAIL so it gates scripts. Channel ownership guard in run-daily skips (with alert) any client account missing slack_channel when a shared channel is configured. 11 tests. Suite: 1107 passed.","done"],
+        ["2026-07-12 7-day cadence: POSTING_SKIP_DAYS default changed from [sat] to [] (no skip days). Saturday is now a posting day. AGENT_POSTING_SKIP_DAYS env override restores any custom skip list. Category rotation ON: Mon podcast, Tue platform, Wed b2b, Thu podcast clip, Fri summit (doctrine fills until Sept), Sat platform, Sun podcast infographic. Book capped at 1/week. Suite: 1108 passed.","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -240,11 +243,11 @@
   ]};
 
   // Open risks / watch items
-  const RISKS={ name:"Open risks & watch items", meta:"Track these, do not let them drift. 10-CLIENT READINESS GRADE (2026-07-11 hardening pass): C+ — safety and isolation B+ (gates, trust ladder, per-client channel/approver/spend all verified or fixed); client content depth D (clients get library-pick drafts only; a thin library means a BLOCKED card every day — stock every gym's library before day 1); operations C (manual onboarding, no preflight, intake-web not deployed, serial fan-out).",
+  const RISKS={ name:"Open risks & watch items", meta:"Track these, do not let them drift. 10-CLIENT READINESS GRADE (updated 2026-07-12): C+ — safety and isolation B+ (gates, trust ladder, per-client channel/approver/spend all verified; preflight + channel-ownership guard shipped da0fb16); client content depth D (clients get library-pick drafts only; a thin library means a BLOCKED card every day — stock every gym library before day 1); operations C+ (preflight ships, intake-web code ready + runbook written; serial fan-out still unaddressed). Posting cadence: 7 days/week, AGENT_CATEGORY_ROTATION=true, Mon podcast / Tue platform / Wed b2b / Thu podcast clip / Fri summit / Sat platform / Sun podcast infographic. Clipper: Phase 1 SELECTION ONLY, no render, AGENT_CLIPPER_ENABLED OFF, blocked on first Riverside export drop.",
     items:[
       ["LAUNCH GAP 1 — client content engine (L)","campaigns and the brain are LASSO-only by design; client gyms draft only from their own library. Decide: per-account source docs + brain plumbing, or explicitly a library-only product with stocked libraries per gym."],
-      ["LAUNCH GAP 2 — intake-web has no deploy target (S-M)","the upload page code and command exist but no Railway web service starts them; client photo uploads are dead until it is deployed."],
-      ["LAUNCH GAP 3 — onboarding preflight (S)","nothing refuses an active account missing slack_channel, approvers, or tokens; an empty channel silently routes that client's cards to LASSO's internal channel."],
+      ["LAUNCH GAP 2 — intake-web (DONE — code + runbook, needs Railway service) (S-M)","code deployable (da0fb16): /healthz, Procfile web: entry, docs/INTAKE_DEPLOY.md. BLAKE BY HAND: create the second Railway service following the runbook."],
+      ["LAUNCH GAP 3 — onboarding preflight (DONE — da0fb16)","python -m agent preflight --account <key> runs 8 checks, READY/NOT READY, exits nonzero on FAIL. Channel-ownership guard prevents silent cross-client routing."],
       ["LAUNCH GAP 4 — fan-out at 12+ accounts (M)","serial run, no Slack 429 backoff/retry. Per-client channels (shipped) reduce burst risk; add backoff before scale."],
       ["LAUNCH GAP 5 — undocumented env surface (S)","~40 env vars incl. META_APP_ID/SECRET documented nowhere; GEMINI_DAILY_CAP, REPORTS_DIR, BASELINE_DIR have copy-pasted defaults with no single owner."],
       ["Repo divergence","deployed repo has commits from other agents (ruvnet, Manus); the reference sandbox may differ. Code ships as a behavior-described Claude Code prompt, never a wholesale push."],
@@ -446,7 +449,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-11 (FULL HARDENING PASS pre 10-client launch: 16 fix commits, suite 1091 green ZERO reds, 12-account launch simulation in the suite, readiness grade C+ with ranked gaps in the risks card; podcast/clipper = Phase 1 selection only, renders nothing, AGENT_CLIPPER_ENABLED off, blocked on first Riverside export drop; approval gate unchanged, every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-12 (7-day cadence live, suite 1108 green; da0fb16 intake-web deployable + preflight command + channel-ownership guard; readiness grade C+, gaps 2+3 resolved, gap 1 client content engine remains the top risk; clipper Phase 1 selection only, renders nothing, blocked on first Riverside export drop; approval gate unchanged, every post waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
