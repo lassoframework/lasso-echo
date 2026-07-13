@@ -3,14 +3,20 @@ Texted-link intake: the processing half, INSIDE the existing listener loop (the
 one process that has both /data and R2).
 
 Per pass, for each client with objects under intake/<client>/incoming/:
-  1. convert HEIC to JPG and normalize EXIF orientation (Pillow + pillow-heif,
-     lazy-imported like every heavy dependency; a conversion failure dead-letters
-     the file, it never crashes the loop),
-  2. dedupe by SHA-256 plus perceptual hash against everything already accepted,
-  3. run the moderation hook (a stub interface today: moderate(data, name) ->
+  1. quarantine zero-byte uploads to deadletter/ with a specific ops alert,
+  2. dedupe the RAW bytes by SHA-256 (the same file uploaded twice lands once,
+     no matter what the converter does with it),
+  3. convert HEIC to JPG (EXIF orientation normalized) and MOV to MP4 (ffmpeg
+     stream-copy remux when ffmpeg is available, unchanged pass-through when
+     not); every conversion archives the ORIGINAL to intake/<client>/originals/
+     before the incoming object is deleted, so no conversion loses a file; a
+     conversion failure dead-letters the file, it never crashes the loop,
+  4. dedupe the converted bytes by SHA-256 plus perceptual hash against
+     everything already accepted,
+  5. run the moderation hook (a stub interface today: moderate(data, name) ->
      (ok, reason); anything flagged moves to intake/<client>/review/ and posts one
      Slack notice line),
-  4. file accepted media into the client's content library prefix with the
+  6. file accepted media into the client's content library prefix with the
      client's sentence saved as the caption note file the drafter already reads.
 
 Idempotent via a processed manifest stored in R2 (intake/<client>/manifest.json);
@@ -32,12 +38,43 @@ MANIFEST = "manifest.json"
 
 
 # ---- default media transforms (lazy imports; injectable for tests) -------------
+def _remux_mov(data, name, runner=None, which=None):
+    """MOV -> MP4 container remux via ffmpeg (stream copy: lossless, cheap).
+    Returns (bytes, new_name) or None when ffmpeg is unavailable or the remux
+    fails — the caller then passes the MOV through unchanged (IG accepts MOV;
+    a playable original always beats a failed conversion)."""
+    import shutil
+    import subprocess
+    import tempfile
+    which = which or shutil.which
+    runner = runner or subprocess.run
+    if which("ffmpeg") is None:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, name)
+            dst = os.path.join(td, os.path.splitext(name)[0] + ".mp4")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            runner(["ffmpeg", "-y", "-i", src, "-c", "copy", dst],
+                   check=True, capture_output=True, timeout=120)
+            with open(dst, "rb") as fh:
+                return fh.read(), os.path.basename(dst)
+    except Exception:
+        return None
+
+
 def _convert_default(data, name):
-    """(new_bytes, new_name): HEIC/HEIF -> JPG; JPEG orientation normalized.
-    Anything Pillow cannot open passes through unchanged (e.g. video)."""
+    """(new_bytes, new_name): HEIC/HEIF -> JPG (orientation normalized);
+    MOV -> MP4 (ffmpeg remux when available, else unchanged); MP4 passes
+    through. The ORIGINAL bytes are archived by the pipeline whenever the
+    name changes, so no conversion ever loses the source file."""
     lower = name.lower()
-    if lower.endswith((".mp4", ".mov")):
+    if lower.endswith(".mp4"):
         return data, name
+    if lower.endswith(".mov"):
+        remuxed = _remux_mov(data, name)
+        return remuxed if remuxed is not None else (data, name)
     from PIL import Image, ImageOps  # lazy
     if lower.endswith((".heic", ".heif")):
         import pillow_heif  # lazy
@@ -74,9 +111,12 @@ def _moderate_default(data, name):
 def _load_manifest(r2, client):
     try:
         raw = r2.get_bytes(f"intake/{client}/{MANIFEST}")
-        return json.loads(raw.decode("utf-8"))
+        manifest = json.loads(raw.decode("utf-8"))
     except Exception:
-        return {"processed": [], "sha256": [], "phash": []}
+        manifest = {"processed": [], "sha256": [], "phash": []}
+    # additive key for raw-bytes dedupe; old manifests gain it on first touch
+    manifest.setdefault("sha256_raw", [])
+    return manifest
 
 
 def _save_manifest(r2, client, manifest):
@@ -148,14 +188,38 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             stats["skipped"] += 1
             continue
         name = os.path.basename(key)
+        raw = None   # kept for dead-letter-from-memory + the originals archive
         try:
-            data = r2.get_bytes(key)
-            data, name = converter(data, name)
+            raw = r2.get_bytes(key)
+
+            # ZERO-BYTE GUARD: an empty upload can never be media. Quarantine to
+            # the dead-letter prefix with a specific alert; never crash, never
+            # hand empty bytes to a converter.
+            if not raw:
+                stats["deadlettered"] += 1
+                r2.put_bytes(f"intake/{client}/deadletter/{name}", b"")
+                r2.delete(key)
+                manifest["processed"].append(key)
+                ops_alerts.alert(f"intake ingest quarantined {client}/{name}: "
+                                 "zero-byte upload (empty file, nothing filed)")
+                continue
+
+            # RAW dedupe FIRST: the same file uploaded twice lands once, no
+            # matter what the converter does with it.
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            if raw_sha in manifest["sha256_raw"]:
+                stats["duplicates"] += 1
+                r2.delete(key)
+                manifest["processed"].append(key)
+                continue
+
+            data, name = converter(raw, name)
 
             sha = hashlib.sha256(data).hexdigest()
             ph = phash(data, name)
             if sha in manifest["sha256"] or (ph is not None and ph in manifest["phash"]):
                 stats["duplicates"] += 1
+                manifest["sha256_raw"].append(raw_sha)   # remember the raw form too
                 r2.delete(key)
                 manifest["processed"].append(key)
                 continue
@@ -171,6 +235,13 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                                        f"({reason}); nothing filed to the library.")
                 continue
 
+            # ORIGINALS KEPT: a conversion (name changed: HEIC->JPG, MOV->MP4)
+            # archives the untouched source bytes to intake/<client>/originals/
+            # BEFORE the incoming object is deleted. No conversion loses a file.
+            if name != os.path.basename(key):
+                r2.put_bytes(f"intake/{client}/originals/{os.path.basename(key)}",
+                             raw)
+
             os.makedirs(lib_dir, exist_ok=True)
             with open(os.path.join(lib_dir, name), "wb") as fh:
                 fh.write(data)
@@ -182,6 +253,7 @@ def _process_client(client, r2, poster, converter, phash, moderator):
 
             manifest["processed"].append(key)
             manifest["sha256"].append(sha)
+            manifest["sha256_raw"].append(raw_sha)
             if ph is not None:
                 manifest["phash"].append(ph)
             r2.delete(key)
@@ -196,8 +268,11 @@ def _process_client(client, r2, poster, converter, phash, moderator):
         except Exception as e:
             stats["deadlettered"] += 1
             try:
+                # quarantine from the bytes already in memory when we have them
+                # (a corrupt object can be unreadable a second time); re-fetch
+                # only if the original get itself was what failed.
                 r2.put_bytes(f"intake/{client}/deadletter/{os.path.basename(key)}",
-                             r2.get_bytes(key))
+                             raw if raw is not None else r2.get_bytes(key))
                 r2.delete(key)
             except Exception as dl_err:
                 # even dead-lettering must never crash the loop, but a failed
