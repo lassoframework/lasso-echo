@@ -1,7 +1,7 @@
 """
 Content category taxonomy, platform sub-topic rotation, and seven-day posting schedule.
 
-Six categories cover every draftable content source:
+Seven categories cover every draftable content source:
   podcast   - episode release cards and infographics (podcast_release, podcast_cards)
   platform  - sourced from the four LASSO platform PDFs:
                 One Platform, Platform Story, Why LASSO Sites Win,
@@ -11,6 +11,8 @@ Six categories cover every draftable content source:
   summit    - summit campaign content from the Growth Playbook
   book      - The Full Gym sales playbook campaign
   doctrine  - regular LASSO pillars from lasso_now.md (house doctrine)
+  services  - LASSO own accounts ONLY; drawn from brand_voice/lasso_services.md;
+              stub or missing file = SKIP (never fabricate)
 
 Platform sub-topics (10 items, rotates deterministically; no repeat within 10 days):
   ads, google, nurture, website, social, portal,
@@ -185,3 +187,77 @@ def apply_daily_format(day_key, has_clip, account_key=""):
         _ops.alert(msg)
         return fallback or "infographic"
     return fmt
+
+
+# ---- Services category (LASSO own accounts only) ------------------------------------
+
+# Days between services slots. Keeps the category appearing once every 10-14 days,
+# matching the intended promotional cadence without flooding the feed.
+SERVICES_SLOT_INTERVAL = 12
+
+
+def is_services_stub(path):
+    """
+    Returns True if the services source doc is missing or contains no real content.
+
+    A file is considered a stub when every non-blank line starts with "#" or "TODO".
+    Any other non-blank line means the file has real content and the category may draft.
+    """
+    import os as _os
+    if not _os.path.exists(path):
+        return True
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return True
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") or stripped.startswith("TODO"):
+            continue
+        # A line that is neither blank, a heading, nor a TODO means real content.
+        return False
+    return True
+
+
+def is_lasso_own_account(account_key):
+    """
+    Returns True when account_key belongs to a LASSO own account.
+
+    All LASSO own account keys start with "lasso_" (e.g. lasso_ig, lasso_fb).
+    Client accounts never start with this prefix; they use their gym slug instead.
+    """
+    return str(account_key).startswith("lasso_")
+
+
+def draft_services_slot(account, source_path=None):
+    """
+    Attempt to build a services-category slot for a LASSO own account.
+
+    Gates (in order):
+      1. AGENT_SERVICES_CATEGORY flag must be ON.
+      2. account.key must start with "lasso_" (LASSO own only, never client).
+      3. source_path must not be a stub/empty file; stub -> ops alert + return None.
+
+    Returns a dict {"category": "services", "source": <path>, "account_key": <key>}
+    when all gates pass, None otherwise.
+    """
+    from . import config as _cfg
+    from . import ops_alerts as _ops
+
+    if not _cfg.services_category_enabled():
+        return None
+
+    if not is_lasso_own_account(account.key):
+        return None
+
+    if source_path is None:
+        source_path = "brand_voice/lasso_services.md"
+
+    if is_services_stub(source_path):
+        _ops.alert("services category skipped: lasso_services.md is empty or stub only")
+        return None
+
+    return {"category": "services", "source": source_path, "account_key": account.key}

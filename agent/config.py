@@ -917,3 +917,9 @@ def clipper_render_output_dir() -> str:
     """Where rendered Reels are written (env AGENT_CLIPPER_RENDER_DIR, default
     /data/clipper/render on the persistent volume)."""
     return os.environ.get("AGENT_CLIPPER_RENDER_DIR", "/data/clipper/render")
+
+
+def services_category_enabled() -> bool:
+    """Services category for LASSO own accounts ONLY, never client accounts. OFF by default.
+    Draws from brand_voice/lasso_services.md; stub file = SKIP not fabricate."""
+    return _truthy(os.environ.get("AGENT_SERVICES_CATEGORY", "false"))
