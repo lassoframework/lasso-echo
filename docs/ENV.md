@@ -120,8 +120,9 @@ before this file existed.
 | Var | Default | Owner | Notes |
 |---|---|---|---|
 | AGENT_INTAKE_ENABLED | false | BLAKE | Gates the page AND the worker AND doc intake. |
-| AGENT_INTAKE_TOKEN_`<CLIENTKEY>` | (unset) | BLAKE | Per account: the tokenized upload link. |
-| AGENT_UPLOAD_BASE_URL | (unset) | BLAKE | Public base of the intake web service (also builds the upload_url the portal API returns). |
+| AGENT_INTAKE_SIGNING_SECRET | (unset) | BLAKE | The ONE shared secret that signs every gym's intake/upload link. Set it once on the intake-web AND listener services; NEVER on the ops portal. No per-gym var, no redeploy per gym. Mint a gym's links with `python -m agent intake-link --account <key>`. Never logged. Rotating it invalidates every signed link at once (legacy per-gym tokens, if any, survive). |
+| AGENT_INTAKE_TOKEN_`<CLIENTKEY>` | (unset) | BLAKE | **LEGACY / deprecated.** Per-account pinned token, still honored as an override so a gym already on an old link keeps it during cutover. Not needed for new gyms once the signing secret is set. |
+| AGENT_UPLOAD_BASE_URL | (unset) | BLAKE | Public base of the intake web service (builds the absolute intake/upload links and the upload_url the portal API returns). |
 | AGENT_INTAKE_PORTAL_ORIGIN | "" (same-origin only) | BLAKE | The ONE origin allowed to POST JSON intakes cross-origin (the ops portal). Never all origins. |
 | PORT | 8080 | code | Railway sets it on the web service. |
 | AGENT_INTAKE_MAX_FILE_MB / AGENT_INTAKE_MAX_REQUEST_MB | code defaults | code | |
