@@ -346,6 +346,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
             if draft is None and account.key.startswith("lasso"):
                 draft = build_daily_infographic_draft(account, day_key)
+            # CLIENT SOURCES (AGENT_CLIENT_SOURCES, OFF by default). A client
+            # (non-LASSO) account drafts the day from its OWN approved sources +
+            # uploaded library, spread across categories. OFF, or no approved
+            # source for the day, -> None, and the library pick below runs exactly
+            # as today. Book/summit stay LASSO-only (never reached here).
+            if (draft is None and config.client_sources_enabled()
+                    and not account.key.startswith("lasso")):
+                from .client_content import build_client_draft
+                draft = build_client_draft(account, day_key, acct_voice, acct_lib,
+                                           poster=poster)
             if draft is None:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
                 draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
