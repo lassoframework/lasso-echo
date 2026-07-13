@@ -110,6 +110,20 @@ def handle_action(action, draft, actor_slack_id, note="",
         pub = publisher or _publisher_for(acct)
         try:
             result = pub.publish(draft, acct)   # draft-only guard lives inside publish()
+        except meta_publisher.MediaNotReady as e:
+            # KNOWN, RETRYABLE: the media container never finished processing on
+            # Meta's side, so NOTHING published. Hold the card for a retry with a
+            # clear, non-alarming note — never the loud "publish attempt failed"
+            # alarm, because no post went out. The draft stays PENDING (we return
+            # before marking APPROVED), so tapping Approve again retries it.
+            ops_alerts.alert(f"held (media not ready) for {draft.account_key} draft "
+                             f"{draft.draft_id}: {e} Nothing published; the card is "
+                             "held. Approve again in a minute to retry.")
+            return ActionResult(ok=False, action="approve", draft_id=draft.draft_id,
+                                detail="Held: the media was still processing on "
+                                       "Meta's side after the wait window. Nothing "
+                                       "was published. Approve again in a minute to "
+                                       "retry.")
         except Exception as e:
             # Behavior unchanged (the error still raises to the caller); with
             # AGENT_OPS_ALERTS_ENABLED it also posts one loud ops alert first.

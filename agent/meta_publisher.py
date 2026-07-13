@@ -34,6 +34,15 @@ class PublishError(Exception):
     pass
 
 
+class MediaNotReady(PublishError):
+    """The media container never reached FINISHED (or it reported ERROR) inside
+    the poll window, so we did NOT publish. This is a KNOWN, RETRYABLE condition
+    (Meta processes the container asynchronously): the post did not go out and
+    the card should be HELD for a retry, not alarmed as a hard publish failure.
+    Subclass of PublishError so anything catching PublishError still catches it."""
+    pass
+
+
 class NotSupported(PublishError):
     pass
 
@@ -128,7 +137,13 @@ def _publish_instagram(client, account, draft, caption, token):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
-    # step 2: publish container
+    # step 2: the container is processed asynchronously; wait for FINISHED before
+    # publishing. Skipping this is what caused subcode 2207027 "The media is not
+    # ready for publishing" — we called media_publish before Meta finished.
+    _await_container_ready(client, base, container_id, token, label="media",
+                           max_tries=IMG_POLL_MAX_TRIES,
+                           interval=IMG_POLL_INTERVAL_SEC)
+    # step 3: publish the processed container
     r2 = client.post(
         f"{base}/{ig_id}/media_publish",
         data={"creation_id": container_id, "access_token": token},
@@ -175,17 +190,23 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 
+# Image containers usually finish in well under a second but can lag; poll
+# status_code before publishing. 30 tries x 2s ~= 60s ceiling.
+IMG_POLL_MAX_TRIES = 30
+IMG_POLL_INTERVAL_SEC = 2
+# Reels are heavier (video transcode); give them the same ~60s ceiling.
 REEL_POLL_MAX_TRIES = 20
 REEL_POLL_INTERVAL_SEC = 3
 
 
-def _await_reel_container(client, base, container_id, token,
-                          *, max_tries=REEL_POLL_MAX_TRIES,
-                          interval=REEL_POLL_INTERVAL_SEC, sleep=time.sleep):
+def _await_container_ready(client, base, container_id, token, *, label="media",
+                           max_tries, interval, sleep=time.sleep):
     """
-    Poll a REELS container's status_code until FINISHED. Raise on ERROR or if it
-    never finishes within the bounded retries. `sleep` is injectable so a test
-    never actually waits. Only runs once publishing is armed (guarded upstream).
+    Poll a media container's status_code until FINISHED, then return. Raise
+    MediaNotReady on ERROR or if it never finishes within the bounded retries
+    (a held-and-retry condition, NOT a hard failure). `sleep` is injectable so a
+    test never actually waits. Only runs once publishing is armed (guarded
+    upstream). READ-ONLY: one GET per poll, never a write.
     """
     for _ in range(max_tries):
         r = client.get(
@@ -198,10 +219,12 @@ def _await_reel_container(client, base, container_id, token,
         if status == "FINISHED":
             return
         if status == "ERROR":
-            raise PublishError(f"Reel container {container_id} processing failed (status ERROR).")
+            raise MediaNotReady(
+                f"{label} container {container_id} processing failed (status ERROR).")
         sleep(interval)
-    raise PublishError(
-        f"Reel container {container_id} not FINISHED after {max_tries} tries."
+    raise MediaNotReady(
+        f"{label} container {container_id} not FINISHED after {max_tries} tries "
+        f"(~{max_tries * interval}s)."
     )
 
 
@@ -234,7 +257,9 @@ def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
     _raise_for_status(r1)
     container_id = r1.json().get("id")
     # step 2: a Reel's video is processed asynchronously; wait for FINISHED.
-    _await_reel_container(client, base, container_id, token)
+    _await_container_ready(client, base, container_id, token, label="Reel",
+                           max_tries=REEL_POLL_MAX_TRIES,
+                           interval=REEL_POLL_INTERVAL_SEC)
     # step 3: publish the processed container
     r2 = client.post(
         f"{base}/{ig_id}/media_publish",
