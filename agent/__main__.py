@@ -690,6 +690,14 @@ def main(argv=None):
             if args[i] == "--dry":
                 dry = True; i += 1; continue
             i += 1
+        from . import config as _cfg
+        from .reporting import take_daily_snapshot
+        if _cfg.reporting_enabled():
+            print("Reporting: enabled")
+            if account:
+                take_daily_snapshot(account)
+        else:
+            print("Reporting: disabled (AGENT_REPORTING_ENABLED=false)")
         from .day30 import report_cli
         report_cli(account, dry)
     elif cmd == "runway":
