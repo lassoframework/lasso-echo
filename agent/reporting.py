@@ -12,7 +12,9 @@ Two honesty rules mirror the rest of Echo:
 fetch_insights() is the only read path and returns None while the flag is OFF.
 """
 
+import json
 import os
+from datetime import datetime, timezone
 
 from . import config
 
@@ -22,11 +24,198 @@ def fetch_insights(account, http=None):
     READ-ONLY insights fetch. Returns None when reporting is disabled (no network,
     no read). The real client (Meta Graph, views-based) is wired only when the flag
     is on; until then this is the safe no-op that keeps the report path inert.
+
+    Returns dict:
+      {
+        "current": {"followers": N, "views": sum_media_views,
+                    "engagements": sum_likes+comments, "posts": count},
+        "posts": [{"id": .., "views": N, "like_count": N,
+                   "comments_count": N, "saved": N, "reach": N}, ...]
+      }
+    or None on flag-off / missing credentials / network error.
     """
     if not config.reporting_enabled():
         return None
-    # Real read wiring lands here when armed (Meta Graph, on views). It NEVER writes.
-    return None
+
+    # Credentials are read lazily; a missing env var is not an error -- we
+    # return None gracefully so the caller never crashes on unconfigured accounts.
+    token = account.get_token() if callable(getattr(account, "get_token", None)) else getattr(account, "token", None)
+    user_id = account.get_target_id() if callable(getattr(account, "get_target_id", None)) else getattr(account, "target_id", None)
+
+    if not token or not user_id:
+        return None
+
+    if http is None:
+        import requests as http  # noqa: PLC0415
+
+    base = config.GRAPH_API_BASE
+
+    try:
+        # Fetch recent media with views-era fields. media_views is VIEWS.
+        media_url = (
+            f"{base}/{user_id}/media"
+            f"?fields=id,timestamp,like_count,comments_count,saved,reach,media_views"
+            f"&limit=100"
+            f"&access_token={token}"
+        )
+        media_resp = http.get(media_url, timeout=20)
+        media_resp.raise_for_status()
+        media_data = media_resp.json().get("data", [])
+
+        # Fetch follower count.
+        profile_url = (
+            f"{base}/{user_id}"
+            f"?fields=followers_count"
+            f"&access_token={token}"
+        )
+        profile_resp = http.get(profile_url, timeout=20)
+        profile_resp.raise_for_status()
+        followers = profile_resp.json().get("followers_count")
+
+    except Exception:
+        return None
+
+    posts_out = []
+    total_views = 0
+    total_engagements = 0
+    for item in media_data:
+        views = item.get("media_views")
+        likes = item.get("like_count", 0) or 0
+        comments = item.get("comments_count", 0) or 0
+        saved = item.get("saved", 0) or 0
+        reach = item.get("reach", 0) or 0
+        posts_out.append({
+            "id": item.get("id", ""),
+            "views": views,
+            "like_count": likes,
+            "comments_count": comments,
+            "saved": saved,
+            "reach": reach,
+        })
+        if views is not None:
+            total_views += views
+        total_engagements += likes + comments
+
+    return {
+        "current": {
+            "followers": followers,
+            "views": total_views,
+            "engagements": total_engagements,
+            "posts": len(posts_out),
+        },
+        "posts": posts_out,
+    }
+
+
+def take_daily_snapshot(account_key, now=None, http=None):
+    """
+    Fetch live insights for account_key and persist a row in the snapshots table.
+    Returns the current metrics dict or None when fetch returns nothing (flag off,
+    credentials missing, network error). Idempotent: INSERT OR REPLACE on
+    (account_key, date).
+    """
+    from . import accounts as _accounts, db as _db  # noqa: PLC0415
+
+    account = _accounts.get_account(account_key)
+    if account is None:
+        return None
+
+    result = fetch_insights(account, http=http)
+    if result is None:
+        return None
+
+    today = (now or datetime.now(timezone.utc)).date().isoformat()
+    current = result["current"]
+
+    with _db.connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO snapshots (account_key, date, metrics) "
+            "VALUES (?, ?, ?)",
+            (account_key, today, json.dumps(current)),
+        )
+        conn.commit()
+
+    return current
+
+
+def render_report(report):
+    """
+    Render a build_report() dict to a human-readable multi-line string.
+
+    Rules:
+      - No em dashes, en dashes, or hyphens in any output line.
+      - Negative numbers are written as "down N" not "-N".
+      - Missing metrics emit a "Data gap: <name>" line instead of raising.
+    """
+
+    def _v(val, *, fmt=None):
+        """Format a value or return 'no data'."""
+        if val is None:
+            return "no data"
+        if fmt == "pct" and isinstance(val, (int, float)):
+            return f"{round(val * 100, 2)}%"
+        if fmt == "signed" and isinstance(val, (int, float)):
+            if val > 0:
+                return f"up {val:,}"
+            if val < 0:
+                return f"down {abs(val):,}"
+            return "flat"
+        if isinstance(val, float):
+            return f"{val:g}"
+        if isinstance(val, int):
+            return f"{val:,}"
+        return str(val)
+
+    lines = []
+    key = report.get("account_key", "")
+    health = report.get("health", "unknown")
+    lines.append(f"ECHO REPORT {key} 30d health: {health}")
+
+    er = report.get("engagement_rate")
+    if er is not None:
+        lines.append(f"Engagement rate: {_v(er, fmt='pct')} (on views)")
+    else:
+        lines.append("Data gap: views")
+
+    followers_net = report.get("followers_net")
+    followers_growth_rate = report.get("followers_growth_rate")
+    if followers_net is not None:
+        growth_str = _v(followers_net, fmt="signed")
+        if followers_growth_rate is not None:
+            growth_pct = _v(followers_growth_rate, fmt="pct")
+            lines.append(f"Follower change: {growth_str} ({growth_pct})")
+        else:
+            lines.append(f"Follower change: {growth_str}")
+    else:
+        lines.append("Data gap: followers")
+
+    freq = report.get("posting_freq_current")
+    freq_base = report.get("posting_freq_baseline")
+    if freq is not None:
+        lines.append(f"Posts this period: {_v(freq)}")
+    if freq_base is not None:
+        lines.append(f"Posts baseline: {_v(freq_base)}")
+
+    top = report.get("top_posts") or []
+    if top:
+        ids = " ".join(p.get("id", "") for p in top if p.get("id"))
+        lines.append(f"Top posts: {ids}")
+
+    bottom = report.get("bottom_posts") or []
+    if bottom:
+        ids = " ".join(p.get("id", "") for p in bottom if p.get("id"))
+        lines.append(f"Bottom posts: {ids}")
+
+    gaps = report.get("gaps") or []
+    for g in gaps:
+        clean = g.replace("-", " ").replace("–", " ").replace("—", " ")
+        lines.append(f"Data gap: {clean}")
+
+    text = "\n".join(lines)
+    # Hard assertion: the standing law forbids dashes in marketing copy.
+    assert "—" not in text and "–" not in text, \
+        "render_report produced a dash character"
+    return text
 
 
 def _num(v):
