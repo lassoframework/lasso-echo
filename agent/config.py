@@ -579,11 +579,21 @@ def connect_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CONNECT_ENABLED", "false"))
 
 
+# ---- Intake signed tokens ----------------------------------------------------
+# One shared secret mints EVERY gym's intake/upload link (no per-gym env var, no
+# redeploy per gym). Read lazily by NAME in intake_tokens.py, never stored on an
+# object, never logged. Lives ONLY on the intake-web / listener service, never on
+# the ops portal. Legacy per-client AGENT_INTAKE_TOKEN_<KEY> values still verify
+# (env fallback) so the cutover is zero-downtime.
+INTAKE_SIGNING_SECRET_ENV = "AGENT_INTAKE_SIGNING_SECRET"  # name of the env var, not the value
+
+
 def intake_enabled() -> bool:
     """
     Texted-link intake switch (upload page + listener ingest). OFF by default: the
-    upload page 404s everything and the ingest step never runs. Tokens are per-client
-    env values (AGENT_INTAKE_TOKEN_<CLIENTKEY>), set by hand, never logged.
+    upload page 404s everything and the ingest step never runs. Links are signed
+    with one shared secret (AGENT_INTAKE_SIGNING_SECRET); legacy per-client env
+    values (AGENT_INTAKE_TOKEN_<CLIENTKEY>) still verify. Neither is ever logged.
     """
     return _truthy(os.environ.get("AGENT_INTAKE_ENABLED", "false"))
 
