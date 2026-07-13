@@ -36,7 +36,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from . import config
+from . import config, whatsapp_intake
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 
@@ -584,6 +584,27 @@ def build_server(port=None):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            # WhatsApp hub challenge verification (GET /whatsapp).
+            # 404 while the flag is off; 403 on a wrong token; 200 + challenge text on match.
+            if self.path.split("?")[0] == "/whatsapp":
+                if not config.whatsapp_intake_enabled():
+                    return self._deny(404, "not found")
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                mode = (qs.get("hub.mode") or [""])[0]
+                challenge = (qs.get("hub.challenge") or [""])[0]
+                verify_token = (qs.get("hub.verify_token") or [""])[0]
+                expected_token = os.environ.get("AGENT_WHATSAPP_VERIFY_TOKEN", "")
+                if mode == "subscribe" and expected_token and verify_token == expected_token:
+                    body_bytes = challenge.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body_bytes)))
+                    self.end_headers()
+                    self.wfile.write(body_bytes)
+                else:
+                    self._deny(403, "forbidden")
+                return
             # The intake FORM: /intake/<token>, same gate as the upload page
             # (flag off or unknown token = the same 404, on purpose).
             form_token = self._form_token()
@@ -613,6 +634,27 @@ def build_server(port=None):
             self.end_headers()
 
         def do_POST(self):
+            # WhatsApp incoming webhook (POST /whatsapp).
+            # 404 while the flag is off; 403 on signature failure; 200 on success.
+            # Raw body is read first (signature covers the exact bytes).
+            if self.path.split("?")[0] == "/whatsapp":
+                if not config.whatsapp_intake_enabled():
+                    return self._deny(404, "not found")
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(length)
+                result = whatsapp_intake.handle_webhook(
+                    dict(self.headers), raw_body)
+                if result is None:
+                    return self._deny(404, "not found")
+                if not result.get("ok"):
+                    return self._deny(403, "forbidden")
+                body_bytes = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                self.wfile.write(body_bytes)
+                return
             # The intake route: a JSON body is the ops portal's API call; a
             # urlencoded body is the gym-facing form. Both land in R2 for the
             # listener's ingest to route through submit_intake() as PENDING
