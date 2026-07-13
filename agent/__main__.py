@@ -256,6 +256,8 @@ _COMMANDS = {
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
         ("intake-link", "mint a gym's signed intake + upload links (--account <key>)"),
+        ("intake-revoke", "kill one gym's signed link via the R2 denylist (--account <key>)"),
+        ("intake-unrevoke", "restore one gym's revoked link (--account <key>)"),
         ("intake-create", "create drafts from an intake payload"),
     ],
     "content & library": [
@@ -362,6 +364,30 @@ def main(argv=None):
             print(f"account : {account.strip().lower()}")
             print(f"intake  : {form}")
             print(f"upload  : {upload}")
+    elif cmd in ("intake-revoke", "intake-unrevoke"):
+        # Kill (or restore) ONE gym's signed link via the R2 denylist, without
+        # rotating the shared secret on everyone. Runs where R2 creds live.
+        from . import intake_web
+        account, args = "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] in ("--account", "--key") and i + 1 < len(args):
+                account = args[i + 1]; i += 2; continue
+            i += 1
+        if not account:
+            print(f"usage: python -m agent {cmd} --account <key>")
+        else:
+            try:
+                fn = intake_web.revoke if cmd == "intake-revoke" else intake_web.unrevoke
+                revoked = fn(account)
+            except RuntimeError:
+                print("storage unavailable; set R2 credentials for the intake bucket.")
+            except Exception as e:
+                print(f"{cmd} failed: {type(e).__name__}: {e}")
+            else:
+                verb = "revoked" if cmd == "intake-revoke" else "restored"
+                print(f"{verb}: {account.strip().lower()}")
+                print(f"denylist now: {', '.join(revoked) if revoked else '(empty)'}")
     elif cmd == "intake-create":
         # Tenant scaffold from a completed intake form JSON (AGENT_INTAKE_ENABLED).
         from .tenants import intake_create_cli

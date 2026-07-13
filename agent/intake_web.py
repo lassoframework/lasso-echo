@@ -78,6 +78,83 @@ def client_for_token(token):
     return None
 
 
+# ---- per-gym revocation (an R2 denylist; this service touches R2 only) ----------
+# Rotating the shared secret kills EVERY link; the denylist kills ONE gym's link
+# without touching the rest. It lives in R2 (never /data) so the intake-web
+# process can read it at verify time. Read fresh each request so a kill switch
+# takes effect immediately; fail OPEN on a flaky read (a denylist outage never
+# takes every intake link down, and a revoked link is re-killed when R2 recovers).
+_DENYLIST_KEY = "intake/_control/denylist.json"
+
+
+def _read_denylist(r2):
+    """The denylist dict from R2; {'revoked': []} when the object does not exist.
+    RAISES on a real storage error, so the WRITE path never clobbers a denylist it
+    failed to read (get_bytes returns None only on a missing key)."""
+    raw = r2.get_bytes(_DENYLIST_KEY)
+    if not raw:
+        return {"revoked": []}
+    data = json.loads(raw)
+    if isinstance(data, dict) and isinstance(data.get("revoked"), list):
+        return data
+    return {"revoked": []}
+
+
+def revoked_clients(r2=None):
+    """The set of revoked client keys, or empty on any problem (fail OPEN on the
+    verify path). Read fresh so revocation is immediate."""
+    r2 = r2 or _default_r2()
+    if r2 is None:
+        return set()
+    try:
+        data = _read_denylist(r2)
+    except Exception:
+        return set()
+    return {str(k).strip().lower()
+            for k in data.get("revoked", []) if str(k).strip()}
+
+
+def is_revoked(client, r2=None):
+    """True when this client key is on the R2 denylist. A revoked link is a 404
+    everywhere, exactly like an unknown token."""
+    if not client:
+        return False
+    return client.strip().lower() in revoked_clients(r2)
+
+
+def _write_denylist(client_key, r2, now, add):
+    client_key = (client_key or "").strip().lower()
+    if not client_key:
+        raise ValueError("client_key is required")
+    r2 = r2 or _default_r2()
+    if r2 is None:
+        raise RuntimeError("storage unavailable")
+    data = _read_denylist(r2)   # RAISES on a real read error (never clobbers)
+    current = {str(k).strip().lower()
+               for k in data.get("revoked", []) if str(k).strip()}
+    if add:
+        current.add(client_key)
+    else:
+        current.discard(client_key)
+    data["revoked"] = sorted(current)
+    data["updated"] = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    r2.put_bytes(_DENYLIST_KEY, json.dumps(data).encode("utf-8"),
+                 content_type="application/json")
+    return data["revoked"]
+
+
+def revoke(client_key, r2=None, now=None):
+    """Add a client key to the R2 denylist (idempotent). Its link 404s on the next
+    verify. Returns the new sorted revoked list."""
+    return _write_denylist(client_key, r2, now, add=True)
+
+
+def unrevoke(client_key, r2=None, now=None):
+    """Remove a client key from the R2 denylist (idempotent). Its link works
+    again. Returns the new sorted revoked list."""
+    return _write_denylist(client_key, r2, now, add=False)
+
+
 def link_for(client_key, kind="u"):
     """The full signed intake link for a client key, or '' when it cannot be built
     (no signing secret set). kind='u' is the media upload page; kind='intake' is
@@ -139,7 +216,7 @@ def handle_upload(token, files, note="", r2=None, now=None):
     if not config.intake_enabled():
         return 404, {"error": "not found"}
     client = client_for_token(token)
-    if client is None:
+    if client is None or is_revoked(client, r2):
         return 404, {"error": "not found"}
 
     ok, reason = validate_files(files)
@@ -211,7 +288,7 @@ def handle_intake_form(token, fields, r2=None, now=None):
     if not config.intake_enabled():
         return 404, {"error": "not found"}
     client = client_for_token(token)
-    if client is None:
+    if client is None or is_revoked(client, r2):
         return 404, {"error": "not found"}
 
     answers = {k: (fields.get(k) or "").strip()[:_FIELD_MAX] for k in FORM_FIELDS}
@@ -346,7 +423,7 @@ def handle_portal_intake(token, body, r2=None, now=None):
     if not config.intake_enabled():
         return 404, {"error": "not found"}
     client = client_for_token(token)
-    if client is None:
+    if client is None or is_revoked(client, r2):
         return 404, {"error": "not found"}
     if not isinstance(body, dict):
         return 400, {"error": "a JSON object is required"}
@@ -394,6 +471,20 @@ class _R2:
     def put_bytes(self, key, data, content_type="application/octet-stream"):
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data,
                             ContentType=content_type)
+
+    def get_bytes(self, key):
+        """Bytes at a key, or None ONLY when the key does not exist. Re-raises any
+        real storage error so callers that must not clobber (the denylist writer)
+        can tell 'empty' from 'unreadable'."""
+        from botocore.exceptions import ClientError
+        try:
+            resp = self._s3.get_object(Bucket=self._bucket, Key=key)
+            return resp["Body"].read()
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("NoSuchKey", "NoSuchBucket", "404"):
+                return None
+            raise
 
     def total_bytes(self, prefix):
         """Measured bytes under a prefix (the quota gate's input), paginated."""
@@ -616,11 +707,17 @@ def build_server(port=None):
             # (flag off or unknown token = the same 404, on purpose).
             form_token = self._form_token()
             if form_token is not None:
-                if not config.intake_enabled() or client_for_token(form_token) is None:
+                if not config.intake_enabled():
+                    return self._deny()
+                client = client_for_token(form_token)
+                if client is None or is_revoked(client):
                     return self._deny()
                 return self._send_html(FORM_PAGE)
             token = self._token()
-            if not config.intake_enabled() or not token or client_for_token(token) is None:
+            if not config.intake_enabled() or not token:
+                return self._deny()
+            client = client_for_token(token)
+            if client is None or is_revoked(client):
                 return self._deny()
             return self._send_html(PAGE)
 
