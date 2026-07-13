@@ -26,7 +26,11 @@ It ships dark: every route except `/healthz` answers 404 until
    - Do NOT attach a volume. This service must never see /data.
 5. Open the service's **Settings > Networking** and click
    **Generate Domain**. Note the URL (e.g. `echo-intake-web.up.railway.app`).
-   This is the base for client upload links: `https://<domain>/u/<token>`.
+   This is the base for both client links (same token, same env var):
+   - intake form: `https://<domain>/intake/<token>` (the gym fills the seven
+     section LASSO social intake; answers land as PENDING sources for that
+     account and the confirmation offers the upload page)
+   - media upload: `https://<domain>/u/<token>`
 6. Open the **Variables** tab and set the env vars below.
 7. Deploy (Railway auto-deploys on save). Watch the logs for:
 

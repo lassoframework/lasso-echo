@@ -163,13 +163,94 @@ def process_all(r2=None, poster=None, converter=None, phash=None, moderator=None
     return results
 
 
+# Intake FORM sections that become PENDING sources, mapped to their client
+# source category. Everything else in the payload (voice, audience, media notes,
+# gym basics) is BIBLE material, kept in the archived form for draft-bible.
+_FORM_SOURCE_SECTIONS = (
+    ("offers", "offer", "intake form"),
+    ("pricing_rule", "offer", "intake form pricing rule, exact wording"),
+    ("services", "service", "intake form"),
+    ("proof", "testimonial", "intake form"),
+    ("about", "about", "intake form"),
+)
+
+
+def _land_intake_form(client, payload, r2, key, manifest):
+    """Route one submitted intake form through the client-sources path: fact
+    sections land as PENDING sources (never auto approved, deduped so a second
+    submission adds nothing twice); the approver + gym basics are held as an
+    account proposal (kv + audit, applied by a human only); the full payload is
+    archived to intake/<client>/forms/ for the bible draft."""
+    from . import client_sources, db
+    answers = payload.get("answers") or {}
+
+    bundle, existing = {}, {(s.category, s.text)
+                            for s in client_sources.all_sources(client)}
+    for field, category, citation in _FORM_SOURCE_SECTIONS:
+        for line in (answers.get(field) or "").splitlines():
+            fact = line.strip().lstrip("-*").strip()
+            if fact and (category, fact) not in existing:
+                existing.add((category, fact))
+                bundle.setdefault(category, []).append((fact, citation))
+    created = client_sources.submit_intake(client, bundle, status="pending") \
+        if bundle else []
+
+    proposal = {k: (answers.get(k) or "").strip()
+                for k in ("gym_name", "city", "website",
+                          "approver_name", "approver_contact")}
+    if any(proposal.values()):
+        db.kv_set(f"account_proposal_{client}", json.dumps(
+            {**proposal, "timestamp": payload.get("timestamp", "")}))
+        db.audit("account_proposal", client,
+                 "intake form proposal held (gym basics + approver); apply to "
+                 "the Account record by hand", client)
+
+    # archive the FULL payload (voice/audience/media notes included) for the
+    # bible draft, then consume the incoming object
+    r2.put_bytes(f"intake/{client}/forms/{os.path.basename(key)}",
+                 json.dumps(payload).encode("utf-8"),
+                 content_type="application/json")
+    r2.delete(key)
+    manifest["processed"].append(key)
+    ops_alerts.alert(
+        f"intake form received for {client}: {len(created)} pending source(s) "
+        "to review (approve before they can draft), account proposal held. Run "
+        f"`python -m agent preflight --account {client}` when applied.")
+    return len(created)
+
+
 def _process_client(client, r2, poster, converter, phash, moderator):
-    stats = {"accepted": 0, "duplicates": 0, "flagged": 0, "deadlettered": 0, "skipped": 0}
+    stats = {"accepted": 0, "duplicates": 0, "flagged": 0, "deadlettered": 0,
+             "skipped": 0, "intake_forms": 0}
     manifest = _load_manifest(r2, client)
     prefix = f"intake/{client}/incoming/"
     keys = sorted(r2.list_keys(prefix))
     sidecars = {k: None for k in keys if k.endswith("_upload.json")}
     media_keys = [k for k in keys if not k.endswith(".json")]
+    form_keys = [k for k in keys if k.endswith("_intake.json")]
+
+    # Intake FORM submissions first: they are tiny and carry the sources the
+    # media may pair with. A malformed payload dead-letters; never crashes.
+    for key in form_keys:
+        if key in manifest["processed"]:
+            stats["skipped"] += 1
+            continue
+        try:
+            payload = json.loads(r2.get_bytes(key).decode("utf-8"))
+            _land_intake_form(client, payload, r2, key, manifest)
+            stats["intake_forms"] += 1
+        except Exception as e:
+            stats["deadlettered"] += 1
+            try:
+                r2.put_bytes(f"intake/{client}/deadletter/{os.path.basename(key)}",
+                             r2.get_bytes(key))
+                r2.delete(key)
+            except Exception as dl_err:
+                print(f"[intake] form dead-letter failed for {client}/"
+                      f"{os.path.basename(key)}: {type(dl_err).__name__}")
+            manifest["processed"].append(key)
+            ops_alerts.alert(f"intake form dead-lettered {client}/"
+                             f"{os.path.basename(key)}: {type(e).__name__}: {e}")
 
     # note lookup: a media file's sidecar shares its timestamp prefix
     def _note_for(media_key):
