@@ -87,6 +87,47 @@ def add_source(account_key, category, text, citation="", status="approved"):
                         text=text, citation=citation, status=status)
 
 
+def submit_intake(account_key, bundle, status="pending", default_citation=""):
+    """
+    Land a client's intake bundle (the intake form, or uploaded material) as
+    source docs for THAT account, PENDING by default — held for human approval
+    before Echo can draft from it. Client input is NEVER auto-trusted as fact.
+
+    bundle: {category: [item, ...]} where each item is either the fact string or
+    a (text, citation) pair. Blank items are skipped. Returns the list of
+    ClientSource created. Validates every category up front, so an unknown
+    category raises and NOTHING is stored (all-or-nothing).
+    """
+    account_key = (account_key or "").strip()
+    if not account_key:
+        raise ValueError("account_key is required")
+    if status not in _STATUSES:
+        raise ValueError(f"status must be one of {_STATUSES}, got {status!r}")
+    # Validate + normalize BEFORE any insert so a malformed bundle stores nothing.
+    normalized = []
+    for category, items in (bundle or {}).items():
+        cat = (category or "").strip().lower()
+        if cat not in CLIENT_CATEGORIES:
+            raise ValueError(
+                f"unknown category {category!r}; one of {CLIENT_CATEGORIES}")
+        for item in (items or []):
+            if isinstance(item, (list, tuple)):
+                text = item[0] if item else ""
+                citation = item[1] if len(item) > 1 else ""
+            else:
+                text, citation = item, ""
+            if not (text or "").strip():
+                continue  # skip blank lines quietly
+            citation = (citation or "").strip() or default_citation \
+                or f"intake:{account_key}"
+            normalized.append((cat, text, citation))
+    created = [add_source(account_key, cat, text, citation, status=status)
+              for cat, text, citation in normalized]
+    db.audit("client_intake", account_key,
+             f"landed {len(created)} {status} source(s)", account_key)
+    return created
+
+
 def _rows(account_key, status=None, category=None):
     q = ("SELECT id, account_key, category, text, citation, status, created_at "
          "FROM client_sources WHERE account_key=?")
