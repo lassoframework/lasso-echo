@@ -11,6 +11,7 @@ agent.approvals.handle_action(...). A minimal manual hook is included for
 testing the reply protocol locally.
 """
 import os
+import re
 import sys
 
 from . import config
@@ -260,6 +261,74 @@ def _capture_baseline():
     capture_baseline()
 
 
+def _config_check():
+    """Audit env vars read in agent/ code against docs/ENV.md.
+    Informational only: exit 0 always, never a CI blocker."""
+    import pathlib
+
+    agent_dir = pathlib.Path(__file__).parent
+    repo_root = agent_dir.parent
+
+    # --- 1. Scan all .py files in agent/ for os.environ reads ---
+    # Match both os.environ.get("VARNAME" ...) and os.environ["VARNAME"]
+    env_get_pattern = re.compile(r'os\.environ\.get\(\s*["\']([A-Z][A-Z0-9_]+)["\']')
+    env_index_pattern = re.compile(r'os\.environ\[\s*["\']([A-Z][A-Z0-9_]+)["\']')
+
+    code_vars = {}  # varname -> first filename found
+    for py_file in sorted(agent_dir.glob("*.py")):
+        text = py_file.read_text(errors="replace")
+        for name in env_get_pattern.findall(text):
+            if name not in code_vars:
+                code_vars[name] = py_file.name
+        for name in env_index_pattern.findall(text):
+            if name not in code_vars:
+                code_vars[name] = py_file.name
+
+    # --- 2. Parse docs/ENV.md for documented var names ---
+    env_md_path = repo_root / "docs" / "ENV.md"
+    documented = set()
+    if env_md_path.exists():
+        md_text = env_md_path.read_text(errors="replace")
+        # Table rows like: | VARNAME | ...
+        table_pattern = re.compile(r'\|\s*([A-Z][A-Z0-9_]+(?:[/<>][A-Z_][A-Z0-9_/<>]*)*)\s*[|/]')
+        for match in table_pattern.finditer(md_text):
+            raw = match.group(1)
+            # Compound entries like AGENT_S3_BUCKET / AGENT_S3_ENDPOINT split on /
+            for part in re.split(r'[/<>]', raw):
+                part = part.strip()
+                if re.match(r'^[A-Z][A-Z0-9_]{1,}$', part):
+                    documented.add(part)
+        # Also pick up bare ALL_CAPS identifiers in code blocks and prose
+        bare_pattern = re.compile(r'\b([A-Z][A-Z0-9_]{3,})\b')
+        for name in bare_pattern.findall(md_text):
+            documented.add(name)
+
+    # --- 3. Compute undocumented vars ---
+    # PORT is Railway-injected; skip it.  Only flag AGENT_* and known external vars.
+    known_external = {"META_APP_ID", "META_APP_SECRET", "OPUS_API_KEY",
+                      "ANTHROPIC_API_KEY"}
+    skip_vars = {"PORT"}
+    undocumented = {}
+    for var, fname in sorted(code_vars.items()):
+        if var in skip_vars:
+            continue
+        is_agent = var.startswith("AGENT_")
+        is_known_external = var in known_external
+        if not is_agent and not is_known_external:
+            continue
+        if var not in documented:
+            undocumented[var] = fname
+
+    # --- 4. Print report ---
+    print("=== config-check ===")
+    print(f"Vars read in code: {len(code_vars)}")
+    print(f"Vars documented in ENV.md: {len(documented)}")
+    print(f"Potentially undocumented ({len(undocumented)}):")
+    for var, fname in sorted(undocumented.items()):
+        print(f"  {var}  ({fname})")
+    print("=== done ===")
+
+
 _COMMANDS = {
     "daily loop": [
         ("run-daily", "draft one post per account, card each for approval"),
@@ -312,6 +381,7 @@ _COMMANDS = {
         ("capture-baseline", "pre-Echo posting baseline (read-only)"),
         ("restore-store", "restore the draft store from a backup"),
         ("whatsapp-status", "show WhatsApp intake env status"),
+        ("config-check", "audit env vars: code vs docs/ENV.md"),
     ],
 }
 
@@ -880,6 +950,8 @@ def main(argv=None):
         _capture_baseline()
     elif cmd == "whatsapp-status":
         _whatsapp_status()
+    elif cmd == "config-check":
+        _config_check()
     elif cmd == "status":
         _status()
     elif cmd in ("help", "--help", "-h"):
