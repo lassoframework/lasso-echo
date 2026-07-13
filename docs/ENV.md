@@ -121,7 +121,8 @@ before this file existed.
 |---|---|---|---|
 | AGENT_INTAKE_ENABLED | false | BLAKE | Gates the page AND the worker AND doc intake. |
 | AGENT_INTAKE_TOKEN_`<CLIENTKEY>` | (unset) | BLAKE | Per account: the tokenized upload link. |
-| AGENT_UPLOAD_BASE_URL | (unset) | BLAKE | Public base of the intake web service. |
+| AGENT_UPLOAD_BASE_URL | (unset) | BLAKE | Public base of the intake web service (also builds the upload_url the portal API returns). |
+| AGENT_INTAKE_PORTAL_ORIGIN | "" (same-origin only) | BLAKE | The ONE origin allowed to POST JSON intakes cross-origin (the ops portal). Never all origins. |
 | PORT | 8080 | code | Railway sets it on the web service. |
 | AGENT_INTAKE_MAX_FILE_MB / AGENT_INTAKE_MAX_REQUEST_MB | code defaults | code | |
 | AGENT_INTAKE_RATE_PER_MINUTE | code default | code | Per-IP rate limit. |

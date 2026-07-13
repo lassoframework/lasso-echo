@@ -195,8 +195,10 @@ def _land_intake_form(client, payload, r2, key, manifest):
     created = client_sources.submit_intake(client, bundle, status="pending") \
         if bundle else []
 
+    # HELD proposal, never applied live: overwrites in place, so a re-submission
+    # UPDATES the pending proposal rather than stacking a second one.
     proposal = {k: (answers.get(k) or "").strip()
-                for k in ("gym_name", "city", "website",
+                for k in ("gym_name", "city", "website", "ig_handle", "fb_page",
                           "approver_name", "approver_contact")}
     if any(proposal.values()):
         db.kv_set(f"account_proposal_{client}", json.dumps(

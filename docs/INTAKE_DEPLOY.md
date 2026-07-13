@@ -31,6 +31,11 @@ It ships dark: every route except `/healthz` answers 404 until
      section LASSO social intake; answers land as PENDING sources for that
      account and the confirmation offers the upload page)
    - media upload: `https://<domain>/u/<token>`
+   The same intake route doubles as the ops portal's API: a POST with a JSON
+   body (Content-Type application/json) lands the portal's intake payload the
+   same way and returns {status, account_key, pending_source_count, upload_url}.
+   Cross-origin calls are allowed ONLY from AGENT_INTAKE_PORTAL_ORIGIN (set it
+   to the portal's origin; empty = same-origin only, never all origins).
 6. Open the **Variables** tab and set the env vars below.
 7. Deploy (Railway auto-deploys on save). Watch the logs for:
 

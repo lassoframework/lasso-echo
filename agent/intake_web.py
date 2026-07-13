@@ -213,6 +213,150 @@ def handle_intake_form(token, fields, r2=None, now=None):
     return 200, {"ok": True, "client": client}
 
 
+# ---- the portal intake API (JSON POST from the ops portal) ----------------------
+def portal_origin():
+    """The single origin allowed to call the JSON intake endpoint cross-origin
+    (env AGENT_INTAKE_PORTAL_ORIGIN, e.g. https://portal.lassoframework.com).
+    Default empty = same-origin only; never all origins."""
+    return os.environ.get("AGENT_INTAKE_PORTAL_ORIGIN", "").strip().rstrip("/")
+
+
+def origin_allowed(origin, host):
+    """True when a request Origin may hit the JSON endpoint: absent (server to
+    server, no CORS in play), same-origin (its host equals our Host header), or
+    exactly the configured portal origin."""
+    if not origin:
+        return True
+    from urllib.parse import urlparse
+    if host and urlparse(origin).netloc == host:
+        return True
+    allowed = portal_origin()
+    return bool(allowed) and origin.rstrip("/") == allowed
+
+
+def _lines(value):
+    """A JSON value as newline-joined text: lists join, strings pass, else ''. """
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip() if value else ""
+
+
+def normalize_portal_intake(body):
+    """The portal's nested 7-section JSON flattened to the intake answers shape
+    the listener's ingest already lands (fact sections -> PENDING sources; gym
+    basics + approver -> the HELD account proposal; the rest is bible material
+    kept in the archived payload)."""
+    body = body or {}
+    gym = body.get("gym") or {}
+    voice = body.get("voice") or {}
+    offers = body.get("offers") or {}
+    audience = body.get("audience") or {}
+    proof = body.get("proof") or {}
+    approver = body.get("approver") or {}
+
+    voice_parts = [
+        f"Vibe: {_lines(voice.get('vibe'))}" if voice.get("vibe") else "",
+        f"Words to use: {_lines(voice.get('words_to_use'))}"
+        if voice.get("words_to_use") else "",
+        f"Words to never use: {_lines(voice.get('words_to_never_use'))}"
+        if voice.get("words_to_never_use") else "",
+        f"Sample posts: {_lines(voice.get('sample_post_links'))}"
+        if voice.get("sample_post_links") else "",
+    ]
+    audience_parts = [
+        f"Ideal member: {_lines(audience.get('ideal_member'))}"
+        if audience.get("ideal_member") else "",
+        f"Prior struggles: {_lines(audience.get('prior_struggles'))}"
+        if audience.get("prior_struggles") else "",
+    ]
+    name = str(approver.get("name", "")).strip()
+    role = str(approver.get("role", "")).strip()
+    contact = ", ".join(v for v in (str(approver.get("cell", "")).strip(),
+                                    str(approver.get("email", "")).strip()) if v)
+    return {
+        "gym_name": str(gym.get("name", "")).strip(),
+        "city": _lines(gym.get("locations")),
+        "website": str(gym.get("website", "")).strip(),
+        "ig_handle": str(gym.get("ig_handle", "")).strip(),
+        "fb_page": str(gym.get("fb_page", "")).strip(),
+        "about": "",
+        "voice": "\n".join(p for p in voice_parts if p),
+        "offers": _lines(offers.get("front_door_offer")),
+        "services": _lines(offers.get("services")),
+        "pricing_rule": _lines(offers.get("exact_pricing_wording")),
+        "audience": "\n".join(p for p in audience_parts if p),
+        "proof": "\n".join(v for v in (_lines(proof.get("wins")),
+                                       _lines(proof.get("verifiable_numbers"))) if v),
+        "media_notes": _lines(body.get("media_notes")),
+        "approver_name": f"{name} ({role})" if name and role else (name or role),
+        "approver_contact": contact,
+    }
+
+
+def _count_source_facts(answers):
+    """How many facts this submission sends toward PENDING sources (the ingest
+    lands them; anything already on file is collapsed there, so a re-POST can
+    land fewer than this count)."""
+    from .intake_ingest import _FORM_SOURCE_SECTIONS  # single source of truth
+    n = 0
+    for field, _category, _citation in _FORM_SOURCE_SECTIONS:
+        for line in (answers.get(field) or "").splitlines():
+            if line.strip().lstrip("-*").strip():
+                n += 1
+    return n
+
+
+def handle_portal_intake(token, body, r2=None, now=None):
+    """
+    The whole portal-POST decision, pure and offline-testable. Returns
+    (status, response_dict). 404 whenever the feature is off or the token is
+    unknown (indistinguishable on purpose); 400 on an empty/invalid body; 503
+    without storage; 200 with {status, account_key, pending_source_count,
+    upload_url}. The payload lands in R2 for the LISTENER's ingest to route
+    through submit_intake() as PENDING sources (this process never touches
+    /data); a re-POST lands a fresh payload whose sources dedupe at ingest and
+    whose account proposal replaces the held one in place.
+    """
+    if not config.intake_enabled():
+        return 404, {"error": "not found"}
+    client = client_for_token(token)
+    if client is None:
+        return 404, {"error": "not found"}
+    if not isinstance(body, dict):
+        return 400, {"error": "a JSON object is required"}
+
+    answers = {k: v[:_FIELD_MAX] for k, v in normalize_portal_intake(body).items()}
+    if not answers["gym_name"]:
+        return 400, {"error": "gym.name is required"}
+    if not any(v for k, v in answers.items() if k != "gym_name"):
+        return 400, {"error": "the intake is empty"}
+
+    r2 = r2 or _default_r2()
+    if r2 is None:
+        return 503, {"error": "storage unavailable"}
+
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    payload = {
+        "kind": "intake_form",
+        "source": "portal",
+        "client": client,
+        "answers": answers,
+        "portal": body,   # the raw sections, archived for the bible draft
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "timestamp": stamp,
+    }
+    r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
+                 json.dumps(payload).encode("utf-8"),
+                 content_type="application/json")
+    base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip().rstrip("/")
+    return 200, {
+        "status": "received",
+        "account_key": client,
+        "pending_source_count": _count_source_facts(answers),
+        "upload_url": f"{base}/u/{token}" if base else f"/u/{token}",
+    }
+
+
 class _R2:
     """Bytes-oriented R2/S3 wrapper for the upload path. Credentials from the same
     env names media hosting uses; read lazily, passed to boto3, never logged."""
@@ -400,6 +544,24 @@ def build_server(port=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_json(self, obj, status=200, cors_origin=""):
+            body = json.dumps(obj).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if cors_origin:
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
+                self.send_header("Vary", "Origin")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _origin_ok(self):
+            """(allowed, origin). Absent Origin (server to server) and
+            same-origin always pass; cross-origin passes ONLY when it equals
+            AGENT_INTAKE_PORTAL_ORIGIN. Never all origins."""
+            origin = (self.headers.get("Origin") or "").strip()
+            return origin_allowed(origin, self.headers.get("Host") or ""), origin
+
         def _deny(self, code=404, msg="not found"):
             body = msg.encode()
             self.send_response(code)
@@ -434,21 +596,49 @@ def build_server(port=None):
                 return self._deny()
             return self._send_html(PAGE)
 
+        def do_OPTIONS(self):
+            # CORS preflight for the portal's JSON POST. Answered ONLY for the
+            # intake route and ONLY for an allowed origin; everything else 404s.
+            if self._form_token() is None:
+                return self._deny()
+            allowed, origin = self._origin_ok()
+            if not allowed or not origin:
+                return self._deny(403, "origin not allowed")
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+            self.end_headers()
+
         def do_POST(self):
-            # The intake FORM submission: urlencoded, lands in R2 for the
+            # The intake route: a JSON body is the ops portal's API call; a
+            # urlencoded body is the gym-facing form. Both land in R2 for the
             # listener's ingest to route through submit_intake() as PENDING
-            # sources. The confirmation offers the upload page for the same
-            # token so photos come in the same sitting.
+            # sources; this process never touches /data.
             form_token = self._form_token()
             if form_token is not None:
+                allowed, origin = self._origin_ok()
+                if not allowed:
+                    return self._deny(403, "origin not allowed")
                 if not allow_request(self.client_address[0]):
                     return self._deny(429, "slow down")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > _max_request_bytes():
                     return self._deny(413, "too large")
+                raw = self.rfile.read(length)
+                ctype = (self.headers.get("Content-Type") or "").lower()
+                if ctype.startswith("application/json"):
+                    try:
+                        body = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        return self._send_json({"error": "invalid JSON"}, 400,
+                                               cors_origin=origin)
+                    status, resp = handle_portal_intake(form_token, body)
+                    return self._send_json(resp, status, cors_origin=origin)
                 from urllib.parse import parse_qs
-                parsed = parse_qs(self.rfile.read(length).decode("utf-8",
-                                                                 "replace"))
+                parsed = parse_qs(raw.decode("utf-8", "replace"))
                 fields = {k: v[0] for k, v in parsed.items() if v}
                 status, _body = handle_intake_form(form_token, fields)
                 if status == 200:
