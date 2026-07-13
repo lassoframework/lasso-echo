@@ -12,6 +12,7 @@ from env at send time and never logged.
 
 import json
 import os
+import time
 
 from . import config
 from .meta_publisher import _is_video
@@ -22,11 +23,67 @@ def _requests():
     return requests
 
 
+# Rate-limit backoff: a 12-account morning fan-out must not drop cards when
+# Slack answers 429. Every send retries up to SLACK_MAX_RETRIES times, honoring
+# the Retry-After header (falling back to exponential 1s/2s/4s). A hard failure
+# after the retries returns ok:False like any other failed send — the runner
+# alerts and moves to the next account, never crashes the fan-out.
+SLACK_MAX_RETRIES = 3
+SLACK_BACKOFF_BASE_SEC = 1.0
+
+
 class SlackPoster:
-    def __init__(self, http=None, token=None, channel=None):
+    def __init__(self, http=None, token=None, channel=None, sleep=None):
         self._http = http
         self._token = token or os.environ.get(config.SLACK_BOT_TOKEN_ENV)
         self._channel = channel or config.SLACK_CHANNEL_ID
+        self._sleep = sleep or time.sleep
+
+    def _send(self, url, payload):
+        """THE one Slack transport: every send (post, thread reply, card edit)
+        goes through here. Retries rate limits with backoff; degrades transport
+        errors to a failed-send dict; never raises into a caller."""
+        client = self._http or _requests()
+        delay = SLACK_BACKOFF_BASE_SEC
+        for attempt in range(SLACK_MAX_RETRIES + 1):
+            try:
+                resp = client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self._token}",
+                             "Content-Type": "application/json; charset=utf-8"},
+                    data=json.dumps(payload),
+                    timeout=30,
+                )
+            except Exception as e:
+                # A Slack outage/timeout must degrade to a failed send, never
+                # raise into the daily run or a card sweep.
+                print(f"[slack] transport error on {url.rsplit('/', 1)[-1]}: "
+                      f"{type(e).__name__}")
+                return {"ok": False, "error": "transport"}
+            status = getattr(resp, "status_code", 200)
+            rate_limited = status == 429
+            body = None
+            if not rate_limited:
+                try:
+                    body = resp.json()
+                except Exception:
+                    return {"ok": False}
+                rate_limited = (body or {}).get("error") == "ratelimited"
+            if rate_limited and attempt < SLACK_MAX_RETRIES:
+                try:
+                    wait = float((getattr(resp, "headers", None) or {})
+                                 .get("Retry-After") or delay)
+                except (TypeError, ValueError):
+                    wait = delay
+                print(f"[slack] rate limited (attempt {attempt + 1}); "
+                      f"retrying in {wait:.0f}s")
+                self._sleep(wait)
+                delay *= 2
+                continue
+            if rate_limited:
+                return {"ok": False, "error": "ratelimited"}
+            return body if body is not None else {"ok": False}
+        return {"ok": False, "error": "ratelimited"}
 
     def post_approval_card(self, draft):
         """Post one approval card. Returns the Slack API response dict.
@@ -63,27 +120,10 @@ class SlackPoster:
         state). Returns the Slack response dict; {"ok": False} without a ts."""
         if not ts:
             return {"ok": False, "error": "no_message_ref"}
-        client = self._http or _requests()
         payload = {"channel": channel or self._channel, "ts": ts, "text": text}
         if blocks:
             payload["blocks"] = blocks
-        try:
-            resp = client.post(
-                "https://slack.com/api/chat.update",
-                headers={"Authorization": f"Bearer {self._token}",
-                         "Content-Type": "application/json; charset=utf-8"},
-                data=json.dumps(payload),
-                timeout=30,
-            )
-        except Exception as e:
-            # A Slack outage must degrade to a failed edit, never raise into
-            # the caller — card updates run inside sweeps that serve everyone.
-            print(f"[slack] chat.update transport error: {type(e).__name__}")
-            return {"ok": False, "error": "transport"}
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": False}
+        return self._send("https://slack.com/api/chat.update", payload)
 
     def mark_superseded(self, draft):
         """Rewrite a superseded draft's card in place: header flipped to SUPERSEDED,
@@ -104,30 +144,12 @@ class SlackPoster:
         )
 
     def _chat_post(self, text, blocks, channel=None, thread_ts=None):
-        client = self._http or _requests()
         payload = {"channel": channel or self._channel, "text": text}
         if blocks:
             payload["blocks"] = blocks
         if thread_ts:
             payload["thread_ts"] = thread_ts
-        try:
-            resp = client.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {self._token}",
-                         "Content-Type": "application/json; charset=utf-8"},
-                data=json.dumps(payload),
-                timeout=30,
-            )
-        except Exception as e:
-            # A Slack timeout on one notice/card must never abort the daily
-            # run: the pre-loop voice notice and every per-account card share
-            # this path. Callers already treat a not-ok dict as a failed post.
-            print(f"[slack] chat.postMessage transport error: {type(e).__name__}")
-            return {"ok": False, "error": "transport"}
-        try:
-            return resp.json()
-        except Exception:
-            return {"ok": False}
+        return self._send("https://slack.com/api/chat.postMessage", payload)
 
 
 def _fallback_text(draft):

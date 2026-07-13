@@ -171,6 +171,15 @@ def _post_and_save(draft, store, poster, idempotent):
             db.audit("trust_dryrun", draft.draft_id, why, draft.account_key,
                      draft.day_key)
     resp = poster.post_approval_card(draft) or {}
+    # A hard send failure (transport down, rate limit past every retry) must be
+    # LOUD for this one account and invisible to the rest of the fan-out: one
+    # ops alert, the draft still saved (PENDING, actionable once Slack is back),
+    # the loop moves to the next account.
+    if draft.status == DraftStatus.PENDING and resp.get("ok") is False:
+        ops_alerts.alert(
+            f"approval card for {draft.account_key} draft {draft.draft_id} did "
+            f"not post ({resp.get('error', 'send failed')} after retries). The "
+            "draft is saved and pending; other accounts are unaffected.")
     if idempotent:
         draft.slack_channel = str(resp.get("channel") or "")
         draft.slack_ts = str(resp.get("ts") or "")
