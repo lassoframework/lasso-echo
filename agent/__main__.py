@@ -129,6 +129,15 @@ def _status():
     print(f"  skip days      : {config.POSTING_SKIP_DAYS}")
     print(f"  priority days  : {config.POSTING_PRIORITY_DAYS}")
     print(f"  timezone       : {config.POSTING_TIMEZONE}")
+    # scheduler process heartbeat (written by the listen loop each cycle)
+    print("  -- scheduler --")
+    from .listener import read_scheduler_heartbeat
+    hb = read_scheduler_heartbeat()
+    if hb:
+        print(f"  heartbeat      : {hb.get('ts', '?')}")
+        print(f"  next fire      : {hb.get('next_fire', '?')}")
+    else:
+        print("  heartbeat      : (none recorded — is the listen process running?)")
 
 
 def _dry_run():

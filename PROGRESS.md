@@ -23,6 +23,29 @@ Commits since last update:
 
 ---
 
+## Scheduler reliability — heartbeat + cron fallback (2026-07-14)
+
+The listen process now writes a SCHEDULER HEARTBEAT (timestamp + next fire time)
+to the store every loop cycle; `python -m agent status` shows it under
+"-- scheduler --". If today's draw is more than 30 minutes past the target hour
+(AGENT_DAILY_HOUR_UTC, default 14:00 UTC) with no run recorded, ONE deduped ops
+alert fires naming the fix.
+
+RAILWAY CRON FALLBACK (if the in-listener scheduler ever proves unreliable):
+1. Railway -> the echo project -> New -> Service -> from this same repo.
+2. Settings -> Cron Schedule: `30 14 * * *`  (14:30 UTC daily, 30 min after the
+   listener's own window so they never race; idempotent drafts make a double
+   fire a no-op anyway).
+3. Settings -> Custom Start Command: `/opt/venv/bin/python -m agent run-daily`
+4. Share the same env vars as the echo worker service (tokens, DB path/volume,
+   channel, flags). Attach the SAME /data volume so it reads the same store.
+5. Optionally set AGENT_SCHEDULER_ENABLED=false on the listener to hand the
+   draw fully to cron (the listener keeps Slack buttons + polling lanes).
+The cron service runs `run-daily` once and exits; every gate (approval, publish
+flag, first post never automated) applies exactly as in the listener.
+
+---
+
 ## Posting cadence — 2026-07-12 (current live rotation)
 
 7 days a week, one post per account per day. `AGENT_CATEGORY_ROTATION=true` must be

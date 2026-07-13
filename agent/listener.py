@@ -103,6 +103,78 @@ def _fire_daily(store, today, run=run_daily):
     return out
 
 
+# Scheduler process heartbeat (no flag, honest observability): one kv row the
+# loop refreshes each cycle so `status` can prove the listen process is alive
+# and show when the next daily draw fires. Distinct from heartbeat.py (which
+# records that each ACCOUNT'S daily run happened); this one says the SCHEDULER
+# LOOP itself is breathing.
+_HEARTBEAT_KEY = "scheduler_heartbeat"
+LATE_DRAW_GRACE_MINUTES = 30
+
+
+def _next_fire(now, target_hour, last_run_date):
+    """The next daily-draw fire time: today at target_hour UTC when today's draw
+    has not happened yet and the hour is still ahead (or current), else tomorrow."""
+    from datetime import timedelta
+    today_fire = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    if last_run_date != now.date().isoformat() and now.hour <= target_hour:
+        return today_fire
+    return today_fire + timedelta(days=1)
+
+
+def write_scheduler_heartbeat(now, target_hour, last_run_date):
+    """One kv write per loop cycle: timestamp + next fire time. Best effort;
+    a db hiccup never touches the loop."""
+    from . import db
+    try:
+        db.kv_set(_HEARTBEAT_KEY, json.dumps({
+            "ts": now.isoformat(),
+            "next_fire": _next_fire(now, target_hour, last_run_date).isoformat(),
+        }))
+    except Exception as e:
+        print(f"[scheduler] heartbeat write failed: {type(e).__name__}: {e}")
+
+
+def read_scheduler_heartbeat():
+    """{'ts', 'next_fire'} from the kv heartbeat, or None when the listener has
+    never run (or the row is unreadable)."""
+    from . import db
+    try:
+        raw = db.kv_get(_HEARTBEAT_KEY, "")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def check_late_draw(now, last_run_date, target_hour):
+    """One ops alert (deduped per day) when today's scheduled draw is more than
+    LATE_DRAW_GRACE_MINUTES past the target hour and still has not fired. Returns
+    True when the alert fired this call (for tests)."""
+    from . import db
+    today = now.date().isoformat()
+    if last_run_date == today:
+        return False                       # today's draw happened: nothing late
+    deadline = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    if now < deadline + timedelta(minutes=LATE_DRAW_GRACE_MINUTES):
+        return False                       # inside the window (or before it)
+    dedup_key = f"late_draw_alerted_{today}"
+    try:
+        if db.kv_get(dedup_key):
+            return False
+        db.kv_set(dedup_key, "1")
+    except Exception:
+        pass                               # a db hiccup must not silence the alert
+    minutes_late = int((now - deadline).total_seconds() // 60)
+    ops_alerts.alert(
+        f"scheduled daily draw is {minutes_late} minutes late (target "
+        f"{target_hour:02d}:00 UTC, no run recorded for {today}). The listener "
+        "loop is alive but the draw did not fire; check the deploy, or run "
+        "`python -m agent run-daily` by hand / via the Railway cron fallback "
+        "(see PROGRESS.md).")
+    return True
+
+
 def _print_scheduled_lanes():
     """One startup line per scheduled lane, armed or dormant. A lane whose
     flag is off used to be INVISIBLE — it simply never fired and never said
@@ -149,6 +221,14 @@ def _daily_scheduler(store):
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
+        # Process heartbeat + late-draw watchdog (no flag): the heartbeat proves
+        # this loop is breathing (read by `status`); the watchdog fires one
+        # deduped ops alert when today's draw is >30 min past the target hour.
+        write_scheduler_heartbeat(now, target_hour, last_run_date)
+        try:
+            check_late_draw(now, last_run_date, target_hour)
+        except Exception as e:
+            print(f"[scheduler] late-draw check failed: {type(e).__name__}: {e}")
         if now.hour == target_hour and last_run_date != today:
             _fire_daily(store, today)
             last_run_date = today
