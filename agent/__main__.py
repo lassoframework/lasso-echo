@@ -250,6 +250,7 @@ _COMMANDS = {
         ("onboard-client / add-client", "scaffold a new client account"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
+        ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -831,6 +832,9 @@ def main(argv=None):
     elif cmd == "seed-sources":
         from .seed_sources import cli as seed_sources_cli
         seed_sources_cli(argv[1:])
+    elif cmd == "intake-onboard":
+        from .intake_onboard import cli as intake_onboard_cli
+        intake_onboard_cli(argv[1:])
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
