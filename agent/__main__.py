@@ -202,6 +202,36 @@ def _intake_doc(args):
         poster.post_approval_card(d)
 
 
+def _whatsapp_status():
+    """python -m agent whatsapp-status: show WhatsApp intake env status.
+    Never prints a secret or token value; only 'set' or 'not set'."""
+    enabled = config.whatsapp_intake_enabled()
+    app_secret = os.environ.get("AGENT_WHATSAPP_APP_SECRET", "")
+    token = os.environ.get("AGENT_WHATSAPP_TOKEN", "")
+    phone_id = os.environ.get("AGENT_WHATSAPP_PHONE_NUMBER_ID", "")
+    verify_token = os.environ.get("AGENT_WHATSAPP_VERIFY_TOKEN", "")
+
+    def _yn(v):
+        return "yes" if v else "no"
+
+    def _set(v):
+        return "set" if v else "not set"
+
+    print("WHATSAPP INTAKE STATUS")
+    print(f"enabled: {_yn(enabled)} (AGENT_WHATSAPP_INTAKE_ENABLED)")
+    print(f"app_secret: {_set(app_secret)}")
+    print(f"token: {_set(token)}")
+    print(f"phone_number_id: {_set(phone_id)}")
+    print(f"verify_token: {_set(verify_token)}")
+
+    if not enabled:
+        print("preflight: WARN (disabled)")
+    elif app_secret and token and phone_id and verify_token:
+        print("preflight: PASS")
+    else:
+        print("preflight: FAIL (enabled but vars missing)")
+
+
 def _check_tokens():
     """python -m agent check-tokens: manual token watchdog run. Prints which
     credential and days remaining ONLY; a token value is never printed."""
@@ -281,6 +311,7 @@ _COMMANDS = {
         ("check-tokens", "token watchdog run (flag must be armed)"),
         ("capture-baseline", "pre-Echo posting baseline (read-only)"),
         ("restore-store", "restore the draft store from a backup"),
+        ("whatsapp-status", "show WhatsApp intake env status"),
     ],
 }
 
@@ -847,6 +878,8 @@ def main(argv=None):
         _check_tokens()
     elif cmd == "capture-baseline":
         _capture_baseline()
+    elif cmd == "whatsapp-status":
+        _whatsapp_status()
     elif cmd == "status":
         _status()
     elif cmd in ("help", "--help", "-h"):

@@ -80,13 +80,15 @@ def _messages(event):
     return out
 
 
-def handle_webhook(headers, body, fetch_media=None, base_dir=None, secret=None):
+def handle_webhook(headers, body, fetch_media=None, base_dir=None, secret=None,
+                   http=None):
     """
     One WABA webhook. Returns a summary dict, or None while the flag is OFF.
       {"ok": False, "reason": ...}                 refused (signature / not JSON)
       {"ok": True, "media": n, "oversize": n, "inbox": {...}|None}
     body is the RAW bytes the signature covers; parsing happens only after the
     signature verifies.
+    http is the injectable HTTP client for send_receipt (default: requests).
     """
     if not config.whatsapp_intake_enabled():
         return None
@@ -105,6 +107,7 @@ def handle_webhook(headers, body, fetch_media=None, base_dir=None, secret=None):
         return {"ok": False, "reason": "body is not JSON"}
 
     fetch_media = fetch_media or _default_fetch_media
+    _http = http  # injectable for send_receipt; None = real requests
     counted, oversize, batches = 0, 0, {}
     for msg in _messages(event):
         sender = str(msg.get("from", "") or "")
@@ -134,10 +137,59 @@ def handle_webhook(headers, body, fetch_media=None, base_dir=None, secret=None):
             {"name": name, "mime": mime, "data": data})
         counted += 1
 
+    sent_receipt_to = set()
     inbox_result = None
     for (sender, caption), items in batches.items():
         inbox_result = media_inbox.receive(
             {"provider": "whatsapp", "sender": f"+{sender.lstrip('+')}",
              "text": caption, "media": items}, base_dir=base_dir)
+        if sender not in sent_receipt_to:
+            send_receipt(sender, http=_http)
+            sent_receipt_to.add(sender)
     return {"ok": True, "media": counted, "oversize": oversize,
             "inbox": inbox_result}
+
+
+def send_receipt(to_number, http=None):
+    """Send a single templated receipt reply to the sender after media staging.
+    Called at most once per unique sender per webhook. Only fires after successful
+    media ingest; never auto-replies to non-media messages. Token and phone
+    number id are read lazily from env; if either is missing, one ops alert fires
+    and the function returns None without raising.
+    """
+    token = os.environ.get("AGENT_WHATSAPP_TOKEN", "")
+    phone_number_id = os.environ.get("AGENT_WHATSAPP_PHONE_NUMBER_ID", "")
+    if not token or not phone_number_id:
+        ops_alerts.alert("whatsapp receipt: token or phone id not set")
+        return None
+    import json as _json
+    payload = _json.dumps({
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {
+            "body": (
+                "Got it! Your media is in review. "
+                "We will reach out if we need anything else."
+            )
+        },
+    }).encode("utf-8")
+    url = f"{config.GRAPH_API_BASE}/{phone_number_id}/messages"
+    headers_out = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    http = http or _default_http()
+    try:
+        resp = http.post(url, data=payload, headers=headers_out, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        ops_alerts.alert(f"whatsapp receipt: send failed to {to_number}: "
+                         f"{type(e).__name__}: {e}")
+        return None
+    return True
+
+
+def _default_http():
+    import requests
+    return requests
