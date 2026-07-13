@@ -663,6 +663,23 @@ def category_rotation_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CATEGORY_ROTATION", "false"))
 
 
+def client_sources_enabled() -> bool:
+    """
+    Per-client source docs switch (AGENT_CLIENT_SOURCES). OFF by default = zero
+    behavior change; a client (non-LASSO) account drafts exactly as today (a
+    library pick, or a blocked card when the library is thin). ON, a client
+    account may draft a full, varied month from its OWN approved source docs
+    (offer / service / testimonial / faq / about / promo), spread across
+    categories like LASSO's doctrine, paired with its uploaded library.
+
+    The fabrication gate stays the SOLE authority on claims: a client caption may
+    only state facts present in THAT account's APPROVED sources, never invented,
+    never a pending (unapproved) source, never LASSO's stats. Book and summit
+    remain LASSO-only and never appear for a client.
+    """
+    return _truthy(os.environ.get("AGENT_CLIENT_SOURCES", "false"))
+
+
 def review_window_days() -> int:
     """
     The review cycle length in days (env AGENT_REVIEW_WINDOW_DAYS, default 14).

@@ -11,6 +11,7 @@ when the volume is absent, e.g. local dev), holding:
   snapshots  - daily per-account metric snapshots (filled by the reporting job)
   counters   - per-day counters (generation spend cap etc.)
   kv         - small key/value state (debounce stamps, digest marks)
+  client_sources - per-account approved/pending source docs (AGENT_CLIENT_SOURCES)
 
 WAL journal mode so the listener's threads (scheduler, ingest, approvals) write
 concurrently without corruption; every write is idempotent (INSERT OR REPLACE /
@@ -46,6 +47,10 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT (datetime('now')),
   day TEXT, account_key TEXT, kind TEXT, subject TEXT, reason TEXT);
+CREATE TABLE IF NOT EXISTS client_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, category TEXT,
+  text TEXT, citation TEXT, status TEXT DEFAULT 'approved',
+  created_at TEXT DEFAULT (datetime('now')));
 """
 
 

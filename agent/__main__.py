@@ -92,6 +92,7 @@ def _status():
           f"window {config.ROTATION_WINDOW_DAYS}d)")
     print(f"  category_rotation: {config.category_rotation_enabled()}  "
           f"(env AGENT_CATEGORY_ROTATION)")
+    print(f"  client_sources : {config.client_sources_enabled()}  (env AGENT_CLIENT_SOURCES)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
