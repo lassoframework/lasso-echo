@@ -74,6 +74,10 @@ class Draft:
     # Category rotation (AGENT_CATEGORY_ROTATION, default OFF). Empty while off.
     category: str = ""    # one of content_categories.CATEGORIES, or "" when not set
     sub_topic: str = ""   # platform sub-topic (ads, google, nurture, ...) or ""
+    # Thin-library grace (client sources, AGENT_CLIENT_SOURCES): a caption-ready
+    # day with no image yet. PENDING and held; a human adds a photo before it can
+    # publish. NOT blocked. False for every other draft.
+    needs_media: bool = False
 
 
 def _make_id(account_key, creative_path, scheduled_for):

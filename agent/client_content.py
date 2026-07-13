@@ -106,12 +106,46 @@ class _CtaKey:
         self.path = stem
 
 
+def _alert_needs_media(account_key, day_key, category):
+    """One ops alert per account per day when a caption is ready but no image is
+    available. Deduped so a re-run never storms the channel."""
+    from . import db, ops_alerts
+    key = f"needs_media_alerted_{account_key}_{day_key}"
+    if db.kv_get(key):
+        return
+    db.kv_set(key, "1")
+    ops_alerts.alert(
+        f"{account_key} {day_key}: caption ready ({category}) but the library has "
+        "no image. Held as needs-media; add a photo to publish. Not blocked.")
+    db.audit("client_needs_media", account_key,
+             f"{category}: caption ready, no image", account_key, day_key)
+
+
+def classify(draft):
+    """The day's state for a client draft: 'ready' (caption + creative, held for
+    the tap), 'needs-media' (caption ready, no image yet), or 'blocked' (nothing
+    to say and nothing to show)."""
+    if draft is None or draft.status == DraftStatus.BLOCKED:
+        return "blocked"
+    if getattr(draft, "needs_media", False):
+        return "needs-media"
+    return "ready"
+
+
 def build_client_draft(account, day_key, voice, library_path, poster=None,
-                       s3_client=None):
+                       s3_client=None, template_fn=None):
     """
-    The day's client draft, sourced from the account's approved sources + library,
-    or None when the client-sources flag is off, the voice doc is missing, the
-    account has no approved source for the day, or (Part 3) it has no image.
+    The day's client draft, sourced from the account's approved sources + library.
+    Returns None only when the client-sources flag is off, the voice doc is
+    missing, or the account has no approved source for the day (the caller then
+    falls back to the library pick, which blocks with a clear reason when the
+    library is also empty — so a day is blocked ONLY when there is neither
+    approved text nor a usable creative).
+
+    Thin-library grace: when the account HAS an approved source for the day but
+    NO image, the day is still caption-ready. If a source-backed template card can
+    be produced (template_fn wired + generation armed) it fills the slot; otherwise
+    the draft is held as needs-media with one ops alert. Never a hard blocked card.
 
     Never fabricates: the caption's fact comes verbatim from one approved source
     and is re-checked against the fabrication gate before it can ship.
@@ -132,29 +166,70 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     claims = client_sources.approved_claims(account.key)
     if not rotation.is_gate_clean(source.text, approved_claims=claims):
         return None
-    image = pick_image(account.key, day_key, library_path)
-    if image is None:
-        return None                        # Part 4 turns this into a needs-media day
 
-    caption, hashtags = compose_caption(account, source, voice, _image_key(image))
-    public_url = getattr(image, "public_url", "")
-    if config.hosting_enabled():
-        hosted = media_host.host_media(image.path, account.key)
-        if hosted:
-            public_url = hosted
-    rotation.record_served(account.key, _image_key(image), category, day_key)
     scheduled_for = schedule.scheduled_for(day_key)
+    fragments = [source.text, f"cite:{source.citation}"]
+
+    image = pick_image(account.key, day_key, library_path)
+    if image is not None:
+        caption, hashtags = compose_caption(account, source, voice,
+                                            _image_key(image))
+        public_url = getattr(image, "public_url", "")
+        if config.hosting_enabled():
+            hosted = media_host.host_media(image.path, account.key)
+            if hosted:
+                public_url = hosted
+        rotation.record_served(account.key, _image_key(image), category, day_key)
+        return Draft(
+            draft_id=_make_id(account.key, image.path, scheduled_for),
+            account_key=account.key,
+            platform=account.platform,
+            caption=caption,
+            hashtags=hashtags,
+            creative_path=image.path,
+            creative_public_url=public_url,
+            scheduled_for=scheduled_for,
+            status=DraftStatus.PENDING,
+            source_fragments=fragments,
+            day_key=day_key,
+            category=category,
+        )
+
+    # THIN-LIBRARY GRACE: caption is ready, but there is no image.
+    caption, hashtags = compose_caption(account, source, voice,
+                                        f"src_{source.id}")
+    # Option A: a source-backed template card, when a generator is wired + armed.
+    template_url = template_fn(account, source, day_key) if template_fn else None
+    if template_url:
+        return Draft(
+            draft_id=_make_id(account.key, f"tmpl_{source.id}", scheduled_for),
+            account_key=account.key,
+            platform=account.platform,
+            caption=caption,
+            hashtags=hashtags,
+            creative_path="",
+            creative_public_url=template_url,
+            scheduled_for=scheduled_for,
+            status=DraftStatus.PENDING,
+            source_fragments=fragments + ["template_card"],
+            day_key=day_key,
+            category=category,
+        )
+    # Option B: mark the day needs-media (held, one ops alert). NOT blocked.
+    _alert_needs_media(account.key, day_key, category)
     return Draft(
-        draft_id=_make_id(account.key, image.path, scheduled_for),
+        draft_id=_make_id(account.key, f"needsmedia_{source.id}", scheduled_for),
         account_key=account.key,
         platform=account.platform,
         caption=caption,
         hashtags=hashtags,
-        creative_path=image.path,
-        creative_public_url=public_url,
+        creative_path="",
+        creative_public_url="",
         scheduled_for=scheduled_for,
         status=DraftStatus.PENDING,
-        source_fragments=[source.text, f"cite:{source.citation}"],
+        source_fragments=fragments,
         day_key=day_key,
         category=category,
+        needs_media=True,
+        warnings=["needs-media: caption ready, add an image to publish"],
     )
