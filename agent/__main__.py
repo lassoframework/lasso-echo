@@ -255,6 +255,7 @@ _COMMANDS = {
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
+        ("intake-link", "mint a gym's signed intake + upload links (--account <key>)"),
         ("intake-create", "create drafts from an intake payload"),
     ],
     "content & library": [
@@ -336,6 +337,31 @@ def main(argv=None):
         # SEPARATE web process (own Railway service). R2 only, never /data.
         from .intake_web import serve
         serve()
+    elif cmd == "intake-link":
+        # Mint a gym's signed intake + upload links from the shared secret (no
+        # per-gym env var). Runs where the secret lives (intake-web / listener);
+        # the secret is never printed. Same mint path a future portal endpoint uses.
+        from .intake_web import link_for
+        from . import intake_tokens
+        account, args = "", argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] in ("--account", "--key") and i + 1 < len(args):
+                account = args[i + 1]; i += 2; continue
+            i += 1
+        if not account:
+            print("usage: python -m agent intake-link --account <key>")
+        elif not intake_tokens.secret_present():
+            print("AGENT_INTAKE_SIGNING_SECRET is not set; cannot mint a link. "
+                  "Set it by hand on the intake-web / listener service.")
+        else:
+            form = link_for(account, kind="intake")
+            upload = link_for(account, kind="u")
+            if not os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip():
+                print("note: AGENT_UPLOAD_BASE_URL not set; showing relative paths.")
+            print(f"account : {account.strip().lower()}")
+            print(f"intake  : {form}")
+            print(f"upload  : {upload}")
     elif cmd == "intake-create":
         # Tenant scaffold from a completed intake form JSON (AGENT_INTAKE_ENABLED).
         from .tenants import intake_create_cli

@@ -78,6 +78,22 @@ def client_for_token(token):
     return None
 
 
+def link_for(client_key, kind="u"):
+    """The full signed intake link for a client key, or '' when it cannot be built
+    (no signing secret set). kind='u' is the media upload page; kind='intake' is
+    the seven-section form. This is the ONE place a link is minted: the intake-link
+    CLI calls it today and a future authenticated mint endpoint calls the same
+    function, so the signing secret never leaves this service and never reaches the
+    ops portal. Absolute when AGENT_UPLOAD_BASE_URL is set, else a relative path."""
+    try:
+        token = intake_tokens.mint(client_key)
+    except ValueError:
+        return ""
+    path = "intake" if kind == "intake" else "u"
+    base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip().rstrip("/")
+    return f"{base}/{path}/{token}" if base else f"/{path}/{token}"
+
+
 # ---- basic per-IP rate limit (in-memory; this is one small service) -----------
 _hits = {}
 
