@@ -20,13 +20,18 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import client_content, client_sources as cs, db  # noqa: E402
-from agent import intake_ingest, intake_web, ops_alerts  # noqa: E402
+from agent import client_content, client_sources as cs, config, db  # noqa: E402
+from agent import intake_ingest, intake_tokens, intake_web, ops_alerts  # noqa: E402
 from agent.accounts import Account, Platform  # noqa: E402
 from agent.intake_web import build_server, handle_intake_form  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
 
-TOKEN = "tok_gym_alpha_form_1"
+# Signed token (the new default path): one shared secret, no per-gym env var. The
+# token carries the client key + an HMAC and contains a '.', which the widened
+# route regex accepts. Minted with an explicit secret so it is stable at import;
+# the fixture sets the same secret in env so the running server verifies it.
+SECRET = "intake-signing-secret-for-form-tests"
+TOKEN = intake_tokens.mint("gym_alpha_ig", secret=SECRET.encode())
 
 
 class FakeR2:
@@ -63,7 +68,8 @@ _ANSWERS = {
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
-    monkeypatch.setenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", TOKEN)
+    monkeypatch.setenv(config.INTAKE_SIGNING_SECRET_ENV, SECRET)
+    monkeypatch.delenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", raising=False)
     monkeypatch.setattr(intake_web, "_hits", {})   # fresh rate-limit window
     yield
 
@@ -206,6 +212,17 @@ def test_second_submission_does_not_duplicate(monkeypatch):
     _ingest(r2, monkeypatch)
     assert len(cs.pending_sources("gym_alpha_ig")) == 6   # not 12
     assert len(cs.all_sources("gym_alpha_ig")) == 6
+
+
+# ---- 7b. legacy per-gym env token still verifies (zero-downtime cutover) ---------
+def test_legacy_env_token_still_works(server, monkeypatch):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)  # no secret
+    legacy = "legacy_env_token_1"
+    monkeypatch.setenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", legacy)
+    status, body = _get(server, f"/intake/{legacy}")
+    assert status == 200
+    assert "Gym basics" in body
 
 
 # ---- 7. the pure handler gates exactly like the upload path ----------------------

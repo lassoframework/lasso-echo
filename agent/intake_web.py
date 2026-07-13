@@ -22,10 +22,13 @@ confirmation page immediately offers the media upload link for the same token so
 photos come in the same sitting.
 
 Gates: everything is 404 unless AGENT_INTAKE_ENABLED=true (default OFF) and the
-token matches a per-client env value (AGENT_INTAKE_TOKEN_<CLIENTKEY>, set by hand).
-Guardrails: content-type allowlist (images + common video), per-file and per-request
-size caps, a basic per-IP rate limit, and no directory listing (only /u/<token>
-and /intake/<token> exist; every other path 404s).
+token authenticates. Tokens are SIGNED with one shared secret
+(AGENT_INTAKE_SIGNING_SECRET) so no per-gym env var is ever needed; legacy
+per-client env values (AGENT_INTAKE_TOKEN_<CLIENTKEY>) still verify for a
+zero-downtime cutover. Guardrails: content-type allowlist (images + common
+video), per-file and per-request size caps, a basic per-IP rate limit, and no
+directory listing (only /u/<token> and /intake/<token> exist; every other path
+404s).
 """
 
 import hashlib
@@ -36,7 +39,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from . import config
+from . import config, intake_tokens
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 
@@ -59,9 +62,16 @@ def _rate_per_minute():
 
 
 def client_for_token(token):
-    """The client key a token belongs to, or None. The token value is never logged."""
+    """The client key a token authenticates, or None. A SIGNED token verifies
+    against the shared secret (no per-gym env var needed); a legacy per-client env
+    value (AGENT_INTAKE_TOKEN_<KEY>) still matches so the cutover is zero-downtime.
+    The token value is never logged. Pure: no I/O beyond reading env. Revocation
+    is enforced separately (see is_revoked)."""
     if not token:
         return None
+    signed = intake_tokens.verify(token)
+    if signed is not None:
+        return signed
     for name, value in os.environ.items():
         if name.startswith(_TOKEN_ENV_PREFIX) and value and value == token:
             return name[len(_TOKEN_ENV_PREFIX):].lower()
@@ -529,11 +539,13 @@ def build_server(port=None):
 
     class Handler(BaseHTTPRequestHandler):
         def _token(self):
-            m = re.match(r"^/u/([A-Za-z0-9_-]{8,})$", self.path.split("?")[0])
+            # Charset includes '.' for signed tokens (b64url.b64url); anchored,
+            # no slashes, so no path traversal.
+            m = re.match(r"^/u/([A-Za-z0-9_.-]{8,})$", self.path.split("?")[0])
             return m.group(1) if m else None
 
         def _form_token(self):
-            m = re.match(r"^/intake/([A-Za-z0-9_-]{8,})$", self.path.split("?")[0])
+            m = re.match(r"^/intake/([A-Za-z0-9_.-]{8,})$", self.path.split("?")[0])
             return m.group(1) if m else None
 
         def _send_html(self, body_str, status=200):
