@@ -349,6 +349,7 @@ _COMMANDS = {
     ],
     "onboarding & intake": [
         ("onboard-client / add-client", "scaffold a new client account"),
+        ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
@@ -1015,6 +1016,38 @@ def main(argv=None):
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])
+    elif cmd == "onboard-dryrun":
+        # 30-day dryrun: plan + draft with no live tokens, no publish, no Slack.
+        # Renders a self-contained HTML review bundle for the operator.
+        account_key, month_arg, out_path = "", None, None
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--month" and i + 1 < len(args_rest):
+                month_arg = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--out" and i + 1 < len(args_rest):
+                out_path = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent onboard-dryrun --account <key> "
+                  "[--month YYYY-MM] [--out <path>]")
+        else:
+            from .onboard_dryrun import render_dryrun_html
+            from .onboard_dryrun import run as dryrun_run
+            result = dryrun_run(account_key, month=month_arg)
+            if out_path is None:
+                out_path = (f"/tmp/echo_dryrun_{account_key}_"
+                            f"{result['month'].replace('-','')}.html")
+            html = render_dryrun_html(result)
+            with open(out_path, "w", encoding="utf-8") as _fh:
+                _fh.write(html)
+            spread = result["category_spread"]
+            spread_str = ", ".join(f"{k}:{v}" for k, v in sorted(spread.items()))
+            print(f"Dryrun complete: {result['days_drafted']}/30 days drafted, "
+                  f"categories: {spread_str}")
+            print(f"HTML bundle written to: {out_path}")
     elif cmd == "check-tokens":
         _check_tokens()
     elif cmd == "capture-baseline":
