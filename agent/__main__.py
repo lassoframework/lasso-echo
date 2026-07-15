@@ -342,6 +342,7 @@ _COMMANDS = {
         ("plan-month", "fill open days for a month (--replan previews/rebuilds)"),
         ("approve-month", "approve a planned month through a date"),
         ("calendar / calendar-html", "client-facing month calendar HTML"),
+        ("calendar-export", "export calendar plan to JSON"),
         ("seed-calendar", "seed a month from approval evidence"),
         ("monday-preview", "the week-ahead preview card"),
         ("runway", "days of approved content left per account"),
@@ -852,6 +853,57 @@ def main(argv=None):
         # and full caption. Read only against state; buttons are display previews.
         from .calendar_artifact import cli as calendar_cli
         calendar_cli(argv[1:])
+    elif cmd == "calendar-export":
+        # Export month plan to JSON and a standalone HTML grid for all specified
+        # accounts. Read only against state; never touches publishing gates.
+        # Usage: calendar-export --account <key> [--account <key2>]
+        #                        --month YYYY-MM [--out <json-path>]
+        #                        [--html-out <html-path>]
+        import re as _re
+        from .calendar_artifact import assemble_month, generate_standalone_html
+        args_rest = argv[1:]
+        account_keys = []
+        month_arg = None
+        out_arg = None
+        html_out_arg = None
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_keys.append(args_rest[i + 1]); i += 2; continue
+            if args_rest[i] == "--month" and i + 1 < len(args_rest):
+                month_arg = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--out" and i + 1 < len(args_rest):
+                out_arg = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--html-out" and i + 1 < len(args_rest):
+                html_out_arg = args_rest[i + 1]; i += 2; continue
+            print(f"calendar-export: unrecognized argument: {args_rest[i]}")
+            i += 1
+        if not account_keys or not month_arg:
+            print("usage: python -m agent calendar-export "
+                  "--account <key> [--account <key2>] --month YYYY-MM "
+                  "[--out <json-path>] [--html-out <html-path>]")
+        elif not _re.fullmatch(r"\d{4}-\d{2}", month_arg):
+            print(f"calendar-export: --month must be YYYY-MM, got {month_arg!r}")
+        else:
+            from .accounts import get_account
+            import json as _json
+            plans = {}
+            for ak in account_keys:
+                if get_account(ak) is None:
+                    print(f"calendar-export: unknown account {ak!r}")
+                    continue
+                plans[ak] = assemble_month(ak, month_arg)
+            if plans:
+                payload = {"month": month_arg, "accounts": plans}
+                json_path = out_arg or f"/tmp/echo_calendar_{month_arg}.json"
+                with open(json_path, "w", encoding="utf-8") as _fh:
+                    _json.dump(payload, _fh, indent=2)
+                print(f"Calendar JSON exported: {json_path}")
+                html_text = generate_standalone_html(plans, month_arg)
+                html_path = html_out_arg or f"/tmp/echo_calendar_{month_arg}.html"
+                with open(html_path, "w", encoding="utf-8") as _fh:
+                    _fh.write(html_text)
+                print(f"Calendar HTML generated: {html_path}")
     elif cmd == "monday-preview":
         # READ ONLY preflight: feed forecast, runway, tokens, heartbeats,
         # pending approvals, flags snapshot; one GO / NO GO verdict. Zero
