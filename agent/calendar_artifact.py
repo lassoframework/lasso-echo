@@ -457,3 +457,213 @@ def cli(args):
               "--month YYYY-MM [--upload] [--out PATH]")
         return
     run(account, month, upload=upload, out_path=out_path)
+
+
+# ---- Part C: multi-account standalone HTML export ------------------------------
+
+# V3 brand palette (navy background, accent red, sky blue, cream)
+_BG_NAVY = "#121E3C"
+_ACCENT_RED = "#FF0000"
+_SKY_BLUE = "#5EB9E6"
+_CREAM = "#FAF6F0"
+
+# Status badge colors for standalone view
+_EXPORT_STATUS_COLORS = {
+    "published": "#3AA76D",
+    "approved": "#5EB9E6",
+    "pending": "#E0A800",
+    "draft": "#8A93A6",
+    "rest": "#2A3452",
+}
+
+# Category chip colors for standalone view
+_EXPORT_CATEGORY_COLORS = {
+    "podcast":  "#5EB9E6",
+    "platform": "#3AA76D",
+    "b2b":      "#E0A800",
+    "summit":   "#FF0000",
+    "book":     "#8A93A6",
+    "doctrine": "#2A3452",
+    "services": _CREAM,
+}
+
+
+def generate_standalone_html(plans_by_account, month):
+    """
+    Returns a self-contained HTML string (no external deps) for multiple accounts.
+    plans_by_account: {"lasso_ig": plan_dict, "lasso_fb": plan_dict, ...}
+    Each plan is the dict from assemble_month().
+    Visible copy is dash free.
+    """
+    e = _html.escape
+    title = _month_title(month)
+    account_keys = list(plans_by_account.keys())
+
+    # Embed all plan data as a JSON literal (no external fetch needed)
+    plans_json = json.dumps(plans_by_account)
+
+    def _rollup_bar(plan):
+        r = plan.get("rollup", {})
+        total_drafted = r.get("draft", 0)
+        total_approved = r.get("approved", 0)
+        total_published = r.get("published", 0)
+        total_pending = r.get("pending", 0)
+        items = [
+            ("published", str(total_published), "#3AA76D"),
+            ("approved", str(total_approved), "#5EB9E6"),
+            ("pending", str(total_pending), "#E0A800"),
+            ("drafted", str(total_drafted), "#8A93A6"),
+        ]
+        chips = "".join(
+            f"<span style=\"display:inline-block;background:{c};color:#fff;"
+            f"font-size:12px;padding:3px 10px;border-radius:12px;margin-right:6px;"
+            f"font-weight:bold\">{e(label)}: {e(count)}</span>"
+            for label, count, c in items
+        )
+        return (
+            f"<div style=\"background:#1A2A50;padding:10px 16px;"
+            f"border-radius:6px;margin-bottom:16px\">{chips}</div>"
+        )
+
+    def _day_cell(d):
+        status = d.get("status", "draft")
+        status_color = _EXPORT_STATUS_COLORS.get(status, "#8A93A6")
+        cat = (d.get("category") or "").lower()
+        cat_color = _EXPORT_CATEGORY_COLORS.get(cat, "#2A3452")
+        day_num = int(d["date"][8:10])
+        caption_preview = (d.get("caption") or "")[:80]
+
+        bits = []
+        # Date number
+        bits.append(
+            f"<div style=\"font-weight:bold;font-size:13px;"
+            f"color:{_CREAM};margin-bottom:4px\">{day_num}</div>"
+        )
+        # Category chip
+        if cat:
+            chip_text_color = "#121E3C" if cat == "services" else "#fff"
+            bits.append(
+                f"<div style=\"display:inline-block;background:{cat_color};"
+                f"color:{chip_text_color};font-size:10px;padding:1px 6px;"
+                f"border-radius:8px;text-transform:uppercase;font-weight:bold;"
+                f"margin-bottom:3px\">{e(cat)}</div><br>"
+            )
+        # Status badge
+        bits.append(
+            f"<span style=\"display:inline-block;background:{status_color};"
+            f"color:#fff;font-size:10px;padding:1px 6px;border-radius:8px;"
+            f"font-weight:bold;margin-bottom:3px\">{e(status.upper())}</span>"
+        )
+        # Caption preview
+        if caption_preview:
+            bits.append(
+                f"<div style=\"font-size:10px;color:#B9C2D8;margin-top:3px;"
+                f"overflow:hidden;word-break:break-word\">{e(caption_preview)}</div>"
+            )
+        elif status == "draft":
+            bits.append(
+                f"<div style=\"font-size:10px;color:#8A93A6;margin-top:3px\">"
+                f"open slot</div>"
+            )
+
+        return (
+            f"<td style=\"vertical-align:top;padding:6px;width:14%;"
+            f"border:1px solid #2A3452;border-top:3px solid {status_color};"
+            f"background:#1A2A50;min-height:80px\">"
+            + "".join(bits) + "</td>"
+        )
+
+    def _month_grid(plan):
+        days = plan.get("days", [])
+        cells = {d["date"]: d for d in days}
+        year, mon = int(month[:4]), int(month[5:7])
+        first_weekday, n_days = monthrange(year, mon)
+
+        weeks = []
+        week = ["<td style=\"background:#121E3C\"></td>"] * first_weekday
+        for n in range(1, n_days + 1):
+            day_key = f"{month}-{n:02d}"
+            week.append(_day_cell(cells[day_key]))
+            if len(week) == 7:
+                weeks.append("<tr>" + "".join(week) + "</tr>")
+                week = []
+        if week:
+            pad = ["<td style=\"background:#121E3C\"></td>"] * (7 - len(week))
+            weeks.append("<tr>" + "".join(week + pad) + "</tr>")
+
+        header = "".join(
+            f"<th style=\"padding:6px;color:{_SKY_BLUE};font-size:12px;"
+            f"text-align:left;border-bottom:1px solid #2A3452\">{w}</th>"
+            for w in ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+        )
+        return (
+            f"<table style=\"border-collapse:collapse;width:100%;table-layout:fixed\">"
+            f"<tr>{header}</tr>{''.join(weeks)}</table>"
+        )
+
+    # Tab buttons (one per account)
+    tab_buttons = "".join(
+        f"<button id=\"tab-btn-{e(ak)}\" onclick=\"showTab('{e(ak)}')\" "
+        f"style=\"background:#1A2A50;color:{_CREAM};border:2px solid #2A3452;"
+        f"padding:8px 20px;margin-right:8px;cursor:pointer;font-size:14px;"
+        f"border-radius:4px\">{e(ak)}</button>"
+        for ak in account_keys
+    )
+
+    # One panel per account (hidden/shown by JS)
+    panels = []
+    for ak in account_keys:
+        plan = plans_by_account[ak]
+        rollup_html = _rollup_bar(plan)
+        grid_html = _month_grid(plan)
+        panels.append(
+            f"<div id=\"tab-{e(ak)}\" class=\"tabpanel\" "
+            f"style=\"display:none\">"
+            f"{rollup_html}"
+            f"{grid_html}"
+            f"</div>"
+        )
+
+    # Inline JS: tab switching using the embedded plans_json for data
+    script = (
+        "<script>"
+        f"var PLANS={plans_json};"
+        "function showTab(ak){"
+        "var panels=document.querySelectorAll('.tabpanel');"
+        "for(var i=0;i<panels.length;i++){panels[i].style.display='none';}"
+        "var btns=document.querySelectorAll('[id^=\"tab-btn-\"]');"
+        "for(var i=0;i<btns.length;i++){"
+        "btns[i].style.borderColor='#2A3452';"
+        f"btns[i].style.color='{_CREAM}';"
+        "}"
+        "var panel=document.getElementById('tab-'+ak);"
+        "if(panel){panel.style.display='block';}"
+        "var btn=document.getElementById('tab-btn-'+ak);"
+        f"if(btn){{btn.style.borderColor='{_SKY_BLUE}';"
+        f"btn.style.color='{_SKY_BLUE}';}}"
+        "}"
+        f"showTab('{e(account_keys[0]) if account_keys else ''}');"
+        "</script>"
+    )
+
+    # Inline CSS reset
+    style = (
+        "<style>"
+        f"body{{margin:0;padding:24px;background:{_BG_NAVY};"
+        f"color:{_CREAM};font-family:Helvetica,Arial,sans-serif}}"
+        "table{border-collapse:collapse}"
+        "button:hover{opacity:0.85}"
+        "td{box-sizing:border-box}"
+        "</style>"
+    )
+
+    return (
+        f"<title>LASSO calendar: {e(title)}</title>"
+        f"{style}"
+        f"<h1 style=\"color:{_CREAM};margin-bottom:4px\">LASSO: {e(title)}</h1>"
+        f"<div style=\"height:3px;background:{_ACCENT_RED};"
+        f"margin-bottom:16px;border-radius:2px\"></div>"
+        f"<div style=\"margin-bottom:16px\">{tab_buttons}</div>"
+        + "".join(panels)
+        + script
+    )
