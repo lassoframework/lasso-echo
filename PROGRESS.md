@@ -6,7 +6,21 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-12
+Last updated: 2026-07-15
+
+---
+
+## Overnight parallel build 2 (2026-07-15)
+
+- Track 1 (Reporting Live): monthly report uploads HTML to R2, posts URL to Slack, --html flag on report CLI. SHA: f6134ca482f07577294b09736c9c2e12aeb3ab3e
+- Track 2 (Calendar view): calendar-export JSON + standalone HTML V3 brand palette, multi-account switcher. SHA: 16c246b15af87b34972d77041ab1b7cc16588c4a
+- Track 3 (Onboard dryrun): onboard-dryrun 30-day harness, no live tokens, HTML review bundle. SHA: 2b19293abf0c36f34b2e42a27d866f258c784a2c
+- Track 4 (Meta check): meta-check token scopes reachability publishable status. SHA: d45c75426289ca473877ecfbb87d62b0e06b71b5
+
+### Readiness grade: B+ (honest)
+Code is complete. Not A until: (1) real gym month of posts, (2) Meta App Review cleared for clients.
+
+---
 
 Commits since last update:
 - `171f488` — intake-web deployable: `/healthz` route, `build_server(port=0)`, Procfile

@@ -203,6 +203,10 @@
         ["da0fb16 intake-web deployable: /healthz answers 200 while dark (Railway health check safe), build_server(port=0) is testable, Procfile web: entry, docs/INTAKE_DEPLOY.md click-by-click Railway runbook with every env var. BLAKE BY HAND: create the second Railway service following the runbook.","done"],
         ["da0fb16 preflight command: python -m agent preflight --account <key> [--live] runs 8 checks (slack_channel, approvers, meta_token, target_id, library depth, voice_doc, spend_cap, category_rotation), prints READY/NOT READY, exits nonzero on any FAIL so it gates scripts. Channel ownership guard in run-daily skips (with alert) any client account missing slack_channel when a shared channel is configured. 11 tests. Suite: 1107 passed.","done"],
         ["2026-07-12 7-day cadence: POSTING_SKIP_DAYS default changed from [sat] to [] (no skip days). Saturday is now a posting day. AGENT_POSTING_SKIP_DAYS env override restores any custom skip list. Category rotation ON: Mon podcast, Tue platform, Wed b2b, Thu podcast clip, Fri summit (doctrine fills until Sept), Sat platform, Sun podcast infographic. Book capped at 1/week. Suite: 1108 passed.","done"],
+        ["2026-07-15 Overnight build 2 — Track 1 (Reporting Live): monthly report uploads HTML to R2, posts URL to Slack, --html flag on report CLI. SHA: f6134ca482f07577294b09736c9c2e12aeb3ab3e","done"],
+        ["2026-07-15 Overnight build 2 — Track 2 (Calendar view): calendar-export JSON + standalone HTML V3 brand palette, multi-account switcher. SHA: 16c246b15af87b34972d77041ab1b7cc16588c4a","done"],
+        ["2026-07-15 Overnight build 2 — Track 3 (Onboard dryrun): onboard-dryrun 30-day harness, no live tokens, HTML review bundle. SHA: 2b19293abf0c36f34b2e42a27d866f258c784a2c","done"],
+        ["2026-07-15 Overnight build 2 — Track 4 (Meta check): meta-check token scopes reachability publishable status. SHA: d45c75426289ca473877ecfbb87d62b0e06b71b5","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -449,7 +453,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-12 (7-day cadence live, suite 1108 green; da0fb16 intake-web deployable + preflight command + channel-ownership guard; readiness grade C+, gaps 2+3 resolved, gap 1 client content engine remains the top risk; clipper Phase 1 selection only, renders nothing, blocked on first Riverside export drop; approval gate unchanged, every post waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-15 (Overnight build 2: Track 1 reporting live HTML to R2 + Slack URL, Track 2 calendar-export JSON + multi-account switcher, Track 3 onboard-dryrun 30-day harness, Track 4 meta-check token reachability; all 4 tracks merged; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; approval gate unchanged, every post waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
