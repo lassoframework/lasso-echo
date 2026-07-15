@@ -254,6 +254,45 @@ def _check_tokens():
         print(f"  {r['account']}: {r['status']} ({days_str})")
 
 
+def _meta_check(argv):
+    """python -m agent meta-check [--account <key>]
+    Verify Meta tokens, scopes, target reachability, and publishable status.
+    Exit 0 when all accounts are READY; exit 1 when any is NOT READY.
+    Token values are never printed; only 'set' or 'not set' for credential checks.
+    """
+    from .meta_check import check_account, check_all
+    from .accounts import get_account, active_accounts
+
+    acct_key = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--account" and i + 1 < len(argv):
+            acct_key = argv[i + 1]; i += 2; continue
+        i += 1
+
+    if acct_key:
+        acct = get_account(acct_key)
+        if acct is None:
+            print(f"meta-check: account {acct_key!r} not found")
+            sys.exit(1)
+        results = [check_account(acct)]
+    else:
+        results = check_all()
+
+    all_ready = True
+    for r in results:
+        status_label = "READY" if r["ready"] else "NOT READY"
+        if not r["ready"]:
+            all_ready = False
+        print(f"{r['account']}: {status_label}")
+        for c in r["checks"]:
+            tag = c["status"].upper()
+            detail = f": {c['detail']}" if c.get("detail") else ""
+            print(f"  [{tag}] {c['name']}{detail}")
+
+    sys.exit(0 if all_ready else 1)
+
+
 def _capture_baseline():
     """python -m agent capture-baseline: MANUAL, READ-ONLY pre-Echo baseline.
     Run by hand once; it is never scheduled and never writes to Meta."""
@@ -379,6 +418,7 @@ _COMMANDS = {
     ],
     "ops": [
         ("check-tokens", "token watchdog run (flag must be armed)"),
+        ("meta-check", "verify Meta tokens, scopes, and publishable status"),
         ("capture-baseline", "pre-Echo posting baseline (read-only)"),
         ("restore-store", "restore the draft store from a backup"),
         ("whatsapp-status", "show WhatsApp intake env status"),
@@ -947,6 +987,8 @@ def main(argv=None):
         intake_onboard_cli(argv[1:])
     elif cmd == "check-tokens":
         _check_tokens()
+    elif cmd == "meta-check":
+        _meta_check(argv[1:])
     elif cmd == "capture-baseline":
         _capture_baseline()
     elif cmd == "whatsapp-status":
