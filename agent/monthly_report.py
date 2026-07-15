@@ -263,9 +263,28 @@ def render_report_pdf(report, refresh, out_path, brand=None):
                      brand=brand)
 
 
-def run(account=None, poster=None, now=None, base_dir=None, pdf=False):
+REPORTS_KEY_PREFIX = "echo/reports"
+
+
+def _report_key(account_key, month):
+    return f"{REPORTS_KEY_PREFIX}/{account_key}_{month}.html"
+
+
+def _public_url(key):
+    base = os.environ.get("AGENT_S3_PUBLIC_BASE_URL", config.S3_PUBLIC_BASE_URL)
+    return f"{base.rstrip('/')}/{key}"
+
+
+def run(account=None, poster=None, now=None, base_dir=None, pdf=False,
+        upload=False, s3_client=None):
     """Build the monthly report per account. Returns {account: html_path} or None
-    while AGENT_REPORTING_ENABLED is OFF."""
+    while AGENT_REPORTING_ENABLED is OFF.
+
+    upload=True: upload the rendered HTML to R2 under
+        echo/reports/{account_key}_{month}.html and post the public URL to Slack
+        via poster.post_notice(). s3_client is injectable (same pattern as
+        calendar_artifact); when None the default client is built from env.
+    """
     if not config.reporting_enabled():
         print("monthly-report: AGENT_REPORTING_ENABLED is OFF. Nothing built.")
         return None
@@ -294,12 +313,39 @@ def run(account=None, poster=None, now=None, base_dir=None, pdf=False):
             render_report_pdf(report, refresh, pdf_path, brand=brand_for(acct))
             out[acct.key + ":pdf"] = pdf_path
             print(f"PDF saved: {pdf_path}")
-        summary = (f"LASSO 30 day report for {acct.key}: views {_fmt(report['views'])}, "
-                   f"engagement rate {_fmt(report['engagement_rate'])}, followers "
-                   f"{_fmt(report['followers'])} (net {_fmt(report['follower_net'])}), "
-                   f"posts {report['posts_published']}, health {report['health']}. "
-                   f"Full report saved: {path}")
-        if poster is not None:
-            poster.post_notice(summary)
-        print(summary)
+        url = ""
+        if upload:
+            client = s3_client
+            if client is None and config.hosting_enabled():
+                from . import media_host
+                client = media_host._default_client()
+            if client is None:
+                print("monthly-report: hosting is dark (flag or credentials); "
+                      "local only.")
+            else:
+                try:
+                    key = _report_key(acct.key, month)
+                    client.put(key, path)
+                    url = _public_url(key)
+                    out[acct.key + ":url"] = url
+                except Exception as ex:
+                    print(f"monthly-report: upload failed "
+                          f"({type(ex).__name__}: {ex}); local file still works.")
+        if url:
+            notice = f"30 day report for {acct.key}: {url}"
+            if poster is not None:
+                poster.post_notice(notice)
+            print(notice)
+        else:
+            summary = (f"LASSO 30 day report for {acct.key}: "
+                       f"views {_fmt(report['views'])}, "
+                       f"engagement rate {_fmt(report['engagement_rate'])}, "
+                       f"followers {_fmt(report['followers'])} "
+                       f"(net {_fmt(report['follower_net'])}), "
+                       f"posts {report['posts_published']}, "
+                       f"health {report['health']}. "
+                       f"Full report saved: {path}")
+            if poster is not None:
+                poster.post_notice(summary)
+            print(summary)
     return out
