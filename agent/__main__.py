@@ -671,17 +671,20 @@ def main(argv=None):
     elif cmd == "monthly-report":
         # The per-account 30 day cycle report from /data snapshots + posts, plus
         # the creative REFRESH proposal. Gated by AGENT_REPORTING_ENABLED.
-        acct_filter, args = None, argv[1:]
+        # --upload: upload HTML to R2 and post the public URL to Slack.
+        acct_filter, do_upload, args = None, False, argv[1:]
         i = 0
         while i < len(args):
             if args[i] == "--account" and i + 1 < len(args):
                 acct_filter = args[i + 1]; i += 2; continue
             if args[i].startswith("--account="):
                 acct_filter = args[i].split("=", 1)[1]
+            if args[i] == "--upload":
+                do_upload = True
             i += 1
         from .monthly_report import run as monthly_run
         monthly_run(account=acct_filter, poster=ConsolePoster(),
-                    pdf="--pdf" in argv[1:])
+                    pdf="--pdf" in argv[1:], upload=do_upload)
     elif cmd == "pull-opus":
         # MANUAL Opus Clip ingest: list new finished clips since the watermark,
         # host to R2, file as video assets (future Reel DRAFTS via the normal
@@ -784,13 +787,17 @@ def main(argv=None):
         # Day 30 report, per account framing (frequency story for FB, the
         # engagement story for IG, frequency never published there). --dry
         # prints the exact Slack text, watermarked, and writes NOTHING.
-        account, dry, args = None, False, argv[1:]
+        # --html: also build the monthly HTML report and upload it to R2
+        #   (requires AGENT_REPORTING_ENABLED=true).
+        account, dry, html_flag, args = None, False, False, argv[1:]
         i = 0
         while i < len(args):
             if args[i] == "--account" and i + 1 < len(args):
                 account = args[i + 1]; i += 2; continue
             if args[i] == "--dry":
                 dry = True; i += 1; continue
+            if args[i] == "--html":
+                html_flag = True; i += 1; continue
             i += 1
         from . import config as _cfg
         from .reporting import take_daily_snapshot
@@ -802,6 +809,17 @@ def main(argv=None):
             print("Reporting: disabled (AGENT_REPORTING_ENABLED=false)")
         from .day30 import report_cli
         report_cli(account, dry)
+        if html_flag:
+            if not _cfg.reporting_enabled():
+                print("report --html: AGENT_REPORTING_ENABLED is OFF. "
+                      "HTML report not built.")
+            else:
+                from .monthly_report import run as monthly_run
+                result = monthly_run(account=account, upload=True, poster=None)
+                if result:
+                    for key, val in result.items():
+                        if key.endswith(":url"):
+                            print(f"HTML report URL: {val}")
     elif cmd == "runway":
         # READ ONLY runway math in plain lines: eligible concepts by name,
         # exclusions with reasons, the consumption assumption, and the same
