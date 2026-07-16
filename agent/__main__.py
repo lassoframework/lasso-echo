@@ -120,6 +120,7 @@ def _status():
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
+    print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -402,6 +403,8 @@ _COMMANDS = {
         ("intake-create", "create drafts from an intake payload"),
         ("intake-worker", "process the R2 intake queue one pass"),
         ("intake-status", "show intake queue depth for one account"),
+        ("mint-token", "mint, rotate, or revoke an intake token for a gym (AGENT_ONBOARD_AUTOMINT required)"),
+        ("tokens --list", "list all gyms with token status (ACTIVE/REVOKED/NOT_SET); never prints a hash"),
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
@@ -473,6 +476,59 @@ def _print_run_daily(out):
     if not drafts:
         line += " (skip day, every account off-cadence, or nothing eligible)"
     print(line)
+
+
+def _mint_token(argv):
+    """python -m agent mint-token --account <key> [--rotate] [--revoke]
+    Requires AGENT_ONBOARD_AUTOMINT=true. Prints the raw token ONCE on mint/rotate;
+    prints a confirmation on revoke. Token values are never stored anywhere."""
+    account_key, do_rotate, do_revoke = "", False, False
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--account" and i + 1 < len(argv):
+            account_key = argv[i + 1]; i += 2; continue
+        if argv[i] == "--rotate":
+            do_rotate = True
+        elif argv[i] == "--revoke":
+            do_revoke = True
+        i += 1
+    if not account_key:
+        print("usage: python -m agent mint-token --account <key> [--rotate] [--revoke]")
+        return
+    if not config.onboard_automint_enabled():
+        print("AGENT_ONBOARD_AUTOMINT is OFF. Set AGENT_ONBOARD_AUTOMINT=true to arm "
+              "the intake token store. Nothing done.")
+        return
+    from .intake_tokens import mint, rotate, revoke
+    if do_revoke:
+        revoke(account_key)
+        print(f"Token revoked for {account_key}. The gym can no longer upload.")
+        return
+    if do_rotate:
+        raw = rotate(account_key)
+    else:
+        raw = mint(account_key)
+    print(f"Intake token for {account_key}: {raw}")
+    print("Save this token now. It will not be shown again.")
+
+
+def _tokens_list():
+    """python -m agent tokens --list
+    Prints account_key, status (ACTIVE/REVOKED/NOT_SET), last rotated (or never).
+    Never prints the raw token or the stored hash."""
+    from .db import gym_list
+    from .intake_tokens import token_status
+    rows = gym_list()
+    if not rows:
+        print("tokens: no gyms recorded in the store.")
+        return
+    print(f"{'ACCOUNT':<20} {'STATUS':<10} {'LAST ROTATED'}")
+    print("-" * 52)
+    for row in rows:
+        key = row["account_key"]
+        st = token_status(key)
+        rotated = st.get("rotated_at") or "never"
+        print(f"{key:<20} {st['status']:<10} {rotated}")
 
 
 def main(argv=None):
@@ -1237,6 +1293,13 @@ def main(argv=None):
                     print(f"{label}: {count}")
             if not config.intake_worker_enabled():
                 print("(AGENT_INTAKE_WORKER is OFF)")
+    elif cmd == "mint-token":
+        _mint_token(argv[1:])
+    elif cmd == "tokens":
+        if "--list" in argv[1:]:
+            _tokens_list()
+        else:
+            print("usage: python -m agent tokens --list")
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:

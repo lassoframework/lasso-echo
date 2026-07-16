@@ -51,6 +51,17 @@ CREATE TABLE IF NOT EXISTS client_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, category TEXT,
   text TEXT, citation TEXT, status TEXT DEFAULT 'approved',
   created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS gyms (
+  account_key TEXT PRIMARY KEY,
+  display_name TEXT DEFAULT '',
+  intake_token_hash TEXT,
+  token_rotated_at TEXT,
+  token_revoked INTEGER DEFAULT 0,
+  publish_flag TEXT DEFAULT 'OFF',
+  publish_creds_status TEXT DEFAULT 'NOT SET (by hand)',
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -200,6 +211,57 @@ def audit(kind, subject, reason, account_key="", day=""):
             conn.commit()
     except Exception as e:
         print(f"[audit] write failed: {type(e).__name__}: {e}")
+
+
+def gym_upsert(account_key, display_name='', **fields):
+    """INSERT OR REPLACE into gyms with the given fields. Never stores a raw token.
+    fields: any subset of the gyms columns except account_key and created_at."""
+    allowed = {
+        'display_name', 'intake_token_hash', 'token_rotated_at',
+        'token_revoked', 'publish_flag', 'publish_creds_status',
+    }
+    # Start with the fixed columns
+    extra_cols = []
+    extra_vals = []
+    for k, v in fields.items():
+        if k in allowed and k != 'display_name':
+            extra_cols.append(k)
+            extra_vals.append(v)
+
+    all_cols = ['account_key', 'display_name'] + extra_cols
+    all_vals = [account_key, display_name] + extra_vals
+
+    placeholders = ', '.join(['?'] * len(all_cols)) + ", datetime('now')"
+    col_str = ', '.join(all_cols) + ', updated_at'
+
+    update_parts = [f"{c} = excluded.{c}" for c in all_cols if c != 'account_key']
+    update_parts.append("updated_at = datetime('now')")
+    update_str = ', '.join(update_parts)
+
+    sql = (
+        f"INSERT INTO gyms ({col_str}) VALUES ({placeholders}) "
+        f"ON CONFLICT(account_key) DO UPDATE SET {update_str}"
+    )
+    with _lock, connect() as conn:
+        conn.execute(sql, all_vals)
+        conn.commit()
+
+
+def gym_get(account_key):
+    """Returns the gyms row as a dict, or None."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM gyms WHERE account_key = ?", (account_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def gym_list():
+    """Returns all gyms rows as list of dicts, ordered by account_key."""
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM gyms ORDER BY account_key"
+        ).fetchall()]
 
 
 def audit_rows(day=None, account_key=None, limit=500):
