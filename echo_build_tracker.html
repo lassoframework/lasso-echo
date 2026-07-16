@@ -211,6 +211,10 @@
         ["2026-07-15 Stage 2 client-readiness — T2 (Portal Approvals): Kill/Deny actions, per-gym scoping, portal-callable endpoints, trust CLI. AGENT_PORTAL_APPROVALS flag (OFF). SHA: 27b4eea2940315c31af1bf7d3bcbf15a69b54057","done"],
         ["2026-07-15 Stage 2 client-readiness — T3 (Voice Brain): voice-template CLI, brain-export CLI, brain events wired to approval flow. AGENT_TENANT_BRAIN_ENABLED already in config (OFF). SHA: 4c98fc2d219ee7b71b81caae8ab4091439564371","done"],
         ["2026-07-15 Stage 2 client-readiness — T4 (Runway Alerts): AGENT_RUNWAY_ALERTS flag (OFF), dash-free text-back, glanceable runway card. SHA: bc605631dc4edf836f937a07bed0c67e638c1cd2","done"],
+        ["2026-07-16 Autonomous onboarding — T1 (Intake Token Store): gyms table, SHA-256 hashed token store, mint/rotate/revoke, tokens --list CLI. SHA: d7f93bdb643e45f24126140f3d0ddfe43ea4d1b2","done"],
+        ["2026-07-16 Autonomous onboarding — T2 (Autonomous Onboard): onboard CLI, voice+brain scaffold, trust=FULL_APPROVAL, publish OFF, upload link. SHA: b9f9aa074c13b164634d1273eba313da349bd42f","done"],
+        ["2026-07-16 Autonomous onboarding — T3 (Intake Web + Portal): data-store token lookup, per-token rate limit, portal /portal/gym/<key> endpoint. SHA: 4b443c25ef592097f3a52791c8e0ac28ded07927","done"],
+        ["2026-07-16 Autonomous onboarding — T4 (Onboard Verify): onboard-verify CLI, READY-FOR-UPLOADS vs READY-TO-PUBLISH per gym. AGENT_ONBOARD_AUTOMINT OFF. SHA: c828d371cd4cf0cdc18795e1b66bae51d35b15cc","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -267,6 +271,7 @@
       ["Flag AGENT_INTAKE_WORKER","OFF (code default). Added T1 Stage 2 client-readiness build 2026-07-15. Arms thumbnail gen, missing-caption gate, low-res flag, intake-worker CLI. Set by hand in Railway env only."],
       ["Flag AGENT_PORTAL_APPROVALS","OFF (code default). Added T2 Stage 2 client-readiness build 2026-07-15. Arms Kill/Deny portal actions and per-gym scoped approval endpoints. Set by hand in Railway env only."],
       ["Flag AGENT_RUNWAY_ALERTS","OFF (code default). Added T4 Stage 2 client-readiness build 2026-07-15. Arms dash-free text-back and glanceable runway card. Set by hand in Railway env only."],
+      ["Flag AGENT_ONBOARD_AUTOMINT","OFF (code default). Added T4 autonomous onboarding build 2026-07-16. When armed, allows auto-minting of intake tokens during onboard CLI flow. Must be set by hand in Railway env only. Never touch client billing, pixel, or CAPI without explicit approval."],
   ]};
 
   // Stage 3 reporting spec (per account, per 30-day cycle)
@@ -274,17 +279,17 @@
     metrics:["Engagement (rate + raw)","Saves","Sends / shares","Likes","Comments","Reach","Views (not impressions)","Follower growth (net + rate)","Posting frequency: before vs after Echo","Top 3 posts","Bottom 3 posts","Health read: growing / flat / declining"]};
 
   // Client intake — how clients feed the creative library (Stage 2)
-  const CLIENT_INTAKE={ name:"Client Intake \u2014 texted link to portal", meta:"Stage 2. Primary path is a texted short link to a full-res upload page (MMS compresses media before it ever reaches us). MMS inbound is the fallback. It is the client's own media and words, so fabrication risk stays near zero.",
+  const CLIENT_INTAKE={ name:"Client Intake \u2014 portal upload + WhatsApp", meta:"Stage 2. Primary path is a per-gym branded portal upload page (full-res direct to R2, no carrier compression). WhatsApp is the secondary path via WABA. Both flow into the same ingest worker. It is the client's own media and words, so fabrication risk stays near zero.",
     items:[
-      "Client texts a keyword; auto-reply sends a per-gym branded upload link",
-      "Upload page streams originals to storage (full-res, HEIC/MOV, EXIF preserved)",
-      "Short token maps to the gym: attribution is automatic, no login",
-      "Fallback: capture inbound MMS media immediately (carrier URLs expire), flag as low-res",
-      "Texted sentence becomes the caption note (no-fabrication gate holds)",
-      "Missing caption: auto-reply asks for one; draft stays blocked until provided",
+      "LASSO sends the gym their branded /portal/gym/&lt;key&gt; upload link (token minted via onboard CLI)",
+      "Portal upload page: full-res originals stream directly to R2 (HEIC/MOV/MP4/JPG), no carrier compression",
+      "Short token maps to the gym: attribution is automatic, no login required",
+      "WhatsApp (secondary): WABA X-Hub-Signature-256 verified before parsing, 16MB ceiling enforced, same ingest queue",
+      "Typed caption in portal notes or WhatsApp message becomes the caption note (no-fabrication gate holds)",
+      "Missing caption: auto-reply asks for one; draft stays blocked until caption provided",
       "Confirmation reply: friendly, branded, no dashes (in your approval queue)",
-      "A2P 10DLC brand + campaign registered before any texting goes live",
-      "Tool: GoHighLevel or Twilio; verify webhook with Ed25519 X-GHL-Signature",
+      "AGENT_WHATSAPP_INTAKE_ENABLED: do not arm before WABA App Review whatsapp_business_messaging permission is granted",
+      "Ingest worker: perceptual dedupe per gym, consent + autotag hooks, thumbnail, tenant-scoped R2 keys",
   ]};
 
   // Creative Studio — generated assets, flagged and default OFF (Stage 2 & 3)
@@ -460,7 +465,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-15 (Stage 2 client-readiness build T5 housekeeping: T1 AGENT_INTAKE_WORKER OFF + thumbnail gen + missing-caption gate SHA 4e29f2c, T2 AGENT_PORTAL_APPROVALS OFF + Kill/Deny + per-gym scoping SHA 27b4eea, T3 voice-template + brain-export + brain events wired SHA 4c98fc2, T4 AGENT_RUNWAY_ALERTS OFF + dash-free text-back + runway card SHA bc60563; last merged SHA bc605631dc4edf836f937a07bed0c67e638c1cd2; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; all new flags default OFF; every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-16 (T5 housekeeping: autonomous onboarding + intake-token store: T1 gyms table + SHA-256 token store + mint/rotate/revoke SHA d7f93bd, T2 onboard CLI + voice+brain scaffold + trust=FULL_APPROVAL SHA b9f9aa0, T3 data-store token lookup + per-token rate limit + portal endpoint SHA 4b443c2, T4 onboard-verify CLI + READY-FOR-UPLOADS vs READY-TO-PUBLISH + AGENT_ONBOARD_AUTOMINT OFF SHA c828d37; last merged SHA c828d371cd4cf0cdc18795e1b66bae51d35b15cc; 1309 green; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; AGENT_ONBOARD_AUTOMINT default OFF; all new flags default OFF; Meta publishing token never touched; every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 

@@ -6,7 +6,19 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-15
+Last updated: 2026-07-16
+
+---
+
+## Autonomous onboarding + intake-token store (2026-07-16)
+
+- T1 (Intake Token Store): gyms table, SHA-256 hashed token store, mint/rotate/revoke, tokens --list CLI. SHA: d7f93bdb643e45f24126140f3d0ddfe43ea4d1b2
+- T2 (Autonomous Onboard): onboard CLI, voice+brain scaffold, trust=FULL_APPROVAL, publish OFF, upload link. SHA: b9f9aa074c13b164634d1273eba313da349bd42f
+- T3 (Intake Web + Portal): data-store token lookup, per-token rate limit, portal /portal/gym/<key> endpoint. SHA: 4b443c25ef592097f3a52791c8e0ac28ded07927
+- T4 (Onboard Verify): onboard-verify CLI, READY-FOR-UPLOADS vs READY-TO-PUBLISH per gym. SHA: c828d371cd4cf0cdc18795e1b66bae51d35b15cc
+
+### Readiness grade: B+
+Grade does NOT move to A. Gate is one real gym completing a full 30-day month of posts plus Meta App Review cleared for client-owned assets.
 
 ---
 
