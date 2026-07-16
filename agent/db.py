@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS gyms (
   token_status TEXT DEFAULT 'NOT_SET',
   upload_link TEXT,
   publish_flag TEXT DEFAULT 'OFF',
+  publish_creds TEXT DEFAULT 'NOT SET (by hand)',
   publish_creds_status TEXT DEFAULT 'NOT SET (by hand)',
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
@@ -221,10 +222,10 @@ def gym_upsert(account_key, display_name='', **fields):
     """INSERT OR REPLACE into gyms with the given fields. Never stores a raw token.
     fields: any subset of the gyms columns except account_key and created_at."""
     allowed = {
-        'display_name', 'intake_token_hash', 'token_rotated_at',
-        'token_revoked', 'publish_flag', 'publish_creds_status',
+        'display_name', 'gym_name', 'intake_token_hash', 'token_rotated_at',
+        'token_revoked', 'upload_link', 'publish_flag',
+        'publish_creds', 'publish_creds_status',
     }
-    # Start with the fixed columns
     extra_cols = []
     extra_vals = []
     for k, v in fields.items():
@@ -251,21 +252,32 @@ def gym_upsert(account_key, display_name='', **fields):
         conn.commit()
 
 
-def gym_get(account_key):
-    """Returns the gyms row as a dict, or None."""
-    with connect() as conn:
-        row = conn.execute(
+def gym_get(account_key, conn=None):
+    """Returns the gyms row as a dict, or None. Accepts an optional open connection."""
+    def _get(c):
+        row = c.execute(
             "SELECT * FROM gyms WHERE account_key = ?", (account_key,)
         ).fetchone()
         return dict(row) if row else None
 
+    if conn is not None:
+        return _get(conn)
+    with connect() as c:
+        return _get(c)
 
-def gym_list():
-    """Returns all gyms rows as list of dicts, ordered by account_key."""
-    with connect() as conn:
-        return [dict(r) for r in conn.execute(
+
+def gym_list(conn=None):
+    """Returns all gyms rows as list of dicts, ordered by account_key.
+    Accepts an optional open connection."""
+    def _list(c):
+        return [dict(r) for r in c.execute(
             "SELECT * FROM gyms ORDER BY account_key"
         ).fetchall()]
+
+    if conn is not None:
+        return _list(conn)
+    with connect() as c:
+        return _list(c)
 
 
 def audit_rows(day=None, account_key=None, limit=500):
