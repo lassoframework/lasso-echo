@@ -113,6 +113,31 @@ def runway_nudge(account_key, library_prefix, poster, threshold=None):
     return True
 
 
+def _spend_alert_lines(accounts, today):
+    """One informational line per account whose generation calls are at or above
+    80% of the daily cap. Fires only when the cap is armed and only once per
+    account per day (dedup lives in the spend module's kv key). No auto-reload:
+    this is a nudge to check billing, nothing more."""
+    from . import spend
+    out = []
+    for account in accounts:
+        try:
+            if not spend.should_alert_spend(account.key, day=today):
+                continue
+            snap = spend.spend_snapshot(account_key=account.key, day=today)
+            calls = snap["buckets"][0]["calls"] if snap["buckets"] else 0
+            cap = snap["cap"]
+            out.append(
+                f"[SPEND ALERT] {account.key}: generation calls at or above "
+                f"80% of daily cap ({calls}/{cap}). Check spend if the cap is "
+                "close to billing limit."
+            )
+            spend.mark_spend_alerted(account.key, day=today)
+        except Exception:
+            pass
+    return out
+
+
 def maybe_send(poster, now=None, library_path=None):
     """
     Fire the digest once per day at the digest hour. Returns the combined
@@ -140,6 +165,8 @@ def maybe_send(poster, now=None, library_path=None):
     for account in accounts:
         lib = account.library_prefix or library_path
         lines.append(build_account_digest(account.key, today, library_path=lib))
+
+    lines.extend(_spend_alert_lines(accounts, today))
 
     combined = "\n".join(lines)
     if poster is not None:
