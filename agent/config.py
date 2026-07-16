@@ -923,3 +923,12 @@ def services_category_enabled() -> bool:
     """Services category for LASSO own accounts ONLY, never client accounts. OFF by default.
     Draws from brand_voice/lasso_services.md; stub file = SKIP not fabricate."""
     return _truthy(os.environ.get("AGENT_SERVICES_CATEGORY", "false"))
+
+
+def intake_worker_enabled() -> bool:
+    """
+    Intake pipeline worker: turns incoming R2 uploads into library-ready assets.
+    Distinct from AGENT_INTAKE_ENABLED which gates the upload web surface.
+    Default OFF. Arm by hand.
+    """
+    return _truthy(os.environ.get("AGENT_INTAKE_WORKER", "false"))

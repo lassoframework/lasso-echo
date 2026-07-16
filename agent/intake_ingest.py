@@ -107,6 +107,30 @@ def _moderate_default(data, name):
     return True, ""
 
 
+def _make_thumbnail(data, name, max_px=400):
+    """Returns (thumb_bytes, thumb_name) or None if Pillow is unavailable or the
+    image format is not supported. Resizes to max_px on the longest side, converts
+    to JPEG, strips EXIF. Never raises."""
+    try:
+        from PIL import Image, ImageOps  # lazy
+        stem = os.path.splitext(name)[0]
+        img = Image.open(io.BytesIO(data))
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        w, h = img.size
+        if w == 0 or h == 0:
+            return None
+        scale = max_px / max(w, h)
+        if scale < 1.0:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                             Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        return out.getvalue(), f"{stem}_thumb.jpg"
+    except Exception:
+        return None
+
+
 # ---- manifest -------------------------------------------------------------------
 def _load_manifest(r2, client):
     try:
@@ -223,7 +247,7 @@ def _land_intake_form(client, payload, r2, key, manifest):
 
 def _process_client(client, r2, poster, converter, phash, moderator):
     stats = {"accepted": 0, "duplicates": 0, "flagged": 0, "deadlettered": 0,
-             "skipped": 0, "intake_forms": 0}
+             "skipped": 0, "intake_forms": 0, "needs_caption": 0, "low_res": 0}
     manifest = _load_manifest(r2, client)
     prefix = f"intake/{client}/incoming/"
     keys = sorted(r2.list_keys(prefix))
@@ -254,16 +278,22 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             ops_alerts.alert(f"intake form dead-lettered {client}/"
                              f"{os.path.basename(key)}: {type(e).__name__}: {e}")
 
-    # note lookup: a media file's sidecar shares its timestamp prefix
-    def _note_for(media_key):
+    # note/sidecar lookup: a media file's sidecar shares its timestamp prefix.
+    # Returns (found, payload): found=True means a sidecar key existed (even if
+    # the payload was malformed); found=False means no sidecar at all.
+    def _sidecar_for(media_key):
         stamp = os.path.basename(media_key).split("_", 1)[0]
         for sk in sidecars:
             if os.path.basename(sk).startswith(stamp):
                 try:
-                    return (json.loads(r2.get_bytes(sk).decode("utf-8")) or {}).get("note", "")
+                    return True, json.loads(r2.get_bytes(sk).decode("utf-8")) or {}
                 except Exception:
-                    return ""
-        return ""
+                    return True, {}
+        return False, {}
+
+    def _note_for(media_key):
+        _, payload = _sidecar_for(media_key)
+        return payload.get("note", "")
 
     lib_dir = _library_dir_for(client)
     for key in media_keys:
@@ -325,14 +355,98 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 r2.put_bytes(f"intake/{client}/originals/{os.path.basename(key)}",
                              raw)
 
+            # THUMBNAIL: generated after conversion, before library filing.
+            # A failed thumbnail logs a warning and never blocks ingest.
+            thumb_result = _make_thumbnail(data, name)
+            if thumb_result is not None:
+                thumb_bytes, thumb_name = thumb_result
+                try:
+                    r2.put_bytes(f"intake/{client}/thumbs/{thumb_name}",
+                                 thumb_bytes, content_type="image/jpeg")
+                except Exception as thumb_err:
+                    print(f"[intake] thumbnail store failed for {client}/{name}: "
+                          f"{type(thumb_err).__name__}")
+            else:
+                if not name.lower().endswith((".mp4", ".mov")):
+                    print(f"[intake] thumbnail skipped for {client}/{name} "
+                          "(Pillow unavailable or unsupported format)")
+
+            # LOW-RES FLAG: images whose width AND height are both below 800px are
+            # accepted without blocking but tagged and the poster is notified.
+            sidecar_found, sidecar_data = _sidecar_for(key)
+            low_res_flag = {}
+            if not name.lower().endswith((".mp4", ".mov")):
+                try:
+                    from PIL import Image  # lazy
+                    img_check = Image.open(io.BytesIO(data))
+                    w_check, h_check = img_check.size
+                    if w_check < 800 and h_check < 800:
+                        low_res_flag = {"low_res": True,
+                                        "resolution": f"{w_check}x{h_check}"}
+                        stats["low_res"] += 1
+                        if poster is not None:
+                            poster.post_notice(
+                                f"Heads up: the photo {name} for {client} is "
+                                f"low resolution ({w_check}x{h_check}). It has "
+                                "been filed but a higher resolution version will "
+                                "look better in your content lineup.")
+                except Exception:
+                    pass
+
+            # MISSING-CAPTION GATE: an upload whose sidecar exists but has no
+            # caption is staged to pending_caption/ rather than the live library,
+            # and status is set to needs_caption. The draft is BLOCKED until a
+            # caption arrives. Nothing is invented. Never fabricate.
+            # When NO sidecar exists at all, we skip this gate (no upload context
+            # means there is nothing to check, and we preserve the old behavior).
+            caption_text = (sidecar_data.get("note") or "").strip()
+            if sidecar_found and not caption_text:
+                stats["needs_caption"] += 1
+                pending_sidecar = {
+                    "status": "needs_caption",
+                    "original_key": key,
+                    **low_res_flag,
+                }
+                r2.put_bytes(f"intake/{client}/pending_caption/{name}", data)
+                r2.put_bytes(
+                    f"intake/{client}/pending_caption/{os.path.splitext(name)[0]}.json",
+                    json.dumps(pending_sidecar).encode("utf-8"),
+                    content_type="application/json",
+                )
+                manifest["processed"].append(key)
+                manifest["sha256"].append(sha)
+                manifest["sha256_raw"].append(raw_sha)
+                if ph is not None:
+                    manifest["phash"].append(ph)
+                r2.delete(key)
+                if poster is not None:
+                    poster.post_notice(
+                        f"Got your photo! Send a quick caption and we will get "
+                        f"it into your content lineup.")
+                continue
+
             os.makedirs(lib_dir, exist_ok=True)
             with open(os.path.join(lib_dir, name), "wb") as fh:
                 fh.write(data)
-            note = _note_for(key)
+            note = caption_text
             if note:
                 stem = os.path.splitext(name)[0]
                 with open(os.path.join(lib_dir, f"{stem}.txt"), "w", encoding="utf-8") as fh:
                     fh.write(note.strip())
+            if low_res_flag:
+                stem = os.path.splitext(name)[0]
+                try:
+                    existing_sidecar_path = os.path.join(lib_dir, f"{stem}.json")
+                    if os.path.exists(existing_sidecar_path):
+                        with open(existing_sidecar_path, encoding="utf-8") as _fh:
+                            filed_sidecar = json.load(_fh)
+                    else:
+                        filed_sidecar = {}
+                    filed_sidecar.update(low_res_flag)
+                    with open(existing_sidecar_path, "w", encoding="utf-8") as _fh:
+                        json.dump(filed_sidecar, _fh)
+                except Exception:
+                    pass
 
             manifest["processed"].append(key)
             manifest["sha256"].append(sha)
