@@ -10,6 +10,51 @@ Last updated: 2026-07-16
 
 ---
 
+## Fable 5 Tier 2/3 remainder (2026-07-16)
+
+### Step 1 DONE: locked pre-Echo baseline (SHA `710be29`, suite 1368 passed)
+
+`pre_echo_baselines` table added to the DB (write-once per account: PRIMARY KEY on
+account_key, no silent overwrite). New functions in `agent/baseline.py`:
+`lock_pre_echo_baseline()`, `read_pre_echo_baseline()`, `baseline_report()`.
+Two new CLI commands: `capture-baseline` now also locks the DB record after the
+JSON snapshot; `baseline-report --account <key>` reads and prints the locked row.
+
+Confidence grades:
+  clean                   first confirmed Echo post found in posts table; pre-Echo
+                          window is 8 weeks
+  partially contaminated  cutoff from would_publish (draft-only) posts, or no Echo
+                          post found at all and window ends at current time
+  no reliable pre-Echo data found
+                          no API token available, or Graph read failed
+
+On production, run `python -m agent capture-baseline` to lock the number now.
+Running again without `--force` is safe (refuses to overwrite). 16 new tests.
+
+### Step 2 ALREADY DONE (prior session): SQLite store on /data
+
+`PendingStore` and the full DB layer are already fully SQLite-backed (WAL, echo.db).
+`AGENT_SQLITE_STORE` flag was not added retroactively; the migration shipped complete.
+No work done here beyond documenting the already-done status.
+
+### Step 3 DONE: Gemini spend-status CLI + digest alert (visibility only, no auto-reload)
+
+`agent/spend.py` added: reads `gemini_calls:<account_key>` counters from the DB
+and computes pct-of-cap for each account. `spend-status` CLI prints a per-account
+table with calls, cap, pct, and armed/disarmed state. Digest alert fires at 80% of
+cap (one alert per day per bucket, stored in kv to suppress duplicates).
+
+Auto-reload is deliberately NOT built. Whether to raise the cap or top up billing
+is Blake's call in the Google Cloud console. See `agent/spend.py` module docstring.
+7 new tests.
+
+### Grade: B+ (unchanged)
+
+Fable 5 visibility tracks complete. Grade moves to A when a real gym completes a
+full 30-day posting month and Meta App Review is cleared for client-owned assets.
+
+---
+
 ## Auto-mint completion + library gap audit (2026-07-16)
 
 ### Step 0 complete: encrypted token at rest
