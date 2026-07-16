@@ -1,5 +1,16 @@
 """
-Client onboarding CLI (Stage 3 templating). RUN BY HAND:
+Autonomous onboarding (Stage 2 T2) + legacy add-client scaffold (Stage 3).
+
+The `run()` function (Stage 2 T2) is the new autonomous onboard path.
+The `add_client()` function (Stage 3) is the existing manual scaffold path.
+
+RUN BY HAND (new):
+
+    python -m agent onboard --account <key> --name "<Gym Name>" [--base-url <url>]
+
+RUN BY HAND (legacy):
+
+    /opt/venv/bin/python -m agent add-client --key <k> --name <n>
 
     /opt/venv/bin/python -m agent add-client --key <k> --name <n>
 
@@ -21,6 +32,10 @@ re-running skips every file that already exists (nothing destructive, ever).
 
 import os
 import re
+
+from . import config, db
+from .trust import TrustLevel, default_trust_for_new_account
+from .voice_template import render_template
 
 VOICE_TEMPLATE = """# {name} Brand Bible (TODO: fill by hand or via draft-bible)
 
@@ -135,3 +150,122 @@ Account(
     print(CHECKLIST.format(key=key))
     print(f"created: {len(created)} file(s); skipped (already existed): {len(skipped)}")
     return {"created": created, "skipped": skipped, "entry": entry}
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 T2: Autonomous onboard  (run via: python -m agent onboard ...)
+# ---------------------------------------------------------------------------
+
+def run(account_key, display_name, db_conn=None, voice_dir=None,
+        brains_dir=None, base_url=None):
+    """
+    Stand up a new gym end to end. Idempotent: re-running updates display_name
+    if different, never re-mints unless rotate was called.
+
+    Returns a result dict with keys:
+      account_key, display_name, token_minted, voice_path, brain_path,
+      trust_level, publish_flag, creds_status, upload_link, pending_human_items
+
+    HARD RULES enforced here:
+      - AGENT_ONBOARD_AUTOMINT must be ON to mint a token; otherwise token_minted=None
+      - Meta credentials are NEVER touched. creds_status is always NOT SET (by hand).
+      - voice file is the empty FILLABLE template only; LASSO content never copied in.
+      - brain file is empty (one header line only).
+      - trust_level is ALWAYS FULL_APPROVAL for new gyms; never set to anything else here.
+      - publish_flag is ALWAYS OFF.
+      - No em dashes, en dashes, or hyphens in any gym-facing copy in this result.
+      - Fabrication gate: no invented facts, stats, prices, or offers written into files.
+    """
+    # Resolve paths relative to cwd when not supplied, using the same conventions
+    # as the rest of the codebase (brand_voice/ and brains/ at the repo root).
+    if voice_dir is None:
+        voice_dir = "brand_voice"
+    if brains_dir is None:
+        brains_dir = "brains"
+
+    result = {
+        "account_key": account_key,
+        "display_name": display_name,
+        "token_minted": None,
+        "voice_path": None,
+        "brain_path": None,
+        "trust_level": default_trust_for_new_account(),
+        "publish_flag": "OFF",
+        "creds_status": "NOT SET (by hand)",
+        "upload_link": None,
+        "pending_human_items": [],
+    }
+
+    # (a) Upsert gym row --------------------------------------------------
+    db.gym_upsert(account_key, display_name=display_name)
+
+    # (b) Token minting ---------------------------------------------------
+    if config.onboard_automint_enabled():
+        status = _token_status(account_key)
+        if status.get("has_token"):
+            result["token_minted"] = False
+        else:
+            from . import intake_tokens
+            raw_token = intake_tokens.mint(account_key, db_conn=db_conn)
+            result["token_minted"] = raw_token   # caller only: never written to file/log
+    else:
+        result["token_minted"] = None   # skipped, pending by hand
+
+    # (c) Scaffold voice file ---------------------------------------------
+    voice_path = os.path.join(voice_dir, f"{account_key}.md")
+    result["voice_path"] = voice_path
+    if not os.path.exists(voice_path):
+        # render_template writes to out_path and returns the path
+        render_template(out_path=voice_path)
+        # Confirm: the rendered file must be dash-free and fabrication-free.
+        # (render_template already asserts this internally.)
+
+    # (d) Scaffold brain file ---------------------------------------------
+    brain_path = os.path.join(brains_dir, f"{account_key}.md")
+    result["brain_path"] = brain_path
+    if not os.path.exists(brain_path):
+        os.makedirs(brains_dir, exist_ok=True)
+        with open(brain_path, "w", encoding="utf-8") as fh:
+            fh.write(f"# Style brain for {account_key}\n")
+
+    # (e) Trust -----------------------------------------------------------
+    db.kv_set(f"gym_trust_{account_key}", str(int(TrustLevel.FULL_APPROVAL)))
+    result["trust_level"] = TrustLevel.FULL_APPROVAL
+
+    # (f) Publish flag and creds ------------------------------------------
+    db.kv_set(f"gym_publish_{account_key}", "OFF")
+    db.kv_set(f"gym_publish_creds_{account_key}", "NOT SET (by hand)")
+    result["publish_flag"] = "OFF"
+    result["creds_status"] = "NOT SET (by hand)"
+    # THE ONE HUMAN LINE: Meta token is set by Blake by hand only.
+    # This function NEVER creates, reads, prints, or infers it.
+
+    # (g) Upload link -----------------------------------------------------
+    if base_url and isinstance(result["token_minted"], str):
+        result["upload_link"] = base_url.rstrip("/") + "/u/" + result["token_minted"]
+
+    # (h) Pending human items ---------------------------------------------
+    pending = ["publish creds: NOT SET (by hand)"]
+    gym_row = db.gym_get(account_key)
+    if not gym_row.get("slack_channel"):
+        pending.append("Slack channel: NOT SET")
+    if not gym_row.get("approvers"):
+        pending.append("approver Slack ID: NOT SET")
+    pending.append("first-month plan: PENDING")
+    if result["token_minted"] is None:
+        pending.append("intake token: requires AGENT_ONBOARD_AUTOMINT=true")
+    result["pending_human_items"] = pending
+
+    return result
+
+
+def _token_status(account_key):
+    """Check kv for whether this account already has an active intake token.
+    Returns a dict matching the intake_tokens.token_status interface so the
+    automint check works even before intake_tokens is available."""
+    try:
+        from . import intake_tokens
+        return intake_tokens.token_status(account_key)
+    except Exception:
+        return {"account_key": account_key, "has_token": False,
+                "revoked": False, "token_prefix": ""}

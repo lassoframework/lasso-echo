@@ -954,7 +954,10 @@ def intake_worker_enabled() -> bool:
 
 def onboard_automint_enabled() -> bool:
     """
-    Auto-mint intake tokens from the data store. Default OFF.
-    When OFF, AGENT_INTAKE_TOKEN_<KEY> env vars remain authoritative.
+    Autonomous onboarding token mint switch. OFF by default.
+    When OFF, the onboard command creates the gym row and scaffolds files but
+    skips intake token minting; AGENT_INTAKE_TOKEN_<KEY> env vars remain
+    authoritative. Blake sets this by hand to enable. Nothing in onboarding
+    arms itself or touches any Meta credential.
     """
     return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))
