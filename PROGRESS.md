@@ -10,6 +10,18 @@ Last updated: 2026-07-15
 
 ---
 
+## Stage 2 client-readiness build (2026-07-15)
+
+- T1 (Intake Worker): AGENT_INTAKE_WORKER flag, thumbnail gen, missing-caption gate, low-res flag, intake-worker/intake-status CLI. SHA: 4e29f2c96e8d301d0bba8d0e6f8864258f52caed
+- T2 (Portal Approvals): Kill/Deny actions, per-gym scoping, portal-callable endpoints, trust CLI. SHA: 27b4eea2940315c31af1bf7d3bcbf15a69b54057
+- T3 (Voice Brain): voice-template CLI, brain-export CLI, brain events wired to approval flow. SHA: 4c98fc2d219ee7b71b81caae8ab4091439564371
+- T4 (Runway Alerts): AGENT_RUNWAY_ALERTS flag, dash-free text-back, glanceable runway card. SHA: bc605631dc4edf836f937a07bed0c67e638c1cd2
+
+### Readiness grade: B+
+Grade does NOT move to A. The gate to A requires: (1) a real gym completes a full 30-day month of posts, (2) Meta App Review cleared for client-owned assets. Not code alone.
+
+---
+
 ## Overnight parallel build 2 (2026-07-15)
 
 - Track 1 (Reporting Live): monthly report uploads HTML to R2, posts URL to Slack, --html flag on report CLI. SHA: f6134ca482f07577294b09736c9c2e12aeb3ab3e

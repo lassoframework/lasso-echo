@@ -207,6 +207,10 @@
         ["2026-07-15 Overnight build 2 — Track 2 (Calendar view): calendar-export JSON + standalone HTML V3 brand palette, multi-account switcher. SHA: 16c246b15af87b34972d77041ab1b7cc16588c4a","done"],
         ["2026-07-15 Overnight build 2 — Track 3 (Onboard dryrun): onboard-dryrun 30-day harness, no live tokens, HTML review bundle. SHA: 2b19293abf0c36f34b2e42a27d866f258c784a2c","done"],
         ["2026-07-15 Overnight build 2 — Track 4 (Meta check): meta-check token scopes reachability publishable status. SHA: d45c75426289ca473877ecfbb87d62b0e06b71b5","done"],
+        ["2026-07-15 Stage 2 client-readiness — T1 (Intake Worker): AGENT_INTAKE_WORKER flag (OFF), thumbnail gen, missing-caption gate, low-res flag, intake-worker/intake-status CLI. SHA: 4e29f2c96e8d301d0bba8d0e6f8864258f52caed","done"],
+        ["2026-07-15 Stage 2 client-readiness — T2 (Portal Approvals): Kill/Deny actions, per-gym scoping, portal-callable endpoints, trust CLI. AGENT_PORTAL_APPROVALS flag (OFF). SHA: 27b4eea2940315c31af1bf7d3bcbf15a69b54057","done"],
+        ["2026-07-15 Stage 2 client-readiness — T3 (Voice Brain): voice-template CLI, brain-export CLI, brain events wired to approval flow. AGENT_TENANT_BRAIN_ENABLED already in config (OFF). SHA: 4c98fc2d219ee7b71b81caae8ab4091439564371","done"],
+        ["2026-07-15 Stage 2 client-readiness — T4 (Runway Alerts): AGENT_RUNWAY_ALERTS flag (OFF), dash-free text-back, glanceable runway card. SHA: bc605631dc4edf836f937a07bed0c67e638c1cd2","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -260,6 +264,9 @@
       ["Brand palette (resolved)","canonical = V3: Navy #121E3C / Red #FF0000 / Sky #5EB9E6 / Cream #FAF6F0. Baked into creative_studio.py; BUILD_SPEC.md updated; the #0F1B33 draft is superseded."],
       ["Publish path decision","spec routes publishing through GHL Social Planner V2; Echo currently publishes direct via Meta Graph (built, working). Lean: keep direct Meta for LASSO now, move to GHL at 100+ client scale for its rate-limit handling."],
       ["Platform access approvals","Meta App Review and Google GBP API access are the client-onboarding long poles (days to weeks). Submit early."],
+      ["Flag AGENT_INTAKE_WORKER","OFF (code default). Added T1 Stage 2 client-readiness build 2026-07-15. Arms thumbnail gen, missing-caption gate, low-res flag, intake-worker CLI. Set by hand in Railway env only."],
+      ["Flag AGENT_PORTAL_APPROVALS","OFF (code default). Added T2 Stage 2 client-readiness build 2026-07-15. Arms Kill/Deny portal actions and per-gym scoped approval endpoints. Set by hand in Railway env only."],
+      ["Flag AGENT_RUNWAY_ALERTS","OFF (code default). Added T4 Stage 2 client-readiness build 2026-07-15. Arms dash-free text-back and glanceable runway card. Set by hand in Railway env only."],
   ]};
 
   // Stage 3 reporting spec (per account, per 30-day cycle)
@@ -453,7 +460,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-15 (Overnight build 2: Track 1 reporting live HTML to R2 + Slack URL, Track 2 calendar-export JSON + multi-account switcher, Track 3 onboard-dryrun 30-day harness, Track 4 meta-check token reachability; all 4 tracks merged; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; approval gate unchanged, every post waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-15 (Stage 2 client-readiness build T5 housekeeping: T1 AGENT_INTAKE_WORKER OFF + thumbnail gen + missing-caption gate SHA 4e29f2c, T2 AGENT_PORTAL_APPROVALS OFF + Kill/Deny + per-gym scoping SHA 27b4eea, T3 voice-template + brain-export + brain events wired SHA 4c98fc2, T4 AGENT_RUNWAY_ALERTS OFF + dash-free text-back + runway card SHA bc60563; last merged SHA bc605631dc4edf836f937a07bed0c67e638c1cd2; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; all new flags default OFF; every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 
