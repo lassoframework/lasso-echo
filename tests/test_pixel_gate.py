@@ -80,12 +80,71 @@ def test_gate_creative_passes_recorded_approved_stat(tmp_path, monkeypatch):
     assert reason == ""
 
 
-def test_gate_creative_unverifiable_passes_without_reader(tmp_path, monkeypatch):
+def test_gate_creative_unverifiable_passes_when_studio_off(tmp_path, monkeypatch):
+    # studio disarmed: no vision path to fail closed on, so an un-scanned image
+    # falls back to the deterministic note check (dev / non-OCR deployments work).
     monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
     monkeypatch.setattr(pixel_gate, "_default_reader", lambda: None)
+    from agent import config
+    monkeypatch.setattr(config, "creative_studio_enabled", lambda: False)
     c = _card(tmp_path, "norecord", rendered_text=None)  # no sidecar, no reader
     ok, reason = pixel_gate.gate_creative(c)
-    assert ok is True  # nothing to gate on yet; the retro scan / ingest OCR handles it
+    assert ok is True
+
+
+def test_gate_creative_fails_closed_on_unreadable_image(tmp_path, monkeypatch):
+    # studio armed but the read cannot run: a card WITH rendered pixels blocks,
+    # never passes as 'unverifiable'.
+    monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
+    monkeypatch.setattr(pixel_gate, "_default_reader", lambda: None)
+    from agent import config
+    monkeypatch.setattr(config, "creative_studio_enabled", lambda: True)
+    c = _card(tmp_path, "unreadable", rendered_text=None)  # image present, no reader
+    ok, reason = pixel_gate.gate_creative(c)
+    assert ok is False
+    assert "could not verify" in reason
+
+
+def test_gate_creative_forced_verification_blocks_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
+    monkeypatch.setattr(pixel_gate, "_default_reader", lambda: None)
+    c = _card(tmp_path, "forced", rendered_text=None)
+    ok, reason = pixel_gate.gate_creative(c, require_verification=True)
+    assert ok is False and "could not verify" in reason
+
+
+def test_read_finding_no_text_records_exempt(tmp_path, monkeypatch):
+    # a successful read that finds NO text (pure photo) records the exempt sentinel
+    # and passes; a later look needs no reader.
+    monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
+    monkeypatch.setattr(pixel_gate, "_default_reader", lambda: (lambda _b: ""))
+    c = _card(tmp_path, "photo", rendered_text=None)
+    ok, reason = pixel_gate.gate_creative(c, require_verification=True)
+    assert ok is True  # scanned, no text: nothing to fabricate
+    # recorded as scanned (empty), so it never re-reads and never blocks
+    monkeypatch.setattr(pixel_gate, "_default_reader", lambda: None)
+    assert pixel_gate.recorded_rendered_text(c.path) == ""
+    ok2, _ = pixel_gate.gate_creative(c, require_verification=True)
+    assert ok2 is True
+
+
+def test_video_creative_is_exempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
+    monkeypatch.setattr(pixel_gate, "_default_reader", lambda: None)
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"0" * 100)
+
+    class _V:
+        path = str(vid)
+        client_note = ""
+    ok, reason = pixel_gate.gate_creative(_V(), require_verification=True)
+    assert ok is True  # no still pixels to OCR; documented gap, not a silent pass-as-clean
+
+
+def test_ocr_model_is_not_the_generation_model():
+    from agent import config
+    assert config.OCR_MODEL != config.NANO_MODEL
+    assert "image" not in config.OCR_MODEL  # a vision TEXT model, not a *-image gen model
 
 
 def test_ocr_belt_records_read_then_gates(tmp_path, monkeypatch):
@@ -193,7 +252,8 @@ def test_fabrication_scan_auto_blocks_bad_card(tmp_path, monkeypatch):
     store = _FakeStore([draft])
     report = fabrication_scan.scan(store=store, poster=_FakePoster(), auto_block=True)
     assert len(report["blocked"]) == 1
-    assert report["blocked"][0]["numbers"] == ["80%"]
+    assert report["blocked"][0]["kind"] == "stat"
+    assert "80%" in report["blocked"][0]["reason"]
     assert store.put_calls and store.put_calls[0].status == DraftStatus.BLOCKED
 
 

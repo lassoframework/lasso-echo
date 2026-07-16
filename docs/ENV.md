@@ -96,7 +96,8 @@ before this file existed.
 |---|---|---|---|
 | AGENT_NANO_ENABLED | false | BLAKE | Infographic generation. |
 | AGENT_NANO_API_KEY | (unset) | BLAKE | Gemini key. Never logged. |
-| AGENT_NANO_MODEL | gemini-3-pro-image | code | |
+| AGENT_NANO_MODEL | gemini-3-pro-image | code | Image GENERATION model (Nano Banana). Returns image parts, not text. |
+| AGENT_OCR_MODEL | gemini-2.5-flash | code | Vision READ model (image to text) for OCR / autotag / the pixel fabrication gate. MUST be a vision-capable TEXT model, NOT a `*-image` generation model (those cannot transcribe text out of an image). Uses the same AGENT_NANO_API_KEY. |
 | AGENT_IMAGE_ASPECT / AGENT_IMAGE_PIXELS | 4:5 / 1080x1350 | code | Feed target. |
 | AGENT_STORY_ASPECT / AGENT_STORY_PIXELS | 9:16 / 1080x1920 | code | Story target. |
 | AGENT_SPEND_CAP_ENABLED | false | BLAKE | Per-account daily generation cap. |

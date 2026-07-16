@@ -1,27 +1,34 @@
 """
-Retroactive pixel fabrication scan.
+Retroactive pixel fabrication scan (fail-closed).
 
-Walk every PENDING / planned card in the queue, resolve the text rendered INTO
-each card's creative (recorded sidecar text first; a one-time OCR read otherwise,
-recorded back so the next look is free), and check it against the approved
-receipts. A card whose pixels carry a stat with no approved source is AUTO-BLOCKED
-(Blake's call): its record flips to BLOCKED naming the number, its Slack card is
-retired in place, and it drops out of the approvable queue. `--dry-run` reports
-without blocking so the queue can be reviewed first.
+Walk every PENDING / planned card in the queue and verify the text rendered INTO
+each card's creative:
 
-Nothing here publishes or fabricates; it only pulls unverifiable stat cards out of
-the queue and names the number so Blake can clear them in one pass.
+  - recorded sidecar text is used first (free);
+  - otherwise the pixels are OCR-read RIGHT NOW (backfill) and the read is recorded
+    so the next look is free.
+
+Two ways a card is AUTO-BLOCKED (Blake's call), each named plainly:
+  1. its rendered pixels carry a stat with no approved receipt (the number named);
+  2. it HAS rendered pixels the gate could not read or verify (fail closed): an
+     unreadable card is blocked, never passed through as "unverifiable".
+
+A card with no renderable creative (a video, or no image) is exempt: there is
+nothing to fabricate. `--dry-run` reports without flipping anything.
+
+Nothing here publishes or fabricates.
 """
 
 from .drafter import DraftStatus
 
 
-def _creative_view(draft):
-    """A minimal creative-like object (path + note) for pixel_gate.gate_creative."""
+def _creative_view(path):
     class _C:
-        path = draft.creative_path or ""
-        client_note = ""
-    return _C()
+        pass
+    c = _C()
+    c.path = path or ""
+    c.client_note = ""
+    return c
 
 
 def scan(store=None, poster=None, auto_block=True, reader=None):
@@ -29,12 +36,13 @@ def scan(store=None, poster=None, auto_block=True, reader=None):
     Returns a report dict:
       {
         "checked": int,
-        "blocked": [{"draft_id","account","day","numbers","path"}],
-        "clean":   int,
-        "unverifiable": [{"draft_id","account","day","path"}],  # no record, no reader
+        "clean":   int,                      # verified clean OR nothing to verify
+        "blocked": [{"draft_id","account","day","reason","kind","path"}],
+                                             # kind is 'stat' or 'unverifiable'
       }
-    When auto_block is False (dry run) the offending cards are only listed, never
-    flipped.
+    Every card with a creative resolves to clean or BLOCKED; nothing is left in a
+    passable 'unverifiable' state. When auto_block is False (dry run) offenders are
+    listed but never flipped.
     """
     from . import pixel_gate, rotation, ops_alerts
     if store is None:
@@ -44,35 +52,32 @@ def scan(store=None, poster=None, auto_block=True, reader=None):
         poster = ops_alerts._default_poster()
 
     approved = rotation._approved_claims()
-    report = {"checked": 0, "blocked": [], "clean": 0, "unverifiable": []}
+    report = {"checked": 0, "clean": 0, "blocked": []}
 
     for draft in store.list_pending():
         path = draft.creative_path or ""
         if not path:
             continue
         report["checked"] += 1
-        rendered, src = pixel_gate.resolve_rendered_text(path, reader=reader)
-        if src == "none":
-            report["unverifiable"].append({
-                "draft_id": draft.draft_id, "account": draft.account_key,
-                "day": draft.day_key or "", "path": path})
-            continue
-        nums = pixel_gate.offending_numbers(rendered, approved)
-        if not nums:
+        # require_verification=True: the scan is an explicit verification pass, so an
+        # unreadable-with-pixels card fails closed regardless of the studio flag.
+        ok, reason = pixel_gate.gate_creative(
+            _creative_view(path), approved_claims=approved, reader=reader,
+            require_verification=True)
+        if ok:
             report["clean"] += 1
             continue
+        kind = "unverifiable" if "could not verify" in reason else "stat"
         report["blocked"].append({
             "draft_id": draft.draft_id, "account": draft.account_key,
-            "day": draft.day_key or "", "numbers": nums, "path": path})
+            "day": draft.day_key or "", "reason": reason, "kind": kind, "path": path})
         if auto_block:
             draft.status = DraftStatus.BLOCKED
-            draft.blocked_reason = ("Fabrication gate (pixels, retro scan): rendered "
-                                    "stat with no approved receipt: " + ", ".join(nums))
+            draft.blocked_reason = "Fabrication gate (pixels, retro scan): " + reason
             store.put(draft)
             ops_alerts.alert(
                 f"fabrication scan AUTO-BLOCKED {draft.account_key} draft "
-                f"{draft.draft_id} ({draft.day_key or 'no day'}): rendered stat with "
-                f"no approved receipt: {', '.join(nums)}.")
+                f"{draft.draft_id} ({draft.day_key or 'no day'}): {reason}")
             try:
                 if getattr(draft, "slack_ts", "") and getattr(draft, "slack_channel", ""):
                     poster.mark_expired(draft)  # retire the card in place (buttons gone)
@@ -83,19 +88,22 @@ def scan(store=None, poster=None, auto_block=True, reader=None):
 
 def format_report(report, dry_run=False):
     verb = "WOULD BLOCK" if dry_run else "BLOCKED"
-    lines = ["FABRICATION SCAN (rendered pixels vs approved receipts)"]
+    lines = ["FABRICATION SCAN (rendered pixels vs approved receipts, fail-closed)"]
     lines.append(f"  checked      : {report['checked']}")
     lines.append(f"  clean        : {report['clean']}")
-    if report["blocked"]:
-        lines.append(f"  {verb} ({len(report['blocked'])})")
-        for e in report["blocked"]:
-            lines.append(f"    {e['account']} {e['draft_id']} ({e['day'] or 'no day'})"
-                         f"  numbers: {', '.join(e['numbers'])}")
+    blocked = report["blocked"]
+    stat = [e for e in blocked if e["kind"] == "stat"]
+    unver = [e for e in blocked if e["kind"] == "unverifiable"]
+    if blocked:
+        lines.append(f"  {verb} ({len(blocked)})")
+        for e in stat:
+            lines.append(f"    [stat]         {e['account']} {e['draft_id']} "
+                         f"({e['day'] or 'no day'})  {e['reason']}")
+        for e in unver:
+            lines.append(f"    [unverifiable] {e['account']} {e['draft_id']} "
+                         f"({e['day'] or 'no day'})  {e['reason']}")
     else:
         lines.append(f"  {verb} (0): none")
-    if report["unverifiable"]:
-        lines.append(f"  UNVERIFIABLE ({len(report['unverifiable'])}) "
-                     "(no recorded text and no OCR reader; arm the studio to read pixels)")
-        for e in report["unverifiable"]:
-            lines.append(f"    {e['account']} {e['draft_id']} ({e['day'] or 'no day'})")
+    lines.append("  UNVERIFIABLE (passthrough): 0  (fail-closed: unreadable cards "
+                 "with rendered pixels are BLOCKED, never passed)")
     return "\n".join(lines)

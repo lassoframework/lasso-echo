@@ -39,8 +39,10 @@ def _default_reader():
     client = genai.Client(api_key=key)
 
     def _read(image_bytes):
+        # OCR_MODEL, NOT NANO_MODEL: the generation model returns image parts, not
+        # text, so it can never transcribe. This is the vision-capable text model.
         resp = client.models.generate_content(
-            model=config.NANO_MODEL,
+            model=config.OCR_MODEL,
             contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                       _TRANSCRIBE_PROMPT])
         return getattr(resp, "text", "") or ""

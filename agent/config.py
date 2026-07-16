@@ -69,6 +69,13 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # never stored on an object and never logged. Only the env var NAME lives here.
 NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
 NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
+# VISION READ model (image -> text), SEPARATE from the generation model above.
+# The *-image models (Nano Banana family: gemini-3-pro-image, gemini-3.1-flash-image)
+# GENERATE images and return image parts, not text, so they cannot transcribe text
+# back OUT of an image. OCR / autotag / the pixel fabrication gate need a
+# vision-capable TEXT model. Override with AGENT_OCR_MODEL; default is the cheapest
+# widely available multimodal text model.
+OCR_MODEL = os.environ.get("AGENT_OCR_MODEL", "gemini-2.5-flash")
 # Image output aspect: IG/FB feed posts are 4:5 PORTRAIT (1080x1350). Tunable via env
 # so the target can change without a code edit.
 IMAGE_ASPECT = os.environ.get("AGENT_IMAGE_ASPECT", "4:5")

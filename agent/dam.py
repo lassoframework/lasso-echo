@@ -134,8 +134,10 @@ def _default_reader():
     client = genai.Client(api_key=key)
 
     def _read(image_bytes):
+        # OCR_MODEL (vision text), NOT NANO_MODEL (image generation): a generation
+        # model returns image parts, not the text tags this autotag call needs.
         resp = client.models.generate_content(
-            model=config.NANO_MODEL,
+            model=config.OCR_MODEL,
             contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                       _TAG_PROMPT])
         return getattr(resp, "text", "") or ""

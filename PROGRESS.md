@@ -10,6 +10,49 @@ Last updated: 2026-07-16
 
 ---
 
+## OCR reader wiring + fail-closed pixel gate (2026-07-16)
+
+`fabrication-scan` returned UNVERIFIABLE on every card. Root cause, from the code:
+
+- **Wiring bug (fixed).** The OCR reader (`ocr_check._default_reader`, and DAM
+  autotag) called `config.NANO_MODEL` to transcribe text out of an image. NANO_MODEL
+  is the image GENERATION model (Nano Banana: `gemini-3-pro-image`, and Blake's
+  `gemini-3.1-flash-image`). Generation models return image parts, not text, so
+  `resp.text` was always empty and the read produced nothing. Fix: new
+  `config.OCR_MODEL` (default `gemini-2.5-flash`, override `AGENT_OCR_MODEL`), a
+  vision-capable TEXT model, used ONLY for reading. The generation model is
+  unchanged. Same API key.
+- **Backfill (added).** `fabrication-scan` OCR-reads any card lacking recorded
+  sidecar text RIGHT NOW and records the read, so pre-gate cards get scanned
+  instead of sitting unverifiable forever. (Cards drafted before the gate shipped
+  had no recorded text; this is what backfill is for.)
+- **Fail-closed (the critical rule).** UNVERIFIABLE was treated as passable, the
+  same fail-open hole under a new name. Now: a card that HAS rendered pixels the
+  gate cannot read or verify is BLOCKED, reason "could not verify rendered text
+  against approved claims", not passed. A creative with NO renderable text (a video,
+  or no image) is exempt. A successful read that finds no text records an exempt
+  sentinel (pure photo). The gate distinguishes never-scanned from scanned-no-text
+  from unreadable. Fail-closed is active whenever the studio is armed (production);
+  with the studio fully disarmed the gate falls back to the deterministic note
+  check so dev / non-OCR deployments still function. Ships ON, no flag.
+
+### fabrication-scan output after the fix (local dry-run, no reader here)
+checked 16, clean 13, WOULD BLOCK 3, UNVERIFIABLE-passthrough 0. The 3 blocked
+(`book_campaign`, `speed_to_lead_carousel`, `summit`) have rendered pixels on disk
+but no reader in this local shell, so they fail closed instead of passing. The
+other 13 reference `lasso_v2_*` files absent from this tree (no renderable creative
+= exempt). On the container (reader wired via OCR_MODEL, files present) those cards
+are read, recorded, and resolve to clean or BLOCKED(stat); fail-closed then bites
+only on a genuine read outage. Run `python -m agent fabrication-scan` there to
+backfill and clear the queue.
+
+### Grade: B+ (unchanged)
+Does NOT move to A. The reader is wired and the gate is fail-closed, but A still
+needs a real gym completing a full 30-day month of posts and Meta App Review
+cleared for client-owned assets. Code correctness is not the gate to A.
+
+---
+
 ## Fabrication gate on pixels + stat-slab retirement (2026-07-16)
 
 A card scheduled 2026-07-16 rendered "80% more conversions" as a giant stat slab.
