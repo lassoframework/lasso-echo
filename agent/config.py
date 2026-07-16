@@ -950,3 +950,15 @@ def intake_worker_enabled() -> bool:
     Default OFF. Arm by hand.
     """
     return _truthy(os.environ.get("AGENT_INTAKE_WORKER", "false"))
+
+
+def onboard_automint_enabled() -> bool:
+    """
+    Onboarding auto-mint switch. OFF by default. When OFF, intake tokens come
+    ONLY from hand-set env vars (AGENT_INTAKE_TOKEN_<CLIENTKEY>), exactly as
+    today. ON, the data store (gyms table) is consulted first for token lookup;
+    env vars remain the fallback and always win when both are present.
+    The raw token is NEVER stored; only the upload link (built at mint time) and
+    token status are kept.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))

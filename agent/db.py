@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS client_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, category TEXT,
   text TEXT, citation TEXT, status TEXT DEFAULT 'approved',
   created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS gyms (
+  account_key TEXT PRIMARY KEY,
+  gym_name TEXT,
+  token_sha256 TEXT,
+  token_status TEXT DEFAULT 'NOT_SET',
+  upload_link TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')));
 """
 
 
@@ -200,6 +208,71 @@ def audit(kind, subject, reason, account_key="", day=""):
             conn.commit()
     except Exception as e:
         print(f"[audit] write failed: {type(e).__name__}: {e}")
+
+
+def gym_upsert(account_key, gym_name=None, token_sha256=None,
+               token_status=None, upload_link=None):
+    """
+    Insert or update a gym row. Only provided (non-None) fields are written.
+    The raw token is NEVER passed here; callers compute the SHA-256 fingerprint
+    before calling. upload_link stores the pre-built link (built at mint time,
+    never contains the raw token by design).
+    """
+    fields = {"updated_at": "datetime('now')"}
+    params = []
+    if gym_name is not None:
+        fields["gym_name"] = "?"
+        params.append(gym_name)
+    if token_sha256 is not None:
+        fields["token_sha256"] = "?"
+        params.append(token_sha256)
+    if token_status is not None:
+        fields["token_status"] = "?"
+        params.append(token_status)
+    if upload_link is not None:
+        fields["upload_link"] = "?"
+        params.append(upload_link)
+
+    with _lock, connect() as conn:
+        # Try UPDATE first; if no row exists, INSERT.
+        set_clause = ", ".join(
+            f"{col} = {expr}" if expr == "datetime('now')" else f"{col} = ?"
+            for col, expr in fields.items()
+        )
+        update_params = [p for (col, expr), p in zip(fields.items(), params)
+                         if expr != "datetime('now')"]
+        update_params.append(account_key)
+        rows = conn.execute(
+            f"UPDATE gyms SET {set_clause} WHERE account_key = ?",
+            update_params
+        ).rowcount
+        if rows == 0:
+            # No existing row: insert with defaults for unspecified fields.
+            col_names = ["account_key"] + [
+                c for c, e in fields.items() if e != "datetime('now')"
+            ]
+            placeholders = ["?"] * len(col_names)
+            insert_params = [account_key] + [
+                p for (c, e), p in zip(fields.items(), params)
+                if e != "datetime('now')"
+            ]
+            conn.execute(
+                f"INSERT OR IGNORE INTO gyms ({', '.join(col_names)}) "
+                f"VALUES ({', '.join(placeholders)})",
+                insert_params
+            )
+        conn.commit()
+
+
+def gym_get(account_key):
+    """Return the gyms row for account_key as a dict, or None if not found."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT account_key, gym_name, token_sha256, token_status, "
+            "upload_link, created_at, updated_at FROM gyms WHERE account_key=?",
+            (account_key,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def audit_rows(day=None, account_key=None, limit=500):

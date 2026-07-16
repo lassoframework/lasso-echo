@@ -62,6 +62,14 @@ def client_for_token(token):
     """The client key a token belongs to, or None. The token value is never logged."""
     if not token:
         return None
+    if config.onboard_automint_enabled():
+        # Data store first: revoked or unknown tokens return None immediately.
+        from . import intake_tokens as _it
+        client = _it.client_for_token_data(token)
+        if client is not None:
+            return client
+        # A token missing from the store may still be an env token; fall through.
+    # Fallback: env vars (original behavior, unchanged).
     for name, value in os.environ.items():
         if name.startswith(_TOKEN_ENV_PREFIX) and value and value == token:
             return name[len(_TOKEN_ENV_PREFIX):].lower()
@@ -80,6 +88,33 @@ def allow_request(ip, now=None):
         return False
     window.append(now)
     _hits[ip] = window
+    return True
+
+
+# ---- per-token rate limit (separate from IP; blocks only abuse) ----------------
+# 20 requests per minute per token (keyed by SHA-256 hash prefix, not raw token).
+_TOKEN_RATE_PER_MINUTE = 20
+_token_hits = {}
+
+
+def _token_hash_prefix(token):
+    """First 16 hex chars of the SHA-256 of the token (never the raw token)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def allow_token_request(token_hash, now=None):
+    """
+    Sliding-window rate limit keyed by the first 16 chars of the SHA-256 hash.
+    Returns False when over 20 requests per minute; True otherwise.
+    The raw token is never passed here; callers pass the hash prefix.
+    """
+    now = now if now is not None else time.monotonic()
+    window = [t for t in _token_hits.get(token_hash, []) if now - t < 60.0]
+    if len(window) >= _TOKEN_RATE_PER_MINUTE:
+        _token_hits[token_hash] = window
+        return False
+    window.append(now)
+    _token_hits[token_hash] = window
     return True
 
 
@@ -357,6 +392,69 @@ def handle_portal_intake(token, body, r2=None, now=None):
     }
 
 
+def handle_portal_gym_status(account_key, r2=None):
+    """
+    Portal gym status endpoint (GET /portal/gym/<account_key>).
+
+    Gated by AGENT_PORTAL_APPROVALS (config.portal_approvals_enabled()).
+    Returns (status_code, response_dict).
+
+    Response shape:
+      account_key    - the gym's account key
+      upload_link    - the stored upload link from the gyms table (set at mint
+                       time; never contains the raw token), or null
+      token_status   - ACTIVE, REVOKED, or NOT_SET
+      last_upload_at - timestamp of most recent object in R2 incoming/, or null
+      upload_count   - count of objects in R2 incoming/, or null
+      intake_status  - same as token_status (alias for the portal UI)
+
+    Returns 403 when AGENT_PORTAL_APPROVALS is OFF.
+    Returns 404 when the account_key is not found in the gyms table.
+    """
+    if not config.portal_approvals_enabled():
+        return 403, {"error": "portal access is disabled"}
+
+    from . import db as _db
+    gym_row = _db.gym_get(account_key)
+    if gym_row is None:
+        return 404, {"error": "gym not found"}
+
+    token_status_val = (gym_row.get("token_status") or "NOT_SET").upper()
+
+    # R2 metadata: last upload and count from intake/<account_key>/incoming/.
+    last_upload_at = None
+    upload_count = None
+    if r2 is not None:
+        prefix = f"intake/{account_key}/incoming/"
+        try:
+            keys = r2.list_keys(prefix) if hasattr(r2, "list_keys") else None
+            if keys is not None:
+                upload_count = len(keys)
+                # last_upload_at from most recent key name (keys are stamped)
+                media_keys = sorted(
+                    (k for k in keys if not k.endswith("_upload.json")
+                     and not k.endswith("_intake.json")),
+                    reverse=True,
+                )
+                if media_keys:
+                    # Extract the timestamp from the key basename (YYYYMMDDTHHMMSSz prefix)
+                    basename = media_keys[0].rsplit("/", 1)[-1]
+                    ts_match = re.match(r"(\d{8}T\d{6}Z)", basename)
+                    if ts_match:
+                        last_upload_at = ts_match.group(1)
+        except Exception:
+            pass  # R2 unavailable: report null, never guess
+
+    return 200, {
+        "account_key": account_key,
+        "upload_link": gym_row.get("upload_link"),
+        "token_status": token_status_val,
+        "last_upload_at": last_upload_at,
+        "upload_count": upload_count,
+        "intake_status": token_status_val,
+    }
+
+
 class _R2:
     """Bytes-oriented R2/S3 wrapper for the upload path. Credentials from the same
     env names media hosting uses; read lazily, passed to boto3, never logged."""
@@ -570,7 +668,19 @@ def build_server(port=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _portal_gym_key(self):
+            m = re.match(r"^/portal/gym/([A-Za-z0-9_-]+)$",
+                         self.path.split("?")[0])
+            return m.group(1) if m else None
+
         def do_GET(self):
+            # Portal gym status: GET /portal/gym/<account_key>
+            # Gated by AGENT_PORTAL_APPROVALS. Returns JSON. No token in path.
+            portal_key = self._portal_gym_key()
+            if portal_key is not None:
+                status, body = handle_portal_gym_status(portal_key)
+                return self._send_json(body, status)
+
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
             # the SERVICE being up and the FEATURE being armed are different
             # facts, and Railway's health check must not kill a dark service.
@@ -666,6 +776,8 @@ def build_server(port=None):
                     return self._deny(403, "origin not allowed")
                 if not allow_request(self.client_address[0]):
                     return self._deny(429, "slow down")
+                if not allow_token_request(_token_hash_prefix(form_token)):
+                    return self._deny(429, "upload limit reached, try again soon")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > _max_request_bytes():
                     return self._deny(413, "too large")
@@ -694,6 +806,8 @@ def build_server(port=None):
             ip = self.client_address[0]
             if not allow_request(ip):
                 return self._deny(429, "slow down")
+            if not allow_token_request(_token_hash_prefix(token)):
+                return self._deny(429, "upload limit reached, try again soon")
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length > _max_request_bytes():
                 return self._deny(413, "too large")

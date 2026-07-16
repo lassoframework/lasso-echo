@@ -120,6 +120,7 @@ def _status():
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
+    print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -402,6 +403,7 @@ _COMMANDS = {
         ("intake-create", "create drafts from an intake payload"),
         ("intake-worker", "process the R2 intake queue one pass"),
         ("intake-status", "show intake queue depth for one account"),
+        ("portal-status", "show portal status for one gym (AGENT_PORTAL_APPROVALS)"),
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
@@ -1237,6 +1239,25 @@ def main(argv=None):
                     print(f"{label}: {count}")
             if not config.intake_worker_enabled():
                 print("(AGENT_INTAKE_WORKER is OFF)")
+    elif cmd == "portal-status":
+        # READ ONLY: show the portal status for one gym account.
+        # Requires AGENT_PORTAL_APPROVALS=true; returns JSON-like output.
+        account_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent portal-status --account <key>")
+        elif not config.portal_approvals_enabled():
+            print("portal-status: AGENT_PORTAL_APPROVALS is OFF. Nothing shown.")
+        else:
+            from .intake_web import handle_portal_gym_status
+            status_code, result = handle_portal_gym_status(account_key)
+            import json as _json
+            print(_json.dumps(result, indent=2))
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
