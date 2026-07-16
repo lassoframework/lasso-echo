@@ -60,6 +60,15 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     if not facts:
         return _blocked(f"pillar '{plan['pillar']}' has no approved body lines in lasso_now.md")
 
+    # PIXEL FABRICATION GATE (pre-generation): the headline is the ONLY text
+    # rendered on the image. If it carries a stat with no approved receipt, do not
+    # spend a generation on it, and NAME the number in the block reason.
+    from . import pixel_gate
+    bad_nums = pixel_gate.offending_numbers(headline)
+    if bad_nums:
+        return _blocked(f"headline carries a stat with no approved receipt: "
+                        f"{', '.join(bad_nums)} ({headline!r})")
+
     # The daily card draws a layout archetype on a deterministic rotation, so the
     # generated run varies in composition day to day (the brand never varies).
     art = creative_studio.generate(headline, facts, client=nano_client,
@@ -82,10 +91,20 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
               "falling back to library creative.")
         return None
 
-    # Headline OCR check (AGENT_OCR_CHECK_ENABLED, OFF): a mismatch adds a
-    # warning line to the card; it never blocks. Blake decides at the tap.
+    # Record the rendered text (the headline) so every later draw gates for free.
+    pixel_gate.write_rendered_text(art["path"], headline)
+
+    # PIXEL FABRICATION BELT (OCR): read the pixels once. A number rendered on the
+    # image that the approved headline never asked for (a silent generator drift,
+    # the "80% more conversions" slab class) BLOCKS the card, named, not shipped.
+    # Inert when the studio reader is unavailable; the recorded-text gate holds.
+    from .ocr_check import headline_block, headline_warning
+    block_reason = headline_block(art["path"], headline)
+    if block_reason:
+        return _blocked(block_reason)
+
+    # Non-numeric headline drift still only WARNS (Blake decides at the tap).
     warnings = []
-    from .ocr_check import headline_warning
     warning = headline_warning(art["path"], headline)
     if warning:
         warnings.append(warning)

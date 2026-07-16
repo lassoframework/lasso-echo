@@ -313,7 +313,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "The AI agents",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "navy",
         "archetype": "headline",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -362,7 +362,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "cream",
         "archetype": "headline",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -408,7 +408,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "red",
         "archetype": "split",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -423,7 +423,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "All in one offer",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "navy",
         "archetype": "hero",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -456,7 +456,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "Sales are now",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "navy",
         "archetype": "headline",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -594,7 +594,7 @@ CONCEPTS = {
         "story": False,
         "set": "b2b",
         "pillar": "Sales are now",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "cream",
         "archetype": "headline",
         "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
@@ -623,7 +623,7 @@ CONCEPTS = {
                     "CTA copy (caption, never rendered): We chase. You close."],
         "story": False,
         "set": "platform",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "navy",
         "archetype": "hero",
     },
@@ -663,7 +663,7 @@ CONCEPTS = {
                     "CTA copy (caption, never rendered): Stop paying for leads nobody calls."],
         "story": False,
         "set": "platform",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "red",
         "archetype": "hero",
     },
@@ -678,7 +678,7 @@ CONCEPTS = {
                     "CTA copy (caption, never rendered): Real gyms. Real receipts."],
         "story": False,
         "set": "platform",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "cream",
         "archetype": "hero",
     },
@@ -693,7 +693,7 @@ CONCEPTS = {
                     "CTA copy (caption, never rendered): Real gyms. Real receipts."],
         "story": False,
         "set": "platform",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "navy",
         "archetype": "hero",
     },
@@ -822,7 +822,7 @@ CONCEPTS = {
                     "CTA destination (caption, never rendered): quiz.lassoframework.com"],
         "story": False,
         "set": "platform_ads",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "red",
         "archetype": "headline",
     },
@@ -947,7 +947,7 @@ CONCEPTS = {
         "story": False,
         "set": "summit_campaign",
         "pillar": "The playbook",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "red",
         "archetype": "headline",
     },
@@ -997,7 +997,7 @@ CONCEPTS = {
         "story": False,
         "set": "summit_campaign",
         "pillar": "The seat",
-        "layout": "stat_hero",
+        "layout": "chart",
         "canvas": "red",
         "archetype": "headline",
     },
@@ -1066,14 +1066,16 @@ def canvas_for(key):
 
 
 def preferred_layout(spec):
-    """The concept's layout: an explicit `layout` field wins; else stat
-    concepts (a cite) take stat_hero, ordered lists take framework, outcome
-    lists take checklist, opposition hooks take contrast, everything else
-    poster (the current default look)."""
+    """The concept's layout: an explicit `layout` field wins (a retired stat_hero
+    remaps to chart, the stat slab being retired brand-wide); else stat concepts
+    (a cite) take chart (labeled data visual, never a slab), ordered lists take
+    framework, outcome lists take checklist, opposition hooks take contrast,
+    everything else poster (the current default look)."""
+    from .creative_studio import _RETIRED_LAYOUTS
     if spec.get("layout"):
-        return spec["layout"]
+        return _RETIRED_LAYOUTS.get(spec["layout"], spec["layout"])
     if spec.get("cite"):
-        return "stat_hero"
+        return "chart"
     joined = " ".join(spec.get("concept", []))
     if "List copy" in joined:
         # a numbered list is a framework; an outcome/benefit list a checklist
@@ -1247,6 +1249,10 @@ def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
             sidecar = {
                 "concept": key,
                 "headline": spec["headline"],
+                # RENDERED TEXT (pixel fabrication gate input): the headline is the
+                # ONLY text rendered on the card, in exact approved wording. Recorded
+                # once here so every later draw gates the pixels for free.
+                "rendered_text": spec["headline"],
                 "generated": date.today().isoformat(),
                 "style": "v2",
                 "archetype": spec.get("archetype", "flow"),

@@ -10,6 +10,53 @@ Last updated: 2026-07-16
 
 ---
 
+## Fabrication gate on pixels + stat-slab retirement (2026-07-16)
+
+A card scheduled 2026-07-16 rendered "80% more conversions" as a giant stat slab.
+That number is NOT an approved receipt (verified_stats.md LOCKS "80% more
+conversions" pending Blake's kill-or-source; the approved wording is "lift
+conversions up to 80 percent", a different claim). The caption fabrication gate
+was watching the words in the post but NOT the words baked INTO the image.
+
+### Two fixes shipped (both hold the human-approval gate; nothing auto-publishes)
+
+**1. Fabrication gate extended to the pixels.** `agent/pixel_gate.py` applies the
+SAME claim rule captions obey (rotation.is_gate_clean + knowledge USE-lines +
+approved social proof) to the text rendered INTO a creative. Any number/percent/
+claim with no approved receipt BLOCKS the card and NAMES the number; never softens,
+never falls back, never publishes.
+- Ships ON (a safety gate is never off): the deterministic layer is free and
+  always runs. `draft_post` (all library-card paths), `daily_studio` (the generated
+  headline), and social proof all gate before a card can go PENDING.
+- OCR at ingest, gate daily (Blake's call): a card's rendered text is recorded to
+  its sidecar (`rendered_text`) once at generation/regen; every later draw gates it
+  for free. When the studio is armed, the OCR belt reads the pixels once and records
+  the read, so a silent generator drift (the slab class) is caught the first time
+  the card is seen. `agent/ocr_check.py` gained `headline_block`: a number on the
+  image the approved headline never asked for now BLOCKS (was warn-only).
+- Retro scan: `python -m agent fabrication-scan [--dry-run]` walks the pending/
+  planned queue and AUTO-BLOCKS (Blake's call) any card whose rendered pixels carry
+  an unapproved stat, naming the number. Dry-run reports without blocking.
+
+**2. Stat-slab template retired.** The giant-number-on-navy layout is off brand.
+`stat_hero` is removed from `creative_studio.LAYOUTS`; any concept naming it remaps
+to `chart` (a labeled data visual, never a colossal single figure) and a
+`NO_STAT_SLAB_LAW` rides every prompt. The social-proof `NUMBER_CARD_STYLE` no
+longer renders a HUGE slab; the stat reads as one clear line in the house style.
+The 17 b2b/platform/platform_ads concepts that used stat_hero now derive chart.
+Navy/red canvases stay (brand colors); only the slab LAYOUT is gone.
+
+### Fabrication-scan output (2026-07-16, local dry-run)
+16 pending lasso_fb planned cards are UNVERIFIABLE locally (no OCR key, and the
+lasso_v2 assets they reference are absent from this tree). On production (studio
+armed, real /data) the scan reads their pixels, records the text, and auto-blocks
+any carrying an unapproved stat. Run `fabrication-scan` there to clear the queue.
+
+### Grade: B+ (unchanged)
+Gate to A: one real gym completes a full 30-day month + Meta App Review cleared.
+
+---
+
 ## Scheduler reliability fix + library audit (2026-07-16)
 
 Root cause confirmed: `now.hour == target_hour` strict equality created a 60-minute

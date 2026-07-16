@@ -413,6 +413,7 @@ _COMMANDS = {
     "content & library": [
         ("regen-library", "regenerate the creative library"),
         ("library-audit", "scan library for MISSING/THIN creatives (--account / --all)"),
+        ("fabrication-scan", "retro-scan the queue for rendered stats with no approved receipt (--dry-run)"),
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
@@ -600,6 +601,17 @@ def _library_audit(args):
         print("All accounts: library clean.")
 
 
+def _fabrication_scan(args):
+    """python -m agent fabrication-scan [--dry-run]
+    Retro-scan the pending/planned queue for cards whose RENDERED pixels carry a
+    stat with no approved receipt. Auto-blocks offenders (naming the number);
+    --dry-run reports only."""
+    from . import fabrication_scan
+    dry_run = "--dry-run" in args
+    report = fabrication_scan.scan(auto_block=not dry_run)
+    print(fabrication_scan.format_report(report, dry_run=dry_run))
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
@@ -617,6 +629,8 @@ def main(argv=None):
         _scheduler_status()
     elif cmd == "library-audit":
         _library_audit(argv[1:])
+    elif cmd == "fabrication-scan":
+        _fabrication_scan(argv[1:])
     elif cmd == "listen":
         from .listener import run_listener
         run_listener()

@@ -23,11 +23,13 @@ from agent import config, creative_studio, regen_library, rotation  # noqa: E402
 
 _DASH_RE = re.compile(r"[‐‑‒–—―−-]")
 
+# stat_hero retired 2026-07-16: the four b2b stat concepts now derive CHART (a
+# labeled data visual), never the giant-number slab.
 BRIEF_ASSIGNMENT = {
-    "b2b_35k_caught": ("navy", "stat_hero"),
-    "b2b_16_cpl": ("cream", "stat_hero"),
-    "b2b_dead_buttons": ("red", "stat_hero"),
-    "b2b_500_gyms": ("navy", "stat_hero"),
+    "b2b_35k_caught": ("navy", "chart"),
+    "b2b_16_cpl": ("cream", "chart"),
+    "b2b_dead_buttons": ("red", "chart"),
+    "b2b_500_gyms": ("navy", "chart"),
     "b2b_diagnosed_in_order": ("cream", "framework"),
     "b2b_ninety_days": ("navy", "checklist"),
     "b2b_five_companies": ("split", "contrast"),
@@ -62,7 +64,8 @@ def test_b2b_assignment_matches_brief_exactly():
 
 
 def test_layout_derivation_for_undeclared_concepts():
-    assert regen_library.preferred_layout({"cite": ["x"]}) == "stat_hero"
+    assert regen_library.preferred_layout({"cite": ["x"]}) == "chart"  # slab retired
+    assert regen_library.preferred_layout({"layout": "stat_hero"}) == "chart"  # remaps
     assert regen_library.preferred_layout(
         {"concept": ["List copy (caption): 1 Close rate, 2 Show rate"]}) == "framework"
     assert regen_library.preferred_layout(
@@ -187,18 +190,21 @@ def test_house_16_unchanged_and_render_original_path():
 
 
 # ---- grammar V2 layouts (chart, diagram, device) -------------------------------------------
+# stat_hero (the giant-number slab) is RETIRED (2026-07-16); the four surviving
+# originals stay byte for byte unchanged.
 V1_LAYOUTS_SHA256 = (
-    "b4d3c6c1404ba72a2d5a3c9d745bc106be25feee08c0cd190ff4cf62d50c3de0")
+    "b745265771e9db1277a33795b825824102efbf228d49c61b691c568b58a7c3b8")
 
 
-def test_v2_layouts_present_five_originals_byte_unchanged():
+def test_v2_layouts_present_four_originals_byte_unchanged():
     import hashlib
     assert set(creative_studio.LAYOUTS) == {
-        "stat_hero", "framework", "contrast", "checklist", "poster",
+        "framework", "contrast", "checklist", "poster",
         "chart", "diagram", "device"}
-    five = {k: creative_studio.LAYOUTS[k]
-            for k in ("stat_hero", "framework", "contrast", "checklist", "poster")}
-    blob = json.dumps(five, sort_keys=True).encode()
+    assert "stat_hero" not in creative_studio.LAYOUTS  # retired stat slab
+    four = {k: creative_studio.LAYOUTS[k]
+            for k in ("framework", "contrast", "checklist", "poster")}
+    blob = json.dumps(four, sort_keys=True).encode()
     assert hashlib.sha256(blob).hexdigest() == V1_LAYOUTS_SHA256
 
 

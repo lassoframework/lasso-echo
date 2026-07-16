@@ -23,12 +23,12 @@ _DASH_RE = re.compile(r"[‐‑‒–—―−-]")
 # (canvas, layout) per the brief, verbatim
 BRIEF = {
     "platform_stuck_lasso": ("split", "contrast"),
-    "platform_719_booking": ("navy", "stat_hero"),
+    "platform_719_booking": ("navy", "chart"),
     "platform_six_engines": ("cream", "framework"),
     "platform_nurture_proof": ("navy", "framework"),
-    "platform_8_of_10": ("red", "stat_hero"),
-    "platform_fit_mamas": ("cream", "stat_hero"),
-    "platform_courage_million": ("navy", "stat_hero"),
+    "platform_8_of_10": ("red", "chart"),
+    "platform_fit_mamas": ("cream", "chart"),
+    "platform_courage_million": ("navy", "chart"),
     "platform_cockpit": ("navy", "poster"),
     "platform_handoffs": ("red", "poster"),
     "platform_close_first": ("split", "framework"),
@@ -37,7 +37,8 @@ CASE_CONCEPTS = ("platform_fit_mamas", "platform_courage_million")
 
 # frozen definitions of the prior sets: any byte moved changes these
 HOUSE_SHA256 = "7ba719559c5244f4998aa269d59b4da81573d3b69bc004af1a03db0c0be13378"
-B2B_SHA256 = "9381b564f023c566d0ffc0c55a12e13a330d2f8743257be3cc657d200078c5fe"
+# stat-slab retired 2026-07-16: b2b stat concepts remap stat_hero -> chart.
+B2B_SHA256 = "fa926da98a6128a4e2fcc001e126c3b3588b142758874ab35c2b91f720a9dd83"
 
 
 def _platform(key):

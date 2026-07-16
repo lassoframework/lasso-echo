@@ -245,6 +245,30 @@ def draft_post(account, creative, scheduled_for, voice=None,
             blocked_reason="No creative available in the library. Not drafting.",
         )
 
+    # PIXEL FABRICATION GATE (always on, never weakened): the words rendered INTO
+    # the creative must resolve to an approved receipt, the same rule captions
+    # obey. A rendered stat with no approved source BLOCKS the card and NAMES the
+    # number; it never softens, never falls back, never publishes. Deterministic
+    # and free (reads the recorded rendered text in the sidecar); the OCR belt
+    # only runs when the studio reader is available.
+    from . import pixel_gate
+    ok, gate_reason = pixel_gate.gate_creative(creative)
+    if not ok:
+        ops_alerts.alert(f"fabrication gate BLOCKED a card for {account.key}: "
+                         f"{gate_reason} ({getattr(creative, 'path', '')}).")
+        return Draft(
+            draft_id=draft_id,
+            account_key=account.key,
+            platform=account.platform,
+            caption="",
+            hashtags=[],
+            creative_path=getattr(creative, "path", ""),
+            creative_public_url="",
+            scheduled_for=scheduled_for,
+            status=DraftStatus.BLOCKED,
+            blocked_reason="Fabrication gate (pixels): " + gate_reason,
+        )
+
     gen = generator or TemplateGenerator()
 
     cta_type = cta_url = ""

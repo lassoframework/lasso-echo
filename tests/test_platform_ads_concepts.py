@@ -28,7 +28,7 @@ BRIEF = {
     "platform_ads_booking_bars": ("split", "chart"),
     "platform_ads_six_engines": ("cream", "diagram"),
     "platform_ads_watched": ("navy", "device"),
-    "platform_ads_35k": ("red", "stat_hero"),
+    "platform_ads_35k": ("red", "chart"),
     "platform_ads_budget_flow": ("split", "diagram"),
     "platform_ads_five_minutes": ("cream", "device"),
     "platform_ads_quiet_page": ("navy", "device"),
@@ -36,9 +36,11 @@ BRIEF = {
 }
 
 HOUSE_SHA256 = "7ba719559c5244f4998aa269d59b4da81573d3b69bc004af1a03db0c0be13378"
-B2B_SHA256 = "9381b564f023c566d0ffc0c55a12e13a330d2f8743257be3cc657d200078c5fe"
+# stat-slab retired 2026-07-16: the b2b + platform stat concepts remap stat_hero
+# -> chart, so these frozen-set hashes were updated in the same commit.
+B2B_SHA256 = "fa926da98a6128a4e2fcc001e126c3b3588b142758874ab35c2b91f720a9dd83"
 PLATFORM_SHA256 = (
-    "aec7a52a25aae2d8c9ba202907c623c7b8f5ed43ba26ed69a66142be4a34738b")
+    "56e5a0d10fab98de245e89744eb68a7bcab536328b6fd6cc1cff57b61abe1b6e")
 
 
 def _ads(key):

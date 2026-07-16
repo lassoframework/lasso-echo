@@ -217,6 +217,8 @@
         ["2026-07-16 Autonomous onboarding — T4 (Onboard Verify): onboard-verify CLI, READY-FOR-UPLOADS vs READY-TO-PUBLISH per gym. AGENT_ONBOARD_AUTOMINT OFF. SHA: c828d371cd4cf0cdc18795e1b66bae51d35b15cc","done"],
         ["2026-07-16 Scheduler reliability fix: now.hour >= target_hour (was ==); run-daily CLI idempotent; _next_fire() corrected; scheduler-status CLI; docs/SCHEDULER_CRON.md Railway cron runbook. 10 new tests. 1331 green.","done"],
         ["2026-07-16 Library audit: library-audit --account / --all; MISSING vs THIN distinction; pending-draft cross-check; runner.py preflight warning on bad creative; hidden-dir filter. 12 new tests. library-audit --all shows: lasso_ig THIN 1 (speed_to_lead 32 bytes stub), lasso_fb MISSING 13 (lasso_v2_* planned Jul 17-31 not in library) + THIN 1 (same stub). Upload lasso_v2 assets or replan those days.","done"],
+        ["2026-07-16 Fabrication gate on PIXELS: agent/pixel_gate.py applies the caption claim rule to text rendered INTO a creative; a rendered stat with no approved receipt BLOCKS the card and NAMES the number (never softens/falls back/publishes). Ships ON (deterministic, free) at draft_post + daily_studio + social proof. OCR at ingest, gate daily: rendered_text recorded to sidecar once, gated free every draw; ocr_check.headline_block turns numeric drift from warn to BLOCK. Retro scan fabrication-scan --dry-run auto-blocks queued offenders. 18 new tests.","done"],
+        ["2026-07-16 Stat-slab RETIRED: giant-number-on-navy layout gone. stat_hero removed from creative_studio.LAYOUTS, remaps to chart; NO_STAT_SLAB_LAW on every prompt; NUMBER_CARD_STYLE no longer a HUGE slab; 17 b2b/platform concepts remapped to chart; navy/red canvases kept (brand colors). Frozen-set + variant hashes updated. Suite 1349 green.","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -467,7 +469,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-16 (scheduler reliability fix: now.hour &gt;= target_hour; run-daily idempotent; scheduler-status CLI; SCHEDULER_CRON.md runbook; library-audit CLI: MISSING/THIN scan + pending-draft cross-check + runner preflight warning; library-audit --all shows lasso_fb MISSING 13 lasso_v2_* planned Jul 17-31 not in library + lasso_ig THIN 1 speed_to_lead stub; 22 new tests; last committed SHA pending; 1331 green; grade B+ unchanged) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-16 (fabrication gate on PIXELS: pixel_gate.py blocks any rendered stat with no approved receipt, names the number, ships ON at draft_post + daily_studio + social proof; OCR at ingest gate daily, headline_block warn to BLOCK; fabrication-scan retro auto-block; stat-slab RETIRED, stat_hero removed and remapped to chart, NO_STAT_SLAB_LAW everywhere, NUMBER_CARD_STYLE no longer a slab; 40 new tests this session; 1349 green; grade B+ unchanged. Prior: scheduler fix now.hour &gt;= target_hour + run-daily idempotent + scheduler-status + SCHEDULER_CRON.md; library-audit CLI MISSING/THIN) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 

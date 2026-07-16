@@ -176,11 +176,14 @@ def test_number_card_template_renders_stat_support_attribution():
     p = creative_studio.build_social_proof_prompt(
         "stat", "18 pounds down in 12 weeks", support_line="First strength block",
         attribution="Mike R.")
-    assert "NUMBER CARD" in p
+    # The stat-slab is retired: the proof stat now renders as a clear line in the
+    # house style (STAT CARD), never a HUGE colossal slab number.
+    assert "STAT CARD" in p
     assert "18 pounds down in 12 weeks" in p
     assert "First strength block" in p
     assert "Mike R." in p
-    assert "HUGE" in p
+    assert "HUGE" not in p
+    assert "stat-slab layout is retired" in p
 
 
 # ---- 5. happy path: hosted PENDING draft, fragments = verified entry text ------

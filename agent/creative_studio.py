@@ -269,12 +269,6 @@ CANVASES = {
 }
 
 LAYOUTS = {
-    "stat_hero": (
-        "Layout token STAT_HERO: ONE colossal number or stat fills half the "
-        "card as the dominant element, with its support line set small "
-        "directly under it. A single stat insight card; nothing competes with "
-        "the number."
-    ),
     "framework": (
         "Layout token FRAMEWORK: the content renders as a clean visual system "
         "for an ordered list: numbered pills, a vertical rail with stops, or a "
@@ -325,17 +319,38 @@ READABILITY_BAR = (
 
 CANVAS_ORDER = ["cream", "navy", "red", "split"]
 
+# RETIRED LAYOUTS: the giant-number-on-navy STAT SLAB is off brand and gimmicky
+# (Blake, 2026-07-16). It is removed from the system; any concept that still
+# names it remaps to CHART (a clean data visual with labeled numbers, never a
+# colossal single figure) so no card renders a slab and no legacy concept crashes.
+_RETIRED_LAYOUTS = {"stat_hero": "chart"}
+
+# The copy law that retires the slab for good, applied to every card: no single
+# giant number as the hero. Numbers live inside a real data visual or a sentence.
+NO_STAT_SLAB_LAW = (
+    "No stat slab: NEVER render one colossal number or percentage as the hero "
+    "element filling the card. That layout is retired. Any figure appears only "
+    "inside a real data visual (labeled bars or a trend) or within the headline "
+    "sentence, at readable size, never as an oversized standalone slab."
+)
+
 
 def variant_block(canvas, layout):
     """The composed variant directive for one card: locked grammar + the one
-    canvas token + the one layout token + the readability bar. LOUD on an
-    unknown token (a typo must never silently render off system)."""
+    canvas token + the one layout token + the readability bar + the no-slab law.
+    A retired layout remaps (loudly) instead of rendering off system; an unknown
+    token still raises (a typo must never silently render off system)."""
+    if layout in _RETIRED_LAYOUTS:
+        remap = _RETIRED_LAYOUTS[layout]
+        print(f"[creative-studio] layout '{layout}' is retired (stat slab); "
+              f"rendering as '{remap}' in the house style instead.")
+        layout = remap
     if canvas not in CANVASES:
         raise ValueError(f"unknown canvas: {canvas} ({', '.join(CANVAS_ORDER)})")
     if layout not in LAYOUTS:
         raise ValueError(f"unknown layout: {layout} ({', '.join(sorted(LAYOUTS))})")
     return (f"{VARIANT_GRAMMAR}\n{CANVASES[canvas]}\n{LAYOUTS[layout]}\n"
-            f"{READABILITY_BAR}")
+            f"{READABILITY_BAR}\n{NO_STAT_SLAB_LAW}")
 
 
 # Copy mechanics from the brand bible: rendered copy carries no dashes.
@@ -394,7 +409,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
         style_tail = composition
     else:
         composition = _composition_style(archetype, is_story)
-        style_tail = f"{composition}\n{palette or BRAND_PALETTE}"
+        style_tail = f"{composition}\n{palette or BRAND_PALETTE}\n{NO_STAT_SLAB_LAW}"
     aspect = (
         f"Canvas: a VERTICAL {use_aspect} PORTRAIT ({use_pixels}, taller "
         f"than wide), designed for an Instagram and Facebook {use_surface}. Fit the entire "
@@ -428,15 +443,18 @@ QUOTE_CARD_STYLE = (
     "modern, premium."
 )
 
-# Number card: one verified stat huge; one short support line; attribution small.
+# Number card: the verified stat sits INSIDE a clean composition, never a slab.
+# The stat-slab (one colossal number as the hero) is retired brand-wide; a proof
+# stat reads as one clear line supported by a small line-icon visual.
 NUMBER_CARD_STYLE = (
-    "Template: SOCIAL PROOF NUMBER CARD in the locked house style. The verified stat "
-    "is rendered HUGE as the single dominant element, with ONE short support line "
-    "beneath it and the attribution SMALL at the bottom. No body sentences, no "
-    "paragraphs, no other text, no dense graphics. Cream canvas (never a solid color "
+    "Template: SOCIAL PROOF STAT CARD in the locked house style. The verified stat "
+    "reads as ONE clear line at readable headline size (never one oversized slab "
+    "number filling the card), with ONE short support line and the attribution SMALL at the "
+    "bottom, beside a single simple line-icon graphic that fits the claim. No body "
+    "sentences, no paragraphs, no dense graphics. Cream canvas (never a solid color "
     "slab), navy text and line work, sky blue for one supporting graphic touch, red "
-    "for exactly ONE focal accent (the stat itself or a single arrow). Minimal, "
-    "modern, premium."
+    "for exactly ONE focal accent. Minimal, modern, premium. Do NOT render the number "
+    "as an oversized standalone stat slab; the stat-slab layout is retired."
 )
 
 
@@ -470,7 +488,7 @@ def build_social_proof_prompt(kind, main_line, support_line="", attribution="",
         lines.append(f"Support line (render small, beneath the stat): {_scrub_dashes(support_line)}")
     if attribution:
         lines.append(f"Attribution (render SMALL): {_scrub_dashes(attribution)}")
-    lines.extend([template, BRAND_PALETTE, NO_DASH_RULE])
+    lines.extend([template, BRAND_PALETTE, NO_STAT_SLAB_LAW, NO_DASH_RULE])
     return _scrub_dashes("\n".join(lines))
 
 

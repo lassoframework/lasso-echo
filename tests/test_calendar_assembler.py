@@ -60,10 +60,10 @@ def test_assembler_matches_store_state(monkeypatch):
     d2 = days["2026-07-02"]
     assert d2["status"] == "approved"
     assert d2["concept"] == "lasso_v2_b2b_16_cpl.png"
-    assert (d2["canvas"], d2["layout"]) == ("cream", "stat_hero")  # b2b brief
+    assert (d2["canvas"], d2["layout"]) == ("cream", "chart")  # b2b brief (slab retired)
     d3 = days["2026-07-03"]
     assert d3["status"] == "pending"
-    assert (d3["canvas"], d3["layout"]) == ("navy", "stat_hero")  # platform brief
+    assert (d3["canvas"], d3["layout"]) == ("navy", "chart")  # platform brief (slab retired)
     assert plan["rollup"]["published"] == 1
     assert plan["rollup"]["approved"] == 1
     assert plan["rollup"]["pending"] == 3
