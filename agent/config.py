@@ -950,3 +950,11 @@ def intake_worker_enabled() -> bool:
     Default OFF. Arm by hand.
     """
     return _truthy(os.environ.get("AGENT_INTAKE_WORKER", "false"))
+
+
+def onboard_automint_enabled() -> bool:
+    """
+    Auto-mint intake tokens from the data store. Default OFF.
+    When OFF, AGENT_INTAKE_TOKEN_<KEY> env vars remain authoritative.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))
