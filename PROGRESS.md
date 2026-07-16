@@ -10,6 +10,92 @@ Last updated: 2026-07-16
 
 ---
 
+## Auto-mint completion + library gap audit (2026-07-16)
+
+### Step 0 complete: encrypted token at rest
+
+All four auto-mint tracks were already merged. This session audited the merged
+state against the spec and shipped the CRITICAL correction: intake tokens are
+now stored ENCRYPTED AT REST (Fernet), not hashed, so the portal can recover
+the raw token and reconstruct the upload link.
+
+Changes shipped (SHA `3f3a13a`, suite 1363 passed):
+- `AGENT_INTAKE_ENC_KEY` env var: base64url-encoded Fernet key, set in Railway
+  by hand. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+- `intake_token_encrypted TEXT` column added to gyms table via additive migration
+- `intake_tokens.mint()` and `rotate()` store the encrypted blob when the key is set
+- `intake_tokens.decrypt_token(account_key)` recovers the raw token for portal use
+- `onboard.py` section (g): builds upload link on fresh mint, recovers via decrypt_token on idempotent re-run, falls back to stored plaintext link
+- `intake_web.py` portal: reconstructs upload link from encrypted blob first, falls back to stored link
+- `onboard_verify.py`: fixed to read token status from gyms table (via `_token_status()`) when AUTOMINT is ON, not the kv store (which was never written)
+- `__main__.py`: reads `AGENT_UPLOAD_BASE_URL` env var when `--base-url` is absent
+- `docs/ENV.md`: added `AGENT_ONBOARD_AUTOMINT` and `AGENT_INTAKE_ENC_KEY` rows
+
+Acceptance: onboard fresh gym -> token + voice + brain + trust=FULL_APPROVAL + publish OFF + creds-pending + link printed. Re-run idempotent. onboard-verify reports READY-FOR-UPLOADS=YES, READY-TO-PUBLISH=NO, reason "publish creds pending by hand." No Meta credential ever touched.
+
+### Step 1: library gap — 13 lasso_v2_* assets MISSING (LOUD, action required)
+
+`library-audit --account lasso_fb` reports 13 MISSING creatives for Jul 17-31:
+lasso_v2_built_by_gym_owners, lasso_v2_b2b_five_companies, lasso_v2_platform_719_booking,
+lasso_v2_platform_ads_booking_bars, lasso_v2_summit_announce, lasso_v2_one_screen,
+lasso_v2_b2b_35k_caught, lasso_v2_platform_stuck_lasso, lasso_v2_platform_ads_stuck,
+lasso_v2_summit_playbook, lasso_v2_follow_up_problem, lasso_v2_b2b_speed_to_lead,
+lasso_v2_platform_six_engines.
+
+These assets must exist in `content_library/` for those days to draft. The
+`regen-library` command generates them but requires `AGENT_NANO_ENABLED=true` +
+`AGENT_NANO_API_KEY` set in the container. `plan-month --replan` would substitute
+available assets but requires `AGENT_PLAN_MONTH_ENABLED=true` (currently OFF).
+
+**BLAKE BY HAND (choose one):**
+1. Run `python -m agent regen-library --set all` on the container (NANO must be armed).
+   Each generated card appears at the `lasso_v2_*` path the plans already reference.
+2. OR set `AGENT_PLAN_MONTH_ENABLED=true` in Railway and run:
+   `python -m agent plan-month --account lasso_fb --month 2026-07 --from 2026-07-17 --replan --write`
+   This substitutes available library assets for the 13 missing days.
+
+Until one of these runs, the 13 lasso_fb drafts for Jul 17-31 will draft with MISSING
+creative (BLOCKED at queue time). The daily scheduler WILL alert on each miss.
+
+Also THIN: `speed_to_lead.jpg` is a 32-byte placeholder on both accounts. Not
+referenced by any current plan (lasso_fb Jul 22 uses `speed_to_lead_carousel`, which
+is healthy). Replace the stub with the real image if this slot is to be used standalone.
+
+### Step 2: Railway cron — manual Blake dashboard action required
+
+`docs/SCHEDULER_CRON.md` has the complete click-by-click runbook (create
+`echo-daily-cron` service, set cron `30 14 * * *`, attach same `/data` volume,
+copy env vars). This CANNOT be created via code; it requires clicking through
+the Railway dashboard.
+
+**BLAKE BY HAND:** follow `docs/SCHEDULER_CRON.md` steps 1-7.
+
+### Step 3: speed-to-lead editorial card — not yet drafted
+
+`content_library/lasso_p2_speed_to_lead_stat.png` (3.8MB, Jul 1) exists. This is
+the editorial card from a prior session. Status:
+- No pending draft references it on lasso_ig or lasso_fb
+- Fabrication gate cannot verify locally (OCR model requires API key absent in dev shell)
+- The card's `.json` note uses "80 percent of conversions happen when you respond in
+  under 5 minutes" — phrasing differs from the USE line on 02_verified_stats.md line 41
+  ("Contact a new lead within 5 minutes and you can lift conversions up to 80 percent.")
+- The LOCKED conflict ("80% more conversions" in three versions) needs resolution before
+  this card can safely post
+
+**BLAKE BY HAND:**
+1. Run `python -m agent fabrication-scan` on the container (OCR key present) to read the
+   card's rendered pixels and confirm CLEAN vs BLOCKED.
+2. If CLEAN: add `lasso_p2_speed_to_lead_stat` to a future plan slot for lasso_ig and lasso_fb.
+3. If BLOCKED: the card's rendered stat is a locked variant; use regen-library to regenerate
+   with the exact USE wording ("Contact a new lead within 5 minutes and you can lift
+   conversions up to 80 percent.") once NANO is armed.
+
+### Grade: B+ (unchanged)
+Auto-mint is complete. No new grade gate cleared. A still requires one real gym completing
+a full 30-day posting month and Meta App Review cleared for client-owned assets.
+
+---
+
 ## OCR model name fix + model-404 sanity check (2026-07-16)
 
 `fabrication-scan --all` on production failed every OCR read:
