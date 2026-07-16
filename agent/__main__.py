@@ -391,6 +391,7 @@ _COMMANDS = {
     ],
     "onboarding & intake": [
         ("onboard-client / add-client", "scaffold a new client account"),
+        ("onboard-verify", "check onboarding completeness for one or all gyms"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
@@ -549,6 +550,35 @@ def main(argv=None):
         else:
             from .onboard_pipeline import onboard
             onboard(intake, key, name or None)
+    elif cmd == "onboard-verify":
+        # READ ONLY: check onboarding completeness for one gym (--account) or
+        # every gym in the gyms table (--all). Never touches env, never reads or
+        # prints a token. Publish creds are recorded as NOT SET (by hand); the
+        # operator sets them, not this command.
+        from .onboard_verify import verify_gym, verify_all, format_result
+        acct_key = ""
+        do_all = False
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                acct_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--all":
+                do_all = True; i += 1; continue
+            i += 1
+        if not acct_key and not do_all:
+            print("usage: python -m agent onboard-verify --account <key>  |  --all")
+        elif do_all:
+            results = verify_all()
+            if not results:
+                print("onboard-verify: no gyms found in the gyms table.")
+            for r in results:
+                for line in format_result(r):
+                    print(line)
+        else:
+            r = verify_gym(acct_key)
+            for line in format_result(r):
+                print(line)
     elif cmd == "add-client":
         # MANUAL onboarding scaffold: config entry + voice/proof templates +
         # library folder + the by-hand checklist. Touches no env, arms nothing.

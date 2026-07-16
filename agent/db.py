@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS client_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, category TEXT,
   text TEXT, citation TEXT, status TEXT DEFAULT 'approved',
   created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS gyms (
+  account_key TEXT PRIMARY KEY,
+  display_name TEXT DEFAULT '',
+  publish_flag TEXT DEFAULT 'OFF',
+  publish_creds TEXT DEFAULT 'NOT SET (by hand)',
+  created_at TEXT DEFAULT (datetime('now')));
 """
 
 
@@ -215,3 +221,45 @@ def audit_rows(day=None, account_key=None, limit=500):
     params.append(limit)
     with connect() as conn:
         return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+# ---- gym table helpers (onboarding state, Stage 2 T4) -----------------------
+
+def gym_upsert(account_key, display_name="", publish_flag="OFF",
+               publish_creds="NOT SET (by hand)"):
+    """Insert or update a gym row. Never stores a token or credential value."""
+    with _lock, connect() as conn:
+        conn.execute(
+            "INSERT INTO gyms (account_key, display_name, publish_flag, publish_creds) "
+            "VALUES (?,?,?,?) ON CONFLICT(account_key) DO UPDATE SET "
+            "display_name=excluded.display_name, publish_flag=excluded.publish_flag, "
+            "publish_creds=excluded.publish_creds",
+            (account_key, display_name, publish_flag, publish_creds))
+        conn.commit()
+
+
+def gym_get(account_key, conn=None):
+    """Return the gym row dict for account_key, or None if not found."""
+    def _get(c):
+        row = c.execute(
+            "SELECT account_key, display_name, publish_flag, publish_creds "
+            "FROM gyms WHERE account_key=?", (account_key,)).fetchone()
+        return dict(row) if row else None
+
+    if conn is not None:
+        return _get(conn)
+    with connect() as c:
+        return _get(c)
+
+
+def gym_list(conn=None):
+    """Return all gym row dicts (may be empty)."""
+    def _list(c):
+        return [dict(r) for r in c.execute(
+            "SELECT account_key, display_name, publish_flag, publish_creds "
+            "FROM gyms ORDER BY account_key").fetchall()]
+
+    if conn is not None:
+        return _list(conn)
+    with connect() as c:
+        return _list(c)
