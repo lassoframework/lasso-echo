@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS client_sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account_key TEXT, category TEXT,
   text TEXT, citation TEXT, status TEXT DEFAULT 'approved',
   created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS pre_echo_baselines (
+  account_key TEXT PRIMARY KEY,
+  locked_at TEXT NOT NULL,
+  pre_echo_cutoff TEXT,
+  window_start TEXT,
+  window_end TEXT,
+  posts_count INTEGER,
+  weeks_in_window REAL,
+  avg_posts_per_week REAL,
+  confidence TEXT,
+  confidence_note TEXT
+);
 CREATE TABLE IF NOT EXISTS gyms (
   account_key TEXT PRIMARY KEY,
   display_name TEXT DEFAULT '',
