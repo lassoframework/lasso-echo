@@ -411,6 +411,7 @@ _COMMANDS = {
         ("dry-run", "the whole Stage 1 loop OFFLINE, no tokens"),
         ("status", "flag + gate + schedule state"),
         ("scheduler-status", "loop liveness, last draw, next expected draw, cron note"),
+        ("spend-status", "today's Gemini call counts, cap status, and auto-reload reminder"),
         ("help", "this list"),
     ],
     "planning & calendar": [
@@ -659,6 +660,10 @@ def main(argv=None):
         _print_run_daily(out)
     elif cmd == "scheduler-status":
         _scheduler_status()
+    elif cmd == "spend-status":
+        from .spend import spend_status_lines
+        for line in spend_status_lines():
+            print(line)
     elif cmd == "library-audit":
         _library_audit(argv[1:])
     elif cmd == "fabrication-scan":
