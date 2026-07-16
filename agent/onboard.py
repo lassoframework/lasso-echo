@@ -202,7 +202,10 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     # (b) Token minting ---------------------------------------------------
     if config.onboard_automint_enabled():
         status = _token_status(account_key)
-        if status.get("has_token"):
+        # Real token_status returns {"status": "ACTIVE"|"REVOKED"|"NOT_SET", ...}
+        # Stub returned {"has_token": bool, ...}. Support both for safety.
+        already_minted = (status.get("status") == "ACTIVE") or bool(status.get("has_token"))
+        if already_minted:
             result["token_minted"] = False
         else:
             from . import intake_tokens
