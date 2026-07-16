@@ -299,10 +299,41 @@ def _meta_check(argv):
 
 def _capture_baseline():
     """python -m agent capture-baseline: MANUAL, READ-ONLY pre-Echo baseline.
-    Run by hand once; it is never scheduled and never writes to Meta."""
-    from .baseline import capture_baseline
+    Run by hand once; it is never scheduled and never writes to Meta.
+    Also locks the pre-Echo baseline into the DB for baseline-report."""
+    import requests as _requests
+    from .baseline import capture_baseline, lock_pre_echo_baseline
+    from .accounts import active_accounts
     print("capture-baseline: reading recent posting history (READ-ONLY, run by hand)")
     capture_baseline()
+    print("\nLocking pre-Echo baseline records (write-once per account):")
+    http = _requests
+    for acct in active_accounts():
+        rec = lock_pre_echo_baseline(acct.key, http=http)
+        already = rec.pop("_already_locked", False)
+        if already:
+            print(f"  {acct.key}: already locked (use --force to overwrite)")
+        else:
+            confidence = rec.get("confidence", "unknown")
+            avg = rec.get("avg_posts_per_week")
+            if avg is not None:
+                print(f"  {acct.key}: locked  avg {avg} posts/week  [{confidence}]")
+            else:
+                print(f"  {acct.key}: locked  [{confidence}]")
+
+
+def _baseline_report(args):
+    """python -m agent baseline-report [--account <key>]
+    Print the locked pre-Echo baseline. Reads only from the DB; no API calls.
+    Token values are never touched or printed here."""
+    from .baseline import baseline_report
+    account_key = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--account" and i + 1 < len(args):
+            account_key = args[i + 1]; i += 2; continue
+        i += 1
+    baseline_report(account_key=account_key)
 
 
 def _config_check():
@@ -438,7 +469,8 @@ _COMMANDS = {
     "ops": [
         ("check-tokens", "token watchdog run (flag must be armed)"),
         ("meta-check", "verify Meta tokens, scopes, and publishable status"),
-        ("capture-baseline", "pre-Echo posting baseline (read-only)"),
+        ("capture-baseline", "pre-Echo posting baseline (read-only, also locks DB record)"),
+        ("baseline-report [--account <key>]", "print locked pre-Echo baseline from DB"),
         ("restore-store", "restore the draft store from a backup"),
         ("whatsapp-status", "show WhatsApp intake env status"),
         ("config-check", "audit env vars: code vs docs/ENV.md"),
@@ -1352,6 +1384,8 @@ def main(argv=None):
         _meta_check(argv[1:])
     elif cmd == "capture-baseline":
         _capture_baseline()
+    elif cmd == "baseline-report":
+        _baseline_report(argv[1:])
     elif cmd == "whatsapp-status":
         _whatsapp_status()
     elif cmd == "config-check":
