@@ -16,6 +16,10 @@ from . import config, meta_publisher, gbp_publisher, ops_alerts, postlog, publis
 from .accounts import get_account, Platform
 from .drafter import Draft, DraftStatus
 
+# Per-account approve-streak counter: keyed by account_key in a plain dict.
+# Increment on approve, reset to 0 on edit / deny / kill.
+_streak_counters: dict = {}
+
 
 def _publisher_for(account):
     """Route by platform: Google Business Profile -> gbp_publisher; everything else
@@ -90,6 +94,14 @@ def handle_action(action, draft, actor_slack_id, note="",
 
     if action == "skip":
         draft.status = DraftStatus.SKIPPED
+        # skip resets the approve streak (same as deny)
+        if config.tenant_brain_enabled():
+            try:
+                from . import tenant_brain as _brain
+                _streak_counters[getattr(draft, "account_key", "")] = 0
+            except Exception as _e:
+                print(f"[brain] skip streak reset failed for "
+                      f"{getattr(draft, 'account_key', '')}: {_e}")
         return ActionResult(ok=True, action="skip", draft_id=draft.draft_id,
                             detail="Dropped.")
 
@@ -97,8 +109,29 @@ def handle_action(action, draft, actor_slack_id, note="",
         if not redraft_fn:
             return ActionResult(ok=False, action="edit", draft_id=draft.draft_id,
                                 detail="No redraft function wired.")
+        original_caption = getattr(draft, "caption", "") or ""
         new_draft = redraft_fn(draft, note)
         new_draft.status = DraftStatus.PENDING
+        # record the edit diff in the tenant brain (best effort)
+        if config.tenant_brain_enabled():
+            try:
+                from . import tenant_brain as _brain
+                acct_key = getattr(draft, "account_key", "")
+                new_caption = getattr(new_draft, "caption", "") or ""
+                # The rule field is always a generic style note, NEVER a stat
+                # claim, a percentage, or a price.
+                _brain.record_event(
+                    acct_key,
+                    "edit_diff",
+                    before=original_caption,
+                    after=new_caption,
+                    rule="human edited: style preference",
+                )
+                # edit resets the approve streak
+                _streak_counters[acct_key] = 0
+            except Exception as _e:
+                print(f"[brain] edit_diff record failed for "
+                      f"{getattr(draft, 'account_key', '')}: {_e}")
         return ActionResult(ok=True, action="edit", draft_id=draft.draft_id,
                             detail="Revised; re-posted for approval.", redraft=new_draft)
 
@@ -158,8 +191,56 @@ def handle_action(action, draft, actor_slack_id, note="",
         # (returns None immediately when OFF, and only ever READS when ON).
         confirm = confirmer or publish_confirm.confirm_publish
         confirm(draft, acct, result)
+        # record approve streak in the tenant brain (best effort)
+        if config.tenant_brain_enabled():
+            try:
+                from . import tenant_brain as _brain
+                acct_key = getattr(draft, "account_key", "")
+                _streak_counters[acct_key] = _streak_counters.get(acct_key, 0) + 1
+                _brain.record_event(
+                    acct_key,
+                    "approve_streak",
+                    streak=_streak_counters[acct_key],
+                )
+            except Exception as _e:
+                print(f"[brain] approve_streak record failed for "
+                      f"{getattr(draft, 'account_key', '')}: {_e}")
         return ActionResult(ok=True, action="approve", draft_id=draft.draft_id,
                             detail=f"{result.mode}: media_id={post_ref or '-'}")
+
+    if action == "deny":
+        draft.status = DraftStatus.SKIPPED
+        # record deny reason in the tenant brain (best effort)
+        if config.tenant_brain_enabled() and note:
+            try:
+                from . import tenant_brain as _brain
+                acct_key = getattr(draft, "account_key", "")
+                _brain.record_event(acct_key, "deny_reason", reason=note)
+                _streak_counters[acct_key] = 0
+            except Exception as _e:
+                print(f"[brain] deny_reason record failed for "
+                      f"{getattr(draft, 'account_key', '')}: {_e}")
+        return ActionResult(ok=True, action="deny", draft_id=draft.draft_id,
+                            detail="Denied and dropped.")
+
+    if action == "kill":
+        draft.status = DraftStatus.SKIPPED
+        import os as _os
+        creative_key = (
+            note or _os.path.basename(getattr(draft, "creative_path", "") or "")
+        )
+        # record kill in the tenant brain (best effort)
+        if config.tenant_brain_enabled():
+            try:
+                from . import tenant_brain as _brain
+                acct_key = getattr(draft, "account_key", "")
+                _brain.record_event(acct_key, "kill", concept=creative_key)
+                _streak_counters[acct_key] = 0
+            except Exception as _e:
+                print(f"[brain] kill record failed for "
+                      f"{getattr(draft, 'account_key', '')}: {_e}")
+        return ActionResult(ok=True, action="kill", draft_id=draft.draft_id,
+                            detail=f"Killed concept: {creative_key or '(unknown)'}.")
 
     return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
                         detail=f"Unknown action '{action}'.")

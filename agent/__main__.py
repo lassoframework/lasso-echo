@@ -426,6 +426,10 @@ _COMMANDS = {
         ("whatsapp-status", "show WhatsApp intake env status"),
         ("config-check", "audit env vars: code vs docs/ENV.md"),
     ],
+    "brand voice & brain": [
+        ("voice-template", "emit the client-fillable brand voice intake template"),
+        ("brain-export", "print the style brain for one account"),
+    ],
 }
 
 
@@ -1098,6 +1102,38 @@ def main(argv=None):
         _whatsapp_status()
     elif cmd == "config-check":
         _config_check()
+    elif cmd == "voice-template":
+        # Emit the client-fillable brand voice intake template (dash-free,
+        # StoryBrand-shaped). No flags, no tokens, safe to run any time.
+        out_path = None
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--out" and i + 1 < len(args_rest):
+                out_path = args_rest[i + 1]; i += 2; continue
+            i += 1
+        from .voice_template import render_template
+        written = render_template(out_path=out_path)
+        print(f"Brand voice template written to: {written}")
+    elif cmd == "brain-export":
+        # Print the tenant brain for one account. Read-only: never creates the file.
+        acct_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                acct_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not acct_key:
+            print("usage: python -m agent brain-export --account <key>")
+        else:
+            brain_file = os.path.join("brains", f"{acct_key}.md")
+            if os.path.exists(brain_file):
+                print(f"=== Brain export for {acct_key} ===")
+                with open(brain_file, encoding="utf-8") as _fh:
+                    print(_fh.read(), end="")
+            else:
+                print(f"No brain data found for {acct_key}.")
     elif cmd == "status":
         _status()
     elif cmd in ("help", "--help", "-h"):
