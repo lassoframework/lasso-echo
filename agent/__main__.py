@@ -79,6 +79,7 @@ def _status():
     print(f"  trust_ladder   : {config.trust_ladder_enabled()}  (env AGENT_TRUST_LADDER_ENABLED)")
     print(f"  trust_dryrun   : {config.trust_dryrun_enabled()}  (env AGENT_TRUST_DRYRUN)")
     print(f"  trust_autopub  : {config.trust_autopublish_enabled()}  (env AGENT_TRUST_AUTOPUBLISH)")
+    print(f"  portal_approvals: {config.portal_approvals_enabled()}  (env AGENT_PORTAL_APPROVALS)")
     print(f"  ocr_check      : {config.ocr_check_enabled()}  (env AGENT_OCR_CHECK_ENABLED)")
     print(f"  consent_guard  : {config.consent_guard_enabled()}  (env AGENT_CONSENT_GUARD_ENABLED)")
     print(f"  autotag        : {config.autotag_enabled()}  (env AGENT_AUTOTAG_ENABLED)")
@@ -420,6 +421,9 @@ _COMMANDS = {
         ("monthly-report / monthly-review / grade-card", "month-end artifacts"),
         ("audit / fleet-status", "cross-account state"),
         ("gbp-check", "Google Business Profile check"),
+    ],
+    "trust & approvals": [
+        ("trust", "show trust level for an account (--account <key>)"),
     ],
     "ops": [
         ("check-tokens", "token watchdog run (flag must be armed)"),
@@ -1101,6 +1105,27 @@ def main(argv=None):
         _whatsapp_status()
     elif cmd == "config-check":
         _config_check()
+    elif cmd == "trust":
+        # Show the TrustLevel name and integer for one account.
+        account_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent trust --account <key>")
+        else:
+            from .accounts import get_account
+            from .trust import effective_level as _eff_level
+            acct = get_account(account_key)
+            if acct is None:
+                print(f"{account_key}: account not found")
+            else:
+                lvl = _eff_level(acct)
+                print(f"{account_key}: trust level {int(lvl)} ({lvl.name})")
+                print("Set by hand in accounts.py. Never auto-set.")
     elif cmd == "status":
         _status()
     elif cmd == "intake-worker":

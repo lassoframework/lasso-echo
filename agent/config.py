@@ -446,6 +446,15 @@ def trust_ladder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_LADDER_ENABLED", "false"))
 
 
+def portal_approvals_enabled() -> bool:
+    """
+    Portal-callable approval endpoints for per-gym approvers. Default OFF.
+    ON, each gym's designated approver can approve, edit, deny, or kill drafts
+    scoped to their gym only. An actor authorized for gym A cannot act on gym B.
+    """
+    return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
+
+
 def backup_enabled() -> bool:
     """
     Nightly store backup switch. OFF by default. ON, a consistent sqlite

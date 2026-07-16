@@ -52,7 +52,7 @@ def _is_approver(actor_slack_id, account=None):
 
 def handle_action(action, draft, actor_slack_id, note="",
                   redraft_fn=None, publisher=None, logger=None, account=None,
-                  confirmer=None):
+                  confirmer=None, **kwargs):
     """
     Apply an approval action.
 
@@ -87,6 +87,35 @@ def handle_action(action, draft, actor_slack_id, note="",
                                    "so nothing was published. Use today's card instead.")
 
     action = (action or "").lower()
+
+    if action == "kill":
+        confirmed = kwargs.get("confirmed", False) if kwargs else False
+        if not confirmed:
+            return ActionResult(ok=False, action="kill", draft_id=draft.draft_id,
+                                detail="Kill requires confirmation. Pass confirmed=True to proceed.")
+        account_key = getattr(draft, "account_key", "") or ""
+        creative_key = getattr(draft, "creative_path", "") or ""
+        import os as _os
+        creative_key = _os.path.basename(creative_key)
+        try:
+            from . import tenant_brain
+            tenant_brain.record_event(account_key, "kill", concept=creative_key)
+        except Exception:
+            pass
+        return ActionResult(ok=True, action="kill", draft_id=draft.draft_id,
+                            detail="Concept banned for this gym. It will not be drafted again.")
+
+    if action == "deny":
+        account_key = getattr(draft, "account_key", "") or ""
+        note = kwargs.get("note", "") if kwargs else ""
+        draft.status = DraftStatus.BLOCKED
+        try:
+            from . import tenant_brain
+            tenant_brain.record_event(account_key, "deny_reason", reason=note)
+        except Exception:
+            pass
+        return ActionResult(ok=True, action="deny", draft_id=draft.draft_id,
+                            detail="Draft denied. Recreate queued.")
 
     if action == "skip":
         draft.status = DraftStatus.SKIPPED
