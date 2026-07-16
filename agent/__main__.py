@@ -117,6 +117,7 @@ def _status():
     print(f"  clipper        : {config.clipper_enabled()}  (env AGENT_CLIPPER_ENABLED)")
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
+    print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -397,6 +398,8 @@ _COMMANDS = {
         ("intake-doc", "turn a client PDF into held draft posts"),
         ("intake-web", "the upload web surface (own service)"),
         ("intake-create", "create drafts from an intake payload"),
+        ("intake-worker", "process the R2 intake queue one pass"),
+        ("intake-status", "show intake queue depth for one account"),
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
@@ -1100,6 +1103,55 @@ def main(argv=None):
         _config_check()
     elif cmd == "status":
         _status()
+    elif cmd == "intake-worker":
+        if not config.intake_worker_enabled():
+            print("AGENT_INTAKE_WORKER is OFF. Set AGENT_INTAKE_WORKER=true to arm the intake worker.")
+        else:
+            from . import intake_ingest
+            results = intake_ingest.process_all()
+            if results is None:
+                print("intake-worker: AGENT_INTAKE_ENABLED is OFF. No pass run.")
+            else:
+                for client, stats in sorted(results.items()):
+                    print(
+                        f"{client}: accepted {stats.get('accepted', 0)}, "
+                        f"duplicates {stats.get('duplicates', 0)}, "
+                        f"flagged {stats.get('flagged', 0)}, "
+                        f"needs_caption {stats.get('needs_caption', 0)}, "
+                        f"low_res {stats.get('low_res', 0)}, "
+                        f"deadlettered {stats.get('deadlettered', 0)}"
+                    )
+                print(f"Intake worker pass complete: {len(results)} clients processed.")
+    elif cmd == "intake-status":
+        account_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent intake-status --account <key>")
+        else:
+            from . import intake_ingest
+            r2 = intake_ingest._default_r2()
+            if r2 is None:
+                print(f"intake-status: R2 not configured (check S3 env vars).")
+            else:
+                prefixes = {
+                    "incoming":       f"intake/{account_key}/incoming/",
+                    "pending_caption": f"intake/{account_key}/pending_caption/",
+                    "review":          f"intake/{account_key}/review/",
+                    "deadletter":      f"intake/{account_key}/deadletter/",
+                }
+                for label, prefix in prefixes.items():
+                    try:
+                        count = len(r2.list_keys(prefix))
+                    except Exception:
+                        count = 0
+                    print(f"{label}: {count}")
+            if not config.intake_worker_enabled():
+                print("(AGENT_INTAKE_WORKER is OFF)")
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
