@@ -54,9 +54,13 @@ CREATE TABLE IF NOT EXISTS client_sources (
 CREATE TABLE IF NOT EXISTS gyms (
   account_key TEXT PRIMARY KEY,
   display_name TEXT DEFAULT '',
+  gym_name TEXT,
   intake_token_hash TEXT,
+  token_sha256 TEXT,
   token_rotated_at TEXT,
   token_revoked INTEGER DEFAULT 0,
+  token_status TEXT DEFAULT 'NOT_SET',
+  upload_link TEXT,
   publish_flag TEXT DEFAULT 'OFF',
   publish_creds_status TEXT DEFAULT 'NOT SET (by hand)',
   created_at TEXT DEFAULT (datetime('now')),

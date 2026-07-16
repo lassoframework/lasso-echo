@@ -406,6 +406,7 @@ _COMMANDS = {
         ("intake-status", "show intake queue depth for one account"),
         ("mint-token", "mint, rotate, or revoke an intake token for a gym (AGENT_ONBOARD_AUTOMINT required)"),
         ("tokens --list", "list all gyms with token status (ACTIVE/REVOKED/NOT_SET); never prints a hash"),
+        ("portal-status", "show portal status for one gym (AGENT_PORTAL_APPROVALS)"),
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
@@ -1342,6 +1343,25 @@ def main(argv=None):
             _tokens_list()
         else:
             print("usage: python -m agent tokens --list")
+    elif cmd == "portal-status":
+        # READ ONLY: show the portal status for one gym account.
+        # Requires AGENT_PORTAL_APPROVALS=true; returns JSON-like output.
+        account_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent portal-status --account <key>")
+        elif not config.portal_approvals_enabled():
+            print("portal-status: AGENT_PORTAL_APPROVALS is OFF. Nothing shown.")
+        else:
+            from .intake_web import handle_portal_gym_status
+            status_code, result = handle_portal_gym_status(account_key)
+            import json as _json
+            print(_json.dumps(result, indent=2))
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
