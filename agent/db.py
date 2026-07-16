@@ -202,6 +202,37 @@ def audit(kind, subject, reason, account_key="", day=""):
         print(f"[audit] write failed: {type(e).__name__}: {e}")
 
 
+def gym_upsert(account_key: str, display_name: str = "", conn=None) -> None:
+    """
+    Insert or update the gym record for account_key in the kv store.
+    Stores: gym_name, gym_display_name. Called by the autonomous onboard flow.
+    If a gyms table is available in future, this function is the choke point;
+    today it uses kv as the fallback so no schema migration is required.
+    Never stores a token or credential of any kind.
+    """
+    import json as _json
+    _key = f"gym_{account_key}"
+    existing_raw = kv_get(_key, "{}")
+    try:
+        existing = _json.loads(existing_raw)
+    except Exception:
+        existing = {}
+    existing["account_key"] = account_key
+    if display_name:
+        existing["display_name"] = display_name
+    kv_set(_key, _json.dumps(existing))
+
+
+def gym_get(account_key: str) -> dict:
+    """Return the gym record dict for account_key, or {} if absent."""
+    import json as _json
+    raw = kv_get(f"gym_{account_key}", "{}")
+    try:
+        return _json.loads(raw) or {}
+    except Exception:
+        return {}
+
+
 def audit_rows(day=None, account_key=None, limit=500):
     q = "SELECT ts, day, account_key, kind, subject, reason FROM audit WHERE 1=1"
     params = []

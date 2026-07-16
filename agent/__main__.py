@@ -120,6 +120,7 @@ def _status():
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
+    print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -390,6 +391,7 @@ _COMMANDS = {
         ("runway", "days of approved content left per account"),
     ],
     "onboarding & intake": [
+        ("onboard", "stand up a new gym end to end"),
         ("onboard-client / add-client", "scaffold a new client account"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
@@ -531,6 +533,47 @@ def main(argv=None):
             print(err)
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name)
+    elif cmd == "onboard":
+        # Autonomous onboard (Stage 2 T2): gym row, voice file, brain file,
+        # trust + publish records. Token minting is behind AGENT_ONBOARD_AUTOMINT
+        # (default OFF). Meta credentials are NEVER touched; set by hand only.
+        account_key, display_name, base_url_arg = "", "", None
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--account" and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--name" and i + 1 < len(args_rest):
+                display_name = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--base-url" and i + 1 < len(args_rest):
+                base_url_arg = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key or not display_name:
+            print('usage: python -m agent onboard --account <key> --name "<Gym Name>" '
+                  '[--base-url <url>]')
+        else:
+            from .onboard import run as _onboard_run
+            r = _onboard_run(account_key, display_name, base_url=base_url_arg)
+            print(f"GYM: {r['account_key']} ({r['display_name']})")
+            if r["token_minted"] is None:
+                print("Token: PENDING (set AGENT_ONBOARD_AUTOMINT=true by hand)")
+            elif r["token_minted"] is False:
+                print("Token: ALREADY SET")
+            else:
+                print(f"Token: MINTED (save the raw token: {r['token_minted']})")
+            voice_status = "created" if not os.path.exists(r["voice_path"]) else "already exists"
+            print(f"Voice file: {r['voice_path']} ({voice_status})")
+            brain_status = "created" if not os.path.exists(r["brain_path"]) else "already exists"
+            print(f"Brain file: {r['brain_path']} ({brain_status})")
+            print("Trust: FULL APPROVAL (new clients always start here)")
+            print(f"Publish: {r['publish_flag']} | Creds: {r['creds_status']}")
+            if r["upload_link"]:
+                print(f"Upload link: {r['upload_link']}")
+            else:
+                print("Upload link: (not generated: token pending or base URL not set)")
+            print("Pending human items:")
+            for item in r["pending_human_items"]:
+                print(f"  {item}")
     elif cmd == "onboard-client":
         # ONE-COMMAND Stage 3 onboarding from a completed intake. Missing fields
         # block with the list; touches no env, arms nothing.

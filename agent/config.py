@@ -950,3 +950,13 @@ def intake_worker_enabled() -> bool:
     Default OFF. Arm by hand.
     """
     return _truthy(os.environ.get("AGENT_INTAKE_WORKER", "false"))
+
+
+def onboard_automint_enabled() -> bool:
+    """
+    Autonomous onboarding token mint switch. OFF by default.
+    When OFF, the onboard command creates the gym row and scaffolds files but
+    skips intake token minting. Blake sets this by hand to enable. Nothing
+    in onboarding arms itself or touches any Meta credential.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))
