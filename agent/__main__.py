@@ -696,6 +696,9 @@ def main(argv=None):
             if args_rest[i] == "--base-url" and i + 1 < len(args_rest):
                 base_url_arg = args_rest[i + 1]; i += 2; continue
             i += 1
+        # Fall back to env var so Railway deployments don't need --base-url explicitly
+        if base_url_arg is None:
+            base_url_arg = os.environ.get("AGENT_UPLOAD_BASE_URL") or None
         if not account_key or not display_name:
             print('usage: python -m agent onboard --account <key> --name "<Gym Name>" '
                   '[--base-url <url>]')

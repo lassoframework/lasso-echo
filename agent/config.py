@@ -970,3 +970,14 @@ def onboard_automint_enabled() -> bool:
     arms itself or touches any Meta credential.
     """
     return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))
+
+
+# ---- Intake token encryption key ---------------------------------------------
+# Name of the env var holding the Fernet key for encrypting intake tokens at
+# rest. When set: intake_tokens.mint() stores the raw token encrypted so
+# /portal/gym/<key> can recover and return the upload link without storing
+# the token in plaintext. When NOT set: encryption is skipped (dev mode) and
+# the upload_link column stores the plaintext URL.
+# Generate a key once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Store it in Railway env only; never commit or log it.
+INTAKE_ENC_KEY_ENV = "AGENT_INTAKE_ENC_KEY"

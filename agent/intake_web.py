@@ -401,8 +401,9 @@ def handle_portal_gym_status(account_key, r2=None):
 
     Response shape:
       account_key    - the gym's account key
-      upload_link    - the stored upload link from the gyms table (set at mint
-                       time; never contains the raw token), or null
+      upload_link    - the reconstructed upload link (decrypted when
+                       AGENT_INTAKE_ENC_KEY is set, else from upload_link column),
+                       or null when unavailable
       token_status   - ACTIVE, REVOKED, or NOT_SET
       last_upload_at - timestamp of most recent object in R2 incoming/, or null
       upload_count   - count of objects in R2 incoming/, or null
@@ -420,6 +421,19 @@ def handle_portal_gym_status(account_key, r2=None):
         return 404, {"error": "gym not found"}
 
     token_status_val = (gym_row.get("token_status") or "NOT_SET").upper()
+
+    # Upload link: prefer decrypted reconstruction (AGENT_INTAKE_ENC_KEY set),
+    # fall back to the plaintext upload_link column stored at onboard time.
+    upload_link = gym_row.get("upload_link")
+    try:
+        from . import intake_tokens as _it
+        raw = _it.decrypt_token(account_key)
+        if raw:
+            base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").rstrip("/")
+            if base:
+                upload_link = base + "/u/" + raw
+    except Exception:
+        pass  # encryption unavailable: use stored plaintext link
 
     # R2 metadata: last upload and count from intake/<account_key>/incoming/.
     last_upload_at = None
@@ -447,7 +461,7 @@ def handle_portal_gym_status(account_key, r2=None):
 
     return 200, {
         "account_key": account_key,
-        "upload_link": gym_row.get("upload_link"),
+        "upload_link": upload_link,
         "token_status": token_status_val,
         "last_upload_at": last_upload_at,
         "upload_count": upload_count,

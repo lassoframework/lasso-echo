@@ -130,3 +130,56 @@ def test_token_status_active_revoked(monkeypatch, tmp_path):
     assert st_after["status"] == "REVOKED"
 
     conn.close()
+
+
+# ---- Encryption at rest (AGENT_INTAKE_ENC_KEY) --------------------------------
+
+def test_encrypted_token_stored_when_key_set(monkeypatch, tmp_path):
+    """When AGENT_INTAKE_ENC_KEY is set, mint stores an encrypted blob."""
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key().decode()
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_INTAKE_ENC_KEY", key)
+    conn = _fresh_conn(tmp_path)
+
+    raw = intake_tokens.mint("gym_enc", db_conn=conn)
+    row = conn.execute(
+        "SELECT intake_token_encrypted FROM gyms WHERE account_key='gym_enc'"
+    ).fetchone()
+    assert row is not None
+    assert row["intake_token_encrypted"] is not None, "encrypted blob must be stored"
+
+    recovered = intake_tokens.decrypt_token("gym_enc", db_conn=conn)
+    assert recovered == raw, "decrypt_token must recover the original raw token"
+    conn.close()
+
+
+def test_no_encrypted_blob_when_key_not_set(monkeypatch, tmp_path):
+    """Without AGENT_INTAKE_ENC_KEY, intake_token_encrypted stays NULL."""
+    _arm(monkeypatch)
+    monkeypatch.delenv("AGENT_INTAKE_ENC_KEY", raising=False)
+    conn = _fresh_conn(tmp_path)
+
+    intake_tokens.mint("gym_noenc", db_conn=conn)
+    row = conn.execute(
+        "SELECT intake_token_encrypted FROM gyms WHERE account_key='gym_noenc'"
+    ).fetchone()
+    assert row is not None
+    assert row["intake_token_encrypted"] is None, "no encrypted blob without key"
+    assert intake_tokens.decrypt_token("gym_noenc", db_conn=conn) is None
+    conn.close()
+
+
+def test_revoke_clears_encrypted_blob(monkeypatch, tmp_path):
+    """After revoke(), intake_token_encrypted is NULL so the link cannot be recovered."""
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key().decode()
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_INTAKE_ENC_KEY", key)
+    conn = _fresh_conn(tmp_path)
+
+    intake_tokens.mint("gym_revenc", db_conn=conn)
+    assert intake_tokens.decrypt_token("gym_revenc", db_conn=conn) is not None
+    intake_tokens.revoke("gym_revenc", db_conn=conn)
+    assert intake_tokens.decrypt_token("gym_revenc", db_conn=conn) is None
+    conn.close()

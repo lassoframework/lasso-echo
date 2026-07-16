@@ -260,3 +260,33 @@ def test_onboard_result_keys_complete(tmp_path):
                 "brain_path", "trust_level", "publish_flag", "creds_status",
                 "upload_link", "pending_human_items"}
     assert required.issubset(result.keys())
+
+
+def test_onboard_upload_link_persisted_in_db(tmp_path, monkeypatch):
+    """upload_link is stored in the gyms row so the portal can return it later."""
+    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    voice_dir = str(tmp_path / "brand_voice")
+    brains_dir = str(tmp_path / "brains")
+    onboard.run("gymlinkdb", "Link DB Gym",
+                base_url="https://intake.example.com",
+                voice_dir=voice_dir, brains_dir=brains_dir)
+    row = db.gym_get("gymlinkdb")
+    assert row is not None
+    assert row.get("upload_link") is not None
+    assert row["upload_link"].startswith("https://intake.example.com/u/")
+
+
+def test_onboard_base_url_from_env(tmp_path, monkeypatch):
+    """When AGENT_UPLOAD_BASE_URL is set, the CLI picks it up without --base-url."""
+    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "https://upload.lasso.test")
+    voice_dir = str(tmp_path / "brand_voice")
+    brains_dir = str(tmp_path / "brains")
+    # Call run() directly with the env var set and no base_url arg (simulates CLI)
+    import os
+    base = os.environ.get("AGENT_UPLOAD_BASE_URL")
+    result = onboard.run("gymenvurl", "Env URL Gym",
+                         base_url=base,
+                         voice_dir=voice_dir, brains_dir=brains_dir)
+    assert result["upload_link"] is not None
+    assert result["upload_link"].startswith("https://upload.lasso.test/u/")

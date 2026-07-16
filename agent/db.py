@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS gyms (
   token_rotated_at TEXT,
   token_revoked INTEGER DEFAULT 0,
   token_status TEXT DEFAULT 'NOT_SET',
+  intake_token_encrypted TEXT,
   upload_link TEXT,
   publish_flag TEXT DEFAULT 'OFF',
   publish_creds TEXT DEFAULT 'NOT SET (by hand)',
@@ -95,6 +96,14 @@ def connect(path=None):
     for col in _POST_METRIC_COLUMNS:
         if col not in have:
             conn.execute(f"ALTER TABLE posts ADD COLUMN {col} INTEGER")
+    # additive gyms migration: intake_token_encrypted added for reversible
+    # encryption at rest (AGENT_INTAKE_ENC_KEY); existing rows stay as-is.
+    gyms_have = {r["name"] for r in conn.execute("PRAGMA table_info(gyms)")}
+    if "intake_token_encrypted" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN intake_token_encrypted TEXT")
+        except Exception:
+            pass
     return conn
 
 
@@ -223,7 +232,7 @@ def gym_upsert(account_key, display_name='', **fields):
     fields: any subset of the gyms columns except account_key and created_at."""
     allowed = {
         'display_name', 'gym_name', 'intake_token_hash', 'token_rotated_at',
-        'token_revoked', 'upload_link', 'publish_flag',
+        'token_revoked', 'intake_token_encrypted', 'upload_link', 'publish_flag',
         'publish_creds', 'publish_creds_status',
     }
     extra_cols = []

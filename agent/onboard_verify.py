@@ -22,6 +22,7 @@ import os
 from datetime import date
 
 from . import db as _db
+from .intake_tokens import token_status as _token_status
 from .trust import effective_level as _effective_level, TrustLevel
 
 
@@ -95,15 +96,24 @@ def verify_gym(account_key, db_conn=None, root="."):
     publish_flag_off = (publish_flag_val in ("OFF", "UNKNOWN"))
 
     # ---------- intake token ----------
-    # Check kv store: intake_token_<key> is set when a token has been minted.
-    # Uses kv_get which is monkeypatched in tests to use the in-memory connection.
-    kv_key = f"intake_token_{account_key}"
-    if db_conn is not None:
-        row = db_conn.execute(
-            "SELECT value FROM kv WHERE key=?", (kv_key,)).fetchone()
-        token_minted = bool(row and row[0])
+    # Check gyms table via token_status (AGENT_ONBOARD_AUTOMINT path) and fall
+    # back to the legacy kv-store key (manual set path).  The gyms-table check
+    # is authoritative when AUTOMINT is ON; the kv fallback handles gyms whose
+    # token was set by hand before automint existed.
+    # gyms-table path (AGENT_ONBOARD_AUTOMINT): authoritative when the token
+    # store is armed.  Falls back to the legacy kv key for hand-set tokens.
+    from . import config as _cfg
+    if _cfg.onboard_automint_enabled():
+        ts = _token_status(account_key, db_conn=db_conn)
+        token_minted = ts.get("status") == "ACTIVE"
     else:
-        token_minted = bool(_db.kv_get(kv_key, ""))
+        kv_key = f"intake_token_{account_key}"
+        if db_conn is not None:
+            row = db_conn.execute(
+                "SELECT value FROM kv WHERE key=?", (kv_key,)).fetchone()
+            token_minted = bool(row and row[0])
+        else:
+            token_minted = bool(_db.kv_get(kv_key, ""))
 
     # ---------- disk checks ----------
     voice_scaffolded = os.path.isfile(_voice_path(account_key, root))

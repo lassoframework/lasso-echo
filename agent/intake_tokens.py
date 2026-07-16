@@ -23,10 +23,54 @@ recorded as NOT SET (by hand) and is never touched here.
 
 import hashlib
 import hmac
+import os
 import secrets
 from datetime import datetime, timezone
 
 from . import config
+
+
+# ---- Reversible encryption helpers (AGENT_INTAKE_ENC_KEY) --------------------
+
+def _fernet_encrypt(raw_token: str) -> str | None:
+    """Encrypt raw_token with Fernet if AGENT_INTAKE_ENC_KEY is set.
+    Returns the encrypted string, or None when the key is absent (dev mode)."""
+    key_str = os.environ.get(config.INTAKE_ENC_KEY_ENV, "").strip()
+    if not key_str:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(key_str.encode()).encrypt(raw_token.encode()).decode()
+    except Exception:
+        return None
+
+
+def decrypt_token(account_key: str, db_conn=None) -> str | None:
+    """Recover the raw token for account_key via Fernet decryption.
+    Returns the raw token string, or None when the key is absent or the
+    encrypted blob is missing. Never raises."""
+    key_str = os.environ.get(config.INTAKE_ENC_KEY_ENV, "").strip()
+    if not key_str:
+        return None
+    conn, owned = _connect(db_conn)
+    try:
+        row = conn.execute(
+            "SELECT intake_token_encrypted FROM gyms WHERE account_key = ?",
+            (account_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        enc = row["intake_token_encrypted"] if hasattr(row, "__getitem__") else None
+        if not enc:
+            return None
+        try:
+            from cryptography.fernet import Fernet
+            return Fernet(key_str.encode()).decrypt(enc.encode()).decode()
+        except Exception:
+            return None
+    finally:
+        if owned:
+            conn.close()
 
 
 def _flag_check():
@@ -81,19 +125,22 @@ def mint(account_key: str, db_conn=None) -> str:
             )
         raw = secrets.token_urlsafe(32)
         token_hash = _sha256(raw)
+        enc = _fernet_encrypt(raw)  # None when AGENT_INTAKE_ENC_KEY not set
         now = _now_iso()
         conn.execute(
             """
             INSERT INTO gyms (account_key, intake_token_hash, token_rotated_at,
-                              token_revoked, publish_creds_status, updated_at)
-            VALUES (?, ?, ?, 0, 'NOT SET (by hand)', datetime('now'))
+                              token_revoked, intake_token_encrypted,
+                              publish_creds_status, updated_at)
+            VALUES (?, ?, ?, 0, ?, 'NOT SET (by hand)', datetime('now'))
             ON CONFLICT(account_key) DO UPDATE SET
                 intake_token_hash = excluded.intake_token_hash,
                 token_rotated_at = excluded.token_rotated_at,
                 token_revoked = 0,
+                intake_token_encrypted = excluded.intake_token_encrypted,
                 updated_at = datetime('now')
             """,
-            (account_key, token_hash, now)
+            (account_key, token_hash, now, enc)
         )
         conn.commit()
         # Audit: kind, subject, reason — never log the raw token or hash
@@ -125,19 +172,22 @@ def rotate(account_key: str, db_conn=None) -> str:
     try:
         raw = secrets.token_urlsafe(32)
         token_hash = _sha256(raw)
+        enc = _fernet_encrypt(raw)
         now = _now_iso()
         conn.execute(
             """
             INSERT INTO gyms (account_key, intake_token_hash, token_rotated_at,
-                              token_revoked, publish_creds_status, updated_at)
-            VALUES (?, ?, ?, 0, 'NOT SET (by hand)', datetime('now'))
+                              token_revoked, intake_token_encrypted,
+                              publish_creds_status, updated_at)
+            VALUES (?, ?, ?, 0, ?, 'NOT SET (by hand)', datetime('now'))
             ON CONFLICT(account_key) DO UPDATE SET
                 intake_token_hash = excluded.intake_token_hash,
                 token_rotated_at = excluded.token_rotated_at,
                 token_revoked = 0,
+                intake_token_encrypted = excluded.intake_token_encrypted,
                 updated_at = datetime('now')
             """,
-            (account_key, token_hash, now)
+            (account_key, token_hash, now, enc)
         )
         conn.commit()
         try:
@@ -168,11 +218,12 @@ def revoke(account_key: str, db_conn=None) -> None:
         conn.execute(
             """
             INSERT INTO gyms (account_key, intake_token_hash, token_revoked,
-                              publish_creds_status, updated_at)
-            VALUES (?, NULL, 1, 'NOT SET (by hand)', datetime('now'))
+                              intake_token_encrypted, publish_creds_status, updated_at)
+            VALUES (?, NULL, 1, NULL, 'NOT SET (by hand)', datetime('now'))
             ON CONFLICT(account_key) DO UPDATE SET
                 intake_token_hash = NULL,
                 token_revoked = 1,
+                intake_token_encrypted = NULL,
                 updated_at = datetime('now')
             """,
             (account_key,)

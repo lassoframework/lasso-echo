@@ -243,13 +243,31 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     # THE ONE HUMAN LINE: Meta token is set by Blake by hand only.
     # This function NEVER creates, reads, prints, or infers it.
 
-    # (g) Upload link -----------------------------------------------------
+    # (g) Upload link — build and persist in DB so the portal can return it
     if base_url and isinstance(result["token_minted"], str):
-        result["upload_link"] = base_url.rstrip("/") + "/u/" + result["token_minted"]
+        link = base_url.rstrip("/") + "/u/" + result["token_minted"]
+        result["upload_link"] = link
+        db.gym_upsert(account_key, upload_link=link)
+    elif base_url:
+        # Idempotent re-run or no fresh token: try to recover
+        # 1. Encrypted blob (when AGENT_INTAKE_ENC_KEY is set)
+        try:
+            from . import intake_tokens as _it
+            raw = _it.decrypt_token(account_key)
+            if raw:
+                link = base_url.rstrip("/") + "/u/" + raw
+                result["upload_link"] = link
+                db.gym_upsert(account_key, upload_link=link)
+        except Exception:
+            pass
+        # 2. Previously-stored plaintext link (fallback when no enc key)
+        if result["upload_link"] is None:
+            existing_row = db.gym_get(account_key) or {}
+            result["upload_link"] = existing_row.get("upload_link")
 
     # (h) Pending human items ---------------------------------------------
     pending = ["publish creds: NOT SET (by hand)"]
-    gym_row = db.gym_get(account_key)
+    gym_row = db.gym_get(account_key) or {}
     if not gym_row.get("slack_channel"):
         pending.append("Slack channel: NOT SET")
     if not gym_row.get("approvers"):
