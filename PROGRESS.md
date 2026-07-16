@@ -10,6 +10,76 @@ Last updated: 2026-07-16
 
 ---
 
+## Scheduler reliability fix + library audit (2026-07-16)
+
+Root cause confirmed: `now.hour == target_hour` strict equality created a 60-minute
+draw window. Any Railway redeploy after 14:59 UTC silently skipped the day's draw.
+Evidence: 164 min late (2026-07-15) and 589 min late (2026-07-16).
+
+### Shipped
+
+- **Fire condition fix**: `now.hour == target_hour` → `now.hour >= target_hour` in
+  `_daily_scheduler()`. A restart at any hour on or after the target fires today's
+  draw immediately if it has not already run.
+- **`run-daily` idempotency**: CLI reads `scheduler_state.json` before running.
+  If today's draw is already recorded, exits clean. Belt + suspenders: both the
+  in-listener loop and the cron service are safe to fire on the same day.
+- **`_next_fire()` fix**: removed `now.hour <= target_hour` condition; now returns
+  today's fire time whenever today has not run (regardless of current hour).
+- **`scheduler-status` CLI**: `python -m agent scheduler-status` — loop liveness,
+  last draw, next expected draw, cron fallback note.
+- **`docs/SCHEDULER_CRON.md`**: click-by-click runbook for the Railway cron service
+  (third service, same repo + volume, cron schedule `30 14 * * *`).
+- **Library audit** (`python -m agent library-audit --account <key>` / `--all`):
+  walks every creative in the account's library and any pending planned drafts;
+  reports MISSING (file/dir absent or pending draft references absent path) and
+  THIN (image < 10KB, video < 100KB, carousel stub < 2 slides). Hidden dirs
+  excluded (.DS_Store, .claude-flow etc). Preflight warning in `runner.py` fires
+  an ops alert when `pick_next()` returns a creative with a known issue.
+- **22 new tests** across `tests/test_scheduler_fix.py` and
+  `tests/test_library_audit.py`.
+
+### `library-audit --all` output (2026-07-16)
+
+```
+LIBRARY AUDIT -- lasso_ig  (content_library)
+  creatives found: 18
+  MISSING (0): none
+  THIN (1)
+    speed_to_lead [image]  THIN (32 bytes < 10000 minimum)
+
+LIBRARY AUDIT -- lasso_fb  (content_library)
+  creatives found: 18
+  MISSING (13)
+    lasso_v2_built_by_gym_owners   pending draft plan_lasso_fb_2026-07-17 on 2026-07-17
+    lasso_v2_b2b_five_companies    pending draft plan_lasso_fb_2026-07-18 on 2026-07-18
+    lasso_v2_platform_719_booking  pending draft plan_lasso_fb_2026-07-19 on 2026-07-19
+    lasso_v2_platform_ads_booking_bars  pending draft plan_lasso_fb_2026-07-20 on 2026-07-20
+    lasso_v2_summit_announce       pending draft plan_lasso_fb_2026-07-21 on 2026-07-21
+    lasso_v2_one_screen            pending draft plan_lasso_fb_2026-07-23 on 2026-07-23
+    lasso_v2_b2b_35k_caught        pending draft plan_lasso_fb_2026-07-24 on 2026-07-24
+    lasso_v2_platform_stuck_lasso  pending draft plan_lasso_fb_2026-07-25 on 2026-07-25
+    lasso_v2_platform_ads_stuck    pending draft plan_lasso_fb_2026-07-26 on 2026-07-26
+    lasso_v2_summit_playbook       pending draft plan_lasso_fb_2026-07-27 on 2026-07-27
+    lasso_v2_follow_up_problem     pending draft plan_lasso_fb_2026-07-28 on 2026-07-28
+    lasso_v2_b2b_speed_to_lead     pending draft plan_lasso_fb_2026-07-30 on 2026-07-30
+    lasso_v2_platform_six_engines  pending draft plan_lasso_fb_2026-07-31 on 2026-07-31
+  THIN (1)
+    speed_to_lead [image]  THIN (32 bytes < 10000 minimum)
+```
+
+**Action needed:** 13 `lasso_v2_*` creatives referenced by planned lasso_fb drafts
+(Jul 17-31) are missing from `content_library/`. Upload the `lasso_v2` assets or
+replan those days. `speed_to_lead.jpg` is a 32-byte stub — replace with the real image.
+`speed_to_lead_carousel/` (3 slides) is clean.
+
+### Grade: B+ (unchanged)
+Gate to A: one real gym completes a full 30-day month + Meta App Review cleared.
+
+---
+
+---
+
 ## Autonomous onboarding + intake-token store (2026-07-16)
 
 - T1 (Intake Token Store): gyms table, SHA-256 hashed token store, mint/rotate/revoke, tokens --list CLI. SHA: d7f93bdb643e45f24126140f3d0ddfe43ea4d1b2

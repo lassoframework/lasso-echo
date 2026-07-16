@@ -367,6 +367,15 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                                            poster=poster)
             if draft is None:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
+                if creative is not None:
+                    from .library_audit import check_creative as _check_creative
+                    _issue = _check_creative(creative)
+                    if _issue:
+                        _msg = (f"creative {creative.stem!r} for {account.key} on "
+                                f"{day_key} has an issue: {_issue}. "
+                                "Upload or replace it; drafting will attempt a fallback.")
+                        print(f"[library] {_msg}")
+                        ops_alerts.alert(_msg)
                 draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=acct_voice)
             # Record the category win for cap history (idempotent by day_key, before
             # idempotent reconcile so a same-content re-run still counts correctly).

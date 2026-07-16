@@ -215,6 +215,8 @@
         ["2026-07-16 Autonomous onboarding — T2 (Autonomous Onboard): onboard CLI, voice+brain scaffold, trust=FULL_APPROVAL, publish OFF, upload link. SHA: b9f9aa074c13b164634d1273eba313da349bd42f","done"],
         ["2026-07-16 Autonomous onboarding — T3 (Intake Web + Portal): data-store token lookup, per-token rate limit, portal /portal/gym/<key> endpoint. SHA: 4b443c25ef592097f3a52791c8e0ac28ded07927","done"],
         ["2026-07-16 Autonomous onboarding — T4 (Onboard Verify): onboard-verify CLI, READY-FOR-UPLOADS vs READY-TO-PUBLISH per gym. AGENT_ONBOARD_AUTOMINT OFF. SHA: c828d371cd4cf0cdc18795e1b66bae51d35b15cc","done"],
+        ["2026-07-16 Scheduler reliability fix: now.hour >= target_hour (was ==); run-daily CLI idempotent; _next_fire() corrected; scheduler-status CLI; docs/SCHEDULER_CRON.md Railway cron runbook. 10 new tests. 1331 green.","done"],
+        ["2026-07-16 Library audit: library-audit --account / --all; MISSING vs THIN distinction; pending-draft cross-check; runner.py preflight warning on bad creative; hidden-dir filter. 12 new tests. library-audit --all shows: lasso_ig THIN 1 (speed_to_lead 32 bytes stub), lasso_fb MISSING 13 (lasso_v2_* planned Jul 17-31 not in library) + THIN 1 (same stub). Upload lasso_v2 assets or replan those days.","done"],
     ]},
     { n:"3", short:"Productize", name:"Stage 3 — Productize ($99/mo)", meta:"The $99 Social Media SKU",
       items:[
@@ -465,7 +467,7 @@
 
     h+=`</div>`; // close grid
 
-    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-16 (T5 housekeeping: autonomous onboarding + intake-token store: T1 gyms table + SHA-256 token store + mint/rotate/revoke SHA d7f93bd, T2 onboard CLI + voice+brain scaffold + trust=FULL_APPROVAL SHA b9f9aa0, T3 data-store token lookup + per-token rate limit + portal endpoint SHA 4b443c2, T4 onboard-verify CLI + READY-FOR-UPLOADS vs READY-TO-PUBLISH + AGENT_ONBOARD_AUTOMINT OFF SHA c828d37; last merged SHA c828d371cd4cf0cdc18795e1b66bae51d35b15cc; 1309 green; readiness grade B+: code complete, not A until real gym month of posts + Meta App Review cleared for clients; AGENT_ONBOARD_AUTOMINT default OFF; all new flags default OFF; Meta publishing token never touched; every post still waits for a human Approve) &middot; this view does not save on reload</p>`;
+    h+=`<p class="foot">One master tracker &middot; tap a task to cycle to do &rarr; ready &rarr; done &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md &middot; updated 2026-07-16 (scheduler reliability fix: now.hour &gt;= target_hour; run-daily idempotent; scheduler-status CLI; SCHEDULER_CRON.md runbook; library-audit CLI: MISSING/THIN scan + pending-draft cross-check + runner preflight warning; library-audit --all shows lasso_fb MISSING 13 lasso_v2_* planned Jul 17-31 not in library + lasso_ig THIN 1 speed_to_lead stub; 22 new tests; last committed SHA pending; 1331 green; grade B+ unchanged) &middot; this view does not save on reload</p>`;
 
     root.innerHTML=h;
 

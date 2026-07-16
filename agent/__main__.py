@@ -375,10 +375,11 @@ def _config_check():
 
 _COMMANDS = {
     "daily loop": [
-        ("run-daily", "draft one post per account, card each for approval"),
+        ("run-daily", "draft one post per account, card each for approval (idempotent)"),
         ("listen", "start the Slack listener + scheduler (the deployed worker)"),
         ("dry-run", "the whole Stage 1 loop OFFLINE, no tokens"),
         ("status", "flag + gate + schedule state"),
+        ("scheduler-status", "loop liveness, last draw, next expected draw, cron note"),
         ("help", "this list"),
     ],
     "planning & calendar": [
@@ -411,6 +412,7 @@ _COMMANDS = {
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
+        ("library-audit", "scan library for MISSING/THIN creatives (--account / --all)"),
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
@@ -534,12 +536,87 @@ def _tokens_list():
         print(f"{key:<20} {st['status']:<10} {rotated}")
 
 
+def _scheduler_status():
+    """python -m agent scheduler-status
+    Prints loop liveness, last draw, next expected draw, and cron fallback note."""
+    import datetime as _dt
+    from .listener import read_scheduler_heartbeat, _read_last_run_date
+    now = _dt.datetime.now(_dt.timezone.utc)
+    target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))
+    last_run = _read_last_run_date() or "(never)"
+    hb = read_scheduler_heartbeat()
+    print("SCHEDULER STATUS")
+    print(f"  now (UTC)      : {now.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  target hour    : {target_hour:02d}:00 UTC  (AGENT_DAILY_HOUR_UTC={target_hour})")
+    print(f"  last draw      : {last_run}")
+    if hb:
+        hb_ts = hb.get("ts", "?")
+        next_f = hb.get("next_fire", "?")
+        try:
+            hb_age = now - _dt.datetime.fromisoformat(hb_ts)
+            age_str = f"{int(hb_age.total_seconds() // 60)} min ago"
+        except Exception:
+            age_str = "?"
+        print(f"  loop heartbeat : ALIVE  (last tick {age_str})")
+        print(f"  next draw      : {next_f}")
+    else:
+        print("  loop heartbeat : (none — is the listen process running?)")
+        print("  next draw      : unknown")
+    sched_on = str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+    print(f"  loop scheduler : {'ENABLED' if sched_on else 'DISABLED (AGENT_SCHEDULER_ENABLED=false)'}")
+    print("  cron fallback  : see docs/SCHEDULER_CRON.md for setup instructions")
+
+
+def _library_audit(args):
+    """python -m agent library-audit [--account <key>] [--all]
+    Walk the creative library for each account and report MISSING or THIN creatives."""
+    from .library_audit import audit_account, audit_all, format_result
+    from .accounts import active_accounts
+    from . import config
+    all_flag = "--all" in args
+    account_key = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--account" and i + 1 < len(args):
+            account_key = args[i + 1]; i += 2; continue
+        i += 1
+    if not all_flag and not account_key:
+        print("usage: python -m agent library-audit --account <key>")
+        print("       python -m agent library-audit --all")
+        return
+    if all_flag:
+        results = audit_all()
+    else:
+        acct = next((a for a in active_accounts() if a.key == account_key), None)
+        lib = (acct.library_prefix if acct else None) or config.LIBRARY_PATH
+        results = [audit_account(account_key, lib)]
+    any_issues = False
+    for r in results:
+        out = format_result(r)
+        print(out)
+        if r["missing"] or r["thin"]:
+            any_issues = True
+    if not any_issues:
+        print("All accounts: library clean.")
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
     if cmd == "run-daily":
+        from .listener import _read_last_run_date, _write_last_run_date
+        import datetime as _dt
+        _today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        if _read_last_run_date() == _today:
+            print(f"[run-daily] {_today}: draw already ran today. No-op.")
+            sys.exit(0)
         out = run_daily()
+        _write_last_run_date(_today)
         _print_run_daily(out)
+    elif cmd == "scheduler-status":
+        _scheduler_status()
+    elif cmd == "library-audit":
+        _library_audit(argv[1:])
     elif cmd == "listen":
         from .listener import run_listener
         run_listener()

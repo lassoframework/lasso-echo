@@ -114,10 +114,11 @@ LATE_DRAW_GRACE_MINUTES = 30
 
 def _next_fire(now, target_hour, last_run_date):
     """The next daily-draw fire time: today at target_hour UTC when today's draw
-    has not happened yet and the hour is still ahead (or current), else tomorrow."""
+    has not happened yet (regardless of current hour — the >= fire condition
+    ensures a late restart still fires today), else tomorrow."""
     from datetime import timedelta
     today_fire = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-    if last_run_date != now.date().isoformat() and now.hour <= target_hour:
+    if last_run_date != now.date().isoformat():
         return today_fire
     return today_fire + timedelta(days=1)
 
@@ -229,7 +230,7 @@ def _daily_scheduler(store):
             check_late_draw(now, last_run_date, target_hour)
         except Exception as e:
             print(f"[scheduler] late-draw check failed: {type(e).__name__}: {e}")
-        if now.hour == target_hour and last_run_date != today:
+        if now.hour >= target_hour and last_run_date != today:
             _fire_daily(store, today)
             last_run_date = today
             _write_last_run_date(today)
