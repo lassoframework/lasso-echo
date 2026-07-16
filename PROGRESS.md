@@ -10,6 +10,44 @@ Last updated: 2026-07-16
 
 ---
 
+## OCR model name fix + model-404 sanity check (2026-07-16)
+
+`fabrication-scan --all` on production failed every OCR read:
+"This model models/gemini-2.5-flash is no longer available to new users." The
+fail-closed rule worked (3 cards BLOCKED, 0 passthrough) so nothing fabricated
+shipped. Model-name fix only, not a design change.
+
+- **OCR_MODEL default is now `gemini-3.5-flash`** (was `gemini-2.5-flash`, which
+  Google retired for new accounts). Verified against Google's live model listing
+  as the current stable, vision-capable default flash (the target of
+  `gemini-flash-latest`). Still overridable by hand via `AGENT_OCR_MODEL`, still a
+  separate config from the image-generation model. Only the default value changed.
+- **Model-not-found sanity check (added).** `ocr_check._warn_if_model_missing`
+  posts ONE loud ops warning naming the bad model string on the model-not-found
+  family (incl. "no longer available"), then re-raises so the read fails. So this
+  class of break is loud immediately, not discovered mid-scan.
+- **Fail-closed unchanged.** A bad model name makes the read raise -> the OCR
+  attempt reports it could not run -> a card with rendered pixels is BLOCKED
+  ("could not verify rendered text against approved claims"), never a passthrough.
+  Proven by test_gate_fails_closed_when_reader_raises.
+
+### Verification note (honest)
+The live resolve call could NOT be run from the dev shell used for this fix: it
+has no API key and no `google` SDK installed (existence-checked; no key value ever
+read or printed). The model name was verified against Google's official model
+listing instead. Local `fabrication-scan --dry-run`: checked 16, clean 13, WOULD
+BLOCK 3, UNVERIFIABLE-passthrough 0 (no reader locally, so pixel-bearing cards
+fail closed, as designed). Blake: run `python -m agent fabrication-scan` on the
+container (key present) to confirm the 3 production cards (lasso_ig aee14e3b97,
+lasso_ig 67cbbbdf3e, lasso_fb ee7b182033) now resolve to CLEAN or a genuine
+stat-BLOCK rather than a model-error block.
+
+### Grade: B+ (unchanged)
+A model-name correction does not move the grade. A still needs a real gym's full
+30-day month of posts and Meta App Review cleared.
+
+---
+
 ## OCR reader wiring + fail-closed pixel gate (2026-07-16)
 
 `fabrication-scan` returned UNVERIFIABLE on every card. Root cause, from the code:

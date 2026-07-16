@@ -26,6 +26,36 @@ def _normalize(text):
     return re.sub(r"[^a-z0-9 ]+", "", (text or "").lower()).strip()
 
 
+# A misconfigured / retired OCR model must be LOUD immediately, not discovered
+# mid-scan. These markers catch the model-not-found family, incl. the exact
+# production error "This model ... is no longer available to new users."
+_MODEL_MISSING_MARKERS = ("not found", "404", "no longer available",
+                          "not available", "is not supported", "does not exist")
+_warned_ocr_models = set()  # one warning per bad model string per process
+
+
+def _warn_if_model_missing(exc, model=None):
+    """If exc looks like a model-not-found error, emit ONE loud ops warning naming
+    the bad model string and return True. Does not swallow anything: the caller
+    still re-raises so the read fails and the gate stays fail-closed."""
+    model = model or config.OCR_MODEL
+    if not any(m in str(exc).lower() for m in _MODEL_MISSING_MARKERS):
+        return False
+    if model not in _warned_ocr_models:
+        _warned_ocr_models.add(model)
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(
+                f"OCR model {model!r} is unavailable (model not found / no longer "
+                "available). The pixel fabrication gate cannot read rendered text, so "
+                "cards WITH rendered pixels will BLOCK fail-closed until AGENT_OCR_MODEL "
+                "is set to a current vision model (see docs/ENV.md). Nothing unverified "
+                "can ship; this only stops new cards from clearing.")
+        except Exception as e:
+            print(f"[ocr] model-missing warning could not post: {type(e).__name__}: {e}")
+    return True
+
+
 def _default_reader():
     """Gemini vision transcription (lazy; None when the studio is unarmed)."""
     if not config.creative_studio_enabled():
@@ -41,10 +71,16 @@ def _default_reader():
     def _read(image_bytes):
         # OCR_MODEL, NOT NANO_MODEL: the generation model returns image parts, not
         # text, so it can never transcribe. This is the vision-capable text model.
-        resp = client.models.generate_content(
-            model=config.OCR_MODEL,
-            contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                      _TRANSCRIBE_PROMPT])
+        try:
+            resp = client.models.generate_content(
+                model=config.OCR_MODEL,
+                contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                          _TRANSCRIBE_PROMPT])
+        except Exception as e:
+            # A retired / wrong model name is named loudly, then re-raised so the
+            # read fails and the gate blocks fail-closed (never a passthrough).
+            _warn_if_model_missing(e)
+            raise
         return getattr(resp, "text", "") or ""
 
     return _read

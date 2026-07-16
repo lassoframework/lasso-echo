@@ -73,9 +73,11 @@ NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
 # The *-image models (Nano Banana family: gemini-3-pro-image, gemini-3.1-flash-image)
 # GENERATE images and return image parts, not text, so they cannot transcribe text
 # back OUT of an image. OCR / autotag / the pixel fabrication gate need a
-# vision-capable TEXT model. Override with AGENT_OCR_MODEL; default is the cheapest
-# widely available multimodal text model.
-OCR_MODEL = os.environ.get("AGENT_OCR_MODEL", "gemini-2.5-flash")
+# vision-capable TEXT model. Override with AGENT_OCR_MODEL; default is the current
+# stable flash model (gemini-2.5-flash was retired for new accounts and returns 404
+# / "no longer available"; gemini-3.5-flash is the current default flash and is
+# vision-capable). Verify a replacement resolves before shipping it.
+OCR_MODEL = os.environ.get("AGENT_OCR_MODEL", "gemini-3.5-flash")
 # Image output aspect: IG/FB feed posts are 4:5 PORTRAIT (1080x1350). Tunable via env
 # so the target can change without a code edit.
 IMAGE_ASPECT = os.environ.get("AGENT_IMAGE_ASPECT", "4:5")

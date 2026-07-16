@@ -147,6 +147,52 @@ def test_ocr_model_is_not_the_generation_model():
     assert "image" not in config.OCR_MODEL  # a vision TEXT model, not a *-image gen model
 
 
+def test_ocr_default_model_is_not_the_retired_one():
+    from agent import config
+    # gemini-2.5-flash was retired for new accounts (returns 404 / no longer available)
+    assert config.OCR_MODEL != "gemini-2.5-flash"
+    assert config.OCR_MODEL == "gemini-3.5-flash"
+
+
+# ---- model-not-found sanity check (loud, fail-closed) --------------------------
+def test_warn_if_model_missing_fires_once(monkeypatch):
+    from agent import ocr_check, ops_alerts
+    ocr_check._warned_ocr_models.clear()
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: fired.append(m))
+    exc = Exception("This model models/gemini-2.5-flash is no longer available to new users.")
+    assert ocr_check._warn_if_model_missing(exc, model="gemini-2.5-flash") is True
+    assert len(fired) == 1 and "gemini-2.5-flash" in fired[0]
+    # deduped: the same bad model does not re-alert this process
+    assert ocr_check._warn_if_model_missing(exc, model="gemini-2.5-flash") is True
+    assert len(fired) == 1
+
+
+def test_warn_if_model_missing_ignores_unrelated_errors(monkeypatch):
+    from agent import ocr_check, ops_alerts
+    ocr_check._warned_ocr_models.clear()
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: fired.append(m))
+    assert ocr_check._warn_if_model_missing(Exception("rate limit exceeded")) is False
+    assert fired == []
+
+
+def test_gate_fails_closed_when_reader_raises(tmp_path, monkeypatch):
+    # a bad model name makes the read RAISE; the gate must still BLOCK fail-closed,
+    # never pass the card through.
+    monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
+
+    def _raising():
+        def _r(_b):
+            raise Exception("This model gemini-2.5-flash is no longer available to new users.")
+        return _r
+    monkeypatch.setattr(pixel_gate, "_default_reader", _raising)
+    c = _card(tmp_path, "badmodel", rendered_text=None)  # real image, reader raises
+    ok, reason = pixel_gate.gate_creative(c, require_verification=True)
+    assert ok is False
+    assert "could not verify" in reason
+
+
 def test_ocr_belt_records_read_then_gates(tmp_path, monkeypatch):
     monkeypatch.setattr(pixel_gate, "_approved_claims", lambda: APPROVED)
     monkeypatch.setattr(pixel_gate, "_default_reader",
