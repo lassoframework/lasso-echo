@@ -111,7 +111,6 @@ def handle_action(action, draft, actor_slack_id, note="",
 
     if action == "deny":
         account_key = getattr(draft, "account_key", "") or ""
-        note = kwargs.get("note", "") if kwargs else ""
         draft.status = DraftStatus.BLOCKED
         try:
             from . import tenant_brain
