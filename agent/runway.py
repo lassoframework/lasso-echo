@@ -208,10 +208,24 @@ def _ask_text(account_key):
             "member win in the member's own words with permission on record.")
 
 
+def _refill_ask(account_key):
+    """
+    A specific, friendly, branded, dash free text to send when runway is low.
+    Never invents a claim. Uses _ask_text() for the content core.
+    Returns a string with NO em dashes, en dashes, or hyphens in copy.
+    """
+    raw = _ask_text(account_key)
+    return ('Hi ' + account_key + ' team! Your content runway is getting short. '
+            + raw + ' Reply here or drop files in your upload link.')
+
+
 def daily_runway(account_key, library_path, day_key, poster=None):
     """
     The daily runway pass for one account: post the status line, and below the
     threshold send ONE debounced ops alert (at most one per 7 days per account).
+    When AGENT_RUNWAY_ALERTS is ON, also sends the dash free refill ask via
+    ops_alerts AND calls poster.post_notice with the refill ask when a poster is
+    provided. When OFF, only the ops_alerts.alert() path fires (no regression).
     Returns the line, or None while AGENT_RUNWAY_ENABLED is OFF.
     """
     if not config.runway_enabled():
@@ -224,6 +238,12 @@ def daily_runway(account_key, library_path, day_key, poster=None):
         last = db.kv_get(f"runway_alert_{account_key}", "")
         cutoff = (date.fromisoformat(day_key) - timedelta(days=7)).isoformat()
         if not last or last <= cutoff:
-            ops_alerts.alert(_ask_text(account_key))
+            if config.runway_alerts_enabled():
+                refill = _refill_ask(account_key)
+                ops_alerts.alert(refill)
+                if poster is not None:
+                    poster.post_notice(refill)
+            else:
+                ops_alerts.alert(_ask_text(account_key))
             db.kv_set(f"runway_alert_{account_key}", day_key)
     return line

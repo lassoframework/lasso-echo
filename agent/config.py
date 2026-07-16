@@ -529,6 +529,15 @@ def runway_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_RUNWAY_ENABLED", "false"))
 
 
+def runway_alerts_enabled() -> bool:
+    """
+    Separate flag for the text-back refill alert to the gym.
+    AGENT_RUNWAY_ENABLED must also be ON for alerts to fire.
+    Default OFF. Arm by hand when a gym is onboarded.
+    """
+    return _truthy(os.environ.get("AGENT_RUNWAY_ALERTS", "false"))
+
+
 def plan_month_enabled() -> bool:
     """
     Month planner switch. OFF by default. ON, plan-month fills open posting days

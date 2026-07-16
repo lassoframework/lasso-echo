@@ -76,6 +76,7 @@ def _status():
     print(f"  monthly_review : {config.monthly_review_enabled()}  (env AGENT_MONTHLY_REVIEW_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
     print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")
+    print(f"  runway_alerts  : {config.runway_alerts_enabled()}  (env AGENT_RUNWAY_ALERTS)")
     print(f"  trust_ladder   : {config.trust_ladder_enabled()}  (env AGENT_TRUST_LADDER_ENABLED)")
     print(f"  trust_dryrun   : {config.trust_dryrun_enabled()}  (env AGENT_TRUST_DRYRUN)")
     print(f"  trust_autopub  : {config.trust_autopublish_enabled()}  (env AGENT_TRUST_AUTOPUBLISH)")
@@ -874,9 +875,9 @@ def main(argv=None):
                         if key.endswith(":url"):
                             print(f"HTML report URL: {val}")
     elif cmd == "runway":
-        # READ ONLY runway math in plain lines: eligible concepts by name,
-        # exclusions with reasons, the consumption assumption, and the same
-        # days number the digest prints. No digest change, no store writes.
+        # READ ONLY. Default: glanceable card (days, color, projected zero,
+        # eligible count, rate, and alert line when below threshold).
+        # --explain: full breakdown with eligible concept names and exclusion reasons.
         account, want_explain, args = None, False, argv[1:]
         i = 0
         while i < len(args):
@@ -885,11 +886,34 @@ def main(argv=None):
             if args[i] == "--explain":
                 want_explain = True; i += 1; continue
             i += 1
-        if not account or not want_explain:
-            print("usage: python -m agent runway --account <key> --explain")
-        else:
+        if not account:
+            print("usage: python -m agent runway --account <key> [--explain]")
+        elif want_explain:
             from .runway import explain as runway_explain
             runway_explain(account)
+        else:
+            import os as _os
+            from datetime import date as _date, timedelta as _td
+            from . import config as _cfg
+            from .runway import (classify_creatives as _classify,
+                                 runway_days as _rdays, _color as _color,
+                                 _posts_per_day as _ppd, _refill_ask as _refill)
+            _lib_path = _cfg.LIBRARY_PATH
+            _threshold = int(_os.environ.get("AGENT_RUNWAY_ALERT_DAYS", "7"))
+            _days = _rdays(account, _lib_path)
+            _color_tag = _color(_days, _threshold)
+            _today = _date.today().isoformat()
+            _zero = (_date.today() + _td(days=int(_days))).isoformat()
+            _eligible, _ = _classify(account, _lib_path)
+            _rate = _ppd()
+            if not _cfg.runway_enabled():
+                print("AGENT_RUNWAY_ENABLED is OFF. Showing numbers in read-only mode.")
+            print(f"RUNWAY {account}: {_days} days")
+            print(f"Status: {_color_tag}  Projected zero: {_zero}")
+            print(f"Eligible assets: {len(_eligible)}  Posts per day: {_rate:.2f}")
+            if _days < _threshold:
+                print(f"Alert: runway low. Below {_threshold} day threshold.")
+                print(f"Ask: {_refill(account)}")
     elif cmd == "plan-month":
         # Fill open posting days from the eligible pool (AGENT_PLAN_MONTH_ENABLED).
         # --write saves pending drafts; without it the run is a dry print.
