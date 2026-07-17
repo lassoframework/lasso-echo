@@ -141,11 +141,23 @@ CONCEPTS = {
     "built_by_gym_owners": {
         "headline": "Built by gym owners, for gym owners.",
         "concept": [
-            "EYEBROW (render at top left, small letterspaced ALL CAPS, navy): OWNER'S ADVANTAGE",
-            "DECK LINE (render below headline, medium muted navy sans, one line): The system we run on ourselves first, not guesswork.",
-            "Composition: pure type only, no illustration, no diagram, no figures. "
-            "Generous negative space on the right half and upper area. "
-            "Visual weight anchored lower left. Open upper right.",
+            "VISUAL ANCHOR: a full-width NAVY color block occupying the top half to "
+            "two-thirds of the card. No illustration, no figures, no vector icons inside "
+            "this block. The block is the design. The headline reverses out of it.",
+            "EYEBROW (render inside the navy block, top left, small letterspaced ALL CAPS, "
+            "RED type): OWNER'S ADVANTAGE. This is the one red element.",
+            "HEADLINE (render inside the navy block, large bold editorial serif, "
+            "cream/white, left-aligned, tight leading, fills the block with confident "
+            "scale — magazine cover weight, not a book title page): "
+            "Built by gym owners, for gym owners.",
+            "DECK LINE (render on the cream field below the navy block, medium muted navy "
+            "sans, one line, left-aligned): The system we run on ourselves first, not "
+            "guesswork.",
+            "Lower zone: cream field below the color block. The deck line anchors it. "
+            "Breathing room is fine; a vacant lower third is not — the deck line sits "
+            "in the upper portion of the cream zone, not at the very bottom.",
+            "No other elements. No illustration, no diagram, no hairline rule, no icons. "
+            "Color block plus type is the complete design.",
         ],
         "story": True,
         "set": "brand",

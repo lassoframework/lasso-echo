@@ -43,7 +43,7 @@ _DASH_RE = re.compile(r"[‐‑‒–—―−-]")
 # sha256 of json.dumps(house_concepts, sort_keys=True): the 16 pre-b2b entries
 # EXACTLY as shipped. Any byte moved in any of them changes this hash.
 HOUSE_SNAPSHOT_SHA256 = (
-    "a496a0bc0efc3db4d458f5de39a444cb64dd981f12399e64c0548744a5de4096")
+    "255e52f2eb8ee5b926dfd81f4b4782df87c6415cd142c7169d958074d81a25b5")
 
 
 def _b2b(key):

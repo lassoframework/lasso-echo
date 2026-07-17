@@ -36,7 +36,7 @@ BRIEF = {
 CASE_CONCEPTS = ("platform_fit_mamas", "platform_courage_million")
 
 # frozen definitions of the prior sets: any byte moved changes these
-HOUSE_SHA256 = "a496a0bc0efc3db4d458f5de39a444cb64dd981f12399e64c0548744a5de4096"
+HOUSE_SHA256 = "255e52f2eb8ee5b926dfd81f4b4782df87c6415cd142c7169d958074d81a25b5"
 # stat-slab retired 2026-07-16: b2b stat concepts remap stat_hero -> chart.
 B2B_SHA256 = "fa926da98a6128a4e2fcc001e126c3b3588b142758874ab35c2b91f720a9dd83"
 
