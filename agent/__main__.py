@@ -162,11 +162,26 @@ def _post_captions(args):
     """
     import hashlib as _hashlib
     import json as _json
+    import os as _os
     from .store import PendingStore
     from .drafter import Draft, DraftStatus
     from .slack_surface import SlackPoster
 
     dry = "--dry-run" in args
+
+    def _sidecar_public_url(creative_path):
+        """Read public_url from the creative's sidecar JSON written by regen_library.
+        Returns "" if the sidecar is absent or has no public_url — never raises."""
+        stem = _os.path.splitext(creative_path)[0]
+        sidecar = stem + ".json"
+        if _os.path.exists(sidecar):
+            try:
+                with open(sidecar, "r", encoding="utf-8") as _f:
+                    data = _json.load(_f)
+                return str(data.get("public_url", "")).strip()
+            except Exception:
+                pass
+        return ""
 
     CAPTION_BUILT = (
         "Most gyms don't have a lead problem. They have a follow up problem. "
@@ -229,6 +244,11 @@ def _post_captions(args):
     print(f"post-captions: {'DRY RUN' if dry else 'LIVE'} — writing 6 feed drafts")
     for (account_key, platform, creative_path, day_key, scheduled_for, caption, hashtags) in SPECS:
         draft_id = _make_id(account_key, creative_path, scheduled_for)
+        public_url = _sidecar_public_url(creative_path)
+        if not public_url:
+            print(f"  WARN: no public_url for {creative_path.split('/')[-1]} "
+                  f"— card will show placeholder. Run regen-library on the container "
+                  f"or add public_url to its sidecar JSON.")
         draft = Draft(
             draft_id=draft_id,
             account_key=account_key,
@@ -236,7 +256,7 @@ def _post_captions(args):
             caption=caption,
             hashtags=hashtags,
             creative_path=creative_path,
-            creative_public_url="",
+            creative_public_url=public_url,
             scheduled_for=scheduled_for,
             status=DraftStatus.PENDING,
             day_key=day_key,
@@ -245,7 +265,8 @@ def _post_captions(args):
         if not dry:
             store.put(draft)
         poster.post_approval_card(draft)
-        print(f"  {'(dry) ' if dry else ''}wrote + carded: {draft_id}  {account_key}  {day_key}  {creative_path.split('/')[-1]}")
+        url_note = f" url={public_url[:60]}" if public_url else " url=(none)"
+        print(f"  {'(dry) ' if dry else ''}wrote + carded: {draft_id}  {account_key}  {day_key}  {creative_path.split('/')[-1]}{url_note}")
 
     print(f"\npost-captions: done. {len(SPECS)} drafts {'would be ' if dry else ''}in DB, "
           f"cards {'would be ' if dry else ''}posted to #echoclaude.")
