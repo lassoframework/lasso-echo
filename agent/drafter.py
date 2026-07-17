@@ -307,6 +307,22 @@ def draft_post(account, creative, scheduled_for, voice=None,
     else:
         caption, hashtags, fragments = gen.build(voice, creative)
 
+    # Caption standard (section 9): a draft with no caption text cannot enter the
+    # approval queue — the content brain or generator returned nothing usable.
+    if not caption.strip():
+        return Draft(
+            draft_id=draft_id,
+            account_key=account.key,
+            platform=account.platform,
+            caption="",
+            hashtags=[],
+            creative_path=getattr(creative, "path", ""),
+            creative_public_url="",
+            scheduled_for=scheduled_for,
+            status=DraftStatus.BLOCKED,
+            blocked_reason="Caption standard (section 9): empty caption. Voice doc or content plan returned no text.",
+        )
+
     # Per-platform variant (flag OFF -> unchanged): selection only, from the same
     # approved set. FB keeps at most 2 tags; IG keeps its existing cap of 5.
     hashtags = variant_hashtags(account.platform, hashtags)

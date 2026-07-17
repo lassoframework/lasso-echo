@@ -1,7 +1,7 @@
 """
 House-style six-question grade gate.
 
-Source of truth: brand_voice/lasso_house_style.md section 9.
+Source of truth: brand_voice/lasso_house_style.md section 10.
 
 A card passes when it answers YES to five or more of the six questions.
 A card that fails is regenerated once by the caller (creative_studio.generate).

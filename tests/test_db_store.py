@@ -117,3 +117,34 @@ def test_rotation_window_through_sqlite(tmp_path, monkeypatch):
     rotation.record_served("lasso_ig", "lasso_p1_a.jpg", "p1", "2026-07-02")
     kind, creative = rotation.choose("lasso_ig", "2026-07-03", str(lib))
     assert os.path.basename(creative.path) == "lasso_p2_b.jpg"   # window holds
+
+
+# ---- caption newline round-trip (section 9 caption standard) ----------------
+def test_caption_newline_round_trip_through_store(tmp_path):
+    """Mixed single and double newlines must survive a store put + get unchanged.
+    Section 9 of lasso_house_style.md: paragraphs are separated by blank lines
+    (double newline); CTA pair lines use a single newline."""
+    caption = (
+        "Most gyms don't have a lead problem. They have a follow up problem.\n"
+        "\n"
+        "That is our job, not yours.\n"
+        "\n"
+        "We built LASSO by running it on ourselves first.\n"
+        "\n"
+        "Your only job is signing people up.\n"
+        "Book a walkthrough and see what done for you actually looks like."
+    )
+    d = Draft(draft_id="nl1", account_key="lasso_ig", platform="instagram",
+              caption=caption, hashtags=["#GymOwner"],
+              creative_path="content_library/lasso_v2_built_by_gym_owners.png",
+              creative_public_url="", scheduled_for="2026-07-17T12:00:00",
+              status=DraftStatus.PENDING, day_key="2026-07-17", draft_type="feed")
+    store = PendingStore(str(tmp_path / "nl_test.db"))
+    store.put(d)
+    got = store.get("nl1")
+    assert got is not None
+    assert got.caption == caption, (
+        f"Newline structure changed in round-trip.\n"
+        f"Expected repr: {repr(caption)}\n"
+        f"Got repr:      {repr(got.caption)}"
+    )

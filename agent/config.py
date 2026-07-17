@@ -165,7 +165,7 @@ def style_gate_enabled() -> bool:
     """
     House-style six-question grade gate switch. OFF by default. When ON, every
     generated card is scored against the six questions in lasso_house_style.md
-    section 9 before entering the approval queue. A card failing two or more
+    section 10 before entering the approval queue. A card failing two or more
     questions is regenerated once; if it still fails, ops_alert fires with named
     failing questions and the card is withheld from the queue. This is ADDITIVE
     to the fabrication gate: both must pass. OFF = generation behavior unchanged.

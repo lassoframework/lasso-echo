@@ -205,7 +205,7 @@ def _run_daily(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_ENABLED", "true")
     monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)  # draft only
     voice = tmp_path / "voice.md"
-    voice.write_text("We help gym owners grow.\n\n## CTAs\n- Save this post.\n\n"
+    voice.write_text("We help gym owners grow.\n\n### CTA rotation\n- Save this post.\n\n"
                      "## Hashtags\n#LASSOFramework", encoding="utf-8")
     lib = tmp_path / "lib"
     lib.mkdir(exist_ok=True)

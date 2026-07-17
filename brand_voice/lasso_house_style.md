@@ -171,7 +171,35 @@ ILLUSTRATED ELEMENT: [ARCHETYPE BLOCK from the archetype system in creative_stud
 
 ---
 
-## 9. Six-Question Grade Gate
+## 9. Caption Standard
+
+Captions are B2B StoryBrand. Every caption follows this beat order:
+
+1. **Problem** — one punchy sentence the gym owner feels immediately.
+2. **Why it persists** — one sentence naming the cause (not the owner's fault).
+3. **Solution** — LASSO as the mechanism that removes the problem.
+4. **CTA tucked at the end** — two short lines, single-newline between them.
+   The CTA is never loud. It earns the click.
+
+**Paragraph rhythm:**
+- Each beat is its own paragraph, separated by a blank line (double newline `\n\n`).
+- The CTA pair is two lines separated by a single newline `\n` — they belong together
+  and must never be split by a blank line.
+- Four paragraphs is the target. Three is acceptable. Five is too many.
+
+**Hard copy rules (same as Section 4, enforced here for captions):**
+- No em dashes, en dashes, or hyphens.
+- Never the word "vendor."
+- No stats or claim without an approved receipt in the source doc.
+- Plainspoken. "You can lift conversions up to 80 percent" — not "80% uplift."
+
+**Empty caption = BLOCKED.** A draft with no caption text cannot enter the approval
+queue. The drafter returns status=BLOCKED if the generated caption is empty after
+stripping whitespace. Source: `agent/drafter.py` (`draft_post`).
+
+---
+
+## 10. Six-Question Grade Gate
 
 A card passes when it answers YES to five or more of the six questions.
 A card that fails (YES to fewer than five) is regenerated once automatically.
@@ -210,7 +238,7 @@ heuristic (anchor keyword scan), confirmed by vision model.
 
 ---
 
-## 10. What This System Replaces
+## 11. What This System Replaces
 
 The following patterns are RETIRED. No new prompt may use them:
 

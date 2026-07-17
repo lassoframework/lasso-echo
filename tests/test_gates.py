@@ -253,3 +253,16 @@ def test_store_roundtrip_and_no_token(tmp_path):
     assert b"token" not in body.lower()
     assert s.remove(d.draft_id) is True
     assert s.get(d.draft_id) is None
+
+
+# ---- GATE: empty caption is blocked (caption standard, section 9) -----------
+def test_empty_caption_is_blocked():
+    """A voice doc with no CTAs + a creative with no client note produces an empty
+    caption. The drafter must return BLOCKED (section 9) not a PENDING empty-caption
+    draft that would surface as a blank Slack card."""
+    voice = VoiceDoc(raw="LASSO helps gym owners grow.", hashtags=[], ctas=[])
+    draft = draft_post(_acct(), _creative(note=""), "2026-07-17T12:00:00Z", voice=voice)
+    assert draft.status == DraftStatus.BLOCKED, (
+        f"Expected BLOCKED for empty caption, got {draft.status}")
+    assert "empty caption" in draft.blocked_reason.lower(), (
+        f"blocked_reason should name the empty-caption cause: {draft.blocked_reason!r}")
