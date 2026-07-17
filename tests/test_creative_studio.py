@@ -277,3 +277,102 @@ def test_validate_models_skips_when_flag_off(monkeypatch, capsys):
     monkeypatch.setenv("AGENT_NANO_API_KEY", "fake-key")
     creative_studio.validate_generation_models()
     assert capsys.readouterr().out == ""
+
+
+# ---- Option B: vision check on generated image output -------------------------
+
+class _VisionAllYes:
+    def ask_image(self, image_bytes, question):
+        return "YES"
+
+
+class _VisionAllNo:
+    def ask_image(self, image_bytes, question):
+        return "NO"
+
+
+class _VisionPassOnAttempt:
+    """Fails first N-1 calls then passes on call N."""
+    def __init__(self, pass_on=2):
+        self.calls = 0
+        self.pass_on = pass_on
+
+    def ask_image(self, image_bytes, question):
+        self.calls += 1
+        # Each round calls ask_image 3 times (Q1, Q2, Q5); round number = ceil(calls/3)
+        round_num = (self.calls + 2) // 3
+        return "YES" if round_num >= self.pass_on else "NO"
+
+
+def test_image_grade_passes_on_first_attempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_IMAGE_GRADE_ENABLED", "true")
+    fake = _FakeClient()
+    out = tmp_path / "img.png"
+
+    monkeypatch.setattr(creative_studio, "_default_vision_client",
+                        lambda: _VisionAllYes())
+
+    res = creative_studio.generate(
+        "Speed to lead wins", ["Leads answered in 5 min close 3x more"],
+        client=fake, out_path=str(out))
+    assert res is not None
+    assert fake.calls == 1      # only one generation attempt needed
+    assert out.exists()
+
+
+def test_image_grade_retries_and_passes_on_second_attempt(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_IMAGE_GRADE_ENABLED", "true")
+    fake = _FakeClient()
+    out = tmp_path / "retry.png"
+
+    monkeypatch.setattr(creative_studio, "_default_vision_client",
+                        lambda: _VisionPassOnAttempt(pass_on=2))
+
+    res = creative_studio.generate(
+        "Speed to lead wins", ["A real fact"],
+        client=fake, out_path=str(out))
+    assert res is not None
+    assert fake.calls == 2      # failed once, passed on second
+    assert out.exists()
+
+
+def test_image_grade_withholds_card_after_max_attempts(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_IMAGE_GRADE_ENABLED", "true")
+    fake = _FakeClient()
+    out = tmp_path / "fail.png"
+    alerts = []
+
+    monkeypatch.setattr(creative_studio, "_default_vision_client",
+                        lambda: _VisionAllNo())
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg, **kw: alerts.append(msg))
+
+    res = creative_studio.generate(
+        "Speed to lead wins", ["A real fact"],
+        client=fake, out_path=str(out))
+    assert res is None
+    assert fake.calls == 3          # 3 attempts (MAX_ATTEMPTS)
+    assert not out.exists()
+    assert len(alerts) == 1
+    assert "grade gate" in alerts[0]
+
+
+def test_image_grade_flag_off_skips_vision_check(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.delenv("AGENT_IMAGE_GRADE_ENABLED", raising=False)
+    fake = _FakeClient()
+    out = tmp_path / "nochk.png"
+
+    # Patch _default_vision_client to explode — it must NOT be called when flag off
+    def _explode():
+        raise AssertionError("vision client built while flag is OFF")
+
+    monkeypatch.setattr(creative_studio, "_default_vision_client", _explode)
+
+    res = creative_studio.generate(
+        "Speed to lead wins", ["A real fact"],
+        client=fake, out_path=str(out))
+    assert res is not None          # no vision gate, completes normally
+    assert fake.calls == 1

@@ -97,6 +97,55 @@ def _vision_questions(prompt_text: str, vision_client=None) -> dict:
     return results
 
 
+def _vision_image_questions(image_bytes: bytes, vision_client) -> dict:
+    """Q1, Q2, Q5: vision checks on the ACTUAL generated image bytes.
+    vision_client must implement ask_image(image_bytes, question) -> str.
+    Returns True/False/None per key (None on exception)."""
+    questions = {
+        "Q1": ("Is every text element (eyebrow, headline, deck) left-aligned, "
+               "with nothing centered or symmetric? Answer YES or NO only."),
+        "Q2": ("Is there visible typographic scale contrast between the eyebrow "
+               "(small), headline (large), and deck (medium)? Answer YES or NO only."),
+        "Q5": ("Can the headline be read clearly at 100px wide? Thin type, low "
+               "contrast, or clutter around the headline FAILS. Answer YES or NO only."),
+    }
+    results = {}
+    for key, question in questions.items():
+        try:
+            answer = vision_client.ask_image(image_bytes, question)
+            results[key] = "yes" in str(answer or "").lower()
+        except Exception:
+            results[key] = None
+    return results
+
+
+def grade_image(image_bytes: bytes, headline: str = "",
+                vision_client=None) -> GradeResult:
+    """
+    Check Q1, Q2, Q5 on the ACTUAL generated image bytes via a vision model.
+    Q3, Q4, Q6 are not re-checked here — they are prompt-level checks in grade_card.
+
+    When vision_client is None all three return None (treated as passing) so the
+    image gate never blocks a card solely because the vision client is unavailable.
+    """
+    if vision_client is None:
+        scores = {"Q1": None, "Q2": None, "Q3": True, "Q4": True, "Q5": None, "Q6": True}
+        return GradeResult(scores=scores, passed=True, failed_questions=[])
+
+    vision = _vision_image_questions(image_bytes, vision_client)
+    scores = {
+        "Q1": vision.get("Q1"),
+        "Q2": vision.get("Q2"),
+        "Q3": True,
+        "Q4": True,
+        "Q5": vision.get("Q5"),
+        "Q6": True,
+    }
+    failed = [k for k, v in scores.items() if v is False]
+    passed = len(failed) <= (6 - PASS_THRESHOLD)  # pass if ≤1 hard False
+    return GradeResult(scores=scores, passed=passed, failed_questions=failed)
+
+
 def grade_card(prompt_text: str, headline: str = "",
                vision_client=None) -> GradeResult:
     """

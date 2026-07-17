@@ -561,6 +561,19 @@ def spend_cap_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SPEND_CAP_ENABLED", "false"))
 
 
+def image_grade_enabled() -> bool:
+    """
+    Vision check on the actual generated image. OFF by default. ON, after Gemini
+    generates an image a second vision call checks Q1 (left-aligned), Q2 (scale
+    contrast), and Q5 (thumbnail legible) against the actual output pixels; if any
+    fail the card is regenerated up to two more times before an ops alert fires and
+    the card is withheld. Uses OCR_MODEL (the same vision-capable text model as the
+    OCR check). Independent of AGENT_STYLE_GATE_ENABLED: both gates can run in the
+    same attempt loop, or either can run alone.
+    """
+    return _truthy(os.environ.get("AGENT_IMAGE_GRADE_ENABLED", "false"))
+
+
 def runway_enabled() -> bool:
     """
     Creative runway switch. OFF by default. ON, one line per account per day:

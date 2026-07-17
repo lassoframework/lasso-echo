@@ -15,6 +15,7 @@ from agent.grade_gate import (  # noqa: E402
     _q4_no_banned_copy,
     _q6_feed_stopping_heuristic,
     grade_card,
+    grade_image,
 )
 
 
@@ -212,3 +213,97 @@ def test_grade_card_two_fails_including_q6():
 
 def test_pass_threshold_constant():
     assert PASS_THRESHOLD == 5
+
+
+# ---- grade_image: vision check on actual image bytes --------------------------
+
+class _AlwaysYesVisionClient:
+    def ask_image(self, image_bytes, question):
+        return "YES"
+
+
+class _AlwaysNoVisionClient:
+    def ask_image(self, image_bytes, question):
+        return "NO"
+
+
+class _Q1FailVisionClient:
+    """Q1 returns NO (centered), Q2 and Q5 return YES."""
+    def ask_image(self, image_bytes, question):
+        if "left-aligned" in question:
+            return "NO"
+        return "YES"
+
+
+class _TwoFailVisionClient:
+    """Q1 and Q5 return NO, Q2 returns YES."""
+    def ask_image(self, image_bytes, question):
+        if "left-aligned" in question or "100px wide" in question:
+            return "NO"
+        return "YES"
+
+
+_FAKE_PNG = b"\x89PNG\r\n\x1a\nFAKE"
+
+
+def test_grade_image_none_client_passes():
+    result = grade_image(_FAKE_PNG, headline="Speed to lead wins", vision_client=None)
+    assert result.passed is True
+    assert result.failed_questions == []
+    assert result.scores["Q1"] is None
+    assert result.scores["Q5"] is None
+    # Q3/Q4/Q6 are assumed True by grade_image (checked at prompt level)
+    assert result.scores["Q3"] is True
+
+
+def test_grade_image_all_yes_passes():
+    result = grade_image(_FAKE_PNG, headline="Speed to lead wins",
+                         vision_client=_AlwaysYesVisionClient())
+    assert result.passed is True
+    assert result.scores["Q1"] is True
+    assert result.scores["Q2"] is True
+    assert result.scores["Q5"] is True
+    assert result.failed_questions == []
+
+
+def test_grade_image_all_no_fails():
+    result = grade_image(_FAKE_PNG, headline="Speed to lead wins",
+                         vision_client=_AlwaysNoVisionClient())
+    # Q1, Q2, Q5 all False -> 3 hard fails -> passes=False
+    assert result.passed is False
+    assert "Q1" in result.failed_questions
+    assert "Q2" in result.failed_questions
+    assert "Q5" in result.failed_questions
+
+
+def test_grade_image_one_fail_still_passes():
+    # ≤1 hard False -> passes (same threshold as grade_card)
+    result = grade_image(_FAKE_PNG, headline="Speed to lead wins",
+                         vision_client=_Q1FailVisionClient())
+    assert result.scores["Q1"] is False
+    assert result.scores["Q2"] is True
+    assert result.scores["Q5"] is True
+    assert result.passed is True   # 1 fail allowed
+    assert result.failed_questions == ["Q1"]
+
+
+def test_grade_image_two_fails_fails():
+    result = grade_image(_FAKE_PNG, headline="Speed to lead wins",
+                         vision_client=_TwoFailVisionClient())
+    assert result.passed is False
+    assert "Q1" in result.failed_questions
+    assert "Q5" in result.failed_questions
+    assert "Q2" not in result.failed_questions
+
+
+def test_grade_image_exception_in_ask_returns_none_not_false():
+    class _ExplodingClient:
+        def ask_image(self, image_bytes, question):
+            raise RuntimeError("network error")
+
+    result = grade_image(_FAKE_PNG, headline="h", vision_client=_ExplodingClient())
+    # Exceptions must map to None (skip), not False (fail)
+    assert result.scores["Q1"] is None
+    assert result.scores["Q2"] is None
+    assert result.scores["Q5"] is None
+    assert result.passed is True  # no hard False -> passes

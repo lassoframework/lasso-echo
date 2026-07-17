@@ -698,6 +698,56 @@ def _default_client():
     return _GeminiImageClient(key)
 
 
+class _GeminiVisionClient:
+    """
+    Thin vision-model wrapper for checking actual image output (not generation).
+    Uses OCR_MODEL (gemini-3.5-flash or override) — a text-returning vision model,
+    NOT the image-generation model. Key is never logged or returned.
+    """
+
+    def __init__(self, api_key, model, genai_client=None):
+        self._api_key = api_key
+        self._model = model
+        self._genai_client = genai_client   # injection seam for tests
+
+    def ask_image(self, image_bytes: bytes, question: str) -> str:
+        """Send image_bytes + question to the vision model; return the text answer."""
+        client = self._genai_client
+        if client is None:
+            from google import genai as _genai  # type: ignore
+            client = _genai.Client(api_key=self._api_key)
+
+        try:
+            from google.genai import types as _types
+            image_part = _types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+            contents = [image_part, question]
+        except (ImportError, AttributeError):
+            # SDK not installed or older API: fall back to text-only (question alone)
+            contents = question
+
+        resp = client.models.generate_content(model=self._model, contents=contents)
+        parts = getattr(resp, "parts", None) or resp.candidates[0].content.parts
+        for part in parts:
+            text = getattr(part, "text", None)
+            if text:
+                return text
+        return ""
+
+
+def _default_vision_client():
+    """
+    Build the vision client for image-grade checks. Same key as the generation
+    client; uses OCR_MODEL (vision-capable text model). Returns None when the
+    flag is off, the key is absent, or generation is disabled.
+    """
+    if not config.creative_studio_enabled():
+        return None
+    key = os.environ.get(config.NANO_API_KEY_ENV)
+    if not key:
+        return None
+    return _GeminiVisionClient(key, config.OCR_MODEL)
+
+
 def validate_generation_models():
     """
     Startup check: verify NANO_MODEL and NANO_MODEL_FLASH exist in the live Gemini
@@ -821,25 +871,39 @@ def generate(headline, facts, client=None, out_path=None,
 
     image_bytes = _do_generate(prompt)
 
-    if config.style_gate_enabled():
+    if config.style_gate_enabled() or config.image_grade_enabled():
         from . import grade_gate as _gg
-        result1 = _gg.grade_card(prompt, headline=headline or "")
-        if not result1.passed:
-            print(f"[creative-studio] grade gate failed (attempt 1): "
-                  f"{result1.failed_questions} — regenerating")
+        _vision = _default_vision_client() if config.image_grade_enabled() else None
+        _MAX_ATTEMPTS = 3
+        _attempt = 1
+        while True:
+            failed_qs = []
+            if config.style_gate_enabled():
+                pg = _gg.grade_card(prompt, headline=headline or "")
+                failed_qs.extend(pg.failed_questions)
+            if config.image_grade_enabled() and _vision is not None:
+                ig = _gg.grade_image(image_bytes, headline=headline or "",
+                                     vision_client=_vision)
+                for q in ig.failed_questions:
+                    if q not in failed_qs:
+                        failed_qs.append(q)
+            if not failed_qs:
+                break
+            print(f"[creative-studio] grade failed (attempt {_attempt}): "
+                  f"{failed_qs} — retrying")
+            if _attempt >= _MAX_ATTEMPTS:
+                from . import ops_alerts as _ops
+                _ops.alert(
+                    f"house-style fail: {headline or '(no headline)'} failed "
+                    f"grade gate {_MAX_ATTEMPTS} times. "
+                    f"Questions: {', '.join(sorted(set(failed_qs)))}. Card withheld."
+                )
+                return None
+            _attempt += 1
             prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                                   surface=surface, archetype=archetype, palette=palette,
                                   canvas=canvas, layout=layout)
             image_bytes = _do_generate(prompt)
-            result2 = _gg.grade_card(prompt, headline=headline or "")
-            if not result2.passed:
-                from . import ops_alerts as _ops
-                qs = ", ".join(result2.failed_questions)
-                _ops.alert(
-                    f"house-style fail: {headline or '(no headline)'} failed "
-                    f"grade gate twice. Questions: {qs}. Card withheld."
-                )
-                return None
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"
