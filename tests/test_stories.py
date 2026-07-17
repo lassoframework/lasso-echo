@@ -226,6 +226,13 @@ def test_runner_flag_off_no_story_cards(monkeypatch, tmp_path):
 
 def test_runner_flag_on_one_story_card_per_account(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    # Stories require a public URL. Provide one via the creative sidecar so the
+    # feed draft carries it and build_story_draft can create the story draft.
+    lib = tmp_path / "lib"
+    lib.mkdir(exist_ok=True)
+    (lib / "asset.json").write_text(
+        '{"public_url": "https://cdn.test/asset.png"}', encoding="utf-8"
+    )
     out, poster, store = _run_daily(tmp_path, monkeypatch)
     story_cards = [d for d in poster.cards if getattr(d, "is_story", False)]
     assert len(story_cards) == 1                     # one account -> one Story
@@ -266,3 +273,53 @@ def test_story_publish_endpoint_shape_when_both_armed(monkeypatch):
     assert data.get("media_type") == "STORIES"
     assert "caption" not in data                     # a Story carries no caption
     assert http.calls[1][0].endswith("/1789/media_publish")
+
+
+# ---- 8. no public URL: block + alert; fallback hosting: story created ----------
+
+class _AlertCapture:
+    def __init__(self):
+        self.messages = []
+
+    def alert(self, msg, **_):
+        self.messages.append(msg)
+        return None
+
+
+def test_story_no_url_blocks_draft_and_fires_alert(monkeypatch):
+    """Library creative with no public URL and hosting off: story is blocked and
+    ops_alert fires with a named reason instead of failing silently at publish."""
+    monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)
+    # Library creative: path does not start with 'nano_' so not a studio creative,
+    # and feed draft has no public URL set.
+    fd = _feed_draft(creative_path="library_asset.png", creative_public_url="",
+                     source_fragments=[])
+    capturer = _AlertCapture()
+    import agent.stories as _stories
+    monkeypatch.setattr(_stories.ops_alerts, "alert", capturer.alert)
+    result = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
+    assert result is None, "story draft must be blocked when no public URL"
+    assert any("blocked" in m for m in capturer.messages), \
+        f"expected 'blocked' in alert messages, got: {capturer.messages}"
+    assert any(DAY in m for m in capturer.messages), \
+        "alert must name the day so ops can identify the draft"
+
+
+def test_story_fallback_hosting_provides_url(monkeypatch):
+    """When feed draft has no URL but hosting succeeds, story draft is created
+    with the hosted URL instead of being blocked."""
+    monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)
+    import agent.stories as _stories
+    monkeypatch.setattr(
+        _stories.media_host, "host_media",
+        lambda path, tenant, client=None: "https://cdn.test/hosted.png",
+    )
+    fd = _feed_draft(creative_path="library_asset.png", creative_public_url="",
+                     source_fragments=[])
+    story = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
+    assert story is not None, "story must be created when fallback hosting succeeds"
+    assert story.creative_public_url == "https://cdn.test/hosted.png"
+    assert story.is_story is True
+    assert story.status == DraftStatus.PENDING

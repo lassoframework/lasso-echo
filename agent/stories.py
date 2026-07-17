@@ -101,6 +101,24 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                     f"(studio dark or Gemini unavailable); reusing feed image."
                 )
 
+    # Fallback hosting for library creatives: if the feed sidecar had no URL
+    # and hosting is on, try uploading now.  Stories need a public URL; unlike
+    # feed posts there is no text-only fallback at publish time.
+    if not creative_public_url and creative_path:
+        hosted = media_host.host_media(creative_path, account.key, client=s3_client)
+        if hosted:
+            creative_public_url = hosted
+
+    # Hard block: a story without a public URL always raises PublishError inside
+    # the approval handler silently.  Surface the failure here instead.
+    if not creative_public_url:
+        ops_alerts.alert(
+            f"story draft blocked for {account.key} on {day_key}: "
+            f"no public URL for {os.path.basename(creative_path or '(no path)')}. "
+            f"Enable AGENT_HOSTING_ENABLED or add public_url to the creative sidecar."
+        )
+        return None
+
     return _story_draft(account, day_key, draft_id, feed_draft,
                         creative_path, creative_public_url, fragments)
 
