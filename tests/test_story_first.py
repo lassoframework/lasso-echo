@@ -49,6 +49,8 @@ def test_story_requirement_rides_story_surface_too():
 # ---- every concept context is a tension/resolution micro story ------------------
 def test_every_concept_context_has_tension_and_resolution():
     for key, spec in regen_library.CONCEPTS.items():
+        if spec.get("archetype") == "editorial":
+            continue  # editorial is type-led; no illustration tension/resolution
         lines = spec["concept"]
         assert any(l.startswith("Tension:") for l in lines), key
         assert any(l.startswith("Resolution:") for l in lines), key

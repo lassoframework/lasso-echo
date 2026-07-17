@@ -10,6 +10,46 @@ Last updated: 2026-07-17
 
 ---
 
+## built_by_gym_owners editorial archetype + library gap partial fix (2026-07-17)
+
+### What shipped
+
+**`agent/creative_studio.py`** — added `"editorial"` to `ARCHETYPES` dict.
+Type-led card: no illustration, eyebrow + oversized headline + deck, negative
+space as designed element, optional single hairline or dumbbell motif, red once
+or not at all. Does NOT appear in `ARCHETYPE_ORDER` (regen-only archetype).
+
+**`agent/regen_library.py`** — `built_by_gym_owners` concept rebuilt:
+- Archetype changed: `flow` → `editorial`
+- Concept lines now specify eyebrow "OWNER'S ADVANTAGE" + deck line for rendering
+- Clip-art two-figures-with-gears illustration REMOVED entirely
+
+**`brand_voice/lasso_house_style.md`** — added section 4 "Layout Archetypes"
+documenting the six archetypes (editorial opener + five illustration archetypes).
+
+**`content_library/speed_to_lead.jpg`** deleted — 32-byte corrupt stub, no
+pending drafts referenced it. Clears THIN warning on both accounts.
+
+**lasso_fb plan drafts unblocked**:
+- Jul 22 (speed_to_lead_carousel) + Jul 29 (summit): status reset from blocked
+  back to pending. Blocks were OCR fail-close (no reader locally), NOT stat
+  violations. All stats in both creatives are in `02_verified_stats.md`.
+
+**Tests** — 1385 green. Updated snapshots in 4 test files:
+- `test_archetypes.py`: `built_by_gym_owners` expected archetype → "editorial"
+- `test_b2b_concepts.py` + `test_platform_concepts.py` + `test_platform_ads_concepts.py`:
+  HOUSE_SHA256 updated to reflect new concept spec
+- `test_story_first.py`: editorial archetype exempt from tension/resolution check
+
+### Action required on Railway
+
+1. Run `regen-library --only built_by_gym_owners` FIRST (new editorial spec).
+2. Then `regen-library --set all` to generate the 13 missing lasso_v2_* files.
+3. Both commands: `/opt/venv/bin/python -m agent regen-library --only built_by_gym_owners`
+   then `/opt/venv/bin/python -m agent regen-library --set all`
+
+---
+
 ## House style system wired into creative pipeline (2026-07-17)
 
 ### What shipped (suite 1385 green)
@@ -86,11 +126,17 @@ Tests added: `test_story_no_url_blocks_draft_and_fires_alert`,
 `test_story_fallback_hosting_provides_url`. Runner test updated to add a
 sidecar URL to the test asset.
 
-### Remaining action required by Blake (unchanged from prior session)
+### Remaining action required by Blake
 
-- **lasso_fb Jul 17-31**: 13 `lasso_v2_*` creatives still MISSING. Choose:
-  1. `python -m agent regen-library --set all` (NANO must be armed), OR
-  2. `python -m agent plan-month ... --replan --write` (PLAN_MONTH flag).
+- **lasso_fb Jul 17-31**: 13 `lasso_v2_*` creatives MISSING. Run on Railway:
+  `/opt/venv/bin/python -m agent regen-library --set all`
+  (requires `AGENT_NANO_ENABLED=true` + `GEMINI_API_KEY`). Once files exist,
+  the 13 pending plan drafts (Jul 17-21, 23-28, 30-31) unblock automatically.
+  Jul 22 (speed_to_lead_carousel) and Jul 29 (summit) are now unblocked —
+  they were fail-closed by local OCR absence, stats are approved.
+  Note: `built_by_gym_owners` MUST be regenerated FIRST (editorial archetype,
+  type-led card, new spec) — see below.
+- **speed_to_lead.jpg**: 32-byte stub deleted (no drafts referenced it).
 - **Public URLs**: all library creatives need either (a) `AGENT_HOSTING_ENABLED`
   armed with R2 credentials so the agent uploads on draft creation, OR (b) a
   `public_url` field in each creative's `.json` sidecar. Without one of these,

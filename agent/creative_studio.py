@@ -155,6 +155,27 @@ ARCHETYPES = {
         "accent above or below it. No diagram. Label density zero; the single red "
         "accent is one emphasized word in the headline or the small icon, never both."
     ),
+    "editorial": (
+        "Archetype EDITORIAL (type-led opener): the card is carried by TYPOGRAPHY "
+        "alone. No illustration, no diagram, no figures, no decorative icons. "
+        "Structure (three levels, all left-aligned and left-anchored): "
+        "1. EYEBROW: the small ALL CAPS letterspaced label at the very top left, navy "
+        "rendered on the image at that position. "
+        "2. HEADLINE: large, bold, high-contrast editorial serif, left-aligned with "
+        "tight leading, navy. This is the hero moment. Give it room. "
+        "3. DECK: one medium-weight muted navy sans-serif line directly below the "
+        "headline, rendered on the image. "
+        "EXCEPTION: for this archetype, the eyebrow label and deck line specified "
+        "in the concept context ARE rendered on the image at the positions described "
+        "above. "
+        "Composition: generous negative space dominant, weighted lower-left, open "
+        "upper-right. The white space is a designed element. "
+        "Optional motif: at most ONE tiny restrained element — a single thin hairline "
+        "rule below the eyebrow, OR a very small dumbbell line-icon at the body type's "
+        "line weight. Never both. Red used at most once: if used, apply to a single "
+        "word in the headline or the hairline rule only, never two red elements. "
+        "When in doubt: no motif, stronger type wins."
+    ),
 }
 
 # Story requirement (Blake's stranger test, applied to EVERY concept and EVERY

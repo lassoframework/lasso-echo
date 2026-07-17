@@ -57,11 +57,34 @@ These rules apply to every card, every surface, every model:
 
 ---
 
+## 4. Layout Archetypes
+
+Six archetypes are registered in `creative_studio.ARCHETYPES`. Five are
+illustration-based; one is type-led.
+
+**Archetype 1 — EDITORIAL (type-led opener)**
+The card is carried by typography alone. No illustration, no diagram, no figures.
+Three levels, all left-aligned:
+- Eyebrow: small ALL CAPS letterspaced label, navy, top left
+- Headline: large bold high-contrast editorial serif, left-aligned, tight leading
+- Deck: one medium-weight muted navy sans line below the headline
+
+Composition: generous negative space dominant, weighted lower-left, open
+upper-right. Optional motif: at most ONE tiny element (thin hairline rule below
+eyebrow, or a very small dumbbell line-icon at body type's line weight — never
+both). Red at most once, or not at all. When in doubt: no motif, stronger type.
+
+**Archetypes 2-6 — FLOW, SPLIT, HERO, PATH, HEADLINE**
+Illustration-based archetypes. See `creative_studio.ARCHETYPES` for their
+detailed composition rules.
+
+---
+
 ## 5. What Varies Per Card
 
 - CANVAS: cream (light, default) or navy (dark, cinematic) dominant field
 - LAYOUT: one of eight layout tokens (framework, contrast, checklist, poster,
-  chart, diagram, device, and the five archetypes)
+  chart, diagram, device, and the six archetypes)
 - SUBJECT: the concrete illustrated scene (varies by content pillar)
 
 Canvas and layout are set per-card from the variant system. Subject comes from

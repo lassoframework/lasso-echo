@@ -63,7 +63,7 @@ def test_default_prompt_is_flow_unchanged():
 # ---- 2. the regen assignment map -------------------------------------------------
 def test_assignment_map_honored_no_archetype_more_than_twice():
     expected = {
-        "built_by_gym_owners": "flow", "one_screen": "hero",
+        "built_by_gym_owners": "editorial", "one_screen": "hero",
         "three_step_path": "path", "follow_up_problem": "split",
         "posting_cadence": "split", "speed_to_lead_concept": "hero",
         "system_runs_itself": "flow", "coach_in_your_corner": "headline",

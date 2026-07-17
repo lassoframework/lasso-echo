@@ -140,11 +140,16 @@ def _print_summary(out_dir, results):
 CONCEPTS = {
     "built_by_gym_owners": {
         "headline": "Built by gym owners, for gym owners.",
-        "concept": ["Tension: a gym floor where the owner once struggled, empty slots and scattered leads, labeled OUR GYM.",
-                    "Resolution: the same proven system carried by arrows into a thriving gym labeled YOUR GYM, members training."],
+        "concept": [
+            "EYEBROW (render at top left, small letterspaced ALL CAPS, navy): OWNER'S ADVANTAGE",
+            "DECK LINE (render below headline, medium muted navy sans, one line): The system we run on ourselves first, not guesswork.",
+            "Composition: pure type only, no illustration, no diagram, no figures. "
+            "Generous negative space on the right half and upper area. "
+            "Visual weight anchored lower left. Open upper right.",
+        ],
         "story": True,
         "set": "brand",
-        "archetype": "flow",
+        "archetype": "editorial",
     },
     "one_screen": {
         "headline": "Every lead, every post, every result. One screen.",
