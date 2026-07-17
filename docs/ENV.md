@@ -123,6 +123,7 @@ before this file existed.
 | AGENT_ONBOARD_AUTOMINT | false | BLAKE | Arms autonomous onboarding token minting. Off by default; set true in Railway to enable `onboard` CLI minting. |
 | AGENT_INTAKE_ENC_KEY | (unset) | BLAKE | Fernet key for encrypting intake tokens at rest. Generate once: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Never commit. When set, `onboard` stores the encrypted blob so the portal can reconstruct the upload link. When unset, token encryption is skipped (dev mode). |
 | AGENT_INTAKE_ENABLED | false | BLAKE | Gates the page AND the worker AND doc intake. |
+| AGENT_PORTAL_KEY | (unset) | BLAKE | Shared server-to-server secret for `GET /api/portal/intake-link/<account_key>`. Set the same value on BOTH the echo-intake-web Railway service AND Vercel portal env. Generate: `python -c "import secrets; print(secrets.token_urlsafe(40))"`. Never log, never expose cross-origin. When unset the endpoint 401s all requests. |
 | AGENT_INTAKE_TOKEN_`<CLIENTKEY>` | (unset) | BLAKE | Per account: the tokenized upload link. |
 | AGENT_UPLOAD_BASE_URL | (unset) | BLAKE | Public base of the intake web service (also builds the upload_url the portal API returns). |
 | AGENT_INTAKE_PORTAL_ORIGIN | "" (same-origin only) | BLAKE | The ONE origin allowed to POST JSON intakes cross-origin (the ops portal). Never all origins. |
