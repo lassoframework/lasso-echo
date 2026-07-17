@@ -6,7 +6,66 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
+
+---
+
+## Incident post-mortem + story public URL fix (2026-07-17, SHA `dc982bc`)
+
+### Root cause: all pending drafts had no public URL
+
+All 13 drafts in the pending queue had `creative_public_url = ""`. Root cause
+chain:
+1. Library creatives do not have `public_url` in their JSON sidecars.
+2. `AGENT_HOSTING_ENABLED` is OFF on production (default), so `drafter.py`
+   never calls `host_media()` and the URL stays empty.
+3. Facebook Page FEED posts silently fall back to text-only when no URL
+   is present (`_publish_fb_page` in meta_publisher.py). No error, no alert.
+4. Instagram feed posts and ALL story posts (both platforms) raise
+   `PublishError("needs a PUBLIC media URL")`, which is caught in
+   `approvals.py`, posts an ops_alert, then re-raises. The approval handler
+   does post an alert, but the story stays silently unposted.
+5. The "164 min late" scheduler warning in the digest was STALE historical
+   data from before SHA `74d2395` (the `>=` fix). Confirmed: `listener.py`
+   line 233 is already `>= target_hour`. Not a fresh regression.
+
+### What shipped (SHA `dc982bc`, suite 1362 green)
+
+`agent/stories.py` — two new blocks after the studio-creative path:
+
+1. **Fallback hosting**: if `creative_public_url` is still empty after the
+   studio path, attempt `media_host.host_media()` on the feed creative
+   (library or studio) before giving up.
+2. **Hard block**: if URL is STILL empty after the hosting attempt, fire a
+   named `ops_alerts.alert` ("story draft blocked for … no public URL for …
+   Enable AGENT_HOSTING_ENABLED or add public_url to the creative sidecar")
+   and return None. No broken draft enters the pending queue, no silent
+   publish failure at approval time.
+
+Tests added: `test_story_no_url_blocks_draft_and_fires_alert`,
+`test_story_fallback_hosting_provides_url`. Runner test updated to add a
+sidecar URL to the test asset.
+
+### Remaining action required by Blake (unchanged from prior session)
+
+- **lasso_fb Jul 17-31**: 13 `lasso_v2_*` creatives still MISSING. Choose:
+  1. `python -m agent regen-library --set all` (NANO must be armed), OR
+  2. `python -m agent plan-month ... --replan --write` (PLAN_MONTH flag).
+- **Public URLs**: all library creatives need either (a) `AGENT_HOSTING_ENABLED`
+  armed with R2 credentials so the agent uploads on draft creation, OR (b) a
+  `public_url` field in each creative's `.json` sidecar. Without one of these,
+  feed posts on FB survive (text-only fallback) but IG feed posts and ALL
+  stories continue to fail.
+- **Railway cron**: still needs manual dashboard click (see `docs/SCHEDULER_CRON.md`).
+- **Fabrication scan**: run on container with OCR key to confirm the 3 blocked
+  cards (lasso_ig aee14e3b97, lasso_ig 67cbbbdf3e, lasso_fb ee7b182033) are
+  OCR-reader errors vs genuine stat blocks (model-name fix shipped 2026-07-16).
+
+### Grade: B+ (unchanged)
+
+Story public URL failure is now loud and early instead of silent at approval
+time. Grade still needs one real gym completing a full 30-day posting month
+and Meta App Review cleared for client-owned assets.
 
 ---
 
