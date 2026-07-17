@@ -10,6 +10,58 @@ Last updated: 2026-07-17
 
 ---
 
+## Generation 404 fix: response_modalities + startup model validation guard (2026-07-17)
+
+### Root cause
+
+`_GeminiImageClient.generate_image()` called `generate_content(model=model, contents=prompt)`
+without `config=GenerateContentConfig(response_modalities=["TEXT","IMAGE"])`. Image-specific
+Gemini models (gemini-3-pro-image, gemini-3.1-flash-image) require this parameter to route
+to the image generation endpoint; without it the API returns 404 NotFound — same class of
+break as the gemini-2.5-flash retirement. Model IDs in config were correct; the request
+format was wrong.
+
+Evidence: API dashboard shows authentication succeeding (requests reach Google), 404s
+started July 16 on both Pro and Flash models identically.
+
+### What shipped
+
+**`agent/creative_studio.py`** — three changes:
+1. `_GeminiImageClient.generate_image()`: added `response_modalities=["TEXT","IMAGE"]` to
+   `GenerateContentConfig`; added ERROR-level debug logging (model string + error body on
+   exception); updated response traversal to try `resp.parts` (modern SDK) before legacy
+   `resp.candidates[0].content.parts`; config build is wrapped in try/except ImportError
+   so the code runs without the SDK installed (dev/test).
+2. `validate_generation_models()` added: startup guard that calls `client.models.list()`,
+   checks NANO_MODEL + NANO_MODEL_FLASH against the live list, fires ONE ops_alert naming
+   bad model strings and listing available image-capable models if either 404s.
+3. Section reference in `_route_model` docstring updated (section 6 → section 7).
+
+**`agent/listener.py`** — `run_listener()` calls `creative_studio.validate_generation_models()`
+at boot, same pattern as the Opus project-ID startup guard.
+
+**`tests/test_creative_studio.py`** — 4 new tests for `validate_generation_models`
+(silent OK, alert on bad ID, skips without key, skips when flag off). `_FakeModels` updated
+to accept `**kwargs` in `generate_content`. Suite: 1399 passed, 5 skipped.
+
+### Verified current model IDs (per Google Gemini API docs, 2026-07-17)
+
+| AGENT_NANO_MODEL (Pro) | `gemini-3-pro-image` |
+| AGENT_NANO_MODEL_FLASH | `gemini-3.1-flash-image` |
+| Flash-Lite (not used)  | `gemini-3.1-flash-lite-image` |
+
+These IDs were confirmed live in the Gemini API documentation. They ARE correct.
+The 404 was entirely caused by the missing `response_modalities` config.
+
+### Action required by Blake (Railway)
+
+No model ID changes needed in Railway env. The fix ships in this commit.
+On next deploy, startup guard will log `[creative-studio] model validation OK`
+and generation will succeed. To verify: run `regen-library --only built_by_gym_owners`
+on the container and confirm a real URL is returned.
+
+---
+
 ## House-style archetype tuned: editorial-for-social + Q6 grade gate (2026-07-17)
 
 ### What shipped

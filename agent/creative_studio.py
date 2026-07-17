@@ -643,18 +643,42 @@ class _GeminiImageClient:
         self._genai_client = genai_client  # injection seam for tests; None in production
 
     def generate_image(self, prompt, model):
-        # The Gemini image models (gemini-3-pro-image, gemini-2.5-flash-image, ...)
-        # support generateContent, NOT predict/generate_images. Lazy import so
+        # Image generation requires response_modalities=['IMAGE'] in the config.
+        # Without it the API returns 404 even for valid model IDs (the image-specific
+        # endpoint is only reachable when the modality is declared). Lazy import so
         # flag-off / draft-only never needs the SDK installed.
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        _log.info("[generate_image] model=%r endpoint=generateContent "
+                  "response_modalities=IMAGE", model)
+
         client = self._genai_client
         if client is None:
-            from google import genai  # type: ignore
-            from google.genai import types  # noqa: F401
+            from google import genai as _genai  # type: ignore
+            client = _genai.Client(api_key=self._api_key)
 
-            client = genai.Client(api_key=self._api_key)
-        resp = client.models.generate_content(model=model, contents=prompt)
-        # The image comes back as inline data on a response part. Return the first one.
-        for part in resp.candidates[0].content.parts:
+        # Build config with IMAGE modality. Falls back to None if SDK not present
+        # (dev / test env without the dependency installed) so the code still runs.
+        try:
+            from google.genai import types as _types
+            gen_config = _types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+            )
+        except ImportError:
+            gen_config = None
+
+        kwargs = {"config": gen_config} if gen_config is not None else {}
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=prompt, **kwargs
+            )
+        except Exception as exc:
+            _log.error("[generate_image] FAILED model=%r error=%r", model, str(exc))
+            raise
+
+        # Normalize: resp.parts (modern SDK shorthand) or the legacy candidates path.
+        parts = getattr(resp, "parts", None) or resp.candidates[0].content.parts
+        for part in parts:
             if getattr(part, "inline_data", None):
                 return part.inline_data.data  # raw image bytes
         raise ValueError("no image returned from Gemini")
@@ -672,6 +696,58 @@ def _default_client():
     if not key:
         return None
     return _GeminiImageClient(key)
+
+
+def validate_generation_models():
+    """
+    Startup check: verify NANO_MODEL and NANO_MODEL_FLASH exist in the live Gemini
+    model list. Fires ONE loud ops_alert naming every bad model string and listing
+    available image-capable models so Blake can set the correct IDs in Railway env.
+
+    Same self-announcing guard pattern as the OCR model check. Called once at boot
+    when AGENT_CREATIVE_STUDIO_ENABLED=true and a key is present. Skips silently if
+    the SDK is not installed or if the key is absent (flag-off path).
+    """
+    if not config.creative_studio_enabled():
+        return
+    key = os.environ.get(config.NANO_API_KEY_ENV)
+    if not key:
+        return
+    try:
+        from google import genai as _genai  # type: ignore
+        _client = _genai.Client(api_key=key)
+        live_names: set = set()
+        for m in _client.models.list():
+            raw = getattr(m, "name", "") or ""
+            live_names.add(raw.split("/")[-1])  # "gemini-3-pro-image"
+            live_names.add(raw)                 # "models/gemini-3-pro-image"
+    except Exception as exc:
+        print(f"[creative-studio] model validation skipped: {exc}")
+        return
+
+    bad = [
+        f"{label}={mid!r}"
+        for label, mid in (("AGENT_NANO_MODEL", config.NANO_MODEL),
+                           ("AGENT_NANO_MODEL_FLASH", config.NANO_MODEL_FLASH))
+        if mid not in live_names
+    ]
+    if not bad:
+        print(f"[creative-studio] model validation OK: "
+              f"{config.NANO_MODEL!r}, {config.NANO_MODEL_FLASH!r}")
+        return
+
+    image_models = sorted(
+        n for n in live_names
+        if ("image" in n.lower() or "imagen" in n.lower())
+        and not n.startswith("models/")
+    )
+    from . import ops_alerts as _ops
+    _ops.alert(
+        f"[STARTUP] Generation model(s) not found in live Gemini API: "
+        f"{', '.join(bad)}. "
+        f"Image-capable models on this key: {image_models or ['(none found)']}. "
+        f"Fix: set AGENT_NANO_MODEL + AGENT_NANO_MODEL_FLASH in Railway env."
+    )
 
 
 def spend_allowed(account_key=None, day=None):

@@ -355,6 +355,12 @@ def run_listener():
     # makes the misconfiguration visible the moment the service boots.
     from . import opus_ingest
     opus_ingest.validated_project_ids()
+    # Generation model sanity check: verify AGENT_NANO_MODEL and
+    # AGENT_NANO_MODEL_FLASH resolve in the live Gemini API. Fires one ops_alert
+    # naming the bad model string(s) and listing available image models if either
+    # 404s. Same class of self-announcing guard as the OCR model check.
+    from . import creative_studio as _cs
+    _cs.validate_generation_models()
     # Facebook connect page: a small HTTP surface INSIDE this process (it needs
     # the /data store for the page token). Dormant unless AGENT_CONNECT_ENABLED;
     # while off, no thread starts and the routes would 404 anyway.

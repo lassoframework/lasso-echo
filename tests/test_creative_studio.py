@@ -35,9 +35,11 @@ class _FakeModels:
     def __init__(self, resp):
         self._resp = resp
         self.calls = []
+        self.kwargs_calls = []
 
-    def generate_content(self, model, contents):
+    def generate_content(self, model, contents, **kwargs):
         self.calls.append((model, contents))
+        self.kwargs_calls.append(kwargs)
         return self._resp
 
 
@@ -188,3 +190,90 @@ def test_image_aspect_is_config_tunable(monkeypatch):
     monkeypatch.setattr(config, "IMAGE_PIXELS", "1080x1080")
     p = creative_studio.build_prompt("H", ["a body line"])
     assert "1:1" in p and "1080x1080" in p
+
+
+# ---- validate_generation_models: startup guard for model-ID 404s ---------------
+
+class _FakeModel:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeListClient:
+    def __init__(self, names):
+        self._models = [_FakeModel(n) for n in names]
+
+    class _M:
+        def __init__(self, models):
+            self._models = models
+
+        def list(self):
+            return iter(self._models)
+
+    def __init__(self, names):
+        self._names = names
+        self.models = _FakeListClient._M([_FakeModel(n) for n in names])
+
+
+def _patch_genai(monkeypatch, live_model_names):
+    """Monkeypatch google.genai so validate_generation_models uses our fake list."""
+    import types as _types_mod
+    fake_genai = _types_mod.SimpleNamespace(
+        Client=lambda api_key: _FakeListClient(live_model_names)
+    )
+    import sys
+    fake_google = _types_mod.SimpleNamespace(genai=fake_genai)
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+
+
+def test_validate_models_silent_when_both_present(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_NANO_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "NANO_MODEL", "gemini-3-pro-image")
+    monkeypatch.setattr(config, "NANO_MODEL_FLASH", "gemini-3.1-flash-image")
+    _patch_genai(monkeypatch, [
+        "models/gemini-3-pro-image",
+        "models/gemini-3.1-flash-image",
+        "models/gemini-3.1-flash-lite-image",
+    ])
+    creative_studio.validate_generation_models()
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "STARTUP" not in out
+
+
+def test_validate_models_alerts_on_bad_model(monkeypatch):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_NANO_API_KEY", "fake-key")
+    monkeypatch.setattr(config, "NANO_MODEL", "gemini-RETIRED-pro-image")
+    monkeypatch.setattr(config, "NANO_MODEL_FLASH", "gemini-3.1-flash-image")
+    _patch_genai(monkeypatch, [
+        "models/gemini-3-pro-image",         # NOT the same as RETIRED
+        "models/gemini-3.1-flash-image",
+    ])
+    alerts = []
+    monkeypatch.setattr(
+        "agent.ops_alerts.alert",
+        lambda msg, **kw: alerts.append(msg),
+    )
+    creative_studio.validate_generation_models()
+    assert len(alerts) == 1
+    assert "AGENT_NANO_MODEL" in alerts[0]
+    assert "gemini-RETIRED-pro-image" in alerts[0]
+    # should list available image models to help Blake pick the right one
+    assert "gemini-3-pro-image" in alerts[0]
+
+
+def test_validate_models_skips_without_key(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_NANO_ENABLED", "true")
+    monkeypatch.delenv("AGENT_NANO_API_KEY", raising=False)
+    creative_studio.validate_generation_models()
+    assert capsys.readouterr().out == ""
+
+
+def test_validate_models_skips_when_flag_off(monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)
+    monkeypatch.setenv("AGENT_NANO_API_KEY", "fake-key")
+    creative_studio.validate_generation_models()
+    assert capsys.readouterr().out == ""
