@@ -10,6 +10,25 @@ Last updated: 2026-07-17
 
 ---
 
+## Caption fix: exact Blake captions applied to 3 cards on lasso_ig + lasso_fb (2026-07-17)
+
+6 feed drafts written directly to echo.db (status=pending, draft_type=feed). No code
+changed; DB is gitignored. Images untouched (V2 virtual files on R2, not local).
+
+Cards and day assignments:
+- `lasso_v2_built_by_gym_owners` — Jul 17 (lasso_ig + lasso_fb)
+- `lasso_v2_speed_to_lead_concept` — Jul 22 (lasso_ig + lasso_fb)
+- `lasso_v2_follow_up_problem` — Jul 28 (lasso_ig + lasso_fb)
+
+Verified: captions match character-for-character, line break structure preserved
+(paragraphs double-newline, CTA pair single-newline), no dashes, no "vendor",
+hashtags in separate list field, draft_type=feed, status=pending.
+
+**Deploy note**: echo.db is local. Push to Railway and trigger the listener (or run
+`python3 -m agent run-daily`) to send Slack approval cards to #echoclaude.
+
+---
+
 ## Generation 404 fix: response_modalities + startup model validation guard (2026-07-17)
 
 ### Root cause
