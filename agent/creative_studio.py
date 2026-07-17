@@ -68,7 +68,7 @@ BRAND_PALETTE = (
     "brand-consistent; calm, premium, easy to read."
 )
 
-# Composition: LOCKED house style from brand_voice/lasso_house_style.md section 7.
+# Composition: LOCKED house style from brand_voice/lasso_house_style.md section 8.
 # The constants below match that document exactly. When the doc changes, update here.
 # The house style is shared by every surface; the LAYOUT block is per surface (the 4:5
 # feed card and the 9:16 Story compose differently), selected in build_prompt.
@@ -78,7 +78,7 @@ BRAND_PALETTE = (
 #   LAYOUT RULES: left-aligned, asymmetric, ONE depth layer
 #   These replace centered / symmetric / slab defaults which are now retired.
 
-# Block A (section 7): Typographic system. Three levels, all left-aligned.
+# Block A (section 8): Typographic system. Three levels, all left-aligned.
 # Kept as a separate constant so tests can assert these new elements are present.
 HOUSE_STYLE_TYPOGRAPHIC_SYSTEM = (
     "TYPOGRAPHIC SYSTEM (apply exactly, three levels, all left-aligned):\n"
@@ -93,7 +93,7 @@ HOUSE_STYLE_TYPOGRAPHIC_SYSTEM = (
     "with the headline."
 )
 
-# Block B (section 7): Layout rules. Left-aligned, asymmetric, one depth layer.
+# Block B (section 8): Layout rules. Left-aligned, asymmetric, one depth layer.
 HOUSE_STYLE_LAYOUT_RULES = (
     "LAYOUT RULES (no exceptions):\n"
     "LEFT-ALIGNED: every text element anchors to the left edge of the content area. "
@@ -451,7 +451,7 @@ def _check_prompt_hard_rules(prompt_text):
 def _route_model(headline="", facts=None):
     """Return (model_name, route_label) for one card.
 
-    Source of truth: brand_voice/lasso_house_style.md section 6.
+    Source of truth: brand_voice/lasso_house_style.md section 7.
 
     Amendment default: ALL cards use NANO_MODEL (Pro) unless the Flash route is
     explicitly armed via AGENT_NANO_FLASH_ENABLED. When Flash is ON, cards with

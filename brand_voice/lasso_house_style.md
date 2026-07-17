@@ -1,10 +1,10 @@
 # LASSO House Style System
 
 Source of truth for every infographic Echo generates.
-Version: 1.0 (2026-07-17)
+Version: 1.1 (2026-07-17)
 
 All constants in `agent/creative_studio.py` that begin with `HOUSE_STYLE_`
-or reference this document must match the scaffold in Section 7 exactly.
+or reference this document must match the scaffold in Section 8 exactly.
 When this document changes, update those constants. Never the reverse.
 
 ---
@@ -12,8 +12,8 @@ When this document changes, update those constants. Never the reverse.
 ## 1. Purpose
 
 Every generated card in the Echo pipeline MUST follow this system.
-The creative studio builds its generation prompts from Section 7 of this doc.
-The grade gate in Section 8 determines whether a card enters the approval queue.
+The creative studio builds its generation prompts from Section 8 of this doc.
+The grade gate in Section 9 determines whether a card enters the approval queue.
 
 ---
 
@@ -57,22 +57,28 @@ These rules apply to every card, every surface, every model:
 
 ---
 
-## 4. Layout Archetypes
+## 5. Layout Archetypes
 
 Six archetypes are registered in `creative_studio.ARCHETYPES`. Five are
 illustration-based; one is type-led.
 
-**Archetype 1 — EDITORIAL (type-led opener)**
-The card is carried by typography alone. No illustration, no diagram, no figures.
+**Archetype 1 — EDITORIAL (type-led opener, built for social feeds)**
+The card is carried by typography and color alone. No illustration, no diagram, no figures.
 Three levels, all left-aligned:
-- Eyebrow: small ALL CAPS letterspaced label, navy, top left
-- Headline: large bold high-contrast editorial serif, left-aligned, tight leading
-- Deck: one medium-weight muted navy sans line below the headline
+- Eyebrow: small ALL CAPS letterspaced label, top left, in RED (the one red element on the card)
+- Headline: large BOLD high-contrast editorial serif, left-aligned, tight leading. Set it BIG — magazine cover scale, not a book title page. This is the hero moment.
+- Deck: one medium-weight sans-serif line below the headline, rendered on the image.
 
-Composition: generous negative space dominant, weighted lower-left, open
-upper-right. Optional motif: at most ONE tiny element (thin hairline rule below
-eyebrow, or a very small dumbbell line-icon at body type's line weight — never
-both). Red at most once, or not at all. When in doubt: no motif, stronger type.
+Visual anchor (REQUIRED — every editorial concept spec must declare one):
+1. Full-width COLOR BLOCK (preferred): a bold color field occupying the top half or more of the card; the headline reverses out of it.
+2. Duotone photo treatment: a full-bleed high-contrast photo behind the type.
+3. Oversized headline scale: the headline fills the card at such scale it becomes a graphic element.
+
+Composition:
+- EVERY ZONE EARNS ITS PLACE — color, type, or photo.
+- NO VACANT THIRDS. A large empty field is not "breathing room" — it is a failed card.
+- Red exactly once: the eyebrow label only.
+- Reference: magazine COVER or Nike/Alo campaign card. Never a book interior.
 
 **Archetypes 2-6 — FLOW, SPLIT, HERO, PATH, HEADLINE**
 Illustration-based archetypes. See `creative_studio.ARCHETYPES` for their
@@ -80,7 +86,7 @@ detailed composition rules.
 
 ---
 
-## 5. What Varies Per Card
+## 6. What Varies Per Card
 
 - CANVAS: cream (light, default) or navy (dark, cinematic) dominant field
 - LAYOUT: one of eight layout tokens (framework, contrast, checklist, poster,
@@ -92,7 +98,7 @@ the approved source doc only. Everything else is constant.
 
 ---
 
-## 6. Model Routing
+## 7. Model Routing
 
 Every card that carries rendered headline text, labels, or stat figures routes
 to the HERO (Pro) model for highest text render accuracy.
@@ -106,7 +112,7 @@ quality are visible. Neither model is hardcoded: both are read from config only.
 
 ---
 
-## 7. Generation Prompt Scaffold (Section 7)
+## 8. Generation Prompt Scaffold
 
 This is the source of truth for `creative_studio.build_prompt()`. Every card
 generation prompt must include all four blocks below, in order:
@@ -165,10 +171,10 @@ ILLUSTRATED ELEMENT: [ARCHETYPE BLOCK from the archetype system in creative_stud
 
 ---
 
-## 8. Five-Question Grade Gate (Section 8)
+## 9. Six-Question Grade Gate
 
-A card passes when it answers YES to four or more questions.
-A card that fails (YES to fewer than four) is regenerated once automatically.
+A card passes when it answers YES to five or more of the six questions.
+A card that fails (YES to fewer than five) is regenerated once automatically.
 If the regeneration also fails, the card surfaces to #echoclaude flagged
 "house-style fail: [which questions]" and does NOT enter the approval queue.
 
@@ -195,9 +201,16 @@ Does the rendered text contain no em dashes, no en dashes, no hyphens, and no
 Can the headline be read at 100px wide? Thin type, low contrast, or clutter
 around the headline FAILS. Checkable: vision model.
 
+**Q6 Feed-stopping?**
+Does the prompt specify a visual anchor — an illustrated element, color block,
+full-width band, duotone photo, or oversized headline scale — that would stop
+a thumb in a social feed? A card that is elegant but inert FAILS. Editorial cards
+with no declared visual anchor always fail this question. Checkable: programmatic
+heuristic (anchor keyword scan), confirmed by vision model.
+
 ---
 
-## 9. What This System Replaces
+## 10. What This System Replaces
 
 The following patterns are RETIRED. No new prompt may use them:
 

@@ -1,9 +1,9 @@
 """
-House-style five-question grade gate.
+House-style six-question grade gate.
 
-Source of truth: brand_voice/lasso_house_style.md section 8.
+Source of truth: brand_voice/lasso_house_style.md section 9.
 
-A card passes when it answers YES to four or more of the five questions.
+A card passes when it answers YES to five or more of the six questions.
 A card that fails is regenerated once by the caller (creative_studio.generate).
 If the regeneration also fails, an ops_alert fires and the card is withheld.
 
@@ -13,12 +13,12 @@ whether the card is TRUE. This gate owns whether it looks ELEVATED. Both must pa
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-PASS_THRESHOLD = 4  # pass if ≥ 4 of 5 questions answered YES
+PASS_THRESHOLD = 5  # pass if ≥ 5 of 6 questions answered YES
 
 
 @dataclass
 class GradeResult:
-    scores: dict          # {"Q1": True/False/None, ..., "Q5": True/False/None}
+    scores: dict          # {"Q1": True/False/None, ..., "Q6": True/False/None}
     passed: bool
     failed_questions: List[str] = field(default_factory=list)
 
@@ -53,6 +53,24 @@ def _q4_no_banned_copy(headline: str) -> bool:
     return not has_dash and not has_vendor
 
 
+def _q6_feed_stopping_heuristic(prompt_text: str) -> bool:
+    """Q6: Feed-stopping visual anchor. Programmatic check: the prompt must name an
+    illustrated element OR a visual anchor (color block, full-width element, duotone
+    treatment, or oversized headline scale). All illustration-based archetype prompts
+    include Block D 'ILLUSTRATED ELEMENT', so they pass automatically. Editorial
+    prompts pass only when the concept spec explicitly names a visual anchor."""
+    p = (prompt_text or "").lower()
+    return any(token in p for token in (
+        "illustrated element",  # present in all non-editorial Block D prompts
+        "visual anchor",        # required in editorial concept specs
+        "color block",          # editorial anchor type
+        "full-width",           # editorial anchor type
+        "full width",           # editorial anchor type
+        "duotone",              # editorial anchor type
+        "magazine cover",       # editorial scale reference
+    ))
+
+
 def _vision_questions(prompt_text: str, vision_client=None) -> dict:
     """Q1, Q2, Q5: vision-model checks. Returns dict with True/False/None per key.
     None means the check was skipped (no vision_client available)."""
@@ -82,16 +100,17 @@ def _vision_questions(prompt_text: str, vision_client=None) -> dict:
 def grade_card(prompt_text: str, headline: str = "",
                vision_client=None) -> GradeResult:
     """
-    Run all five house-style questions. Returns a GradeResult.
+    Run all six house-style questions. Returns a GradeResult.
 
-    Q3 and Q4 are programmatic. Q1, Q2, Q5 use the vision client when available;
+    Q3, Q4, and Q6 are programmatic. Q1, Q2, Q5 use the vision client when available;
     when vision_client is None those questions return None (treated as passing so
     the gate does not block cards solely because vision is unavailable).
 
-    A card passes when ≥ PASS_THRESHOLD (4) of the five questions return True or None.
+    A card passes when ≥ PASS_THRESHOLD (5) of the six questions return True or None.
     """
     q3 = _q3_single_accent_heuristic(prompt_text)
     q4 = _q4_no_banned_copy(headline)
+    q6 = _q6_feed_stopping_heuristic(prompt_text)
     vision = _vision_questions(prompt_text, vision_client)
 
     scores = {
@@ -100,9 +119,10 @@ def grade_card(prompt_text: str, headline: str = "",
         "Q3": q3,
         "Q4": q4,
         "Q5": vision.get("Q5"),
+        "Q6": q6,
     }
 
     failed = [k for k, v in scores.items() if v is False]
-    passed = len(failed) <= (5 - PASS_THRESHOLD)  # pass if ≤1 hard False
+    passed = len(failed) <= (6 - PASS_THRESHOLD)  # pass if ≤1 hard False
 
     return GradeResult(scores=scores, passed=passed, failed_questions=failed)

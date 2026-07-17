@@ -72,11 +72,11 @@ NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
 # accuracy). NANO_MODEL_FLASH is the optional lower-cost route for photographic
 # or text-light fills; gated behind nano_flash_enabled() (OFF by default).
 # Neither model is hardcoded: both read from env so Blake changes them by hand.
-# Source of truth: brand_voice/lasso_house_style.md section 6.
+# Source of truth: brand_voice/lasso_house_style.md section 7.
 NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
 NANO_MODEL_FLASH = os.environ.get("AGENT_NANO_MODEL_FLASH", "gemini-3.1-flash-image")
 # House style source of truth: the prompt scaffold and grade gate are defined
-# in this document. Code constants in creative_studio.py must match section 7.
+# in this document. Code constants in creative_studio.py must match section 8.
 HOUSE_STYLE_PATH = os.environ.get("AGENT_HOUSE_STYLE_PATH",
                                   "brand_voice/lasso_house_style.md")
 # VISION READ model (image -> text), SEPARATE from the generation model above.
@@ -163,9 +163,9 @@ def nano_flash_enabled() -> bool:
 
 def style_gate_enabled() -> bool:
     """
-    House-style five-question grade gate switch. OFF by default. When ON, every
-    generated card is scored against the five questions in lasso_house_style.md
-    section 8 before entering the approval queue. A card failing two or more
+    House-style six-question grade gate switch. OFF by default. When ON, every
+    generated card is scored against the six questions in lasso_house_style.md
+    section 9 before entering the approval queue. A card failing two or more
     questions is regenerated once; if it still fails, ops_alert fires with named
     failing questions and the card is withheld from the queue. This is ADDITIVE
     to the fabrication gate: both must pass. OFF = generation behavior unchanged.

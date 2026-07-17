@@ -1,7 +1,8 @@
 """
 House-style grade gate tests. Offline: no API calls. Asserts programmatic checks
-(Q3 single accent, Q4 no banned copy) and structural logic (GradeResult, pass
-threshold). Vision client None -> vision questions default to None (pass-through).
+(Q3 single accent, Q4 no banned copy, Q6 feed-stopping) and structural logic
+(GradeResult, pass threshold). Vision client None -> vision questions default
+to None (pass-through).
 """
 import os
 import sys
@@ -12,6 +13,7 @@ from agent.grade_gate import (  # noqa: E402
     GradeResult, PASS_THRESHOLD,
     _q3_single_accent_heuristic,
     _q4_no_banned_copy,
+    _q6_feed_stopping_heuristic,
     grade_card,
 )
 
@@ -64,6 +66,50 @@ def test_q4_passes_empty_headline():
     assert _q4_no_banned_copy("") is True
 
 
+# ---- Q6: feed-stopping visual anchor -------------------------------------------
+
+def test_q6_passes_with_illustrated_element():
+    prompt = "ILLUSTRATED ELEMENT: a gym owner reviewing reports at a desk."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_passes_with_visual_anchor():
+    prompt = "VISUAL ANCHOR: a full-width NAVY color block occupying the top half."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_passes_with_color_block():
+    prompt = "color block in navy fills the upper zone of the card."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_passes_with_full_width():
+    prompt = "full-width photo treatment behind the type."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_passes_with_duotone():
+    prompt = "duotone photo treatment: navy on cream, full bleed."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_passes_with_magazine_cover():
+    prompt = "Set the headline at magazine cover scale."
+    assert _q6_feed_stopping_heuristic(prompt) is True
+
+
+def test_q6_fails_bare_editorial_no_anchor():
+    prompt = (
+        "Archetype EDITORIAL: typography alone. Eyebrow: OWNER'S ADVANTAGE. "
+        "Headline: Built by gym owners. Deck: The system we run on ourselves first."
+    )
+    assert _q6_feed_stopping_heuristic(prompt) is False
+
+
+def test_q6_fails_empty_prompt():
+    assert _q6_feed_stopping_heuristic("") is False
+
+
 # ---- GradeResult structural logic ----------------------------------------------
 
 def test_grade_result_zero_fails_passes():
@@ -96,26 +142,35 @@ def test_grade_result_two_fails_fails():
 
 
 # ---- grade_card: vision=None treats Q1/Q2/Q5 as None (pass-through) -----------
+# Prompts include "ILLUSTRATED ELEMENT" so Q6 passes programmatically.
 
 def test_grade_card_no_vision_client_q3_q4_pass():
-    # Good prompt: has "exactly one" + "red" + no "red background"; clean headline
-    prompt = ("Exactly one element on the entire card uses red (#FF0000). "
-              "Never a red background.")
+    # Good prompt: Q3 passes, Q4 passes, Q6 passes (has illustrated element)
+    prompt = (
+        "Exactly one element on the entire card uses red (#FF0000). "
+        "Never a red background. "
+        "ILLUSTRATED ELEMENT: a gym owner reviewing a lead pipeline report."
+    )
     result = grade_card(prompt, headline="Speed to lead wins", vision_client=None)
-    # Q1, Q2, Q5 are None (vision skipped). Q3=True, Q4=True. 0 hard fails -> passed.
+    # Q1, Q2, Q5 are None (vision skipped). Q3=True, Q4=True, Q6=True. 0 hard fails -> passed.
     assert result.passed is True
     assert result.scores["Q1"] is None
     assert result.scores["Q3"] is True
     assert result.scores["Q4"] is True
+    assert result.scores["Q6"] is True
     assert "Q3" not in result.failed_questions
     assert "Q4" not in result.failed_questions
+    assert "Q6" not in result.failed_questions
 
 
 def test_grade_card_no_vision_client_q4_fail():
-    # Banned headline: contains a hyphen
-    prompt = "Exactly one element on the entire card uses red. Never a red background."
+    # Banned headline (hyphen). Q3 passes, Q6 passes (illustrated element), Q4 fails.
+    # 1 hard fail -> passed (≤1 fail allowed).
+    prompt = (
+        "Exactly one element on the entire card uses red. Never a red background. "
+        "ILLUSTRATED ELEMENT: a gym owner at a whiteboard."
+    )
     result = grade_card(prompt, headline="Speed-to-lead wins", vision_client=None)
-    # Q4 fails; Q1/Q2/Q5 None; Q3 True. 1 hard fail -> passed (≤1 fail allowed).
     assert result.passed is True
     assert "Q4" in result.failed_questions
 
@@ -124,11 +179,36 @@ def test_grade_card_no_vision_client_q3_and_q4_fail():
     # Both programmatic checks fail -> 2 hard fails -> card fails
     prompt = "Use a red background with cream text."  # no "exactly one", red background
     result = grade_card(prompt, headline="Speed-to-lead wins", vision_client=None)
-    # Q3=False (red background), Q4=False (hyphen). 2 fails -> failed.
+    # Q3=False (red background), Q4=False (hyphen), Q6=False (no anchor). 3 fails -> failed.
     assert result.passed is False
     assert "Q3" in result.failed_questions
     assert "Q4" in result.failed_questions
 
 
+def test_grade_card_q6_fails_bare_editorial():
+    # Editorial prompt with no visual anchor: Q6 fails.
+    # Q3 passes (has "exactly one" + "red"), Q4 passes, Q6 fails.
+    # 1 hard fail -> still passes (≤1 fail allowed).
+    prompt = (
+        "Exactly one element on the entire card uses red. Never a red background. "
+        "Archetype EDITORIAL: Eyebrow OWNER'S ADVANTAGE. "
+        "Headline: Built by gym owners."
+    )
+    result = grade_card(prompt, headline="Built by gym owners", vision_client=None)
+    assert result.scores["Q6"] is False
+    assert "Q6" in result.failed_questions
+    # Q3 True, Q4 True, Q6 False, Q1/Q2/Q5 None -> 1 fail -> passes
+    assert result.passed is True
+
+
+def test_grade_card_two_fails_including_q6():
+    # Q4 fails (hyphen) AND Q6 fails (no anchor) -> 2 fails -> card fails.
+    prompt = "Exactly one element on the entire card uses red. Never a red background."
+    result = grade_card(prompt, headline="Speed-to-lead wins", vision_client=None)
+    assert result.scores["Q4"] is False
+    assert result.scores["Q6"] is False
+    assert result.passed is False
+
+
 def test_pass_threshold_constant():
-    assert PASS_THRESHOLD == 4
+    assert PASS_THRESHOLD == 5

@@ -10,6 +10,46 @@ Last updated: 2026-07-17
 
 ---
 
+## House-style archetype tuned: editorial-for-social + Q6 grade gate (2026-07-17)
+
+### What shipped
+
+**`brand_voice/lasso_house_style.md`** — section numbering fixed (duplicate section 4
+resolved), section 5 now "Layout Archetypes." Archetype 1 (EDITORIAL) updated:
+- Visual anchor now REQUIRED in every editorial concept spec (color block, duotone,
+  or oversized headline scale)
+- NO VACANT THIRDS rule added
+- Reference changed to "magazine COVER or Nike/Alo campaign card, never book interior"
+- Eyebrow explicitly RED in the doc (matching the creative_studio ARCHETYPES entry)
+Section 9 renamed "Six-Question Grade Gate" with Q6 added.
+
+**`agent/grade_gate.py`** — added `_q6_feed_stopping_heuristic()` and Q6 to `grade_card()`.
+- Q6 is programmatic: passes when prompt names an illustrated element OR a visual anchor
+  (color block, full-width, duotone, magazine cover). All non-editorial cards auto-pass
+  (Block D always includes "ILLUSTRATED ELEMENT"). Editorial cards pass only when the
+  concept spec explicitly declares a visual anchor.
+- `PASS_THRESHOLD` raised from 4 to 5 (≤1 hard False of 6 questions allowed).
+
+**Cross-reference updates** — section numbers updated in `creative_studio.py` and
+`config.py` to match the new numbering (section 7 Model Routing, section 8 Scaffold,
+section 9 Grade Gate).
+
+**`tests/test_grade_gate.py`** — 10 new tests for Q6 heuristic and grade_card integration.
+Suite: 1395 passed, 5 skipped (was 1385).
+
+### Remaining action required by Blake (Railway)
+
+Run `regen-library --set all` on Railway to regenerate all 38+ cards under the updated
+archetype (editorial-for-social) and the updated grade gate (Q6 enforced):
+
+```
+/opt/venv/bin/python -m agent regen-library --set all
+```
+
+Ensure `AGENT_STYLE_GATE_ENABLED=true` is set in Railway env (confirmed set 2026-07-17).
+
+---
+
 ## built_by_gym_owners editorial archetype + library gap partial fix (2026-07-17)
 
 ### What shipped
