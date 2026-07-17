@@ -497,6 +497,33 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+# ---- Portal server-to-server key (AGENT_PORTAL_KEY) --------------------------
+# Shared secret used to authenticate server-to-server calls FROM the LASSO ops
+# portal TO Echo's read-only /api/portal/* endpoints. Set by hand in BOTH:
+#   - Railway env for the echo-intake-web service (the Echo side)
+#   - Vercel env for the portal (the portal side)
+# The value is compared with hmac.compare_digest (constant-time; no timing
+# oracle). When unset, the portal intake-link endpoint 503s rather than
+# accepting unauthenticated requests.
+#
+# Generate a suitable value:
+#   python -c "import secrets; print(secrets.token_urlsafe(40))"
+#
+# The key name intentionally omits any hint of its function from the var name.
+# Never log, never print, never include in health or status responses.
+AGENT_PORTAL_KEY_ENV = "AGENT_PORTAL_KEY"  # name only, not the value
+
+
+def portal_key_valid(provided: str) -> bool:
+    """True when AGENT_PORTAL_KEY is set and provided matches it (constant-time).
+    Returns False when the env var is unset (no key = no access, always)."""
+    import hmac
+    stored = os.environ.get(AGENT_PORTAL_KEY_ENV, "").strip()
+    if not stored or not provided:
+        return False
+    return hmac.compare_digest(stored.encode(), provided.encode())
+
+
 def backup_enabled() -> bool:
     """
     Nightly store backup switch. OFF by default. ON, a consistent sqlite

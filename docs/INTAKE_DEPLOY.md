@@ -64,6 +64,27 @@ This service's own:
 | `AGENT_INTAKE_MAX_FILE_MB` | `100` | Per-file size cap. |
 | `AGENT_INTAKE_MAX_REQUEST_MB` | `300` | Per-request size cap. |
 | `AGENT_INTAKE_RATE_PER_MINUTE` | `10` | Per-IP request rate limit. |
+| `AGENT_PORTAL_KEY` | (none) | Shared server-to-server secret for `GET /api/portal/intake-link/<account_key>`. Must match the same var set in Vercel portal env. Generate: `python -c "import secrets; print(secrets.token_urlsafe(40))"`. When unset, the endpoint 401s every request. Never log or expose cross-origin. |
+
+## Portal intake-link endpoint (Option A scalable path)
+
+Once `AGENT_ONBOARD_AUTOMINT=true` and `AGENT_INTAKE_ENC_KEY` are set, each
+`onboard` run stores an encrypted token blob in Echo's SQLite DB. The portal
+can fetch it automatically (no operator paste at 100-gym scale) using:
+
+    GET /api/portal/intake-link/<account_key>
+    X-Portal-Key: <AGENT_PORTAL_KEY value>
+
+The endpoint is server-to-server only (no CORS headers, never call from a browser).
+It returns:
+
+    200: { account_key, intake_token_encrypted, token_minted_at }
+    401: key missing, wrong, or AGENT_PORTAL_KEY unset
+    404: feature off, gym not found, or no encrypted token yet
+
+The portal UPSERTs `intake_token_encrypted` into its `echo_intake_tokens` table
+and uses the shared `AGENT_INTAKE_ENC_KEY` to decrypt and build links server-side.
+The raw token never leaves Echo; only the Fernet-encrypted blob travels over the wire.
 
 The worker's Slack, Meta, and /data vars are NOT needed here. This service
 never posts to Slack and never publishes; it only writes uploads to

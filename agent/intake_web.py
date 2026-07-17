@@ -392,6 +392,54 @@ def handle_portal_intake(token, body, r2=None, now=None):
     }
 
 
+def handle_portal_intake_link(account_key, provided_key):
+    """
+    Read-only server-to-server endpoint: GET /api/portal/intake-link/<account_key>
+
+    Returns the Fernet-encrypted intake token blob for the given account_key so
+    the portal can populate its echo_intake_tokens table without operator paste.
+    This endpoint is server-to-server only — never cross-origin to browsers.
+
+    Auth: X-Portal-Key header must match AGENT_PORTAL_KEY (constant-time compare).
+
+    Response shapes (always JSON):
+      401 — X-Portal-Key absent, wrong, or AGENT_PORTAL_KEY not set.
+      404 — AGENT_INTAKE_ENABLED is OFF, or the account_key is not found,
+            or the account has no encrypted token yet (honest 404, not
+            distinguishable between "no gym" and "no token" to limit
+            information disclosure).
+      200 — { account_key, intake_token_encrypted, token_minted_at }
+            intake_token_encrypted is the Fernet ciphertext the portal stores
+            and decrypts server-side; the raw token is never returned.
+
+    The raw token and AGENT_INTAKE_ENC_KEY never appear in any response.
+    """
+    if not config.portal_key_valid(provided_key):
+        return 401, {"error": "unauthorized"}
+
+    if not config.intake_enabled():
+        return 404, {"error": "not found"}
+
+    from . import db as _db
+    row = _db.gym_get(account_key)
+    if row is None:
+        return 404, {"error": "not found"}
+
+    enc = row.get("intake_token_encrypted") if row else None
+    if not enc:
+        # Gym exists but has no encrypted token yet (onboard has not run,
+        # or AGENT_INTAKE_ENC_KEY was not set when onboard ran). Return 404
+        # so the caller cannot distinguish "no gym" from "no token".
+        return 404, {"error": "not found"}
+
+    token_minted_at = row.get("token_rotated_at") or None
+    return 200, {
+        "account_key": account_key,
+        "intake_token_encrypted": enc,
+        "token_minted_at": token_minted_at,
+    }
+
+
 def handle_portal_gym_status(account_key, r2=None):
     """
     Portal gym status endpoint (GET /portal/gym/<account_key>).
@@ -687,7 +735,24 @@ def build_server(port=None):
                          self.path.split("?")[0])
             return m.group(1) if m else None
 
+        def _portal_intake_link_key(self):
+            """Extract account_key from GET /api/portal/intake-link/<account_key>."""
+            m = re.match(r"^/api/portal/intake-link/([A-Za-z0-9_-]+)$",
+                         self.path.split("?")[0])
+            return m.group(1) if m else None
+
         def do_GET(self):
+            # Portal intake-link: GET /api/portal/intake-link/<account_key>
+            # Server-to-server only. Auth: X-Portal-Key header (constant-time).
+            # Returns the Fernet-encrypted token blob so the portal can populate
+            # echo_intake_tokens without operator paste. Never cross-origin to
+            # browsers (no CORS headers on this route, ever).
+            intake_link_key = self._portal_intake_link_key()
+            if intake_link_key is not None:
+                provided = (self.headers.get("X-Portal-Key") or "").strip()
+                status, body = handle_portal_intake_link(intake_link_key, provided)
+                return self._send_json(body, status)
+
             # Portal gym status: GET /portal/gym/<account_key>
             # Gated by AGENT_PORTAL_APPROVALS. Returns JSON. No token in path.
             portal_key = self._portal_gym_key()
