@@ -2,10 +2,12 @@
 post-captions sidecar URL resolution.
 
 Confirms:
-- When a sidecar JSON exists with a public_url, the draft's creative_public_url
-  is populated (not empty) so the Slack card renders the image inline.
-- When no sidecar exists, creative_public_url is "" and a WARN is printed (loud
-  failure, not silent placeholder via empty string).
+- _sidecar_public_url reads from config.LIBRARY_PATH first (Railway persistent
+  volume fix: sidecars at /data/content_library survive redeploys even when the
+  creative_path is a relative ephemeral path).
+- Falls back to the literal path for local dev.
+- When no sidecar has a public_url, returns "" (loud WARN, card shows placeholder,
+  no crash).
 - Re-running is idempotent: INSERT OR REPLACE means no duplicate DB rows.
 - The draft IDs match the deterministic sha1 formula so the same 6 IDs appear
   on every run (stable Slack card dedup).
@@ -48,12 +50,14 @@ class _CardCapture:
 
 # ---- tests -------------------------------------------------------------------
 
-def test_sidecar_public_url_is_read_into_draft(tmp_path, monkeypatch, capsys):
-    """When a sidecar JSON has public_url, the draft carries that URL.
-    This is the Slack-card image fix: _post_captions must not hardcode ""."""
+def test_sidecar_public_url_is_read_into_draft(tmp_path, monkeypatch):
+    """When a sidecar JSON exists in LIBRARY_PATH, _sidecar_public_url
+    returns its public_url so the Slack card renders the image inline."""
+    from agent.__main__ import _sidecar_public_url
+    import agent.config as _cfg
+
     r2_url = "https://pub-XXXX.r2.dev/echo/lasso_ig/abc/lasso_v2_built_by_gym_owners.png"
 
-    # Create sidecar alongside the creative path in tmp_path
     lib = tmp_path / "content_library"
     lib.mkdir()
     png = lib / "lasso_v2_built_by_gym_owners.png"
@@ -61,27 +65,54 @@ def test_sidecar_public_url_is_read_into_draft(tmp_path, monkeypatch, capsys):
     sidecar = lib / "lasso_v2_built_by_gym_owners.json"
     sidecar.write_text(json.dumps({"public_url": r2_url, "note": ""}))
 
-    creative_path = str(png)
+    monkeypatch.setattr(_cfg, "LIBRARY_PATH", str(lib))
 
-    # Run sidecar reader directly (same logic as _post_captions._sidecar_public_url)
-    import importlib, agent.__main__ as m
-    # Inline the helper logic to test it independently of the full CLI
-    stem = os.path.splitext(creative_path)[0]
-    sc = stem + ".json"
-    assert os.path.exists(sc)
-    data = json.loads(open(sc).read())
-    resolved = str(data.get("public_url", "")).strip()
+    resolved = _sidecar_public_url(str(png))
     assert resolved == r2_url, f"expected R2 URL, got {resolved!r}"
 
 
-def test_missing_sidecar_gives_empty_url(tmp_path):
-    """No sidecar -> creative_public_url = "" (loud WARN emitted by the CLI loop,
-    card shows placeholder, but no crash)."""
+def test_sidecar_resolved_via_library_path(tmp_path, monkeypatch):
+    """config.LIBRARY_PATH is checked BEFORE the literal creative_path stem.
+    This is the Railway fix: sidecars on the persistent volume survive redeploys
+    even when creative_path is a relative ephemeral path that no longer exists."""
+    from agent.__main__ import _sidecar_public_url
+    import agent.config as _cfg
+
+    r2_url = "https://pub-XXXX.r2.dev/echo/lasso/abc/lasso_v2_built_by_gym_owners.png"
+
+    # Persistent volume: LIBRARY_PATH has the sidecar
+    persistent_lib = tmp_path / "data" / "content_library"
+    persistent_lib.mkdir(parents=True)
+    (persistent_lib / "lasso_v2_built_by_gym_owners.json").write_text(
+        json.dumps({"public_url": r2_url})
+    )
+
+    # Ephemeral container FS: PNG exists but no sidecar alongside it
+    ephemeral_lib = tmp_path / "content_library"
+    ephemeral_lib.mkdir()
+    png = ephemeral_lib / "lasso_v2_built_by_gym_owners.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+
+    monkeypatch.setattr(_cfg, "LIBRARY_PATH", str(persistent_lib))
+
+    resolved = _sidecar_public_url(str(png))
+    assert resolved == r2_url, (
+        "must resolve from LIBRARY_PATH even when the literal path has no sidecar"
+    )
+
+
+def test_missing_sidecar_gives_empty_url(tmp_path, monkeypatch):
+    """No sidecar in LIBRARY_PATH or alongside creative -> returns "" (loud WARN
+    emitted by the CLI loop; card shows placeholder, but no crash)."""
+    from agent.__main__ import _sidecar_public_url
+    import agent.config as _cfg
+
+    empty_lib = tmp_path / "empty_lib"
+    empty_lib.mkdir()
+    monkeypatch.setattr(_cfg, "LIBRARY_PATH", str(empty_lib))
+
     creative_path = str(tmp_path / "content_library" / "lasso_v2_no_sidecar.png")
-    stem = os.path.splitext(creative_path)[0]
-    sc = stem + ".json"
-    assert not os.path.exists(sc)
-    resolved = ""  # what _sidecar_public_url returns when file absent
+    resolved = _sidecar_public_url(creative_path)
     assert resolved == ""
 
 

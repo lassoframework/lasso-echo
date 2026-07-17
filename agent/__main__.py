@@ -148,6 +148,34 @@ def _status():
         print("  heartbeat      : (none recorded — is the listen process running?)")
 
 
+def _sidecar_public_url(creative_path):
+    """Read public_url from the creative's sidecar JSON written by regen_library.
+
+    Checks config.LIBRARY_PATH first so sidecars at /data/content_library survive
+    Railway redeploys (set AGENT_LIBRARY_PATH=/data/content_library on the container).
+    Falls back to the literal creative_path stem for local dev.
+    Returns "" if no sidecar with a public_url is found — never raises.
+    """
+    import json as _j
+    import os as _o
+    fname = _o.path.splitext(_o.path.basename(creative_path))[0] + ".json"
+    candidates = [
+        _o.path.join(config.LIBRARY_PATH, fname),    # persistent volume path
+        _o.path.splitext(creative_path)[0] + ".json", # literal path (local dev)
+    ]
+    for sc in candidates:
+        if _o.path.exists(sc):
+            try:
+                with open(sc, "r", encoding="utf-8") as _f:
+                    data = _j.load(_f)
+                url = str(data.get("public_url", "")).strip()
+                if url:
+                    return url
+            except Exception:
+                pass
+    return ""
+
+
 def _post_captions(args):
     """One-shot command: write Blake's 3 hand-crafted caption drafts (6 total,
     lasso_ig + lasso_fb) to the DB and post them to Slack as pending approval cards.
@@ -168,20 +196,6 @@ def _post_captions(args):
     from .slack_surface import SlackPoster
 
     dry = "--dry-run" in args
-
-    def _sidecar_public_url(creative_path):
-        """Read public_url from the creative's sidecar JSON written by regen_library.
-        Returns "" if the sidecar is absent or has no public_url — never raises."""
-        stem = _os.path.splitext(creative_path)[0]
-        sidecar = stem + ".json"
-        if _os.path.exists(sidecar):
-            try:
-                with open(sidecar, "r", encoding="utf-8") as _f:
-                    data = _json.load(_f)
-                return str(data.get("public_url", "")).strip()
-            except Exception:
-                pass
-        return ""
 
     CAPTION_BUILT = (
         "Most gyms don't have a lead problem. They have a follow up problem. "
