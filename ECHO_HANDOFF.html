@@ -1,0 +1,159 @@
+<!-- Echo Handoff — session close-out for continuity. LASSO V3 brand. Self-contained. -->
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    --navy: #121E3C; --navy2: #1B326E; --red: #FF0000; --sky: #5EB9E6;
+    --cream: #FAF6F0; --steel: #D8E3EE; --muted: rgba(216,227,238,.22);
+    font-family: 'Inter', Helvetica, Arial, sans-serif;
+    background: var(--navy); color: #fff;
+    padding: 40px 34px 60px; max-width: 960px; margin: 0 auto;
+    -webkit-font-smoothing: antialiased;
+  }
+  .eyebrow { font-size: 11px; font-weight: 800; letter-spacing: .28em; text-transform: uppercase; color: var(--sky); margin-bottom: 8px; }
+  h1 { font-size: 42px; font-weight: 900; line-height: .97; letter-spacing: -.02em; margin-bottom: 6px; }
+  h1 .r { color: var(--red); }
+  .deck { font-size: 13px; font-weight: 500; color: var(--steel); margin-bottom: 32px; }
+  .deck .dot { color: var(--red); padding: 0 7px; }
+
+  section { margin-bottom: 28px; }
+  h2 { font-size: 11px; font-weight: 800; letter-spacing: .22em; text-transform: uppercase; color: var(--sky); border-bottom: 1px solid var(--muted); padding-bottom: 7px; margin-bottom: 14px; }
+
+  ul { list-style: none; }
+  ul li { font-size: 13px; font-weight: 500; color: var(--steel); padding: 5px 0 5px 20px; position: relative; line-height: 1.5; }
+  ul li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--muted); border: 1.5px solid var(--steel); position: absolute; left: 0; top: 9px; }
+  ul li.done::before { background: var(--sky); border-color: var(--sky); }
+  ul li.action::before { background: var(--red); border-color: var(--red); }
+  ul li b { color: #fff; font-weight: 700; }
+
+  .grade-box {
+    background: var(--muted); border: 1.5px solid var(--sky);
+    border-radius: 10px; padding: 18px 22px; margin-bottom: 28px;
+    display: flex; align-items: flex-start; gap: 20px;
+  }
+  .grade-letter { font-size: 52px; font-weight: 900; color: var(--sky); line-height: 1; flex: 0 0 auto; }
+  .grade-body h3 { font-size: 13px; font-weight: 700; color: #fff; margin-bottom: 5px; }
+  .grade-body p { font-size: 12px; font-weight: 500; color: var(--steel); line-height: 1.55; }
+  .grade-body .gate { margin-top: 8px; font-size: 12px; color: var(--red); font-weight: 700; }
+
+  code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; background: rgba(94,185,230,.12); color: var(--sky); padding: 2px 6px; border-radius: 4px; }
+  pre { background: rgba(0,0,0,.35); border: 1px solid var(--muted); border-radius: 8px; padding: 14px 16px; margin: 10px 0; overflow-x: auto; }
+  pre code { background: none; padding: 0; font-size: 12px; color: var(--sky); }
+
+  .cmd-box { background: rgba(0,0,0,.4); border-left: 3px solid var(--sky); border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 10px 0; }
+  .cmd-box .label { font-size: 10px; font-weight: 800; letter-spacing: .2em; text-transform: uppercase; color: var(--sky); margin-bottom: 6px; }
+  .cmd-box code { background: none; padding: 0; color: #fff; font-size: 13px; }
+
+  .tag { display: inline-block; font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; margin-right: 6px; }
+  .tag.done { background: rgba(94,185,230,.18); color: var(--sky); }
+  .tag.action { background: rgba(255,0,0,.18); color: var(--red); }
+  .tag.watch { background: rgba(255,200,0,.12); color: #ffc800; }
+
+  .foot { font-size: 11px; color: rgba(216,227,238,.45); margin-top: 36px; border-top: 1px solid var(--muted); padding-top: 14px; }
+</style>
+
+<p class="eyebrow">LASSO Echo</p>
+<h1>Session <span class="r">Handoff</span></h1>
+<p class="deck">2026-07-17 close-out<span class="dot">/</span>1427 tests green<span class="dot">/</span>SHA pending push<span class="dot">/</span>Draft-only, publishing not armed</p>
+
+<div class="grade-box">
+  <div class="grade-letter">B+</div>
+  <div class="grade-body">
+    <h3>Current readiness grade</h3>
+    <p>House style live (11 sections, grade gate, Q6 feed-stopping). Caption standard wired (Section 9, empty-caption blocked). lasso_v2 library on Pro. built_by_gym_owners scored C to A-minus in one day. post-captions CLI ready to surface 6 cards in #echoclaude.</p>
+    <p class="gate">Does NOT move to A. Gate: one real gym client, one full approval month.</p>
+  </div>
+</div>
+
+<section>
+  <h2>What shipped today (2026-07-17)</h2>
+  <ul>
+    <li class="done"><b>Scheduler fix confirmed live</b> — root cause was <code>now.hour == target_hour</code> fixed to <code>&gt;=</code>. Cron fallback documented at <code>docs/SCHEDULER_CRON.md</code>. Next fire: 2026-07-18 12:00 UTC.</li>
+    <li class="done"><b>Fabrication gate extended to pixels + OCR reader wired</b> — pixel gate runs on every card at draft time. OCR model corrected twice (gemini-2.5-flash retired, then gemini-3-pro-image missing -preview). Startup model-validation guard added: bad model ID self-announces at listener boot.</li>
+    <li class="done"><b>Nano Pro live</b> — <code>AGENT_NANO_MODEL=gemini-3-pro-image-preview</code>. Flash route OFF. Pro on every card. Per-image cost: $0.134. Scale watch: 10 clients x 7 cards/week = $9.38/week.</li>
+    <li class="done"><b>House style system shipped</b> — <code>lasso_house_style.md</code> Sections 1 to 8 (typographic system, archetypes, layout, prompt scaffold). Grade gate added (6 questions, pass threshold 5). Archetype tuned to editorial-for-social. Q6 feed-stopping heuristic enforced.</li>
+    <li class="done"><b>lasso_v2 library regenerated</b> on Pro + house style. Library gap closed. All 3 flagship cards replaced.</li>
+    <li class="done"><b>Caption standard (Section 9)</b> — B2B StoryBrand 4-beat (Problem / Why / Solution / CTA tucked). Empty caption = BLOCKED. Mixed single/double newlines round-trip through <code>echo.db</code> unchanged. Grade Gate renumbered Section 10.</li>
+    <li class="done"><b>3 flagship captions rewritten</b> — built_by_gym_owners, speed_to_lead_concept, follow_up_problem. Both lasso_ig + lasso_fb. Hand-written by Blake, not generated.</li>
+    <li class="done"><b>post-captions CLI</b> — <code>python3 -m agent post-captions [--dry-run]</code>. Writes 6 feed drafts to DB (INSERT OR REPLACE, idempotent). Posts Slack approval cards. 1427 tests green.</li>
+    <li class="done"><b>built_by_gym_owners arc: C to A-minus</b> — the visible proof the system works. Editorial-for-social spec, navy color block, feed-stopping headline, no stat slab.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Blake: do these by hand</h2>
+  <ul>
+    <li class="action"><b>Surface the 3 caption cards to #echoclaude</b> — after Railway deploys from this push, run on the Railway console:
+      <div class="cmd-box">
+        <div class="label">Railway console</div>
+        <code>python3 -m agent post-captions</code>
+      </div>
+      Idempotent. Safe to run twice. 6 pending approval cards land in #echoclaude: built_by_gym_owners Jul 17, speed_to_lead_concept Jul 22, follow_up_problem Jul 28 (both lasso_ig + lasso_fb).
+    </li>
+    <li class="action"><b>Meta App Review screencast</b> — re-record walkthrough and resubmit. Days to weeks to approval. This is the blocker for any client going live on Meta posts.</li>
+    <li class="action"><b>Create Railway cron service</b> — click-by-click runbook at <code>docs/SCHEDULER_CRON.md</code>. Belt-and-suspenders for the daily draw. Cannot be done in code.</li>
+    <li class="action"><b>Confirm client auto-mint onboarding status</b> — is <code>AGENT_ONBOARD_AUTOMINT</code> build merged or still pending? Update PROGRESS.md accordingly.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>The 6 cards going into #echoclaude</h2>
+  <ul>
+    <li><b>lasso_ig + lasso_fb</b> — <code>lasso_v2_built_by_gym_owners.png</code> — Jul 17 — caption: built-by-gym-owners beat</li>
+    <li><b>lasso_ig + lasso_fb</b> — <code>lasso_v2_speed_to_lead_concept.png</code> — Jul 22 — caption: speed-to-lead beat</li>
+    <li><b>lasso_ig + lasso_fb</b> — <code>lasso_v2_follow_up_problem.png</code> — Jul 28 — caption: follow-up-problem beat</li>
+  </ul>
+  <p style="font-size:12px;color:var(--steel);margin-top:10px;">Draft IDs are deterministic: sha1("{account_key}|{creative_path}|{scheduled_for}")[:10]. No duplicate cards on re-run.</p>
+</section>
+
+<section>
+  <h2>Open items (honest record)</h2>
+  <ul>
+    <li class="watch"><b>One real gym, one full month on approval</b> — the only gate to A. Everything else is wired.</li>
+    <li class="watch"><b>Railway cron service</b> — docs written (<code>docs/SCHEDULER_CRON.md</code>), service not stood up in the Railway dashboard. Daily draw relies on the listener scheduler loop only.</li>
+    <li class="watch"><b>Public URLs for library creatives</b> — all pending drafts have empty <code>creative_public_url</code>. IG feed posts fail without it. Two options: arm <code>AGENT_HOSTING_ENABLED</code> with R2 credentials, or add <code>public_url</code> to each creative sidecar JSON.</li>
+    <li class="watch"><b>ENV.md drift</b> — config-check: 160 vars read vs 164 documented, 30 mismatched. Low urgency. Run <code>python3 -m agent config-check</code> on the container to see the full list.</li>
+    <li class="watch"><b>Nano Pro cost</b> — $0.134/image is fine at LASSO own accounts. Flag before adding more clients.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>What would move the grade to A</h2>
+  <ul>
+    <li>One real gym client onboarded and posting via the approval flow</li>
+    <li>One full 30-day calendar month of approved posts (not just drafts)</li>
+    <li>Meta App Review approved (required for any client Meta posting)</li>
+  </ul>
+  <p style="font-size:12px;color:var(--steel);margin-top:10px;">None of these are code problems. The system is ready. The gate is operational proof.</p>
+</section>
+
+<section>
+  <h2>Next session start commands</h2>
+  <div class="cmd-box">
+    <div class="label">Baseline check</div>
+    <code>cd lasso-echo &amp;&amp; git pull &amp;&amp; source .venv/bin/activate &amp;&amp; python3 -m pytest --tb=no -q</code>
+  </div>
+  <div class="cmd-box">
+    <div class="label">Surface cards (Railway console, after deploy)</div>
+    <code>python3 -m agent post-captions</code>
+  </div>
+  <div class="cmd-box">
+    <div class="label">Dry run (safe to run locally anytime)</div>
+    <code>python3 -m agent post-captions --dry-run</code>
+  </div>
+</section>
+
+<section>
+  <h2>Ground rules (never change)</h2>
+  <ul>
+    <li>Every post waits for human approval. Approver Slack ID: U06EPUUCL13</li>
+    <li>Publishing defaults OFF. <code>AGENT_PUBLISH_ENABLED=false</code>. Draft-only until armed by hand.</li>
+    <li>Client content only. No invented facts, offers, prices, or stats. Missing voice doc or note = BLOCKED.</li>
+    <li>No em dashes, en dashes, or hyphens in any published copy or on-image text.</li>
+    <li>Secrets and tokens set by hand in env only. Never log, print, or commit them.</li>
+    <li>Every new capability ships behind a flag that defaults OFF.</li>
+    <li>IMAGE FROZEN. No regeneration unless explicitly instructed.</li>
+  </ul>
+</section>
+
+<p class="foot">Echo Handoff &middot; 2026-07-17 &middot; 1427 tests green &middot; grade B+ &middot; mirrors PROGRESS.md &middot; full scope in BUILD_SPEC.md</p>

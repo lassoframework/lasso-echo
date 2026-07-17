@@ -10,6 +10,28 @@ Last updated: 2026-07-17
 
 ---
 
+## post-captions CLI + Section 9 caption standard wired (2026-07-17, SHA d858d5a + this commit)
+
+`python3 -m agent post-captions` writes 6 hand-crafted feed drafts to the DB
+(INSERT OR REPLACE, idempotent) and posts Slack approval cards to #echoclaude.
+Section 9 of lasso_house_style.md is the live caption standard for ALL future cards.
+
+Deploy: Railway auto-deploys from main. After it picks up, run on the Railway console:
+```
+python3 -m agent post-captions
+```
+No flags needed. Idempotent: safe to run twice.
+
+Grade: B+. Does NOT move to A.
+Gate to A: one real gym client, one full month on approval.
+Open items:
+- Blake: re-record Meta App Review screencast and resubmit (2026-07-18)
+- Blake: create Railway cron service (runbook at docs/SCHEDULER_CRON.md)
+- Blake: confirm client auto-mint onboarding status (merged or still pending)
+- Cleanup: ENV.md drift (160 read vs 164 documented, 30 mismatched)
+
+---
+
 ## Caption fix: exact Blake captions applied to 3 cards on lasso_ig + lasso_fb (2026-07-17)
 
 6 feed drafts written directly to echo.db (status=pending, draft_type=feed). No code

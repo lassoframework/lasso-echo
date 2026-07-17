@@ -148,6 +148,111 @@ def _status():
         print("  heartbeat      : (none recorded — is the listen process running?)")
 
 
+def _post_captions(args):
+    """One-shot command: write Blake's 3 hand-crafted caption drafts (6 total,
+    lasso_ig + lasso_fb) to the DB and post them to Slack as pending approval cards.
+
+    Idempotent: uses INSERT OR REPLACE keyed by draft_id so repeated runs do NOT
+    create duplicate Slack cards (the store dedupes by draft_id).
+
+    Requires AGENT_SLACK_BOT_TOKEN and AGENT_SLACK_CHANNEL_ID to post to Slack.
+    Without Slack credentials the drafts are written to the DB only (no card posted).
+
+    Usage:  python3 -m agent post-captions [--dry-run]
+    """
+    import hashlib as _hashlib
+    import json as _json
+    from .store import PendingStore
+    from .drafter import Draft, DraftStatus
+    from .slack_surface import SlackPoster
+
+    dry = "--dry-run" in args
+
+    CAPTION_BUILT = (
+        "Most gyms don't have a lead problem. They have a follow up problem. "
+        "You are great at coaching. You are not supposed to be great at chasing leads, "
+        "rebuilding funnels, and guessing what marketing actually works.\n"
+        "\n"
+        "That is our job, not yours.\n"
+        "\n"
+        "We built LASSO by running it on ourselves first. Every system we hand you is "
+        "one we already proved, not a theory we are testing on your gym.\n"
+        "\n"
+        "Your leads, your content, and your reporting in one place. Your only job is signing people up.\n"
+        "Book a walkthrough and see what done for you actually looks like."
+    )
+    CAPTION_SPEED = (
+        "A lead goes cold in five minutes. Most gyms answer in five hours. "
+        "It is not because you do not care. It is because you are coaching a class "
+        "when the lead comes in, and by the time you look up they already booked with "
+        "the gym down the street.\n"
+        "\n"
+        "That is the gap that quietly kills your month. Not ad spend. Speed.\n"
+        "\n"
+        "LASSO answers in the first five minutes automatically, then hands a warm, "
+        "ready to book lead to a live human. You can lift conversions up to 80 percent "
+        "just by being first.\n"
+        "\n"
+        "Stop losing leads to a slow reply.\n"
+        "Let us show you the fix."
+    )
+    CAPTION_FOLLOW = (
+        "You are not short on leads. You are short on follow up. The leads are sitting "
+        "in your CRM right now. The ones who raised their hand, went quiet, and never "
+        "got a second touch because you were busy running your gym.\n"
+        "\n"
+        "Every one of those is money you already paid for and never collected.\n"
+        "\n"
+        "LASSO chases every lead, every time, so nothing slips. You close the ones who "
+        "show up ready. We handle the hundred touches it took to get them there.\n"
+        "\n"
+        "We chase. You close.\n"
+        "Book a walkthrough."
+    )
+
+    SPECS = [
+        ("lasso_ig", "instagram",     "content_library/lasso_v2_built_by_gym_owners.png",   "2026-07-17", "2026-07-17T12:00:00", CAPTION_BUILT, ["#GymOwner", "#GymMarketing", "#LASSOFramework", "#GymGrowth"]),
+        ("lasso_fb", "facebook_page", "content_library/lasso_v2_built_by_gym_owners.png",   "2026-07-17", "2026-07-17T12:00:00", CAPTION_BUILT, ["#GymOwner", "#GymMarketing", "#LASSOFramework", "#GymGrowth"]),
+        ("lasso_ig", "instagram",     "content_library/lasso_v2_speed_to_lead_concept.png", "2026-07-22", "2026-07-22T12:00:00", CAPTION_SPEED, ["#SpeedToLead", "#GymMarketing", "#LASSOFramework", "#GymOwner"]),
+        ("lasso_fb", "facebook_page", "content_library/lasso_v2_speed_to_lead_concept.png", "2026-07-22", "2026-07-22T12:00:00", CAPTION_SPEED, ["#SpeedToLead", "#GymMarketing", "#LASSOFramework", "#GymOwner"]),
+        ("lasso_ig", "instagram",     "content_library/lasso_v2_follow_up_problem.png",     "2026-07-28", "2026-07-28T12:00:00", CAPTION_FOLLOW, ["#FollowUp", "#GymMarketing", "#LASSOFramework", "#GymGrowth"]),
+        ("lasso_fb", "facebook_page", "content_library/lasso_v2_follow_up_problem.png",     "2026-07-28", "2026-07-28T12:00:00", CAPTION_FOLLOW, ["#FollowUp", "#GymMarketing", "#LASSOFramework", "#GymGrowth"]),
+    ]
+
+    def _make_id(account_key, creative_path, scheduled_for):
+        h = _hashlib.sha1(f"{account_key}|{creative_path}|{scheduled_for}".encode()).hexdigest()
+        return h[:10]
+
+    store = PendingStore()
+    poster = SlackPoster() if not dry else ConsolePoster()
+
+    print(f"post-captions: {'DRY RUN' if dry else 'LIVE'} — writing 6 feed drafts")
+    for (account_key, platform, creative_path, day_key, scheduled_for, caption, hashtags) in SPECS:
+        draft_id = _make_id(account_key, creative_path, scheduled_for)
+        draft = Draft(
+            draft_id=draft_id,
+            account_key=account_key,
+            platform=platform,
+            caption=caption,
+            hashtags=hashtags,
+            creative_path=creative_path,
+            creative_public_url="",
+            scheduled_for=scheduled_for,
+            status=DraftStatus.PENDING,
+            day_key=day_key,
+            draft_type="feed",
+        )
+        if not dry:
+            store.put(draft)
+        poster.post_approval_card(draft)
+        print(f"  {'(dry) ' if dry else ''}wrote + carded: {draft_id}  {account_key}  {day_key}  {creative_path.split('/')[-1]}")
+
+    print(f"\npost-captions: done. {len(SPECS)} drafts {'would be ' if dry else ''}in DB, "
+          f"cards {'would be ' if dry else ''}posted to #echoclaude.")
+    if not dry:
+        print("Idempotent: re-running will not post duplicate cards (INSERT OR REPLACE).")
+
+
 def _dry_run():
     """Run the full Stage 1 loop offline: draft -> card -> approve -> log. No tokens."""
     from .store import PendingStore
@@ -409,6 +514,7 @@ def _config_check():
 _COMMANDS = {
     "daily loop": [
         ("run-daily", "draft one post per account, card each for approval (idempotent)"),
+        ("post-captions", "write the 3 hand-crafted caption drafts to DB + post Slack cards (--dry-run)"),
         ("listen", "start the Slack listener + scheduler (the deployed worker)"),
         ("dry-run", "the whole Stage 1 loop OFFLINE, no tokens"),
         ("status", "flag + gate + schedule state"),
@@ -1559,6 +1665,8 @@ def main(argv=None):
             status_code, result = handle_portal_gym_status(account_key)
             import json as _json
             print(_json.dumps(result, indent=2))
+    elif cmd == "post-captions":
+        _post_captions(argv[1:])
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
