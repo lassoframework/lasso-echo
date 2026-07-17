@@ -316,7 +316,7 @@ def _daily_scheduler(store):
         # unless AGENT_DIGEST_ENABLED. Never crashes the loop.
         if config.digest_enabled():
             try:
-                from . import digest, ops_alerts
+                from . import digest
                 poster = ops_alerts._default_poster()
                 digest.maybe_send(poster, now=now, library_path=config.LIBRARY_PATH)
             except Exception as e:
@@ -333,7 +333,7 @@ def _daily_scheduler(store):
         # AGENT_BRAIN_PROPOSALS_ENABLED. Never crashes the loop.
         if config.brain_proposals_enabled():
             try:
-                from . import brain, ops_alerts
+                from . import brain
                 brain.maybe_send(ops_alerts._default_poster(), now=now)
             except Exception as e:
                 print(f"[brain] pass failed: {type(e).__name__}: {e}")

@@ -120,9 +120,10 @@ def parse_feed(xml_text):
 # ---- polling ------------------------------------------------------------------------
 def _default_fetch():
     url = config.PODCAST_FEED_URL
-    if not url:
+    if not url or url.startswith("<") or "://" not in url:
         raise ValueError("AGENT_PODCAST_ENABLED is armed but AGENT_PODCAST_FEED_URL "
-                         "is not set. Stopping loud, not guessing.")
+                         f"is not set to a valid URL (got: {url!r}). "
+                         "Set AGENT_PODCAST_FEED_URL=https://... in Railway vars.")
     import requests
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
