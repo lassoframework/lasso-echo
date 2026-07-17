@@ -68,17 +68,53 @@ BRAND_PALETTE = (
     "brand-consistent; calm, premium, easy to read."
 )
 
-# Composition: a LOCKED house style (consistent every card so the run reads as one brand
-# system) while the illustrated SUBJECT varies by pillar. No forced monitor/dashboard.
+# Composition: LOCKED house style from brand_voice/lasso_house_style.md section 7.
+# The constants below match that document exactly. When the doc changes, update here.
 # The house style is shared by every surface; the LAYOUT block is per surface (the 4:5
 # feed card and the 9:16 Story compose differently), selected in build_prompt.
+#
+# Three new structural elements vs the pre-house-style defaults (enforced in code):
+#   TYPOGRAPHIC SYSTEM: eyebrow (small caps) + headline (large, left-aligned) + deck
+#   LAYOUT RULES: left-aligned, asymmetric, ONE depth layer
+#   These replace centered / symmetric / slab defaults which are now retired.
+
+# Block A (section 7): Typographic system. Three levels, all left-aligned.
+# Kept as a separate constant so tests can assert these new elements are present.
+HOUSE_STYLE_TYPOGRAPHIC_SYSTEM = (
+    "TYPOGRAPHIC SYSTEM (apply exactly, three levels, all left-aligned):\n"
+    "EYEBROW: one short ALL-CAPS label in small type at the very top left of the "
+    "content area, naming the context in 1 to 3 words (examples: LEAD SPEED, "
+    "FOLLOW UP, BOOKING RATE). This is the only small-caps line.\n"
+    "HEADLINE: the ONE large text element, set BIG and BOLD directly below the "
+    "eyebrow, left-aligned, never centered. This is what the reader sees first. "
+    "The headline is the ONLY large text.\n"
+    "DECK: one short sentence set SMALL directly below the headline at about one "
+    "third the headline size, left-aligned. One line of context, never competing "
+    "with the headline."
+)
+
+# Block B (section 7): Layout rules. Left-aligned, asymmetric, one depth layer.
+HOUSE_STYLE_LAYOUT_RULES = (
+    "LAYOUT RULES (no exceptions):\n"
+    "LEFT-ALIGNED: every text element anchors to the left edge of the content area. "
+    "Nothing is centered. Nothing is symmetric.\n"
+    "ASYMMETRIC: visual weight sits on one side; the other side breathes. The text "
+    "column is the left spine. The illustrated element occupies the right half, the "
+    "bottom two thirds, or a diagonal zone.\n"
+    "ONE DEPTH LAYER: exactly one subtle depth element on the card: a light wash "
+    "behind the illustrated element, a soft drop shadow on the headline type, or a "
+    "very faint geometric shape in the background field. Never a texture. Never a "
+    "pattern. One quiet layer only."
+)
+
 _HOUSE_STYLE_LEAD = (
-    "House style, the LASSO brand system (keep this CONSISTENT on every card so the "
-    "whole run reads as one brand system): a clean, minimal, modern FLAT infographic on "
-    "a cream canvas with generous negative space, uncluttered and premium. ONE navy "
-    "headline, bold but not shouting; the headline is the ONLY large text. All artwork "
-    "is simple line-icon illustrations with small UPPERCASE labels, drawn with a "
-    "consistent stroke weight in the brand palette."
+    "House style, the LASSO brand system (keep CONSISTENT on every card so the "
+    "whole run reads as one brand system): a clean, minimal, modern infographic on "
+    "a cream canvas with generous negative space, uncluttered and premium.\n"
+    f"{HOUSE_STYLE_TYPOGRAPHIC_SYSTEM}\n"
+    f"{HOUSE_STYLE_LAYOUT_RULES}\n"
+    "All artwork is simple line-icon illustrations with small UPPERCASE labels, "
+    "drawn with a consistent stroke weight in the brand palette."
 )
 
 # ---- Layout ARCHETYPES: the composition varies, the brand never does. Every card
@@ -359,6 +395,56 @@ NO_DASH_RULE = (
     "text. Use the word 'to' for ranges."
 )
 
+# Banned phrases for the rendered headline text (enforced in code, not just prompt).
+_BANNED_HEADLINE_WORDS = ("vendor",)
+_BANNED_PROMPT_PHRASES = (
+    "centered composition", "symmetric layout", "symmetrical layout",
+    "centered symmetrically", "centered and symmetric",
+)
+
+
+def _check_headline_hard_rules(headline):
+    """Raise ValueError for banned content in the rendered headline text.
+    The dash check is handled by _scrub_dashes; this catches remaining bans."""
+    hl = str(headline or "").lower()
+    for word in _BANNED_HEADLINE_WORDS:
+        if word in hl:
+            raise ValueError(
+                f"build_prompt: banned word '{word}' in rendered headline. "
+                f"Remove it before generating."
+            )
+
+
+def _check_prompt_hard_rules(prompt_text):
+    """Raise ValueError if the composed prompt contains a banned instruction.
+    Catches centered-symmetric language that must never appear in a generation prompt."""
+    p_lower = (prompt_text or "").lower()
+    for phrase in _BANNED_PROMPT_PHRASES:
+        if phrase in p_lower:
+            raise ValueError(
+                f"build_prompt: banned instruction phrase '{phrase}' in prompt. "
+                f"No card may instruct a centered or symmetric composition."
+            )
+
+
+def _route_model(headline="", facts=None):
+    """Return (model_name, route_label) for one card.
+
+    Source of truth: brand_voice/lasso_house_style.md section 6.
+
+    Amendment default: ALL cards use NANO_MODEL (Pro) unless the Flash route is
+    explicitly armed via AGENT_NANO_FLASH_ENABLED. When Flash is ON, cards with
+    no rendered headline text and no stat figures may route to NANO_MODEL_FLASH.
+    The actual model is never hardcoded; both names come from config so Blake
+    can change either by editing the env var on the container.
+    """
+    if not config.nano_flash_enabled():
+        return config.NANO_MODEL, f"pro:all (flash route disabled, model={config.NANO_MODEL})"
+    has_digits = facts and any(any(c.isdigit() for c in str(f)) for f in facts)
+    if str(headline or "").strip() or has_digits:
+        return config.NANO_MODEL, f"pro:rendered-text (model={config.NANO_MODEL})"
+    return config.NANO_MODEL_FLASH, f"flash:photographic (model={config.NANO_MODEL_FLASH})"
+
 
 def _scrub_dashes(text):
     """Strip em/en dashes from approved copy (the brand no-dash rule). Hyphens and
@@ -393,6 +479,7 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
     palette for this one card. Both None (the default everywhere) = the
     original path, byte for byte.
     """
+    _check_headline_hard_rules(headline)
     fact_lines = "\n".join(f"- {_scrub_dashes(f)}" for f in facts if str(f).strip())
     # Aspect first and prominent. Config-tunable; per-use overridable.
     use_aspect = aspect or config.IMAGE_ASPECT
@@ -427,7 +514,9 @@ def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,
         f"{style_tail}\n"
         f"{NO_DASH_RULE}"
     )
-    return _scrub_dashes(prompt)
+    result = _scrub_dashes(prompt)
+    _check_prompt_hard_rules(result)
+    return result
 
 
 # ---- Social proof cards: two templates in the locked V3 house style -----------
@@ -627,7 +716,33 @@ def generate(headline, facts, client=None, out_path=None,
     if client is None:
         return None
 
-    image_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
+    model, route = _route_model(headline, facts)
+    print(f"[creative-studio] model route: {route}")
+
+    def _do_generate(p):
+        return client.generate_image(prompt=p, model=model)
+
+    image_bytes = _do_generate(prompt)
+
+    if config.style_gate_enabled():
+        from . import grade_gate as _gg
+        result1 = _gg.grade_card(prompt, headline=headline or "")
+        if not result1.passed:
+            print(f"[creative-studio] grade gate failed (attempt 1): "
+                  f"{result1.failed_questions} — regenerating")
+            prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
+                                  surface=surface, archetype=archetype, palette=palette,
+                                  canvas=canvas, layout=layout)
+            image_bytes = _do_generate(prompt)
+            result2 = _gg.grade_card(prompt, headline=headline or "")
+            if not result2.passed:
+                from . import ops_alerts as _ops
+                qs = ", ".join(result2.failed_questions)
+                _ops.alert(
+                    f"house-style fail: {headline or '(no headline)'} failed "
+                    f"grade gate twice. Questions: {qs}. Card withheld."
+                )
+                return None
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"
@@ -635,4 +750,4 @@ def generate(headline, facts, client=None, out_path=None,
     with open(out_path, "wb") as fh:
         fh.write(image_bytes)
 
-    return {"path": out_path, "prompt": prompt}
+    return {"path": out_path, "prompt": prompt, "model": model, "route": route}

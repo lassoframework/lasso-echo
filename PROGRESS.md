@@ -10,6 +10,46 @@ Last updated: 2026-07-17
 
 ---
 
+## House style system wired into creative pipeline (2026-07-17)
+
+### What shipped (suite 1385 green)
+
+**`brand_voice/lasso_house_style.md`** — source of truth for every generated card.
+Sections 1-9: brand DNA, hard copy rules, model routing, generation prompt scaffold
+(Blocks A-D), five-question grade gate, and retired patterns.
+
+**`agent/config.py`** — two new flags + two new constants:
+- `NANO_MODEL_FLASH` (env `AGENT_NANO_MODEL_FLASH`, default `gemini-3.1-flash-image`)
+- `HOUSE_STYLE_PATH` (env `AGENT_HOUSE_STYLE_PATH`)
+- `nano_flash_enabled()` (env `AGENT_NANO_FLASH_ENABLED`, **OFF** by default)
+- `style_gate_enabled()` (env `AGENT_STYLE_GATE_ENABLED`, **OFF** by default)
+
+**`agent/creative_studio.py`** — typographic system + layout rules wired in:
+- `HOUSE_STYLE_TYPOGRAPHIC_SYSTEM` + `HOUSE_STYLE_LAYOUT_RULES` constants (section 7)
+- `_HOUSE_STYLE_LEAD` updated to include eyebrow, left-aligned headline, deck, asymmetric layout, one depth layer
+- `_check_headline_hard_rules()` — raises ValueError for "vendor" in headline
+- `_check_prompt_hard_rules()` — raises ValueError for banned centered/symmetric phrases
+- `_route_model()` — default ALL cards to Pro; Flash opt-in via `AGENT_NANO_FLASH_ENABLED`
+- `generate()` — uses `_route_model()`, logs routing per card, returns `model` + `route` in dict, wires grade gate when `AGENT_STYLE_GATE_ENABLED`
+
+**`agent/grade_gate.py`** — new module. Five-question house-style grade gate:
+- Q3/Q4 programmatic; Q1/Q2/Q5 vision-model (pass-through when vision unavailable)
+- `grade_card()` returns `GradeResult(scores, passed, failed_questions)`
+- Pass threshold: ≤1 hard False of 5 questions
+
+**`agent/__main__.py`** — `regen-weak-cards` command added (built_by_gym_owners +
+speed_to_lead_stat; Pro model; fabrication + grade gate; draft only, never publishes).
+Also added `nano_flash` and `style_gate` to `_status()` output.
+
+**Tests** — 3 new/updated test files, 23 new assertions:
+- `tests/test_house_style.py` — 8 new assertions (eyebrow, left-aligned, deck, never centered, asymmetric, depth layer, banned phrases absent)
+- `tests/test_model_routing.py` — 7 new tests (flash off/on routing + return dict)
+- `tests/test_grade_gate.py` — 14 new tests (Q3/Q4 heuristics, GradeResult, grade_card)
+
+Two open decisions in PROGRESS.md unchanged: brand palette and publish path.
+
+---
+
 ## Incident post-mortem + story public URL fix (2026-07-17, SHA `dc982bc`)
 
 ### Root cause: all pending drafts had no public URL

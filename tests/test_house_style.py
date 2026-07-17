@@ -39,6 +39,16 @@ def test_prompt_carries_illustrated_diagram_style():
     for hexcode in ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0"):
         assert hexcode in p
     assert "never a red background" in low
+    # house style section 7 typographic system
+    assert "eyebrow" in low
+    assert "left-aligned" in low or "left aligned" in low
+    assert "deck" in low
+    assert "never centered" in low
+    assert "asymmetric" in low
+    assert "depth layer" in low
+    # banned composition instructions must NEVER appear in a generated prompt
+    assert "centered composition" not in low
+    assert "symmetrical" not in low
 
 
 def test_story_prompt_same_style_designed_from_scratch():

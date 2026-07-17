@@ -68,7 +68,17 @@ GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # OFF by default. The API key is read lazily in creative_studio.py (like tokens),
 # never stored on an object and never logged. Only the env var NAME lives here.
 NANO_API_KEY_ENV = "AGENT_NANO_API_KEY"  # name of the env var, not the value
+# Generation models. NANO_MODEL is the default for ALL cards (Pro tier for text
+# accuracy). NANO_MODEL_FLASH is the optional lower-cost route for photographic
+# or text-light fills; gated behind nano_flash_enabled() (OFF by default).
+# Neither model is hardcoded: both read from env so Blake changes them by hand.
+# Source of truth: brand_voice/lasso_house_style.md section 6.
 NANO_MODEL = os.environ.get("AGENT_NANO_MODEL", "gemini-3-pro-image")
+NANO_MODEL_FLASH = os.environ.get("AGENT_NANO_MODEL_FLASH", "gemini-3.1-flash-image")
+# House style source of truth: the prompt scaffold and grade gate are defined
+# in this document. Code constants in creative_studio.py must match section 7.
+HOUSE_STYLE_PATH = os.environ.get("AGENT_HOUSE_STYLE_PATH",
+                                  "brand_voice/lasso_house_style.md")
 # VISION READ model (image -> text), SEPARATE from the generation model above.
 # The *-image models (Nano Banana family: gemini-3-pro-image, gemini-3.1-flash-image)
 # GENERATE images and return image parts, not text, so they cannot transcribe text
@@ -138,6 +148,29 @@ def creative_studio_enabled() -> bool:
     controls whether Echo draws an infographic, never whether it posts.
     """
     return _truthy(os.environ.get("AGENT_NANO_ENABLED", "false"))
+
+
+def nano_flash_enabled() -> bool:
+    """
+    Flash model route switch. OFF by default = ALL cards use NANO_MODEL (Pro).
+    When ON, photographic or text-light fills route to NANO_MODEL_FLASH instead.
+    Text-heavy cards (headline, labels, stats) always stay on the Pro model
+    regardless of this flag. The actual model used is logged per card.
+    Arm by hand in Railway env only; source of truth: lasso_house_style.md sec 6.
+    """
+    return _truthy(os.environ.get("AGENT_NANO_FLASH_ENABLED", "false"))
+
+
+def style_gate_enabled() -> bool:
+    """
+    House-style five-question grade gate switch. OFF by default. When ON, every
+    generated card is scored against the five questions in lasso_house_style.md
+    section 8 before entering the approval queue. A card failing two or more
+    questions is regenerated once; if it still fails, ops_alert fires with named
+    failing questions and the card is withheld from the queue. This is ADDITIVE
+    to the fabrication gate: both must pass. OFF = generation behavior unchanged.
+    """
+    return _truthy(os.environ.get("AGENT_STYLE_GATE_ENABLED", "false"))
 
 
 def hosting_enabled() -> bool:

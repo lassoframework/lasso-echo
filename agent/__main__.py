@@ -62,6 +62,8 @@ def _status():
     print("  -- capability flags --")
     print(f"  content_brain  : {config.content_brain_enabled()}  (env AGENT_CONTENT_BRAIN_ENABLED)")
     print(f"  creative_studio: {config.creative_studio_enabled()}  (env AGENT_NANO_ENABLED)")
+    print(f"  nano_flash     : {config.nano_flash_enabled()}  (env AGENT_NANO_FLASH_ENABLED)")
+    print(f"  style_gate     : {config.style_gate_enabled()}  (env AGENT_STYLE_GATE_ENABLED)")
     print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
     print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
     print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
@@ -444,6 +446,7 @@ _COMMANDS = {
     ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
+        ("regen-weak-cards", "regenerate the two off-style seed cards in house style (draft only, never publishes)"),
         ("library-audit", "scan library for MISSING/THIN creatives (--account / --all)"),
         ("fabrication-scan", "retro-scan the queue for rendered stats with no approved receipt (--dry-run)"),
         ("dam-scan", "scan/tag the library"),
@@ -706,6 +709,37 @@ def main(argv=None):
             from .bible_drafter import run as draft_bible_run
             bible_path, proof_path = draft_bible_run(client, intake)
             print(f"DRAFTS written (review + activate by hand):\n  {bible_path}\n  {proof_path}")
+    elif cmd == "regen-weak-cards":
+        # MANUAL: regenerate the two off-style seed cards under the new house style.
+        # Routes to Pro model. Runs fabrication gate AND grade gate (if armed).
+        # Lands as drafts only; never auto-publishes. Requires AGENT_NANO_ENABLED=true
+        # and a valid GEMINI_API_KEY on the container; no-ops safely without them.
+        from .regen_library import _generate_one, CONCEPTS
+        weak_cards = ["built_by_gym_owners", "speed_to_lead_stat"]
+        found = [k for k in weak_cards if k in CONCEPTS]
+        if not found:
+            print("regen-weak-cards: concept keys not found in regen_library.CONCEPTS. "
+                  "Nothing done.")
+        else:
+            dry_run = "--dry-run" in argv[1:]
+            for key in found:
+                concept = CONCEPTS[key]
+                if dry_run:
+                    print(f"regen-weak-cards [dry-run]: would regenerate '{key}' "
+                          f"headline='{concept.get('headline', '')}' -> "
+                          f"model={config.NANO_MODEL}, gate=fabrication+grade")
+                else:
+                    print(f"regen-weak-cards: regenerating '{key}' ...")
+                    result = _generate_one(key)
+                    if result is None:
+                        print(f"  {key}: skipped (flag off, no API key, or gate blocked)")
+                    else:
+                        print(f"  {key}: OK -> {result.get('path', '?')} "
+                              f"model={result.get('model', '?')} "
+                              f"route={result.get('route', '?')}")
+            if not dry_run:
+                print("regen-weak-cards: done. Both cards are DRAFT ONLY — "
+                      "no post was sent. Review and approve by hand.")
     elif cmd == "regen-library":
         # MANUAL batch rebuild of the seed library in the v2 house style (never
         # scheduled, no flag arms it into the daily path). Prints one public URL

@@ -23,6 +23,7 @@ brand_voice/*
 !brand_voice/.gitkeep
 !brand_voice/lasso_voice.example.md
 !brand_voice/lasso_voice.md
+!brand_voice/lasso_house_style.md
 !brand_voice/social_proof.example.md
 !brand_voice/social_proof.md
 !brand_voice/BRAND_VOICE_INTAKE.example.md
