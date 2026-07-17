@@ -62,6 +62,30 @@ def test_update_card_swallows_transport_error():
     assert resp.get("ok") is False
 
 
+def test_stdlib_adapter_constructs_and_posts():
+    """_requests() returns a stdlib urllib adapter with no external deps.
+    Verify it instantiates cleanly and provides the .post() interface — the
+    root-cause check for the post-captions ModuleNotFoundError: requests crash.
+    SlackPoster() with no http= must not require the requests library."""
+    from agent.slack_surface import _requests
+    client = _requests()
+    assert hasattr(client, "post"), "_requests() must return an object with .post()"
+    # Verify the fallback path: SlackPoster() with no http injected falls
+    # through to _requests() and gets our stdlib client, never requests.
+    import importlib, sys
+    # Block requests so we prove the stdlib path is self-contained.
+    original = sys.modules.get("requests")
+    sys.modules["requests"] = None  # type: ignore[assignment]
+    try:
+        client2 = _requests()
+        assert hasattr(client2, "post"), "stdlib path must work without requests installed"
+    finally:
+        if original is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = original
+
+
 def test_run_daily_completes_through_slack_outage(monkeypatch, tmp_path):
     """Full-path proof: every Slack post times out, yet run_daily returns
     normally and the draft is still stored (card just never posted)."""

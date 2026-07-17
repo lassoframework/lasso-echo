@@ -19,8 +19,36 @@ from .meta_publisher import _is_video
 
 
 def _requests():
-    import requests
-    return requests
+    """Stdlib urllib adapter — same interface as requests, zero extra deps.
+    SlackPoster._send calls client.post(url, headers=..., data=..., timeout=...)
+    and reads resp.status_code / resp.json() / resp.headers."""
+    import json as _json
+    import urllib.error as _ue
+    import urllib.request as _ur
+
+    class _Resp:
+        def __init__(self, status_code, body_bytes, headers):
+            self.status_code = status_code
+            self._body = body_bytes
+            self.headers = headers or {}
+
+        def json(self):
+            return _json.loads(self._body.decode())
+
+    class _Client:
+        def post(self, url, headers=None, data=None, timeout=30):
+            if isinstance(data, str):
+                data = data.encode()
+            req = _ur.Request(url, data=data, headers=headers or {}, method="POST")
+            try:
+                with _ur.urlopen(req, timeout=timeout) as r:
+                    return _Resp(r.status, r.read(), dict(r.headers))
+            except _ue.HTTPError as e:
+                # 4xx / 5xx: return a response so _send can read the Slack error
+                # body and status rather than propagating an exception.
+                return _Resp(e.code, e.read(), dict(e.headers))
+
+    return _Client()
 
 
 # Rate-limit backoff: a 12-account morning fan-out must not drop cards when
