@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LASSO Content Calendar</title>
+<style>
+  :root {
+    --navy: #121E3C;
+    --navy2: #1A2A50;
+    --red: #FF2A2A;
+    --sky: #5EB9E6;
+    --cream: #FAF6F0;
+    --steel: #D8E3EE;
+    --green: #3DD68C;
+    --amber: #F5A623;
+    --muted: rgba(255,255,255,.10);
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, 'Inter', Helvetica, Arial, sans-serif;
+    background: var(--navy);
+    color: var(--cream);
+    margin: 0;
+    padding: 20px 16px 60px;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .header h1 { font-size: 20px; margin: 0; }
+  .header .gym { font-size: 13px; color: var(--sky); margin: 0; letter-spacing: .08em; text-transform: uppercase; }
+  .nav { display: flex; gap: 8px; align-items: center; }
+  .nav button {
+    background: var(--muted);
+    border: none;
+    color: var(--cream);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .nav .month-label { font-size: 15px; font-weight: 600; min-width: 100px; text-align: center; }
+  .approval-note {
+    background: rgba(94,185,230,.10);
+    border: 1px solid rgba(94,185,230,.25);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--steel);
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+  .approval-note strong { color: var(--cream); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 4px;
+    margin-bottom: 4px;
+  }
+  .day-label {
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--steel);
+    text-align: center;
+    padding: 6px 0;
+  }
+  .day-cell {
+    background: var(--muted);
+    border-radius: 8px;
+    min-height: 80px;
+    padding: 6px;
+    position: relative;
+  }
+  .day-cell.empty { background: rgba(255,255,255,.03); }
+  .day-cell.today { border: 1px solid var(--sky); }
+  .day-num {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--steel);
+    margin-bottom: 4px;
+  }
+  .day-cell.today .day-num { color: var(--sky); }
+  .draft-card {
+    background: var(--navy2);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    font-size: 11px;
+    line-height: 1.35;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+  }
+  .draft-card.pending    { border-left-color: var(--amber); }
+  .draft-card.approved   { border-left-color: var(--green); }
+  .draft-card.skipped    { border-left-color: rgba(255,255,255,.25); opacity: .55; }
+  .draft-card.superseded { border-left-color: rgba(255,255,255,.2); opacity: .45; }
+  .draft-card.expired    { border-left-color: rgba(255,0,0,.3); opacity: .5; }
+  .draft-card.blocked    { border-left-color: var(--red); }
+  .draft-status {
+    font-size: 9px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+    font-weight: 700;
+  }
+  .pending    .draft-status { color: var(--amber); }
+  .approved   .draft-status { color: var(--green); }
+  .skipped    .draft-status { color: rgba(255,255,255,.4); }
+  .superseded .draft-status { color: rgba(255,255,255,.35); }
+  .expired    .draft-status { color: rgba(255,80,80,.6); }
+  .blocked    .draft-status { color: var(--red); }
+  .draft-caption { color: var(--steel); }
+  /* Detail panel */
+  .detail-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.65);
+    z-index: 100;
+    justify-content: center;
+    align-items: flex-end;
+    padding: 0;
+  }
+  .detail-overlay.open { display: flex; }
+  .detail-panel {
+    background: var(--navy2);
+    border-radius: 20px 20px 0 0;
+    width: 100%;
+    max-width: 540px;
+    padding: 24px 20px 40px;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+  .detail-panel h3 { margin: 0 0 6px; font-size: 17px; }
+  .detail-panel .meta { font-size: 12px; color: var(--sky); margin-bottom: 16px; }
+  .detail-caption {
+    background: rgba(255,255,255,.06);
+    border-radius: 10px;
+    padding: 14px;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--cream);
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+  }
+  .slack-cta {
+    background: rgba(94,185,230,.10);
+    border: 1px solid rgba(94,185,230,.25);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 13px;
+    color: var(--steel);
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+  .slack-cta a { color: var(--sky); }
+  .panel-close {
+    width: 100%;
+    background: var(--muted);
+    border: none;
+    color: var(--cream);
+    border-radius: 10px;
+    padding: 14px;
+    font-size: 15px;
+    cursor: pointer;
+    font-family: inherit;
+    margin-top: 4px;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+    font-size: 11px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; color: var(--steel); }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  @media (max-width: 480px) {
+    .grid { gap: 2px; }
+    .day-cell { min-height: 60px; padding: 4px; }
+    .draft-status { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <p class="gym">District H</p>
+    <h1>Content Calendar</h1>
+  </div>
+  <div class="nav">
+    <button onclick="prevMonth()">&larr;</button>
+    <span class="month-label" id="monthLabel">July 2026</span>
+    <button onclick="nextMonth()">&rarr;</button>
+  </div>
+</div>
+
+<div class="approval-note">
+  <strong>Approvals happen in Slack.</strong> Tap a draft below to see the caption. To approve, edit, or skip it, go to your approval channel in Slack.
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#F5A623"></div> Pending approval</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#3DD68C"></div> Approved</div>
+  <div class="legend-item"><div class="legend-dot" style="background:rgba(255,255,255,.25)"></div> Skipped</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#FF2A2A"></div> Blocked</div>
+</div>
+
+<div class="grid" id="dayLabels"></div>
+<div class="grid" id="calGrid"></div>
+
+<div class="detail-overlay" id="overlay" onclick="closePanel(event)">
+  <div class="detail-panel" onclick="event.stopPropagation()">
+    <h3 id="panelDate">July 14, 2026</h3>
+    <p class="meta" id="panelMeta">Instagram &bull; 6:30 PM</p>
+    <div class="detail-caption" id="panelCaption"></div>
+    <div class="slack-cta" id="panelSlack">
+      To approve, edit, or skip this post, head to your Slack approval channel. Slack keeps your approval history and lets the team collaborate.
+    </div>
+    <button class="panel-close" onclick="closePanel()">Close</button>
+  </div>
+</div>
+
+<script>
+// Demo data for the calendar display
+// In production: replace DEMO_DRAFTS with data from the Echo calendar API
+// GET https://echo-intake-web-production.up.railway.app/api/calendar/<account_key>?month=YYYY-MM
+// (PLANNED endpoint (not yet live); see STATUS.md)
+
+var DEMO_DRAFTS = {
+  1:  [{ status:'approved',   platform:'instagram', time:'6:30 PM', caption:'Coach Marcus on the floor before 5am. This is what it looks like when someone means it. The 5am crew has been showing up like this for 3 years straight.' }],
+  3:  [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'Three weeks in and Sarah is already seeing the difference. She came in not knowing anyone. Now she is closing the gym down every Tuesday.' }],
+  5:  [{ status:'pending',    platform:'facebook',  time:'6:30 PM', caption:'New member intro is still open this week. 21 days for $21. No contract, no catch, no giant gym feel. Just real coaching and a crew that will remember your name.' }],
+  7:  [{ status:'skipped',    platform:'instagram', time:'6:30 PM', caption:'What does a Saturday look like at District H? We asked four members to describe it in one word.' }],
+  8:  [{ status:'approved',   platform:'instagram', time:'6:30 PM', caption:'Rest day does not mean sitting still. Here is how our coaches spend theirs. Spoiler: it still involves a kettlebell.' }],
+  10: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'The question we get asked most often: "Is this for beginners?" Yes. Marcus built this for the person who has tried everything else and stopped.' }],
+  12: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'Six months ago Dave could not get through a warmup. Last week he hit a personal best and did not even mention it until someone asked.' }],
+  14: [{ status:'blocked',    platform:'instagram', time:'6:30 PM', caption:'Draft blocked: voice doc missing a content pillar. Staff must update brand_voice/districth/lasso_voice.md.' }],
+  15: [{ status:'pending',    platform:'facebook',  time:'6:30 PM', caption:'Open gym hours are back. Drop in, work on what you want, ask questions if you have them. No class format, no pressure.' }],
+  17: [{ status:'superseded', platform:'instagram', time:'6:30 PM', caption:'Original draft replaced by a newer version for this day.' }],
+  18: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'What the 6am class looks like on a Wednesday. Twelve people, zero excuses, one hour.' }],
+  19: [{ status:'approved',   platform:'instagram', time:'6:30 PM', caption:'We keep the group small on purpose. You will not get lost here. You will get coached.' }],
+  22: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'The $21 intro is there because we believe the first three weeks should be a chance to see if this is right for you.' }],
+  24: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'Member spotlight. Tanya started because her doctor told her to move more. She stayed because of the people.' }],
+  26: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'We have had coaches at District H for six years. That is not a coincidence. It is the culture.' }],
+  29: [{ status:'pending',    platform:'instagram', time:'6:30 PM', caption:'July recap goes up this week. Results from the 21 day intro cohort, new class times, and a sneak peek at what is next.' }],
+  31: [{ status:'pending',    platform:'facebook',  time:'6:30 PM', caption:'August intro spots are open. Same deal: 21 days for $21, real coaching, no lock-in.' }],
+};
+
+var currentYear = 2026;
+var currentMonth = 6; // 0-indexed, 6 = July
+var today = new Date(2026, 6, 18); // demo today
+
+var DAY_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+var MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function render() {
+  // Day label row
+  var labelsEl = document.getElementById('dayLabels');
+  labelsEl.innerHTML = DAY_LABELS.map(d => '<div class="day-label">'+d+'</div>').join('');
+
+  var grid = document.getElementById('calGrid');
+  grid.innerHTML = '';
+
+  var firstDay = new Date(currentYear, currentMonth, 1).getDay();
+  var daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+
+  // Empty cells before month start
+  for (var i = 0; i < firstDay; i++) {
+    var blank = document.createElement('div');
+    blank.className = 'day-cell empty';
+    grid.appendChild(blank);
+  }
+
+  for (var d = 1; d <= daysInMonth; d++) {
+    var cell = document.createElement('div');
+    var isToday = (currentYear === today.getFullYear() && currentMonth === today.getMonth() && d === today.getDate());
+    cell.className = 'day-cell' + (isToday ? ' today' : '');
+
+    var numEl = document.createElement('div');
+    numEl.className = 'day-num';
+    numEl.textContent = d;
+    cell.appendChild(numEl);
+
+    var drafts = DEMO_DRAFTS[d] || [];
+    drafts.forEach(function(draft) {
+      var card = document.createElement('div');
+      card.className = 'draft-card ' + draft.status;
+      card.innerHTML = '<div class="draft-status">'+draft.status+'</div><div class="draft-caption">'+draft.caption.slice(0,38)+'...</div>';
+      card.addEventListener('click', function() { openPanel(d, draft); });
+      cell.appendChild(card);
+    });
+
+    grid.appendChild(cell);
+  }
+
+  document.getElementById('monthLabel').textContent = MONTH_NAMES[currentMonth] + ' ' + currentYear;
+}
+
+function openPanel(day, draft) {
+  var monthName = MONTH_NAMES[currentMonth];
+  document.getElementById('panelDate').textContent = monthName + ' ' + day + ', ' + currentYear;
+  document.getElementById('panelMeta').textContent = cap(draft.platform) + ' • ' + draft.time;
+  document.getElementById('panelCaption').textContent = draft.caption;
+  var slackEl = document.getElementById('panelSlack');
+  if (draft.status === 'pending') {
+    slackEl.innerHTML = '<strong>Waiting for your approval.</strong> To approve, edit, or skip this post, go to your Slack approval channel. Your approval keeps it in your voice.';
+  } else if (draft.status === 'approved') {
+    slackEl.innerHTML = '<strong>Approved.</strong> This post is scheduled to publish.';
+    slackEl.style.borderColor = 'rgba(61,214,140,.25)';
+    slackEl.style.background = 'rgba(61,214,140,.06)';
+  } else if (draft.status === 'blocked') {
+    slackEl.innerHTML = '<strong>Blocked.</strong> ' + draft.caption;
+    slackEl.style.borderColor = 'rgba(255,42,42,.3)';
+    slackEl.style.background = 'rgba(255,42,42,.06)';
+  } else {
+    slackEl.innerHTML = 'This draft was ' + draft.status + '.';
+  }
+  document.getElementById('overlay').classList.add('open');
+}
+
+function closePanel(event) {
+  if (!event || event.target === document.getElementById('overlay')) {
+    document.getElementById('overlay').classList.remove('open');
+  }
+}
+
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+
+function prevMonth() {
+  currentMonth--;
+  if (currentMonth < 0) { currentMonth = 11; currentYear--; }
+  render();
+}
+function nextMonth() {
+  currentMonth++;
+  if (currentMonth > 11) { currentMonth = 0; currentYear++; }
+  render();
+}
+
+render();
+</script>
+</body>
+</html>

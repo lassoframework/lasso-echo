@@ -1598,6 +1598,18 @@ The complete scope Echo grows into. Everything plugs onto the proven Stage 1 cor
 
 ---
 
+## Portal Handoff Package (2026-07-18)
+
+`docs/portal_handoff/` — 9 markdown specs + 2 HTML reference files.
+
+Portal CC reads this to build: intake wizard, media upload hand-off, calendar display, reporting display.
+
+**Live today:** POST /intake/<token> (JSON portal path), GET/POST /u/<token>, GET /healthz. Approval via Slack (approve/edit/skip only; no deny or kill action in approvals.py today).
+
+**PLANNED:** Calendar API, portal-native approval API (behind future AGENT_PORTAL_APPROVALS), reporting API.
+
+---
+
 ## Open risks / watch items
 - Repo divergence: deployed repo has commits from other agents (ruvnet, Manus); the
   reference sandbox may differ. Code ships as a behavior-described Claude Code prompt,

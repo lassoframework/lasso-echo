@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LASSO Social Intake</title>
+<style>
+  :root {
+    --navy: #121E3C;
+    --red: #FF2A2A;
+    --sky: #5EB9E6;
+    --cream: #FAF6F0;
+    --steel: #D8E3EE;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, 'Inter', Helvetica, Arial, sans-serif;
+    background: var(--navy);
+    color: var(--cream);
+    margin: 0;
+    padding: 20px 16px 64px;
+    display: flex;
+    justify-content: center;
+  }
+  .card { max-width: 540px; width: 100%; }
+  .logo { font-size: 13px; letter-spacing: .18em; text-transform: uppercase; color: var(--sky); margin: 0 0 18px; }
+  h1 { font-size: 26px; line-height: 1.1; margin: 0 0 8px; }
+  h1 .accent { color: var(--red); }
+  .deck { color: var(--steel); font-size: 15px; margin: 0 0 28px; line-height: 1.5; }
+  h2 {
+    font-size: 11px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--sky);
+    margin: 32px 0 12px;
+    border-bottom: 1px solid rgba(94,185,230,.2);
+    padding-bottom: 8px;
+  }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--steel); margin: 16px 0 5px; }
+  input[type=text], input[type=url], textarea {
+    width: 100%;
+    background: var(--cream);
+    color: var(--navy);
+    border: none;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 15px;
+    font-family: inherit;
+  }
+  textarea { min-height: 80px; resize: vertical; }
+  input[type=text]:focus, input[type=url]:focus, textarea:focus {
+    outline: 2px solid var(--sky);
+    outline-offset: 1px;
+  }
+  .hint { font-size: 12px; color: var(--steel); margin: 6px 0 0; line-height: 1.4; }
+  .callout {
+    background: rgba(94,185,230,.10);
+    border-left: 3px solid var(--sky);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12.5px;
+    color: var(--steel);
+    margin: 10px 0 0;
+    line-height: 1.5;
+  }
+  .callout strong { color: var(--cream); }
+  .ack-block { margin: 28px 0 0; }
+  .ack-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px;
+    background: rgba(255,255,255,.04);
+    border-radius: 10px;
+    margin-bottom: 10px;
+  }
+  .ack-item input[type=checkbox] { margin-top: 2px; width: 18px; height: 18px; accent-color: var(--sky); flex-shrink: 0; }
+  .ack-item span { font-size: 13.5px; color: var(--steel); line-height: 1.45; }
+  button[type=submit] {
+    width: 100%;
+    background: var(--red);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    padding: 16px;
+    font-size: 17px;
+    font-weight: 700;
+    margin-top: 28px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: opacity .15s;
+  }
+  button[type=submit]:disabled { opacity: .4; cursor: not-allowed; }
+  button[type=submit]:not(:disabled):hover { opacity: .88; }
+  .required-star { color: var(--red); margin-left: 2px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <p class="logo">LASSO Social</p>
+  <h1>Tell us about<br><span class="accent">your gym.</span></h1>
+  <p class="deck">Seven quick sections. Fill in what you have and hit send. Nothing goes out until you approve it.</p>
+
+  <form id="intakeForm" method="post">
+
+    <h2>1. Gym basics</h2>
+    <label>Gym name <span class="required-star">*</span></label>
+    <input type="text" name="gym_name" maxlength="200" required placeholder="District H">
+    <label>City</label>
+    <input type="text" name="city" maxlength="200" placeholder="Indianapolis, IN">
+    <label>Website</label>
+    <input type="url" name="website" maxlength="200" placeholder="https://yourgym.com" inputmode="url">
+    <label>About the gym</label>
+    <textarea name="about" placeholder="Who you are in your own words. Coach led since 2019, small groups, that kind of thing."></textarea>
+
+    <h2>2. Brand voice</h2>
+    <label>How do you talk?</label>
+    <textarea name="voice" placeholder="Words you love, words you avoid, how a post should sound coming from you."></textarea>
+
+    <h2>3. Offers and services</h2>
+    <label>Current offers</label>
+    <textarea name="offers" placeholder="One per line. Example: 21 day intro for new members"></textarea>
+    <label>Services and programs</label>
+    <textarea name="services" placeholder="One per line. Example: small group personal training"></textarea>
+    <label>Pricing rule (exact wording)</label>
+    <textarea name="pricing_rule" placeholder="The exact words we may use for pricing, if any."></textarea>
+    <div class="callout">
+      <strong>Pricing rule:</strong> We never post a price, discount, or guarantee unless it is written here exactly as you want it to appear. If this box is empty, no prices are ever posted.
+    </div>
+
+    <h2>4. Audience</h2>
+    <label>Who are we talking to?</label>
+    <textarea name="audience" placeholder="Busy parents? Beginners? People getting back into it after time off?"></textarea>
+
+    <h2>5. Proof</h2>
+    <label>Member wins we may share</label>
+    <textarea name="proof" placeholder="One per line. Example: Sarah lost 30 pounds in 3 months"></textarea>
+    <div class="callout">
+      <strong>Permission required:</strong> Only share wins the member has agreed to make public. We hold every one for your approval before it can appear in a post.
+    </div>
+
+    <h2>6. Media notes</h2>
+    <label>Anything we should know about your photos and videos?</label>
+    <textarea name="media_notes" placeholder="What to feature, what to avoid, members who prefer to stay off camera."></textarea>
+
+    <h2>7. Approver</h2>
+    <label>Who approves posts?</label>
+    <input type="text" name="approver_name" maxlength="200" placeholder="Name and role">
+    <label>Best way to reach them</label>
+    <input type="text" name="approver_contact" maxlength="200" placeholder="Phone or email">
+
+    <div class="ack-block">
+      <div class="ack-item">
+        <input type="checkbox" id="ack1" required>
+        <span>Everything I share here waits for my approval before a single post goes live.</span>
+      </div>
+      <div class="ack-item">
+        <input type="checkbox" id="ack2" required>
+        <span>Member wins and photos I include here have permission to be used publicly.</span>
+      </div>
+    </div>
+
+    <button type="submit" id="submitBtn" disabled>Send it to LASSO</button>
+  </form>
+</div>
+
+<script>
+  var ack1 = document.getElementById('ack1');
+  var ack2 = document.getElementById('ack2');
+  var btn = document.getElementById('submitBtn');
+  function updateBtn() {
+    btn.disabled = !(ack1.checked && ack2.checked);
+  }
+  ack1.addEventListener('change', updateBtn);
+  ack2.addEventListener('change', updateBtn);
+</script>
+</body>
+</html>
