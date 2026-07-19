@@ -1,6 +1,6 @@
 # Echo Portal Status
 
-**Last updated:** 2026-07-18 | **SHA:** cc1c4f5182ecdae9f6e1cc66b06847dbad72ea9c
+**Last updated:** 2026-07-19 | **SHA:** 67594a7d92492c95f795c45563e149809246aae9
 
 This is a standing coordination file. Any Echo build that changes the portal-facing contract must update this file in the same commit. The portal CC reads this at the start of every session and updates PORTAL OWES when it ships something.
 
