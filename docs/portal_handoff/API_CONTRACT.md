@@ -8,7 +8,7 @@ All endpoints are on the **intake-web** Railway service (`agent/intake_web.py`).
 
 ## Auth Model
 
-Every gym has one token. The token is an opaque string that Echo mints by hand (set in Railway env as `AGENT_INTAKE_TOKEN_<CLIENTKEY>`). The token is never plain-text in portal code, chat, or git. The portal stores it as a secret (e.g. a Supabase row with RLS, or a Vercel environment variable per gym — never in client-side code or git). The portal sends the token in the URL path, not a header.
+Every gym has one token. The token is an opaque string that Echo mints by hand (set in Railway env as `AGENT_INTAKE_TOKEN_<CLIENTKEY>`). The token is never plain-text in portal code, chat, or git. Echo stores tokens in its own gyms table. When `AGENT_INTAKE_ENC_KEY` is set in Echo's Railway env, the token is Fernet-encrypted at rest in the gyms table (the portal never decrypts it; Echo reconstructs the upload link server-side). The portal sends the token in the URL path on intake calls. On portal gym status calls, the portal uses the account key instead.
 
 Echo validates the token by looking it up in its own Railway env. A bad token returns the same `404 Not Found` as a disabled flag. The raw token is never logged by Echo.
 
@@ -198,6 +198,39 @@ Limits:
 
 ---
 
+### GET /portal/gym/<account_key>
+
+**Purpose:** Portal gym status. Returns the gym's token status, upload link, last upload timestamp, and upload count. The portal uses this to show staff whether a gym's intake is armed and what they have uploaded.
+
+**Gate:** Requires `AGENT_PORTAL_APPROVALS=true` in Echo's Railway env. Returns `403 {"error": "portal access is disabled"}` when the flag is off.
+
+**Auth:** No token in path. The account key is not a secret. The portal must be server-side when calling this endpoint (do not expose from a client-side browser context).
+
+**CORS:** Same origin rules as the intake endpoint. Set `AGENT_INTAKE_PORTAL_ORIGIN` to the portal's origin.
+
+**Response 200:**
+```json
+{
+  "account_key": "districth",
+  "upload_link": "https://echo-intake-web-production.up.railway.app/u/<token>",
+  "token_status": "ACTIVE",
+  "last_upload_at": "20260718T193000Z",
+  "upload_count": 7,
+  "intake_status": "ACTIVE"
+}
+```
+
+- `token_status` / `intake_status`: `ACTIVE`, `REVOKED`, or `NOT_SET`.
+- `upload_link`: the gym's upload URL (reconstructed from Fernet-decrypted token when `AGENT_INTAKE_ENC_KEY` is set, else from stored plaintext). `null` when unavailable.
+- `last_upload_at`: UTC timestamp string from the most recent R2 media key. `null` when R2 is not configured or no uploads yet.
+- `upload_count`: count of media objects in R2 `intake/<account_key>/incoming/`. `null` when R2 is not configured.
+
+**Error responses:**
+- `403 {"error": "portal access is disabled"}` — `AGENT_PORTAL_APPROVALS=false`.
+- `404 {"error": "gym not found"}` — account key not in gyms table.
+
+---
+
 ## PLANNED Endpoints (not yet built)
 
 These endpoints do not exist in Echo today. They are specified here so the portal CC can build stubs and wire them when Echo ships them. Mark all portal UI that depends on these as **PLANNED** until STATUS.md says otherwise.
@@ -243,9 +276,10 @@ States: `pending`, `approved`, `skipped`, `superseded`, `expired`, `blocked`.
 **Planned request:**
 ```json
 {
-  "action": "approve" | "edit" | "skip",
+  "action": "approve" | "edit" | "skip" | "deny" | "kill",
   "note": "optional edit instruction",
-  "actor_slack_id": "U06EPUUCL13"
+  "actor_slack_id": "U06EPUUCL13",
+  "confirmed": true
 }
 ```
 

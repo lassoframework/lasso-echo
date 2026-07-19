@@ -29,7 +29,7 @@ Verified against `DraftStatus` enum in `agent/drafter.py`:
 
 | State | Label | What it means | Available actions |
 |---|---|---|---|
-| `pending` | Waiting for approval | Human tap required before anything publishes | Approve, Edit, Skip |
+| `pending` | Waiting for approval | Human tap required before anything publishes | Approve, Edit, Skip, Deny, Kill |
 | `approved` | Approved | Human approved; published (or would publish in draft-only mode) | None |
 | `skipped` | Skipped | Human chose to drop this draft | None |
 | `superseded` | Superseded | A newer draft for the same day replaced this one; approving it does nothing | None (read-only, show the newer card instead) |
@@ -50,19 +50,32 @@ Human confirms the draft is ready to post. Echo calls `publish()` on the Meta or
 
 ### Edit (with note)
 
-Human provides an edit instruction. Echo re-drafts the post using the note, replaces the card with a new `pending` draft, and the old draft is marked `superseded`. The recreate budget is NOT charged for an Edit (only a future Deny action will charge the budget; not wired today).
+Human provides an edit instruction. Echo re-drafts the post using the note, replaces the card with a new `pending` draft, and the old draft is marked `superseded`. The recreate budget is NOT charged for an Edit (Deny charges the budget; Edit does not).
 
 **Portal display:** Show a text field for the note + "Request edit" button. Until AGENT_PORTAL_APPROVALS is live, show "Send your edit note in Slack."
 
-### Deny and Kill (PLANNED, not yet in approval handler)
+### Deny (reason)
 
-Neither "Deny" nor "Kill" is a real approval action in `agent/approvals.py` today. The approval handler only knows: `approve`, `edit`, `skip`. The Slack surface only surfaces these three.
+Human rejects the draft with a reason. Echo marks the draft `denied` and records the reason in the tenant brain (best effort, behind `AGENT_TENANT_BRAIN_ENABLED`). The recreate budget is charged one unit. When the budget is exhausted, the action still proceeds but no budget unit is logged (the caller is responsible for surfacing the empty-budget state).
 
-The tenant brain (`agent/tenant_brain.py`) records `deny_reason` and `kill` events as structured learning entries for the gym's voice tuning, but only behind `AGENT_TENANT_BRAIN_ENABLED` (default OFF). These are not approval gate actions.
+Reason chips (suggested in the UI, free text also accepted):
+- "Off voice"
+- "Wrong offer"
+- "Timing not right"
+- "Use a different photo"
+- "Caption needs work"
 
-**Portal display today:** Only show Approve, Edit, and Skip. Do not build Deny or Kill buttons.
+**Budget meter:** The portal should display how many recreates remain this month. Default cap is 20 for Stage 2 tenant-onboarded gyms (from `tenants.DEFAULT_MONTHLY_RECREATE_BUDGET`); 0 for legacy env-token clients.
 
-**Future (PLANNED):** When a Deny/Kill approval action is added to Echo's approval handler and the portal approvals API is live, update the spec. The recreate budget mechanic (`quotas.py`) is already built in Echo and will be wired to Deny at that time.
+**Portal display today:** "Deny in Slack with your reason." (Portal-native buttons require `AGENT_PORTAL_APPROVALS=true`.)
+
+### Kill (permanent, free, confirm dialog, bans the concept)
+
+Human permanently kills a draft concept for this gym. Kill is free (does not charge the recreate budget). The concept is recorded in the tenant brain so Echo will not regenerate it for this gym. Requires `confirmed=True` in the action call — the portal must show a confirm dialog before sending.
+
+**Confirm dialog text:** "This permanently removes this concept for [gym name]. It will not come back. Are you sure?"
+
+**Portal display today:** "Kill in Slack." (Portal-native buttons require `AGENT_PORTAL_APPROVALS=true`.)
 
 ### Skip
 

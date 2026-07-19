@@ -38,15 +38,15 @@ This is a standing coordination file. Any Echo build that changes the portal-fac
 - [ ] Media upload hand-off (redirect gym to `/u/<token>` after intake)
 - [ ] Calendar page (read-only display; show "Approve in Slack" until calendar API is live)
 - [ ] Reporting page (show "coming soon" holding card until reporting API is live)
-- [ ] Store gym token as encrypted secret (never plain in code or git)
+- [ ] Store gym account_key (not the raw token) for portal gym status calls; Echo owns token storage
 - [ ] Handle Echo `gaps` in report display (never substitute zero for missing metrics)
 
 ---
 
 ## ECHO OWES
 
-- [ ] Calendar read API (`GET /api/calendar/<key>?month=YYYY-MM`)
-- [ ] Portal-native approval API (`POST /api/approve/<key>/<draft_id>`) behind `AGENT_PORTAL_APPROVALS`
+- [ ] Calendar read API (`GET /api/calendar/<key>?month=YYYY-MM`) — not yet built
+- [ ] Calendar read API (`GET /api/calendar/<key>?month=YYYY-MM`) — not yet built
 - [ ] Reporting API (`GET /api/report/<key>?days=30`)
 - [ ] Update STATUS.md in every commit that changes portal-facing contract
 
