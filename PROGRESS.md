@@ -10,6 +10,28 @@ Last updated: 2026-07-20
 
 ---
 
+## Video editor v1 A-build (Minimal Broadcast + Word Highlight + routing) (2026-07-20)
+
+v1 layered on the video editor. Independent re-audit (2 fresh agents): parity
+13/13 BUILT, gates 8/8 PASS, zero CRITICAL/MAJOR, all prior gaps closed. SHA d72cf8f.
+
+- Overlay ROUTING per beat: motion/scene -> Higgsfield video (motion cap);
+  stat/number/quote/framework -> Nano Banana still card via the SAME
+  creative_studio Gemini pipeline (stills cap). AGENT_VIDEO_STILLS_ENABLED (OFF).
+- Bottom treatment "Minimal Broadcast": real LASSO wordmark (pulled from
+  lassoframework.com, cropped to LASSO, transparent) bottom-left sized by width,
+  @GYMMARKETINGMADESIMPLE bottom-right Oswald tracked caps, navy gradient scrim,
+  no bar/line. Assets in agent/assets/brand + fonts (persistent).
+- Captions "Word Highlight": Anton ALL CAPS word-by-word, ONE red active word
+  (255,42,42), rest white, heavy outline+shadow, no ghost, lower third, face
+  avoidance via opencv (graceful fallback). Fonts bundled.
+- Fabrication gate extended to NUMBERS (invented stat cannot reach a still card).
+  Clip in/out snap to whole-word boundaries (no mid-word cuts) with degenerate
+  guard. Transcription source reported. Silent drops/clamps now logged.
+- Separate per-episode budgets (motion + stills), stop+log, never overspend.
+- 3 sample reels (4/3/4 overlays each, motion + still) rendered + sent to
+  #echoclaude held for approval. Suite 1508 green.
+
 ## Video editor shipped (Option A: Echo directs, Higgsfield renders) (2026-07-20)
 
 Full podcast-to-clips video editor in `agent/video_editor.py`, on top of the clipper.
