@@ -998,6 +998,86 @@ def clipper_broll_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CLIPPER_BROLL_ENABLED", "false"))
 
 
+# ---- Video editor (Option A: Echo directs, Higgsfield renders) --------------------
+# The video editor turns a full podcast episode into finished, ad-ready clips with
+# AI b-roll overlays rendered by Higgsfield. Three flags, all default OFF, layered:
+#   AGENT_VIDEO_EDITOR_ENABLED  master switch for the video editor pipeline
+#   AGENT_VIDEO_BROLL_ENABLED   plan b-roll beats + composite overlays
+#   AGENT_VIDEO_RENDER          actually CALL Higgsfield (spends real credits)
+# When VIDEO_RENDER is OFF the pipeline plans a b-roll manifest and projects cost
+# but renders zero overlays (or uses the text-card fallback). Higgsfield is only
+# reachable through an interactive Claude session (claude.ai MCP), never the
+# headless Railway cron, so the render arm is Claude-in-the-loop by design.
+
+
+def video_editor_enabled() -> bool:
+    """Video editor master switch. OFF by default. Set AGENT_VIDEO_EDITOR_ENABLED=true."""
+    return _truthy(os.environ.get("AGENT_VIDEO_EDITOR_ENABLED", "false"))
+
+
+def video_broll_enabled() -> bool:
+    """B-roll planning + overlay compositing in the video editor. OFF by default.
+    Set AGENT_VIDEO_BROLL_ENABLED=true. Requires the editor master also armed."""
+    return _truthy(os.environ.get("AGENT_VIDEO_BROLL_ENABLED", "false"))
+
+
+def video_render_enabled() -> bool:
+    """The Higgsfield-call arm: when ON, overlay beats are rendered by calling
+    Higgsfield (real credit spend). OFF by default. Set AGENT_VIDEO_RENDER=true.
+    When OFF, the pipeline plans + projects cost but spends nothing."""
+    return _truthy(os.environ.get("AGENT_VIDEO_RENDER", "false"))
+
+
+def video_broll_cap() -> int:
+    """Max Higgsfield overlay renders per episode (hard cost guard). Hitting the
+    cap stops and surfaces, never silently spends. Env AGENT_VIDEO_BROLL_CAP,
+    default 6."""
+    try:
+        return max(0, int(os.environ.get("AGENT_VIDEO_BROLL_CAP", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
+def video_broll_kind() -> str:
+    """Overlay type: 'video' (motion, ~7.5 cr each) or 'image' (Ken-Burns still,
+    ~2 cr each). Env AGENT_VIDEO_BROLL_KIND, default 'video'."""
+    kind = (os.environ.get("AGENT_VIDEO_BROLL_KIND", "video") or "video").strip().lower()
+    return kind if kind in ("video", "image") else "video"
+
+
+def video_cost_per_overlay() -> float:
+    """Projected credit cost of one overlay render, for the pre-render cost report.
+    Env AGENT_VIDEO_COST_PER_OVERLAY overrides; default depends on overlay kind
+    (video 7.5, image 2.0) preflighted against Higgsfield on 2026-07-20."""
+    override = os.environ.get("AGENT_VIDEO_COST_PER_OVERLAY")
+    if override:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            pass
+    return 7.5 if video_broll_kind() == "video" else 2.0
+
+
+def video_output_dir() -> str:
+    """Where finished clips are written. Env AGENT_VIDEO_OUTPUT_DIR,
+    default /data/clipper/video."""
+    return os.environ.get("AGENT_VIDEO_OUTPUT_DIR", "/data/clipper/video")
+
+
+def video_overlay_cache_dir() -> str:
+    """Where rendered Higgsfield overlay assets are cached for reuse across re-runs
+    (never re-pay). Env AGENT_VIDEO_OVERLAY_CACHE, default /data/clipper/overlays."""
+    return os.environ.get("AGENT_VIDEO_OVERLAY_CACHE", "/data/clipper/overlays")
+
+
+def video_aspects() -> list:
+    """Which aspect ratios to export. Env AGENT_VIDEO_ASPECTS (csv of 9:16,1:1),
+    default both."""
+    raw = os.environ.get("AGENT_VIDEO_ASPECTS", "9:16,1:1")
+    out = [a.strip() for a in raw.split(",") if a.strip() in ("9:16", "1:1")]
+    return out or ["9:16", "1:1"]
+
+
 def services_category_enabled() -> bool:
     """Services category for LASSO own accounts ONLY, never client accounts. OFF by default.
     Draws from brand_voice/lasso_services.md; stub file = SKIP not fabricate."""

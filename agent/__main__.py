@@ -145,6 +145,9 @@ def _status():
     print(f"  clipper        : {config.clipper_enabled()}  (env AGENT_CLIPPER_ENABLED)")
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
     print(f"  clipper_broll  : {config.clipper_broll_enabled()}  (env AGENT_CLIPPER_BROLL_ENABLED)")
+    print(f"  video_editor   : {config.video_editor_enabled()}  (env AGENT_VIDEO_EDITOR_ENABLED)")
+    print(f"  video_broll    : {config.video_broll_enabled()}  (env AGENT_VIDEO_BROLL_ENABLED)")
+    print(f"  video_render   : {config.video_render_enabled()}  (env AGENT_VIDEO_RENDER)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
@@ -733,6 +736,7 @@ _COMMANDS = {
         ("pull-opus / opus-pull / opus-check / opus-doctor / opus-organize",
          "Opus clip factory"),
         ("clip-episode", "score one episode's clip moments"),
+        ("video-episode", "full video editor: b-roll overlays, captions, 9:16 + 1:1"),
         ("inbox-status", "episode inbox state"),
         ("episode-upload", "upload a Riverside episode export to the episode inbox"),
     ],
@@ -1642,6 +1646,14 @@ def main(argv=None):
         # writes/renders nothing (the approval checkpoint before any video work).
         from .clipper import clip_episode_cli
         clip_episode_cli(argv[1:])
+    elif cmd == "video-episode":
+        # Video editor (AGENT_VIDEO_EDITOR_ENABLED): the full Option A pipeline —
+        # transcribe -> select -> plan b-roll manifest -> render Higgsfield overlays
+        # (Claude-in-the-loop, AGENT_VIDEO_RENDER) -> assemble 9:16 + 1:1, captioned
+        # + caption-free ad -> held review card. Prints the b-roll plan + projected
+        # Higgsfield cost. Overlays render only when armed; nothing publishes.
+        from .video_editor import video_episode_cli
+        video_episode_cli(argv[1:])
     elif cmd == "opus-organize":
         # Add each pinned project's finished clips to one target collection so the
         # factory scan (collections only) can read them (AGENT_OPUS_FACTORY_ENABLED).

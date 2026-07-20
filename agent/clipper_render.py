@@ -11,10 +11,10 @@ silently skipping, so callers know exactly why nothing happened. The
 orchestrator (clip_episode) self-skips when the flag is OFF; these
 functions raise so tests can verify the guard clearly.
 
-Render target: 1080x1920 (Instagram / TikTok vertical, 9:16).
-Brand palette:
-  Navy #1A2340  — lower-third, text outlines
-  Red  #E03131  — accent, social handle
+Render target: 1080x1920 (Instagram / TikTok vertical, 9:16) and 1080x1080 (1:1).
+Brand palette (LASSO V3 house style, locked 2026-07-17):
+  Navy #121E3C  — lower-third, text outlines
+  Red  #FF0000  — accent, social handle
   White         — primary caption text
 """
 
@@ -31,8 +31,13 @@ REEL_W = 1080
 REEL_H = 1920
 LOWER_H = 70    # lower-third bar height (pixels)
 
-_BRAND_NAVY_HEX = "1A2340"   # without #
-_BRAND_RED_HEX = "E03131"
+# Caption vertical position as a fraction of frame height, measured from the
+# bottom. 0.417 of a 1920px frame ~= 800px (lower-middle / second-third of the
+# frame). Scales correctly to any height (e.g. 1:1 1080 -> ~450px).
+_CAPTION_MARGIN_FRAC = 0.417
+
+_BRAND_NAVY_HEX = "121E3C"   # without # — LASSO V3 house-style navy
+_BRAND_RED_HEX = "FF0000"    # LASSO V3 house-style red
 _BRAND_WHITE_HEX = "FFFFFF"
 
 _CAPTION_FONT_SIZE = 100   # px — large enough for mobile
@@ -61,11 +66,15 @@ def _ffmpeg():
 
 
 def _require_render():
-    """Raise RenderError when the render flag is OFF or ffmpeg is absent."""
-    if not config.clipper_render_enabled():
+    """Raise RenderError when the render flag is OFF or ffmpeg is absent.
+    The ffmpeg layer is armed by EITHER the clipper render flag
+    (AGENT_CLIPPER_RENDER_ENABLED) or the video editor master
+    (AGENT_VIDEO_EDITOR_ENABLED) — the video editor reuses these render
+    primitives under its own flag."""
+    if not (config.clipper_render_enabled() or config.video_editor_enabled()):
         raise RenderError(
-            "render is OFF (AGENT_CLIPPER_RENDER_ENABLED not set to true). "
-            "Phase 2 render is disabled until armed.")
+            "render is OFF (neither AGENT_CLIPPER_RENDER_ENABLED nor "
+            "AGENT_VIDEO_EDITOR_ENABLED set to true). Render is disabled until armed.")
     _ffmpeg()
 
 
@@ -126,13 +135,14 @@ def _probe_media_kind(path):
     return "audio"
 
 
-def frame_vertical(input_path, output_path, media_kind=None, segments=None):
+def frame_vertical(input_path, output_path, media_kind=None, segments=None,
+                   width=REEL_W, height=REEL_H):
     """
-    Reframe to 9:16 (1080x1920):
-      video -> fill-scale to cover 1080x1920, center-safe crop (active speaker
+    Reframe to width x height (default 9:16 1080x1920; pass 1080x1080 for 1:1):
+      video -> fill-scale to cover the target, center-safe crop (active speaker
                tracking via segments is a Phase 2 enhancement; center crop when
                segments are absent).
-      audio -> audiogram: navy canvas 1080x1920, animated red waveform centered,
+      audio -> audiogram: navy canvas, animated red waveform centered,
                suitable for podcast/voiceover clips without a video source.
 
     Raises RenderError when the render flag is OFF or ffmpeg is absent.
@@ -142,14 +152,14 @@ def frame_vertical(input_path, output_path, media_kind=None, segments=None):
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     if kind == "video":
-        # Fill-scale: scale so BOTH width >= 1080 AND height >= 1920, then
-        # center-crop to exactly 1080x1920. This never letterboxes.
+        # Fill-scale: scale so BOTH width >= W AND height >= H, then
+        # center-crop to exactly WxH. This never letterboxes.
         vf = (
-            f"scale=w='if(gt(iw/ih,{REEL_W}/{REEL_H}),-2,{REEL_W})':"
-            f"h='if(gt(iw/ih,{REEL_W}/{REEL_H}),{REEL_H},-2)',"
-            f"scale=w='if(lt(iw,{REEL_W}),{REEL_W},iw)':"
-            f"h='if(lt(ih,{REEL_H}),{REEL_H},ih)',"
-            f"crop={REEL_W}:{REEL_H}:(iw-{REEL_W})/2:(ih-{REEL_H})/2"
+            f"scale=w='if(gt(iw/ih,{width}/{height}),-2,{width})':"
+            f"h='if(gt(iw/ih,{width}/{height}),{height},-2)',"
+            f"scale=w='if(lt(iw,{width}),{width},iw)':"
+            f"h='if(lt(ih,{height}),{height},ih)',"
+            f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2"
         )
         cmd = [
             _ffmpeg(), "-y", "-i", input_path,
@@ -160,9 +170,10 @@ def frame_vertical(input_path, output_path, media_kind=None, segments=None):
         ]
     else:
         # Audiogram: navy background, red waveform, silent where no audio.
+        wave_h = max(200, int(height * 0.21))
         lavfi = (
-            f"color=c=0x{_BRAND_NAVY_HEX}:s={REEL_W}x{REEL_H}:r=30[bg];"
-            f"[0:a]showwaves=s={REEL_W}x400:mode=line:colors=0x{_BRAND_RED_HEX}[wave];"
+            f"color=c=0x{_BRAND_NAVY_HEX}:s={width}x{height}:r=30[bg];"
+            f"[0:a]showwaves=s={width}x{wave_h}:mode=line:colors=0x{_BRAND_RED_HEX}[wave];"
             f"[bg][wave]overlay=(W-w)/2:(H-h)/2[v]"
         )
         cmd = [
@@ -194,15 +205,18 @@ def _fmt_ass_ts(seconds):
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
+def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path,
+                        width=REEL_W, height=REEL_H):
     """
     Multi-word group karaoke captions (modern Reels style).
     Words are grouped in sets of _WORDS_PER_GROUP. For each word's event, all
     words in the group are visible at once: the currently-spoken word in white,
     context words in gray. Dark semi-transparent box behind each event
-    (BorderStyle=3). MarginV=800 positions captions in the second third of the
-    1920px-tall frame — well above the brand bar and away from the edges.
-    Only words within [start_ts, end_ts] are included (fabrication-safe).
+    (BorderStyle=3). MarginV is _CAPTION_MARGIN_FRAC of frame height from the
+    bottom, positioning captions in the second/third of the frame for BOTH 9:16
+    (1920 -> ~800px) and 1:1 (1080 -> ~450px) — clear of headline overlays and
+    the brand bar. Only words within [start_ts, end_ts] are included
+    (fabrication-safe).
     """
     start_ts = float(start_ts)
     end_ts = float(end_ts)
@@ -217,22 +231,26 @@ def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
     for i in range(0, len(words), _WORDS_PER_GROUP):
         chunks.append(words[i:i + _WORDS_PER_GROUP])
 
+    margin_v = int(height * _CAPTION_MARGIN_FRAC)
+    # Scale font down a touch for the shorter 1:1 canvas so 3 words fit on a line
+    font_size = _CAPTION_FONT_SIZE if height >= REEL_H else int(_CAPTION_FONT_SIZE * 0.8)
+
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        f"PlayResX: {REEL_W}",
-        f"PlayResY: {REEL_H}",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        # Bold large text; semi-transparent dark box; 800px from bottom (second third)
-        f"Style: Karaoke,Arial,{_CAPTION_FONT_SIZE},"
+        # Bold large text; semi-transparent dark box; lower-middle (second-third)
+        f"Style: Karaoke,Arial,{font_size},"
         f"&H00{_ACTIVE_COLOR},&H003131E0,"
         f"&H00{_BRAND_NAVY_HEX},&H50000000,"
-        f"-1,0,0,0,100,100,2,0,3,0,0,2,20,20,800,0",
+        f"-1,0,0,0,100,100,2,0,3,0,0,2,20,20,{margin_v},0",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -263,12 +281,13 @@ def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
     return ass_path
 
 
-def burn_captions(input_path, output_path, transcript, start_ts, end_ts):
+def burn_captions(input_path, output_path, transcript, start_ts, end_ts,
+                  width=REEL_W, height=REEL_H):
     """
     Burn word-by-word karaoke captions from the word-level transcript into the
     video. Each word appears at its exact spoken timestamp (relative to
-    start_ts) and disappears when the next word starts. Positioned above the
-    LASSO brand-frame lower-third (220px margin from bottom).
+    start_ts) and disappears when the next word starts. Positioned in the
+    lower-middle (second/third) of the frame, scaled to frame height.
     Only words within [start_ts, end_ts] are included — never fabricates text.
     Raises RenderError when the render flag is OFF or ffmpeg is absent.
     """
@@ -279,7 +298,8 @@ def burn_captions(input_path, output_path, transcript, start_ts, end_ts):
         ass_path = tf.name
 
     try:
-        _make_ass_subtitles(transcript, start_ts, end_ts, ass_path)
+        _make_ass_subtitles(transcript, start_ts, end_ts, ass_path,
+                            width=width, height=height)
         # ffmpeg ass filter: escape backslashes and colons in the path for the
         # vf string. On macOS/Linux this is typically safe; use absolute path.
         safe = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
@@ -303,29 +323,29 @@ def burn_captions(input_path, output_path, transcript, start_ts, end_ts):
 # ---- Part 8: LASSO brand frame + safe margins ---------------------------------------
 
 def add_brand_frame(input_path, output_path,
-                    logo_text="LASSO", handle_text="@GymMarketingMadeSimple"):
+                    logo_text="LASSO", handle_text="@GymMarketingMadeSimple",
+                    width=REEL_W, height=REEL_H):
     """
-    Overlay the LASSO brand frame on a 1080x1920 vertical video.
+    Overlay the LASSO brand frame on a vertical or square video.
     Design: thin LOWER_H-px solid navy bar at the bottom.
     - 3px LASSO red accent line at the very top of the bar
     - Logo left-aligned, white, vertically centered in bar
     - Handle right-aligned, white, vertically centered in bar
+    Uses ffmpeg 'ih'/'iw' expressions so it adapts to any frame size.
     Raises RenderError when the render flag is OFF or ffmpeg is absent.
     """
     _require_render()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    bar_y = REEL_H - LOWER_H   # top of brand bar (1850 with LOWER_H=70)
-
     def _esc(t):
         return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
     vf_parts = [
-        # Solid navy brand bar
-        f"drawbox=x=0:y={bar_y}:w={REEL_W}:h={LOWER_H}:"
+        # Solid navy brand bar (full width, LOWER_H tall, anchored to bottom)
+        f"drawbox=x=0:y=ih-{LOWER_H}:w=iw:h={LOWER_H}:"
         f"color=0x{_BRAND_NAVY_HEX}@1.0:t=fill",
         # 3px LASSO red accent line at the very top of the bar
-        f"drawbox=x=0:y={bar_y}:w={REEL_W}:h=3:"
+        f"drawbox=x=0:y=ih-{LOWER_H}:w=iw:h=3:"
         f"color=0x{_BRAND_RED_HEX}@1.0:t=fill",
         # Logo: white, left-aligned, vertically centered via th expression
         f"drawtext=fontsize=42:fontcolor=0x{_BRAND_WHITE_HEX}:"
