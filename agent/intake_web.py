@@ -37,6 +37,7 @@ import time
 from datetime import datetime, timezone
 
 from . import config, whatsapp_intake
+from . import portal_routes as _pr
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 _TRACKER_TOKEN_ENV = "AGENT_TRACKER_TOKEN"   # name only; value is set by hand
@@ -743,6 +744,18 @@ def build_server(port=None):
                          self.path.split("?")[0])
             return m.group(1) if m else None
 
+        def _portal_token_route(self):
+            """Returns (token, sub) for /portal/<token>/<sub> routes, else (None, None).
+            sub is one of: calendar, library, approve, edit, deny, kill."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_-]{8,})/"
+                r"(calendar|library|approve|edit|deny|kill)$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2)
+            return None, None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -757,6 +770,21 @@ def build_server(port=None):
             portal_key = self._portal_gym_key()
             if portal_key is not None:
                 status, body = handle_portal_gym_status(portal_key)
+                return self._send_json(body, status)
+
+            # Portal token routes: /portal/<token>/calendar and /portal/<token>/library.
+            # Token resolves to account_key; unknown/revoked token = 404 (indistinguishable).
+            pt_token, pt_sub = self._portal_token_route()
+            if pt_token is not None and pt_sub in ("calendar", "library"):
+                account_key = client_for_token(pt_token)
+                if account_key is None:
+                    return self._deny(404)
+                if pt_sub == "calendar":
+                    from urllib.parse import urlparse, parse_qs
+                    month = (parse_qs(urlparse(self.path).query).get("month") or [""])[0]
+                    status, body = _pr.handle_portal_calendar(account_key, month)
+                else:
+                    status, body = _pr.handle_portal_library(account_key)
                 return self._send_json(body, status)
 
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
@@ -836,6 +864,29 @@ def build_server(port=None):
             self.end_headers()
 
         def do_POST(self):
+            # Portal draft actions: /portal/<token>/{approve|edit|deny|kill}
+            # Gated by AGENT_PORTAL_APPROVALS. Token resolves to account_key.
+            # Unknown/revoked token = 404. Body is JSON: {draft_id, actor_id, note?}.
+            pt_token, pt_action = self._portal_token_route()
+            if pt_token is not None and pt_action in ("approve", "edit", "deny", "kill"):
+                account_key = client_for_token(pt_token)
+                if account_key is None:
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                draft_id = body.get("draft_id", "")
+                actor_id = body.get("actor_id", "")
+                note = body.get("note", "")
+                status, resp = _pr.handle_portal_action(
+                    pt_action, account_key, draft_id, actor_id, note=note
+                )
+                return self._send_json(resp, status)
+
             # WhatsApp incoming webhook (POST /whatsapp).
             # 404 while the flag is off; 403 on signature failure; 200 on success.
             # Raw body is read first (signature covers the exact bytes).
