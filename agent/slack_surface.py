@@ -204,11 +204,13 @@ class SlackPoster:
             return data1
         upload_url = data1["upload_url"]
         file_id = data1["file_id"]
-        # Step 2: PUT the file
+        # Step 2: POST the file bytes to the upload URL. Slack's upload endpoint
+        # expects POST; a PUT gets a 302 redirect (which urllib raises), so the
+        # method here must be POST.
         with open(local_path, "rb") as fh:
             body = fh.read()
-        req2 = _ur.Request(upload_url, data=body, method="PUT",
-                           headers={"Content-Type": "video/mp4"})
+        req2 = _ur.Request(upload_url, data=body, method="POST",
+                           headers={"Content-Type": "application/octet-stream"})
         try:
             with _ur.urlopen(req2, timeout=300):
                 pass
