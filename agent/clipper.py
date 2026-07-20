@@ -644,7 +644,7 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
         render_dir = config.clipper_render_output_dir()
         for m in selection["accepted"]:
             try:
-                result = clipper_render.render_clip(m, media_path, transcript, render_dir)
+                result = clipper_render.render_clip(m, media_path, transcript, render_dir, llm=llm)
                 if result:
                     reels.append({"moment": m, "reel_path": result["reel_path"]})
                     print(f"clip-episode: rendered {result['reel_path']}")

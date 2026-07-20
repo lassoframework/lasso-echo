@@ -144,6 +144,7 @@ def _status():
     print(f"  opus_factory   : {config.opus_factory_enabled()}  (env AGENT_OPUS_FACTORY_ENABLED)")
     print(f"  clipper        : {config.clipper_enabled()}  (env AGENT_CLIPPER_ENABLED)")
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
+    print(f"  clipper_broll  : {config.clipper_broll_enabled()}  (env AGENT_CLIPPER_BROLL_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")

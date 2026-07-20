@@ -29,11 +29,16 @@ from . import config
 
 REEL_W = 1080
 REEL_H = 1920
-LOWER_H = 180   # lower-third bar height (pixels)
+LOWER_H = 70    # lower-third bar height (pixels)
 
 _BRAND_NAVY_HEX = "1A2340"   # without #
 _BRAND_RED_HEX = "E03131"
 _BRAND_WHITE_HEX = "FFFFFF"
+
+_CAPTION_FONT_SIZE = 100   # px — large enough for mobile
+_WORDS_PER_GROUP = 3       # words shown per caption event
+_ACTIVE_COLOR = "FFFFFF"   # white — currently spoken word
+_CONTEXT_COLOR = "888888"  # gray — other words in the group
 
 
 class RenderError(Exception):
@@ -191,11 +196,13 @@ def _fmt_ass_ts(seconds):
 
 def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
     """
-    Write an ASS subtitle file with one Dialogue event per word so each word
-    pops up and disappears at the exact moment it is spoken (karaoke-style).
-    Only words whose start time falls in [start_ts, end_ts] are included.
-    Timestamps in the ASS file are relative to the start of the segment.
-    Never includes words outside the segment (fabrication-safe).
+    Multi-word group karaoke captions (modern Reels style).
+    Words are grouped in sets of _WORDS_PER_GROUP. For each word's event, all
+    words in the group are visible at once: the currently-spoken word in white,
+    context words in gray. Dark semi-transparent box behind each event
+    (BorderStyle=3). MarginV=800 positions captions in the second third of the
+    1920px-tall frame — well above the brand bar and away from the edges.
+    Only words within [start_ts, end_ts] are included (fabrication-safe).
     """
     start_ts = float(start_ts)
     end_ts = float(end_ts)
@@ -205,7 +212,10 @@ def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
         and float(w.get("start", 0)) < end_ts + 0.05
     ]
 
-    caption_y = REEL_H - LOWER_H - 60   # above the lower-third brand frame
+    # Group into chunks of _WORDS_PER_GROUP
+    chunks = []
+    for i in range(0, len(words), _WORDS_PER_GROUP):
+        chunks.append(words[i:i + _WORDS_PER_GROUP])
 
     lines = [
         "[Script Info]",
@@ -218,24 +228,34 @@ def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path):
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        # White text, navy outline, bottom-center, 220px margin from bottom
-        f"Style: Karaoke,Arial,80,&H00{_BRAND_WHITE_HEX},&H00{_BRAND_WHITE_HEX},"
-        f"&H00{_BRAND_NAVY_HEX},&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,10,10,220,0",
+        # Bold large text; semi-transparent dark box; 800px from bottom (second third)
+        f"Style: Karaoke,Arial,{_CAPTION_FONT_SIZE},"
+        f"&H00{_ACTIVE_COLOR},&H003131E0,"
+        f"&H00{_BRAND_NAVY_HEX},&H50000000,"
+        f"-1,0,0,0,100,100,2,0,3,0,0,2,20,20,800,0",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    for w in words:
-        w_start = max(0.0, float(w.get("start", 0)) - start_ts)
-        w_end = max(w_start + 0.05, float(w.get("end", 0)) - start_ts)
-        text = str(w.get("word", "") or "").strip().upper()
-        if not text:
-            continue
-        lines.append(
-            f"Dialogue: 0,{_fmt_ass_ts(w_start)},{_fmt_ass_ts(w_end)},"
-            f"Karaoke,,0,0,0,,{text}"
-        )
+    for chunk in chunks:
+        for word_idx, w in enumerate(chunk):
+            w_start = max(0.0, float(w.get("start", 0)) - start_ts)
+            w_end = max(w_start + 0.05, float(w.get("end", 0)) - start_ts)
+            parts = []
+            for ci, cw in enumerate(chunk):
+                text = str(cw.get("word", "") or "").strip().upper()
+                if not text:
+                    continue
+                color = _ACTIVE_COLOR if ci == word_idx else _CONTEXT_COLOR
+                parts.append(f"{{\\c&H00{color}&}}{text}")
+            if not parts:
+                continue
+            display_text = " ".join(parts)
+            lines.append(
+                f"Dialogue: 0,{_fmt_ass_ts(w_start)},{_fmt_ass_ts(w_end)},"
+                f"Karaoke,,0,0,0,,{display_text}"
+            )
 
     os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
     with open(ass_path, "w", encoding="utf-8") as fh:
@@ -285,29 +305,34 @@ def burn_captions(input_path, output_path, transcript, start_ts, end_ts):
 def add_brand_frame(input_path, output_path,
                     logo_text="LASSO", handle_text="@GymMarketingMadeSimple"):
     """
-    Overlay the LASSO brand frame on a 1080x1920 vertical video:
-      - Navy lower-third bar at the bottom (LOWER_H px)
-      - Logo name and social handle centered in the bar
-    Design tokens match Echo's infographic house style: navy #1A2340, red #E03131.
+    Overlay the LASSO brand frame on a 1080x1920 vertical video.
+    Design: thin LOWER_H-px solid navy bar at the bottom.
+    - 3px LASSO red accent line at the very top of the bar
+    - Logo left-aligned, white, vertically centered in bar
+    - Handle right-aligned, white, vertically centered in bar
     Raises RenderError when the render flag is OFF or ffmpeg is absent.
     """
     _require_render()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    bar_y = REEL_H - LOWER_H          # top of the lower-third bar
-    logo_y = bar_y + 28               # logo text baseline
-    handle_y = bar_y + 108            # handle text baseline
+    bar_y = REEL_H - LOWER_H   # top of brand bar (1850 with LOWER_H=70)
+
+    def _esc(t):
+        return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
     vf_parts = [
-        # Navy lower-third bar
+        # Solid navy brand bar
         f"drawbox=x=0:y={bar_y}:w={REEL_W}:h={LOWER_H}:"
         f"color=0x{_BRAND_NAVY_HEX}@1.0:t=fill",
-        # Logo text: white, centered (bold via font-name on systems that support it)
-        f"drawtext=fontsize=56:fontcolor=0x{_BRAND_WHITE_HEX}:"
-        f"text='{logo_text}':x=(w-text_w)/2:y={logo_y}:font=Arial",
-        # Social handle: brand red, smaller, centered
-        f"drawtext=fontsize=36:fontcolor=0x{_BRAND_RED_HEX}:"
-        f"text='{handle_text}':x=(w-text_w)/2:y={handle_y}:font=Arial",
+        # 3px LASSO red accent line at the very top of the bar
+        f"drawbox=x=0:y={bar_y}:w={REEL_W}:h=3:"
+        f"color=0x{_BRAND_RED_HEX}@1.0:t=fill",
+        # Logo: white, left-aligned, vertically centered via th expression
+        f"drawtext=fontsize=42:fontcolor=0x{_BRAND_WHITE_HEX}:"
+        f"text='{_esc(logo_text)}':x=28:y=h-{LOWER_H}+({LOWER_H}-th)/2:font=Arial",
+        # Handle: white, right-aligned, same vertical center
+        f"drawtext=fontsize=22:fontcolor=0x{_BRAND_WHITE_HEX}:"
+        f"text='{_esc(handle_text)}':x=w-tw-28:y=h-{LOWER_H}+({LOWER_H}-th)/2:font=Arial",
     ]
     vf = ",".join(vf_parts)
 
@@ -324,10 +349,11 @@ def add_brand_frame(input_path, output_path,
 
 # ---- orchestrator -------------------------------------------------------------------
 
-def render_clip(moment, media_path, transcript, output_dir):
+def render_clip(moment, media_path, transcript, output_dir, llm=None):
     """
     Full Phase 2 render pipeline for one approved moment:
-      cut → frame_vertical → burn_captions → add_brand_frame
+      cut → frame_vertical → burn_captions → [B-roll overlay] → add_brand_frame
+    B-roll step runs only when AGENT_CLIPPER_BROLL_ENABLED=true (default OFF).
     Returns {"reel_path": str} or None if the render flag is OFF or ffmpeg absent.
     Callers should check config.clipper_render_enabled() before calling if they want
     to skip silently; this function raises RenderError so partial builds are loud.
@@ -346,6 +372,16 @@ def render_clip(moment, media_path, transcript, output_dir):
                           label=base)
     frame_vertical(cut_out, framed_out)
     burn_captions(framed_out, captioned_out, transcript, moment.start_ts, moment.end_ts)
-    add_brand_frame(captioned_out, final_out)
+
+    brolled_out = captioned_out
+    try:
+        from . import clipper_broll
+        if clipper_broll.broll_enabled():
+            brolled_out = clipper_broll.add_broll(
+                moment, captioned_out, transcript, output_dir, llm=llm)
+    except Exception as exc:
+        print(f"[broll] skipped: {exc}", flush=True)
+
+    add_brand_frame(brolled_out, final_out)
 
     return {"reel_path": final_out}

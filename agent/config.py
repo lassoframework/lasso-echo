@@ -992,6 +992,12 @@ def clipper_render_output_dir() -> str:
     return os.environ.get("AGENT_CLIPPER_RENDER_DIR", "/data/clipper/render")
 
 
+def clipper_broll_enabled() -> bool:
+    """B-roll text-card overlay in the render pipeline. OFF by default.
+    Set AGENT_CLIPPER_BROLL_ENABLED=true to arm. Requires render also armed."""
+    return _truthy(os.environ.get("AGENT_CLIPPER_BROLL_ENABLED", "false"))
+
+
 def services_category_enabled() -> bool:
     """Services category for LASSO own accounts ONLY, never client accounts. OFF by default.
     Draws from brand_voice/lasso_services.md; stub file = SKIP not fabricate."""
