@@ -14,6 +14,28 @@ import os
 import re
 import sys
 
+
+def _load_dotenv():
+    """Load .env from the repo root into os.environ (no-op if absent). Never overwrites existing vars."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_path = os.path.join(root, ".env")
+    try:
+        with open(env_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 from . import config
 from .runner import run_daily
 
