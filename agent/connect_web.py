@@ -200,6 +200,20 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
+            # Admin tracker: /admin/tracker/<token>[/handoff] (read-only, token-gated)
+            import re as _re
+            m = _re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
+                          parsed.path)
+            if m:
+                from .intake_web import handle_tracker
+                status, body = handle_tracker(
+                    m.group(1), "handoff" if m.group(2) else "tracker")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if parsed.path == "/connect":
                 self._send(*handle_connect())
             elif parsed.path == "/connect/callback":
