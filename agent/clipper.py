@@ -126,17 +126,58 @@ def _validate_transcript(t):
     return t
 
 
+def _deepgram_transcriber(media_path):
+    """Deepgram Nova-2 API backend. Used when AGENT_TRANSCRIBE_API_KEY is set."""
+    import urllib.request as _urlreq
+    import json as _json
+    key = os.environ.get(config.CLIPPER_TRANSCRIBE_KEY_ENV, "")
+    if not key:
+        raise ClipperError(f"{config.CLIPPER_TRANSCRIBE_KEY_ENV} not set")
+    ext = os.path.splitext(media_path)[1].lower()
+    content_type = {
+        ".mp4": "video/mp4", ".m4a": "audio/mp4", ".mp3": "audio/mpeg",
+        ".wav": "audio/wav", ".mov": "video/quicktime",
+    }.get(ext, "video/mp4")
+    with open(media_path, "rb") as fh:
+        audio_data = fh.read()
+    url = ("https://api.deepgram.com/v1/listen"
+           "?model=nova-2&smart_format=true&utterances=true&words=true")
+    req = _urlreq.Request(url, data=audio_data, method="POST",
+                          headers={"Authorization": f"Token {key}",
+                                   "Content-Type": content_type})
+    try:
+        with _urlreq.urlopen(req, timeout=600) as resp:
+            data = _json.loads(resp.read())
+    except Exception as exc:
+        raise ClipperError(f"Deepgram API error: {exc}")
+    try:
+        alt = data["results"]["channels"][0]["alternatives"][0]
+    except (KeyError, IndexError) as exc:
+        raise ClipperError(f"Unexpected Deepgram response shape: {exc}")
+    words = [{"word": w.get("punctuated_word", w.get("word", "")),
+               "start": w["start"], "end": w["end"]}
+              for w in alt.get("words", [])]
+    segs = [{"speaker": str(u.get("speaker", "")), "start": u["start"],
+              "end": u["end"], "text": u.get("transcript", "")}
+             for u in (data.get("results", {}).get("utterances") or [])]
+    if not segs:
+        for para in (alt.get("paragraphs", {}).get("paragraphs") or []):
+            for sent in para.get("sentences", []):
+                segs.append({"speaker": "", "start": sent["start"],
+                              "end": sent["end"], "text": sent.get("text", "")})
+    return {"words": words, "segments": segs}
+
+
 def _default_transcriber(media_path):
-    """Local faster-whisper backend with word timestamps. Raises ClipperError when
-    it is not installed, naming the env-var key for an API backend (value never
-    read here). Injected/mocked in tests."""
+    """Deepgram API when AGENT_TRANSCRIBE_API_KEY is set, else local faster-whisper."""
+    if os.environ.get(config.CLIPPER_TRANSCRIBE_KEY_ENV):
+        return _deepgram_transcriber(media_path)
     try:
         from faster_whisper import WhisperModel
     except Exception:
         raise ClipperError(
-            "no transcriber available: install faster-whisper, or pass a "
-            "transcriber that returns word-level timestamps. An API backend's key "
-            f"is read from the env var named {config.CLIPPER_TRANSCRIBE_KEY_ENV}.")
+            "no transcriber available: install faster-whisper, or set "
+            f"{config.CLIPPER_TRANSCRIBE_KEY_ENV} for the Deepgram API backend.")
     model = WhisperModel(os.environ.get("AGENT_WHISPER_MODEL", "base"))
     segments, _info = model.transcribe(media_path, word_timestamps=True)
     words, segs = [], []
@@ -391,33 +432,40 @@ def _fmt_ts(seconds):
     return f"{s // 60}:{s % 60:02d}"
 
 
-def print_plan(selection):
-    """Print the ranked selection plan for Blake to confirm the picks BEFORE any
-    video work: per pick the timestamps, duration, score, hook, bucket, rationale,
-    and the exact transcript text. Renders nothing, writes nothing."""
+def format_plan(selection) -> str:
+    """Return the ranked selection plan as a string (no side effects)."""
     accepted = selection.get("accepted", [])
     dropped = selection.get("dropped", [])
-    print("\nclip-episode PLAN (SELECTION ONLY, nothing rendered, nothing written):")
+    lines = ["\nclip-episode PLAN (SELECTION ONLY, nothing rendered, nothing written):"]
     if not accepted:
-        print("  no moments passed the score floor + fabrication gate.")
+        lines.append("  no moments passed the score floor + fabrication gate.")
     for i, m in enumerate(accepted, 1):
-        print(f"  #{i}  score {m.score}  {m.bucket or '(no bucket)':10s}  "
-              f"[{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}]  {m.duration:g}s")
-        print(f"      hook : {m.hook}")
-        print(f"      why  : {m.rationale}")
-        print(f"      text : {m.transcript_text}")
+        lines.append(f"  #{i}  score {m.score}  {m.bucket or '(no bucket)':10s}  "
+                     f"[{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}]  {m.duration:g}s")
+        lines.append(f"      hook : {m.hook}")
+        lines.append(f"      why  : {m.rationale}")
+        lines.append(f"      text : {m.transcript_text}")
     if dropped:
-        print("  dropped:")
+        lines.append("  dropped:")
         for m in dropped:
-            print(f"    [{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] score {m.score}: "
-                  f"{m.reason}")
+            lines.append(f"    [{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] score {m.score}: "
+                         f"{m.reason}")
     if not accepted:
-        print(f"  summary: 0 of {len(accepted) + len(dropped)} candidate "
-              "moment(s) passed the score, duration, and fabrication gates — "
-              "nothing to render. See the dropped reasons above.")
+        lines.append(f"  summary: 0 of {len(accepted) + len(dropped)} candidate "
+                     "moment(s) passed the score, duration, and fabrication gates — "
+                     "nothing to render. See the dropped reasons above.")
     else:
-        print(f"  summary: {len(accepted)} pick(s) held for confirmation, "
-              f"{len(dropped)} dropped.")
+        lines.append(f"  summary: {len(accepted)} pick(s) held for confirmation, "
+                     f"{len(dropped)} dropped.")
+    return "\n".join(lines)
+
+
+def print_plan(selection):
+    """Print the ranked selection plan for Blake to confirm the picks BEFORE any
+    video work. Returns the formatted string."""
+    text = format_plan(selection)
+    print(text)
+    return text
 
 
 # ---- Part 9: save each finished Reel as a HELD draft --------------------------------
@@ -575,13 +623,15 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
 
     staged = stage_episode(source, tenant, client=client)
     print(f"clip-episode: staged episode -> {staged['r2_key']} "
-          f"({'uploaded' if staged['staged'] else 'already in R2'})")
+          f"({'uploaded' if staged['staged'] else 'already in R2'})", flush=True)
 
     media_path = staged["source"] if staged["staged"] else None
+    print("clip-episode: transcribing (this may take 30-90s for a full episode)...",
+          flush=True)
     transcript = transcribe(staged["r2_key"], media_path=media_path,
                             transcriber=transcriber)
     print(f"clip-episode: transcript {len(transcript['words'])} word(s), "
-          f"{len(transcript.get('segments', []))} segment(s)")
+          f"{len(transcript.get('segments', []))} segment(s)", flush=True)
 
     selection = select_moments(transcript, llm=llm, account_key=account_key)
     print(f"clip-episode: {len(selection['accepted'])} moment(s) pass, "
@@ -609,17 +659,27 @@ def clip_episode(source, tenant=HOST_TENANT, render=False, client=None,
 
 
 def clip_episode_cli(argv):
-    """python -m agent clip-episode --source <path-or-R2-key> [--render]"""
-    source, render, i = None, False, 0
+    """python -m agent clip-episode --source <path-or-R2-key> [--render] [--account <key>]"""
+    source, render, account_key, i = None, False, None, 0
     while i < len(argv):
         if argv[i] == "--source" and i + 1 < len(argv):
             source = argv[i + 1]; i += 2; continue
         if argv[i] == "--render":
-            render = True
+            render = True; i += 1; continue
+        if argv[i] == "--account" and i + 1 < len(argv):
+            account_key = argv[i + 1]; i += 2; continue
         i += 1
     if not source:
-        print("usage: python -m agent clip-episode --source <path-or-R2-key> [--render]")
+        print("usage: python -m agent clip-episode --source <path-or-R2-key> "
+              "[--render] [--account <key>]")
         return
+
+    # Default render ON when AGENT_CLIPPER_RENDER_ENABLED is armed.
+    if not render and config.clipper_render_enabled():
+        render = True
+        print("clip-episode: AGENT_CLIPPER_RENDER_ENABLED is on — rendering clips.",
+              flush=True)
+
     client = None
     key_id = os.environ.get(config.S3_ACCESS_KEY_ID_ENV)
     secret = os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
@@ -637,7 +697,115 @@ def clip_episode_cli(argv):
             client = media_host._S3Client(s3, config.S3_BUCKET)
         except Exception:
             pass
+
     try:
-        clip_episode(source, render=render, client=client)
+        result = clip_episode(source, render=render, client=client)
     except ClipperError as exc:
-        print(str(exc))
+        print(str(exc), flush=True)
+        return
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        print(f"clip-episode: unexpected error: {exc}", flush=True)
+        return
+
+    if result is None:
+        return
+
+    selection = result.get("selection") or {}
+    accepted = selection.get("accepted", [])
+    reels = result.get("reels", [])
+    staged = result.get("staged") or {}
+    r2_key = staged.get("r2_key", source)
+    episode_public_url = staged.get("public_url", "")
+    episode_title = os.path.basename(r2_key).rsplit(".", 1)[0]
+    acct = account_key or os.environ.get("AGENT_CLIPPER_ACCOUNT_KEY") \
+           or config.episode_inbox_tenant()
+
+    # Build moment-id -> (reel_path, reel_url) for rendered clips.
+    reel_map = {}
+    for r in reels:
+        m = r.get("moment")
+        reel_path = r.get("reel_path", "")
+        reel_url = ""
+        if reel_path and client:
+            try:
+                reel_url = media_host.host_media(reel_path, acct, client=client) or ""
+                if reel_url:
+                    print(f"clip-episode: uploaded {os.path.basename(reel_path)}",
+                          flush=True)
+            except Exception as exc:
+                print(f"clip-episode: reel upload failed: {exc}", flush=True)
+        if m is not None:
+            reel_map[id(m)] = (reel_path, reel_url)
+
+    if not accepted:
+        print("clip-episode: no moments passed — nothing to post.", flush=True)
+        return
+
+    # Build Slack poster once for the upload + card flow.
+    slack_poster = None
+    slack_token = os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
+    slack_channel = os.environ.get("AGENT_SLACK_CHANNEL_ID", "")
+    if slack_token and slack_channel:
+        try:
+            from .slack_surface import SlackPoster
+            slack_poster = SlackPoster(token=slack_token, channel=slack_channel)
+        except Exception:
+            pass
+
+    # Post one proper approval card per accepted moment.
+    posted = 0
+    for m in accepted:
+        reel_path, reel_url = reel_map.get(id(m), ("", episode_public_url))
+        clip_ts = None
+
+        # Upload the rendered clip directly to Slack for inline video playback.
+        if reel_path and os.path.isfile(reel_path) and slack_poster:
+            clip_title = (f"Clip [{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] "
+                          f"score={m.score} — {episode_title}")
+            print(f"clip-episode: uploading clip to Slack "
+                  f"[{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}]...", flush=True)
+            resp = slack_poster.upload_clip(reel_path, title=clip_title,
+                                            initial_comment=f"*{m.hook}*")
+            if (resp or {}).get("ok"):
+                # Get the message ts so we can thread the approval card under the video.
+                files = (resp.get("files") or [{}])
+                f = files[0] if files else {}
+                shares = f.get("shares", {})
+                ch_shares = shares.get("private", {}) or shares.get("public", {})
+                for _ch, msgs in ch_shares.items():
+                    if msgs:
+                        clip_ts = msgs[0].get("ts")
+                        break
+                reel_url = f.get("permalink", reel_url)
+                print(f"clip-episode: clip uploaded to Slack", flush=True)
+            else:
+                print(f"clip-episode: Slack upload failed: {resp}", flush=True)
+
+        try:
+            # Post the approval card (in the clip's thread when we have a ts).
+            custom_poster = None
+            if clip_ts and slack_poster:
+                from .slack_surface import SlackPoster
+                custom_poster = SlackPoster(token=slack_token, channel=slack_channel)
+                custom_poster._thread_ts = clip_ts
+                _orig_chat_post = custom_poster._chat_post
+                def _threaded_post(text, blocks, channel=None, thread_ts=None):
+                    return _orig_chat_post(text, blocks, channel,
+                                           thread_ts=clip_ts)
+                custom_poster._chat_post = _threaded_post
+
+            save_clip_draft(m, reel_path, reel_url, acct,
+                            episode_title=episode_title, poster=custom_poster)
+            print(f"clip-episode: approval card posted "
+                  f"[{_fmt_ts(m.start_ts)}-{_fmt_ts(m.end_ts)}] "
+                  f"score={m.score}", flush=True)
+            posted += 1
+        except Exception as exc:
+            print(f"clip-episode: card failed [{_fmt_ts(m.start_ts)}]: {exc}",
+                  flush=True)
+
+    if posted:
+        print(f"clip-episode: {posted} clip(s) uploaded + approval card(s) posted. "
+              "Tap Approve / Edit / Skip on each thread.", flush=True)

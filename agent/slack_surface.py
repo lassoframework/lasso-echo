@@ -171,6 +171,63 @@ class SlackPoster:
             blocks=build_expired_blocks(draft),
         )
 
+    def upload_clip(self, local_path, title, initial_comment="", channel=None):
+        """Upload a rendered clip directly to Slack for inline video playback.
+        Returns the Slack file dict (has 'id', 'permalink', and shares.private ts).
+        Uses the new external upload API so the file appears with a play button."""
+        import os as _os
+        import urllib.request as _ur
+        import urllib.parse as _up
+        ch = channel or self._channel
+        filename = _os.path.basename(local_path)
+        size = _os.path.getsize(local_path)
+        # Step 1: get upload URL
+        params = _up.urlencode({"filename": filename, "length": size})
+        req1 = _ur.Request(
+            f"https://slack.com/api/files.getUploadURLExternal?{params}",
+            headers={"Authorization": f"Bearer {self._token}"},
+        )
+        try:
+            with _ur.urlopen(req1, timeout=30) as r:
+                import json as _j
+                data1 = _j.loads(r.read())
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not data1.get("ok"):
+            return data1
+        upload_url = data1["upload_url"]
+        file_id = data1["file_id"]
+        # Step 2: PUT the file
+        with open(local_path, "rb") as fh:
+            body = fh.read()
+        req2 = _ur.Request(upload_url, data=body, method="PUT",
+                           headers={"Content-Type": "video/mp4"})
+        try:
+            with _ur.urlopen(req2, timeout=300):
+                pass
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        # Step 3: complete the upload → posts to channel
+        import json as _j
+        payload3 = {
+            "files": [{"id": file_id, "title": title}],
+            "channel_id": ch,
+            "initial_comment": initial_comment,
+        }
+        req3 = _ur.Request(
+            "https://slack.com/api/files.completeUploadExternal",
+            data=_j.dumps(payload3).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {self._token}",
+                     "Content-Type": "application/json"},
+        )
+        try:
+            with _ur.urlopen(req3, timeout=30) as r:
+                data3 = _j.loads(r.read())
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return data3
+
     def _chat_post(self, text, blocks, channel=None, thread_ts=None):
         payload = {"channel": channel or self._channel, "text": text}
         if blocks:

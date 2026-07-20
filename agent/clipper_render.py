@@ -338,13 +338,12 @@ def render_clip(moment, media_path, transcript, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     base = f"clip_{int(moment.start_ts):05d}_{int(moment.end_ts):05d}"
 
-    cut_out = os.path.join(output_dir, base + "_cut.mp4")
     framed_out = os.path.join(output_dir, base + "_framed.mp4")
     captioned_out = os.path.join(output_dir, base + "_captioned.mp4")
     final_out = os.path.join(output_dir, base + "_reel.mp4")
 
-    cut_segment(media_path, moment.start_ts, moment.end_ts, output_dir,
-                label=base)
+    cut_out = cut_segment(media_path, moment.start_ts, moment.end_ts, output_dir,
+                          label=base)
     frame_vertical(cut_out, framed_out)
     burn_captions(framed_out, captioned_out, transcript, moment.start_ts, moment.end_ts)
     add_brand_frame(captioned_out, final_out)
