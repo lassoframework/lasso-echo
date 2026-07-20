@@ -655,6 +655,10 @@ def handle_tracker(token, which="tracker"):
     Returns (status, html_bytes). 404 when the tracker token is unset, does not
     match, or the requested page is unknown; 200 with the file contents on match.
     The raw token is never logged; a file that does not yet exist is a 404.
+
+    For the "handoff" page, first checks /data/handoff_live.html (written by the
+    scheduler at 12pm + 4pm ET via gen-handoff). If that file exists and is < 25h
+    old, it takes precedence over the static ECHO_HANDOFF.html in the repo.
     """
     expected = _tracker_token()
     if not expected or token != expected:
@@ -662,6 +666,20 @@ def handle_tracker(token, which="tracker"):
     rel = _TRACKER_PAGES.get(which)
     if rel is None:
         return 404, b"not found"
+
+    # For the handoff page, prefer a live-generated version if recent.
+    if which == "handoff":
+        import time as _time
+        data_dir = os.environ.get("AGENT_DATA_DIR", "/data")
+        live = os.path.join(data_dir, "handoff_live.html")
+        try:
+            age = _time.time() - os.path.getmtime(live)
+            if age < 25 * 3600:
+                with open(live, "rb") as fh:
+                    return 200, fh.read()
+        except (OSError, IOError):
+            pass  # fall through to static file
+
     full = os.path.join(_REPO_ROOT, rel)
     try:
         with open(full, "rb") as fh:

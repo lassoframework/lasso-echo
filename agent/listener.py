@@ -345,6 +345,22 @@ def _daily_scheduler(store):
                 backup.maybe_backup(now=now)
             except Exception as e:
                 print(f"[backup] pass failed: {type(e).__name__}: {e}")
+        # Handoff live-page refresh at 12pm + 4pm ET (16:00 + 20:00 UTC by default).
+        # Writes /data/handoff_live.html so the tracker route always has a fresh view.
+        # No flag required; fires as long as the loop is running. Idempotent per hour.
+        try:
+            _hh = {int(h.strip()) for h in
+                   os.environ.get("AGENT_HANDOFF_REFRESH_HOURS_UTC", "16,20").split(",")
+                   if h.strip().isdigit()}
+            if now.hour in _hh and now.minute < 10:
+                _hkey = f"handoff_refresh_{today}_{now.hour}"
+                from . import db as _db_hr
+                if (_db_hr.kv_get(_hkey, "") or "") != "done":
+                    from . import handoff_refresh as _hr
+                    _hr.generate()
+                    _db_hr.kv_set(_hkey, "done")
+        except Exception as e:
+            print(f"[handoff] refresh failed: {type(e).__name__}: {e}")
         time.sleep(60)
 
 

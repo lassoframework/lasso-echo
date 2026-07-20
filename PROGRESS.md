@@ -6,7 +6,30 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-17
+Last updated: 2026-07-20
+
+---
+
+## Admin tracker route + image grade check shipped (2026-07-20)
+
+### Admin tracker: /admin/tracker/<token>[/handoff]
+Read-only admin view of the build tracker and handoff docs. Served by the
+connect_web.py listener (port 8090). Token set by hand via AGENT_TRACKER_TOKEN
+(never logged, fingerprint only). Route matches [A-Za-z0-9_-]{8,}.
+
+Files served:
+- /admin/tracker/<token>         -> echo_build_tracker.html (live build dashboard)
+- /admin/tracker/<token>/handoff -> ECHO_HANDOFF.html (static) OR /data/handoff_live.html (live, if generated)
+
+### Image grade check on generated output (AGENT_IMAGE_GRADE_ENABLED)
+Vision check on the actual generated PNG, not just the prompt. After each Gemini
+image generation, a second Gemini vision call (OCR_MODEL) checks Q1 (left-aligned),
+Q2 (scale contrast), and Q5 (thumbnail legible) against the actual output pixels.
+Fails trigger up to 2 more retries (3 total). Both gates (style_gate + image_grade)
+run in a unified retry loop. Card withheld after 3 failed attempts + one ops alert.
+Flag: AGENT_IMAGE_GRADE_ENABLED (OFF by default). 57 tests added.
+
+Grade: B+ (unchanged). New flag does not move the grade.
 
 ---
 

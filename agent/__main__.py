@@ -381,6 +381,114 @@ def _whatsapp_status():
         print("preflight: FAIL (enabled but vars missing)")
 
 
+def _episode_upload(args):
+    """Upload a local episode file (mp4/mov/mp3/wav) to the R2 episode inbox.
+
+    Usage:  python -m agent episode-upload --file <path> [--tenant <key>]
+
+    The file lands at AGENT_EPISODE_INBOX_PREFIX/<filename>. Echo picks it up on
+    the next inbox poll (default every 5 minutes), runs Phase 1 clip selection,
+    and posts the ranked plan to #echoclaude. To cut actual Reels:
+    set AGENT_CLIPPER_RENDER_ENABLED=true before or after uploading.
+    """
+    import os as _os
+
+    file_path = None
+    tenant = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--file" and i + 1 < len(args):
+            file_path = args[i + 1]; i += 2
+        elif args[i] == "--tenant" and i + 1 < len(args):
+            tenant = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not file_path:
+        print("usage: python -m agent episode-upload --file <path> [--tenant <key>]")
+        sys.exit(1)
+
+    if not _os.path.exists(file_path):
+        print(f"ERROR: file not found: {file_path}")
+        sys.exit(1)
+
+    ext = _os.path.splitext(file_path)[1].lower()
+    if ext not in {".mp4", ".mov", ".mp3", ".wav"}:
+        print(f"ERROR: unsupported format {ext!r}  (accepted: .mp4 .mov .mp3 .wav)")
+        sys.exit(1)
+
+    key_id = _os.environ.get(config.S3_ACCESS_KEY_ID_ENV)
+    secret = _os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
+    if not key_id or not secret:
+        print(f"ERROR: R2 credentials not set.")
+        print(f"  Set {config.S3_ACCESS_KEY_ID_ENV} and {config.S3_SECRET_ACCESS_KEY_ENV}.")
+        sys.exit(1)
+    if not config.S3_BUCKET:
+        print("ERROR: AGENT_S3_BUCKET not configured.")
+        sys.exit(1)
+
+    try:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+    except ImportError:
+        print("ERROR: boto3 not installed. Run: pip install boto3")
+        sys.exit(1)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=config.S3_ENDPOINT or None,
+        region_name=config.S3_REGION or None,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret,
+        config=_BotoConfig(retries={"max_attempts": 3, "mode": "adaptive"}),
+    )
+
+    tenant_key = tenant or config.episode_inbox_tenant()
+    prefix = _os.environ.get("AGENT_EPISODE_INBOX_PREFIX",
+                             f"echo/episode_inbox/{tenant_key}/")
+    filename = _os.path.basename(file_path)
+    r2_key = prefix.rstrip("/") + "/" + filename
+    size_mb = _os.path.getsize(file_path) / (1024 * 1024)
+
+    print(f"Uploading {filename} ({size_mb:.1f} MB) ...")
+    try:
+        s3.upload_file(file_path, config.S3_BUCKET, r2_key)
+    except Exception as e:
+        print(f"ERROR: upload failed: {e}")
+        sys.exit(1)
+
+    print(f"  Done.  R2 key: {r2_key}")
+    print()
+    print("NEXT STEPS (in Railway env):")
+    print("  AGENT_EPISODE_INBOX_ENABLED=true     (inbox watcher, polls every 5 min)")
+    print("  AGENT_CLIPPER_ENABLED=true            (Phase 1: Claude clip selection)")
+    print("  AGENT_CLIPPER_RENDER_ENABLED=true     (Phase 2: ffmpeg cut + captions + brand frame)")
+    print("  ANTHROPIC_API_KEY=sk-...              (Claude moment selection)")
+    print("  AGENT_TRANSCRIBE_API_KEY=...          (transcription, OR install faster-whisper)")
+    print()
+    print("  For RSS podcast cards (release post + infographics):")
+    print("  AGENT_PODCAST_ENABLED=true")
+    print("  AGENT_PODCAST_FEED_URL=https://...    (your RSS feed URL from Riverside or anchor)")
+    print()
+    print(f"  Echo polls every {config.episode_inbox_poll_minutes()} min.")
+    print("  A ranked clip plan posts to #echoclaude once the episode is processed.")
+
+
+def _gen_handoff(args):
+    """Write a live status page to /data/handoff_live.html (served at /admin/tracker/<token>/handoff).
+
+    Usage:  python -m agent gen-handoff
+    """
+    import os as _os
+    try:
+        from . import handoff_refresh
+        path = handoff_refresh.generate()
+        print(f"Handoff page written to: {path}")
+    except Exception as e:
+        print(f"gen-handoff failed: {type(e).__name__}: {e}")
+        sys.exit(1)
+
+
 def _check_tokens():
     """python -m agent check-tokens: manual token watchdog run. Prints which
     credential and days remaining ONLY; a token value is never printed."""
@@ -602,12 +710,14 @@ _COMMANDS = {
          "Opus clip factory"),
         ("clip-episode", "score one episode's clip moments"),
         ("inbox-status", "episode inbox state"),
+        ("episode-upload", "upload a Riverside episode export to the episode inbox"),
     ],
     "reporting": [
         ("report", "one account report"),
         ("monthly-report / monthly-review / grade-card", "month-end artifacts"),
         ("audit / fleet-status", "cross-account state"),
         ("gbp-check", "Google Business Profile check"),
+        ("gen-handoff", "regenerate the live admin tracker HTML page"),
     ],
     "trust & approvals": [
         ("trust", "show trust level for an account (--account <key>)"),
@@ -1703,6 +1813,10 @@ def main(argv=None):
             print(_json.dumps(result, indent=2))
     elif cmd == "post-captions":
         _post_captions(argv[1:])
+    elif cmd == "episode-upload":
+        _episode_upload(argv[1:])
+    elif cmd == "gen-handoff":
+        _gen_handoff(argv[1:])
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
