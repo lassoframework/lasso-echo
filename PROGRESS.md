@@ -10,6 +10,36 @@ Last updated: 2026-07-20
 
 ---
 
+## Video editor shipped (Option A: Echo directs, Higgsfield renders) (2026-07-20)
+
+Full podcast-to-clips video editor in `agent/video_editor.py`, on top of the clipper.
+Pipeline: transcribe (Deepgram) -> select moments -> plan b-roll manifest ->
+render AI overlays via Higgsfield (Claude-in-the-loop) -> assemble 9:16 AND 1:1,
+captioned AND caption-free ad -> held Slack review card. Nothing publishes.
+
+- Flags (all default OFF): AGENT_VIDEO_EDITOR_ENABLED, AGENT_VIDEO_BROLL_ENABLED,
+  AGENT_VIDEO_RENDER. Cap AGENT_VIDEO_BROLL_CAP (default 6, per EPISODE), kind
+  video|image, cost/overlay, dirs, aspects.
+- B-roll planner: restrained beats (cap + 8s gap + 4s min offset), house-style
+  Higgsfield prompt per beat, fabrication-gated against the clip transcript.
+- Overlay renderer: pluggable interface + content-hash cache (re-runs never
+  re-pay) + RenderBudget episode-level cost guard (stops + logs, never silent).
+- Captions moved to lower-middle (second/third) via height fraction; karaoke
+  3-word groups; scrub_onscreen strips dashes + "vendor" from all burned text.
+- Brand frame redesigned: thin navy #121E3C bar, red #FF0000 accent, LASSO left
+  + handle right. Palette aligned to locked V3 house style.
+- Higgsfield reachable ONLY via interactive claude.ai MCP (never Railway cron):
+  render arm is Claude-in-the-loop by design; headless plans + projects cost only.
+- Cost preflighted: image overlay 2 cr, video overlay 7.5 cr. Default cap 6 ->
+  ~45 cr/episode (video) or ~12 (image).
+- Slack inline video FIXED: upload_clip used PUT (Slack 302s it) -> POST. Clips
+  now play inline in #echoclaude (files:write scope was present all along).
+- Independent audit (2 fresh agents) ran per BIG BUILD protocol: found per-clip
+  (not per-episode) cap + on-screen dash/vendor gaps; both fixed + re-tested.
+- 20 new tests. Suite 1494 green. SHA b61246f.
+
+---
+
 ## Admin tracker route + image grade check shipped (2026-07-20)
 
 ### Admin tracker: /admin/tracker/<token>[/handoff]
