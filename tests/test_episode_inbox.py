@@ -170,10 +170,11 @@ class TestPollLoop:
         import agent.clipper as _clipper_mod
         orig_clip = _clipper_mod.clip_episode
 
-        def fake_clip_episode(source, transcriber=None, llm=None, account_key=None):
+        def fake_clip_episode(source, render=False, transcriber=None, llm=None,
+                              account_key=None):
             fake_clipper(source, transcriber=transcriber,
                          llm=llm, account_key=account_key)
-            return {"staged": source, "transcript": {}, "selection": []}
+            return {"staged": source, "transcript": {}, "selection": {}, "reels": []}
 
         monkeypatch.setattr(_clipper_mod, "clip_episode", fake_clip_episode)
 
@@ -196,9 +197,10 @@ class TestPollLoop:
         call_count = {"n": 0}
 
         import agent.clipper as _clipper_mod
-        def fake_clip(source, transcriber=None, llm=None, account_key=None):
+        def fake_clip(source, render=False, transcriber=None, llm=None,
+                      account_key=None):
             call_count["n"] += 1
-            return {"staged": source, "transcript": {}, "selection": []}
+            return {"staged": source, "transcript": {}, "selection": {}, "reels": []}
         monkeypatch.setattr(_clipper_mod, "clip_episode", fake_clip)
 
         episode_inbox.poll(client=client)   # size registered
@@ -224,7 +226,8 @@ class TestPollLoop:
         client = _FakeR2Client([obj])
 
         import agent.clipper as _clipper_mod
-        def bad_clip(source, transcriber=None, llm=None, account_key=None):
+        def bad_clip(source, render=False, transcriber=None, llm=None,
+                     account_key=None):
             raise RuntimeError("transcription service down")
         monkeypatch.setattr(_clipper_mod, "clip_episode", bad_clip)
 
@@ -471,3 +474,246 @@ class TestMondayNudge:
         monday1 = _monday_9am_et()
         episode_inbox.check_monday_nudge(now=monday1, poster=poster)
         assert len(poster.notices) == 1
+
+
+# ---- Part 2 (render-armed): Phase 2+3 wiring -----------------------------------
+
+class _FakeDraftStore:
+    def __init__(self):
+        self.saved = []
+
+    def put(self, draft):
+        self.saved.append(draft)
+        return draft
+
+
+class _FakeDraftPoster:
+    def __init__(self):
+        self.posted = []
+
+    def post_approval_card(self, draft):
+        self.posted.append(draft)
+        return {"ok": True, "ts": "111.222", "channel": "C_TEST"}
+
+
+def _arm_render(monkeypatch, tmp_path):
+    """Arm both inbox and render flags."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_CLIPPER_RENDER_ENABLED", "true")
+    monkeypatch.setenv("AGENT_CLIPPER_ENABLED", "true")
+
+
+class TestPollRenderArmed:
+    """Phase 2+3 wiring: when AGENT_CLIPPER_RENDER_ENABLED is armed, poll()
+    must call clip_episode(render=True) and save a HELD draft per rendered Reel."""
+
+    def _make_moment(self):
+        from agent.clipper import Moment
+        return Moment(
+            start_ts=5.0, end_ts=50.0, duration=45.0,
+            hook="Most gyms ignore follow-up completely.",
+            rationale="Strong opening claim.",
+            bucket="doctrine", score=90,
+            transcript_text="Most gyms ignore follow-up completely.",
+        )
+
+    def test_poll_passes_render_true_when_flag_armed(self, tmp_path, monkeypatch):
+        """clip_episode must be called with render=True when the render flag is set."""
+        _arm_render(monkeypatch, tmp_path)
+        key = "echo/inbox/ep.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        render_calls = {"render": None}
+
+        import agent.clipper as _clipper_mod
+        def fake_clip(source, render=False, transcriber=None, llm=None,
+                      account_key=None):
+            render_calls["render"] = render
+            return {"staged": source, "transcript": {}, "selection": {}, "reels": []}
+
+        monkeypatch.setattr(_clipper_mod, "clip_episode", fake_clip)
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        episode_inbox.poll(client=client)    # size registered
+        episode_inbox.poll(client=client)    # stable -> clips with render=True
+
+        assert render_calls["render"] is True
+
+    def test_poll_saves_draft_per_rendered_reel(self, tmp_path, monkeypatch):
+        """One Reel in the result must produce one HELD draft in the store."""
+        _arm_render(monkeypatch, tmp_path)
+        key = "echo/inbox/ep47.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        moment = self._make_moment()
+        fake_reel = {"moment": moment, "reel_path": "/data/render/clip_reel.mp4"}
+
+        import agent.clipper as _clipper_mod
+        monkeypatch.setattr(_clipper_mod, "clip_episode",
+                            lambda *a, **kw: {
+                                "staged": key, "transcript": {},
+                                "selection": {}, "reels": [fake_reel],
+                            })
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        # Stub out media_host.host_media so no real R2 upload is attempted.
+        import agent.media_host as _media_host
+        monkeypatch.setattr(_media_host, "host_media",
+                            lambda path, tenant, client=None: "https://cdn.test/reel.mp4")
+
+        store = _FakeDraftStore()
+        draft_poster = _FakeDraftPoster()
+
+        episode_inbox.poll(client=client)    # size registered
+        result = episode_inbox.poll(
+            client=client,
+            draft_store=store,
+            draft_poster=draft_poster,
+        )
+
+        assert result["drafts_saved"] == 1
+        # save_clip_draft calls store.put() twice (save + Slack ts update);
+        # verify one unique draft was saved (by draft_id).
+        assert len({d.draft_id for d in store.saved}) == 1
+        draft = store.saved[0]
+        assert draft.status.value == "pending" or str(draft.status).lower() == "pending"
+
+    def test_poll_draft_has_pending_status_never_autopublishes(
+            self, tmp_path, monkeypatch):
+        """Clipper drafts are always PENDING regardless of trust ladder."""
+        _arm_render(monkeypatch, tmp_path)
+        key = "echo/inbox/ep48.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        moment = self._make_moment()
+        fake_reel = {"moment": moment, "reel_path": "/data/render/clip48.mp4"}
+
+        import agent.clipper as _clipper_mod
+        monkeypatch.setattr(_clipper_mod, "clip_episode",
+                            lambda *a, **kw: {
+                                "staged": key, "transcript": {},
+                                "selection": {}, "reels": [fake_reel],
+                            })
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        import agent.media_host as _media_host
+        monkeypatch.setattr(_media_host, "host_media",
+                            lambda path, tenant, client=None: "")
+
+        store = _FakeDraftStore()
+        episode_inbox.poll(client=client)    # size registered
+        episode_inbox.poll(client=client, draft_store=store,
+                           draft_poster=_FakeDraftPoster())
+
+        assert len(store.saved) >= 1
+        for d in store.saved:
+            assert str(d.status).lower() == "pending" or d.status.value == "pending"
+
+    def test_poll_render_flag_off_no_drafts_saved(self, tmp_path, monkeypatch):
+        """When the render flag is OFF, poll still works but never saves drafts."""
+        _arm(monkeypatch, tmp_path)  # inbox ON, render OFF
+        monkeypatch.delenv("AGENT_CLIPPER_RENDER_ENABLED", raising=False)
+
+        key = "echo/inbox/ep49.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        moment = self._make_moment()
+        fake_reel = {"moment": moment, "reel_path": "/data/render/clip49.mp4"}
+
+        import agent.clipper as _clipper_mod
+        monkeypatch.setattr(_clipper_mod, "clip_episode",
+                            lambda *a, **kw: {
+                                "staged": key, "transcript": {},
+                                "selection": {}, "reels": [fake_reel],
+                            })
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        store = _FakeDraftStore()
+        episode_inbox.poll(client=client)   # size registered
+        result = episode_inbox.poll(client=client, draft_store=store,
+                                    draft_poster=_FakeDraftPoster())
+
+        assert "drafts_saved" not in result
+        assert len(store.saved) == 0
+
+    def test_poll_slack_card_posted_per_rendered_reel(
+            self, tmp_path, monkeypatch):
+        """Each rendered Reel gets its own Slack approval card."""
+        _arm_render(monkeypatch, tmp_path)
+        key = "echo/inbox/ep50.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        moment = self._make_moment()
+        fake_reels = [
+            {"moment": moment, "reel_path": "/data/render/clipA.mp4"},
+            {"moment": moment, "reel_path": "/data/render/clipB.mp4"},
+        ]
+
+        import agent.clipper as _clipper_mod
+        monkeypatch.setattr(_clipper_mod, "clip_episode",
+                            lambda *a, **kw: {
+                                "staged": key, "transcript": {},
+                                "selection": {}, "reels": fake_reels,
+                            })
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        import agent.media_host as _media_host
+        monkeypatch.setattr(_media_host, "host_media",
+                            lambda path, tenant, client=None: "https://cdn.test/r.mp4")
+
+        store = _FakeDraftStore()
+        draft_poster = _FakeDraftPoster()
+
+        episode_inbox.poll(client=client)   # size registered
+        result = episode_inbox.poll(
+            client=client, draft_store=store, draft_poster=draft_poster)
+
+        assert result["drafts_saved"] == 2
+        assert len(draft_poster.posted) == 2
+
+    def test_reel_upload_failure_does_not_crash_loop(
+            self, tmp_path, monkeypatch):
+        """A reel upload failure fires an ops alert but the draft is still saved."""
+        _arm_render(monkeypatch, tmp_path)
+        key = "echo/inbox/ep51.mp4"
+        obj = {"key": key, "size": 5000000, "last_modified": ""}
+        client = _FakeR2Client([obj])
+
+        moment = self._make_moment()
+        fake_reel = {"moment": moment, "reel_path": "/data/render/clipC.mp4"}
+
+        import agent.clipper as _clipper_mod
+        monkeypatch.setattr(_clipper_mod, "clip_episode",
+                            lambda *a, **kw: {
+                                "staged": key, "transcript": {},
+                                "selection": {}, "reels": [fake_reel],
+                            })
+        monkeypatch.setattr("agent.episode_inbox._post_plan_to_slack",
+                            lambda *a, **kw: None)
+
+        import agent.media_host as _media_host
+        monkeypatch.setattr(_media_host, "host_media",
+                            lambda *a, **kw: (_ for _ in ()).throw(
+                                RuntimeError("R2 upload failed")))
+
+        store = _FakeDraftStore()
+        draft_poster = _FakeDraftPoster()
+
+        episode_inbox.poll(client=client)   # size registered
+        result = episode_inbox.poll(
+            client=client, draft_store=store, draft_poster=draft_poster)
+
+        # Draft is still saved (with empty URL) even after upload failure
+        assert result["drafts_saved"] == 1
+        # save_clip_draft calls put() twice (save + Slack ts update); check 1 unique draft_id
+        assert len({d.draft_id for d in store.saved}) == 1

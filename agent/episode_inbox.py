@@ -192,18 +192,25 @@ def _post_plan_to_slack(selection, episode_meta: dict, r2_key: str,
         )
 
 
-def poll(client=None, transcriber=None, llm=None, poster=None) -> dict:
+def poll(client=None, transcriber=None, llm=None, poster=None,
+         draft_store=None, draft_poster=None) -> dict:
     """
     One inbox poll pass.
 
     - Lists the watched prefix.
     - Guards against in-progress uploads (size must be stable across two polls).
     - Claims stable, unclaimed files and invokes Phase 1 clip selection.
-    - Posts the ranked plan to Slack.
+    - When AGENT_CLIPPER_RENDER_ENABLED is armed, also runs Phase 2 (render) and
+      Phase 3 (save each rendered Reel as a HELD draft with a Slack approval card).
+      Drafts are always PENDING regardless of trust ladder.
+    - Always posts the ranked selection plan to Slack as a summary notice.
     - Marks each file processed or failed.
     - Updates db.kv last-run timestamp.
 
     Returns a summary dict for tests/ops.
+
+    draft_store / draft_poster: injected in tests; default is PendingStore /
+    SlackPoster in production. Only used when the render flag is armed.
     """
     if not config.episode_inbox_enabled():
         return {"status": "disabled"}
@@ -249,6 +256,10 @@ def poll(client=None, transcriber=None, llm=None, poster=None) -> dict:
 
     processed = 0
     failed = 0
+    drafts_saved = 0
+
+    # Whether to also run Phase 2 render + Phase 3 draft saving this pass.
+    render_armed = config.clipper_render_enabled()
 
     for key in stable_keys:
         if not _claim(key):
@@ -259,12 +270,49 @@ def poll(client=None, transcriber=None, llm=None, poster=None) -> dict:
             from . import clipper as _clipper
             result = _clipper.clip_episode(
                 key,
+                render=render_armed,
                 transcriber=transcriber,
                 llm=llm,
                 account_key=config.episode_inbox_tenant(),
             )
-            selection = result.get("selection", [])
+            selection = result.get("selection", {})
             _post_plan_to_slack(selection, episode_meta, key, poster=poster)
+
+            # Phase 3: when render is armed, save each rendered Reel as a HELD draft.
+            if render_armed:
+                reels = result.get("reels", [])
+                episode_title = os.path.basename(key).rsplit(".", 1)[0]
+                acct = config.episode_inbox_tenant()
+                for reel_entry in reels:
+                    m = reel_entry.get("moment")
+                    reel_path = reel_entry.get("reel_path", "")
+                    if m is None or not reel_path:
+                        continue
+                    # Upload the rendered reel to R2 so the approval card has a URL.
+                    reel_url = ""
+                    try:
+                        from . import media_host as _media_host
+                        reel_url = _media_host.host_media(
+                            reel_path, acct, client=r2_client) or ""
+                    except Exception as upload_exc:
+                        ops_alerts.alert(
+                            f"[episode_inbox] reel upload failed for {reel_path}: "
+                            f"{type(upload_exc).__name__}: {upload_exc}"
+                        )
+                    try:
+                        _clipper.save_clip_draft(
+                            m, reel_path, reel_url, acct,
+                            episode_title=episode_title,
+                            store=draft_store,
+                            poster=draft_poster,
+                        )
+                        drafts_saved += 1
+                    except Exception as draft_exc:
+                        ops_alerts.alert(
+                            f"[episode_inbox] draft save failed for {reel_path}: "
+                            f"{type(draft_exc).__name__}: {draft_exc}"
+                        )
+
             ep_num = episode_meta.get("episode")
             if ep_num is not None:
                 _mark_ep_matched(ep_num)
@@ -277,7 +325,7 @@ def poll(client=None, transcriber=None, llm=None, poster=None) -> dict:
             ops_alerts.alert(f"[episode_inbox] processing failed for {key}: {reason}")
             # Never crash the loop: continue to next file
 
-    return {
+    result_dict = {
         "status": "ok",
         "prefix": prefix,
         "objects_found": len(current_sizes),
@@ -285,6 +333,9 @@ def poll(client=None, transcriber=None, llm=None, poster=None) -> dict:
         "processed": processed,
         "failed": failed,
     }
+    if render_armed:
+        result_dict["drafts_saved"] = drafts_saved
+    return result_dict
 
 
 # ---- Part 3: ops surface --------------------------------------------------------

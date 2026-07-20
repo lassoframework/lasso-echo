@@ -1474,12 +1474,15 @@ Part 1 (inbox convention + state, SHA 990d81f):
       claimed keys; marker survives restarts (persistent SQLite kv).
 - [x] _S3Client.list_prefix() added to media_host — paginated R2 prefix listing.
 
-Part 2 (watcher loop, SHA 990d81f):
+Part 2 (watcher loop, SHA 990d81f + Phase 2/3 wiring 2026-07-20):
 - [x] poll() every AGENT_EPISODE_INBOX_POLL_MINUTES (default 5) in _daily_scheduler.
 - [x] Size-stability guard: file must have same size across two consecutive polls
       before it is claimed (guards against in-progress uploads from Riverside).
 - [x] Claim + invoke Phase 1 clip selection; post ranked plan to Slack #echoclaude
-      as a held plan message. NOTHING renders, NOTHING posts.
+      as a held plan message. When AGENT_CLIPPER_RENDER_ENABLED is armed, also runs
+      Phase 2 (render via clipper_render) and Phase 3 (save_clip_draft per Reel,
+      PENDING regardless of trust ladder, Slack approval card per reel). Plan notice
+      always posts; drafts only post when render flag is armed. 6 new tests added.
 - [x] Exception in processing marks file FAILED, alerts via ops_alerts, loop
       continues uninterrupted.
 
@@ -1503,9 +1506,10 @@ Part 5 (Monday 9am nudge, SHA 43a3653):
 - [x] Stale episode outside window is silent.
 - [x] Nudge slot added to _daily_scheduler (never crashes loop).
 
-39 tests, all green. Suite 1000 passed, 7 pre-existing reportlab failures.
+45 tests, all green. Suite 1473 passed (2026-07-20).
 
 BLAKE BY HAND to arm this pipeline:
+  Phase 1 only (selection plan to Slack):
   1. Set AGENT_EPISODE_INBOX_ENABLED=true in Railway.
   2. Ensure AGENT_HOSTING_ENABLED=true + R2 credentials set (for list_prefix).
   3. Ensure AGENT_CLIPPER_ENABLED=true (Phase 1 clip selection).
@@ -1517,6 +1521,12 @@ BLAKE BY HAND to arm this pipeline:
      AGENT_EPISODE_NUDGE_WINDOW_DAYS (default 2).
   7. Export a finished episode from Riverside, drop it in the inbox prefix.
   8. Within one poll cycle, a ranked clip plan appears in #echoclaude.
+
+  Phase 2+3 (render + held drafts): after Phase 1 is confirmed working:
+  9. Set AGENT_CLIPPER_RENDER_ENABLED=true in Railway.
+  10. Each new episode file dropped in the inbox now produces rendered Reels
+      AND Slack approval cards (Approve / Edit / Skip). Drafts are PENDING,
+      never auto-published. Approve each Reel individually in #echoclaude.
 
 ### Stage 2 foundation (2026-07-09 buildout; ten parts, every flag defaults OFF)
 - [x] 7-day cadence: POSTING_SKIP_DAYS default is now empty (no skip days); Saturday
