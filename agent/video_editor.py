@@ -229,6 +229,13 @@ def snap_to_word_boundaries(moment, transcript, window=1.2):
         if near:
             moment.end_ts = min(near, key=lambda t: abs(t - e))
 
+    # Guard: never let snapping collapse a clip. If the snapped span is degenerate
+    # (inverted or under 1s), revert to the original timestamps and log it.
+    if moment.end_ts - moment.start_ts < 1.0:
+        print(f"[video] snap produced a degenerate span "
+              f"({moment.start_ts:.2f}-{moment.end_ts:.2f}); keeping original "
+              f"{s:.2f}-{e:.2f}", flush=True)
+        moment.start_ts, moment.end_ts = s, e
     try:
         moment.duration = round(moment.end_ts - moment.start_ts, 2)
     except Exception:

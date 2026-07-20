@@ -369,6 +369,18 @@ def test_snap_to_word_boundaries():
     assert m.duration == round(61.5 - 10.0, 2)
 
 
+def test_snap_reverts_degenerate_span():
+    # two boundaries so close they'd collapse the clip -> revert to original
+    tr = {"words": [
+        {"word": "a", "start": 10.0, "end": 10.2},
+        {"word": "b", "start": 10.25, "end": 10.4},
+    ], "segments": []}
+    m = _moment(10.1, 10.3)  # both inside adjacent tiny words
+    ve.snap_to_word_boundaries(m, tr)
+    # snapped span would be < 1s -> guard reverts to original
+    assert m.start_ts == 10.1 and m.end_ts == 10.3
+
+
 def test_snap_is_noop_when_no_word_in_window():
     tr = {"words": [{"word": "x", "start": 500.0, "end": 500.5}], "segments": []}
     m = _moment(10.0, 70.0)
