@@ -148,6 +148,7 @@ def _status():
     print(f"  video_editor   : {config.video_editor_enabled()}  (env AGENT_VIDEO_EDITOR_ENABLED)")
     print(f"  video_broll    : {config.video_broll_enabled()}  (env AGENT_VIDEO_BROLL_ENABLED)")
     print(f"  video_render   : {config.video_render_enabled()}  (env AGENT_VIDEO_RENDER)")
+    print(f"  video_stills   : {config.video_stills_enabled()}  (env AGENT_VIDEO_STILLS_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")

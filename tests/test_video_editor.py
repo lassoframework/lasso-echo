@@ -245,7 +245,141 @@ def test_edit_episode_off_returns_none(monkeypatch):
 
 # ---- assembly (ffmpeg) ------------------------------------------------------
 
+# ---- v1: routing, stills, treatment, captions -------------------------------
+
+def test_route_classifier_stats_go_still_scenes_go_motion():
+    assert ve._classify_route("close rate 80 percent", "eighty percent close") == "still"
+    assert ve._classify_route("the three step framework", "three step") == "still"
+    assert ve._classify_route("a coach on the phone", "calling a lead") == "motion"
+
+
+def test_planner_routes_and_enforces_separate_caps(monkeypatch):
+    monkeypatch.setenv("AGENT_VIDEO_BROLL_CAP", "1")   # motion cap
+    monkeypatch.setenv("AGENT_VIDEO_STILLS_CAP", "1")  # stills cap
+    m = _moment(0, 200)
+    tr = _transcript(0, 200)
+
+    def fake_llm(system, user):
+        return json.dumps([
+            {"offset": 10, "duration": 4, "concept": "coach calling a lead",
+             "source_span": "coach phone", "visual": "a coach on the phone",
+             "route": "motion"},
+            {"offset": 30, "duration": 4, "concept": "front desk missed calls",
+             "source_span": "missed calls", "visual": "a busy front desk",
+             "route": "motion"},
+            {"offset": 60, "duration": 4, "concept": "booking calendar revenue",
+             "source_span": "booking calendar", "visual": "n/a", "route": "still"},
+            {"offset": 90, "duration": 4, "concept": "members showed booking",
+             "source_span": "members showed", "visual": "n/a", "route": "still"},
+        ])
+
+    man = ve.plan_broll_manifest(m, tr, llm=fake_llm)
+    assert man["motion_count"] == 1
+    assert man["still_count"] == 1
+    assert man["dropped_for_cap"] == 2
+    # still beat carries card_text + image kind
+    still = [b for b in man["beats"] if b["route"] == "still"][0]
+    assert still["kind"] == "image"
+    assert still["card_text"]
+    # projected cost mixes motion (video) + still (nano)
+    assert man["projected_cost"] == round(1 * man["cost_per_overlay"]
+                                          + 1 * man["cost_per_still"], 2)
+
+
+def test_still_prompt_has_grounded_text_no_dashes():
+    beat = {"concept": "twenty-five percent", "card_text": "TWENTY FIVE PERCENT"}
+    p = ve._build_still_prompt(beat)
+    assert "TWENTY FIVE PERCENT" in p
+    assert "-" not in p.split("reads exactly:")[1]
+
+
+def test_still_card_renderer_needs_pipeline(monkeypatch):
+    # with creative_studio disabled, the still renderer raises (never silent spend)
+    monkeypatch.delenv("AGENT_CREATIVE_STUDIO_ENABLED", raising=False)
+    with pytest.raises(ve.VideoEditorError, match="creative_studio"):
+        ve.still_card_renderer({"prompt": "x"}, "/tmp/none.png", "image")
+
+
+def test_render_overlays_routes_still_and_motion(tmp_path):
+    cache = str(tmp_path / "ov")
+    manifest = {"kind": "video", "beats": [
+        {"offset": 5, "duration": 4, "concept": "m", "prompt": "pm", "route": "motion"},
+        {"offset": 20, "duration": 4, "concept": "s", "prompt": "ps", "route": "still",
+         "kind": "image"},
+    ]}
+    hits = {"motion": 0, "still": 0}
+
+    def motion_r(beat, out, kind):
+        hits["motion"] += 1
+        open(out, "wb").write(b"m" * 50)
+
+    def still_r(beat, out, kind):
+        hits["still"] += 1
+        open(out, "wb").write(b"s" * 50)
+
+    ov = ve.render_overlays(manifest, renderer=motion_r, still_renderer=still_r,
+                            cache_dir=cache, budget=ve.RenderBudget(6),
+                            still_budget=ve.RenderBudget(6))
+    assert hits == {"motion": 1, "still": 1}
+    routes = sorted(o["route"] for o in ov)
+    assert routes == ["motion", "still"]
+    # still asset is a .png, motion a .mp4
+    kinds = {o["route"]: o["asset_path"].rsplit(".", 1)[1] for o in ov}
+    assert kinds["still"] == "png" and kinds["motion"] == "mp4"
+
+
+def test_word_highlight_ass_one_red_word_no_ghost(tmp_path):
+    tr = _transcript(0, 6, step=0.5)
+    ass = str(tmp_path / "wh.ass")
+    ve._make_word_highlight_ass(tr, 0, 6, ass, 1080, 1920, margin_v=500)
+    content = open(ass).read()
+    assert "Anton" in content
+    events = [l for l in content.splitlines() if l.startswith("Dialogue:")]
+    assert events
+    for e in events:
+        # exactly ONE active red word per event (one red color tag), rest white
+        assert e.count("&H002A2AFF&") == 1, e
+    # no hyphen reaches on-screen text
+    body = "\n".join(events)
+    assert "-" not in body
+
+
+def test_flags_default_off_v1(monkeypatch):
+    monkeypatch.delenv("AGENT_VIDEO_STILLS_ENABLED", raising=False)
+    assert config.video_stills_enabled() is False
+
+
 pytestmark_ff = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not found")
+
+
+@pytestmark_ff
+def test_face_detect_graceful_on_no_face(tmp_path):
+    # a synthetic solid-color video has no face -> returns None, never raises
+    src = str(tmp_path / "noface.mp4")
+    _make_src(src, duration=3)
+    assert ve.video_assets.detect_face_bottom_frac(src) is None
+
+
+@pytestmark_ff
+def test_bottom_treatment_produces_correct_dims(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    src = str(tmp_path / "framed.mp4")
+    _make_src(src, duration=3, w=1080, h=1920)
+    out = str(tmp_path / "branded.mp4")
+    ve.apply_bottom_treatment(src, out, 1080, 1920, str(tmp_path / "work"))
+    assert _probe_dims(out) == (1080, 1920)
+
+
+@pytestmark_ff
+def test_word_highlight_burns_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    src = str(tmp_path / "framed.mp4")
+    _make_src(src, duration=4, w=1080, h=1920)
+    out = str(tmp_path / "wh.mp4")
+    tr = _transcript(0, 4, step=0.4)
+    ve.burn_word_highlight(src, out, tr, 0, 4, 1080, 1920, face_bottom_frac=0.4)
+    assert os.path.isfile(out) and os.path.getsize(out) > 0
+    assert _probe_dims(out) == (1080, 1920)
 
 
 def _make_src(path, duration=12, w=640, h=360):

@@ -1029,13 +1029,42 @@ def video_render_enabled() -> bool:
 
 
 def video_broll_cap() -> int:
-    """Max Higgsfield overlay renders per episode (hard cost guard). Hitting the
-    cap stops and surfaces, never silently spends. Env AGENT_VIDEO_BROLL_CAP,
-    default 6."""
+    """Max MOTION b-roll renders per episode (Higgsfield video, hard cost guard).
+    Hitting the cap stops and surfaces, never silently spends. Env
+    AGENT_VIDEO_BROLL_CAP, default 6."""
     try:
         return max(0, int(os.environ.get("AGENT_VIDEO_BROLL_CAP", "6")))
     except (TypeError, ValueError):
         return 6
+
+
+def video_stills_enabled() -> bool:
+    """Arms Nano Banana (Gemini) STILL card overlays in the video editor. OFF by
+    default. Set AGENT_VIDEO_STILLS_ENABLED=true. Reuses the SAME creative_studio
+    Gemini pipeline / model / key as organic cards (one image source of truth)."""
+    return _truthy(os.environ.get("AGENT_VIDEO_STILLS_ENABLED", "false"))
+
+
+def video_stills_cap() -> int:
+    """Max Nano Banana still-card renders per episode (separate, cheaper cap).
+    Hitting the cap stops and surfaces, never silently spends. Env
+    AGENT_VIDEO_STILLS_CAP, default 6."""
+    try:
+        return max(0, int(os.environ.get("AGENT_VIDEO_STILLS_CAP", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
+def video_cost_per_still() -> float:
+    """Projected credit cost of one Nano Banana still card, for the cost report.
+    Env AGENT_VIDEO_COST_PER_STILL overrides; default 2.0."""
+    override = os.environ.get("AGENT_VIDEO_COST_PER_STILL")
+    if override:
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            pass
+    return 2.0
 
 
 def video_broll_kind() -> str:

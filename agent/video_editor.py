@@ -32,9 +32,28 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from . import config
 from . import clipper_render
+from . import video_assets
+
+# ---- Minimal Broadcast bottom treatment (house standard) --------------------
+# navy scrim color (LASSO V3 navy), semi-transparent gradient for legibility
+_SCRIM_NAVY = (18, 30, 60)      # #121E3C
+_SCRIM_MAX_ALPHA = 150          # bottom of the gradient
+_HANDLE_TEXT = "@GYMMARKETINGMADESIMPLE"
+# fractions of frame HEIGHT
+_LOGO_H_FRAC = 0.042
+_INSET_FRAC = 0.036
+_HANDLE_FS_FRAC = 0.014
+_SCRIM_H_FRAC = 0.09
+
+# ---- Word Highlight caption style (house standard) --------------------------
+_WH_ACTIVE_BGR = "2A2AFF"       # ASS &HBBGGRR for red (255,42,42)
+_WH_WHITE_BGR = "FFFFFF"
+_WH_WORDS_PER_GROUP = 3
+_WH_FONT_FRAC = 0.062           # caption font size as fraction of frame height
 
 
 class VideoEditorError(Exception):
@@ -150,6 +169,19 @@ def _fabrication_ok(concept, source_span, clip_tokens):
     return hits >= max(1, int(len(meaningful) * 0.5))
 
 
+_STILL_SIGNAL_RE = re.compile(
+    r"\d|\bpercent\b|\bdollars?\b|\bstep\b|\bframework\b|\bthree\b|\bfour\b|"
+    r"\bfive\b|\bstat\b|\bnumber\b|\bquote\b|\brate\b|\bformula\b")
+
+
+def _classify_route(concept, source_span, visual=""):
+    """Route a beat: 'still' when the beat is a stat/number/quote/framework meant
+    to be READ (Nano Banana card); otherwise 'motion' scene/action (Higgsfield
+    video). Restraint on stills: only when there is a readable signal."""
+    blob = f"{concept} {source_span}".lower()
+    return "still" if _STILL_SIGNAL_RE.search(blob) else "motion"
+
+
 def _dedup_and_space(beats, clip_dur):
     """Sort by offset, enforce min offset / min gap / in-bounds, dedup."""
     out = []
@@ -244,7 +276,10 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
             "'concept' (2 to 5 words naming the idea, drawn from what is actually said), "
             "'visual' (one sentence describing a CONCRETE gym-owner scene to show, no text "
             "in the image), "
-            "'source_span' (the spoken words that triggered it, verbatim from the transcript). "
+            "'source_span' (the spoken words that triggered it, verbatim from the transcript), "
+            "'route' (either 'motion' for a scene/action/movement beat, or 'still' for a "
+            "stat/number/quote/framework beat that is meant to be READ). Prefer 'motion'; "
+            "use 'still' only when the point is a number or a quotable line. "
             "Never invent a concept not spoken. No dashes of any kind in any field."
         )
         user = (
@@ -273,12 +308,16 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
                     print(f"[video] b-roll beat dropped (not grounded): '{concept}'",
                           flush=True)
                     continue
+                route = str(item.get("route", "")).strip().lower()
+                if route not in ("motion", "still"):
+                    route = _classify_route(concept, span, visual)
                 planned.append({
                     "offset": round(off, 2),
                     "duration": max(2.0, min(6.0, dur)),
                     "concept": concept,
                     "visual": visual,
                     "source_span": span,
+                    "route": route,
                 })
         except Exception as exc:
             print(f"[video] planner LLM error: {exc} — using heuristic fallback",
@@ -289,27 +328,78 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
 
     planned = _dedup_and_space(planned, clip_dur)
 
-    dropped_for_cap = max(0, len(planned) - cap)
+    # ensure every beat carries a route (fallback beats classify heuristically)
+    for b in planned:
+        if b.get("route") not in ("motion", "still"):
+            b["route"] = _classify_route(b.get("concept", ""),
+                                         b.get("source_span", ""), b.get("visual", ""))
+
+    # Per-route caps: motion beats -> Higgsfield video cap; still beats -> Nano cap.
+    stills_cap = config.video_stills_cap()
+    motion, still = [], []
+    dropped_for_cap = 0
+    for b in planned:
+        if b["route"] == "still":
+            if len(still) < stills_cap:
+                still.append(b)
+            else:
+                dropped_for_cap += 1
+        else:
+            if len(motion) < cap:
+                motion.append(b)
+            else:
+                dropped_for_cap += 1
     if dropped_for_cap:
-        print(f"[video] b-roll plan capped: kept {cap} of {len(planned)} beats "
-              f"(AGENT_VIDEO_BROLL_CAP={cap})", flush=True)
-    beats = planned[:cap]
+        print(f"[video] b-roll plan capped: dropped {dropped_for_cap} beat(s) beyond "
+              f"caps (motion {cap}, stills {stills_cap})", flush=True)
 
+    beats = sorted(motion + still, key=lambda x: x["offset"])
     for b in beats:
-        b["prompt"] = build_higgsfield_prompt(b["visual"])
+        if b["route"] == "still":
+            b["kind"] = "image"
+            # on-card text is the grounded concept, scrubbed for on-screen rules
+            b["card_text"] = clipper_render.scrub_onscreen(b["concept"].upper())
+            b["prompt"] = _build_still_prompt(b)
+        else:
+            b["kind"] = "video"
+            b["prompt"] = build_higgsfield_prompt(b["visual"])
 
-    cost_per = config.video_cost_per_overlay()
+    cost_video = config.video_cost_per_overlay()
+    cost_still = config.video_cost_per_still()
+    projected = round(len(motion) * cost_video + len(still) * cost_still, 2)
     return {
         "clip_start": clip_start,
         "clip_end": clip_end,
         "clip_dur": clip_dur,
         "kind": kind,
         "beats": beats,
-        "cost_per_overlay": cost_per,
-        "projected_cost": round(len(beats) * cost_per, 2),
+        "motion_count": len(motion),
+        "still_count": len(still),
+        "cost_per_overlay": cost_video,
+        "cost_per_still": cost_still,
+        "projected_cost": projected,
         "cap": cap,
+        "stills_cap": stills_cap,
         "dropped_for_cap": dropped_for_cap,
     }
+
+
+def _build_still_prompt(beat):
+    """House-style Nano Banana card prompt for a stat/quote/framework beat. The
+    on-card text is the grounded, scrubbed concept (fabrication-safe). Palette and
+    layout follow the LASSO V3 house style; no dashes, no vendor."""
+    text = beat.get("card_text") or clipper_render.scrub_onscreen(
+        beat.get("concept", "").upper())
+    return (
+        "LASSO V3 house-style editorial card, vertical. "
+        "Navy #121E3C background, one bold headline in white set large and "
+        "left-aligned, one restrained red #FF0000 accent element only. "
+        "Anton or a bold condensed sans headline. Clean, magazine editorial, "
+        "not clip art, not an infographic, no photo. "
+        "The headline text reads exactly: "
+        f"\"{text}\". "
+        "No other text anywhere. No dashes, no hyphens."
+    )
 
 
 def project_episode_cost(manifests):
@@ -351,71 +441,101 @@ def overlay_cache_path(cache_dir, beat, kind):
     return os.path.join(cache_dir, overlay_cache_key(beat, kind) + ext)
 
 
-def render_overlays(manifest, renderer=None, cache_dir=None, cap=None, budget=None):
+def _beat_kind(beat, manifest):
+    """A beat's asset kind: still beats -> image (Nano card), else the manifest
+    default (motion video)."""
+    if beat.get("kind"):
+        return beat["kind"]
+    if beat.get("route") == "still":
+        return "image"
+    return manifest.get("kind", "video")
+
+
+def render_overlays(manifest, renderer=None, cache_dir=None, cap=None, budget=None,
+                    still_renderer=None, still_budget=None):
     """
-    Turn manifest beats into rendered overlay assets.
+    Turn manifest beats into rendered overlay assets, ROUTING each beat:
+      route == 'motion' -> `renderer` + `budget`      (Higgsfield video)
+      route == 'still'  -> `still_renderer` + `still_budget` (Nano Banana card)
+    A beat with no route defaults to motion (backward compatible).
 
-    renderer: callable(beat, out_path, kind) that WRITES the asset to out_path.
-      In an interactive Claude session this drives Higgsfield; headless it is the
-      text-card fallback or None. When None, only already-cached assets are used.
+    renderer/still_renderer: callable(beat, out_path, kind) that WRITES the asset.
+      In an interactive Claude session these drive Higgsfield / the Gemini card
+      pipeline; None means only already-cached assets are used (no spend).
 
-    Caching: each beat maps to a content-hash cache path. A cache HIT is reused
-    (never re-pays). A cache MISS calls the renderer, counting against the guard.
+    Caching: content-hash cache path per beat. A cache HIT is reused (never
+    re-pays). A cache MISS calls the route's renderer, decrementing that route's
+    budget. When a route's episode budget is exhausted the loop skips further NEW
+    renders of that route and LOGS (surfaces), never spending past it.
 
-    Cost guard (two modes):
-      budget=RenderBudget  -> EPISODE-level guard shared across all clips. New
-        renders decrement it; when exhausted the loop STOPS and LOGS (surfaces),
-        returning what was rendered/cached so far, never spending past the episode
-        budget and never discarding renders already paid for. Use this from
-        edit_episode so the whole episode is capped, not each clip.
-      cap=int (no budget) -> per-CALL guard: at most `cap` NEW renders; exceeding
-        RAISES. Used in isolation/tests.
+    cap=int (only when no budget given) -> per-CALL motion guard that RAISES when
+    exceeded. Used in isolation/tests.
 
-    Returns a list of overlay dicts {offset, duration, asset_path, kind, cached}.
-    Beats with no asset (miss + no renderer) are skipped with a log line.
+    Returns overlay dicts {offset, duration, asset_path, kind, route, cached}.
     """
-    kind = manifest.get("kind", "video")
     cache_dir = cache_dir or config.video_overlay_cache_dir()
     cap = config.video_broll_cap() if cap is None else cap
     os.makedirs(cache_dir, exist_ok=True)
 
     overlays = []
-    new_renders = 0
+    new_motion = 0
     for beat in manifest.get("beats", []):
+        route = beat.get("route", "motion")
+        kind = _beat_kind(beat, manifest)
+        rndr = still_renderer if route == "still" else renderer
+        bdgt = still_budget if route == "still" else budget
         path = overlay_cache_path(cache_dir, beat, kind)
+
         if os.path.isfile(path) and os.path.getsize(path) > 0:
             overlays.append({
                 "offset": beat["offset"], "duration": beat["duration"],
-                "asset_path": path, "kind": kind, "cached": True,
+                "asset_path": path, "kind": kind, "route": route, "cached": True,
             })
             continue
-        if renderer is None:
-            print(f"[video] overlay not cached and no renderer: skipping "
+        if rndr is None:
+            print(f"[video] {route} overlay not cached and no renderer: skipping "
                   f"'{beat.get('concept')}'", flush=True)
             continue
-        if budget is not None:
-            if budget.remaining <= 0:
-                print(f"[video] episode b-roll cap reached ({budget.total} renders); "
-                      f"skipping remaining overlay(s) this episode "
-                      f"(AGENT_VIDEO_BROLL_CAP={budget.total})", flush=True)
-                break
-        elif new_renders >= cap:
+        if bdgt is not None:
+            if bdgt.remaining <= 0:
+                print(f"[video] episode {route} cap reached ({bdgt.total}); skipping "
+                      f"remaining {route} overlay(s) this episode", flush=True)
+                continue
+        elif route == "motion" and new_motion >= cap:
             raise VideoEditorError(
                 f"b-roll cost cap reached ({cap} renders). Stopping before spending "
                 f"more. Raise AGENT_VIDEO_BROLL_CAP to allow more overlays.")
-        renderer(beat, path, kind)
+        rndr(beat, path, kind)
         if not (os.path.isfile(path) and os.path.getsize(path) > 0):
             print(f"[video] renderer produced no asset for '{beat.get('concept')}'",
                   flush=True)
             continue
-        new_renders += 1
-        if budget is not None:
-            budget.used += 1
+        if route == "motion":
+            new_motion += 1
+        if bdgt is not None:
+            bdgt.used += 1
         overlays.append({
             "offset": beat["offset"], "duration": beat["duration"],
-            "asset_path": path, "kind": kind, "cached": False,
+            "asset_path": path, "kind": kind, "route": route, "cached": False,
         })
     return overlays
+
+
+def still_card_renderer(beat, out_path, kind):
+    """Nano Banana still-card renderer: reuses Echo's EXISTING creative_studio
+    Gemini pipeline (same model config + key as organic cards, one source of
+    truth). Writes a PNG card to out_path. Raises if the pipeline is unavailable
+    so the caller can skip the beat rather than spend blindly."""
+    from . import creative_studio
+    client = creative_studio._default_client()
+    if client is None:
+        raise VideoEditorError(
+            "still card needs the creative_studio Gemini pipeline "
+            "(AGENT_CREATIVE_STUDIO_ENABLED + AGENT_NANO_API_KEY).")
+    image_bytes = client.generate_image(prompt=beat["prompt"], model=config.NANO_MODEL)
+    with open(out_path, "wb") as fh:
+        fh.write(image_bytes)
+    return out_path
 
 
 def textcard_renderer(beat, out_path, kind):
@@ -518,20 +638,190 @@ def _composite_overlays(video_path, overlays, output_path, width, height, work_d
     return output_path
 
 
+def _make_scrim_png(width, scrim_h, out_path):
+    """Vertical gradient PNG: transparent at top -> navy@_SCRIM_MAX_ALPHA at bottom."""
+    from PIL import Image
+    img = Image.new("RGBA", (max(2, width), max(2, scrim_h)), (0, 0, 0, 0))
+    px = img.load()
+    r, g, b = _SCRIM_NAVY
+    for y in range(img.height):
+        a = int(_SCRIM_MAX_ALPHA * (y / max(1, img.height - 1)))
+        for x in range(img.width):
+            px[x, y] = (r, g, b, a)
+    img.save(out_path)
+    return out_path
+
+
+def apply_bottom_treatment(input_path, output_path, width, height, work_dir):
+    """
+    Minimal Broadcast bottom treatment (house standard, every clip):
+      - soft bottom gradient scrim (transparent -> navy@150 over bottom ~9%)
+      - LASSO red mark bottom-LEFT (~4.2% frame-h, 92% opacity, ~3.6% inset)
+      - @GYMMARKETINGMADESIMPLE bottom-RIGHT, Oswald tracked caps, white ~92%
+      - NO solid bar, NO red line
+    Uses ffmpeg 'ih'/'iw' where possible so it holds for 9:16 and 1:1.
+    """
+    clipper_render._require_render()
+    os.makedirs(work_dir, exist_ok=True)
+    ffmpeg = clipper_render._ffmpeg()
+
+    logo_h = int(height * _LOGO_H_FRAC)
+    inset = int(height * _INSET_FRAC)
+    handle_fs = int(height * _HANDLE_FS_FRAC)
+    scrim_h = int(height * _SCRIM_H_FRAC)
+
+    scrim_png = os.path.join(work_dir, "scrim.png")
+    _make_scrim_png(width, scrim_h, scrim_png)
+    mark_png = video_assets.lasso_mark_path()
+    oswald = video_assets.oswald_font_path()
+
+    # tracked caps: insert a thin space (U+2009) between characters for spacing
+    handle_tracked = " ".join(list(_HANDLE_TEXT))
+    handle_esc = handle_tracked.replace("\\", "\\\\").replace(":", "\\:").replace(
+        "'", "\\'")
+    font_esc = oswald.replace("\\", "\\\\").replace(":", "\\:")
+
+    filt = (
+        f"[2:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa=0.92[mark];"
+        f"[0:v][1:v]overlay=x=0:y=H-{scrim_h}[a];"
+        f"[a][mark]overlay=x={inset}:y=H-{inset}-{logo_h}[b];"
+        f"[b]drawtext=fontfile='{font_esc}':text='{handle_esc}':"
+        f"fontcolor=white@0.92:fontsize={handle_fs}:"
+        f"x=W-tw-{inset}:y=H-{inset}-{logo_h}/2-th/2[v]"
+    )
+    cmd = [
+        ffmpeg, "-y",
+        "-i", input_path,
+        "-i", scrim_png,
+        "-i", mark_png,
+        "-filter_complex", filt,
+        "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+        "-c:a", "copy",
+        output_path,
+    ]
+    clipper_render._run(cmd, "bottom_treatment")
+    return output_path
+
+
+def _caption_margin_v(height, face_bottom_frac=None):
+    """Bottom-anchored MarginV (px) placing captions in the lower third, below the
+    speaker's face when detected, and clear of the bottom treatment."""
+    scrim_top_frac = 1.0 - _SCRIM_H_FRAC          # captions must stay above this
+    default_center = 0.72                          # lower third
+    if face_bottom_frac and face_bottom_frac > 0.55:
+        center = min(scrim_top_frac - 0.08, face_bottom_frac + 0.07)
+    else:
+        center = default_center
+    center = max(0.62, min(center, scrim_top_frac - 0.06))
+    return int(height * (1.0 - center))
+
+
+def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
+                             width, height, margin_v):
+    """Word Highlight ASS: Anton ALL CAPS, groups of _WH_WORDS_PER_GROUP, the ONE
+    active (currently spoken) word in brand RED, the rest white, heavy outline +
+    shadow. One event per word so exactly one line is visible (no ghost/duplicate).
+    Fabrication-safe: only words within the segment; dashes/vendor scrubbed."""
+    start_ts = float(start_ts)
+    end_ts = float(end_ts)
+    words = [
+        w for w in transcript.get("words", [])
+        if float(w.get("start", 0)) >= start_ts - 0.05
+        and float(w.get("start", 0)) < end_ts + 0.05
+    ]
+    chunks = [words[i:i + _WH_WORDS_PER_GROUP]
+              for i in range(0, len(words), _WH_WORDS_PER_GROUP)]
+
+    font_size = int(height * _WH_FONT_FRAC)
+    outline = max(4, int(font_size * 0.09))
+    shadow = max(2, int(font_size * 0.04))
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+",
+        f"PlayResX: {width}", f"PlayResY: {height}", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        # Anton, white default, heavy black outline + shadow, bottom-center
+        f"Style: WH,Anton,{font_size},&H00{_WH_WHITE_BGR},&H00{_WH_WHITE_BGR},"
+        f"&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},"
+        f"2,40,40,{margin_v},0",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    for chunk in chunks:
+        for word_idx, w in enumerate(chunk):
+            w_start = max(0.0, float(w.get("start", 0)) - start_ts)
+            w_end = max(w_start + 0.05, float(w.get("end", 0)) - start_ts)
+            parts = []
+            for ci, cw in enumerate(chunk):
+                text = clipper_render.scrub_onscreen(
+                    str(cw.get("word", "") or "").strip().upper())
+                if not text:
+                    continue
+                color = _WH_ACTIVE_BGR if ci == word_idx else _WH_WHITE_BGR
+                parts.append(f"{{\\c&H00{color}&}}{text}")
+            if not parts:
+                continue
+            lines.append(
+                f"Dialogue: 0,{clipper_render._fmt_ass_ts(w_start)},"
+                f"{clipper_render._fmt_ass_ts(w_end)},WH,,0,0,0,,{' '.join(parts)}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
+    with open(ass_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return ass_path
+
+
+def burn_word_highlight(input_path, output_path, transcript, start_ts, end_ts,
+                        width, height, face_bottom_frac=None):
+    """Burn Word Highlight captions (Anton, one red active word) into the video,
+    placed in the lower third below the detected face. Loads Anton via fontsdir."""
+    clipper_render._require_render()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    margin_v = _caption_margin_v(height, face_bottom_frac)
+
+    with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tf:
+        ass_path = tf.name
+    try:
+        _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
+                                 width, height, margin_v)
+        safe = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
+        fonts = video_assets.FONTS_DIR.replace("\\", "/").replace(":", "\\:")
+        cmd = [
+            clipper_render._ffmpeg(), "-y", "-i", input_path,
+            "-vf", f"ass={safe}:fontsdir={fonts}",
+            "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+            "-c:a", "copy",
+            output_path,
+        ]
+        clipper_render._run(cmd, "burn_word_highlight")
+    finally:
+        try:
+            os.unlink(ass_path)
+        except OSError:
+            pass
+    return output_path
+
+
 def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
                   aspect="9:16", captioned=True):
     """
-    Assemble one finished clip:
-      cut -> frame(aspect) -> composite overlays -> [captions] -> brand frame.
-    captioned=False produces the caption-FREE ad cut from the same timeline.
-    Returns the output path. Requires the render flag (raises via clipper_render).
+    Assemble one finished clip (house standard):
+      cut -> frame(aspect) -> composite overlays -> [Word Highlight captions] ->
+      Minimal Broadcast bottom treatment.
+    Real host footage is the spine; overlays are cutaways only, never AI-altering
+    the host. captioned=False produces the caption-FREE ad cut from the same
+    timeline (it still gets the bottom treatment). Requires the render flag.
     """
     width, height = _dims(aspect)
     tag = aspect.replace(":", "x") + ("_cap" if captioned else "_ad")
     work = os.path.join(output_dir, f"{base}_{tag}_work")
     os.makedirs(work, exist_ok=True)
 
-    cut_out = os.path.join(work, "cut.mp4")
     framed = os.path.join(work, "framed.mp4")
     composited = os.path.join(work, "composited.mp4")
     captioned_out = os.path.join(work, "captioned.mp4")
@@ -540,7 +830,6 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
     # cut (stream copy) then frame to the target aspect
     clipper_render.cut_segment(media_path, moment.start_ts, moment.end_ts, work,
                                label="src")
-    # cut_segment names the file itself; find it
     cut_files = [f for f in os.listdir(work) if f.startswith("src_")]
     if not cut_files:
         raise VideoEditorError("cut_segment produced no file")
@@ -548,18 +837,21 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
 
     clipper_render.frame_vertical(src_cut, framed, width=width, height=height)
 
+    # Detect the speaker's face on the framed host footage so captions dodge it.
+    face_bottom = video_assets.detect_face_bottom_frac(framed)
+
     stage = framed
     if overlays:
         _composite_overlays(framed, overlays, composited, width, height, work)
         stage = composited
 
     if captioned:
-        clipper_render.burn_captions(stage, captioned_out, transcript,
-                                     moment.start_ts, moment.end_ts,
-                                     width=width, height=height)
+        burn_word_highlight(stage, captioned_out, transcript,
+                            moment.start_ts, moment.end_ts,
+                            width, height, face_bottom_frac=face_bottom)
         stage = captioned_out
 
-    clipper_render.add_brand_frame(stage, final_out, width=width, height=height)
+    apply_bottom_treatment(stage, final_out, width, height, work)
     return final_out
 
 
@@ -628,19 +920,24 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
                               float(m.end_ts) - float(m.start_ts)})
 
     projected = project_episode_cost(manifests)
-    total_beats = sum(len(mf.get("beats", [])) for mf in manifests)
+    motion_beats = sum(mf.get("motion_count", 0) for mf in manifests)
+    still_beats = sum(mf.get("still_count", 0) for mf in manifests)
     if plan_broll:
-        print(f"video-episode: b-roll plan = {total_beats} overlay(s) across "
-              f"{len(accepted)} clip(s); projected Higgsfield cost "
-              f"~{projected} credits (cap {config.video_broll_cap()}/clip, "
-              f"{config.video_broll_kind()} overlays). "
+        print(f"video-episode: b-roll plan = {motion_beats} motion (Higgsfield) + "
+              f"{still_beats} still (Nano Banana) across {len(accepted)} clip(s); "
+              f"projected cost ~{projected} credits (motion cap "
+              f"{config.video_broll_cap()}, stills cap {config.video_stills_cap()} "
+              f"per episode). "
               f"{'RENDERING' if (render and renderer) else 'NOT rendering overlays'}.",
               flush=True)
 
-    # ONE episode-level render budget (hard cost guard), shared across all clips
-    # so the whole episode never renders more than the cap, no matter the clip
-    # count. This is the per-episode enforcement (not just per clip).
-    episode_budget = RenderBudget(config.video_broll_cap())
+    # ONE episode-level budget PER ROUTE (hard cost guards), shared across all clips
+    # so the whole episode never renders more than each cap, no matter clip count.
+    motion_budget = RenderBudget(config.video_broll_cap())
+    stills_budget = RenderBudget(config.video_stills_cap())
+    # Still renderer: reuse Echo's Gemini pipeline (armed by AGENT_VIDEO_STILLS_ENABLED).
+    use_still_renderer = (still_card_renderer
+                          if (render and config.video_stills_enabled()) else None)
 
     clips = []
     for m, manifest in zip(accepted, manifests):
@@ -650,8 +947,9 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
         if plan_broll and manifest.get("beats"):
             use_renderer = renderer if (render and config.video_render_enabled()) else None
             try:
-                overlays = render_overlays(manifest, renderer=use_renderer,
-                                           budget=episode_budget)
+                overlays = render_overlays(
+                    manifest, renderer=use_renderer, budget=motion_budget,
+                    still_renderer=use_still_renderer, still_budget=stills_budget)
             except VideoEditorError as exc:
                 print(f"video-episode: overlay render stopped: {exc}", flush=True)
 
