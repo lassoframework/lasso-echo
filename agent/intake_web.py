@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from . import config, whatsapp_intake
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
+_TRACKER_TOKEN_ENV = "AGENT_TRACKER_TOKEN"   # name only; value is set by hand
 
 ALLOWED_TYPES = {
     "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
@@ -632,6 +633,43 @@ One more step while you are here: send us your photos and videos.</p>
 </div></body></html>"""
 
 
+# ---- admin tracker: /admin/tracker/<token>[/handoff] ----------------------------
+# Read-only: serves two static HTML files from the deployed repo (docs/).
+# Gated by a single long random token in the URL path (AGENT_TRACKER_TOKEN, set by
+# hand in Railway env). No flag — the route 404s whenever the env var is unset.
+# Raw token is never logged (same discipline as upload tokens).
+_TRACKER_PAGES = {
+    "tracker": "docs/echo_build_tracker.html",
+    "handoff": "docs/ECHO_HANDOFF.html",
+}
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _tracker_token():
+    """The admin tracker token, or empty string when not set."""
+    return (os.environ.get(_TRACKER_TOKEN_ENV) or "").strip()
+
+
+def handle_tracker(token, which="tracker"):
+    """
+    Returns (status, html_bytes). 404 when the tracker token is unset, does not
+    match, or the requested page is unknown; 200 with the file contents on match.
+    The raw token is never logged; a file that does not yet exist is a 404.
+    """
+    expected = _tracker_token()
+    if not expected or token != expected:
+        return 404, b"not found"
+    rel = _TRACKER_PAGES.get(which)
+    if rel is None:
+        return 404, b"not found"
+    full = os.path.join(_REPO_ROOT, rel)
+    try:
+        with open(full, "rb") as fh:
+            return 200, fh.read()
+    except (OSError, IOError):
+        return 404, b"not found"
+
+
 def build_server(port=None):
     """Build the HTTP server (bound, not serving). serve() runs it; tests bind
     port 0 and drive real requests against it without blocking."""
@@ -687,6 +725,14 @@ def build_server(port=None):
                          self.path.split("?")[0])
             return m.group(1) if m else None
 
+        def _tracker_route(self):
+            """Returns (token, page) for admin tracker URLs, else (None, None)."""
+            m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
+                         self.path.split("?")[0])
+            if m:
+                return m.group(1), ("handoff" if m.group(2) else "tracker")
+            return None, None
+
         def do_GET(self):
             # Portal gym status: GET /portal/gym/<account_key>
             # Gated by AGENT_PORTAL_APPROVALS. Returns JSON. No token in path.
@@ -707,6 +753,20 @@ def build_server(port=None):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            # Admin tracker: /admin/tracker/<token>[/handoff]
+            # Read-only dashboard; 404 for wrong/absent token (indistinguishable).
+            tracker_tok, tracker_page = self._tracker_route()
+            if tracker_tok is not None:
+                status, body = handle_tracker(tracker_tok, tracker_page)
+                if status == 200:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self._deny()
                 return
             # WhatsApp hub challenge verification (GET /whatsapp).
             # 404 while the flag is off; 403 on a wrong token; 200 + challenge text on match.
