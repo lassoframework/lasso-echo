@@ -51,7 +51,8 @@ def _make_broll_card(text, output_path, duration=BROLL_CARD_DURATION):
     ffmpeg = _ffmpeg()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    safe_text = _esc_drawtext(str(text or "").strip().upper())
+    from .clipper_render import scrub_onscreen
+    safe_text = _esc_drawtext(scrub_onscreen(str(text or "").strip().upper()))
     fade_out_start = max(0.0, float(duration) - BROLL_FADE_DUR)
 
     # Red accent line: horizontally centered block, 80px from center, 4px tall

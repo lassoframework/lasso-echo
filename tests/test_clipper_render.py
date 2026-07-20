@@ -178,6 +178,39 @@ class TestBurnCaptions:
         assert os.path.isfile(out)
         assert os.path.getsize(out) > 0
 
+    def test_scrub_onscreen_removes_dashes_and_vendor(self):
+        # dashes -> space, vendor -> partner, in both cases
+        assert "-" not in clipper_render.scrub_onscreen("twenty-five")
+        assert clipper_render.scrub_onscreen("TWENTY-FIVE") == "TWENTY FIVE"
+        assert "—" not in clipper_render.scrub_onscreen("a—b")
+        assert clipper_render.scrub_onscreen("VENDOR") == "PARTNER"
+        assert clipper_render.scrub_onscreen("vendors") == "partners"
+
+    def test_captions_never_burn_hyphens(self):
+        """A hyphenated spoken word must not reach on-screen caption text."""
+        transcript = {
+            "words": [
+                {"word": "twenty-five", "start": 0.0, "end": 0.4},
+                {"word": "follow-up", "start": 0.4, "end": 0.8},
+            ],
+            "segments": [],
+        }
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as tf:
+            ass_path = tf.name
+        try:
+            clipper_render._make_ass_subtitles(transcript, 0.0, 2.0, ass_path)
+            content = open(ass_path, encoding="utf-8").read()
+            events = [ln for ln in content.splitlines() if ln.startswith("Dialogue:")]
+            body = "\n".join(events)
+            assert "-" not in body  # no hyphen in any burned caption token
+            assert "TWENTY FIVE" in body and "FOLLOW UP" in body
+        finally:
+            try:
+                os.unlink(ass_path)
+            except OSError:
+                pass
+
     def test_ass_only_includes_words_in_segment(self):
         """_make_ass_subtitles excludes words outside [start_ts, end_ts]."""
         transcript = {

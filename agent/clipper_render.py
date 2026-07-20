@@ -46,6 +46,25 @@ _ACTIVE_COLOR = "FFFFFF"   # white — currently spoken word
 _CONTEXT_COLOR = "888888"  # gray — other words in the group
 
 
+_VENDOR_RE = re.compile(r"(?i)\bvendors\b|\bvendor\b")
+
+
+def scrub_onscreen(text):
+    """Enforce the LASSO on-screen text rules on any burned-in string:
+      - no em dashes, en dashes, or hyphens (replaced with a space)
+      - never the word 'vendor' (replaced with 'partner')
+    Applies to captions and text cards so the render pipeline's no-dash /
+    no-vendor promise holds for everything the viewer actually reads. This is a
+    mechanical spelling fix, not a claim edit (dash -> space keeps the words;
+    vendor -> partner is LASSO's own house term)."""
+    t = str(text or "")
+    t = t.replace("—", " ").replace("–", " ").replace("-", " ")
+    t = _VENDOR_RE.sub(lambda m: "PARTNERS" if m.group(0).lower().endswith("s")
+                       else "PARTNER", t) if t.isupper() else _VENDOR_RE.sub(
+        lambda m: "partners" if m.group(0).lower().endswith("s") else "partner", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 class RenderError(Exception):
     """A render step could not proceed. Never raised when the flag is just OFF
     inside the orchestrator; raised loudly when called directly so tests can
@@ -262,7 +281,7 @@ def _make_ass_subtitles(transcript, start_ts, end_ts, ass_path,
             w_end = max(w_start + 0.05, float(w.get("end", 0)) - start_ts)
             parts = []
             for ci, cw in enumerate(chunk):
-                text = str(cw.get("word", "") or "").strip().upper()
+                text = scrub_onscreen(str(cw.get("word", "") or "").strip().upper())
                 if not text:
                     continue
                 color = _ACTIVE_COLOR if ci == word_idx else _CONTEXT_COLOR

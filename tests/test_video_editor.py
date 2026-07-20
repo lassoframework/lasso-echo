@@ -194,6 +194,30 @@ def test_render_overlays_cost_cap_stops(tmp_path):
         ve.render_overlays(manifest, renderer=renderer, cache_dir=cache, cap=2)
 
 
+def test_episode_budget_caps_across_clips(tmp_path):
+    """The episode budget is shared across manifests so total NEW renders never
+    exceed the cap, no matter how many clips."""
+    cache = str(tmp_path / "ov")
+    budget = ve.RenderBudget(3)
+
+    def renderer(beat, out_path, kind):
+        with open(out_path, "wb") as fh:
+            fh.write(b"x" * 100)
+
+    total = 0
+    # 4 clips, 2 fresh beats each = 8 desired; budget of 3 must stop at 3
+    for c in range(4):
+        manifest = {"kind": "video", "beats": [
+            {"offset": 5, "duration": 3, "concept": f"c{c}a", "prompt": f"p{c}a"},
+            {"offset": 15, "duration": 3, "concept": f"c{c}b", "prompt": f"p{c}b"},
+        ]}
+        ov = ve.render_overlays(manifest, renderer=renderer, cache_dir=cache,
+                                budget=budget)
+        total += sum(1 for o in ov if not o["cached"])
+    assert budget.used == 3
+    assert total == 3  # never spent past the episode cap
+
+
 def test_render_overlays_no_renderer_skips_uncached(tmp_path):
     cache = str(tmp_path / "ov")
     manifest = {"kind": "video", "beats": [

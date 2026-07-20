@@ -109,6 +109,8 @@ def build_higgsfield_prompt(visual):
     Higgsfield prompt. Strips any dashes so no on-image text rule stays intact."""
     scene = str(visual or "").strip()
     scene = scene.replace("—", " ").replace("–", " ").replace("-", " ")
+    scene = re.sub(r"(?i)\bvendors?\b", "partner", scene)
+    scene = re.sub(r"\s+", " ", scene).strip()
     if not scene.endswith("."):
         scene += "."
     return _HOUSE_STYLE_WRAP + scene
@@ -317,6 +319,25 @@ def project_episode_cost(manifests):
 
 # ---- Part 2: overlay renderer interface + cache -----------------------------
 
+class RenderBudget:
+    """Episode-level overlay render budget (the hard cost guard).
+
+    One budget is created per episode and threaded through every clip's
+    render_overlays call, so the WHOLE episode never renders more than `total`
+    overlays no matter how many clips it has. Cached hits are free and do not
+    decrement. When the budget is exhausted the render loop stops and logs
+    (surfaces) rather than silently spending past it.
+    """
+
+    def __init__(self, total):
+        self.total = max(0, int(total))
+        self.used = 0
+
+    @property
+    def remaining(self):
+        return max(0, self.total - self.used)
+
+
 def overlay_cache_key(beat, kind):
     """Content hash of an overlay beat: same prompt+kind+duration -> same key,
     so a re-run reuses the cached asset and never re-pays."""
@@ -330,7 +351,7 @@ def overlay_cache_path(cache_dir, beat, kind):
     return os.path.join(cache_dir, overlay_cache_key(beat, kind) + ext)
 
 
-def render_overlays(manifest, renderer=None, cache_dir=None, cap=None):
+def render_overlays(manifest, renderer=None, cache_dir=None, cap=None, budget=None):
     """
     Turn manifest beats into rendered overlay assets.
 
@@ -339,10 +360,16 @@ def render_overlays(manifest, renderer=None, cache_dir=None, cap=None):
       text-card fallback or None. When None, only already-cached assets are used.
 
     Caching: each beat maps to a content-hash cache path. A cache HIT is reused
-    (never re-pays). A cache MISS calls the renderer, counting against the cap.
+    (never re-pays). A cache MISS calls the renderer, counting against the guard.
 
-    Cost cap: at most `cap` NEW renders per call. Hitting the cap STOPS and
-    surfaces (raises), never silently spends beyond it.
+    Cost guard (two modes):
+      budget=RenderBudget  -> EPISODE-level guard shared across all clips. New
+        renders decrement it; when exhausted the loop STOPS and LOGS (surfaces),
+        returning what was rendered/cached so far, never spending past the episode
+        budget and never discarding renders already paid for. Use this from
+        edit_episode so the whole episode is capped, not each clip.
+      cap=int (no budget) -> per-CALL guard: at most `cap` NEW renders; exceeding
+        RAISES. Used in isolation/tests.
 
     Returns a list of overlay dicts {offset, duration, asset_path, kind, cached}.
     Beats with no asset (miss + no renderer) are skipped with a log line.
@@ -366,7 +393,13 @@ def render_overlays(manifest, renderer=None, cache_dir=None, cap=None):
             print(f"[video] overlay not cached and no renderer: skipping "
                   f"'{beat.get('concept')}'", flush=True)
             continue
-        if new_renders >= cap:
+        if budget is not None:
+            if budget.remaining <= 0:
+                print(f"[video] episode b-roll cap reached ({budget.total} renders); "
+                      f"skipping remaining overlay(s) this episode "
+                      f"(AGENT_VIDEO_BROLL_CAP={budget.total})", flush=True)
+                break
+        elif new_renders >= cap:
             raise VideoEditorError(
                 f"b-roll cost cap reached ({cap} renders). Stopping before spending "
                 f"more. Raise AGENT_VIDEO_BROLL_CAP to allow more overlays.")
@@ -376,6 +409,8 @@ def render_overlays(manifest, renderer=None, cache_dir=None, cap=None):
                   flush=True)
             continue
         new_renders += 1
+        if budget is not None:
+            budget.used += 1
         overlays.append({
             "offset": beat["offset"], "duration": beat["duration"],
             "asset_path": path, "kind": kind, "cached": False,
@@ -602,6 +637,11 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
               f"{'RENDERING' if (render and renderer) else 'NOT rendering overlays'}.",
               flush=True)
 
+    # ONE episode-level render budget (hard cost guard), shared across all clips
+    # so the whole episode never renders more than the cap, no matter the clip
+    # count. This is the per-episode enforcement (not just per clip).
+    episode_budget = RenderBudget(config.video_broll_cap())
+
     clips = []
     for m, manifest in zip(accepted, manifests):
         base = f"clip_{int(m.start_ts):05d}_{int(m.end_ts):05d}"
@@ -610,7 +650,8 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
         if plan_broll and manifest.get("beats"):
             use_renderer = renderer if (render and config.video_render_enabled()) else None
             try:
-                overlays = render_overlays(manifest, renderer=use_renderer)
+                overlays = render_overlays(manifest, renderer=use_renderer,
+                                           budget=episode_budget)
             except VideoEditorError as exc:
                 print(f"video-episode: overlay render stopped: {exc}", flush=True)
 
