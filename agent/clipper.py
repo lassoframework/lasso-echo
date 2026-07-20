@@ -165,7 +165,7 @@ def _deepgram_transcriber(media_path):
             for sent in para.get("sentences", []):
                 segs.append({"speaker": "", "start": sent["start"],
                               "end": sent["end"], "text": sent.get("text", "")})
-    return {"words": words, "segments": segs}
+    return {"words": words, "segments": segs, "source": "deepgram"}
 
 
 def _default_transcriber(media_path):
@@ -186,7 +186,7 @@ def _default_transcriber(media_path):
                      "text": seg.text})
         for w in (seg.words or []):
             words.append({"word": w.word, "start": w.start, "end": w.end})
-    return {"words": words, "segments": segs}
+    return {"words": words, "segments": segs, "source": "faster-whisper"}
 
 
 def transcribe(r2_key, media_path=None, transcriber=None, cache_dir=None):

@@ -89,6 +89,17 @@ def test_plan_fallback_is_grounded_and_capped(monkeypatch):
         assert b["offset"] >= ve._BROLL_MIN_OFFSET
 
 
+def test_fabrication_gate_rejects_invented_numbers():
+    # transcript speaks "retention" but never "70" -> an invented stat is blocked
+    clip_tokens = ve._tokens("we lose members on retention every month booking")
+    assert ve._fabrication_ok("retention", "retention rate", clip_tokens) is True
+    # invented number "70" not in transcript -> rejected even though words are grounded
+    assert ve._fabrication_ok("70 percent retention", "70 percent", clip_tokens) is False
+    # a number that IS spoken passes
+    ct2 = ve._tokens("if i have 10 in my group i designate 3 people")
+    assert ve._fabrication_ok("10 in group", "10 group", ct2) is True
+
+
 def test_planner_llm_drops_ungrounded_beats():
     m = _moment(0, 60)
     tr = _transcript(0, 60)
@@ -342,6 +353,27 @@ def test_word_highlight_ass_one_red_word_no_ghost(tmp_path):
     # no hyphen reaches on-screen text
     body = "\n".join(events)
     assert "-" not in body
+
+
+def test_snap_to_word_boundaries():
+    tr = {"words": [
+        {"word": "most", "start": 10.0, "end": 10.4},
+        {"word": "gyms", "start": 10.4, "end": 10.9},
+        {"word": "ignore", "start": 60.2, "end": 60.8},
+        {"word": "leads", "start": 60.8, "end": 61.5},
+    ], "segments": []}
+    m = _moment(10.3, 61.2)  # slightly mid-word on both ends
+    ve.snap_to_word_boundaries(m, tr)
+    assert m.start_ts == 10.0   # snapped to nearest word start
+    assert m.end_ts == 61.5     # snapped to nearest word end
+    assert m.duration == round(61.5 - 10.0, 2)
+
+
+def test_snap_is_noop_when_no_word_in_window():
+    tr = {"words": [{"word": "x", "start": 500.0, "end": 500.5}], "segments": []}
+    m = _moment(10.0, 70.0)
+    ve.snap_to_word_boundaries(m, tr)
+    assert m.start_ts == 10.0 and m.end_ts == 70.0  # unchanged
 
 
 def test_flags_default_off_v1(monkeypatch):

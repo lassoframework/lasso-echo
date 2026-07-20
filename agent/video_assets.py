@@ -20,13 +20,19 @@ BRAND_DIR = os.path.join(ASSETS_DIR, "brand")
 FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
 
 
-def lasso_mark_path():
-    """Red L mark on transparent. Raises if missing (asset is required)."""
-    p = os.path.join(BRAND_DIR, "lasso_mark.png")
+def lasso_logo_path():
+    """The LASSO wordmark logo on transparent (the real brand lockup pulled from
+    lassoframework.com). Raises if missing (asset is required)."""
+    p = os.path.join(BRAND_DIR, "lasso_wordmark.png")
     if not os.path.isfile(p):
         raise FileNotFoundError(
-            f"LASSO mark asset missing at {p}. Regenerate it from the brand logo.")
+            f"LASSO wordmark asset missing at {p}. Regenerate it from the brand logo.")
     return p
+
+
+# Back-compat alias (older callers). Points at the current brand logo.
+def lasso_mark_path():
+    return lasso_logo_path()
 
 
 def anton_font_path():

@@ -43,8 +43,8 @@ from . import video_assets
 _SCRIM_NAVY = (18, 30, 60)      # #121E3C
 _SCRIM_MAX_ALPHA = 150          # bottom of the gradient
 _HANDLE_TEXT = "@GYMMARKETINGMADESIMPLE"
-# fractions of frame HEIGHT
-_LOGO_H_FRAC = 0.042
+# logo (LASSO wordmark) sized by frame WIDTH; other insets by HEIGHT
+_LOGO_W_FRAC = 0.20
 _INSET_FRAC = 0.036
 _HANDLE_FS_FRAC = 0.014
 _SCRIM_H_FRAC = 0.09
@@ -156,15 +156,28 @@ def _parse_manifest_json(raw):
     return data if isinstance(data, list) else None
 
 
+_DIGIT_RE = re.compile(r"\d")
+
+
 def _fabrication_ok(concept, source_span, clip_tokens):
     """A b-roll concept is grounded when its concept/source words are drawn from
-    the clip transcript, never invented. We require most concept tokens to be
-    present in the clip's spoken words."""
+    the clip transcript, never invented. We require most meaningful concept tokens
+    to be present in the clip's spoken words.
+
+    Numbers get NO length exemption: any numeric token (a stat/percentage/figure)
+    must appear verbatim in the transcript, else the beat is rejected. This closes
+    the gap where an invented figure like "70" (too short for the len>3 filter)
+    could otherwise ride onto a still card as a fabricated stat."""
     concept_tokens = _tokens(concept) | _tokens(source_span)
-    # ignore tiny filler words when judging grounding
-    meaningful = {t for t in concept_tokens if len(t) > 3}
+    # any numeric token must be spoken verbatim in the clip
+    for t in concept_tokens:
+        if _DIGIT_RE.search(t) and t not in clip_tokens:
+            return False
+    # ignore tiny filler words (non-numeric) when judging grounding
+    meaningful = {t for t in concept_tokens if len(t) > 3 and not _DIGIT_RE.search(t)}
     if not meaningful:
-        return False
+        # only numeric/short tokens: grounded only if every one was verbatim (checked above)
+        return bool(concept_tokens)
     hits = sum(1 for t in meaningful if t in clip_tokens)
     return hits >= max(1, int(len(meaningful) * 0.5))
 
@@ -182,18 +195,66 @@ def _classify_route(concept, source_span, visual=""):
     return "still" if _STILL_SIGNAL_RE.search(blob) else "motion"
 
 
+def snap_to_word_boundaries(moment, transcript, window=1.2):
+    """Adjust a moment's start/end to the nearest word boundary in the transcript
+    so clips never cut mid-word. Start snaps to the nearest word START, end to the
+    nearest word END, each within `window` seconds. Mutates and returns the moment.
+    No-op when no word falls in the window (keeps the original timestamp)."""
+    words = transcript.get("words", [])
+    if not words:
+        return moment
+    s = float(moment.start_ts)
+    e = float(moment.end_ts)
+
+    # Start: if it lands INSIDE a word, expand out to that word's start (never clip
+    # the front of a word). Otherwise snap to the nearest word start within window.
+    inside_s = [w for w in words
+                if float(w.get("start", 0)) <= s <= float(w.get("end", 0))]
+    if inside_s:
+        moment.start_ts = min(float(w.get("start", 0)) for w in inside_s)
+    else:
+        near = [float(w.get("start", 0)) for w in words
+                if abs(float(w.get("start", 0)) - s) <= window]
+        if near:
+            moment.start_ts = min(near, key=lambda t: abs(t - s))
+
+    # End: if inside a word, expand out to that word's end (never clip the tail).
+    inside_e = [w for w in words
+                if float(w.get("start", 0)) <= e <= float(w.get("end", 0))]
+    if inside_e:
+        moment.end_ts = max(float(w.get("end", 0)) for w in inside_e)
+    else:
+        near = [float(w.get("end", 0)) for w in words
+                if abs(float(w.get("end", 0)) - e) <= window]
+        if near:
+            moment.end_ts = min(near, key=lambda t: abs(t - e))
+
+    try:
+        moment.duration = round(moment.end_ts - moment.start_ts, 2)
+    except Exception:
+        pass
+    return moment
+
+
 def _dedup_and_space(beats, clip_dur):
-    """Sort by offset, enforce min offset / min gap / in-bounds, dedup."""
+    """Sort by offset, enforce min offset / min gap / in-bounds. Drops are logged
+    (never silent) so the review reflects what was discarded."""
     out = []
     last = -1e9
     for b in sorted(beats, key=lambda x: x["offset"]):
         off = b["offset"]
         dur = b.get("duration", _DEFAULT_OVERLAY_DUR)
         if off < _BROLL_MIN_OFFSET:
+            print(f"[video] b-roll beat dropped (before {_BROLL_MIN_OFFSET:.0f}s "
+                  f"min offset): '{b.get('concept')}'", flush=True)
             continue
         if off + dur > clip_dur - 1.0:
+            print(f"[video] b-roll beat dropped (runs past clip end): "
+                  f"'{b.get('concept')}'", flush=True)
             continue
         if off - last < _BROLL_MIN_GAP:
+            print(f"[video] b-roll beat dropped (within {_BROLL_MIN_GAP:.0f}s of "
+                  f"prior beat): '{b.get('concept')}'", flush=True)
             continue
         out.append(b)
         last = off
@@ -311,9 +372,13 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
                 route = str(item.get("route", "")).strip().lower()
                 if route not in ("motion", "still"):
                     route = _classify_route(concept, span, visual)
+                clamped = max(2.0, min(6.0, dur))
+                if abs(clamped - dur) > 0.01:
+                    print(f"[video] b-roll beat duration clamped {dur:.1f}s -> "
+                          f"{clamped:.1f}s: '{concept}'", flush=True)
                 planned.append({
                     "offset": round(off, 2),
-                    "duration": max(2.0, min(6.0, dur)),
+                    "duration": clamped,
                     "concept": concept,
                     "visual": visual,
                     "source_span": span,
@@ -665,14 +730,14 @@ def apply_bottom_treatment(input_path, output_path, width, height, work_dir):
     os.makedirs(work_dir, exist_ok=True)
     ffmpeg = clipper_render._ffmpeg()
 
-    logo_h = int(height * _LOGO_H_FRAC)
+    logo_w = int(width * _LOGO_W_FRAC)
     inset = int(height * _INSET_FRAC)
     handle_fs = int(height * _HANDLE_FS_FRAC)
     scrim_h = int(height * _SCRIM_H_FRAC)
 
     scrim_png = os.path.join(work_dir, "scrim.png")
     _make_scrim_png(width, scrim_h, scrim_png)
-    mark_png = video_assets.lasso_mark_path()
+    logo_png = video_assets.lasso_logo_path()
     oswald = video_assets.oswald_font_path()
 
     # tracked caps: insert a thin space (U+2009) between characters for spacing
@@ -682,18 +747,18 @@ def apply_bottom_treatment(input_path, output_path, width, height, work_dir):
     font_esc = oswald.replace("\\", "\\\\").replace(":", "\\:")
 
     filt = (
-        f"[2:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa=0.92[mark];"
+        f"[2:v]scale={logo_w}:-1,format=rgba,colorchannelmixer=aa=0.95[logo];"
         f"[0:v][1:v]overlay=x=0:y=H-{scrim_h}[a];"
-        f"[a][mark]overlay=x={inset}:y=H-{inset}-{logo_h}[b];"
+        f"[a][logo]overlay=x={inset}:y=H-{inset}-overlay_h[b];"
         f"[b]drawtext=fontfile='{font_esc}':text='{handle_esc}':"
         f"fontcolor=white@0.92:fontsize={handle_fs}:"
-        f"x=W-tw-{inset}:y=H-{inset}-{logo_h}/2-th/2[v]"
+        f"x=W-tw-{inset}:y=H-{inset}-th[v]"
     )
     cmd = [
         ffmpeg, "-y",
         "-i", input_path,
         "-i", scrim_png,
-        "-i", mark_png,
+        "-i", logo_png,
         "-filter_complex", filt,
         "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-crf", "20", "-preset", "fast",
@@ -893,11 +958,16 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
     print("video-episode: transcribing...", flush=True)
     transcript = clipper.transcribe(staged["r2_key"], media_path=media_path,
                                     transcriber=transcriber)
-    print(f"video-episode: transcript {len(transcript['words'])} word(s)", flush=True)
+    print(f"video-episode: transcript {len(transcript['words'])} word(s) "
+          f"(source: {transcript.get('source', 'unknown')})", flush=True)
 
     selection = clipper.select_moments(transcript, llm=llm, account_key=account_key)
     accepted = selection.get("accepted", [])
-    print(f"video-episode: {len(accepted)} moment(s) pass", flush=True)
+    # Snap each clip's in/out to the nearest word boundary so we never cut mid-word.
+    for m in accepted:
+        snap_to_word_boundaries(m, transcript)
+    print(f"video-episode: {len(accepted)} moment(s) pass "
+          f"(snapped to word boundaries)", flush=True)
     clipper.print_plan(selection)
 
     if media_path is None:
