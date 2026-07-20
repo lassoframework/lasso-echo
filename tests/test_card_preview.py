@@ -66,11 +66,24 @@ def test_carousel_shows_slide_one_cover():
     assert "slide 1 of 3" in _all_text(blocks)
 
 
-def test_video_gets_no_image_block_just_a_note():
+def test_video_gets_no_image_block_watch_link():
     blocks = slack_surface.build_card_blocks(
         _draft(creative_public_url="https://cdn.example.com/reel.mp4"))
     assert _images(blocks) == []
-    assert "not previewed inline" in _all_text(blocks).lower()
+    text = _all_text(blocks).lower()
+    # Card must have a watch link pointing at the URL
+    assert "https://cdn.example.com/reel.mp4" in _all_text(blocks)
+    # No stale "not previewed inline" fallback when a URL is present
+    assert "not previewed inline" not in text
+
+
+def test_video_no_url_gets_fallback_note():
+    # local-only path with no public URL -> fallback note
+    blocks = slack_surface.build_card_blocks(
+        _draft(creative_path="/tmp/clip.mp4", creative_public_url=""))
+    assert _images(blocks) == []
+    text = _all_text(blocks).lower()
+    assert "not yet hosted" in text
 
 
 def test_unhosted_creative_gets_note_not_image():

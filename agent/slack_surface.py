@@ -194,6 +194,13 @@ class SlackPoster:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         if not data1.get("ok"):
+            err = data1.get("error", "unknown")
+            if err == "missing_scope":
+                print("[slack] upload_clip: missing 'files:write' scope — add it at "
+                      "api.slack.com/apps under OAuth & Permissions, then reinstall the app",
+                      flush=True)
+            else:
+                print(f"[slack] upload_clip: getUploadURL failed: {err}", flush=True)
             return data1
         upload_url = data1["upload_url"]
         file_id = data1["file_id"]
@@ -271,7 +278,12 @@ def _preview_blocks(draft):
             _ctx(f"Carousel preview: slide 1 of {n}. The remaining slides post in order."),
         ]
     if _is_video(draft.creative_public_url) or _is_video(draft.creative_path):
-        return [_ctx("Video creative (Reel): not previewed inline in Slack.")]
+        url = getattr(draft, "creative_public_url", "") or ""
+        if url and str(url).startswith("https://"):
+            return [
+                _ctx(f"Reel ready: <{url}|Watch clip> (tap to open in browser)"),
+            ]
+        return [_ctx("Reel: not yet hosted — check R2 upload.")]
     if _is_hosted_image(draft.creative_public_url):
         return [{"type": "image", "image_url": draft.creative_public_url,
                  "alt_text": "creative preview"}]

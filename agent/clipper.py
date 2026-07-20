@@ -781,7 +781,13 @@ def clip_episode_cli(argv):
                 reel_url = f.get("permalink", reel_url)
                 print(f"clip-episode: clip uploaded to Slack", flush=True)
             else:
-                print(f"clip-episode: Slack upload failed: {resp}", flush=True)
+                err = (resp or {}).get("error", "unknown")
+                if err == "missing_scope":
+                    print("clip-episode: Slack upload needs 'files:write' scope on the bot token. "
+                          "Go to api.slack.com/apps → Echo → OAuth & Permissions, add "
+                          "'files:write', reinstall, update AGENT_SLACK_BOT_TOKEN.", flush=True)
+                else:
+                    print(f"clip-episode: Slack upload failed ({err}): {resp}", flush=True)
 
         try:
             # Post the approval card (in the clip's thread when we have a ts).
