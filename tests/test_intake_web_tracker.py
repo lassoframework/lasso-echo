@@ -35,10 +35,8 @@ def _arm(monkeypatch):
 def test_correct_token_tracker_page(monkeypatch, tmp_path):
     _arm(monkeypatch)
     monkeypatch.setattr(intake_web, "_REPO_ROOT", str(tmp_path))
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "echo_build_tracker.html").write_bytes(b"<html>TRACKER</html>")
-    (docs / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF</html>")
+    (tmp_path / "echo_build_tracker.html").write_bytes(b"<html>TRACKER</html>")
+    (tmp_path / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF</html>")
 
     status, body = intake_web.handle_tracker(_GOOD_TOKEN, "tracker")
     assert status == 200
@@ -48,10 +46,8 @@ def test_correct_token_tracker_page(monkeypatch, tmp_path):
 def test_correct_token_handoff_page(monkeypatch, tmp_path):
     _arm(monkeypatch)
     monkeypatch.setattr(intake_web, "_REPO_ROOT", str(tmp_path))
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "echo_build_tracker.html").write_bytes(b"<html>TRACKER</html>")
-    (docs / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF</html>")
+    (tmp_path / "echo_build_tracker.html").write_bytes(b"<html>TRACKER</html>")
+    (tmp_path / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF</html>")
 
     status, body = intake_web.handle_tracker(_GOOD_TOKEN, "handoff")
     assert status == 200
@@ -61,8 +57,7 @@ def test_correct_token_handoff_page(monkeypatch, tmp_path):
 def test_wrong_token_is_404(monkeypatch, tmp_path):
     _arm(monkeypatch)
     monkeypatch.setattr(intake_web, "_REPO_ROOT", str(tmp_path))
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "echo_build_tracker.html").write_bytes(b"X")
+    (tmp_path / "echo_build_tracker.html").write_bytes(b"X")
 
     status, _ = intake_web.handle_tracker("wrong-token-xxxxxxxx", "tracker")
     assert status == 404
@@ -84,8 +79,7 @@ def test_unknown_page_is_404(monkeypatch, tmp_path):
 def test_missing_file_is_404(monkeypatch, tmp_path):
     _arm(monkeypatch)
     monkeypatch.setattr(intake_web, "_REPO_ROOT", str(tmp_path))
-    # docs/ exists but the HTML files do not
-    (tmp_path / "docs").mkdir()
+    # HTML files do not exist in tmp_path
     status, _ = intake_web.handle_tracker(_GOOD_TOKEN, "tracker")
     assert status == 404
 
@@ -148,13 +142,11 @@ def test_route_no_match_random_path():
 
 @pytest.fixture
 def tracker_server(monkeypatch, tmp_path):
-    """Live server with tracker token set and fake docs files."""
+    """Live server with tracker token set and fake tracker files."""
     monkeypatch.setenv("AGENT_TRACKER_TOKEN", _GOOD_TOKEN)
     monkeypatch.setattr(intake_web, "_REPO_ROOT", str(tmp_path))
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "echo_build_tracker.html").write_bytes(b"<html>BUILD TRACKER</html>")
-    (docs / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF PAGE</html>")
+    (tmp_path / "echo_build_tracker.html").write_bytes(b"<html>BUILD TRACKER</html>")
+    (tmp_path / "ECHO_HANDOFF.html").write_bytes(b"<html>HANDOFF PAGE</html>")
     srv = intake_web.build_server(port=0)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()

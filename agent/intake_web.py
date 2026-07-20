@@ -639,8 +639,8 @@ One more step while you are here: send us your photos and videos.</p>
 # hand in Railway env). No flag — the route 404s whenever the env var is unset.
 # Raw token is never logged (same discipline as upload tokens).
 _TRACKER_PAGES = {
-    "tracker": "docs/echo_build_tracker.html",
-    "handoff": "docs/ECHO_HANDOFF.html",
+    "tracker": "echo_build_tracker.html",
+    "handoff": "ECHO_HANDOFF.html",
 }
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
