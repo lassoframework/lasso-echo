@@ -620,7 +620,24 @@ def clip_episode_cli(argv):
     if not source:
         print("usage: python -m agent clip-episode --source <path-or-R2-key> [--render]")
         return
+    client = None
+    key_id = os.environ.get(config.S3_ACCESS_KEY_ID_ENV)
+    secret = os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
+    if key_id and secret and config.S3_BUCKET:
+        try:
+            import boto3
+            from botocore.config import Config as _BC
+            s3 = boto3.client("s3",
+                endpoint_url=config.S3_ENDPOINT or None,
+                region_name=config.S3_REGION or None,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=secret,
+                config=_BC(retries={"max_attempts": 2, "mode": "standard"}),
+            )
+            client = media_host._S3Client(s3, config.S3_BUCKET)
+        except Exception:
+            pass
     try:
-        clip_episode(source, render=render)
+        clip_episode(source, render=render, client=client)
     except ClipperError as exc:
         print(str(exc))

@@ -34,7 +34,8 @@ def _load_dotenv():
         pass
 
 
-_load_dotenv()
+if __name__ == "__main__" or os.environ.get("AGENT_LOAD_DOTENV") == "1":
+    _load_dotenv()
 
 from . import config
 from .runner import run_daily
