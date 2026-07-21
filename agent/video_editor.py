@@ -459,21 +459,49 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
 
 
 def _build_still_prompt(beat):
-    """House-style Nano Banana card prompt for a stat/quote/framework beat. The
-    on-card text is the grounded, scrubbed concept (fabrication-safe). Palette and
-    layout follow the LASSO V3 house style; no dashes, no vendor."""
+    """Professional, house-style Nano Banana infographic prompt for a
+    stat/quote/framework beat. The ONLY rendered words are the grounded, scrubbed
+    concept (fabrication-safe). Art-directed to magazine quality (not a plain text
+    slide): navy premium canvas, depth layer, one red accent, LASSO lockup.
+    beat['still_layout'] picks the structure: 'framework' (labeled nodes/rail for a
+    list of roles or steps) or 'poster' (headline-dominant editorial). Default
+    poster."""
     text = beat.get("card_text") or clipper_render.scrub_onscreen(
         beat.get("concept", "").upper())
-    return (
-        "LASSO V3 house-style editorial card, vertical. "
-        "Navy #121E3C background, one bold headline in white set large and "
-        "left-aligned, one restrained red #FF0000 accent element only. "
-        "Anton or a bold condensed sans headline. Clean, magazine editorial, "
-        "not clip art, not an infographic, no photo. "
-        "The headline text reads exactly: "
-        f"\"{text}\". "
-        "No other text anywhere. No dashes, no hyphens."
+    layout = beat.get("still_layout", "poster")
+
+    base = (
+        "Design a premium, professional LASSO-branded editorial infographic, "
+        "vertical 9:16, magazine art-direction quality like a Nike or Alo campaign "
+        "card. NOT a plain centered text slide, NOT clip art, NOT a generic stock "
+        "template, NOT a photo. "
+        "Canvas: deep navy #121E3C field with a subtle darker vignette and a very "
+        "faint geometric line texture for depth (exactly one quiet depth layer). "
+        "Composition: left-aligned and asymmetric, generous margins, nothing "
+        "centered. Typography: a bold condensed sans headline (Anton style) set BIG "
+        "and confident. Exactly ONE restrained red #FF0000 accent element (a short "
+        "rule line, a single node, or one emphasized word) and nothing else in red. "
+        "Keep the bottom eighth of the frame clear and empty (the video adds its own "
+        "branding there) and do NOT draw any logo or wordmark. "
+        f"The ONLY words rendered anywhere on the card are exactly: \"{text}\". "
+        "No other text, no labels, no numbers, no logo, no lorem, no captions, "
+        "no watermark. No dashes, no hyphens."
     )
+    if layout == "framework":
+        base += (
+            " Render those words as a clean FRAMEWORK diagram: each word in its own "
+            "rounded pill or connected node arranged in a vertical rail with thin "
+            "connecting lines between them, evenly spaced, editorial and premium, "
+            "like a designed process graphic."
+        )
+    else:
+        base += (
+            " Render as a HEADLINE-dominant editorial poster: the words as one bold "
+            "left-aligned headline block anchored in the upper left, using oversized "
+            "type scale as the visual anchor with a strong navy color field and a "
+            "single thin red rule under the headline."
+        )
+    return base
 
 
 def project_episode_cost(manifests):
@@ -853,20 +881,15 @@ def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
                     str(cw.get("word", "") or "").strip().upper())
                 if not text:
                     continue
+                # STATIC captions: only the colour changes per active word (one red
+                # word, rest white). No scale pop / fade — motion hurt readability.
                 color = _WH_ACTIVE_BGR if ci == word_idx else _WH_WHITE_BGR
-                if motion and ci == word_idx:
-                    # active word pops from 118% to 100% over 90ms
-                    parts.append(
-                        f"{{\\c&H00{color}&\\fscx118\\fscy118"
-                        f"\\t(0,90,\\fscx100\\fscy100)}}{text}")
-                else:
-                    parts.append(f"{{\\c&H00{color}&\\fscx100\\fscy100}}{text}")
+                parts.append(f"{{\\c&H00{color}&\\fscx100\\fscy100}}{text}")
             if not parts:
                 continue
-            fad = "{\\fad(60,0)}" if motion else ""
             lines.append(
                 f"Dialogue: 0,{clipper_render._fmt_ass_ts(w_start)},"
-                f"{clipper_render._fmt_ass_ts(w_end)},WH,,0,0,0,,{fad}{' '.join(parts)}")
+                f"{clipper_render._fmt_ass_ts(w_end)},WH,,0,0,0,,{' '.join(parts)}")
 
     os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
     with open(ass_path, "w", encoding="utf-8") as fh:

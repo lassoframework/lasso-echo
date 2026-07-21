@@ -301,7 +301,17 @@ def test_still_prompt_has_grounded_text_no_dashes():
     beat = {"concept": "twenty-five percent", "card_text": "TWENTY FIVE PERCENT"}
     p = ve._build_still_prompt(beat)
     assert "TWENTY FIVE PERCENT" in p
-    assert "-" not in p.split("reads exactly:")[1]
+    # the only-rendered-words clause carries the grounded text, dash-free
+    only = p.split("exactly:")[1]
+    assert "-" not in only.split("No other text")[0]
+    # professional art-direction, not a plain text slide
+    assert "NOT a plain centered text slide" in p
+
+
+def test_still_prompt_framework_layout():
+    beat = {"card_text": "CLIENT SALESPERSON OVERSEER", "still_layout": "framework"}
+    p = ve._build_still_prompt(beat)
+    assert "FRAMEWORK diagram" in p
 
 
 def test_still_card_renderer_needs_pipeline(monkeypatch):
