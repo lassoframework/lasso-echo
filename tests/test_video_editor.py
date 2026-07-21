@@ -574,7 +574,8 @@ def test_polish_and_jumpcuts_end_to_end(monkeypatch, tmp_path):
     p = ve.assemble_clip(m, src, tr, [], str(tmp_path / "out"), "clip",
                          aspect="9:16", captioned=True)
     assert os.path.isfile(p)
-    assert p.endswith("_final.mp4")            # bookended
+    # hook + CTA are now Treatment B panels over the live footage (no concat card),
+    # so the total duration stays ~the tightened clip length, not clip + cards
     assert _probe_dims(p) == (1080, 1920)
     # video and audio durations stay within 0.3s of each other (in sync)
     import subprocess as _sp
@@ -583,6 +584,48 @@ def test_polish_and_jumpcuts_end_to_end(monkeypatch, tmp_path):
     durs = [float(s["duration"]) for s in json.loads(r.stdout)["streams"]
             if "duration" in s]
     assert max(durs) - min(durs) < 0.3
+
+
+def test_side_panel_ass_animated_one_red_word_no_dash():
+    import tempfile as _tf
+    specs = [{"start": 2.0, "end": 6.0, "eyebrow": "ROLE PLAY",
+              "headline": "CLIENT SALESPERSON OVERSEER", "red_word": "SALESPERSON"}]
+    with _tf.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as f:
+        ass = f.name
+    try:
+        ve._make_side_panel_ass(specs, 1080, 1920, ass)
+        c = open(ass).read()
+        assert "Anton" in c and "Oswald" in c            # house fonts
+        events = [l for l in c.splitlines() if l.startswith("Dialogue:")]
+        body = "\n".join(events)
+        assert "\\move" in body or "\\fad" in body        # animates in
+        assert body.count("&H002A2AFF&") == 1             # exactly one red word
+        assert "-" not in body                            # no hyphen on screen
+    finally:
+        os.unlink(ass)
+
+
+@pytestmark_ff
+def test_side_panel_keeps_footage_visible(monkeypatch, tmp_path):
+    """Treatment B panel is a semi-transparent overlay: the underlying footage is
+    NOT replaced (the right side stays the host color, not flat navy)."""
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    src = str(tmp_path / "src.mp4")
+    _make_src(src, duration=6, w=1080, h=1920)   # solid blue host
+    out = str(tmp_path / "panelled.mp4")
+    specs = [{"start": 1.0, "end": 5.0, "eyebrow": "ROLE PLAY",
+              "headline": "CLIENT SALESPERSON OVERSEER", "red_word": "SALESPERSON"}]
+    ve.burn_side_panels(src, out, specs, 1080, 1920, str(tmp_path / "w"))
+    assert os.path.isfile(out) and _probe_dims(out) == (1080, 1920)
+    # sample a frame mid-panel; the far-right column should still be host blue
+    # (panel fades to transparent), proving no full-frame takeover
+    import subprocess as _sp
+    px = str(tmp_path / "px.png")
+    _sp.run(["ffmpeg", "-y", "-ss", "3", "-i", out, "-vf",
+             "crop=40:40:1030:900", "-frames:v", "1", px], capture_output=True)
+    from PIL import Image
+    r, g, b = Image.open(px).convert("RGB").resize((1, 1)).getpixel((0, 0))
+    assert b > r and b > 60   # still bluish host, not navy takeover
 
 
 @pytestmark_ff

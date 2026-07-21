@@ -57,6 +57,17 @@ _WH_WHITE_BGR = "FFFFFF"
 _WH_WORDS_PER_GROUP = 3
 _WH_FONT_FRAC = 0.062           # caption font size as fraction of frame height
 
+# ---- Treatment B: text side panel (house standard for concept beats) --------
+# A semi-transparent navy gradient panel over ~left 60%, fading to transparent
+# over the live host (which keeps playing on the right). Panel + text slide/fade
+# in, hold, then clear. NEVER a full-screen static text takeover.
+_PANEL_COVERAGE = 0.60          # panel opaque zone as a fraction of width
+_PANEL_NAVY = (18, 30, 60)      # #121E3C
+_PANEL_MAX_ALPHA = 205          # panel opacity (semi-transparent, host faint behind)
+_SKYBLUE_BGR = "E6B95E"         # ASS BGR for sky blue #5EB9E6
+_PANEL_HEAD_FRAC = 0.060        # headline font size as fraction of frame height
+_PANEL_EYE_FRAC = 0.022         # eyebrow font size
+
 
 class VideoEditorError(Exception):
     """A video-editor stage could not proceed."""
@@ -806,7 +817,8 @@ def _caption_margin_v(height, face_bottom_frac=None):
 
 
 def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
-                             width, height, margin_v, motion=False):
+                             width, height, margin_v, motion=False,
+                             skip_windows=None):
     """Word Highlight ASS: Anton ALL CAPS, groups of _WH_WORDS_PER_GROUP, the ONE
     active (currently spoken) word in brand RED, the rest white, heavy outline +
     shadow. One event per word so exactly one line is visible (no ghost/duplicate).
@@ -821,6 +833,13 @@ def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
         if float(w.get("start", 0)) >= start_ts - 0.05
         and float(w.get("start", 0)) < end_ts + 0.05
     ]
+    # Suppress captions inside Treatment B panel windows (clip-relative seconds) so
+    # the side-panel headline never collides with the lower-third captions.
+    sw = skip_windows or []
+    if sw:
+        def _in_win(rel):
+            return any(a - 0.15 <= rel <= b + 0.15 for a, b in sw)
+        words = [w for w in words if not _in_win(float(w.get("start", 0)) - start_ts)]
     chunks = [words[i:i + _WH_WORDS_PER_GROUP]
               for i in range(0, len(words), _WH_WORDS_PER_GROUP)]
 
@@ -870,10 +889,12 @@ def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
 
 
 def burn_word_highlight(input_path, output_path, transcript, start_ts, end_ts,
-                        width, height, face_bottom_frac=None, motion=None):
+                        width, height, face_bottom_frac=None, motion=None,
+                        skip_windows=None):
     """Burn Word Highlight captions (Anton, one red active word) into the video,
     placed in the lower third below the detected face. Loads Anton via fontsdir.
-    motion defaults to the AGENT_VIDEO_POLISH flag (active-word pop-in)."""
+    skip_windows: clip-relative (start,end) spans where captions are suppressed
+    (a Treatment B panel is showing there)."""
     clipper_render._require_render()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     margin_v = _caption_margin_v(height, face_bottom_frac)
@@ -884,7 +905,8 @@ def burn_word_highlight(input_path, output_path, transcript, start_ts, end_ts,
         ass_path = tf.name
     try:
         _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
-                                 width, height, margin_v, motion=motion)
+                                 width, height, margin_v, motion=motion,
+                                 skip_windows=skip_windows)
         safe = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
         fonts = video_assets.FONTS_DIR.replace("\\", "/").replace(":", "\\:")
         cmd = [
@@ -1095,8 +1117,178 @@ def _concat_av(paths, out_path, width, height):
     return out_path
 
 
+def _make_panel_png(width, height, out_path):
+    """Left gradient panel: navy opaque on the far left, fading to fully
+    transparent by _PANEL_COVERAGE of the width, so the host stays visible on the
+    right. RGBA PNG."""
+    from PIL import Image
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    px = img.load()
+    r, g, b = _PANEL_NAVY
+    # A clear navy panel holds high alpha across the whole TEXT zone (left ~50%),
+    # then fades to transparent by ~68% so the host stays visible/in-motion on the
+    # right. Semi-transparent (not fully opaque) so it reads as an overlay panel.
+    solid_to = int(width * 0.50)          # panel body: strong, even alpha
+    fade_to = int(width * 0.68)           # transparent by here
+    for x in range(width):
+        if x <= solid_to:
+            a = _PANEL_MAX_ALPHA
+        elif x >= fade_to:
+            a = 0
+        else:
+            a = int(_PANEL_MAX_ALPHA * (1 - (x - solid_to) / (fade_to - solid_to)))
+        row = (r, g, b, a)
+        for y in range(height):
+            px[x, y] = row
+    img.save(out_path)
+    return out_path
+
+
+def _wrap_headline(text, width_chars=13):
+    words = str(text or "").split()
+    lines, cur = [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width_chars:
+            lines.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines[:4]
+
+
+def _make_side_panel_ass(specs, width, height, ass_path):
+    """ASS for Treatment B panel text: Oswald tracked eyebrow in sky blue, a short
+    red rule, Anton oversized headline with ONE red word, all left-aligned inside
+    the left panel. Each block slides + fades in over its window (animated, never
+    static-pop). Text is scrubbed (no dashes/vendor)."""
+    head_fs = int(height * _PANEL_HEAD_FRAC)
+    eye_fs = int(height * _PANEL_EYE_FRAC)
+    left = int(width * 0.06)
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+",
+        f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 2", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: SPEye,Oswald,{eye_fs},&H00{_SKYBLUE_BGR},&H00{_SKYBLUE_BGR},"
+        f"&H00000000,&H64000000,-1,0,0,0,100,100,4,0,1,2,0,7,{left},10,0,0",
+        f"Style: SPHead,Anton,{head_fs},&H00{_WH_WHITE_BGR},&H00{_WH_WHITE_BGR},"
+        f"&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,4,2,7,{left},10,0,0",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    ts = clipper_render._fmt_ass_ts
+    for sp in specs:
+        s = float(sp["start"]); e = float(sp["end"])
+        eye = clipper_render.scrub_onscreen(str(sp.get("eyebrow", "")).strip().upper())
+        head = clipper_render.scrub_onscreen(str(sp.get("headline", "")).strip().upper())
+        red = clipper_render.scrub_onscreen(str(sp.get("red_word", "")).strip().upper())
+        eye_y = int(height * 0.34)
+        rule_y = int(height * 0.38)
+        head_y = int(height * 0.40)
+        # eyebrow: slide up + fade in
+        if eye:
+            lines.append(
+                f"Dialogue: 0,{ts(s)},{ts(e)},SPEye,,0,0,0,,"
+                f"{{\\pos({left},{eye_y})\\an7\\fad(220,180)"
+                f"\\move({left-30},{eye_y},{left},{eye_y},0,260)}}{eye}")
+        # red rule: a short red drawing rectangle
+        rw = int(width * 0.10)
+        lines.append(
+            f"Dialogue: 0,{ts(s)},{ts(e)},SPHead,,0,0,0,,"
+            f"{{\\pos({left},{rule_y})\\an7\\fad(220,180)\\1c&H0000FF&\\p1}}"
+            f"m 0 0 l {rw} 0 l {rw} 6 l 0 6{{\\p0}}")
+        # headline: one red word, wrapped, slide up + fade in
+        hl_lines = _wrap_headline(head, 13)
+        parts = []
+        for ln in hl_lines:
+            words = []
+            for w in ln.split():
+                if red and w == red:
+                    words.append(f"{{\\c&H00{_WH_ACTIVE_BGR}&}}{w}{{\\c&H00{_WH_WHITE_BGR}&}}")
+                else:
+                    words.append(w)
+            parts.append(" ".join(words))
+        headline_text = "\\N".join(parts)
+        lines.append(
+            f"Dialogue: 0,{ts(s)},{ts(e)},SPHead,,0,0,0,,"
+            f"{{\\pos({left},{head_y})\\an7\\fad(240,200)"
+            f"\\move({left-40},{head_y},{left},{head_y},0,300)}}{headline_text}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
+    with open(ass_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return ass_path
+
+
+def burn_side_panels(input_path, output_path, specs, width, height, work_dir):
+    """Treatment B: composite an animated navy gradient panel + house-style text
+    over the LIVE footage for each spec window (host keeps playing underneath).
+    Panel fades in/out; text slides + fades in. Never a full-frame takeover.
+    specs: [{start, end, eyebrow, headline, red_word}]. No-op if empty."""
+    specs = [s for s in (specs or []) if s.get("headline")]
+    if not specs:
+        shutil.copyfile(input_path, output_path)
+        return output_path
+    ffmpeg = clipper_render._ffmpeg()
+    os.makedirs(work_dir, exist_ok=True)
+    panel_png = os.path.join(work_dir, "panel.png")
+    _make_panel_png(width, height, panel_png)
+
+    # Step 1: fade the gradient panel in/out over each window, composited on host.
+    inputs = ["-i", input_path]
+    for _ in specs:
+        inputs += ["-loop", "1", "-i", panel_png]
+    parts = []
+    cur = "0:v"
+    for i, sp in enumerate(specs):
+        s = float(sp["start"]); e = float(sp["end"]); d = max(0.5, e - s)
+        idx = i + 1
+        fo = max(0.0, d - 0.35)
+        parts.append(
+            f"[{idx}:v]format=yuva420p,trim=duration={d},setpts=PTS-STARTPTS,"
+            f"fade=t=in:st=0:d=0.35:alpha=1,fade=t=out:st={fo:.2f}:d=0.35:alpha=1,"
+            f"setpts=PTS-STARTPTS+{s:.3f}/TB[p{i}]")
+        parts.append(f"[{cur}][p{i}]overlay=x=0:y=0:eof_action=pass[pb{i}]")
+        cur = f"pb{i}"
+    panel_bg = os.path.join(work_dir, "panel_bg.mp4")
+    cmd = ([ffmpeg, "-y"] + inputs + [
+        "-filter_complex", ";".join(parts), "-map", f"[{cur}]", "-map", "0:a?",
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-c:a", "copy",
+        panel_bg])
+    clipper_render._run(cmd, "side_panel_bg")
+
+    # Step 2: burn the animated house-style text into the panels.
+    with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tf:
+        ass_path = tf.name
+    try:
+        _make_side_panel_ass(specs, width, height, ass_path)
+        safe = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
+        fonts = video_assets.FONTS_DIR.replace("\\", "/").replace(":", "\\:")
+        cmd = [ffmpeg, "-y", "-i", panel_bg, "-vf", f"ass={safe}:fontsdir={fonts}",
+               "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-c:a", "copy",
+               output_path]
+        clipper_render._run(cmd, "side_panel_text")
+    finally:
+        try:
+            os.unlink(ass_path)
+        except OSError:
+            pass
+    return output_path
+
+
+def _eyebrow_for(text):
+    """A short 1-2 word ALL-CAPS eyebrow derived from the grounded concept (first
+    meaningful words). Grounded, not invented."""
+    words = [w for w in str(text or "").split() if len(w) > 2]
+    return " ".join(words[:2]).upper()
+
+
 def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
-                  aspect="9:16", captioned=True):
+                  aspect="9:16", captioned=True, panel_specs=None):
     """
     Assemble one finished clip (house standard):
       cut -> frame(aspect) -> [jump-cut pacing] -> [A+ host grade] -> overlays ->
@@ -1132,11 +1324,15 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
     # caption timeline + overlay offsets default to the original clip timeline
     cap_transcript = transcript
     cap_start, cap_end = float(moment.start_ts), float(moment.end_ts)
-    eff_overlays = overlays
+    # Motion b-roll cutaways only (moving footage). Text NEVER becomes a full-frame
+    # cutaway — it is a Treatment B side panel over the live footage (below).
+    motion_overlays = [o for o in (overlays or []) if o.get("kind", "video") == "video"]
+    eff_overlays = motion_overlays
+    panels = [dict(p) for p in (panel_specs or [])]   # still/concept text beats
     eff_dur = clip_dur
 
-    # A+ pacing: remove dead air, then remap overlays + captions onto the tighter
-    # timeline so everything stays in sync.
+    # A+ pacing: remove dead air, then remap overlays + captions + panels onto the
+    # tighter timeline so everything stays in sync.
     if config.video_jumpcuts_enabled():
         words_rel = [
             (float(w["start"]) - float(moment.start_ts),
@@ -1155,10 +1351,34 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
                   f"({clip_dur:.0f}s -> {new_dur:.0f}s)", flush=True)
             host_base = tightened
             eff_dur = new_dur
-            eff_overlays = [dict(ov, offset=time_map(ov["offset"])) for ov in overlays]
+            eff_overlays = [dict(ov, offset=time_map(ov["offset"]))
+                            for ov in motion_overlays]
+            panels = [dict(p, start=time_map(p["start"]), end=time_map(p["end"]))
+                      for p in panels]
             cap_transcript = _remap_transcript(
                 transcript, float(moment.start_ts), float(moment.end_ts), time_map)
             cap_start, cap_end = 0.0, new_dur
+
+    # Hook + CTA are Treatment B panels over the live footage, NOT full-frame cards:
+    # hook over the opening seconds, CTA over the closing seconds. Captioned cut
+    # only; the ad cut stays clean.
+    if config.video_polish_enabled() and captioned:
+        hook_txt = getattr(moment, "hook", "") or ""
+        if hook_txt.strip():
+            panels.append({
+                "start": 0.4, "end": min(3.6, max(1.5, eff_dur * 0.28)),
+                "eyebrow": "", "headline": hook_txt,
+                "red_word": _pick_red_word(hook_txt)})
+        panels.append({
+            "start": max(0.0, eff_dur - 3.0), "end": max(0.5, eff_dur - 0.2),
+            "eyebrow": "LASSO", "headline": "FOLLOW FOR MORE", "red_word": "FOLLOW"})
+
+    # clamp/clean panels to the effective timeline
+    panels = [p for p in panels
+              if p.get("headline") and float(p["end"]) > float(p["start"])
+              and float(p["start"]) < eff_dur]
+    for p in panels:
+        p["end"] = min(float(p["end"]), eff_dur - 0.05)
 
     if config.video_polish_enabled():
         _polish_host(host_base, polished, width, height, eff_dur)
@@ -1172,36 +1392,30 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
         _composite_overlays(host_base, eff_overlays, composited, width, height, work)
         stage = composited
 
+    if panels:
+        panelled = os.path.join(work, "panelled.mp4")
+        burn_side_panels(stage, panelled, panels, width, height, work)
+        stage = panelled
+
     if captioned:
+        # suppress captions wherever a Treatment B panel is on screen (no collision)
+        skip_windows = [(float(p["start"]), float(p["end"])) for p in panels]
         burn_word_highlight(stage, captioned_out, cap_transcript,
                             cap_start, cap_end,
-                            width, height, face_bottom_frac=face_bottom)
+                            width, height, face_bottom_frac=face_bottom,
+                            skip_windows=skip_windows)
         stage = captioned_out
 
     apply_bottom_treatment(stage, final_out, width, height, work)
-
-    # A+ bookends: animated hook card at the open + end CTA card. Only on the
-    # captioned (organic) cut; the ad cut stays clean for paid placements.
-    if config.video_polish_enabled() and captioned:
-        try:
-            hook_txt = getattr(moment, "hook", "") or ""
-            cards = []
-            if hook_txt.strip():
-                hook_card = os.path.join(work, "hook.mp4")
-                _make_title_card(hook_txt, "", hook_card, width, height, 1.6)
-                cards.append(hook_card)
-            cards.append(final_out)
-            cta_card = os.path.join(work, "cta.mp4")
-            _make_title_card("FOLLOW FOR MORE", _HANDLE_TEXT, cta_card,
-                             width, height, 2.0)
-            cards.append(cta_card)
-            if len(cards) > 1:
-                booked = os.path.join(output_dir, f"{base}_{tag}_final.mp4")
-                _concat_av(cards, booked, width, height)
-                return booked
-        except Exception as exc:
-            print(f"[video] bookend cards skipped: {exc}", flush=True)
     return final_out
+
+
+def _pick_red_word(headline):
+    """Pick ONE word to accent red: the longest meaningful word in the headline."""
+    words = [w for w in str(headline or "").split() if len(w) > 2]
+    if not words:
+        return ""
+    return max(words, key=len).upper()
 
 
 # ---- Part 4: orchestrator ---------------------------------------------------
@@ -1278,34 +1492,41 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
     still_beats = sum(mf.get("still_count", 0) for mf in manifests)
     if plan_broll:
         print(f"video-episode: b-roll plan = {motion_beats} motion (Higgsfield) + "
-              f"{still_beats} still (Nano Banana) across {len(accepted)} clip(s); "
-              f"projected cost ~{projected} credits (motion cap "
-              f"{config.video_broll_cap()}, stills cap {config.video_stills_cap()} "
-              f"per episode). "
+              f"{still_beats} text panels across {len(accepted)} clip(s); "
+              f"projected motion cost ~{projected} credits (motion cap "
+              f"{config.video_broll_cap()} per episode). Text beats render as "
+              f"Treatment B side panels over live footage (no image cost). "
               f"{'RENDERING' if (render and renderer) else 'NOT rendering overlays'}.",
               flush=True)
 
-    # ONE episode-level budget PER ROUTE (hard cost guards), shared across all clips
-    # so the whole episode never renders more than each cap, no matter clip count.
+    # ONE episode-level motion budget (hard cost guard), shared across all clips.
     motion_budget = RenderBudget(config.video_broll_cap())
-    stills_budget = RenderBudget(config.video_stills_cap())
-    # Still renderer: reuse Echo's Gemini pipeline (armed by AGENT_VIDEO_STILLS_ENABLED).
-    use_still_renderer = (still_card_renderer
-                          if (render and config.video_stills_enabled()) else None)
 
     clips = []
     for m, manifest in zip(accepted, manifests):
         base = f"clip_{int(m.start_ts):05d}_{int(m.end_ts):05d}"
 
         overlays = []
+        panel_specs = []
         if plan_broll and manifest.get("beats"):
             use_renderer = renderer if (render and config.video_render_enabled()) else None
+            # MOTION beats -> Higgsfield b-roll cutaways. STILL/concept beats ->
+            # Treatment B text side panels over the live footage (no image render,
+            # never a full-frame takeover), so still_renderer stays None.
             try:
                 overlays = render_overlays(
                     manifest, renderer=use_renderer, budget=motion_budget,
-                    still_renderer=use_still_renderer, still_budget=stills_budget)
+                    still_renderer=None)
             except VideoEditorError as exc:
                 print(f"video-episode: overlay render stopped: {exc}", flush=True)
+            for b in manifest["beats"]:
+                if b.get("route") == "still":
+                    ct = b.get("card_text") or b.get("concept", "")
+                    panel_specs.append({
+                        "start": float(b["offset"]),
+                        "end": float(b["offset"]) + float(b.get("duration", 4.0)),
+                        "eyebrow": _eyebrow_for(b.get("concept", "")),
+                        "headline": ct, "red_word": _pick_red_word(ct)})
 
         files = {}
         for aspect in aspects:
@@ -1314,7 +1535,7 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
                 try:
                     path = assemble_clip(m, media_path, transcript, overlays,
                                          output_dir, base, aspect=aspect,
-                                         captioned=captioned)
+                                         captioned=captioned, panel_specs=panel_specs)
                     files[f"{aspect}_{mode}"] = path
                     print(f"video-episode: assembled {aspect} {mode} -> {path}",
                           flush=True)
