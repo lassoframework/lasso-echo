@@ -559,6 +559,24 @@ def save_clip_draft(moment, reel_path, reel_url, account_key,
             poster = None
 
     if poster is not None:
+        # Inline playback: upload the actual reel so Slack shows its native video
+        # player right in the channel. A URL alone only opens in a browser. Best-
+        # effort (needs files:write on the bot token); the card still links the URL
+        # as a fallback, so a failed upload never blocks the approval card.
+        _local = reel_path or ""
+        if _local and os.path.isfile(_local) and \
+                _local.lower().endswith((".mp4", ".mov", ".m4v", ".webm")):
+            try:
+                ch = None
+                try:
+                    ch = poster._channel_for(draft)
+                except Exception:
+                    ch = None
+                poster.upload_clip(_local, title=(episode_title or "Reel"),
+                                   initial_comment=f"Reel for review: {caption}",
+                                   channel=ch)
+            except Exception as exc:
+                print(f"[clipper] inline clip upload failed: {exc}")
         try:
             resp = poster.post_approval_card(draft) or {}
             ts = str(resp.get("ts") or "")
