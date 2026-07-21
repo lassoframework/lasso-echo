@@ -431,9 +431,12 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
     for b in beats:
         if b["route"] == "still":
             b["kind"] = "image"
-            # on-card text is the grounded concept, scrubbed for on-screen rules
+            # on-card headline is the grounded concept, scrubbed for on-screen rules.
+            # The card itself is rendered by still_card_renderer through the shared
+            # house-style pipeline (editorial archetype + grade gate) — there is no
+            # per-beat styling prompt. `prompt` here is only the cache-key basis.
             b["card_text"] = clipper_render.scrub_onscreen(b["concept"].upper())
-            b["prompt"] = _build_still_prompt(b)
+            b["prompt"] = f"house-editorial-card|{b['card_text']}"
         else:
             b["kind"] = "video"
             b["prompt"] = build_higgsfield_prompt(b["visual"])
@@ -456,52 +459,6 @@ def plan_broll_manifest(moment, transcript, llm=None, cap=None, kind=None):
         "stills_cap": stills_cap,
         "dropped_for_cap": dropped_for_cap,
     }
-
-
-def _build_still_prompt(beat):
-    """Professional, house-style Nano Banana infographic prompt for a
-    stat/quote/framework beat. The ONLY rendered words are the grounded, scrubbed
-    concept (fabrication-safe). Art-directed to magazine quality (not a plain text
-    slide): navy premium canvas, depth layer, one red accent, LASSO lockup.
-    beat['still_layout'] picks the structure: 'framework' (labeled nodes/rail for a
-    list of roles or steps) or 'poster' (headline-dominant editorial). Default
-    poster."""
-    text = beat.get("card_text") or clipper_render.scrub_onscreen(
-        beat.get("concept", "").upper())
-    layout = beat.get("still_layout", "poster")
-
-    base = (
-        "Design a premium, professional LASSO-branded editorial infographic, "
-        "vertical 9:16, magazine art-direction quality like a Nike or Alo campaign "
-        "card. NOT a plain centered text slide, NOT clip art, NOT a generic stock "
-        "template, NOT a photo. "
-        "Canvas: deep navy #121E3C field with a subtle darker vignette and a very "
-        "faint geometric line texture for depth (exactly one quiet depth layer). "
-        "Composition: left-aligned and asymmetric, generous margins, nothing "
-        "centered. Typography: a bold condensed sans headline (Anton style) set BIG "
-        "and confident. Exactly ONE restrained red #FF0000 accent element (a short "
-        "rule line, a single node, or one emphasized word) and nothing else in red. "
-        "Keep the bottom eighth of the frame clear and empty (the video adds its own "
-        "branding there) and do NOT draw any logo or wordmark. "
-        f"The ONLY words rendered anywhere on the card are exactly: \"{text}\". "
-        "No other text, no labels, no numbers, no logo, no lorem, no captions, "
-        "no watermark. No dashes, no hyphens."
-    )
-    if layout == "framework":
-        base += (
-            " Render those words as a clean FRAMEWORK diagram: each word in its own "
-            "rounded pill or connected node arranged in a vertical rail with thin "
-            "connecting lines between them, evenly spaced, editorial and premium, "
-            "like a designed process graphic."
-        )
-    else:
-        base += (
-            " Render as a HEADLINE-dominant editorial poster: the words as one bold "
-            "left-aligned headline block anchored in the upper left, using oversized "
-            "type scale as the visual anchor with a strong navy color field and a "
-            "single thin red rule under the headline."
-        )
-    return base
 
 
 def project_episode_cost(manifests):
@@ -623,20 +580,35 @@ def render_overlays(manifest, renderer=None, cache_dir=None, cap=None, budget=No
     return overlays
 
 
-def still_card_renderer(beat, out_path, kind):
-    """Nano Banana still-card renderer: reuses Echo's EXISTING creative_studio
-    Gemini pipeline (same model config + key as organic cards, one source of
-    truth). Writes a PNG card to out_path. Raises if the pipeline is unavailable
-    so the caller can skip the beat rather than spend blindly."""
+def still_card_renderer(beat, out_path, kind, account_key=None):
+    """Still-card renderer. Routes through the SAME house-style card pipeline the
+    organic feed cards use: creative_studio.generate() -> build_prompt (editorial
+    archetype, Section 8 house style) -> Gemini image -> the SAME six-question
+    grade gate with auto-retry. There is NO separate text-on-navy path for video.
+
+    A card that grades a fail (centered/flat/no anchor) is auto-retried and, if it
+    still fails 3x, generate() returns None and we raise so the beat is skipped
+    rather than shipping an off-brand card. 9:16 with story safe zones so the
+    composition stays in the upper-middle, clear of the caption lower-third and
+    the bottom treatment.
+
+    on-card headline = the grounded, scrubbed concept; facts = grounded context
+    (not rendered as text). Fabrication-safe."""
     from . import creative_studio
-    client = creative_studio._default_client()
-    if client is None:
+    headline = beat.get("card_text") or clipper_render.scrub_onscreen(
+        str(beat.get("concept", "")).upper())
+    facts = [f for f in (beat.get("source_span"), beat.get("concept")) if f] \
+        or [headline]
+    art = creative_studio.generate(
+        headline, facts,
+        aspect="9:16", pixels="1080x1920",
+        surface="reel still card (9:16 story safe area)",
+        archetype="editorial", account_key=account_key)
+    if not art or not art.get("path"):
         raise VideoEditorError(
-            "still card needs the creative_studio Gemini pipeline "
-            "(AGENT_CREATIVE_STUDIO_ENABLED + AGENT_NANO_API_KEY).")
-    image_bytes = client.generate_image(prompt=beat["prompt"], model=config.NANO_MODEL)
-    with open(out_path, "wb") as fh:
-        fh.write(image_bytes)
+            "still card: creative_studio.generate returned None (studio flag off, "
+            "no Nano key, spend cap, or failed the house-style grade gate 3x).")
+    shutil.copyfile(art["path"], out_path)
     return out_path
 
 

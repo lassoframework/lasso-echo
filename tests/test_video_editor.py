@@ -297,21 +297,53 @@ def test_planner_routes_and_enforces_separate_caps(monkeypatch):
                                           + 1 * man["cost_per_still"], 2)
 
 
-def test_still_prompt_has_grounded_text_no_dashes():
-    beat = {"concept": "twenty-five percent", "card_text": "TWENTY FIVE PERCENT"}
-    p = ve._build_still_prompt(beat)
-    assert "TWENTY FIVE PERCENT" in p
-    # the only-rendered-words clause carries the grounded text, dash-free
-    only = p.split("exactly:")[1]
-    assert "-" not in only.split("No other text")[0]
-    # professional art-direction, not a plain text slide
-    assert "NOT a plain centered text slide" in p
+def test_still_card_routes_through_house_style_generate(monkeypatch, tmp_path):
+    """The still-card renderer MUST call the shared creative_studio.generate()
+    (house style + grade gate), NOT a separate text-on-navy path."""
+    from agent import creative_studio
+    calls = {}
+
+    def fake_generate(headline, facts, **kw):
+        calls["headline"] = headline
+        calls["facts"] = facts
+        calls["archetype"] = kw.get("archetype")
+        calls["aspect"] = kw.get("aspect")
+        # write a dummy card file the renderer will copy
+        p = str(tmp_path / "card.png")
+        open(p, "wb").write(b"x" * 100)
+        return {"path": p, "prompt": "..."}
+
+    monkeypatch.setattr(creative_studio, "generate", fake_generate)
+    out = str(tmp_path / "out.png")
+    ve.still_card_renderer(
+        {"card_text": "ASSIGN ROLES EVERY REP", "concept": "assign roles",
+         "source_span": "assign roles every rep"}, out, "image")
+    assert os.path.isfile(out)
+    assert calls["archetype"] == "editorial"     # house-style editorial archetype
+    assert calls["aspect"] == "9:16"
+    assert calls["headline"] == "ASSIGN ROLES EVERY REP"
 
 
-def test_still_prompt_framework_layout():
-    beat = {"card_text": "CLIENT SALESPERSON OVERSEER", "still_layout": "framework"}
-    p = ve._build_still_prompt(beat)
-    assert "FRAMEWORK diagram" in p
+def test_still_card_raises_when_generate_returns_none(monkeypatch):
+    """If generate() returns None (grade gate failed 3x / studio off), the beat is
+    skipped loudly rather than shipping an off-brand card."""
+    from agent import creative_studio
+    monkeypatch.setattr(creative_studio, "generate", lambda *a, **k: None)
+    with pytest.raises(ve.VideoEditorError, match="grade gate|generate returned None"):
+        ve.still_card_renderer({"card_text": "X", "concept": "x"}, "/tmp/none.png",
+                               "image")
+
+
+def test_editorial_card_prompt_passes_grade_gate():
+    """The house-style editorial archetype used for video stills passes the SAME
+    six-question grade gate as feed cards (not centered text on flat navy)."""
+    from agent import creative_studio, grade_gate
+    p = creative_studio.build_prompt(
+        "Assign roles so every rep counts", ["three roles client salesperson overseer"],
+        aspect="9:16", pixels="1080x1920", surface="reel still card",
+        archetype="editorial")
+    r = grade_gate.grade_card(p, headline="Assign roles so every rep counts")
+    assert r.failed_questions == []
 
 
 def test_still_card_renderer_needs_pipeline(monkeypatch):
