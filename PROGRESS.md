@@ -10,6 +10,18 @@ Last updated: 2026-07-20
 
 ---
 
+## Video text = overlays on live footage (kill full-screen takeovers) (2026-07-21)
+
+Blake locked two approved text treatments; full-screen static text cards BANNED.
+- Treatment A (default): word-highlight captions over the full-frame live host.
+- Treatment B (concept/hook/CTA): burn_side_panels composites a semi-transparent
+  navy gradient panel over ~left 55% (fading to transparent, host stays live +
+  in motion on the right), house-style text (Oswald sky-blue eyebrow + red rule
+  + Anton headline with ONE red word, left-aligned), fades/slides in and clears.
+- Retired the still-card full-frame cutaway + hook/CTA concat cards. Captions are
+  suppressed inside any panel window (no collision). All text animates in.
+- 3 samples posted to #echoclaude. Suite 1517. SHA a8af0e8.
+
 ## Video editor A+ finish (Phase 1-3) (2026-07-20)
 
 Phases layered on the v1 A-build, all behind flags default OFF.
