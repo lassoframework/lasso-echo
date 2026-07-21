@@ -10,8 +10,9 @@ Run command: `python -m agent podcast-auto`
 
 ## Weekly process (once set up)
 
-1. Record in Riverside. It auto-exports the finished video to the Drive folder.
-   Nothing else from you.
+1. Record in Riverside, then export the finished episode to Drive: Exports tab ->
+   Share -> Drive icon -> Save to Google Drive. This is ONE manual click per
+   episode (Riverside has no scheduled auto-push; see "Riverside reality" below).
 2. Monday ~9am ET the cron pulls the newest episode, edits it, and spreads up to
    5 clips one-per-day across the next posting days as HELD drafts.
 3. Each clip posts a Slack approval card to the approver (U06EPUUCL13).
@@ -21,7 +22,30 @@ Run command: `python -m agent podcast-auto`
    Until then, Approve = green-lit, not posted.
 
 No file labeling needed. Echo pulls the newest video by created time, so just
-drop the episode in the folder.
+get the episode into the folder.
+
+## Riverside reality (read this — it shapes the folder setup)
+
+Riverside does NOT have automatic/scheduled export to Google Drive. It is manual,
+one click per export (Exports -> Share -> Drive). Two hard constraints:
+
+- You CANNOT choose the destination folder. Every Drive export lands in a single
+  folder named `Riverside` that Riverside auto-creates in My Drive.
+- It exports rendered exports (finished episode/clips), not raw recordings.
+
+Because of this, point Echo at that forced `Riverside` folder rather than a folder
+you make yourself:
+  1. Do one export to Drive to make the `Riverside` folder appear.
+  2. Copy that folder's ID from its URL.
+  3. Set `AGENT_PODCAST_DRIVE_FOLDER_ID` to the `Riverside` folder ID.
+  4. Share the `Riverside` folder with the service account (Viewer).
+
+GOTCHA: Echo grabs the NEWEST video in the folder. Everything you export from
+Riverside piles into that one folder, so export ONLY the full episode to Drive
+(or export it last), or Echo may grab a clip instead of the episode.
+
+Truly zero-click is only possible with a third-party automation (Zapier/Make)
+watching the `Riverside` folder. Riverside itself can't do it. Optional add-on.
 
 Headless note: the cron cannot use Higgsfield (interactive auth), so auto reels
 get the animated intro card + word-highlight captions + Treatment B side panels
@@ -32,10 +56,12 @@ get the animated intro card + word-highlight captions + Treatment B side panels
 ## One-time setup
 
 ### 1. Google Drive folder
-- Create a folder (any name, e.g. `LASSO Podcast Episodes`).
+- Do NOT hand-make a folder for this. Use the `Riverside` folder Riverside creates
+  in My Drive the first time you export to Drive (you cannot change Riverside's
+  destination). See "Riverside reality" above.
 - Folder ID = the chunk after `/folders/` in the URL:
   `drive.google.com/drive/folders/`**`<FOLDER_ID>`**
-- Point Riverside's auto-export / Drive integration at this folder.
+- Share that `Riverside` folder with the service account (Viewer).
 
 ### 2. Google Cloud service account (headless credential)
 - Console: https://console.cloud.google.com/apis/credentials (project `lasso-echo`).
