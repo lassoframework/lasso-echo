@@ -10,6 +10,23 @@ Last updated: 2026-07-20
 
 ---
 
+## Video editor A+ finish (Phase 1-3) (2026-07-20)
+
+Phases layered on the v1 A-build, all behind flags default OFF.
+- Phase 1 (AGENT_VIDEO_POLISH + AGENT_VIDEO_JUMPCUTS, ffmpeg, $0):
+  caption pop-motion (active word 118->100% + fade), b-roll cross-dissolves,
+  host color grade (eq), jump-cut pacing (removes inter-word dead air with
+  time-map remapping of overlay offsets + caption transcript so A/V stays in
+  sync), hook + end CTA title cards (Anton, grounded hook text, _concat_av
+  normalizes streams). Host punch-in DEFERRED (zoompan desync).
+- Phase 2: AGENT_VIDEO_BROLL_RESOLUTION (1080p) + AGENT_VIDEO_STILL_RESOLUTION
+  (2k, same cost) + house-style card prompt.
+- Phase 3: AGENT_VIDEO_HERO_MODEL (e.g. veo3_1) for the hero beat.
+- 3 sample reels re-rendered at A+ (Veo 3.1 hero on Reel A, 2k still cards,
+  full Phase 1 finish) and sent to #echoclaude held for approval. Suite 1511.
+- Deep-dive doc: editing/Higgsfield/Gemini levers with preflighted costs
+  (image 2cr, kling turbo 1080p 10cr, Veo 3.1 22cr).
+
 ## Video editor v1 A-build (Minimal Broadcast + Word Highlight + routing) (2026-07-20)
 
 v1 layered on the video editor. Independent re-audit (2 fresh agents): parity
