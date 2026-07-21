@@ -369,8 +369,6 @@ def handle_portal_intake(token, body, r2=None, now=None):
         return 400, {"error": "the intake is empty"}
 
     r2 = r2 or _default_r2()
-    if r2 is None:
-        return 503, {"error": "storage unavailable"}
 
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     payload = {
@@ -382,16 +380,28 @@ def handle_portal_intake(token, body, r2=None, now=None):
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "timestamp": stamp,
     }
-    r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
-                 json.dumps(payload).encode("utf-8"),
-                 content_type="application/json")
+    if r2 is not None:
+        r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
+                     json.dumps(payload).encode("utf-8"),
+                     content_type="application/json")
+    else:
+        # R2 not yet configured — log the payload locally so nothing is lost.
+        import logging
+        logging.getLogger(__name__).warning(
+            "R2 unavailable; intake payload not archived: client=%s stamp=%s answers_keys=%s",
+            client, stamp, list(answers.keys()),
+        )
+
     base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip().rstrip("/")
-    return 200, {
+    upload_url = (f"{base}/u/{token}" if base and not base.startswith("<") else None)
+    resp = {
         "status": "received",
         "account_key": client,
         "pending_source_count": _count_source_facts(answers),
-        "upload_url": f"{base}/u/{token}" if base else f"/u/{token}",
     }
+    if upload_url:
+        resp["upload_url"] = upload_url
+    return 200, resp
 
 
 def handle_portal_gym_status(account_key, r2=None):
@@ -502,11 +512,18 @@ def _default_r2():
     secret = os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
     if not key_id or not secret or not config.S3_BUCKET:
         return None
-    import boto3  # lazy
-    s3 = boto3.client("s3", endpoint_url=config.S3_ENDPOINT or None,
-                      region_name=config.S3_REGION or None,
-                      aws_access_key_id=key_id, aws_secret_access_key=secret)
-    return _R2(s3, config.S3_BUCKET)
+    # Placeholder values from the setup runbook (e.g. "<your-account>.r2...") are
+    # invalid boto3 endpoints and raise ValueError at client construction time.
+    # Treat any construction failure as "not configured" so intake still accepts
+    # submissions without R2 (upload link is omitted until R2 is wired up).
+    try:
+        import boto3  # lazy
+        s3 = boto3.client("s3", endpoint_url=config.S3_ENDPOINT or None,
+                          region_name=config.S3_REGION or None,
+                          aws_access_key_id=key_id, aws_secret_access_key=secret)
+        return _R2(s3, config.S3_BUCKET)
+    except Exception:
+        return None
 
 
 # ---- the tiny mobile-first page + stdlib HTTP layer ----------------------------
