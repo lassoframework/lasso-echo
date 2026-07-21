@@ -611,6 +611,31 @@ def test_intro_ass_animated_one_red_word_no_dash():
         os.unlink(ass)
 
 
+def test_one_red_word_even_when_word_repeats():
+    """Exactly ONE red word even if the picked word appears twice (audit fix)."""
+    import tempfile as _tf
+    # intro: 'ROLES' appears twice
+    with _tf.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as f:
+        ass = f.name
+    try:
+        ve._make_intro_ass(ass, 1080, 1920, 2.6, "SALES",
+                           "ROLES ASSIGN ROLES DAILY", "ROLES", "")
+        assert open(ass).read().count("&H002A2AFF&") == 1
+    finally:
+        os.unlink(ass)
+    # side panel: same guard
+    with _tf.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as f:
+        ass2 = f.name
+    try:
+        ve._make_side_panel_ass(
+            [{"start": 1.0, "end": 4.0, "eyebrow": "X",
+              "headline": "REPS BUILD REPS FAST", "red_word": "REPS"}],
+            1080, 1920, ass2)
+        assert open(ass2).read().count("&H002A2AFF&") == 1
+    finally:
+        os.unlink(ass2)
+
+
 @pytestmark_ff
 def test_intro_card_renders_full_screen_with_audio(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")

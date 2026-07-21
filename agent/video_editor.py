@@ -1142,14 +1142,16 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
     # headline builds line-by-line; the line with the red word pops (scale)
     hl_lines = _wrap_headline(head, 12)
     line_h = int(head_fs * 1.02)
+    red_used = False   # color ONLY the first occurrence -> exactly one red word
     for i, ln in enumerate(hl_lines):
         y = head_y + i * line_h
         start = 0.5 + i * 0.22
         words = []
         has_red = False
         for w in ln.split():
-            if red and w == red:
+            if red and w == red and not red_used:
                 has_red = True
+                red_used = True
                 words.append(f"{{\\c&H00{_WH_ACTIVE_BGR}&}}{w}{{\\c&H00{_WH_WHITE_BGR}&}}")
             else:
                 words.append(w)
@@ -1344,13 +1346,15 @@ def _make_side_panel_ass(specs, width, height, ass_path):
             f"Dialogue: 0,{ts(s)},{ts(e)},SPHead,,0,0,0,,"
             f"{{\\pos({left},{rule_y})\\an7\\fad(220,180)\\1c&H0000FF&\\p1}}"
             f"m 0 0 l {rw} 0 l {rw} 6 l 0 6{{\\p0}}")
-        # headline: one red word, wrapped, slide up + fade in
+        # headline: EXACTLY one red word (first occurrence only), wrapped
         hl_lines = _wrap_headline(head, 13)
         parts = []
+        red_used = False
         for ln in hl_lines:
             words = []
             for w in ln.split():
-                if red and w == red:
+                if red and w == red and not red_used:
+                    red_used = True
                     words.append(f"{{\\c&H00{_WH_ACTIVE_BGR}&}}{w}{{\\c&H00{_WH_WHITE_BGR}&}}")
                 else:
                     words.append(w)
