@@ -58,23 +58,57 @@ def _scheduler_state_path():
                         _SCHEDULER_STATE_FILE)
 
 
+def _read_state():
+    """The persisted scheduler-state dict, or {} when /data is unavailable."""
+    try:
+        with open(_scheduler_state_path(), encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except Exception:
+        return {}
+
+
+def _write_state(d):
+    """Best-effort persist of the whole scheduler-state dict; a missing /data
+    never breaks the scheduler."""
+    try:
+        with open(_scheduler_state_path(), "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+    except Exception as e:
+        print(f"[scheduler] could not persist state: {type(e).__name__}: {e}")
+
+
 def _read_last_run_date():
     """The persisted last fire date, or None when /data is unavailable or empty
     (in-memory tracking then carries the day, exactly the old behavior)."""
-    try:
-        with open(_scheduler_state_path(), encoding="utf-8") as fh:
-            return (json.load(fh) or {}).get("last_run_date")
-    except Exception:
-        return None
+    return _read_state().get("last_run_date")
 
 
 def _write_last_run_date(day):
-    """Best-effort persist; a missing /data never breaks the scheduler."""
-    try:
-        with open(_scheduler_state_path(), "w", encoding="utf-8") as fh:
-            json.dump({"last_run_date": day}, fh)
-    except Exception as e:
-        print(f"[scheduler] could not persist last run date: {type(e).__name__}: {e}")
+    """Best-effort persist; a missing /data never breaks the scheduler. Merges so
+    sibling markers (e.g. the weekly podcast-auto date) are not clobbered."""
+    d = _read_state()
+    d["last_run_date"] = day
+    _write_state(d)
+
+
+def _read_podcast_auto_date():
+    """The persisted date the weekly podcast auto-ingest last fired, or None."""
+    return _read_state().get("podcast_auto_last_date")
+
+
+def _write_podcast_auto_date(day):
+    d = _read_state()
+    d["podcast_auto_last_date"] = day
+    _write_state(d)
+
+
+def _podcast_auto_due(now, last_date, target_hour):
+    """True when the weekly Drive->edit->schedule auto-ingest should fire: Monday,
+    at/after the target hour (UTC), and not already fired today. Pure + testable;
+    the AGENT_PODCAST_AUTO_ENABLED gate is checked by the caller."""
+    return (now.weekday() == 0                       # Monday
+            and now.hour >= target_hour
+            and last_date != now.date().isoformat())
 
 
 def _fire_daily(store, today, run=run_daily):
@@ -188,6 +222,8 @@ def _print_scheduled_lanes():
         ("podcast feed", config.podcast_enabled(), "AGENT_PODCAST_ENABLED"),
         ("episode inbox", config.episode_inbox_enabled(),
          "AGENT_EPISODE_INBOX_ENABLED"),
+        ("podcast auto-ingest (Mon)", config.podcast_auto_enabled(),
+         "AGENT_PODCAST_AUTO_ENABLED"),
         ("reporting snapshot", config.reporting_enabled(),
          "AGENT_REPORTING_ENABLED"),
         ("evening digest", config.digest_enabled(), "AGENT_DIGEST_ENABLED"),
@@ -215,6 +251,7 @@ def _daily_scheduler(store):
     podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
     inbox_every = config.episode_inbox_poll_minutes() * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
+    last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
     last_opus = 0.0
     last_podcast = 0.0
@@ -297,6 +334,24 @@ def _daily_scheduler(store):
                 episode_inbox.check_monday_nudge(now=now)
             except Exception as e:
                 print(f"[inbox] nudge check failed: {type(e).__name__}: {e}")
+        # Weekly podcast auto-ingest: Monday at/after the target hour, pull the
+        # newest episode from the Drive folder, edit it, and schedule the week as
+        # HELD drafts. Runs INSIDE this listener (the one process with /data + R2
+        # + the store the Approve buttons read), NOT a separate Railway service
+        # (a Railway volume attaches to a single service, so a second service
+        # cannot see /data/echo.db). Dormant unless AGENT_PODCAST_AUTO_ENABLED.
+        # Errors alert (inside run), never crash the loop.
+        if config.podcast_auto_enabled() and _podcast_auto_due(
+                now, last_pcast_auto, target_hour):
+            last_pcast_auto = today
+            _write_podcast_auto_date(today)
+            try:
+                from . import podcast_auto
+                podcast_auto.run(today=now.date())
+            except Exception as e:
+                print(f"[podcast-auto] weekly run failed: {type(e).__name__}: {e}")
+                ops_alerts.alert(
+                    f"podcast auto-ingest failed: {type(e).__name__}: {e}")
         # Card self-expiry sweep (no flag, queue hygiene): hourly, cheap.
         if now.minute == 0:
             try:

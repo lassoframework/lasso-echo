@@ -44,6 +44,15 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
 
     acct = account_key or config.podcast_account_key()
 
+    # Default the R2 client so the approval card gets a hosted video URL when the
+    # daemon calls run() with no args (mirrors episode_inbox.poll()). A missing
+    # client is non-fatal: the draft still saves, just without a preview URL.
+    if client is None:
+        try:
+            client = media_host._default_client()
+        except Exception:
+            client = None
+
     # 1. get the newest episode (Drive pull, headless) unless one was passed in
     if source is None:
         from . import podcast_source

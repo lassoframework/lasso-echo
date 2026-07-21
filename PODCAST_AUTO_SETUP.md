@@ -4,7 +4,26 @@ Echo pulls the newest podcast episode from a Google Drive folder every Monday,
 edits it headless, and drops the week's clips into Slack as HELD approval cards.
 Nothing publishes. Everything is behind `AGENT_PODCAST_AUTO_ENABLED` (default OFF).
 
-Run command: `python -m agent podcast-auto`
+## ARCHITECTURE (read this first — do NOT make a separate Railway service)
+
+The Monday run happens INSIDE the main Echo listener service's scheduler (the same
+loop that runs the episode inbox, opus poll, etc.). It is NOT a separate Railway
+cron service.
+
+Why: a Railway volume attaches to exactly ONE service. The drafts live in
+`/data/echo.db` on the main service's volume, and the Slack Approve button is
+handled by that same service. A second service cannot mount that volume, so a
+separate cron service writes to a different (empty) database and Approve says
+"not found" — plus, pointed at the repo, it boots a SECOND full Echo daemon
+(duplicate Slack listener). So the schedule lives in-process on the main service.
+
+To arm it: set the env vars below ON THE MAIN ECHO SERVICE and set
+`AGENT_PODCAST_AUTO_ENABLED=true`. The scheduler fires it every Monday at
+`AGENT_DAILY_HOUR_UTC` (default 14:00 UTC, ~10am ET). No cron service, no cron
+schedule string.
+
+Manual one-off (for testing) still works from the main service shell:
+`python -m agent podcast-auto`
 
 ---
 
@@ -88,27 +107,35 @@ Plus the same vars the editor + listener already use: `AGENT_DB_PATH=/data/echo.
 (shared volume, so drafts land where Approve can find them), Slack token, R2/S3
 media host creds, Anthropic + Deepgram keys.
 
-### 4. Railway cron service
-The main Echo service runs the Slack listener 24/7 — do not change its command.
-Add the cron as its OWN service in the same project:
-- + New -> GitHub Repo -> `lassoframework/lasso-echo` (same repo).
-- Settings:
-  - Custom Start Command: `python -m agent podcast-auto`
-  - Cron Schedule: `0 13 * * 1`  (Mondays ~9am ET; Railway crons run in UTC)
-- Variables: reference-copy all vars from the main service, plus the podcast ones.
-  Point it at the same `AGENT_DB_PATH=/data/echo.db`.
+### 4. No separate service — arm it on the MAIN service
+Do NOT create a second Railway service (see ARCHITECTURE above). Instead, on the
+existing main Echo listener service:
+- Set `AGENT_PODCAST_AUTO_ENABLED=true` plus the podcast vars in the table above.
+- The in-process scheduler fires it every Monday at `AGENT_DAILY_HOUR_UTC`
+  (default 14:00 UTC). Adjust that env var if you want a different Monday hour.
+- Turn OFF the legacy R2 episode inbox: `AGENT_EPISODE_INBOX_ENABLED=false`. It
+  overlaps with this job (both ingest `lasso_episodes`) and, left on, double-
+  processes the staged file and spams "processing failed" alerts.
+- If you created a separate "echo podcast" cron service already, DELETE it — it
+  can't see the volume and runs a duplicate daemon.
 
 ---
 
 ## First test (do this once, do not wait for Monday)
-- In Railway, trigger the cron service by hand (Run now / redeploy once).
-- It runs the full pipeline on the newest Drive episode and posts real cards.
+- From the MAIN Echo service shell (Railway: service -> ... -> Shell, or
+  `railway ssh` into it), run: `python -m agent podcast-auto`
+- It runs the full pipeline on the newest Drive episode and posts real cards to
+  the store the Approve button reads.
 - Approve one and confirm the card flips to "Approved" (proves the store fix).
 - It will NOT publish (publish gate still OFF by design).
 
 ## Gotchas
-- Env vars alone do NOT trigger the job. The cron service is what runs it.
+- Set the vars on the MAIN service. A separate service can't see `/data/echo.db`.
+- Turn the legacy episode inbox OFF (`AGENT_EPISODE_INBOX_ENABLED=false`) or it
+  double-processes and spams alerts.
 - Code must be deployed. If `podcast-auto` errors as unknown, the remote is behind
   — push `main`.
 - If the job logs a `PodcastSourceError`, read it: it names the exact missing
   piece (folder id, key, folder not shared, or Drive API not enabled).
+- Transcription: set `AGENT_TRANSCRIBE_API_KEY` (Deepgram) or the run falls back
+  to local Whisper, which is very slow on a CPU box (many minutes per episode).

@@ -51,3 +51,17 @@ def test_run_spreads_clips_across_week_as_held(monkeypatch, tmp_path):
     days = [s["day"] for s in out["scheduled"]]
     assert days == ["2026-07-21", "2026-07-22"]
     assert all("18:30" in s["scheduled_for"] for s in out["scheduled"])
+
+
+def test_podcast_auto_due_monday_only():
+    """Weekly trigger fires Monday at/after target hour, once per day."""
+    from agent import listener
+    from datetime import datetime, timezone
+    mon = datetime(2026, 7, 20, 14, 0, tzinfo=timezone.utc)   # Monday 14:00
+    tue = datetime(2026, 7, 21, 14, 0, tzinfo=timezone.utc)   # Tuesday
+    mon_early = datetime(2026, 7, 20, 9, 0, tzinfo=timezone.utc)
+    assert listener._podcast_auto_due(mon, None, 14) is True
+    assert listener._podcast_auto_due(tue, None, 14) is False        # not Monday
+    assert listener._podcast_auto_due(mon_early, None, 14) is False   # before hour
+    # already fired today -> not due again
+    assert listener._podcast_auto_due(mon, "2026-07-20", 14) is False
