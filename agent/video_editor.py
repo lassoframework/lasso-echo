@@ -1104,7 +1104,7 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
                   aspect="9:16", captioned=True):
     """
     Assemble one finished clip (house standard):
-      cut -> frame(aspect) -> [A+ host punch-in + grade] -> composite overlays ->
+      cut -> frame(aspect) -> [jump-cut pacing] -> [A+ host grade] -> overlays ->
       [Word Highlight captions] -> Minimal Broadcast bottom treatment.
     Real host footage is the spine; overlays are cutaways only, never AI-altering
     the host. captioned=False produces the caption-FREE ad cut from the same

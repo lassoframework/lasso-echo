@@ -1071,8 +1071,8 @@ def video_cost_per_still() -> float:
 # All OFF by default; the base look is unchanged unless armed by hand.
 
 def video_polish_enabled() -> bool:
-    """A+ finish pass: caption pop-motion, b-roll cross-dissolves, host punch-in,
-    color grade, hook + CTA cards. OFF by default. Set AGENT_VIDEO_POLISH=true.
+    """A+ finish pass: caption pop-motion, b-roll cross-dissolves, host color
+    grade, hook + CTA cards. OFF by default. Set AGENT_VIDEO_POLISH=true.
     Pure ffmpeg finish — no extra credits, no external calls."""
     return _truthy(os.environ.get("AGENT_VIDEO_POLISH", "false"))
 

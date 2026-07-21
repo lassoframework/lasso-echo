@@ -514,6 +514,53 @@ def test_ad_cut_differs_from_captioned(monkeypatch, tmp_path):
 
 
 @pytestmark_ff
+def test_polish_and_jumpcuts_end_to_end(monkeypatch, tmp_path):
+    """Full polish=ON + jumpcuts=ON assemble path: bookended, correct dims, synced."""
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    monkeypatch.setenv("AGENT_VIDEO_POLISH", "true")
+    monkeypatch.setenv("AGENT_VIDEO_JUMPCUTS", "true")
+    src = str(tmp_path / "src.mp4")
+    _make_src(src, duration=12)
+    # words 0-4, a 3s dead-air gap, then 7-10 -> jumpcuts should fire
+    tr = {"words": (
+        [{"word": w, "start": 0.5 * i, "end": 0.5 * i + 0.4} for i, w in
+         enumerate(["most", "gyms", "ignore", "the", "follow", "up", "calls"])]
+        + [{"word": w, "start": 7.0 + 0.5 * i, "end": 7.0 + 0.5 * i + 0.4}
+           for i, w in enumerate(["speed", "to", "lead", "wins", "members"])]
+    ), "segments": []}
+    m = _moment(0, 10, hook="most gyms ignore follow up")
+    p = ve.assemble_clip(m, src, tr, [], str(tmp_path / "out"), "clip",
+                         aspect="9:16", captioned=True)
+    assert os.path.isfile(p)
+    assert p.endswith("_final.mp4")            # bookended
+    assert _probe_dims(p) == (1080, 1920)
+    # video and audio durations stay within 0.3s of each other (in sync)
+    import subprocess as _sp
+    r = _sp.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_streams", p], capture_output=True, text=True)
+    durs = [float(s["duration"]) for s in json.loads(r.stdout)["streams"]
+            if "duration" in s]
+    assert max(durs) - min(durs) < 0.3
+
+
+@pytestmark_ff
+def test_concat_av_joins_mixed_inputs(tmp_path):
+    """_concat_av normalizes and joins clips with different fps/audio (bookend fix)."""
+    a = str(tmp_path / "a.mp4")
+    b = str(tmp_path / "b.mp4")
+    _make_src(a, duration=2)
+    _make_src(b, duration=3)
+    out = str(tmp_path / "joined.mp4")
+    ve._concat_av([a, b], out, 1080, 1920)
+    assert os.path.isfile(out)
+    assert _probe_dims(out) == (1080, 1920)
+    import subprocess as _sp
+    r = _sp.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", out], capture_output=True, text=True)
+    assert float(r.stdout.strip()) > 4.0   # ~5s joined
+
+
+@pytestmark_ff
 def test_assemble_composites_overlay(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
     src = str(tmp_path / "src.mp4")
