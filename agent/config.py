@@ -1137,10 +1137,19 @@ def gdrive_service_account_json() -> str:
     return os.environ.get("AGENT_GDRIVE_SA_JSON", "")
 
 
+def podcast_account_keys() -> list:
+    """Accounts the auto-scheduled podcast clips cross-post to. Env
+    AGENT_PODCAST_ACCOUNT_KEY is comma-separated (e.g. 'lasso_ig,lasso_fb') so one
+    clip drafts to every listed account. Default: [episode-inbox tenant]."""
+    raw = os.environ.get("AGENT_PODCAST_ACCOUNT_KEY", "").strip()
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    return keys or [episode_inbox_tenant()]
+
+
 def podcast_account_key() -> str:
-    """Account the auto-scheduled podcast clips post under. Env
-    AGENT_PODCAST_ACCOUNT_KEY, default the episode-inbox tenant."""
-    return os.environ.get("AGENT_PODCAST_ACCOUNT_KEY", episode_inbox_tenant())
+    """First account the auto-scheduled podcast clips post under (back-compat).
+    See podcast_account_keys() for the full cross-post list."""
+    return podcast_account_keys()[0]
 
 
 def podcast_auto_max_clips() -> int:

@@ -42,7 +42,9 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
 
     from . import video_editor, media_host, clipper
 
-    acct = account_key or config.podcast_account_key()
+    # Accounts the clips cross-post to (e.g. lasso_ig + lasso_fb). One clip drafts
+    # a card per account so each platform gets its own approval + publish.
+    accts = [account_key] if account_key else config.podcast_account_keys()
 
     # Default the R2 client so the approval card gets a hosted video URL when the
     # daemon calls run() with no args (mirrors episode_inbox.poll()). A missing
@@ -63,7 +65,7 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
     # 2. edit the episode (headless treatment; motion b-roll skipped without MCP)
     result = video_editor.edit_episode(source, render=render, client=client,
                                        transcriber=transcriber, llm=llm,
-                                       account_key=acct)
+                                       account_key=accts[0])
     if not result:
         print("podcast-auto: editor returned nothing (flag off or no clips).",
               flush=True)
@@ -89,24 +91,29 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
             print(f"podcast-auto: no rendered file for [{m.start_ts:.0f}], skipping",
                   flush=True)
             continue
-        url = ""
-        if client:
-            try:
-                url = media_host.host_media(primary, acct, client=client) or ""
-            except Exception as exc:
-                print(f"podcast-auto: host failed: {exc}", flush=True)
         sched = schedule.scheduled_for(day)
-        try:
-            d = clipper.save_clip_draft(m, primary, url, acct,
-                                        scheduled_for=sched, episode_title=ep_title,
-                                        poster=poster)
-            scheduled.append({"draft_id": getattr(d, "draft_id", ""),
-                              "day": day, "scheduled_for": sched,
-                              "hook": getattr(m, "hook", "")})
-            print(f"podcast-auto: scheduled {day} {schedule.weekday_abbr(day)} "
-                  f"-> draft {getattr(d, 'draft_id', '?')} (held)", flush=True)
-        except Exception as exc:
-            print(f"podcast-auto: draft failed [{m.start_ts:.0f}]: {exc}", flush=True)
+        # Cross-post: one held card per account (IG, FB, ...) for this clip+day.
+        for acct in accts:
+            url = ""
+            if client:
+                try:
+                    url = media_host.host_media(primary, acct, client=client) or ""
+                except Exception as exc:
+                    print(f"podcast-auto: host failed ({acct}): {exc}", flush=True)
+            try:
+                d = clipper.save_clip_draft(m, primary, url, acct,
+                                            scheduled_for=sched, episode_title=ep_title,
+                                            poster=poster)
+                scheduled.append({"draft_id": getattr(d, "draft_id", ""),
+                                  "account": acct,
+                                  "day": day, "scheduled_for": sched,
+                                  "hook": getattr(m, "hook", "")})
+                print(f"podcast-auto: scheduled {day} {schedule.weekday_abbr(day)} "
+                      f"{acct} -> draft {getattr(d, 'draft_id', '?')} (held)",
+                      flush=True)
+            except Exception as exc:
+                print(f"podcast-auto: draft failed [{m.start_ts:.0f}] {acct}: {exc}",
+                      flush=True)
 
     print(f"podcast-auto: {len(scheduled)} clip(s) scheduled across the week, "
           f"all HELD for approval. Nothing published.", flush=True)

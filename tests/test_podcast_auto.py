@@ -53,6 +53,27 @@ def test_run_spreads_clips_across_week_as_held(monkeypatch, tmp_path):
     assert all("18:30" in s["scheduled_for"] for s in out["scheduled"])
 
 
+def test_run_crossposts_to_every_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
+    monkeypatch.setenv("AGENT_PODCAST_ACCOUNT_KEY", "lasso_ig,lasso_fb")
+    monkeypatch.setattr(config, "POSTING_SKIP_DAYS", [])
+    f1 = str(tmp_path / "a.mp4"); open(f1, "wb").write(b"x")
+    m1 = Moment(start_ts=10, end_ts=40, duration=30, hook="one", rationale="r",
+                bucket="sales", score=80, transcript_text="t")
+    from agent import video_editor, clipper
+    monkeypatch.setattr(video_editor, "edit_episode", lambda *a, **k: {
+        "staged": {"r2_key": "ep99.mp4"},
+        "clips": [{"moment": m1, "files": {"9:16_cap": f1}}]})
+    monkeypatch.setattr(clipper, "save_clip_draft",
+                        lambda m, p, u, a, **k: type("D", (), {
+                            "draft_id": f"d_{a}"})())
+    out = podcast_auto.run(source="ep.mp4", today=datetime.date(2026, 7, 21))
+    # one clip -> one card per account (cross-post)
+    accts = sorted(s["account"] for s in out["scheduled"])
+    assert accts == ["lasso_fb", "lasso_ig"]
+    assert all(s["day"] == "2026-07-21" for s in out["scheduled"])
+
+
 def test_podcast_auto_due_monday_only():
     """Weekly trigger fires Monday at/after target hour, once per day."""
     from agent import listener
