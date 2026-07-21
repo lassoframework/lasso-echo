@@ -10,3 +10,5 @@ cryptography>=42.0  # GHL webhook Ed25519 signature verify; imported lazily in g
 faster-whisper>=1.0  # Clipper transcription; imported lazily in clipper.py
 anthropic>=0.40  # Clipper moment scoring; imported lazily in clipper.py
 opencv-python-headless>=4.10,<5  # Video editor caption face-avoidance; imported lazily in video_assets.py (optional, graceful fallback)
+google-api-python-client>=2.100  # Podcast auto-ingest Drive pull; imported lazily in podcast_source.py
+google-auth>=2.30  # Service-account creds for the Drive pull; imported lazily in podcast_source.py

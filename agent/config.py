@@ -1116,6 +1116,42 @@ def video_still_resolution() -> str:
     return r if r in ("1k", "2k", "4k") else "2k"
 
 
+def podcast_auto_enabled() -> bool:
+    """Deployed Monday auto-ingest: pull the newest episode from the Drive folder,
+    edit it, and schedule the week as HELD drafts. OFF by default. Set
+    AGENT_PODCAST_AUTO_ENABLED=true on Railway to arm. Nothing publishes."""
+    return _truthy(os.environ.get("AGENT_PODCAST_AUTO_ENABLED", "false"))
+
+
+def podcast_drive_folder_id() -> str:
+    """Google Drive folder id that Riverside auto-exports episodes into; the auto
+    job pulls the newest video from here. Env AGENT_PODCAST_DRIVE_FOLDER_ID."""
+    return os.environ.get("AGENT_PODCAST_DRIVE_FOLDER_ID", "")
+
+
+def gdrive_service_account_json() -> str:
+    """Path to (or inline JSON of) a Google service-account key with read access to
+    the podcast Drive folder, for HEADLESS pulls on Railway (the claude.ai Drive
+    connector is interactive-only and unavailable in cron). Env
+    AGENT_GDRIVE_SA_JSON."""
+    return os.environ.get("AGENT_GDRIVE_SA_JSON", "")
+
+
+def podcast_account_key() -> str:
+    """Account the auto-scheduled podcast clips post under. Env
+    AGENT_PODCAST_ACCOUNT_KEY, default the episode-inbox tenant."""
+    return os.environ.get("AGENT_PODCAST_ACCOUNT_KEY", episode_inbox_tenant())
+
+
+def podcast_auto_max_clips() -> int:
+    """Max clips the auto job schedules per episode. Env
+    AGENT_PODCAST_AUTO_MAX_CLIPS, default 5."""
+    try:
+        return max(1, int(os.environ.get("AGENT_PODCAST_AUTO_MAX_CLIPS", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
 def video_hero_model() -> str:
     """Optional top-tier model for the single highest-score (hero) beat per reel,
     e.g. 'veo3_1' (~22 cr). Empty = every motion beat uses the standard model.

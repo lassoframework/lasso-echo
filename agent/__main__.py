@@ -151,6 +151,7 @@ def _status():
     print(f"  video_stills   : {config.video_stills_enabled()}  (env AGENT_VIDEO_STILLS_ENABLED)")
     print(f"  video_polish   : {config.video_polish_enabled()}  (env AGENT_VIDEO_POLISH)")
     print(f"  video_jumpcuts : {config.video_jumpcuts_enabled()}  (env AGENT_VIDEO_JUMPCUTS)")
+    print(f"  podcast_auto   : {config.podcast_auto_enabled()}  (env AGENT_PODCAST_AUTO_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
@@ -740,6 +741,7 @@ _COMMANDS = {
          "Opus clip factory"),
         ("clip-episode", "score one episode's clip moments"),
         ("video-episode", "full video editor: b-roll overlays, captions, 9:16 + 1:1"),
+        ("podcast-auto", "deployed Monday job: pull newest Drive episode, edit, schedule the week (held)"),
         ("inbox-status", "episode inbox state"),
         ("episode-upload", "upload a Riverside episode export to the episode inbox"),
     ],
@@ -1657,6 +1659,35 @@ def main(argv=None):
         # Higgsfield cost. Overlays render only when armed; nothing publishes.
         from .video_editor import video_episode_cli
         video_episode_cli(argv[1:])
+    elif cmd == "podcast-auto":
+        # Deployed Monday auto-ingest (AGENT_PODCAST_AUTO_ENABLED): pull the newest
+        # episode from the Google Drive folder, edit it, and schedule the week as
+        # HELD drafts in this environment's store (run on Railway so the Slack
+        # listener + publisher see the drafts). Nothing publishes.
+        from . import podcast_auto, media_host
+        import os as _os
+        client = None
+        kid = _os.environ.get(config.S3_ACCESS_KEY_ID_ENV)
+        sec = _os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
+        if kid and sec and config.S3_BUCKET:
+            try:
+                import boto3
+                from botocore.config import Config as _BC
+                s3 = boto3.client("s3", endpoint_url=config.S3_ENDPOINT or None,
+                    region_name=config.S3_REGION or None, aws_access_key_id=kid,
+                    aws_secret_access_key=sec,
+                    config=_BC(retries={"max_attempts": 2, "mode": "standard"}))
+                client = media_host._S3Client(s3, config.S3_BUCKET)
+            except Exception:
+                pass
+        poster = None
+        tok = _os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
+        ch = _os.environ.get("AGENT_SLACK_CHANNEL_ID", "")
+        if tok and ch:
+            from .slack_surface import SlackPoster
+            poster = SlackPoster(token=tok, channel=ch)
+        src = argv[2] if len(argv) > 2 and argv[1] == "--source" else None
+        podcast_auto.run(source=src, client=client, poster=poster)
     elif cmd == "opus-organize":
         # Add each pinned project's finished clips to one target collection so the
         # factory scan (collections only) can read them (AGENT_OPUS_FACTORY_ENABLED).
