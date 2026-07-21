@@ -41,6 +41,8 @@ from . import video_assets
 # ---- Minimal Broadcast bottom treatment (house standard) --------------------
 # navy scrim color (LASSO V3 navy), semi-transparent gradient for legibility
 _SCRIM_NAVY = (18, 30, 60)      # #121E3C
+_SCRIM_NAVY_HEXSTR = "121E3C"   # ffmpeg 0x color for the navy fields
+_BRAND_RED_HEX = "FF0000"       # LASSO V3 house-style red
 _SCRIM_MAX_ALPHA = 150          # bottom of the gradient
 _HANDLE_TEXT = "@GYMMARKETINGMADESIMPLE"
 # logo (LASSO wordmark) sized by frame WIDTH; other insets by HEIGHT
@@ -684,14 +686,28 @@ def _composite_overlays(video_path, overlays, output_path, width, height, work_d
     for pr in prepared:
         inputs += ["-i", pr["path"]]
 
+    # A+ finish: cross-dissolve each cutaway in/out instead of a hard cut.
+    dissolve = config.video_polish_enabled()
+    fd = 0.25  # dissolve duration (seconds)
+
     filter_parts = []
     current = "0:v"
     for i, pr in enumerate(prepared):
         idx = i + 1
         off = float(pr["offset"])
+        dur = float(overlays[i]["duration"])
         shifted = f"s{i}"
         out_label = f"o{i}"
-        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{off:.3f}/TB[{shifted}]")
+        if dissolve:
+            fout = max(0.0, dur - fd)
+            filter_parts.append(
+                f"[{idx}:v]format=yuva420p,"
+                f"fade=t=in:st=0:d={fd}:alpha=1,"
+                f"fade=t=out:st={fout:.3f}:d={fd}:alpha=1,"
+                f"setpts=PTS-STARTPTS+{off:.3f}/TB[{shifted}]")
+        else:
+            filter_parts.append(
+                f"[{idx}:v]setpts=PTS-STARTPTS+{off:.3f}/TB[{shifted}]")
         filter_parts.append(
             f"[{current}][{shifted}]overlay=x=0:y=0:eof_action=pass[{out_label}]")
         current = out_label
@@ -790,11 +806,14 @@ def _caption_margin_v(height, face_bottom_frac=None):
 
 
 def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
-                             width, height, margin_v):
+                             width, height, margin_v, motion=False):
     """Word Highlight ASS: Anton ALL CAPS, groups of _WH_WORDS_PER_GROUP, the ONE
     active (currently spoken) word in brand RED, the rest white, heavy outline +
     shadow. One event per word so exactly one line is visible (no ghost/duplicate).
-    Fabrication-safe: only words within the segment; dashes/vendor scrubbed."""
+    Fabrication-safe: only words within the segment; dashes/vendor scrubbed.
+    motion=True adds an A+ pop: the active word scales in from ~118% to 100% and
+    the line fades in fast (ASS \\t transform + \\fad); colour tags are unchanged
+    so the one-red-word invariant holds."""
     start_ts = float(start_ts)
     end_ts = float(end_ts)
     words = [
@@ -835,12 +854,19 @@ def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
                 if not text:
                     continue
                 color = _WH_ACTIVE_BGR if ci == word_idx else _WH_WHITE_BGR
-                parts.append(f"{{\\c&H00{color}&}}{text}")
+                if motion and ci == word_idx:
+                    # active word pops from 118% to 100% over 90ms
+                    parts.append(
+                        f"{{\\c&H00{color}&\\fscx118\\fscy118"
+                        f"\\t(0,90,\\fscx100\\fscy100)}}{text}")
+                else:
+                    parts.append(f"{{\\c&H00{color}&\\fscx100\\fscy100}}{text}")
             if not parts:
                 continue
+            fad = "{\\fad(60,0)}" if motion else ""
             lines.append(
                 f"Dialogue: 0,{clipper_render._fmt_ass_ts(w_start)},"
-                f"{clipper_render._fmt_ass_ts(w_end)},WH,,0,0,0,,{' '.join(parts)}")
+                f"{clipper_render._fmt_ass_ts(w_end)},WH,,0,0,0,,{fad}{' '.join(parts)}")
 
     os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
     with open(ass_path, "w", encoding="utf-8") as fh:
@@ -849,18 +875,21 @@ def _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
 
 
 def burn_word_highlight(input_path, output_path, transcript, start_ts, end_ts,
-                        width, height, face_bottom_frac=None):
+                        width, height, face_bottom_frac=None, motion=None):
     """Burn Word Highlight captions (Anton, one red active word) into the video,
-    placed in the lower third below the detected face. Loads Anton via fontsdir."""
+    placed in the lower third below the detected face. Loads Anton via fontsdir.
+    motion defaults to the AGENT_VIDEO_POLISH flag (active-word pop-in)."""
     clipper_render._require_render()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     margin_v = _caption_margin_v(height, face_bottom_frac)
+    if motion is None:
+        motion = config.video_polish_enabled()
 
     with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tf:
         ass_path = tf.name
     try:
         _make_word_highlight_ass(transcript, start_ts, end_ts, ass_path,
-                                 width, height, margin_v)
+                                 width, height, margin_v, motion=motion)
         safe = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
         fonts = video_assets.FONTS_DIR.replace("\\", "/").replace(":", "\\:")
         cmd = [
@@ -879,12 +908,204 @@ def burn_word_highlight(input_path, output_path, transcript, start_ts, end_ts,
     return output_path
 
 
+def plan_keep_intervals(words_rel, clip_dur, gap, keep):
+    """Given words with clip-relative (start,end) times, return the list of
+    (a,b) intervals to KEEP after removing inter-word dead air longer than `gap`
+    (each removed gap leaves `keep` seconds of breathing room), plus a piecewise
+    time_map(orig_clip_t) -> tightened_clip_t. Speech is never cut; only silence
+    between words is compressed."""
+    words_rel = sorted(words_rel, key=lambda w: w[0])
+    intervals = []
+    seg_start = 0.0
+    prev_end = 0.0
+    for (ws, we) in words_rel:
+        if ws - prev_end > gap and prev_end > 0:
+            # close the current keep interval shortly after the last word, then
+            # resume at this word (the middle silence is dropped)
+            intervals.append((seg_start, min(prev_end + keep, ws)))
+            seg_start = ws
+        prev_end = max(prev_end, we)
+    intervals.append((seg_start, clip_dur))
+    # merge/clean
+    intervals = [(round(a, 3), round(b, 3)) for a, b in intervals if b - a > 0.02]
+
+    # cumulative kept duration before each interval, for the time map
+    cum = []
+    total = 0.0
+    for (a, b) in intervals:
+        cum.append(total)
+        total += (b - a)
+
+    def time_map(t):
+        t = float(t)
+        for i, (a, b) in enumerate(intervals):
+            if t < a:
+                return cum[i]              # inside a removed gap -> snap to next kept start
+            if a <= t <= b:
+                return cum[i] + (t - a)
+        return total
+
+    return intervals, time_map, total
+
+
+def _apply_jumpcuts(input_path, intervals, output_path):
+    """Cut input_path into the keep `intervals` and concat them into output_path
+    (re-encode). Returns output_path. No-op passthrough if a single full interval."""
+    ffmpeg = clipper_render._ffmpeg()
+    if len(intervals) <= 1:
+        shutil.copyfile(input_path, output_path)
+        return output_path
+    parts = []
+    for i, (a, b) in enumerate(intervals):
+        parts.append(f"[0:v]trim={a}:{b},setpts=PTS-STARTPTS[v{i}]")
+        parts.append(f"[0:a]atrim={a}:{b},asetpts=PTS-STARTPTS[a{i}]")
+    concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(intervals)))
+    parts.append(f"{concat_in}concat=n={len(intervals)}:v=1:a=1[v][a]")
+    cmd = [
+        ffmpeg, "-y", "-i", input_path,
+        "-filter_complex", ";".join(parts),
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    clipper_render._run(cmd, "jumpcuts")
+    return output_path
+
+
+def _remap_transcript(transcript, clip_start, clip_end, time_map):
+    """Return a NEW transcript whose words are shifted to the tightened clip
+    timeline (0-based), for caption timing. Words outside the clip are dropped."""
+    out_words = []
+    for w in transcript.get("words", []):
+        ws = float(w.get("start", 0))
+        if ws < clip_start - 0.05 or ws > clip_end + 0.05:
+            continue
+        rel_s = ws - clip_start
+        rel_e = float(w.get("end", 0)) - clip_start
+        out_words.append({"word": w.get("word", ""),
+                          "start": time_map(rel_s), "end": time_map(rel_e)})
+    return {"words": out_words, "segments": []}
+
+
+def _polish_host(input_path, output_path, width, height, duration):
+    """A+ finish on the HOST base only: a subtle unifying color grade so the
+    talking-head matches the cinematic AI b-roll (contrast + saturation + a touch
+    of gamma). Frame-safe (eq is per-pixel, preserves every frame and A/V sync).
+    Overlays are composited AFTER as full-frame cutaways, so they are unaffected.
+    Never alters the host content, only the grade."""
+    ffmpeg = clipper_render._ffmpeg()
+    vf = "eq=contrast=1.06:saturation=1.10:brightness=0.01:gamma=0.98"
+    cmd = [
+        ffmpeg, "-y", "-i", input_path, "-vf", vf,
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+        "-c:a", "copy", output_path,
+    ]
+    clipper_render._run(cmd, "polish_host")
+    return output_path
+
+
+def _wrap_text(text, width_chars=16):
+    """Word-wrap ALL-CAPS text into lines of ~width_chars for a title card."""
+    words = str(text or "").split()
+    lines, cur = [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width_chars:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines[:4]  # cap at 4 lines
+
+
+def _make_title_card(headline, subline, out_path, width, height, duration,
+                     accent=True):
+    """Branded full-frame title card (navy, Anton headline, red underline accent,
+    fade in/out, silent audio) used for the hook open and the end CTA. Text is
+    scrubbed (no dashes/vendor) before it is drawn."""
+    ffmpeg = clipper_render._ffmpeg()
+    anton = video_assets.anton_font_path().replace("\\", "\\\\").replace(":", "\\:")
+    oswald = video_assets.oswald_font_path().replace("\\", "\\\\").replace(":", "\\:")
+    head = clipper_render.scrub_onscreen(str(headline or "").strip().upper())
+    lines = _wrap_text(head, 16)
+    fs = int(height * 0.075)
+    line_h = int(fs * 1.12)
+    block_h = line_h * len(lines)
+    top = int(height * 0.30)
+
+    def esc(t):
+        return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+    vf = [f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{_SCRIM_NAVY_HEXSTR}@1.0:t=fill"]
+    for i, ln in enumerate(lines):
+        y = top + i * line_h
+        vf.append(
+            f"drawtext=fontfile='{anton}':text='{esc(ln)}':fontcolor=white:"
+            f"fontsize={fs}:x=(w-tw)/2:y={y}")
+    if accent:
+        ay = top + block_h + int(height * 0.02)
+        vf.append(
+            f"drawbox=x=(iw-{int(width*0.16)})/2:y={ay}:w={int(width*0.16)}:h=6:"
+            f"color=0x{_BRAND_RED_HEX}@1.0:t=fill")
+    if subline:
+        sub = clipper_render.scrub_onscreen(str(subline).strip().upper())
+        sy = top + block_h + int(height * 0.06)
+        sfs = int(height * 0.028)
+        vf.append(
+            f"drawtext=fontfile='{oswald}':text='{esc(sub)}':fontcolor=white@0.85:"
+            f"fontsize={sfs}:x=(w-tw)/2:y={sy}")
+    fade_out = max(0.0, float(duration) - 0.3)
+    vf.append(f"fade=t=in:st=0:d=0.3,fade=t=out:st={fade_out:.2f}:d=0.3")
+
+    cmd = [
+        ffmpeg, "-y",
+        "-f", "lavfi", "-i", f"color=c=0x{_SCRIM_NAVY_HEXSTR}:s={width}x{height}:r=30",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-vf", ",".join(vf), "-t", str(float(duration)),
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        out_path,
+    ]
+    clipper_render._run(cmd, "title_card")
+    return out_path
+
+
+def _concat_av(paths, out_path, width, height):
+    """Concatenate clips (video+audio) via the concat filter (re-encode) so hook +
+    main + CTA join cleanly. Every input's video (WxH, sar, 30fps) and audio
+    (44.1kHz stereo fltp) is NORMALIZED first, because concat requires identical
+    stream parameters across inputs (a mismatch silently fails otherwise)."""
+    ffmpeg = clipper_render._ffmpeg()
+    inputs = []
+    for p in paths:
+        inputs += ["-i", p]
+    parts = []
+    for i in range(len(paths)):
+        parts.append(
+            f"[{i}:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[v{i}]")
+        parts.append(
+            f"[{i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]")
+    streams = "".join(f"[v{i}][a{i}]" for i in range(len(paths)))
+    parts.append(f"{streams}concat=n={len(paths)}:v=1:a=1[v][a]")
+    cmd = [
+        ffmpeg, "-y", *inputs,
+        "-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k",
+        out_path,
+    ]
+    clipper_render._run(cmd, "concat_av")
+    return out_path
+
+
 def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
                   aspect="9:16", captioned=True):
     """
     Assemble one finished clip (house standard):
-      cut -> frame(aspect) -> composite overlays -> [Word Highlight captions] ->
-      Minimal Broadcast bottom treatment.
+      cut -> frame(aspect) -> [A+ host punch-in + grade] -> composite overlays ->
+      [Word Highlight captions] -> Minimal Broadcast bottom treatment.
     Real host footage is the spine; overlays are cutaways only, never AI-altering
     the host. captioned=False produces the caption-FREE ad cut from the same
     timeline (it still gets the bottom treatment). Requires the render flag.
@@ -895,6 +1116,8 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
     os.makedirs(work, exist_ok=True)
 
     framed = os.path.join(work, "framed.mp4")
+    tightened = os.path.join(work, "tightened.mp4")
+    polished = os.path.join(work, "polished.mp4")
     composited = os.path.join(work, "composited.mp4")
     captioned_out = os.path.join(work, "captioned.mp4")
     final_out = os.path.join(output_dir, f"{base}_{tag}.mp4")
@@ -909,21 +1132,80 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
 
     clipper_render.frame_vertical(src_cut, framed, width=width, height=height)
 
-    # Detect the speaker's face on the framed host footage so captions dodge it.
-    face_bottom = video_assets.detect_face_bottom_frac(framed)
+    clip_dur = float(moment.end_ts) - float(moment.start_ts)
+    host_base = framed
+    # caption timeline + overlay offsets default to the original clip timeline
+    cap_transcript = transcript
+    cap_start, cap_end = float(moment.start_ts), float(moment.end_ts)
+    eff_overlays = overlays
+    eff_dur = clip_dur
 
-    stage = framed
-    if overlays:
-        _composite_overlays(framed, overlays, composited, width, height, work)
+    # A+ pacing: remove dead air, then remap overlays + captions onto the tighter
+    # timeline so everything stays in sync.
+    if config.video_jumpcuts_enabled():
+        words_rel = [
+            (float(w["start"]) - float(moment.start_ts),
+             float(w["end"]) - float(moment.start_ts))
+            for w in transcript.get("words", [])
+            if float(moment.start_ts) - 0.05 <= float(w.get("start", 0))
+            <= float(moment.end_ts) + 0.05
+        ]
+        intervals, time_map, new_dur = plan_keep_intervals(
+            words_rel, clip_dur, config.video_jumpcut_gap(),
+            config.video_jumpcut_keep())
+        if new_dur > 2.0 and new_dur < clip_dur - 0.2:
+            _apply_jumpcuts(framed, intervals, tightened)
+            removed = clip_dur - new_dur
+            print(f"[video] jump-cuts removed {removed:.1f}s of dead air "
+                  f"({clip_dur:.0f}s -> {new_dur:.0f}s)", flush=True)
+            host_base = tightened
+            eff_dur = new_dur
+            eff_overlays = [dict(ov, offset=time_map(ov["offset"])) for ov in overlays]
+            cap_transcript = _remap_transcript(
+                transcript, float(moment.start_ts), float(moment.end_ts), time_map)
+            cap_start, cap_end = 0.0, new_dur
+
+    if config.video_polish_enabled():
+        _polish_host(host_base, polished, width, height, eff_dur)
+        host_base = polished
+
+    # Detect the speaker's face on the host footage so captions dodge it.
+    face_bottom = video_assets.detect_face_bottom_frac(host_base)
+
+    stage = host_base
+    if eff_overlays:
+        _composite_overlays(host_base, eff_overlays, composited, width, height, work)
         stage = composited
 
     if captioned:
-        burn_word_highlight(stage, captioned_out, transcript,
-                            moment.start_ts, moment.end_ts,
+        burn_word_highlight(stage, captioned_out, cap_transcript,
+                            cap_start, cap_end,
                             width, height, face_bottom_frac=face_bottom)
         stage = captioned_out
 
     apply_bottom_treatment(stage, final_out, width, height, work)
+
+    # A+ bookends: animated hook card at the open + end CTA card. Only on the
+    # captioned (organic) cut; the ad cut stays clean for paid placements.
+    if config.video_polish_enabled() and captioned:
+        try:
+            hook_txt = getattr(moment, "hook", "") or ""
+            cards = []
+            if hook_txt.strip():
+                hook_card = os.path.join(work, "hook.mp4")
+                _make_title_card(hook_txt, "", hook_card, width, height, 1.6)
+                cards.append(hook_card)
+            cards.append(final_out)
+            cta_card = os.path.join(work, "cta.mp4")
+            _make_title_card("FOLLOW FOR MORE", _HANDLE_TEXT, cta_card,
+                             width, height, 2.0)
+            cards.append(cta_card)
+            if len(cards) > 1:
+                booked = os.path.join(output_dir, f"{base}_{tag}_final.mp4")
+                _concat_av(cards, booked, width, height)
+                return booked
+        except Exception as exc:
+            print(f"[video] bookend cards skipped: {exc}", flush=True)
     return final_out
 
 

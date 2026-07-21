@@ -388,6 +388,37 @@ def test_snap_is_noop_when_no_word_in_window():
     assert m.start_ts == 10.0 and m.end_ts == 70.0  # unchanged
 
 
+def test_plan_keep_intervals_removes_dead_air():
+    # words at 0-1, then a 3s gap, then 4-5, then 5-6 (no gap)
+    words = [(0.0, 1.0), (4.0, 5.0), (5.0, 6.0)]
+    intervals, time_map, total = ve.plan_keep_intervals(words, 6.0, gap=0.45, keep=0.1)
+    # the 3s gap (1.0 -> 4.0) is removed, leaving ~0.1s
+    assert total < 6.0
+    assert total == pytest.approx(6.0 - (3.0 - 0.1), abs=0.05)
+    # time before the gap maps ~1:1; time after the gap is shifted earlier
+    assert time_map(0.5) == pytest.approx(0.5, abs=0.01)
+    assert time_map(4.5) < 4.5
+
+
+def test_plan_keep_intervals_noop_when_tight():
+    words = [(0.0, 1.0), (1.1, 2.0), (2.1, 3.0)]  # no gap over 0.45
+    intervals, time_map, total = ve.plan_keep_intervals(words, 3.0, gap=0.45, keep=0.1)
+    assert total == pytest.approx(3.0, abs=0.01)
+    assert len(intervals) == 1
+
+
+def test_remap_transcript_shifts_words_to_tightened_timeline():
+    tr = {"words": [
+        {"word": "a", "start": 100.0, "end": 100.5},
+        {"word": "b", "start": 105.0, "end": 105.5},
+    ], "segments": []}
+    # a linear map that halves time (stub)
+    rt = ve._remap_transcript(tr, 100.0, 106.0, lambda t: t / 2.0)
+    assert [w["word"] for w in rt["words"]] == ["a", "b"]
+    assert rt["words"][0]["start"] == pytest.approx(0.0)   # (100-100)/2
+    assert rt["words"][1]["start"] == pytest.approx(2.5)   # (105-100)/2
+
+
 def test_flags_default_off_v1(monkeypatch):
     monkeypatch.delenv("AGENT_VIDEO_STILLS_ENABLED", raising=False)
     assert config.video_stills_enabled() is False

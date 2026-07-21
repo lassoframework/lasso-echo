@@ -1067,6 +1067,62 @@ def video_cost_per_still() -> float:
     return 2.0
 
 
+# ---- A+ finish (Phase 1 polish, Phase 2 fidelity, Phase 3 hero) -------------
+# All OFF by default; the base look is unchanged unless armed by hand.
+
+def video_polish_enabled() -> bool:
+    """A+ finish pass: caption pop-motion, b-roll cross-dissolves, host punch-in,
+    color grade, hook + CTA cards. OFF by default. Set AGENT_VIDEO_POLISH=true.
+    Pure ffmpeg finish — no extra credits, no external calls."""
+    return _truthy(os.environ.get("AGENT_VIDEO_POLISH", "false"))
+
+
+def video_jumpcuts_enabled() -> bool:
+    """Silence/filler jump-cut pacing: remove inter-word gaps longer than
+    video_jumpcut_gap() so the clip is tight. OFF by default (content-affecting).
+    Set AGENT_VIDEO_JUMPCUTS=true."""
+    return _truthy(os.environ.get("AGENT_VIDEO_JUMPCUTS", "false"))
+
+
+def video_jumpcut_gap() -> float:
+    """Inter-word gap (seconds) above which dead air is removed; the kept residual
+    is video_jumpcut_keep(). Env AGENT_VIDEO_JUMPCUT_GAP, default 0.45."""
+    try:
+        return max(0.15, float(os.environ.get("AGENT_VIDEO_JUMPCUT_GAP", "0.45")))
+    except (TypeError, ValueError):
+        return 0.45
+
+
+def video_jumpcut_keep() -> float:
+    """Residual breathing room (seconds) left in place of a removed gap.
+    Env AGENT_VIDEO_JUMPCUT_KEEP, default 0.12."""
+    try:
+        return max(0.0, float(os.environ.get("AGENT_VIDEO_JUMPCUT_KEEP", "0.12")))
+    except (TypeError, ValueError):
+        return 0.12
+
+
+def video_broll_resolution() -> str:
+    """Motion b-roll render resolution: '720p' (7.5 cr) or '1080p' (10 cr).
+    Env AGENT_VIDEO_BROLL_RESOLUTION, default '720p'."""
+    r = (os.environ.get("AGENT_VIDEO_BROLL_RESOLUTION", "720p") or "720p").strip().lower()
+    return r if r in ("720p", "1080p") else "720p"
+
+
+def video_still_resolution() -> str:
+    """Nano Banana still-card resolution: '1k' or '2k' (same 2-credit cost).
+    Env AGENT_VIDEO_STILL_RESOLUTION, default '2k' (crisper card text, no extra cost)."""
+    r = (os.environ.get("AGENT_VIDEO_STILL_RESOLUTION", "2k") or "2k").strip().lower()
+    return r if r in ("1k", "2k", "4k") else "2k"
+
+
+def video_hero_model() -> str:
+    """Optional top-tier model for the single highest-score (hero) beat per reel,
+    e.g. 'veo3_1' (~22 cr). Empty = every motion beat uses the standard model.
+    Env AGENT_VIDEO_HERO_MODEL, default '' (off)."""
+    return (os.environ.get("AGENT_VIDEO_HERO_MODEL", "") or "").strip()
+
+
 def video_broll_kind() -> str:
     """Overlay type: 'video' (motion, ~7.5 cr each) or 'image' (Ken-Burns still,
     ~2 cr each). Env AGENT_VIDEO_BROLL_KIND, default 'video'."""
