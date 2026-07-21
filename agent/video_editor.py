@@ -1022,6 +1022,153 @@ def _polish_host(input_path, output_path, width, height, duration):
     return output_path
 
 
+def _make_radial_glow_png(width, height, out_path):
+    """Navy field with a soft off-center radial glow (a real depth layer, never a
+    flat fill) for the intro/outro card background."""
+    from PIL import Image
+    import math
+    # render small then upscale (the glow is soft, so scaling is invisible + fast)
+    sw, sh = max(64, width // 5), max(64, height // 5)
+    img = Image.new("RGB", (sw, sh), _PANEL_NAVY)
+    px = img.load()
+    cx, cy = int(sw * 0.62), int(sh * 0.34)
+    maxd = math.hypot(sw, sh) * 0.6
+    gr, gg, gb = 42, 60, 104
+    br, bg, bb = _PANEL_NAVY
+    for y in range(sh):
+        for x in range(sw):
+            t = max(0.0, 1.0 - math.hypot(x - cx, y - cy) / maxd)
+            t *= t
+            px[x, y] = (int(br + (gr - br) * t), int(bg + (gg - bg) * t),
+                        int(bb + (gb - bb) * t))
+    img.resize((width, height)).save(out_path)
+    return out_path
+
+
+def _make_intro_card(out_path, width, height, duration, eyebrow, headline,
+                     red_word, anchor, deck):
+    """Animated house-style INTRO/OUTRO card (full screen, ~2.5s), Blake's approved
+    look, ANIMATED:
+      - deep navy + radial-glow depth layer + subtle grain
+      - giant ghosted anchor (numeral or key word) bleeding off frame, slow drift
+      - Oswald sky-blue tracked eyebrow + short red rule (fade in)
+      - Anton oversized left-aligned headline, builds line by line, ONE red word
+        that pops (scale) last
+      - Montserrat deck (<=2 lines), muted, fades in
+      - Minimal Broadcast bottom treatment
+    Passes the house-style six-question gate by construction (left-aligned,
+    asymmetric, scale contrast, one red accent, one depth layer, feed-stopping)."""
+    ffmpeg = clipper_render._ffmpeg()
+    work = os.path.dirname(os.path.abspath(out_path))
+    anton = video_assets.anton_font_path().replace("\\", "\\\\").replace(":", "\\:")
+
+    def esc(t):
+        return str(t).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+    glow = os.path.join(work, "glow.png")
+    _make_radial_glow_png(width, height, glow)
+
+    # Stage 1: background = glow + grain + drifting giant ghosted anchor.
+    anchor_txt = clipper_render.scrub_onscreen(str(anchor or "").strip().upper())
+    anchor_fs = int(height * (0.9 if len(anchor_txt) <= 2 else 0.42))
+    bg = os.path.join(work, "introbg.mp4")
+    vf1 = (f"noise=alls=7:allf=t,"
+           f"drawtext=fontfile='{anton}':text='{esc(anchor_txt)}':"
+           f"fontcolor=white@0.06:fontsize={anchor_fs}:"
+           f"x=w-tw*0.72:y='h*0.30 - 40*t/{max(0.5,duration):.2f}'")
+    clipper_render._run([
+        ffmpeg, "-y", "-loop", "1", "-i", glow,
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-vf", vf1, "-t", str(duration),
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", bg], "intro_bg")
+
+    # Stage 2: animated text (eyebrow + red rule + headline build + deck) via ASS.
+    ass = os.path.join(work, "intro.ass")
+    _make_intro_ass(ass, width, height, duration, eyebrow, headline, red_word, deck)
+    txt = os.path.join(work, "introtxt.mp4")
+    safe = os.path.abspath(ass).replace("\\", "/").replace(":", "\\:")
+    fonts = video_assets.FONTS_DIR.replace("\\", "/").replace(":", "\\:")
+    clipper_render._run([
+        ffmpeg, "-y", "-i", bg, "-vf", f"ass={safe}:fontsdir={fonts}",
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-c:a", "copy", txt],
+        "intro_text")
+
+    # Stage 3: Minimal Broadcast bottom treatment.
+    apply_bottom_treatment(txt, out_path, width, height, work)
+    return out_path
+
+
+def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
+                    red_word, deck):
+    eye_fs = int(height * 0.024)
+    head_fs = int(height * 0.072)
+    deck_fs = int(height * 0.024)
+    left = int(width * 0.07)
+    ms = clipper_render._fmt_ass_ts
+    dur = float(duration)
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+",
+        f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 2", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding",
+        f"Style: IEye,Oswald,{eye_fs},&H00{_SKYBLUE_BGR},&H00{_SKYBLUE_BGR},"
+        f"&H00000000,&H00000000,-1,0,0,0,100,100,5,0,1,2,0,7,{left},10,0,0",
+        f"Style: IHead,Anton,{head_fs},&H00{_WH_WHITE_BGR},&H00{_WH_WHITE_BGR},"
+        f"&H64000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,1,7,{left},10,0,0",
+        f"Style: IDeck,Montserrat,{deck_fs},&H00C8C8C8,&H00C8C8C8,"
+        f"&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,{left},10,0,0",
+        "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    eye = clipper_render.scrub_onscreen(str(eyebrow or "").strip().upper())
+    head = clipper_render.scrub_onscreen(str(headline or "").strip().upper())
+    red = clipper_render.scrub_onscreen(str(red_word or "").strip().upper())
+    deck_t = clipper_render.scrub_onscreen(str(deck or "").strip())
+    eye_y = int(height * 0.30)
+    rule_y = int(height * 0.345)
+    head_y = int(height * 0.37)
+
+    if eye:
+        lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IEye,,0,0,0,,"
+                     f"{{\\pos({left},{eye_y})\\an7\\fad(260,0)}}{eye}")
+    rw = int(width * 0.09)
+    lines.append(f"Dialogue: 0,{ms(0.30)},{ms(dur)},IHead,,0,0,0,,"
+                 f"{{\\pos({left},{rule_y})\\an7\\fad(260,0)\\1c&H0000FF&\\p1}}"
+                 f"m 0 0 l {rw} 0 l {rw} 6 l 0 6{{\\p0}}")
+    # headline builds line-by-line; the line with the red word pops (scale)
+    hl_lines = _wrap_headline(head, 12)
+    line_h = int(head_fs * 1.02)
+    for i, ln in enumerate(hl_lines):
+        y = head_y + i * line_h
+        start = 0.5 + i * 0.22
+        words = []
+        has_red = False
+        for w in ln.split():
+            if red and w == red:
+                has_red = True
+                words.append(f"{{\\c&H00{_WH_ACTIVE_BGR}&}}{w}{{\\c&H00{_WH_WHITE_BGR}&}}")
+            else:
+                words.append(w)
+        txt = " ".join(words)
+        pop = "\\t(0,160,\\fscx100\\fscy100)\\fscx88\\fscy88" if has_red else ""
+        lines.append(f"Dialogue: 0,{ms(start)},{ms(dur)},IHead,,0,0,0,,"
+                     f"{{\\pos({left},{y})\\an7\\fad(220,0){pop}}}{txt}")
+    if deck_t:
+        dy = head_y + len(hl_lines) * line_h + int(height * 0.02)
+        for j, dl in enumerate(_wrap_text(deck_t, 40)[:2]):
+            lines.append(f"Dialogue: 0,{ms(1.5 + j * 0.15)},{ms(dur)},IDeck,,0,0,0,,"
+                         f"{{\\pos({left},{dy + j * int(deck_fs*1.3)})\\an7\\fad(300,0)}}{dl}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
+    with open(ass_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return ass_path
+
+
 def _wrap_text(text, width_chars=16):
     """Word-wrap ALL-CAPS text into lines of ~width_chars for a title card."""
     words = str(text or "").split()
@@ -1122,12 +1269,10 @@ def _make_panel_png(width, height, out_path):
     transparent by _PANEL_COVERAGE of the width, so the host stays visible on the
     right. RGBA PNG."""
     from PIL import Image
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    px = img.load()
+    # alpha varies only by x, so build a width x 1 strip and stretch to height.
     r, g, b = _PANEL_NAVY
-    # A clear navy panel holds high alpha across the whole TEXT zone (left ~50%),
-    # then fades to transparent by ~68% so the host stays visible/in-motion on the
-    # right. Semi-transparent (not fully opaque) so it reads as an overlay panel.
+    strip = Image.new("RGBA", (width, 1), (0, 0, 0, 0))
+    sp = strip.load()
     solid_to = int(width * 0.50)          # panel body: strong, even alpha
     fade_to = int(width * 0.68)           # transparent by here
     for x in range(width):
@@ -1137,10 +1282,8 @@ def _make_panel_png(width, height, out_path):
             a = 0
         else:
             a = int(_PANEL_MAX_ALPHA * (1 - (x - solid_to) / (fade_to - solid_to)))
-        row = (r, g, b, a)
-        for y in range(height):
-            px[x, y] = row
-    img.save(out_path)
+        sp[x, 0] = (r, g, b, a)
+    strip.resize((width, height)).save(out_path)
     return out_path
 
 
@@ -1359,19 +1502,9 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
                 transcript, float(moment.start_ts), float(moment.end_ts), time_map)
             cap_start, cap_end = 0.0, new_dur
 
-    # Hook + CTA are Treatment B panels over the live footage, NOT full-frame cards:
-    # hook over the opening seconds, CTA over the closing seconds. Captioned cut
-    # only; the ad cut stays clean.
-    if config.video_polish_enabled() and captioned:
-        hook_txt = getattr(moment, "hook", "") or ""
-        if hook_txt.strip():
-            panels.append({
-                "start": 0.4, "end": min(3.6, max(1.5, eff_dur * 0.28)),
-                "eyebrow": "", "headline": hook_txt,
-                "red_word": _pick_red_word(hook_txt)})
-        panels.append({
-            "start": max(0.0, eff_dur - 3.0), "end": max(0.5, eff_dur - 0.2),
-            "eyebrow": "LASSO", "headline": "FOLLOW FOR MORE", "red_word": "FOLLOW"})
+    # Mid-body concept beats stay as Treatment B side panels (overlay on live
+    # footage). The HOOK is now the animated INTRO card and the CTA the OUTRO card
+    # (full-screen designed cards, INTRO/OUTRO only) — added by concat below.
 
     # clamp/clean panels to the effective timeline
     panels = [p for p in panels
@@ -1407,7 +1540,50 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
         stage = captioned_out
 
     apply_bottom_treatment(stage, final_out, width, height, work)
+
+    # INTRO (hook) + OUTRO (CTA) designed animated cards, INTRO/OUTRO only, over
+    # the captioned cut. The ad cut stays clean (no cards) for paid placements.
+    if config.video_polish_enabled() and captioned:
+        try:
+            hook_txt = (getattr(moment, "hook", "") or "").strip()
+            bucket = (getattr(moment, "bucket", "") or "").replace("_", " ")
+            cards = []
+            if hook_txt:
+                intro = os.path.join(work, "intro.mp4")
+                _make_intro_card(intro, width, height, 2.6,
+                                 eyebrow=bucket or "LASSO", headline=hook_txt,
+                                 red_word=_pick_red_word(hook_txt),
+                                 anchor=_anchor_for(hook_txt, _pick_red_word(hook_txt)),
+                                 deck="")
+                cards.append(intro)
+            cards.append(final_out)
+            outro = os.path.join(work, "outro.mp4")
+            _make_intro_card(outro, width, height, 2.2,
+                             eyebrow="LASSO", headline="FOLLOW FOR MORE",
+                             red_word="MORE", anchor="LASSO", deck="")
+            cards.append(outro)
+            if len(cards) > 1:
+                booked = os.path.join(output_dir, f"{base}_{tag}_final.mp4")
+                _concat_av(cards, booked, width, height)
+                return booked
+        except Exception as exc:
+            print(f"[video] intro/outro cards skipped: {exc}", flush=True)
     return final_out
+
+
+def _anchor_for(text, fallback):
+    """Giant ghosted anchor for the intro card: a spoken number if present, else a
+    fallback word (grounded, never invented)."""
+    import re as _re
+    m = _re.search(r"\b(\d{1,3})\b", str(text or ""))
+    if m:
+        return m.group(1)
+    nums = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+    for w in str(text or "").lower().split():
+        if w.strip(".,!?") in nums:
+            return nums[w.strip(".,!?")]
+    return str(fallback or "").upper()
 
 
 def _pick_red_word(headline):

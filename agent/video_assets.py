@@ -44,6 +44,12 @@ def oswald_font_path():
     return p if os.path.isfile(p) else os.path.join(FONTS_DIR, "Oswald-SemiBold.ttf")
 
 
+def montserrat_font_path():
+    """Montserrat (deck line on the intro card). Falls back to Oswald if absent."""
+    p = os.path.join(FONTS_DIR, "Montserrat-Medium.ttf")
+    return p if os.path.isfile(p) else oswald_font_path()
+
+
 def _face_cascade_path():
     """opencv bundled cascade first, repo fallback second."""
     try:

@@ -586,6 +586,47 @@ def test_polish_and_jumpcuts_end_to_end(monkeypatch, tmp_path):
     assert max(durs) - min(durs) < 0.3
 
 
+def test_anchor_for_prefers_spoken_number():
+    assert ve._anchor_for("if i have 10 in my group", "X") == "10"
+    assert ve._anchor_for("designate three people", "X") == "3"
+    assert ve._anchor_for("assign roles every rep", "OPPORTUNITY") == "OPPORTUNITY"
+
+
+def test_intro_ass_animated_one_red_word_no_dash():
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(suffix=".ass", delete=False, mode="w") as f:
+        ass = f.name
+    try:
+        ve._make_intro_ass(ass, 1080, 1920, 2.6, "SALES",
+                           "ASSIGN ROLES SO EVERY REP COUNTS", "ASSIGN", "")
+        c = open(ass).read()
+        assert "Anton" in c and "Oswald" in c and "Montserrat" in c
+        events = [l for l in c.splitlines() if l.startswith("Dialogue:")]
+        body = "\n".join(events)
+        assert "\\fad" in body                       # animates in
+        assert "\\t(" in body                         # red word pop (scale)
+        assert body.count("&H002A2AFF&") == 1         # exactly one red word
+        assert "-" not in body                        # no hyphen on screen
+    finally:
+        os.unlink(ass)
+
+
+@pytestmark_ff
+def test_intro_card_renders_full_screen_with_audio(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
+    out = str(tmp_path / "intro.mp4")
+    ve._make_intro_card(out, 1080, 1920, 2.2, eyebrow="SALES",
+                        headline="ASSIGN ROLES EVERY REP", red_word="ASSIGN",
+                        anchor="3", deck="")
+    assert os.path.isfile(out)
+    assert _probe_dims(out) == (1080, 1920)
+    import subprocess as _sp
+    r = _sp.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_streams", out], capture_output=True, text=True)
+    kinds = {s["codec_type"] for s in json.loads(r.stdout)["streams"]}
+    assert "video" in kinds and "audio" in kinds     # silent audio for concat
+
+
 def test_side_panel_ass_animated_one_red_word_no_dash():
     import tempfile as _tf
     specs = [{"start": 2.0, "end": 6.0, "eyebrow": "ROLE PLAY",
