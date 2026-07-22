@@ -222,8 +222,8 @@ def archetype_for_day(day_key):
 # Feed (4:5) fit: generic portrait guidance; the headline position and body
 # structure come from the archetype block.
 FEED_LAYOUT = (
-    "Feed layout (4:5 PORTRAIT): compose the whole design to FILL the tall portrait "
-    "frame, but keep HARD SAFE ZONES so Instagram never crops anything that matters "
+    "Feed layout (4:5 PORTRAIT): lay the whole design out so it FILLS the tall "
+    "portrait canvas, but keep HARD SAFE ZONES so Instagram never crops anything that matters "
     "(the feed trims the top and bottom, and the square profile-grid thumbnail crops "
     "them harder). Keep the TOP ~160 pixels and the BOTTOM ~160 pixels of the frame "
     "CLEAR of any headline text, footer label, or key icon: NOTHING critical may touch "
