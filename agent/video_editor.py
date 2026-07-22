@@ -1068,14 +1068,20 @@ def _make_intro_card(out_path, width, height, duration, eyebrow, headline,
     glow = os.path.join(work, "glow.png")
     _make_radial_glow_png(width, height, glow)
 
-    # Stage 1: background = glow + grain + drifting giant ghosted anchor.
+    # Stage 1: background = glow + grain + (only when the anchor is a spoken NUMBER)
+    # a giant ghosted numeral drifting off frame. A random word fragment ghosted huge
+    # reads as a glitch, so text anchors are dropped for a cleaner, premium open.
     anchor_txt = clipper_render.scrub_onscreen(str(anchor or "").strip().upper())
-    anchor_fs = int(height * (0.9 if len(anchor_txt) <= 2 else 0.42))
+    anchor_is_num = anchor_txt.replace(",", "").replace(".", "").isdigit()
     bg = os.path.join(work, "introbg.mp4")
-    vf1 = (f"noise=alls=7:allf=t,"
-           f"drawtext=fontfile='{anton}':text='{esc(anchor_txt)}':"
-           f"fontcolor=white@0.06:fontsize={anchor_fs}:"
-           f"x=w-tw*0.72:y='h*0.30 - 40*t/{max(0.5,duration):.2f}'")
+    vf1_parts = ["noise=alls=7:allf=t"]
+    if anchor_is_num:
+        anchor_fs = int(height * (0.9 if len(anchor_txt) <= 2 else 0.5))
+        vf1_parts.append(
+            f"drawtext=fontfile='{anton}':text='{esc(anchor_txt)}':"
+            f"fontcolor=white@0.07:fontsize={anchor_fs}:"
+            f"x=w-tw*0.72:y='h*0.28 - 40*t/{max(0.5,duration):.2f}'")
+    vf1 = ",".join(vf1_parts)
     clipper_render._run([
         ffmpeg, "-y", "-loop", "1", "-i", glow,
         "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -1101,8 +1107,8 @@ def _make_intro_card(out_path, width, height, duration, eyebrow, headline,
 
 def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
                     red_word, deck):
-    eye_fs = int(height * 0.024)
-    head_fs = int(height * 0.072)
+    eye_fs = int(height * 0.028)
+    head_fs = int(height * 0.076)
     deck_fs = int(height * 0.024)
     left = int(width * 0.07)
     ms = clipper_render._fmt_ass_ts
@@ -1116,7 +1122,7 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding",
         f"Style: IEye,Oswald,{eye_fs},&H00{_SKYBLUE_BGR},&H00{_SKYBLUE_BGR},"
-        f"&H00000000,&H00000000,-1,0,0,0,100,100,5,0,1,2,0,7,{left},10,0,0",
+        f"&H00000000,&H00000000,-1,0,0,0,100,100,9,0,1,2,0,7,{left},10,0,0",
         f"Style: IHead,Anton,{head_fs},&H00{_WH_WHITE_BGR},&H00{_WH_WHITE_BGR},"
         f"&H64000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,1,7,{left},10,0,0",
         f"Style: IDeck,Montserrat,{deck_fs},&H00C8C8C8,&H00C8C8C8,"
@@ -1135,10 +1141,11 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
     if eye:
         lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IEye,,0,0,0,,"
                      f"{{\\pos({left},{eye_y})\\an7\\fad(260,0)}}{eye}")
-    rw = int(width * 0.09)
+    rw = int(width * 0.12)
+    rh = max(6, int(height * 0.006))
     lines.append(f"Dialogue: 0,{ms(0.30)},{ms(dur)},IHead,,0,0,0,,"
                  f"{{\\pos({left},{rule_y})\\an7\\fad(260,0)\\1c&H0000FF&\\p1}}"
-                 f"m 0 0 l {rw} 0 l {rw} 6 l 0 6{{\\p0}}")
+                 f"m 0 0 l {rw} 0 l {rw} {rh} l 0 {rh}{{\\p0}}")
     # headline builds line-by-line; the line with the red word pops (scale)
     hl_lines = _wrap_headline(head, 12)
     line_h = int(head_fs * 1.02)
