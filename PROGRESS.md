@@ -10,6 +10,44 @@ Last updated: 2026-07-22
 
 ---
 
+## Stage 4 Python agent features built (2026-07-22, SHA ed26210)
+
+Three Stage 4 gaps closed and armed (where applicable). Stage 2-3 also fully armed.
+
+### Stage 2-3 arming complete
+All flags now on in Railway: AGENT_AUTOTAG_ENABLED, AGENT_BRAIN_PROPOSALS_ENABLED,
+AGENT_GRADE_ENABLED, AGENT_MONTHLY_REVIEW_ENABLED, AGENT_GRAPH_API_VERSION=v23.0,
+AGENT_GEMINI_DAILY_CAP=100. AGENT_TRUST_LADDER_ENABLED intentionally NOT armed
+(deliberate by-hand step per CLAUDE.md).
+
+### [x] GHL inbound webhook HTTP route
+`POST /ghl/inbound` wired into intake_web.py (same 404-dark / 403-bad-sig / 200-ok
+pattern as the WhatsApp route). Logic in ghl_intake.py was complete; it was missing
+the HTTP surface. Armed when AGENT_GHL_INTAKE_ENABLED=true is set in Railway.
+
+### [x] Consent audit log
+New `consent_log` SQLite table (asset_path, action, member_ref, granted_by, note,
+recorded_at) in the shared echo.db schema. `dam.set_consent()` writes both the sidecar
+(existing enforcement path) AND an audit row. `dam.consent_log_entries()` reads the
+history. The fail-safe consent guard in dam.py is unchanged.
+
+### [x] Gemini Vision content moderation
+`_moderate_default()` in intake_ingest.py is no longer a stub. Behind
+AGENT_CONTENT_MODERATION_ENABLED (default OFF): calls Gemini Vision with a
+nudity/violence/explicit_text prompt; flagged images route to intake/<client>/review/
+with a Slack notice (the interface was already wired). Fails open on any API error so
+uploads never stall. Video is skipped (image-only pass). Armed by setting
+AGENT_CONTENT_MODERATION_ENABLED=true in Railway.
+
+### Stage 4 items NOT in this Python build (by design)
+- A2P/10DLC registration: carrier compliance, done by hand in Twilio/GHL
+- Supabase/Next.js portal: the BUILD_SPEC full vision uses Next.js; this repo is the
+  Railway Python worker only
+
+10 new tests added. Suite: 1556 passing, 3 pre-existing failures (unchanged).
+
+---
+
 ## Auto-approve + story crosspost confirmed live (2026-07-22)
 
 `AGENT_AUTO_APPROVE_ENABLED=true` — posts now publish at schedule time without a Slack
