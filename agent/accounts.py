@@ -122,6 +122,20 @@ ACCOUNTS = [
         # after story IS the headline for this account.
         report_framing="frequency",
     ),
+    Account(
+        key="district_h_ig",
+        display_name="District H Strength and Fitness IG",
+        platform=Platform.INSTAGRAM,
+        token_env="AGENT_DISTRICT_H_IG_TOKEN",
+        target_id_env="AGENT_DISTRICT_H_IG_ID",
+        voice_doc="brand_voice/district_h/lasso_voice.md",
+        social_proof_doc="brand_voice/district_h/social_proof.md",
+        library_prefix="content_library/district_h",
+        slack_channel="",            # the client's approval channel id, by hand
+        approvers=[],                # approver Slack ids, by hand
+        active=False,                # arm after tokens + voice doc are filled
+        # trust defaults to FULL_APPROVAL (level 0). Do not change here.
+    ),
     # Kept as an INACTIVE record for history. Meta ended personal-profile publishing
     # in 2018 (Graph API cannot post to a personal profile), so this account can never
     # publish and must not generate daily draft cards. active=False excludes it from
