@@ -154,7 +154,9 @@ def test_story_layout_true_vertical_feed_unchanged():
         "Leads go cold in minutes.", ["Answer inside five minutes."])
     assert "FILLS the tall portrait canvas" in feed
     assert "UPPER THIRD" not in feed
-    assert "safe zones" not in feed.lower()
+    # feed now has its OWN safe zones (crop fix); the Story-specific 250px bands
+    # and upper-third headline placement must not leak into the feed composition.
+    assert "TOP 250 pixels" not in feed and "BOTTOM 250 pixels" not in feed
     # the shipped feed composition constant is intact inside the feed prompt
     assert creative_studio.COMPOSITION_STYLE in feed
 
