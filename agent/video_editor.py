@@ -1434,8 +1434,58 @@ def _eyebrow_for(text):
     return " ".join(words[:2]).upper()
 
 
+def _make_nano_intro_png(moment, out_path, account_key=None):
+    """Generate the reel's OPENING infographic through the SAME house-style Gemini
+    pipeline + six-question grade gate the feed cards use (creative_studio.generate,
+    9:16, illustration archetype). Headline = the clip's verbatim hook (scrubbed);
+    no fabrication. Returns the png path, or None on any failure (studio flag off,
+    no Nano key, spend cap, or 3x grade fail) so the caller falls back to the
+    code-built intro card and the reel is never blocked."""
+    try:
+        from . import creative_studio
+        hook = clipper_render.scrub_onscreen(str(getattr(moment, "hook", "") or "").strip())
+        if not hook:
+            return None
+        facts = [f for f in (getattr(moment, "hook", ""),
+                             getattr(moment, "transcript_text", "")) if f] or [hook]
+        art = creative_studio.generate(
+            hook, facts, aspect="9:16", pixels="1080x1920",
+            surface="reel opening infographic (9:16, slides away to host)",
+            archetype="hero", account_key=account_key)
+        if art and art.get("path"):
+            shutil.copyfile(art["path"], out_path)
+            return out_path
+    except Exception as exc:
+        print(f"[video] nano intro generation skipped: {exc}", flush=True)
+    return None
+
+
+def _slide_away_intro(intro_png, body_path, out_path, width, height,
+                      hold=2.0, slide=0.6):
+    """Open on the still infographic for `hold` seconds, then SLIDE it up and off
+    over `slide` seconds to reveal the host body (xfade slideup). The host audio is
+    delayed to start exactly when the host video begins revealing, so lip-sync is
+    intact and the intro plays silent."""
+    intro_dur = hold + slide
+    delay_ms = int(hold * 1000)
+    vf = (
+        f"[0:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[iv];"
+        f"[1:v]scale={width}:{height},setsar=1,fps=30,format=yuv420p[bv];"
+        f"[iv][bv]xfade=transition=slideup:duration={slide}:offset={hold}[v];"
+        f"[1:a]adelay={delay_ms}|{delay_ms},aresample=44100[a]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-loop", "1", "-t", f"{intro_dur:.2f}", "-i", intro_png,
+        "-i", body_path, "-filter_complex", vf, "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path,
+    ]
+    clipper_render._run(cmd, "nano_intro_slide")
+    return out_path
+
+
 def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
-                  aspect="9:16", captioned=True, panel_specs=None):
+                  aspect="9:16", captioned=True, panel_specs=None, account_key=None):
     """
     Assemble one finished clip (house standard):
       cut -> frame(aspect) -> [jump-cut pacing] -> [A+ host grade] -> overlays ->
@@ -1552,15 +1602,27 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
             hook_txt = (getattr(moment, "hook", "") or "").strip()
             bucket = (getattr(moment, "bucket", "") or "").replace("_", " ")
             cards = []
-            if hook_txt:
-                intro = os.path.join(work, "intro.mp4")
-                _make_intro_card(intro, width, height, 2.6,
-                                 eyebrow=bucket or "LASSO", headline=hook_txt,
-                                 red_word=_pick_red_word(hook_txt),
-                                 anchor=_anchor_for(hook_txt, _pick_red_word(hook_txt)),
-                                 deck="")
-                cards.append(intro)
-            cards.append(final_out)
+            # Reel opener: a Gemini/Nano house-style infographic that holds ~2s then
+            # SLIDES AWAY to reveal the host (AGENT_VIDEO_NANO_INTRO, 9:16 reel only).
+            # Falls back to the code-built intro card if generation is off or fails.
+            nano_png = None
+            if config.video_nano_intro_enabled() and aspect == "9:16":
+                nano_png = _make_nano_intro_png(
+                    moment, os.path.join(work, "nano_intro.png"), account_key)
+            if nano_png:
+                opener = os.path.join(work, "opener.mp4")
+                _slide_away_intro(nano_png, final_out, opener, width, height)
+                cards.append(opener)  # infographic slide-away + host body, combined
+            else:
+                if hook_txt:
+                    intro = os.path.join(work, "intro.mp4")
+                    _make_intro_card(intro, width, height, 2.6,
+                                     eyebrow=bucket or "LASSO", headline=hook_txt,
+                                     red_word=_pick_red_word(hook_txt),
+                                     anchor=_anchor_for(hook_txt, _pick_red_word(hook_txt)),
+                                     deck="")
+                    cards.append(intro)
+                cards.append(final_out)
             outro = os.path.join(work, "outro.mp4")
             _make_intro_card(outro, width, height, 2.2,
                              eyebrow="LASSO", headline="FOLLOW FOR MORE",
@@ -1715,7 +1777,8 @@ def edit_episode(source, render=False, client=None, transcriber=None, llm=None,
                 try:
                     path = assemble_clip(m, media_path, transcript, overlays,
                                          output_dir, base, aspect=aspect,
-                                         captioned=captioned, panel_specs=panel_specs)
+                                         captioned=captioned, panel_specs=panel_specs,
+                                         account_key=account_key)
                     files[f"{aspect}_{mode}"] = path
                     print(f"video-episode: assembled {aspect} {mode} -> {path}",
                           flush=True)

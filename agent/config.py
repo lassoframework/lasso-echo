@@ -1077,6 +1077,14 @@ def video_polish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_VIDEO_POLISH", "false"))
 
 
+def video_nano_intro_enabled() -> bool:
+    """Open each reel with a Gemini/Nano-generated house-style infographic that
+    holds ~2s then SLIDES AWAY to reveal the host footage (replaces the code-built
+    intro card). Headless-capable (creative_studio + AGENT_NANO_API_KEY). OFF by
+    default. Set AGENT_VIDEO_NANO_INTRO=true."""
+    return _truthy(os.environ.get("AGENT_VIDEO_NANO_INTRO", "false"))
+
+
 def video_jumpcuts_enabled() -> bool:
     """Silence/filler jump-cut pacing: remove inter-word gaps longer than
     video_jumpcut_gap() so the clip is tight. OFF by default (content-affecting).

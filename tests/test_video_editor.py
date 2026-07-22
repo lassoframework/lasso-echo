@@ -730,3 +730,30 @@ def test_assemble_composites_overlay(monkeypatch, tmp_path):
                            captioned=False)
     assert os.path.isfile(out)
     assert _probe_dims(out) == (1080, 1920)
+
+
+def test_nano_intro_none_without_hook():
+    """No hook -> no infographic generated (graceful; caller uses the code card)."""
+    from agent import video_editor as ve
+    class _M:
+        hook = ""
+        transcript_text = ""
+    assert ve._make_nano_intro_png(_M(), "/tmp/nano_x.png") is None
+
+
+def test_slide_away_intro_renders(tmp_path):
+    """The infographic holds then slides up to reveal the host body; output plays."""
+    import subprocess
+    from agent import video_editor as ve
+    body = str(tmp_path / "body.mp4")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=navy:s=108x192:d=1",
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", body],
+                   check=True, capture_output=True)
+    png = str(tmp_path / "intro.png")
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=red:s=108x192:d=0.1",
+                    "-frames:v", "1", png], check=True, capture_output=True)
+    out = str(tmp_path / "opener.mp4")
+    ve._slide_away_intro(png, body, out, 108, 192, hold=0.4, slide=0.2)
+    import os as _os
+    assert _os.path.exists(out) and _os.path.getsize(out) > 0

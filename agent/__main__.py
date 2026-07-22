@@ -150,6 +150,7 @@ def _status():
     print(f"  video_render   : {config.video_render_enabled()}  (env AGENT_VIDEO_RENDER)")
     print(f"  video_stills   : {config.video_stills_enabled()}  (env AGENT_VIDEO_STILLS_ENABLED)")
     print(f"  video_polish   : {config.video_polish_enabled()}  (env AGENT_VIDEO_POLISH)")
+    print(f"  video_nano_intro: {config.video_nano_intro_enabled()}  (env AGENT_VIDEO_NANO_INTRO)")
     print(f"  video_jumpcuts : {config.video_jumpcuts_enabled()}  (env AGENT_VIDEO_JUMPCUTS)")
     print(f"  podcast_auto   : {config.podcast_auto_enabled()}  (env AGENT_PODCAST_AUTO_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
