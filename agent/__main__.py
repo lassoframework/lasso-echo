@@ -1036,11 +1036,14 @@ def main(argv=None):
         # STRICT parsing: a typo or unsupported form errors out loudly; it can
         # never silently fall through to the full 10-card batch.
         from .regen_library import parse_args, run as regen_run
+        from .creative_studio import _default_client as _nano_default
+        from .media_host import _default_client as _s3_default
         only, set_name, dry_run, err = parse_args(argv[1:])
         if err:
             print(err)
         else:
-            regen_run(only=only, dry_run=dry_run, set_name=set_name)
+            regen_run(only=only, dry_run=dry_run, set_name=set_name,
+                      nano_client=_nano_default(), s3_client=_s3_default())
     elif cmd == "onboard":
         # Autonomous onboard (Stage 2 T2): gym row, voice file, brain file,
         # trust + publish records. Token minting is behind AGENT_ONBOARD_AUTOMINT
