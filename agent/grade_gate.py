@@ -62,6 +62,7 @@ def _q6_feed_stopping_heuristic(prompt_text: str) -> bool:
     p = (prompt_text or "").lower()
     return any(token in p for token in (
         "illustrated element",  # present in all non-editorial Block D prompts
+        "focal graphic",        # canvas/layout-override cards (split, navy, etc.)
         "visual anchor",        # required in editorial concept specs
         "color block",          # editorial anchor type
         "full-width",           # editorial anchor type
