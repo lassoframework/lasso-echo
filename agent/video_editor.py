@@ -1135,11 +1135,10 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
     red = clipper_render.scrub_onscreen(str(red_word or "").strip().upper())
     deck_t = clipper_render.scrub_onscreen(str(deck or "").strip())
     eye_y = int(height * 0.27)
-    head_y = int(height * 0.335)
+    head_y = int(height * 0.345)
 
-    # A solid red square marker leads the eyebrow (brand accent, replaces the timid
-    # floating rule); the eyebrow sits just to its right. Confident magazine kicker.
-    sq = int(eye_fs * 0.9)
+    # Red square stamp: sized off frame height (confident brand mark, not a dot)
+    sq = int(height * 0.04)
     sq_y = eye_y + int(eye_fs * 0.1)
     lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IHead,,0,0,0,,"
                  f"{{\\pos({left},{sq_y})\\an7\\fad(260,0)\\1c&H0000FF&\\p1}}"
@@ -1148,8 +1147,15 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
         ex = left + sq + int(eye_fs * 0.55)
         lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IEye,,0,0,0,,"
                      f"{{\\pos({ex},{eye_y})\\an7\\fad(260,0)}}{eye}")
-    # headline builds line-by-line; the line with the red word pops (scale)
-    hl_lines = _wrap_headline(head, 12)
+    # Thin red rule between eyebrow block and headline (editorial separator)
+    rule_w = int(width * 0.12)
+    rule_h = max(3, int(height * 0.0019))
+    rule_y = eye_y + sq + int((head_y - eye_y - sq) * 0.35)
+    lines.append(f"Dialogue: 0,{ms(0.30)},{ms(dur)},IHead,,0,0,0,,"
+                 f"{{\\pos({left},{rule_y})\\an7\\fad(180,0)\\1c&H0000FF&\\p1}}"
+                 f"m 0 0 l {rule_w} 0 l {rule_w} {rule_h} l 0 {rule_h}{{\\p0}}")
+    # headline builds line-by-line; wrap wider for 3 punchy lines instead of 4
+    hl_lines = _wrap_headline(head, 16)
     line_h = int(head_fs * 1.02)
     red_used = False   # color ONLY the first occurrence -> exactly one red word
     for i, ln in enumerate(hl_lines):
