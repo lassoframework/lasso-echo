@@ -1076,11 +1076,11 @@ def _make_intro_card(out_path, width, height, duration, eyebrow, headline,
     bg = os.path.join(work, "introbg.mp4")
     vf1_parts = ["noise=alls=7:allf=t"]
     if anchor_is_num:
-        anchor_fs = int(height * (0.9 if len(anchor_txt) <= 2 else 0.5))
+        anchor_fs = int(height * (0.95 if len(anchor_txt) <= 2 else 0.55))
         vf1_parts.append(
             f"drawtext=fontfile='{anton}':text='{esc(anchor_txt)}':"
-            f"fontcolor=white@0.07:fontsize={anchor_fs}:"
-            f"x=w-tw*0.72:y='h*0.28 - 40*t/{max(0.5,duration):.2f}'")
+            f"fontcolor=white@0.12:fontsize={anchor_fs}:"
+            f"x=w-tw*0.62:y='(h-th)/2 - 30*t/{max(0.5,duration):.2f}'")
     vf1 = ",".join(vf1_parts)
     clipper_render._run([
         ffmpeg, "-y", "-loop", "1", "-i", glow,
@@ -1134,18 +1134,20 @@ def _make_intro_ass(ass_path, width, height, duration, eyebrow, headline,
     head = clipper_render.scrub_onscreen(str(headline or "").strip().upper())
     red = clipper_render.scrub_onscreen(str(red_word or "").strip().upper())
     deck_t = clipper_render.scrub_onscreen(str(deck or "").strip())
-    eye_y = int(height * 0.30)
-    rule_y = int(height * 0.345)
-    head_y = int(height * 0.37)
+    eye_y = int(height * 0.27)
+    head_y = int(height * 0.335)
 
+    # A solid red square marker leads the eyebrow (brand accent, replaces the timid
+    # floating rule); the eyebrow sits just to its right. Confident magazine kicker.
+    sq = int(eye_fs * 0.9)
+    sq_y = eye_y + int(eye_fs * 0.1)
+    lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IHead,,0,0,0,,"
+                 f"{{\\pos({left},{sq_y})\\an7\\fad(260,0)\\1c&H0000FF&\\p1}}"
+                 f"m 0 0 l {sq} 0 l {sq} {sq} l 0 {sq}{{\\p0}}")
     if eye:
+        ex = left + sq + int(eye_fs * 0.55)
         lines.append(f"Dialogue: 0,{ms(0.15)},{ms(dur)},IEye,,0,0,0,,"
-                     f"{{\\pos({left},{eye_y})\\an7\\fad(260,0)}}{eye}")
-    rw = int(width * 0.12)
-    rh = max(6, int(height * 0.006))
-    lines.append(f"Dialogue: 0,{ms(0.30)},{ms(dur)},IHead,,0,0,0,,"
-                 f"{{\\pos({left},{rule_y})\\an7\\fad(260,0)\\1c&H0000FF&\\p1}}"
-                 f"m 0 0 l {rw} 0 l {rw} {rh} l 0 {rh}{{\\p0}}")
+                     f"{{\\pos({ex},{eye_y})\\an7\\fad(260,0)}}{eye}")
     # headline builds line-by-line; the line with the red word pops (scale)
     hl_lines = _wrap_headline(head, 12)
     line_h = int(head_fs * 1.02)
