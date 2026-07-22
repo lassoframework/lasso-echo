@@ -182,10 +182,34 @@ Captions are B2B StoryBrand. Every caption follows this beat order:
    The CTA is never loud. It earns the click.
 
 **Paragraph rhythm:**
-- Each beat is its own paragraph, separated by a blank line (double newline `\n\n`).
+- A blank line separates genuine beat SHIFTS only — a new thought, a tonal pivot, a new
+  rhetorical move. NOT every sentence.
+- Sentences that continue the same beat or flow naturally from the prior sentence stay in
+  the same paragraph (period + space, no blank line between them).
 - The CTA pair is two lines separated by a single newline `\n` — they belong together
   and must never be split by a blank line.
-- Four paragraphs is the target. Three is acceptable. Five is too many.
+- Three to four paragraphs is the target. Five is too many. Do not manufacture extra
+  breaks to pad visual length.
+
+**Anti-pattern (wrong):**
+```
+Agencies send reports.
+
+LASSO hands you the cockpit.
+
+We run the same system on ourselves.
+
+No guesswork.
+```
+
+**Correct:**
+```
+Agencies send reports. LASSO hands you the cockpit.
+
+We run the same system on ourselves before we ever hand it to you. No guesswork and no bait and switch.
+
+Just the system, run for you.
+```
 
 **Hard copy rules (same as Section 4, enforced here for captions):**
 - No em dashes, en dashes, or hyphens.
