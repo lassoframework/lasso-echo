@@ -101,10 +101,42 @@ def _phash_default(data, name):
         return None
 
 
+_MODERATION_PROMPT = (
+    "Review this image for content moderation. Reply ONLY with a JSON object, no "
+    'other text: {"safe": true or false, "reason": "" (empty when safe, else one '
+    'short phrase such as "nudity", "violence", "explicit_text", or "other"), '
+    '"confidence": 0.0 to 1.0}')
+
+
+def _gemini_moderate(data):
+    """Gemini Vision moderation call. Returns (safe: bool, reason: str) or raises."""
+    import json as _json
+    from google import genai
+    from google.genai import types as gtypes
+    key = os.environ.get(config.NANO_API_KEY_ENV, "")
+    if not key:
+        return True, ""
+    client = genai.Client(api_key=key)
+    resp = client.models.generate_content(
+        model=config.OCR_MODEL,
+        contents=[gtypes.Part.from_bytes(data=data, mime_type="image/jpeg"),
+                  _MODERATION_PROMPT])
+    raw = getattr(resp, "text", "") or ""
+    body = _json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+    return bool(body.get("safe", True)), str(body.get("reason", ""))
+
+
 def _moderate_default(data, name):
-    """Moderation hook STUB: everything passes today. The interface is the contract;
-    a real classifier slots in here without touching the pipeline."""
-    return True, ""
+    """Passes while AGENT_CONTENT_MODERATION_ENABLED is OFF. When ON, calls
+    Gemini Vision; fails open on any error so uploads never stall permanently."""
+    if not config.content_moderation_enabled():
+        return True, ""
+    if os.path.splitext(name)[1].lower() in (".mp4", ".mov", ".avi"):
+        return True, ""  # video moderation out of scope for the current pass
+    try:
+        return _gemini_moderate(data)
+    except Exception:
+        return True, ""
 
 
 def _make_thumbnail(data, name, max_px=400):

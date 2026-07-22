@@ -110,6 +110,7 @@ def _status():
     print(f"  portal_approvals: {config.portal_approvals_enabled()}  (env AGENT_PORTAL_APPROVALS)")
     print(f"  ocr_check      : {config.ocr_check_enabled()}  (env AGENT_OCR_CHECK_ENABLED)")
     print(f"  consent_guard  : {config.consent_guard_enabled()}  (env AGENT_CONSENT_GUARD_ENABLED)")
+    print(f"  content_mod    : {config.content_moderation_enabled()}  (env AGENT_CONTENT_MODERATION_ENABLED)")
     print(f"  autotag        : {config.autotag_enabled()}  (env AGENT_AUTOTAG_ENABLED)")
     print(f"  spend_cap      : {config.spend_cap_enabled()}  (env AGENT_SPEND_CAP_ENABLED)")
     print(f"  digest         : {config.digest_enabled()}  (env AGENT_DIGEST_ENABLED)")

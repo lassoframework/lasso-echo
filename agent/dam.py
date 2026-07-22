@@ -74,6 +74,39 @@ def consent_blocked(creative_path):
     return True  # unknown = excluded while the guard is armed
 
 
+def set_consent(creative_path, status, member_ref="", granted_by="", note=""):
+    """Write consent to sidecar AND record to consent_log for audit trail.
+    status: 'granted' | 'denied' | 'pending'. Never raises."""
+    try:
+        updates = {"consent": status}
+        if member_ref:
+            updates["member_ref"] = member_ref
+        write_sidecar(creative_path, updates)
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO consent_log "
+                "(asset_path, action, member_ref, granted_by, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (creative_path, status, member_ref or "", granted_by or "", note or ""))
+            conn.commit()
+    except Exception as e:
+        print(f"[dam] set_consent failed for {os.path.basename(creative_path)}: "
+              f"{type(e).__name__}: {e}")
+
+
+def consent_log_entries(asset_path):
+    """Consent audit history for an asset, newest first."""
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT action, member_ref, granted_by, note, recorded_at "
+                "FROM consent_log WHERE asset_path=? ORDER BY id DESC",
+                (asset_path,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 # ---- near-dupe collapse ---------------------------------------------------------------
 def _phash_default(data):
     """8x8 average hash (pillow lazy); None when unreadable / not an image."""

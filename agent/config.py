@@ -550,6 +550,16 @@ def consent_guard_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CONSENT_GUARD_ENABLED", "false"))
 
 
+def content_moderation_enabled() -> bool:
+    """
+    Content moderation switch. OFF by default. ON, the ingest moderator calls
+    Gemini Vision per image; flagged assets move to intake/<client>/review/ with
+    a Slack notice rather than the content library. Video is skipped (image-only
+    pass). Fails open: any API error lets the asset through so uploads never stall.
+    """
+    return _truthy(os.environ.get("AGENT_CONTENT_MODERATION_ENABLED", "false"))
+
+
 def autotag_enabled() -> bool:
     """
     Auto-tag switch. OFF by default. ON, one lowest-cost Gemini vision call per

@@ -36,7 +36,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from . import config, whatsapp_intake
+from . import config, ghl_intake, whatsapp_intake
 from . import portal_routes as _pr
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
@@ -904,6 +904,25 @@ def build_server(port=None):
                 )
                 return self._send_json(resp, status)
 
+            # GHL inbound webhook (POST /ghl/inbound).
+            # 404 while the flag is off; 403 on signature failure; 200 on success.
+            if self.path.split("?")[0] == "/ghl/inbound":
+                if not config.ghl_intake_enabled():
+                    return self._deny(404, "not found")
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(length)
+                result = ghl_intake.handle_webhook(dict(self.headers), raw_body)
+                if result is None:
+                    return self._deny(404, "not found")
+                if not result.get("ok"):
+                    return self._deny(403, "forbidden")
+                body_bytes = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                self.wfile.write(body_bytes)
+                return
             # WhatsApp incoming webhook (POST /whatsapp).
             # 404 while the flag is off; 403 on signature failure; 200 on success.
             # Raw body is read first (signature covers the exact bytes).

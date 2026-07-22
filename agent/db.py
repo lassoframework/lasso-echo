@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS gyms (
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS consent_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_path TEXT NOT NULL,
+  action TEXT NOT NULL,
+  member_ref TEXT DEFAULT '',
+  granted_by TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  recorded_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
