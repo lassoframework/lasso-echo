@@ -943,8 +943,9 @@ def main(argv=None):
         from .listener import _read_last_run_date, _write_last_run_date
         import datetime as _dt
         _today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
-        if _read_last_run_date() == _today:
-            print(f"[run-daily] {_today}: draw already ran today. No-op.")
+        _force = "--force" in argv
+        if not _force and _read_last_run_date() == _today:
+            print(f"[run-daily] {_today}: draw already ran today. No-op. (pass --force to override)")
             sys.exit(0)
         out = run_daily()
         _write_last_run_date(_today)
