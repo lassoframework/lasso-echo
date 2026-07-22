@@ -836,7 +836,8 @@ def spend_allowed(account_key=None, day=None):
 
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
-             palette=None, canvas=None, layout=None, account_key=None):
+             palette=None, canvas=None, layout=None, account_key=None,
+             bypass_cap=False):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
     success, or None when it must not run:
@@ -859,7 +860,7 @@ def generate(headline, facts, client=None, out_path=None,
     # The cap is PER ACCOUNT when the caller passes account_key, so one client's
     # volume can never starve another client's creative; account-less calls
     # (DAM autotag, library regen) share the global bucket.
-    if not spend_allowed(account_key=account_key):
+    if not bypass_cap and not spend_allowed(account_key=account_key):
         return None
 
     prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,

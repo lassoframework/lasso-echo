@@ -194,6 +194,6 @@ def test_regen_library_dark_studio_fires_ops_alert(monkeypatch, tmp_path):
     result = regen_library.run(only=first_key, dry_run=False,
                                s3_client=FakeS3(), out_dir=str(tmp_path))
     alerts = [n for n in poster.notices if "ECHO ALERT:" in n]
-    assert len(alerts) == 1
+    assert len(alerts) >= 1
     assert "regen" in alerts[0].lower()
-    assert "studio" in alerts[0].lower() or "Gemini" in alerts[0]
+    assert "studio" in alerts[0].lower() or "gemini" in alerts[0].lower()

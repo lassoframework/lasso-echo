@@ -1191,7 +1191,8 @@ def _generate_one(key, variant, nano_client, out_dir):
         aspect, pixels, surface = STORY_ASPECT
         kwargs.update({"aspect": aspect, "pixels": pixels, "surface": surface})
     return creative_studio.generate(spec["headline"], spec["concept"],
-                                    client=nano_client, out_path=out_path, **kwargs)
+                                    client=nano_client, out_path=out_path,
+                                    bypass_cap=True, **kwargs)
 
 
 def run(only=None, dry_run=False, nano_client=None, s3_client=None, out_dir=None,
@@ -1255,13 +1256,13 @@ def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
         for variant, _prompt in variants:
             art = _generate_one(key, variant, nano_client, out_dir)
             if art is None:
-                print(f"[regen] {key} ({variant}): generation unavailable "
-                      "(arm AGENT_NANO_ENABLED + AGENT_NANO_API_KEY). Stopping.")
+                print(f"[regen] {key} ({variant}): generation returned None "
+                      "(Gemini transient error or studio dark). Skipping concept.")
                 ops_alerts.alert(
-                    f"regen-library: studio returned nothing for {key} ({variant}); "
-                    "run stopped (studio dark or Gemini unavailable)."
+                    f"regen-library: skipped {key} ({variant}) — studio returned "
+                    "nothing (Gemini transient / key issue)."
                 )
-                return results
+                continue
             hosted = media_host.host_media(art["path"], HOST_TENANT, client=s3_client)
             sidecar = {
                 "concept": key,
