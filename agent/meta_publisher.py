@@ -96,15 +96,26 @@ def publish(draft, account, http=None):
         raise NotSupported(f"Stories are not supported on platform: {account.platform}")
 
     if account.platform == Platform.INSTAGRAM:
-        return _publish_instagram(client, account, draft, full_caption, token)
-    if account.platform == Platform.FACEBOOK_PAGE:
-        return _publish_fb_page(client, account, draft, full_caption, token)
-    if account.platform == Platform.PERSONAL:
+        result = _publish_instagram(client, account, draft, full_caption, token)
+    elif account.platform == Platform.FACEBOOK_PAGE:
+        result = _publish_fb_page(client, account, draft, full_caption, token)
+    elif account.platform == Platform.PERSONAL:
         raise NotSupported(
             "Graph API cannot publish to a personal Facebook profile. "
             "Use a Page or an IG Business/Creator account. See AGENT_README.md."
         )
-    raise NotSupported(f"Unknown platform: {account.platform}")
+    else:
+        raise NotSupported(f"Unknown platform: {account.platform}")
+
+    # Cross-post to Stories on the same account when AGENT_STORY_CROSSPOST_ENABLED=true.
+    # Non-fatal: a story failure never overrides the main publish result.
+    if result.ok and result.mode == "published" and config.story_crosspost_enabled():
+        try:
+            _crosspost_story(client, account, draft, token)
+        except Exception as _se:
+            print(f"[meta] story crosspost skipped ({account.key}): {_se}", flush=True)
+
+    return result
 
 
 def _compose_caption(draft):
@@ -305,8 +316,8 @@ def _publish_instagram_story(client, account, draft, token):
 
 def _publish_fb_page_story(client, account, draft, token):
     """
-    FB Page photo Story: upload the photo unpublished, then attach it to
-    /photo_stories. DORMANT until BOTH the publish flag and the stories flag are
+    FB Page Story. Video -> /video_stories (file_url). Image -> upload unpublished
+    then /photo_stories. DORMANT until BOTH the publish flag and the stories flag are
     armed: publish() short-circuits upstream before this is ever reached.
     """
     page_id = account.get_target_id()
@@ -318,6 +329,15 @@ def _publish_fb_page_story(client, account, draft, token):
             "Host it first. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
+    if _is_video(draft.creative_public_url):
+        r = client.post(
+            f"{base}/{page_id}/video_stories",
+            data={"file_url": draft.creative_public_url, "access_token": token},
+            timeout=60,
+        )
+        _raise_for_status(r)
+        return PublishResult(ok=True, mode="published", media_id=r.json().get("id", ""))
+    # Photo story: upload unpublished then attach
     r1 = client.post(
         f"{base}/{page_id}/photos",
         data={"url": draft.creative_public_url, "published": "false",
@@ -335,6 +355,17 @@ def _publish_fb_page_story(client, account, draft, token):
     body = r2.json()
     return PublishResult(ok=True, mode="published",
                          media_id=body.get("post_id") or body.get("id", ""))
+
+
+def _crosspost_story(client, account, draft, token):
+    """Post the same creative as a Story right after the main reel/image publish.
+    Called only when AGENT_STORY_CROSSPOST_ENABLED=true; errors are caught upstream."""
+    if account.platform == Platform.INSTAGRAM:
+        r = _publish_instagram_story(client, account, draft, token)
+        print(f"[meta] ig story crossposted: {r.media_id}", flush=True)
+    elif account.platform == Platform.FACEBOOK_PAGE:
+        r = _publish_fb_page_story(client, account, draft, token)
+        print(f"[meta] fb story crossposted: {r.media_id}", flush=True)
 
 
 def _publish_fb_page(client, account, draft, caption, token):

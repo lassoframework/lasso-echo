@@ -229,6 +229,14 @@ def stories_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_STORIES_ENABLED", "false"))
 
 
+def story_crosspost_enabled() -> bool:
+    """When armed, every approved reel or image is also cross-posted to Stories
+    on the same account immediately after the main publish succeeds.
+    AGENT_STORY_CROSSPOST_ENABLED (default OFF). Requires AGENT_PUBLISH_ENABLED.
+    Story failures are non-fatal — the main publish result is unaffected."""
+    return _truthy(os.environ.get("AGENT_STORY_CROSSPOST_ENABLED", "false"))
+
+
 def caption_seo_enabled() -> bool:
     """
     2026 caption SEO switch for the content brain. OFF by default = captions are

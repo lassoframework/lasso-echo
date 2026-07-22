@@ -86,6 +86,45 @@ class _FakeHTTP:
     def post(self, url, data=None, timeout=None):
         self.calls.append(url)
         return _FakeResp()
+    def get(self, url, params=None, timeout=None):
+        # Returns FINISHED so _await_container_ready exits immediately
+        class _PollResp:
+            status_code = 200
+            def json(self): return {"status_code": "FINISHED"}
+        return _PollResp()
+
+
+def test_story_crosspost_fires_after_ig_reel(monkeypatch):
+    """When AGENT_STORY_CROSSPOST_ENABLED=true, a second story POST fires after the reel."""
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("AGENT_STORY_CROSSPOST_ENABLED", "true")
+    monkeypatch.setenv("T_TOKEN", "tok")
+    monkeypatch.setenv("T_ID", "ig123")
+    d = Draft(draft_id="d", account_key="t_ig", platform="instagram", caption="c",
+              hashtags=[], creative_path="/lib/reel.mp4",
+              creative_public_url="https://cdn.example.com/reel.mp4",
+              scheduled_for="t")
+    http = _FakeHTTP()
+    meta_publisher.publish(d, _acct(platform=Platform.INSTAGRAM, key="t_ig"), http=http)
+    # Should see at least 4 calls: reel container, reel publish, story container, story publish
+    assert len(http.calls) >= 4
+    assert any("/media" in c for c in http.calls)
+
+
+def test_story_crosspost_off_by_default(monkeypatch):
+    """Without the flag, only the reel calls fire (no story crosspost)."""
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.delenv("AGENT_STORY_CROSSPOST_ENABLED", raising=False)
+    monkeypatch.setenv("T_TOKEN", "tok")
+    monkeypatch.setenv("T_ID", "ig123")
+    d = Draft(draft_id="d", account_key="t_ig", platform="instagram", caption="c",
+              hashtags=[], creative_path="/lib/reel.mp4",
+              creative_public_url="https://cdn.example.com/reel.mp4",
+              scheduled_for="t")
+    http = _FakeHTTP()
+    meta_publisher.publish(d, _acct(platform=Platform.INSTAGRAM, key="t_ig"), http=http)
+    # Only reel container + publish = 2 calls (no story crosspost)
+    assert len(http.calls) == 2
 
 
 def test_fb_reel_posts_to_videos_not_photos(monkeypatch):
