@@ -6,7 +6,28 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-20
+Last updated: 2026-07-22
+
+---
+
+## Auto-approve + story crosspost confirmed live (2026-07-22)
+
+`AGENT_AUTO_APPROVE_ENABLED=true` — posts now publish at schedule time without a Slack
+approval card. A lightweight "Auto-published" notice fires to Slack instead. Gate
+documented in CLAUDE.md; non-negotiable gates otherwise unchanged.
+
+`AGENT_STORY_CROSSPOST_ENABLED=true` — every approved reel/image also posts to IG Story
++ FB Story automatically after the main publish. Confirmed live today: IG story
+`17879609124495208`, FB story `2304453533658075`.
+
+Caption spacing rule fixed in `brand_voice/lasso_house_style.md`: blank lines on
+BEAT SHIFTS only, not every sentence. Related sentences stay in the same paragraph.
+Verified against Blake's example (agencies/cockpit caption). Memory saved.
+
+`run-daily --force` flag added to bypass same-day idempotency (testing + ops use only).
+
+Grade: **B+** (unchanged). Grade moves to A when first client completes a full
+30-day cycle AND Meta App Review is cleared for client-owned pages.
 
 ---
 
