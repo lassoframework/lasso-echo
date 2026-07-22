@@ -342,7 +342,17 @@ def _publish_fb_page(client, account, draft, caption, token):
     if not page_id:
         raise PublishError(f"No Page id for '{account.key}'.")
     base = config.GRAPH_API_BASE
-    if draft.creative_public_url:
+    if draft.creative_public_url and (_is_video(draft.creative_public_url)
+                                      or _is_video(draft.creative_path)):
+        # A reel/video posts to the Page /videos endpoint (file_url), NOT /photos
+        # (which rejects mp4 with "Can't Read Files"). description carries the caption.
+        r = client.post(
+            f"{base}/{page_id}/videos",
+            data={"file_url": draft.creative_public_url, "description": caption,
+                  "access_token": token},
+            timeout=60,
+        )
+    elif draft.creative_public_url:
         r = client.post(
             f"{base}/{page_id}/photos",
             data={"url": draft.creative_public_url, "caption": caption, "access_token": token},

@@ -71,3 +71,34 @@ def test_slack_card_labels_reel():
         for b in blocks if isinstance(b.get("text"), dict)
     )
     assert "Reel — promo.mp4" in text
+
+
+# ---- 5. a FB reel posts to /videos, never /photos (the "Can't Read Files" bug) ----
+class _FakeResp:
+    status_code = 200
+    def json(self):
+        return {"id": "vid_1", "post_id": "p_1"}
+
+
+class _FakeHTTP:
+    def __init__(self):
+        self.calls = []
+    def post(self, url, data=None, timeout=None):
+        self.calls.append(url)
+        return _FakeResp()
+
+
+def test_fb_reel_posts_to_videos_not_photos(monkeypatch):
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("T_TOKEN", "tok")
+    monkeypatch.setenv("T_ID", "page123")
+    d = Draft(draft_id="d", account_key="t_fb", platform="facebook", caption="c",
+              hashtags=[], creative_path="/lib/reel.mp4",
+              creative_public_url="https://cdn.example.com/reel.mp4",
+              scheduled_for="t")
+    http = _FakeHTTP()
+    meta_publisher.publish(d, _acct(platform=Platform.FACEBOOK_PAGE, key="t_fb"),
+                           http=http)
+    joined = " ".join(http.calls)
+    assert "/videos" in joined       # reel goes to the video endpoint
+    assert "/photos" not in joined   # never the photo endpoint (mp4 -> "Can't Read Files")
