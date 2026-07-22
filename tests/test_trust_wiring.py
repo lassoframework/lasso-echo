@@ -213,3 +213,41 @@ def test_seed_calendar_unapproved_never_enters_and_roundtrips(monkeypatch):
     seed_calendar.run("lasso_ig", "2026-07", write=True)
     assert trust.approved_calendar("lasso_ig", "2026-07") == {"cal_ok.png",
                                                               "tapped.png"}
+
+
+# ---- AGENT_AUTO_APPROVE_ENABLED: master bypass, no eligibility check ----------------
+def test_auto_approve_publishes_without_card(monkeypatch):
+    """When AGENT_AUTO_APPROVE_ENABLED=true every PENDING draft publishes — no
+    Slack card, no eligibility check, no trust-level requirement."""
+    monkeypatch.setenv("AGENT_AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.delenv("AGENT_TRUST_AUTOPUBLISH", raising=False)
+
+    class Result:
+        mode = "published"
+        media_id = "M9"
+
+    calls = []
+    import agent.meta_publisher as mp
+    monkeypatch.setattr(mp, "publish", lambda d, a: calls.append(d) or Result())
+    # level-0 account with NO history — would be blocked by trust ladder
+    monkeypatch.setattr("agent.accounts.get_account",
+                        lambda key: _acct(TrustLevel.FULL_APPROVAL, key))
+    d = _draft()
+    poster = RecordingPoster()
+    store = Store()
+    _post_and_save(d, store, poster, idempotent=True)
+    assert calls == [d]                    # published
+    assert poster.cards == []              # no approval card
+    assert d.status == DraftStatus.APPROVED
+    # notice sent (visibility)
+    assert any("Auto-published" in n for n in poster.notices)
+
+
+def test_auto_approve_off_by_default_still_cards(monkeypatch):
+    monkeypatch.delenv("AGENT_AUTO_APPROVE_ENABLED", raising=False)
+    monkeypatch.delenv("AGENT_TRUST_AUTOPUBLISH", raising=False)
+    monkeypatch.delenv("AGENT_TRUST_DRYRUN", raising=False)
+    d = _draft()
+    poster = RecordingPoster()
+    _post_and_save(d, Store(), poster, idempotent=True)
+    assert poster.cards == [d]             # card still required

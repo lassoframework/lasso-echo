@@ -473,6 +473,14 @@ def trust_dryrun_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_TRUST_DRYRUN", "false"))
 
 
+def auto_approve_enabled() -> bool:
+    """Master auto-approve: bypass the Slack approval card entirely and publish
+    each draft at its scheduled time. A lightweight notice is still posted to Slack
+    for visibility. AGENT_AUTO_APPROVE_ENABLED (default OFF).
+    Requires AGENT_PUBLISH_ENABLED to actually write to Meta."""
+    return _truthy(os.environ.get("AGENT_AUTO_APPROVE_ENABLED", "false"))
+
+
 def trust_autopublish_enabled() -> bool:
     """
     Trust AUTOPUBLISH switch. OFF by default; a startup warning prints when

@@ -76,6 +76,7 @@ def _status():
     print("  -- gates --")
     print(f"  master_enabled : {config.master_enabled()}  (env AGENT_ENABLED)")
     print(f"  publish_enabled: {config.publish_enabled()}  (env AGENT_PUBLISH_ENABLED)")
+    print(f"  auto_approve   : {config.auto_approve_enabled()}  (env AGENT_AUTO_APPROVE_ENABLED)")
     print(f"  approver       : {config.APPROVER_SLACK_ID}")
     print(f"  voice doc      : {config.VOICE_DOC_PATH}")
     print(f"  library        : {config.LIBRARY_PATH}")

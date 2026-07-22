@@ -11,7 +11,10 @@ any code, read these three files. They are the source of truth for scope and sta
 3. `echo_build_tracker.html` — the visual dashboard that mirrors PROGRESS.md.
 
 ## Non-negotiable gates (never remove, never weaken)
-- Every post waits for human approval. Approver Slack id: U06EPUUCL13.
+- Approval gate default: every post waits for human approval. Approver Slack id: U06EPUUCL13.
+  Exception: `AGENT_AUTO_APPROVE_ENABLED=true` (armed by Blake 2026-07-22) bypasses the
+  card and publishes at schedule time, but still sends a lightweight "posted" notice to Slack.
+  Do NOT add new auto-approve paths or weaken any other gate.
 - Publishing defaults OFF (`AGENT_PUBLISH_ENABLED=false`). Draft-only until armed by hand.
 - Client content only. No invented facts, offers, prices, or stats. If a required
   note or the voice doc is missing, BLOCK the draft, do not fabricate.

@@ -138,6 +138,29 @@ def _expire_stale(day_key, store, poster):
 
 def _post_and_save(draft, store, poster, idempotent):
     """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
+    # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
+    # entirely. Drafts publish at schedule time; a lightweight notice goes to Slack
+    # so Blake can see what went out without needing to tap anything.
+    if draft.status.value == "pending" and config.auto_approve_enabled():
+        from . import db, postlog
+        from .accounts import get_account
+        from .meta_publisher import publish
+        acct = get_account(draft.account_key)
+        if acct:
+            result = publish(draft, acct)
+            draft.status = DraftStatus.APPROVED
+            postlog.log_post(account_key=draft.account_key, platform=draft.platform,
+                             caption=draft.caption,
+                             media_id=getattr(result, "media_id", ""),
+                             mode=result.mode, draft_id=draft.draft_id)
+            db.audit("auto_approve", draft.draft_id, "AGENT_AUTO_APPROVE_ENABLED",
+                     draft.account_key, draft.day_key)
+            preview = (draft.caption or "")[:80].replace("\n", " ")
+            poster.post_notice(
+                f"Auto-published ({result.mode}): *{draft.account_key}* | "
+                f"{preview}{'...' if len(draft.caption or '') > 80 else ''}")
+            store.put(draft)
+            return
     # Trust ladder wiring (both flags default OFF; nothing changes while off).
     if draft.status.value == "pending" and (
             config.trust_dryrun_enabled() or config.trust_autopublish_enabled()):
