@@ -181,17 +181,53 @@ Captions are B2B StoryBrand. Every caption follows this beat order:
 4. **CTA tucked at the end** — two short lines, single-newline between them.
    The CTA is never loud. It earns the click.
 
+**Caption length — the week must mix SHORT and MEDIUM. Never run the same length 3 days in a row.**
+
+- **SHORT** — Each beat is one tight sentence. 3 to 4 paragraphs, each a single line.
+  Total caption is 3 to 5 lines of copy before hashtags. Punchy. Scrolls in a second.
+- **MEDIUM** — Beats are fleshed out. 3 to 4 paragraphs, some with 2 to 3 sentences grouped
+  together. Total copy is 5 to 9 lines before hashtags.
+- Longer captions (10+ lines) are not the LASSO standard. Use short and medium.
+
 **Paragraph rhythm:**
 - A blank line separates genuine beat SHIFTS only — a new thought, a tonal pivot, a new
   rhetorical move. NOT every sentence.
-- Sentences that continue the same beat or flow naturally from the prior sentence stay in
-  the same paragraph (period + space, no blank line between them).
-- The CTA pair is two lines separated by a single newline `\n` — they belong together
-  and must never be split by a blank line.
+- Sentences that continue the SAME beat and flow directly from each other stay in the
+  same paragraph (period + space, no blank line between them).
+- A standalone hook line that creates a pause or a breath gets its own paragraph.
+  Do NOT run a hook into the next beat by appending a sentence to it.
+- The CTA is its own paragraph. Never append the CTA to the sentence above it.
 - Three to four paragraphs is the target. Five is too many. Do not manufacture extra
   breaks to pad visual length.
 
-**Anti-pattern (wrong):**
+**SHORT example (correct):**
+```
+Honest numbers or no numbers.
+
+Ads, lead nurture, your website, your social, and your reporting.
+
+LASSO puts it all in one place, done for you, so you stop duct taping tools together.
+
+Save this for later.
+```
+
+**MEDIUM example (correct):**
+```
+Agencies send reports. LASSO hands you the cockpit.
+
+We run the same system on ourselves before we ever hand it to you. No guesswork and no bait and switch.
+
+Just the system, run for you.
+```
+
+**Anti-pattern — hook smashed into the next beat (wrong):**
+```
+Honest numbers or no numbers.Ads, lead nurture, your website, your social, and your reporting.
+
+LASSO puts it all in one place...
+```
+
+**Anti-pattern — every sentence its own paragraph (wrong for MEDIUM; only valid for SHORT):**
 ```
 Agencies send reports.
 
@@ -200,15 +236,6 @@ LASSO hands you the cockpit.
 We run the same system on ourselves.
 
 No guesswork.
-```
-
-**Correct:**
-```
-Agencies send reports. LASSO hands you the cockpit.
-
-We run the same system on ourselves before we ever hand it to you. No guesswork and no bait and switch.
-
-Just the system, run for you.
 ```
 
 **Hard copy rules (same as Section 4, enforced here for captions):**
