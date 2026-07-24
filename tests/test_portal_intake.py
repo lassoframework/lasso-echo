@@ -20,13 +20,16 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import client_content, client_sources as cs, db  # noqa: E402
-from agent import intake_ingest, intake_web  # noqa: E402
+from agent import client_content, client_sources as cs, config, db  # noqa: E402
+from agent import intake_ingest, intake_tokens, intake_web  # noqa: E402
 from agent.accounts import Account, Platform  # noqa: E402
 from agent.intake_web import build_server, handle_portal_intake  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
 
-TOKEN = "tok_gym_alpha_portal1"
+# Signed token (the new default path): one shared secret mints it, it carries the
+# client key + HMAC and contains a '.', which the widened route regex accepts.
+SECRET = "intake-signing-secret-for-portal-tests"
+TOKEN = intake_tokens.mint("gym_alpha_ig", secret=SECRET.encode())
 PORTAL = "https://portal.lassoframework.test"
 
 
@@ -73,7 +76,8 @@ _EXPECTED_FACTS = 6
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
-    monkeypatch.setenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", TOKEN)
+    monkeypatch.setenv(config.INTAKE_SIGNING_SECRET_ENV, SECRET)
+    monkeypatch.delenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", raising=False)
     monkeypatch.delenv("AGENT_INTAKE_PORTAL_ORIGIN", raising=False)
     monkeypatch.delenv("AGENT_UPLOAD_BASE_URL", raising=False)
     monkeypatch.setattr(intake_web, "_hits", {})
@@ -255,6 +259,17 @@ def test_no_origin_server_to_server_passes(server, monkeypatch):
     monkeypatch.setattr(intake_web, "_default_r2", lambda: r2)
     status, _h, _b = _post_json(server, f"/intake/{TOKEN}", _BODY)
     assert status == 200
+
+
+# ---- 5b. legacy per-gym env token still verifies (zero-downtime cutover) ---------
+def test_legacy_env_token_still_works(monkeypatch):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)  # no secret
+    monkeypatch.setenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", "legacy_env_token_1")
+    r2 = FakeR2()
+    status, resp = handle_portal_intake("legacy_env_token_1", _BODY, r2=r2)
+    assert status == 200
+    assert resp["account_key"] == "gym_alpha_ig"
 
 
 # ---- 6. body validation -----------------------------------------------------------

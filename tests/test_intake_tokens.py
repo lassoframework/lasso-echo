@@ -1,185 +1,94 @@
 """
-Intake token store tests.
-
-All tests use in-memory or tmp SQLite so no real /data is touched, and no real
-tokens are ever printed or stored as raw values.
+Signed intake token primitive (Phase 1): mint -> verify round-trips; tampering,
+wrong secret, and malformed tokens all yield None (a 404, never a crash); the
+token stays inside the intake route charset [A-Za-z0-9_.-]. Pure module, no I/O
+beyond the secret env var.
 """
 
-import hashlib
-import inspect
 import os
+import re
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import db, intake_tokens  # noqa: E402
+from agent import config, intake_tokens as it  # noqa: E402
+
+SECRET = "s3cret-signing-key-for-tests-only"
+_CHARSET = re.compile(r"^[A-Za-z0-9_.-]{8,}$")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _fresh_conn(tmp_path):
-    """Open a test-isolated SQLite connection with the full schema."""
-    path = str(tmp_path / "tokens_test.db")
-    return db.connect(path)
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    monkeypatch.setenv(config.INTAKE_SIGNING_SECRET_ENV, SECRET)
+    yield
 
 
-def _arm(monkeypatch):
-    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+def test_round_trip():
+    tok = it.mint("gym_alpha_ig")
+    assert it.verify(tok) == "gym_alpha_ig"
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-def test_mint_returns_raw_token_and_stores_hash(monkeypatch, tmp_path):
-    """mint() returns a non-empty string; the db stores the SHA-256 hash, NOT the raw value."""
-    _arm(monkeypatch)
-    conn = _fresh_conn(tmp_path)
-    raw = intake_tokens.mint("gym_alpha", db_conn=conn)
-
-    assert raw and len(raw) > 10, "raw token must be non-empty"
-
-    row = conn.execute(
-        "SELECT intake_token_hash FROM gyms WHERE account_key = 'gym_alpha'"
-    ).fetchone()
-    assert row is not None, "gym row must exist after mint"
-
-    stored_hash = row["intake_token_hash"]
-    expected_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    assert stored_hash == expected_hash, "stored value must be the SHA-256 hash"
-    assert stored_hash != raw, "the raw token must not be stored"
-    conn.close()
+def test_mint_normalizes_case_before_signing():
+    # a caller passing the display-cased key still lands the canonical key
+    tok = it.mint("Gym_Alpha_IG")
+    assert it.verify(tok) == "gym_alpha_ig"
 
 
-def test_rotate_invalidates_old_hash(monkeypatch, tmp_path):
-    """After rotate(), the old hash no longer resolves via client_for_token_data."""
-    _arm(monkeypatch)
-    conn = _fresh_conn(tmp_path)
-
-    raw_old = intake_tokens.mint("gym_beta", db_conn=conn)
-    raw_new = intake_tokens.rotate("gym_beta", db_conn=conn)
-
-    assert raw_old != raw_new, "rotate must produce a new token"
-
-    result_old = intake_tokens.client_for_token_data(raw_old, db_conn=conn)
-    assert result_old is None, "old token must not resolve after rotate"
-
-    result_new = intake_tokens.client_for_token_data(raw_new, db_conn=conn)
-    assert result_new == "gym_beta", "new token must resolve to the gym"
-    conn.close()
+def test_token_is_route_charset_safe():
+    for key in ("gym_alpha_ig", "a_b", "north-naples_fb", "x" * 40):
+        tok = it.mint(key)
+        assert _CHARSET.match(tok), f"token out of charset for {key}: {tok}"
+        assert "=" not in tok  # padding stripped
 
 
-def test_revoke_clears_lookup(monkeypatch, tmp_path):
-    """After revoke(), client_for_token_data returns None for any token."""
-    _arm(monkeypatch)
-    conn = _fresh_conn(tmp_path)
-
-    raw = intake_tokens.mint("gym_gamma", db_conn=conn)
-    assert intake_tokens.client_for_token_data(raw, db_conn=conn) == "gym_gamma"
-
-    intake_tokens.revoke("gym_gamma", db_conn=conn)
-    assert intake_tokens.client_for_token_data(raw, db_conn=conn) is None
-    conn.close()
+def test_two_keys_two_tokens():
+    assert it.mint("gym_a_ig") != it.mint("gym_b_ig")
 
 
-def test_client_for_token_data_constant_time(monkeypatch, tmp_path):
-    """client_for_token_data must use hmac.compare_digest for constant-time comparison."""
-    source = inspect.getsource(intake_tokens.client_for_token_data)
-    assert "hmac.compare_digest" in source, (
-        "client_for_token_data must use hmac.compare_digest for constant-time comparison"
-    )
+def test_tampered_client_key_fails():
+    tok = it.mint("gym_alpha_ig")
+    key_part, _, sig_part = tok.partition(".")
+    forged = it._b64url(b"gym_victim_ig") + "." + sig_part
+    assert it.verify(forged) is None
 
 
-def test_double_mint_raises(monkeypatch, tmp_path):
-    """Minting twice on the same account without --rotate raises ValueError."""
-    _arm(monkeypatch)
-    conn = _fresh_conn(tmp_path)
-
-    intake_tokens.mint("gym_delta", db_conn=conn)
-    with pytest.raises(ValueError, match="already has an active token"):
-        intake_tokens.mint("gym_delta", db_conn=conn)
-    conn.close()
+def test_tampered_signature_fails():
+    tok = it.mint("gym_alpha_ig")
+    key_part, _, sig_part = tok.partition(".")
+    # flip the last char of the signature to something else in the charset
+    flipped = sig_part[:-1] + ("A" if sig_part[-1] != "A" else "B")
+    assert it.verify(key_part + "." + flipped) is None
 
 
-def test_flag_off_mint_raises_or_returns_none(monkeypatch, tmp_path):
-    """When AGENT_ONBOARD_AUTOMINT=false, mint() raises RuntimeError (flag-off guard)."""
-    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "false")
-    conn = _fresh_conn(tmp_path)
-
-    with pytest.raises(RuntimeError, match="AGENT_ONBOARD_AUTOMINT is OFF"):
-        intake_tokens.mint("gym_epsilon", db_conn=conn)
-    conn.close()
+def test_wrong_secret_fails():
+    tok = it.mint("gym_alpha_ig")
+    assert it.verify(tok, secret=b"a-completely-different-secret") is None
 
 
-def test_token_status_active_revoked(monkeypatch, tmp_path):
-    """token_status returns ACTIVE after mint, REVOKED after revoke."""
-    _arm(monkeypatch)
-    conn = _fresh_conn(tmp_path)
-
-    intake_tokens.mint("gym_zeta", db_conn=conn)
-    st_before = intake_tokens.token_status("gym_zeta", db_conn=conn)
-    assert st_before["status"] == "ACTIVE"
-    assert st_before["rotated_at"] is not None
-
-    intake_tokens.revoke("gym_zeta", db_conn=conn)
-    st_after = intake_tokens.token_status("gym_zeta", db_conn=conn)
-    assert st_after["status"] == "REVOKED"
-
-    conn.close()
+def test_malformed_tokens_return_none():
+    for bad in ("", "no-separator", ".", "a.", ".b", "!!.??", "gym_alpha_ig"):
+        assert it.verify(bad) is None
 
 
-# ---- Encryption at rest (AGENT_INTAKE_ENC_KEY) --------------------------------
-
-def test_encrypted_token_stored_when_key_set(monkeypatch, tmp_path):
-    """When AGENT_INTAKE_ENC_KEY is set, mint stores an encrypted blob."""
-    from cryptography.fernet import Fernet
-    key = Fernet.generate_key().decode()
-    _arm(monkeypatch)
-    monkeypatch.setenv("AGENT_INTAKE_ENC_KEY", key)
-    conn = _fresh_conn(tmp_path)
-
-    raw = intake_tokens.mint("gym_enc", db_conn=conn)
-    row = conn.execute(
-        "SELECT intake_token_encrypted FROM gyms WHERE account_key='gym_enc'"
-    ).fetchone()
-    assert row is not None
-    assert row["intake_token_encrypted"] is not None, "encrypted blob must be stored"
-
-    recovered = intake_tokens.decrypt_token("gym_enc", db_conn=conn)
-    assert recovered == raw, "decrypt_token must recover the original raw token"
-    conn.close()
+def test_no_secret_verify_is_none(monkeypatch):
+    good = it.mint("gym_alpha_ig")
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)
+    assert it.verify(good) is None
+    assert it.secret_present() is False
 
 
-def test_no_encrypted_blob_when_key_not_set(monkeypatch, tmp_path):
-    """Without AGENT_INTAKE_ENC_KEY, intake_token_encrypted stays NULL."""
-    _arm(monkeypatch)
-    monkeypatch.delenv("AGENT_INTAKE_ENC_KEY", raising=False)
-    conn = _fresh_conn(tmp_path)
-
-    intake_tokens.mint("gym_noenc", db_conn=conn)
-    row = conn.execute(
-        "SELECT intake_token_encrypted FROM gyms WHERE account_key='gym_noenc'"
-    ).fetchone()
-    assert row is not None
-    assert row["intake_token_encrypted"] is None, "no encrypted blob without key"
-    assert intake_tokens.decrypt_token("gym_noenc", db_conn=conn) is None
-    conn.close()
+def test_no_secret_mint_raises(monkeypatch):
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)
+    with pytest.raises(ValueError):
+        it.mint("gym_alpha_ig")
 
 
-def test_revoke_clears_encrypted_blob(monkeypatch, tmp_path):
-    """After revoke(), intake_token_encrypted is NULL so the link cannot be recovered."""
-    from cryptography.fernet import Fernet
-    key = Fernet.generate_key().decode()
-    _arm(monkeypatch)
-    monkeypatch.setenv("AGENT_INTAKE_ENC_KEY", key)
-    conn = _fresh_conn(tmp_path)
+def test_empty_client_key_mint_raises():
+    with pytest.raises(ValueError):
+        it.mint("")
 
-    intake_tokens.mint("gym_revenc", db_conn=conn)
-    assert intake_tokens.decrypt_token("gym_revenc", db_conn=conn) is not None
-    intake_tokens.revoke("gym_revenc", db_conn=conn)
-    assert intake_tokens.decrypt_token("gym_revenc", db_conn=conn) is None
-    conn.close()
+
+def test_secret_present_true_when_set():
+    assert it.secret_present() is True

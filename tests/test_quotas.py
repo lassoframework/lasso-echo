@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import db, intake_web, ops_alerts, quotas, tenants, token_watchdog  # noqa: E402
+from agent import config, db, intake_web, ops_alerts, quotas, tenants, token_watchdog  # noqa: E402
 
 
 class FakeR2:
@@ -136,19 +136,39 @@ def test_no_tenant_record_has_nothing_to_spend(monkeypatch, tmp_path):
 
 # ---- token watchdog covers tenant tokens --------------------------------------------------------
 
-def test_watchdog_flags_missing_tenant_token(monkeypatch, tmp_path):
+def test_watchdog_flags_dead_link_when_no_secret_no_legacy(monkeypatch, tmp_path):
+    # No shared signing secret AND no legacy per-tenant token = a dead link.
     _tenant(monkeypatch, tmp_path, key="tokgym", lanes=("upload", "sms"))
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)
     monkeypatch.delenv("AGENT_INTAKE_TOKEN_TOKGYM", raising=False)
     fired = []
     monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: fired.append(msg))
     results = token_watchdog.check_tenant_tokens(base_dir=str(tmp_path))
     row = next(r for r in results if r["tenant"] == "tokgym")
     assert row["status"] == "missing_token"
-    assert any("tokgym" in m and "dead" in m for m in fired)
+    # ONE aggregate alert names the shared secret, not one alert per tenant.
+    assert len(fired) == 1
+    assert "AGENT_INTAKE_SIGNING_SECRET" in fired[0] and "dead" in fired[0]
 
 
-def test_watchdog_passes_when_token_set_and_never_prints_it(monkeypatch, tmp_path):
+def test_watchdog_ok_when_shared_secret_set_no_per_gym_token(monkeypatch, tmp_path):
+    # The whole point: the shared secret covers every upload-lane tenant, no
+    # per-gym env var, no alert.
+    _tenant(monkeypatch, tmp_path, key="signedgym", lanes=("upload",))
+    monkeypatch.setenv(config.INTAKE_SIGNING_SECRET_ENV, "shared-signing-secret")
+    monkeypatch.delenv("AGENT_INTAKE_TOKEN_SIGNEDGYM", raising=False)
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda msg, **kw: fired.append(msg))
+    results = token_watchdog.check_tenant_tokens(base_dir=str(tmp_path))
+    row = next(r for r in results if r["tenant"] == "signedgym")
+    assert row["status"] == "ok"
+    assert fired == []
+
+
+def test_watchdog_passes_on_legacy_token_and_never_prints_it(monkeypatch, tmp_path):
+    # A pinned legacy override still counts as a live link during the cutover.
     _tenant(monkeypatch, tmp_path, key="tokgym2", lanes=("upload",))
+    monkeypatch.delenv(config.INTAKE_SIGNING_SECRET_ENV, raising=False)
     secret_value = "tok_super_secret_value_999"
     monkeypatch.setenv("AGENT_INTAKE_TOKEN_TOKGYM2", secret_value)
     fired = []

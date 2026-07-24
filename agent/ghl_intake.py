@@ -27,7 +27,7 @@ Nothing here publishes or drafts. The reply hook is an injected callable
 import base64
 import os
 
-from . import config, media_inbox, ops_alerts, tenants
+from . import config, intake_tokens, media_inbox, ops_alerts, tenants
 
 _UPLOAD_TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 
@@ -49,13 +49,21 @@ def _verify_default(signature_b64, body_bytes):
 
 
 def upload_link_for(tenant_key):
-    """The tenant's tokenized upload link, or '' when the token env is not set
-    (the reply then says the link is coming rather than sending a dead URL)."""
-    token = os.environ.get(f"{_UPLOAD_TOKEN_ENV_PREFIX}{tenant_key.upper()}", "")
+    """The tenant's tokenized upload link, or '' when it cannot be built (the reply
+    then says the link is coming rather than sending a dead URL). The link is
+    SIGNED with the shared secret, so no per-tenant env var is needed. A legacy
+    AGENT_INTAKE_TOKEN_<KEY> value, if still set, is honored as a pinned override
+    so a tenant already on the old link keeps it during the cutover."""
     base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").rstrip("/")
-    if not token or not base:
+    if not base:
         return ""
-    return f"{base}/u/{token}"
+    legacy = os.environ.get(f"{_UPLOAD_TOKEN_ENV_PREFIX}{tenant_key.upper()}", "")
+    if legacy:
+        return f"{base}/u/{legacy}"
+    try:
+        return f"{base}/u/{intake_tokens.mint(tenant_key)}"
+    except ValueError:
+        return ""   # no signing secret set yet
 
 
 def _video_reply(tenant_key):

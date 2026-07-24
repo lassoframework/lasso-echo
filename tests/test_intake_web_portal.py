@@ -1,8 +1,11 @@
 """
-Tests for Stage 2 T3: intake-web data-store token lookup, per-token rate limit,
-and portal gym endpoint.
+Tests for per-token rate limit and portal gym endpoint.
 
-All tests are OFFLINE: mock db, injectable R2, no live network calls.
+Token lookup tests for the HMAC-signed path live in test_intake_tokens.py and
+test_portal_intake.py. The DB-backed client_for_token_data tests were removed
+when HMAC signing superseded the per-gym token store.
+
+All tests are OFFLINE: injectable R2, no live network calls.
 """
 
 import hashlib
@@ -22,7 +25,7 @@ def _sha256(token):
 
 
 def _make_db():
-    """In-memory SQLite db with the merged gyms table (all columns from T1–T3)."""
+    """In-memory SQLite db with the gyms table schema."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.executescript("""
@@ -48,11 +51,6 @@ def _make_db():
 
 def _insert_gym(conn, account_key, token=None, status="ACTIVE", upload_link=None,
                 gym_name=None):
-    """Insert a gym row using the real schema columns.
-    token is hashed into both intake_token_hash (for client_for_token_data lookup)
-    and token_sha256 (legacy / portal endpoint column).
-    token_revoked is set to 0 for ACTIVE, 1 for REVOKED to match the real logic.
-    """
     fp = _sha256(token) if token else None
     revoked = 1 if status == "REVOKED" else 0
     conn.execute(
@@ -77,29 +75,7 @@ class FakeR2WithList:
         return [k for k in self._keys if k.startswith(prefix)]
 
 
-# ---- 1. client_for_token checks data store when automint ON --------------------
-
-def test_client_for_token_checks_data_store(monkeypatch):
-    """When automint ON, client_for_token calls client_for_token_data first."""
-    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
-    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
-    # No env token set for this gym.
-    monkeypatch.delenv("AGENT_INTAKE_TOKEN_GYMSTORE", raising=False)
-
-    conn = _make_db()
-    token = "store-tok-abcdef1234"
-    _insert_gym(conn, "gymstore", token=token, status="ACTIVE")
-
-    # Import the real function once to avoid recursive patching.
-    from agent.intake_tokens import client_for_token_data as _real_cftd
-
-    # Patch to call the real implementation with our in-memory db connection.
-    monkeypatch.setattr("agent.intake_tokens.client_for_token_data",
-                        lambda t, db_conn=None: _real_cftd(t, db_conn=conn))
-
-    result = intake_web.client_for_token(token)
-    assert result == "gymstore"
-
+# ---- 1. client_for_token env fallback ------------------------------------------
 
 def test_client_for_token_env_fallback(monkeypatch):
     """When automint OFF, env fallback still works (flag-OFF path byte-identical)."""
@@ -111,41 +87,7 @@ def test_client_for_token_env_fallback(monkeypatch):
     assert result == "gymenv"
 
 
-def test_client_for_token_env_fallback_when_automint_on(monkeypatch):
-    """When automint ON but token not in db, env var fallback still resolves."""
-    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
-    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
-    monkeypatch.setenv("AGENT_INTAKE_TOKEN_GYMFALLBACK", "fallback-tok-8888")
-
-    # Patch data store to return None (token not in db).
-    monkeypatch.setattr("agent.intake_tokens.client_for_token_data",
-                        lambda t, db_conn=None: None)
-
-    result = intake_web.client_for_token("fallback-tok-8888")
-    assert result == "gymfallback"
-
-
-# ---- 2. Revoked token rejected -------------------------------------------------
-
-def test_revoked_token_rejected(monkeypatch):
-    """A REVOKED token returns None from client_for_token."""
-    monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
-    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
-    monkeypatch.delenv("AGENT_INTAKE_TOKEN_GYMREVOKED", raising=False)
-
-    conn = _make_db()
-    token = "revoked-tok-54321xyz"
-    _insert_gym(conn, "gymrevoked", token=token, status="REVOKED")
-
-    from agent.intake_tokens import client_for_token_data as _real_cftd
-    monkeypatch.setattr("agent.intake_tokens.client_for_token_data",
-                        lambda t, db_conn=None: _real_cftd(t, db_conn=conn))
-
-    result = intake_web.client_for_token(token)
-    assert result is None
-
-
-# ---- 3. Per-token rate limit ---------------------------------------------------
+# ---- 2. Per-token rate limit ---------------------------------------------------
 
 def test_per_token_rate_limit(monkeypatch):
     """21 calls on same token hash prefix triggers 429 on the 21st."""
@@ -179,7 +121,7 @@ def test_per_token_rate_limit_constant():
     assert intake_web._TOKEN_RATE_PER_MINUTE == 20
 
 
-# ---- 4. Portal endpoint returns gym info when flag ON --------------------------
+# ---- 3. Portal endpoint returns gym info when flag ON --------------------------
 
 def test_portal_endpoint_returns_gym_info(monkeypatch):
     """GET /portal/gym/<key> returns JSON with account_key and intake_status."""
@@ -253,7 +195,7 @@ def test_portal_endpoint_not_found(monkeypatch):
     assert "not found" in body["error"]
 
 
-# ---- 5. Portal endpoint 403 when flag OFF --------------------------------------
+# ---- 4. Portal endpoint 403 when flag OFF --------------------------------------
 
 def test_portal_endpoint_flag_off_returns_403(monkeypatch):
     """AGENT_PORTAL_APPROVALS OFF returns 403."""

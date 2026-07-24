@@ -208,16 +208,17 @@ def test_onboard_pending_items_include_first_month_plan(tmp_path):
 def test_onboard_automint_mints_token(tmp_path, monkeypatch):
     """When AGENT_ONBOARD_AUTOMINT=true, token_minted is a URL-safe string of at least 40 chars."""
     monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-automint-secret")
     result = _run(tmp_path, "gymautomint", "Auto Mint Gym",
                   monkeypatch=monkeypatch, automint=False)
     assert isinstance(result["token_minted"], str)
-    # secrets.token_urlsafe(32) yields 43 chars; stubs may yield 44. Accept >= 40.
     assert len(result["token_minted"]) >= 40
 
 
 def test_onboard_automint_idempotent_no_remint(tmp_path, monkeypatch):
-    """Second run with AUTOMINT on returns token_minted=False (already set)."""
+    """HMAC mode: second run returns the same deterministic token (idempotent)."""
     monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-idempotent-secret")
     voice_dir = str(tmp_path / "brand_voice")
     brains_dir = str(tmp_path / "brains")
     r1 = onboard.run("gymremint", "Re Mint Gym",
@@ -225,12 +226,14 @@ def test_onboard_automint_idempotent_no_remint(tmp_path, monkeypatch):
     assert isinstance(r1["token_minted"], str)
     r2 = onboard.run("gymremint", "Re Mint Gym",
                      voice_dir=voice_dir, brains_dir=brains_dir)
-    assert r2["token_minted"] is False
+    # HMAC minting is deterministic: same key + same secret = same token
+    assert r2["token_minted"] == r1["token_minted"]
 
 
 def test_onboard_upload_link_generated(tmp_path, monkeypatch):
     """upload_link is set when base_url is provided and token is minted."""
     monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-link-secret")
     result = _run(tmp_path, "gymlink", "Link Gym",
                   base_url="https://intake.example.com",
                   monkeypatch=monkeypatch, automint=False)
@@ -265,6 +268,7 @@ def test_onboard_result_keys_complete(tmp_path):
 def test_onboard_upload_link_persisted_in_db(tmp_path, monkeypatch):
     """upload_link is stored in the gyms row so the portal can return it later."""
     monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-db-persist-secret")
     voice_dir = str(tmp_path / "brand_voice")
     brains_dir = str(tmp_path / "brains")
     onboard.run("gymlinkdb", "Link DB Gym",
@@ -279,6 +283,7 @@ def test_onboard_upload_link_persisted_in_db(tmp_path, monkeypatch):
 def test_onboard_base_url_from_env(tmp_path, monkeypatch):
     """When AGENT_UPLOAD_BASE_URL is set, the CLI picks it up without --base-url."""
     monkeypatch.setenv("AGENT_ONBOARD_AUTOMINT", "true")
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-base-url-secret")
     monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "https://upload.lasso.test")
     voice_dir = str(tmp_path / "brand_voice")
     brains_dir = str(tmp_path / "brains")

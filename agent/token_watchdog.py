@@ -64,29 +64,35 @@ def _check_one(client, account, now, warn_days, poster):
 
 def check_tenant_tokens(poster=None, base_dir=None):
     """
-    Stage 2 tenant upload tokens (Part 9): for every tenant whose media lanes
-    include the upload endpoint, warn when AGENT_INTAKE_TOKEN_<KEY> is not set
-    (its texted link would be a dead URL). READS env presence only; the token
-    VALUE is never printed, logged, or included in an alert. Returns one result
-    dict per upload-lane tenant.
+    Upload-lane tenants: their texted links are now SIGNED with one shared secret
+    (AGENT_INTAKE_SIGNING_SECRET), so no per-tenant env var is needed. A tenant's
+    link is dead only when NEITHER the shared secret NOR a legacy per-tenant
+    override (AGENT_INTAKE_TOKEN_<KEY>) is set. READS presence only; no token or
+    secret VALUE is ever printed, logged, or alerted. When the shared secret is
+    missing, ONE aggregate alert fires (a missing secret kills every signed link
+    at once), never one alert per tenant. Returns one result dict per upload-lane
+    tenant.
     """
     import os as _os
-    from . import tenants
-    results = []
+    from . import intake_tokens, tenants
+    secret_ok = intake_tokens.secret_present()
+    results, upload_tenants = [], []
     for key in tenants.list_tenants(base_dir=base_dir):
         rec = tenants.load_tenant(key, base_dir=base_dir) or {}
         if "upload" not in (rec.get("media_lanes") or []):
             continue
-        present = bool(_os.environ.get(f"AGENT_INTAKE_TOKEN_{key.upper()}"))
-        results.append({"tenant": key,
-                        "status": "ok" if present else "missing_token"})
-        if not present:
-            ops_alerts.alert(
-                f"upload token for tenant {key} is NOT set "
-                f"(AGENT_INTAKE_TOKEN_{key.upper()}): its upload link is dead. "
-                "Set the token by hand in env.",
-                poster=poster, force=True,
-            )
+        legacy = bool(_os.environ.get(f"AGENT_INTAKE_TOKEN_{key.upper()}"))
+        ok = secret_ok or legacy
+        results.append({"tenant": key, "status": "ok" if ok else "missing_token"})
+        upload_tenants.append(key)
+    dead = [r["tenant"] for r in results if r["status"] == "missing_token"]
+    if upload_tenants and not secret_ok and dead:
+        ops_alerts.alert(
+            f"AGENT_INTAKE_SIGNING_SECRET is not set: signed upload links are dead "
+            f"for {len(dead)} tenant(s) with no legacy token. Set the shared secret "
+            "by hand on the intake-web / listener service.",
+            poster=poster, force=True,
+        )
     return results
 
 

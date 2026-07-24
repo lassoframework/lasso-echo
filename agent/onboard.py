@@ -201,16 +201,21 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
 
     # (b) Token minting ---------------------------------------------------
     if config.onboard_automint_enabled():
-        status = _token_status(account_key)
-        # Real token_status returns {"status": "ACTIVE"|"REVOKED"|"NOT_SET", ...}
-        # Stub returned {"has_token": bool, ...}. Support both for safety.
-        already_minted = (status.get("status") == "ACTIVE") or bool(status.get("has_token"))
-        if already_minted:
-            result["token_minted"] = False
+        from . import intake_tokens as _it
+        if _it.secret_present():
+            # HMAC mode: mint is deterministic from the shared secret — always
+            # returns the same token for the same gym key, never re-randomizes.
+            raw_token = _it.mint(account_key, db_conn=db_conn)
+            result["token_minted"] = raw_token
         else:
-            from . import intake_tokens
-            raw_token = intake_tokens.mint(account_key, db_conn=db_conn)
-            result["token_minted"] = raw_token   # caller only: never written to file/log
+            # DB-backed mode: check if already minted so we don't re-randomize.
+            status = _token_status(account_key)
+            already_minted = (status.get("status") == "ACTIVE") or bool(status.get("has_token"))
+            if already_minted:
+                result["token_minted"] = False
+            else:
+                raw_token = _it.mint(account_key, db_conn=db_conn)
+                result["token_minted"] = raw_token
     else:
         result["token_minted"] = None   # skipped, pending by hand
 
