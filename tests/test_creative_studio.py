@@ -157,11 +157,11 @@ def test_prompt_locks_house_style_and_varies_subject():
     p = creative_studio.build_prompt(headline, [body])
     low = p.lower()
 
-    # a locked, consistent house look (illustrated-diagram concept)
+    # a locked, consistent house look (data-visualization concept)
     assert "house style" in low
     assert "minimal" in low
-    assert "illustrated diagram" in low
-    assert "consistent stroke weight" in low
+    assert "typographic data visualization" in low
+    assert "flat icons" in low
     assert "negative space" in low
     assert "not a busy poster" in low
     # 4:5 PORTRAIT canvas for IG/FB feed

@@ -1,9 +1,9 @@
 """
-Illustrated-diagram house style tests. Asserts the generated-card prompt carries the
-locked style constraints (cream canvas, navy headline, illustrated diagram with
-uppercase labels and flow arrows, single red accent, one idea per card, no text-only
-slabs), and that the rotation guard excludes OFF-STYLE library cards while IN-STYLE
-cards still rotate. Offline.
+House style tests. Asserts the generated-card prompt carries the locked style
+constraints (cream canvas, navy headline, clean data visualization with uppercase
+labels and flow arrows, single red accent, one idea per card, no text-only slabs),
+and that the rotation guard excludes OFF-STYLE library cards while IN-STYLE cards
+still rotate. Offline.
 """
 
 import json
@@ -25,9 +25,9 @@ def test_prompt_carries_illustrated_diagram_style():
     # navy headline, top, the only large text
     assert "navy" in low and "headline at the top" in low
     assert "the only large text" in low
-    # illustrated diagram: line icons, uppercase labels, flow arrows
-    assert "illustrated diagram" in low
-    assert "line-icon illustrations" in low
+    # clean data visualization: flat icons, uppercase labels, flow arrows
+    assert "typographic data visualization" in low
+    assert "flat icons" in low
     assert "uppercase labels" in low
     assert "flow arrows" in low
     # one idea, no text slabs
@@ -57,7 +57,7 @@ def test_story_prompt_same_style_designed_from_scratch():
     low = p.lower()
     assert "9:16" in p and "1080x1920" in p
     assert "never a cropped, stretched, or reused feed card" in low
-    assert "illustrated diagram" in low          # same house style, own composition
+    assert "typographic data visualization" in low  # same house style, own composition
     assert "cream #faf6f0: the canvas" in low
 
 

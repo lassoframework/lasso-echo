@@ -20,12 +20,12 @@ BRAND_HEXES = ("#121E3C", "#FF0000", "#5EB9E6", "#FAF6F0")
 
 STRUCTURE_MARKS = {
     "flow": ["archetype flow", "vertical", "flow arrows", "headline at the top"],
-    "split": ["archetype split", "two side contrast", "one side muted",
+    "split": ["archetype split", "contrast layout", "muted",
               "winning side", "headline at the top"],
-    "hero": ["archetype hero", "one large central illustration",
+    "hero": ["archetype hero", "one large clean data element",
              "maximum negative space", "two small uppercase labels",
              "headline at the top"],
-    "path": ["archetype path", "winding journey path", "begins at the bottom",
+    "path": ["archetype path", "staged progression", "begins at the bottom",
              "ends at the top", "final stop"],
     "headline": ["archetype headline", "typography forward", "centered in the middle",
                  "no diagram", "use sparingly"],

@@ -323,7 +323,9 @@ CONCEPTS = {
         "headline": "$35,000 in wasted gym ad spend. Found. Named. Fixed.",
         "cite": ["The Ad Engine has caught more than $35,000 in wasted gym ad "
                  "spend. One recent audit cycle flagged over $17,000."],
-        "concept": ["Visual: a clean two-column audit table on a navy background.",
+        "concept": ["Tension: $35,000 in wasted gym ad spend sitting inside live campaigns, undetected.",
+                    "Resolution: the audit engine surfaces every dollar, names it, and marks it fixed.",
+                    "Visual: a clean two column audit table on a navy background.",
                     "Left column labeled FLAGGED: 3 to 4 campaign rows, each with a red status dot, a short campaign name, and a dollar amount in red. Total row at the bottom: $35,000 WASTED.",
                     "Right column labeled FIXED: same rows, now with green checkmarks and the dollar amounts reclaimed. Total row: $35,000 RECOVERED.",
                     "No illustrated scenes, no metaphors, no cartoon elements. Looks like a real audit output.",
@@ -335,7 +337,7 @@ CONCEPTS = {
         "layout": "chart",
         "canvas": "navy",
         "archetype": "headline",
-        "art_directive": "Clean data visualization only. A structured table or audit report layout. Navy background #121E3C, red #FF0000 for flagged items, sky blue #5EB9E6 for labels, white text. No illustrated scenes, no cartoon figures, no metaphorical imagery, no dripping money, no safes, no gym equipment. This must look like a real data dashboard output, not concept art.",
+        "art_directive": "Data visualization realism: this card must look like a real audit dashboard output, not concept art. Structured table layout on navy background #121E3C. Red #FF0000 for flagged items, sky blue #5EB9E6 for column labels, white text. No illustrated scenes, no cartoon figures, no metaphorical imagery, no dripping money, no safes, no gym equipment.",
     },
     "b2b_dynamic_spend": {
         "headline": "Your ad budget should follow signups.",

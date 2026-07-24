@@ -147,7 +147,7 @@ def test_dry_run_spends_nothing(monkeypatch, tmp_path, capsys):
     assert all(v["dry_run"] for v in out.values())
     assert os.listdir(lib) == []                               # no files written
     printed = capsys.readouterr().out
-    assert "one_screen" in printed and "ILLUSTRATED DIAGRAM" in printed
+    assert "one_screen" in printed and "STEP DIAGRAM" in printed
 
 
 # ---- rotation eligibility: v2 in, old exclusions hold, story never feed --------

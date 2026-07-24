@@ -52,7 +52,7 @@ These rules apply to every card, every surface, every model:
 3. The stat slab is retired: one colossal number as the card hero is banned.
 4. One red element maximum. Never a red background. Never two red elements.
 5. No centered symmetric compositions. Every card is left-aligned and asymmetric.
-6. No abstract symbolism. Images show concrete gym owner scenes only.
+6. No illustrated scenes, no cartoon figures, no metaphorical imagery, no AI-looking art. Visual elements are clean flat icons, structured data layouts, and step diagrams only.
 7. No STEP 1 / STEP 2 / STEP 3 labels in the illustrated element.
 
 ---
@@ -158,15 +158,18 @@ ONE RED ACCENT: exactly one element on the entire card uses red (#FF0000 or
   one arrow tip. Never a red background. Never two red elements.
 ```
 
-### Block D: Illustrated Element
+### Block D: Visual Element
 
 ```
-ILLUSTRATED ELEMENT: [ARCHETYPE BLOCK from the archetype system in creative_studio.py]
-  The illustration depicts a CONCRETE SCENE from a gym owner's world.
-  No abstract symbols. No generic business icons.
-  Banned labels: STEP 1, STEP 2, STEP 3, GROW, PLAN, LEARN, DISCOVER.
-  Allowed labels: LEADS, NO FOLLOW UP, BOOKED, SHOWED, MEMBERS, and other
-  words a gym owner uses.
+VISUAL ELEMENT: [ARCHETYPE BLOCK from the archetype system in creative_studio.py]
+  Premium B2B agency quality. Clean, professional, never illustrated-scene or
+  AI-generated looking. Allowed: flat icons (1-2 max), structured tables, step
+  diagrams with labeled nodes, data callouts, comparison columns, minimal flow
+  arrows. Banned: illustrated scenes, people in action, cartoon figures,
+  metaphorical imagery, 3D effects, generic process labels (STEP 1, STEP 2,
+  STEP 3, GROW, PLAN, LEARN, DISCOVER).
+  Required labels: real business language — LEADS, BOOKED, SHOWED, CLOSED,
+  FOLLOW UP, AD SPEND, COST PER LEAD.
 ```
 
 ---

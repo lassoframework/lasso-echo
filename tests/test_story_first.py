@@ -1,7 +1,7 @@
 """
-Story-first card tests (the stranger test). Asserts: the STORY REQUIREMENT rides
-every archetype's prompt (concrete gym-world scene, tension + resolution, the
-banned generic label list, the stranger test itself); every concept context is a
+Quality-standard card tests. Asserts: the QUALITY STANDARD (new style direction)
+rides every archetype's prompt (premium B2B agency quality, banned illustrated
+scenes, banned generic labels, the two-second test); every concept context is a
 Tension/Resolution micro story; no banned generic label appears anywhere in an
 assembled prompt OUTSIDE the ban statement itself. Offline.
 """
@@ -19,22 +19,22 @@ BANNED_LABELS = ("STEP 1", "STEP 2", "STEP 3", "PLAN", "GROW", "LEARN",
 
 
 def _without_ban_statement(prompt):
-    """The prompt with the story-requirement block removed, so the ban list's own
+    """The prompt with the quality-standard block removed, so the ban list's own
     wording does not count against the check."""
     return prompt.replace(creative_studio.STORY_REQUIREMENT, "")
 
 
-# ---- the spec carries the story requirement on every archetype -----------------
+# ---- the spec carries the quality standard on every archetype -----------------
 def test_story_requirement_on_every_archetype():
     for arch in creative_studio.ARCHETYPES:
         p = creative_studio.build_prompt("A headline.", ["Tension: x.", "Resolution: y."],
                                          archetype=arch)
         low = p.lower()
-        assert "concrete scene" in low, arch
-        assert "gym owner's world" in low, arch
-        assert "tension and a resolution" in low, arch
-        assert "never heard of lasso" in low, arch        # the stranger test, stated
-        assert "banned generic process labels" in low, arch
+        assert "quality standard" in low, arch
+        assert "premium b2b agency" in low, arch
+        assert "two-second test" in low, arch
+        assert "banned" in low, arch
+        assert "illustrated scenes" in low, arch
         for label in BANNED_LABELS:
             assert label in p, arch                        # the ban list itself is present
 
@@ -43,7 +43,7 @@ def test_story_requirement_rides_story_surface_too():
     p = creative_studio.build_prompt("H", ["Tension: x.", "Resolution: y."],
                                      archetype="split", aspect="9:16",
                                      pixels="1080x1920", surface="story")
-    assert "stranger test" in p.lower() or "never heard of lasso" in p.lower()
+    assert "two-second test" in p.lower() or "premium b2b agency" in p.lower()
 
 
 # ---- every concept context is a tension/resolution micro story ------------------
