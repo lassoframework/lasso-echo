@@ -323,8 +323,10 @@ CONCEPTS = {
         "headline": "$35,000 in wasted gym ad spend. Found. Named. Fixed.",
         "cite": ["The Ad Engine has caught more than $35,000 in wasted gym ad "
                  "spend. One recent audit cycle flagged over $17,000."],
-        "concept": ["Tension: ad spend leaking out of a campaign dashboard nobody reads, money dripping away unnoticed.",
-                    "Resolution: the engine reading every campaign line and flagging the leak, the waste caught and named.",
+        "concept": ["Visual: a clean two-column audit table on a navy background.",
+                    "Left column labeled FLAGGED: 3 to 4 campaign rows, each with a red status dot, a short campaign name, and a dollar amount in red. Total row at the bottom: $35,000 WASTED.",
+                    "Right column labeled FIXED: same rows, now with green checkmarks and the dollar amounts reclaimed. Total row: $35,000 RECOVERED.",
+                    "No illustrated scenes, no metaphors, no cartoon elements. Looks like a real audit output.",
                     "Support copy (caption, never rendered): Our engine reads every campaign every single day.",
                     "CTA copy (caption, never rendered): Receipts, not reports"],
         "story": False,
@@ -333,7 +335,7 @@ CONCEPTS = {
         "layout": "chart",
         "canvas": "navy",
         "archetype": "headline",
-        "art_directive": "Photographic realism throughout. Fewer visual elements, cleaner composition. Where a person appears, use the consistent gym owner brand person: athletic wear, standing in the gym, turf and rig and equipment visible. V3 palette: navy #121E3C, red #FF0000, sky #5EB9E6, cream #FAF6F0.",
+        "art_directive": "Clean data visualization only. A structured table or audit report layout. Navy background #121E3C, red #FF0000 for flagged items, sky blue #5EB9E6 for labels, white text. No illustrated scenes, no cartoon figures, no metaphorical imagery, no dripping money, no safes, no gym equipment. This must look like a real data dashboard output, not concept art.",
     },
     "b2b_dynamic_spend": {
         "headline": "Your ad budget should follow signups.",
