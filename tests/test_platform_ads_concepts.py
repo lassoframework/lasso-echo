@@ -38,7 +38,7 @@ BRIEF = {
 HOUSE_SHA256 = "255e52f2eb8ee5b926dfd81f4b4782df87c6415cd142c7169d958074d81a25b5"
 # stat-slab retired 2026-07-16: the b2b + platform stat concepts remap stat_hero
 # -> chart, so these frozen-set hashes were updated in the same commit.
-B2B_SHA256 = "3cde17819b6452791f3e1e2926318a84b0924ff9751251337281279b4e8a057d"
+B2B_SHA256 = "e1b0b6ba6772058a735ad59e55f9e653735ee5f811e065816662b104b3229bb8"
 PLATFORM_SHA256 = (
     "56e5a0d10fab98de245e89744eb68a7bcab536328b6fd6cc1cff57b61abe1b6e")
 

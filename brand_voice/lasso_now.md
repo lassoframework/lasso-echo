@@ -48,7 +48,7 @@ Named case studies (verified):
 ## Content pillars (Echo rotates one per day)
 1. All in one offer
 2. Sales are now
-3. The AI agents
+3. We do the heavy lifting
 4. The portal
 5. Proof
 
@@ -67,10 +67,10 @@ Hook: You did not open a gym to run ads at 11pm.
 Body: The job is closing members, not building funnels.
 Body: We get the leads and nurture them. You do the one thing only you can do: sell.
 
-### Pillar: The AI agents
-Hook: We built AI agents that do the busywork so you do not have to.
-Body: They draft the content, keep the calendar full, and surface what needs you.
-Body: A human approves everything before it goes out. Nothing runs on its own.
+### Pillar: We do the heavy lifting
+Hook: We run your social media for you.
+Body: We plan the month, draft every post, and track what is working.
+Body: A human approves every post before it goes live. You get the results without doing the work.
 
 ### Pillar: The portal
 Hook: Every lead, every post, every result. One screen.
