@@ -186,11 +186,18 @@ def frame_vertical(input_path, output_path, media_kind=None, segments=None,
             cw = int(width / _PUNCH)
             ch = int(height / _PUNCH)
             cx, cy = face_center[0], face_center[1]
+            # Clamp expressions without commas (ffmpeg parses commas as
+            # filter separators inside crop arguments):
+            #   min(a,b) = (a+b-abs(a-b))/2
+            #   max(r,0) = (r+abs(r))/2
+            def _clamp(val, hi):
+                inner = f"({val}+{hi}-abs({val}-{hi}))/2"
+                return f"({inner}+abs({inner}))/2"
+            crop_x = _clamp(f"{cx:.4f}*iw-{cw}/2", f"iw-{cw}")
+            crop_y = _clamp(f"{cy:.4f}*ih-{ch}/2", f"ih-{ch}")
             vf = (
                 f"{_scale},"
-                f"crop={cw}:{ch}:"
-                f"max(0,min(iw-{cw},{cx:.4f}*iw-{cw}/2)):"
-                f"max(0,min(ih-{ch},{cy:.4f}*ih-{ch}/2)),"
+                f"crop={cw}:{ch}:{crop_x}:{crop_y},"
                 f"scale={width}:{height}"
             )
         else:
