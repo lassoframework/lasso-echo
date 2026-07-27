@@ -1529,7 +1529,12 @@ def assemble_clip(moment, media_path, transcript, overlays, output_dir, base,
         raise VideoEditorError("cut_segment produced no file")
     src_cut = os.path.join(work, cut_files[0])
 
-    clipper_render.frame_vertical(src_cut, framed, width=width, height=height)
+    face_center = (
+        video_assets.detect_face_center(src_cut)
+        if config.video_punch_zoom_enabled() else None
+    )
+    clipper_render.frame_vertical(src_cut, framed, width=width, height=height,
+                                  face_center=face_center)
 
     clip_dur = float(moment.end_ts) - float(moment.start_ts)
     host_base = framed

@@ -1128,6 +1128,61 @@ def video_jumpcuts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_VIDEO_JUMPCUTS", "false"))
 
 
+def video_punch_zoom_enabled() -> bool:
+    """Punch-in zoom centered on the detected face for podcast reels.
+    ON by default when render is enabled. Set AGENT_VIDEO_PUNCH_ZOOM=false to disable."""
+    return _truthy(os.environ.get("AGENT_VIDEO_PUNCH_ZOOM", "true"))
+
+
+# ---- fal.ai headless b-roll renderer ----------------------------------------
+
+def fal_api_key() -> str:
+    """API key for fal.ai headless b-roll rendering. Set AGENT_FAL_API_KEY in
+    Railway env. When set + AGENT_VIDEO_RENDER=true, motion overlays render
+    headlessly via fal.ai instead of requiring an interactive Higgsfield MCP session."""
+    return os.environ.get("AGENT_FAL_API_KEY", "").strip()
+
+
+def fal_video_model() -> str:
+    """fal.ai model for motion b-roll clips. Env AGENT_FAL_VIDEO_MODEL,
+    default fal-ai/kling-video/v1.6/standard/text-to-video."""
+    return (os.environ.get("AGENT_FAL_VIDEO_MODEL", "")
+            or "fal-ai/kling-video/v1.6/standard/text-to-video").strip()
+
+
+def fal_image_model() -> str:
+    """fal.ai model for still image overlays. Env AGENT_FAL_IMAGE_MODEL,
+    default fal-ai/flux/schnell."""
+    return (os.environ.get("AGENT_FAL_IMAGE_MODEL", "")
+            or "fal-ai/flux/schnell").strip()
+
+
+# ---- Higgsfield headless b-roll renderer ------------------------------------
+
+def hf_api_key() -> str:
+    """Higgsfield API key presence check. Set HF_API_KEY + HF_API_SECRET
+    (or HF_KEY) in Railway. When set, Higgsfield is preferred over fal.ai
+    for b-roll rendering."""
+    key = os.environ.get("HF_KEY", "").strip()
+    if key:
+        return key
+    return os.environ.get("HF_API_KEY", "").strip()
+
+
+def hf_video_app() -> str:
+    """Higgsfield SDK application path for text-to-video. Env AGENT_HF_VIDEO_APP.
+    Default: kling-video/v3.0/text-to-video."""
+    return (os.environ.get("AGENT_HF_VIDEO_APP", "")
+            or "kling-video/v3.0/text-to-video").strip()
+
+
+def hf_image_app() -> str:
+    """Higgsfield SDK application path for text-to-image. Env AGENT_HF_IMAGE_APP.
+    Default: bytedance/seedream/v4/text-to-image (confirmed from SDK docs)."""
+    return (os.environ.get("AGENT_HF_IMAGE_APP", "")
+            or "bytedance/seedream/v4/text-to-image").strip()
+
+
 def video_jumpcut_gap() -> float:
     """Inter-word gap (seconds) above which dead air is removed; the kept residual
     is video_jumpcut_keep(). Env AGENT_VIDEO_JUMPCUT_GAP, default 0.45."""
