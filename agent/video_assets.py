@@ -89,6 +89,8 @@ def detect_face_center(video_path, samples=8):
             cap.release()
             return None
         best = None   # (area, cx_frac, cy_frac, bottom_frac)
+        frames_with_faces = 0
+        frames_with_multiple = 0
         for i in range(samples):
             frame_no = int(total * (i + 0.5) / samples)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
@@ -99,6 +101,11 @@ def detect_face_center(video_path, samples=8):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
                                              minSize=(int(w * 0.08), int(h * 0.08)))
+            if len(faces) == 0:
+                continue
+            frames_with_faces += 1
+            if len(faces) > 1:
+                frames_with_multiple += 1
             for (fx, fy, fw, fh) in faces:
                 area = fw * fh
                 if best is None or area > best[0]:
@@ -106,6 +113,10 @@ def detect_face_center(video_path, samples=8):
                             (fy + fh) / float(h))
         cap.release()
         if best is None:
+            return None
+        # If most frames show multiple faces (two-person interview), skip punch-in
+        # so we don't zoom into one person and cut off the other.
+        if frames_with_faces > 0 and frames_with_multiple / frames_with_faces > 0.5:
             return None
         _, cx, cy, bot = best
         return (cx, min(0.95, cy), min(0.95, bot))

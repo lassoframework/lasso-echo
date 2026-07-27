@@ -224,11 +224,10 @@ def test_hf_key_not_logged(monkeypatch, capsys):
 
 # ---- podcast_auto wires Higgsfield renderer ---------------------------------
 
-def test_podcast_auto_prefers_hf_over_fal(monkeypatch):
-    """When both HF and fal keys set, podcast_auto uses Higgsfield."""
+def test_podcast_auto_uses_hf_renderer(monkeypatch):
+    """podcast_auto uses Higgsfield when HF keys are set."""
     monkeypatch.setenv("HF_API_KEY", "hf-key")
     monkeypatch.setenv("HF_API_SECRET", "hf-secret")
-    monkeypatch.setenv("AGENT_FAL_API_KEY", "fal-key")
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
 
@@ -254,41 +253,11 @@ def test_podcast_auto_prefers_hf_over_fal(monkeypatch):
     assert rndr.__module__.endswith("higgsfield_renderer")
 
 
-def test_podcast_auto_falls_back_to_fal_without_hf(monkeypatch):
+def test_podcast_auto_no_renderer_without_hf_keys(monkeypatch):
+    """podcast_auto skips overlays when HF keys are absent."""
     monkeypatch.delenv("HF_KEY", raising=False)
     monkeypatch.delenv("HF_API_KEY", raising=False)
     monkeypatch.delenv("HF_API_SECRET", raising=False)
-    monkeypatch.setenv("AGENT_FAL_API_KEY", "fal-key")
-    monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
-    monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
-
-    from agent import podcast_auto, video_editor
-
-    captured = {}
-
-    def _fake_edit_episode(source, render=False, renderer=None, **kwargs):
-        captured["renderer"] = renderer
-        return None
-
-    def _fake_newest(cache_dir):
-        return "/fake/episode.mp4"
-
-    monkeypatch.setattr(video_editor, "edit_episode", _fake_edit_episode)
-    import agent.podcast_source as _ps
-    monkeypatch.setattr(_ps, "newest_episode", _fake_newest)
-
-    podcast_auto.run(account_key="lasso_ig")
-
-    rndr = captured.get("renderer")
-    assert rndr is not None
-    assert rndr.__module__.endswith("fal_renderer")
-
-
-def test_podcast_auto_no_renderer_without_any_key(monkeypatch):
-    monkeypatch.delenv("HF_KEY", raising=False)
-    monkeypatch.delenv("HF_API_KEY", raising=False)
-    monkeypatch.delenv("HF_API_SECRET", raising=False)
-    monkeypatch.delenv("AGENT_FAL_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
 
