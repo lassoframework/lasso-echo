@@ -126,6 +126,11 @@ def _status():
     print(f"  client_sources : {config.client_sources_enabled()}  (env AGENT_CLIENT_SOURCES)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
+    _sapi_key = config.socialapi_key()
+    print(f"  socialapi      : {config.socialapi_enabled()}  (env AGENT_SOCIALAPI_ENABLED)")
+    print(f"  socialapi_key   : {'SET' if _sapi_key else 'NOT SET'}  (env AGENT_SOCIALAPI_KEY)")
+    print(f"  socialapi_base  : {config.socialapi_base_url()}  (env AGENT_SOCIALAPI_BASE_URL)")
+    print(f"  socialapi_max/d : {config.socialapi_max_per_day()}  (env AGENT_SOCIALAPI_MAX_PER_DAY)")
     print(f"  stories        : {config.stories_enabled()}  (env AGENT_STORIES_ENABLED)")
     print(f"  story_crosspost: {config.story_crosspost_enabled()}  (env AGENT_STORY_CROSSPOST_ENABLED)")
     print(f"  story_premade  : {config.story_premade_enabled()}  (env AGENT_STORY_PREMADE_ENABLED)")
@@ -741,6 +746,16 @@ _COMMANDS = {
         ("tokens --list", "list all gyms with token status (ACTIVE/REVOKED/NOT_SET); never prints a hash"),
         ("portal-status", "show portal status for one gym (AGENT_PORTAL_APPROVALS)"),
     ],
+    "campaigns": [
+        ("summit-queue", "upload + schedule LASSO Growth Summit infographic posts (--images-dir / --from-manifest)"),
+        ("book-queue", "upload + schedule The Full Gym book launch infographic posts (--images-dir / --from-manifest)"),
+        ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
+    ],
+    "socialapi lane": [
+        ("socialapi-onboard", "create a gym's SocialAPI brand and store the id (--account <key>)"),
+        ("socialapi-connect", "print the OAuth connect URL(s) to hand the gym (--account <key>)"),
+        ("socialapi-status", "print per-platform SocialAPI connection status (--account <key>)"),
+    ],
     "content & library": [
         ("regen-library", "regenerate the creative library"),
         ("regen-weak-cards", "regenerate the two off-style seed cards in house style (draft only, never publishes)"),
@@ -949,6 +964,78 @@ def _fabrication_scan(args):
     print(fabrication_scan.format_report(report, dry_run=dry_run))
 
 
+def _socialapi_cli(sub, argv):
+    """SocialAPI lane operator commands (BLAKE runbook helpers).
+
+      socialapi-onboard --account <key>   create the gym's brand, store the id
+      socialapi-connect --account <key>    print the OAuth connect URL(s) to hand the gym
+      socialapi-status  --account <key>    print per-platform connection status
+
+    All require AGENT_SOCIALAPI_KEY set by hand. Nothing publishes here; these
+    only set up / inspect the SocialAPI brand and connections."""
+    account_key = ""
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--account" and i + 1 < len(argv):
+            account_key = argv[i + 1]; i += 2; continue
+        i += 1
+    if not account_key:
+        print(f"usage: python -m agent {sub} --account <key>")
+        return
+    from .accounts import get_account
+    acct = get_account(account_key)
+    if acct is None:
+        print(f"{sub}: account {account_key!r} not found")
+        return
+    if getattr(acct, "publish_route", "meta_direct") != "socialapi":
+        print(f"{sub}: {account_key} is not routed to SocialAPI "
+              f"(publish_route={getattr(acct, 'publish_route', 'meta_direct')!r}). "
+              "Set publish_route='socialapi' on the account first.")
+        return
+    if not config.socialapi_key():
+        print(f"{sub}: {config.SOCIALAPI_KEY_ENV} is not set. Set it by hand in "
+              "Railway env first.")
+        return
+
+    if sub == "socialapi-onboard":
+        from . import socialapi_client, socialapi_store
+        existing = socialapi_store.get_brand_id(account_key)
+        if existing:
+            print(f"brand already exists for {account_key}: {existing}")
+            return
+        brand_id = socialapi_client.create_brand(acct.display_name)
+        if brand_id:
+            socialapi_store.set_brand_id(account_key, brand_id)
+            print(f"brand created for {account_key}: {brand_id}")
+            print("Next: python -m agent socialapi-connect --account "
+                  f"{account_key}  (hand the gym the auth URL to authorize IG + FB)")
+        else:
+            print("brand create returned no id; check the API key and try again.")
+    elif sub == "socialapi-connect":
+        from .intake_web import handle_portal_social_connect
+        # reuse the portal handler for a single source of truth
+        import os as _os
+        _os.environ.setdefault("AGENT_PORTAL_APPROVALS", "true")
+        status, body = handle_portal_social_connect(account_key)
+        if status != 200:
+            print(f"connect: {body}")
+            return
+        print(f"brand: {body.get('brand_id')}")
+        for plat, url in (body.get("connect") or {}).items():
+            print(f"  {plat}: {url or '(no url returned)'}")
+    elif sub == "socialapi-status":
+        from .intake_web import handle_portal_social_status
+        import os as _os
+        _os.environ.setdefault("AGENT_PORTAL_APPROVALS", "true")
+        status, body = handle_portal_social_status(account_key)
+        if status != 200:
+            print(f"status: {body}")
+            return
+        print(f"brand: {body.get('brand_id')}")
+        for plat, st in (body.get("status") or {}).items():
+            print(f"  {plat}: {st}")
+
+
 def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
@@ -980,6 +1067,12 @@ def main(argv=None):
             from .summit_queue import run as _sq_run_startup
             _sq_run_startup(from_manifest=True)
             print("[startup] summit queue done.", flush=True)
+        if os.environ.get("AGENT_BOOK_QUEUE_ON_START", "").lower() in ("1", "true"):
+            print("[startup] AGENT_BOOK_QUEUE_ON_START detected — loading book queue…",
+                  flush=True)
+            from .book_queue import run as _bq_run_startup
+            _bq_run_startup(from_manifest=True)
+            print("[startup] book queue done.", flush=True)
         from .listener import run_listener
         run_listener()
     elif cmd == "dry-run":
@@ -1975,6 +2068,21 @@ def main(argv=None):
                 _from_manifest = True; i += 1; continue
             i += 1
         _sq_run(images_dir=_images_dir, from_manifest=_from_manifest)
+    elif cmd == "book-queue":
+        from .book_queue import run as _bq_run
+        _images_dir = None
+        _from_manifest = False
+        _bq_args = argv[1:]
+        i = 0
+        while i < len(_bq_args):
+            if _bq_args[i] == "--images-dir" and i + 1 < len(_bq_args):
+                _images_dir = _bq_args[i + 1]; i += 2; continue
+            if _bq_args[i] == "--from-manifest":
+                _from_manifest = True; i += 1; continue
+            i += 1
+        _bq_run(images_dir=_images_dir, from_manifest=_from_manifest)
+    elif cmd in ("socialapi-onboard", "socialapi-connect", "socialapi-status"):
+        _socialapi_cli(cmd, argv[1:])
     elif cmd == "send-card":
         # Manually post an approval card to Slack for an existing PENDING draft.
         # Usage: python -m agent send-card <draft_id> [<draft_id> ...]

@@ -141,6 +141,41 @@ def publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PUBLISH_ENABLED", "false"))
 
 
+def socialapi_enabled() -> bool:
+    """
+    SocialAPI.ai publish-lane master switch. OFF by default. When OFF, EVERY
+    account publishes through meta_direct exactly as before, even one whose
+    publish_route is 'socialapi'. When ON, an account whose publish_route is
+    'socialapi' routes its publish step through the SocialAPI lane; meta_direct
+    accounts are untouched. This gates ROUTING only, never whether a post goes
+    out: the publish_enabled() draft-only gate still applies inside the lane.
+    Arm by hand in Railway env only.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIALAPI_ENABLED", "false"))
+
+
+def socialapi_key() -> str:
+    """The SocialAPI.ai API key, read lazily BY NAME every call so a rotation
+    takes effect without a reimport. Never logged, never stored on an object,
+    never returned in any card or report. Empty string when unset."""
+    return os.environ.get(SOCIALAPI_KEY_ENV, "")
+
+
+def socialapi_base_url() -> str:
+    """The SocialAPI.ai REST base URL (override for tests / a staging host)."""
+    return os.environ.get("AGENT_SOCIALAPI_BASE_URL", SOCIALAPI_BASE_URL_DEFAULT)
+
+
+def socialapi_max_per_day() -> int:
+    """Sanity ceiling on publishes per account per day for the SocialAPI lane.
+    One post/day is the norm; more than this is an upstream bug and fires a loud
+    ops alert. Default 3."""
+    try:
+        return int(os.environ.get("AGENT_SOCIALAPI_MAX_PER_DAY", "3"))
+    except ValueError:
+        return 3
+
+
 def creative_studio_enabled() -> bool:
     """
     Nano Banana image generation switch. OFF by default. When OFF, generate()
@@ -1342,3 +1377,14 @@ def onboard_automint_enabled() -> bool:
 # Generate a key once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Store it in Railway env only; never commit or log it.
 INTAKE_ENC_KEY_ENV = "AGENT_INTAKE_ENC_KEY"
+
+# ---- SocialAPI.ai publish lane ----------------------------------------------
+# The API key is read BY NAME only (never stored, never logged). Set it by hand
+# in Railway: AGENT_SOCIALAPI_KEY=sapi_key_...  Nothing in code writes it.
+SOCIALAPI_KEY_ENV = "AGENT_SOCIALAPI_KEY"           # name of the env var, not the value
+SOCIALAPI_BASE_URL_DEFAULT = "https://api.social-api.ai/v1"
+# Name of the env var holding the Fernet key for encrypting per-brand SocialAPI
+# material (brand id / connected account ids) at rest, same pattern as intake
+# tokens. When unset: values are stored in plaintext in the kv table (dev mode).
+# Generate once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+SOCIALAPI_ENC_KEY_ENV = "AGENT_SOCIALAPI_ENC_KEY"

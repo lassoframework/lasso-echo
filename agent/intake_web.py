@@ -574,6 +574,102 @@ def handle_portal_gym_status(account_key, r2=None):
     }
 
 
+def _is_socialapi_account(account_key):
+    """True when this gym is routed to the SocialAPI lane. The connect/status
+    endpoints exist ONLY for such gyms; a meta_direct gym gets a 404 so nothing
+    leaks about routing it does not use."""
+    try:
+        from .accounts import get_account as _ga
+        acct = _ga(account_key)
+        return acct is not None and getattr(acct, "publish_route", "meta_direct") == "socialapi"
+    except Exception:
+        return False
+
+
+def handle_portal_social_connect(account_key, http=None):
+    """
+    GET /portal/<token>/social-connect  (token already resolved to account_key).
+
+    Returns the SocialAPI OAuth connect URL(s) the gym clicks to authorize their
+    IG and FB. Gated by AGENT_PORTAL_APPROVALS. 404 for a non-SocialAPI gym so a
+    gym's token can never reveal routing it does not use. Returns (status, dict).
+    """
+    if not config.portal_approvals_enabled():
+        return 403, {"error": "portal access is disabled"}
+    if not _is_socialapi_account(account_key):
+        return 404, {"error": "not found"}
+
+    from . import socialapi_store as _sstore
+    brand_id = _sstore.get_brand_id(account_key)
+    if not brand_id:
+        return 409, {"error": "brand not created yet",
+                     "detail": "run socialapi-onboard for this gym first"}
+
+    if not config.socialapi_key():
+        return 503, {"error": "SocialAPI not configured"}
+
+    redirect_uri = os.environ.get("AGENT_SOCIALAPI_REDIRECT_URI", "")
+    from . import socialapi_client as _sclient
+    connect = {}
+    for platform in ("instagram", "facebook"):
+        try:
+            body = _sclient.connect_account(
+                platform, brand_id=brand_id, redirect_uri=redirect_uri,
+                state=account_key, http=http)
+            connect[platform] = body.get("auth_url", "")
+        except Exception as e:
+            from . import ops_alerts as _oa
+            connect[platform] = ""
+            print(f"[portal] social-connect {platform} failed for {account_key}: "
+                  f"{type(e).__name__}: {_oa.scrub(str(e))}")
+
+    return 200, {"account_key": account_key, "brand_id": brand_id, "connect": connect}
+
+
+def handle_portal_social_status(account_key, http=None):
+    """
+    GET /portal/<token>/social-status  (token already resolved to account_key).
+
+    Returns per-platform connection status (connected / disconnected / expired)
+    for the gym's brand, for the portal to display. Gated by AGENT_PORTAL_APPROVALS.
+    404 for a non-SocialAPI gym. Falls back to the cached status when the live
+    read fails, so the portal never sees a hard error. Returns (status, dict).
+    """
+    if not config.portal_approvals_enabled():
+        return 403, {"error": "portal access is disabled"}
+    if not _is_socialapi_account(account_key):
+        return 404, {"error": "not found"}
+
+    from . import socialapi_store as _sstore
+    brand_id = _sstore.get_brand_id(account_key)
+    status_map = {"instagram": "disconnected", "facebook": "disconnected"}
+
+    if brand_id and config.socialapi_key():
+        try:
+            from . import socialapi_client as _sclient
+            accounts = _sclient.list_accounts(brand_id=brand_id, http=http)
+            for acc in accounts:
+                plat = str(acc.get("platform", "")).lower()
+                if plat in status_map:
+                    st = str(acc.get("status", "connected")).lower()
+                    status_map[plat] = st or "connected"
+                    # remember the connected account id for the publisher
+                    acc_id = acc.get("id") or acc.get("account_id")
+                    if acc_id and st in ("", "connected", "active"):
+                        _sstore.set_account_id(account_key, plat, acc_id)
+            _sstore.set_connection_status(account_key, status_map)
+        except Exception as e:
+            from . import ops_alerts as _oa
+            print(f"[portal] social-status live read failed for {account_key}: "
+                  f"{type(e).__name__}: {_oa.scrub(str(e))}")
+            cached = _sstore.get_connection_status(account_key)
+            if cached:
+                status_map = cached
+
+    return 200, {"account_key": account_key, "brand_id": brand_id,
+                 "status": status_map}
+
+
 class _R2:
     """Bytes-oriented R2/S3 wrapper for the upload path. Credentials from the same
     env names media hosting uses; read lazily, passed to boto3, never logged."""
@@ -882,6 +978,18 @@ def build_server(port=None):
                 return m.group(1), m.group(2)
             return None, None
 
+        def _portal_social_route(self):
+            """Returns (token, sub) for /portal/<token>/social-{connect|status},
+            else (None, None). sub is 'social-connect' or 'social-status'."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/"
+                r"(social-connect|social-status)$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2)
+            return None, None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -911,6 +1019,23 @@ def build_server(port=None):
                     status, body = _pr.handle_portal_calendar(account_key, month)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
+                return self._send_json(body, status)
+
+            # Portal social routes: /portal/<token>/social-connect and
+            # /portal/<token>/social-status. Token resolves to ONE account_key
+            # (HMAC-verified), so gym A's token can never reach gym B's brand.
+            # Unknown/revoked token = 404 (indistinguishable).
+            ps_token, ps_sub = self._portal_social_route()
+            if ps_token is not None:
+                account_key = client_for_token(ps_token)
+                # A revoked gym is a 404 everywhere, exactly like an unknown token:
+                # its live OAuth links and connection state must go dark on kill.
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                if ps_sub == "social-connect":
+                    status, body = handle_portal_social_connect(account_key)
+                else:
+                    status, body = handle_portal_social_status(account_key)
                 return self._send_json(body, status)
 
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —

@@ -189,6 +189,20 @@ before this file existed.
 | AGENT_GBP_ACCESS_TOKEN / AGENT_GBP_ACCOUNT_ID / AGENT_GBP_LOCATION_ID | (unset) | BLAKE | |
 | AGENT_GBP_API_BASE / AGENT_GBP_DEFAULT_CTA / AGENT_GBP_CTA_URL | code defaults | code | |
 
+## SocialAPI.ai publish lane
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_SOCIALAPI_ENABLED | false | BLAKE | Routing master. OFF = every account publishes meta_direct, even a socialapi-routed one. |
+| AGENT_SOCIALAPI_KEY | (unset) | BLAKE | `sapi_key_...` Bearer key. Read by name only; never logged or stored. |
+| AGENT_SOCIALAPI_BASE_URL | https://api.social-api.ai/v1 | code | Override for a staging host / tests. |
+| AGENT_SOCIALAPI_MAX_PER_DAY | 3 | code | Per-account/day publish ceiling; over it fires a loud ops alert. |
+| AGENT_SOCIALAPI_ENC_KEY | (unset) | BLAKE | Fernet key encrypting per-brand ids at rest (same pattern as intake). Unset = plaintext in kv (dev). |
+| AGENT_SOCIALAPI_REDIRECT_URI | (unset) | BLAKE | OAuth callback the gym returns to after authorizing IG/FB. |
+
+Per-account routing is NOT an env var: it is the `publish_route` field on the
+Account record in `agent/accounts.py` ("meta_direct" default, or "socialapi").
+
 ## Previously read in code but documented nowhere (now closed)
 
 - **META_APP_ID / META_APP_SECRET** — the token watchdog's debug_token app

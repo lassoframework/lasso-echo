@@ -89,6 +89,10 @@ CREATE TABLE IF NOT EXISTS consent_log (
   note TEXT DEFAULT '',
   recorded_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS socialapi_claims (
+  draft_id TEXT, account_key TEXT, status TEXT DEFAULT 'in_flight',
+  post_id TEXT DEFAULT '', claimed_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (draft_id, account_key));
 """
 
 
@@ -229,6 +233,78 @@ def counter_get(name, day):
         row = conn.execute("SELECT count FROM counters WHERE name=? AND day=?",
                            (name, day)).fetchone()
         return row["count"] if row else 0
+
+
+def socialapi_claim(draft_id, account_key):
+    """Atomically claim the right to publish this draft on the SocialAPI lane.
+
+    Returns one of:
+      ("won", "")           caller owns the claim; proceed to publish
+      ("in_flight", pid)    another publish holds the claim (pid may be "" if it
+                            has not yet reached the vendor, or the vendor post id
+                            if a prior attempt got that far but did not finish)
+      ("done", pid)         already published; caller must NOT publish again
+
+    The PRIMARY KEY on (draft_id, account_key) makes the INSERT the atomic
+    single-winner across threads AND processes: a concurrent second caller hits
+    IntegrityError and reads back the existing row. This closes the double-post
+    race where the posts row is only written later by approvals. Raises on a real
+    DB error so the caller can fail SAFE (hold, never publish blind)."""
+    with _lock, connect() as conn:
+        row = conn.execute(
+            "SELECT status, post_id FROM socialapi_claims "
+            "WHERE draft_id=? AND account_key=?",
+            (draft_id, account_key)).fetchone()
+        if row is not None:
+            if row["status"] == "done":
+                return ("done", row["post_id"] or "")
+            return ("in_flight", row["post_id"] or "")
+        try:
+            conn.execute(
+                "INSERT INTO socialapi_claims (draft_id, account_key, status) "
+                "VALUES (?,?, 'in_flight')", (draft_id, account_key))
+            conn.commit()
+            return ("won", "")
+        except sqlite3.IntegrityError:
+            # A concurrent caller won the race between our SELECT and INSERT.
+            row = conn.execute(
+                "SELECT status, post_id FROM socialapi_claims "
+                "WHERE draft_id=? AND account_key=?",
+                (draft_id, account_key)).fetchone()
+            if row is not None and row["status"] == "done":
+                return ("done", row["post_id"] or "")
+            return ("in_flight", (row["post_id"] if row else "") or "")
+
+
+def socialapi_claim_set_post(draft_id, account_key, post_id):
+    """Record the vendor post id on an in-flight claim (the vendor accepted the
+    post but it is still processing). Keeps the claim so a retry POLLS this post
+    instead of re-POSTing it."""
+    with _lock, connect() as conn:
+        conn.execute(
+            "UPDATE socialapi_claims SET post_id=? "
+            "WHERE draft_id=? AND account_key=?", (post_id, draft_id, account_key))
+        conn.commit()
+
+
+def socialapi_claim_done(draft_id, account_key, post_id):
+    """Mark a claim published. A later re-approve returns an idempotent no-op."""
+    with _lock, connect() as conn:
+        conn.execute(
+            "UPDATE socialapi_claims SET status='done', post_id=? "
+            "WHERE draft_id=? AND account_key=?", (post_id, draft_id, account_key))
+        conn.commit()
+
+
+def socialapi_claim_release(draft_id, account_key):
+    """Release a claim so a genuine retry can proceed. Called ONLY when nothing
+    was posted to the vendor (a pre-network failure), never after the vendor
+    accepted the post."""
+    with _lock, connect() as conn:
+        conn.execute(
+            "DELETE FROM socialapi_claims WHERE draft_id=? AND account_key=?",
+            (draft_id, account_key))
+        conn.commit()
 
 
 def audit(kind, subject, reason, account_key="", day=""):
