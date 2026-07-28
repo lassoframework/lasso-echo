@@ -236,21 +236,21 @@ def test_fal_key_not_logged(monkeypatch, capsys):
 # ---- podcast_auto wires fal renderer ----------------------------------------
 
 def test_podcast_auto_passes_fal_renderer_when_key_set(monkeypatch):
-    """podcast_auto uses HF renderer when HF keys are set (fal no longer used)."""
-    monkeypatch.setenv("HF_API_KEY", "hf-key")
-    monkeypatch.setenv("HF_API_SECRET", "hf-secret")
-    monkeypatch.delenv("AGENT_FAL_API_KEY", raising=False)
+    """podcast_auto wires HF renderer when build_renderer returns callable."""
+    import agent.higgsfield_renderer as _hf_mod
+    from agent import podcast_auto, video_editor
+
+    _sentinel = object()
+    monkeypatch.setattr(_hf_mod, "build_renderer", lambda: _sentinel)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
-
-    from agent import podcast_auto, video_editor
 
     captured = {}
 
     def _fake_edit_episode(source, render=False, renderer=None, **kwargs):
         captured["render"] = render
         captured["renderer"] = renderer
-        return None  # short-circuit (no clips)
+        return None
 
     def _fake_newest(cache_dir):
         return "/fake/episode.mp4"
@@ -262,7 +262,7 @@ def test_podcast_auto_passes_fal_renderer_when_key_set(monkeypatch):
 
     podcast_auto.run(account_key="lasso_ig")
 
-    assert captured.get("renderer") is not None
+    assert captured.get("renderer") is _sentinel
     assert captured.get("render") is True
 
 

@@ -1956,6 +1956,19 @@ def main(argv=None):
         _episode_upload(argv[1:])
     elif cmd == "gen-handoff":
         _gen_handoff(argv[1:])
+    elif cmd == "summit-queue":
+        from .summit_queue import run as _sq_run
+        _images_dir = None
+        _from_manifest = False
+        _sq_args = argv[1:]
+        i = 0
+        while i < len(_sq_args):
+            if _sq_args[i] == "--images-dir" and i + 1 < len(_sq_args):
+                _images_dir = _sq_args[i + 1]; i += 2; continue
+            if _sq_args[i] == "--from-manifest":
+                _from_manifest = True; i += 1; continue
+            i += 1
+        _sq_run(images_dir=_images_dir, from_manifest=_from_manifest)
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
