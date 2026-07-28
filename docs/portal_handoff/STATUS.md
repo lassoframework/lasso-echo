@@ -1,6 +1,6 @@
 # Echo Portal Status
 
-**Last updated:** 2026-07-19 | **SHA:** 698e7948 (portal PR #238 feat/echo-portal-owes)
+**Last updated:** 2026-07-28 | **SHA:** 698e7948 (portal PR #238) + social connections (portal branch feat/social-connections)
 
 This is a standing coordination file. Any Echo build that changes the portal-facing contract must update this file in the same commit. The portal CC reads this at the start of every session and updates PORTAL OWES when it ships something.
 
@@ -22,6 +22,8 @@ Endpoint-level. One line per Echo endpoint the portal calls or will call.
 | `GET /api/calendar/<key>?month=YYYY-MM` | PLANNED | Portal cannot render live calendar until Echo ships this |
 | `POST /api/approve/<key>/<draft_id>` | PLANNED | Portal cannot send approval actions until Echo ships this |
 | `GET /api/report/<key>?days=30` | PLANNED | Portal cannot display live report until Echo ships this |
+| `GET /portal/<token>/social-status` | PLANNED | Social Connections page holds until Echo ships; portal shows honest holding state |
+| `GET /portal/<token>/social-connect` | PLANNED | Portal cannot mint the OAuth connect link until Echo ships this |
 
 ---
 
@@ -35,6 +37,7 @@ What the portal CC is building next, in priority order:
 - [x] Calendar page — read-only display; show "Approve posts in your Slack channel" on every card until `GET /api/calendar/<key>` is live _(shipped portal PR #238 — /command-center/social-calendar; holding state until Echo ships calendar API)_
 - [x] Reporting page — show "Reporting coming soon" holding card until `GET /api/report/<key>` is live; when live, display gaps explicitly, never substitute zero for a missing metric _(shipped portal PR #238 — /command-center/social-report; holding card live)_
 - [ ] Approval action buttons — Approve, Edit, Skip, Deny, Kill wired to `POST /api/approve/<key>/<draft_id>`; Kill requires a confirm dialog; do not build until that endpoint is in STATUS.md as LIVE
+- [x] Social Connections page — client /my tab; GET `/portal/<token>/social-status` for per-platform Instagram + Facebook state (connected / not connected / expired) and GET `/portal/<token>/social-connect` for the OAuth URL. Portal decrypts the gym token server-side, holds NO credentials. Built against the stub contract; shows an honest "coming soon" holding state until both endpoints are LIVE _(shipped portal branch feat/social-connections)_
 
 ---
 
@@ -45,6 +48,8 @@ What Echo CC must ship before the portal can wire each item. Named dependency pa
 - [ ] `GET /api/calendar/<key>?month=YYYY-MM` — portal cannot render live calendar or show real draft states until this ships
 - [ ] `POST /api/approve/<key>/<draft_id>` — portal cannot send Approve/Edit/Skip/Deny/Kill actions until this ships; Slack is the only approval channel until then
 - [ ] `GET /api/report/<key>?days=30` — portal cannot display live 30-day report until this ships
+- [ ] `GET /portal/<token>/social-status` — the Social Connections page is built and waiting. Expected shape: `{ platforms: { instagram: { connected: bool, handle: string|null, expired: bool }, facebook: { connected: bool, handle: string|null, expired: bool } } }`. Portal degrades to a holding state until this is LIVE.
+- [ ] `GET /portal/<token>/social-connect` — mints the SocialAPI.ai OAuth URL for one-time Instagram + Facebook connect. Expected shape: `{ oauth_url: string }`. Portal shows the Connect button as "coming soon" until this is LIVE.
 - Echo must update STATUS.md in every commit that changes any portal-facing endpoint, flag, or response shape
 
 ---
