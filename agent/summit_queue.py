@@ -286,8 +286,10 @@ def create_drafts(manifest=None):
     """Create 28 HELD draft posts (14 images x lasso_ig + lasso_fb) in the DB.
     Every draft is PENDING (held for approval). Nothing publishes automatically.
     Safe to re-run; existing draft_ids are overwritten in-place (INSERT OR REPLACE)."""
-    from . import db, schedule as sched, accounts as _accts
+    from . import schedule as sched, accounts as _accts
     from .drafter import Draft, DraftStatus
+    from .store import PendingStore
+    _store = PendingStore()
 
     if manifest is None:
         manifest = _load_manifest()
@@ -325,7 +327,7 @@ def create_drafts(manifest=None):
                 day_key=day,
                 draft_type="feed",
             )
-            db.save_draft(d)
+            _store.put(d)
             created += 1
             print(f"  queued week {post['week']:02d} {day} {acct} -> {did}")
 
