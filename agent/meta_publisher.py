@@ -148,19 +148,13 @@ def _publish_instagram(client, account, draft, caption, token):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
-    # step 2: the container is processed asynchronously; wait for FINISHED before
-    # publishing. Skipping this is what caused subcode 2207027 "The media is not
-    # ready for publishing" — we called media_publish before Meta finished.
+    # step 2: wait for FINISHED before publishing
     _await_container_ready(client, base, container_id, token, label="media",
                            max_tries=IMG_POLL_MAX_TRIES,
-                           interval=IMG_POLL_INTERVAL_SEC)
-    # step 3: publish the processed container
-    r2 = client.post(
-        f"{base}/{ig_id}/media_publish",
-        data={"creation_id": container_id, "access_token": token},
-        timeout=30,
-    )
-    _raise_for_status(r2)
+                           interval=IMG_POLL_INTERVAL_SEC,
+                           grace=POST_FINISH_GRACE_SEC)
+    # step 3: publish with retry for 9007
+    r2 = _publish_container(client, base, ig_id, container_id, token)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 
@@ -205,19 +199,66 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
 # status_code before publishing. 30 tries x 2s ~= 60s ceiling.
 IMG_POLL_MAX_TRIES = 30
 IMG_POLL_INTERVAL_SEC = 2
-# Reels are heavier (video transcode); give them the same ~60s ceiling.
-REEL_POLL_MAX_TRIES = 20
+# Reels are heavier (video transcode); give them more room (~90s).
+REEL_POLL_MAX_TRIES = 30
 REEL_POLL_INTERVAL_SEC = 3
+# After status turns FINISHED, IG sometimes still returns 9007 for a moment.
+# Sleep this many seconds before calling media_publish, then retry on 9007.
+POST_FINISH_GRACE_SEC = 5
+POST_FINISH_RETRIES = 3
+POST_FINISH_RETRY_SEC = 5
+
+
+def _publish_container(client, base, ig_id, container_id, token,
+                       _sleep=time.sleep):
+    """
+    Call /{ig_id}/media_publish and return the response. Retries up to
+    POST_FINISH_RETRIES times on error 9007 / subcode 2207027 ("The media is
+    not ready for publishing") — IG sometimes lags briefly after FINISHED.
+    Raises MediaNotReady if all retries are exhausted, PublishError otherwise.
+    """
+    for attempt in range(POST_FINISH_RETRIES + 1):
+        r = client.post(
+            f"{base}/{ig_id}/media_publish",
+            data={"creation_id": container_id, "access_token": token},
+            timeout=30,
+        )
+        if getattr(r, "status_code", 200) < 400:
+            return r
+        body = {}
+        try:
+            body = r.json() or {}
+        except Exception:
+            pass
+        err = body.get("error", {})
+        is_not_ready = (
+            err.get("error_subcode") == 2207027
+            or err.get("code") == 9007
+        )
+        if is_not_ready and attempt < POST_FINISH_RETRIES:
+            _sleep(POST_FINISH_RETRY_SEC)
+            continue
+        if is_not_ready:
+            raise MediaNotReady(
+                f"container {container_id} still not publishable after "
+                f"{POST_FINISH_RETRIES} retries: {r.text}"
+            )
+        raise PublishError(f"Meta API error {r.status_code}: {r.text}")
+    return r  # unreachable but satisfies linters
 
 
 def _await_container_ready(client, base, container_id, token, *, label="media",
-                           max_tries, interval, sleep=time.sleep):
+                           max_tries, interval, grace=0, sleep=time.sleep):
     """
     Poll a media container's status_code until FINISHED, then return. Raise
     MediaNotReady on ERROR or if it never finishes within the bounded retries
     (a held-and-retry condition, NOT a hard failure). `sleep` is injectable so a
     test never actually waits. Only runs once publishing is armed (guarded
     upstream). READ-ONLY: one GET per poll, never a write.
+
+    `grace`: extra seconds to sleep after FINISHED before returning. Even after
+    status is FINISHED, IG can still return 9007 on the media_publish call for a
+    brief window. A small grace sleep eliminates most of those races.
     """
     for _ in range(max_tries):
         r = client.get(
@@ -228,6 +269,8 @@ def _await_container_ready(client, base, container_id, token, *, label="media",
         _raise_for_status(r)
         status = (r.json() or {}).get("status_code")
         if status == "FINISHED":
+            if grace:
+                sleep(grace)
             return
         if status == "ERROR":
             raise MediaNotReady(
@@ -267,17 +310,13 @@ def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
-    # step 2: a Reel's video is processed asynchronously; wait for FINISHED.
+    # step 2: wait for FINISHED + grace buffer before publishing
     _await_container_ready(client, base, container_id, token, label="Reel",
                            max_tries=REEL_POLL_MAX_TRIES,
-                           interval=REEL_POLL_INTERVAL_SEC)
-    # step 3: publish the processed container
-    r2 = client.post(
-        f"{base}/{ig_id}/media_publish",
-        data={"creation_id": container_id, "access_token": token},
-        timeout=30,
-    )
-    _raise_for_status(r2)
+                           interval=REEL_POLL_INTERVAL_SEC,
+                           grace=POST_FINISH_GRACE_SEC)
+    # step 3: publish with retry for 9007 (IG can still lag briefly after FINISHED)
+    r2 = _publish_container(client, base, ig_id, container_id, token)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 

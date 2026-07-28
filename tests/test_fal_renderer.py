@@ -236,8 +236,10 @@ def test_fal_key_not_logged(monkeypatch, capsys):
 # ---- podcast_auto wires fal renderer ----------------------------------------
 
 def test_podcast_auto_passes_fal_renderer_when_key_set(monkeypatch):
-    """When AGENT_FAL_API_KEY is set, podcast_auto passes a renderer to edit_episode."""
-    monkeypatch.setenv("AGENT_FAL_API_KEY", "fal-key")
+    """podcast_auto uses HF renderer when HF keys are set (fal no longer used)."""
+    monkeypatch.setenv("HF_API_KEY", "hf-key")
+    monkeypatch.setenv("HF_API_SECRET", "hf-secret")
+    monkeypatch.delenv("AGENT_FAL_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_PODCAST_AUTO_ENABLED", "true")
     monkeypatch.setenv("AGENT_VIDEO_EDITOR_ENABLED", "true")
 
