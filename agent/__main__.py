@@ -1975,6 +1975,24 @@ def main(argv=None):
                 _from_manifest = True; i += 1; continue
             i += 1
         _sq_run(images_dir=_images_dir, from_manifest=_from_manifest)
+    elif cmd == "send-card":
+        # Manually post an approval card to Slack for an existing PENDING draft.
+        # Usage: python -m agent send-card <draft_id> [<draft_id> ...]
+        from .store import PendingStore
+        from .slack_surface import SlackPoster
+        _draft_ids = argv[1:]
+        if not _draft_ids:
+            print("usage: python -m agent send-card <draft_id> [<draft_id> ...]")
+            sys.exit(1)
+        _store = PendingStore()
+        _poster = SlackPoster()
+        for _did in _draft_ids:
+            _d = _store.get(_did)
+            if _d is None:
+                print(f"  NOT FOUND: {_did}")
+                continue
+            _poster.post_approval_card(_d)
+            print(f"  card sent: {_did}  ({_d.account_key}  {_d.day_key})")
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
