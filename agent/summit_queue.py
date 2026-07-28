@@ -286,7 +286,7 @@ def create_drafts(manifest=None):
     """Create 28 HELD draft posts (14 images x lasso_ig + lasso_fb) in the DB.
     Every draft is PENDING (held for approval). Nothing publishes automatically.
     Safe to re-run; existing draft_ids are overwritten in-place (INSERT OR REPLACE)."""
-    from . import db, schedule as sched
+    from . import db, schedule as sched, accounts as _accts
     from .drafter import Draft, DraftStatus
 
     if manifest is None:
@@ -301,17 +301,23 @@ def create_drafts(manifest=None):
     if missing_urls:
         raise RuntimeError(f"Manifest is missing URLs for: {missing_urls}")
 
+    # Resolve platform strings once per account key
+    _acct_objs = {a: _accts.get_account(a) for a in ACCOUNTS}
+
     created = 0
     for post in SUMMIT_POSTS:
         url = manifest[post["filename"]]
         day = post["date"]
         scheduled_for = sched.scheduled_for(day)
         for acct in ACCOUNTS:
+            acct_obj = _acct_objs[acct]
             did = _draft_id(acct, post["filename"], day)
             d = Draft(
                 draft_id=did,
                 account_key=acct,
+                platform=acct_obj.platform if acct_obj else acct,
                 caption=post["caption"],
+                hashtags=[],
                 creative_path=post["filename"],
                 creative_public_url=url,
                 scheduled_for=scheduled_for,
