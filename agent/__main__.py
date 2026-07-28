@@ -974,6 +974,12 @@ def main(argv=None):
     elif cmd == "fabrication-scan":
         _fabrication_scan(argv[1:])
     elif cmd == "listen":
+        if os.environ.get("AGENT_SUMMIT_QUEUE_ON_START", "").lower() in ("1", "true"):
+            print("[startup] AGENT_SUMMIT_QUEUE_ON_START detected — loading summit queue…",
+                  flush=True)
+            from .summit_queue import run as _sq_run_startup
+            _sq_run_startup(from_manifest=True)
+            print("[startup] summit queue done.", flush=True)
         from .listener import run_listener
         run_listener()
     elif cmd == "dry-run":
