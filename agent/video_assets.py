@@ -63,6 +63,67 @@ def _face_cascade_path():
     return repo if os.path.isfile(repo) else None
 
 
+def detect_face_center(video_path, samples=8):
+    """
+    Sample frames and return (cx_frac, cy_frac, bottom_frac) — the normalized
+    center-x, center-y, and bottom-y of the largest detected face (0..1 from
+    top-left). Returns None when opencv is unavailable, no face found, or error.
+    Used for punch-in crop centering. Never raises.
+    """
+    try:
+        import cv2
+    except Exception:
+        return None
+    cascade_path = _face_cascade_path()
+    if not cascade_path:
+        return None
+    try:
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            return None
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            cap.release()
+            return None
+        best = None   # (area, cx_frac, cy_frac, bottom_frac)
+        frames_with_faces = 0
+        frames_with_multiple = 0
+        for i in range(samples):
+            frame_no = int(total * (i + 0.5) / samples)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
+                                             minSize=(int(w * 0.08), int(h * 0.08)))
+            if len(faces) == 0:
+                continue
+            frames_with_faces += 1
+            if len(faces) > 1:
+                frames_with_multiple += 1
+            for (fx, fy, fw, fh) in faces:
+                area = fw * fh
+                if best is None or area > best[0]:
+                    best = (area, (fx + fw / 2) / w, (fy + fh / 2) / h,
+                            (fy + fh) / float(h))
+        cap.release()
+        if best is None:
+            return None
+        # If most frames show multiple faces (two-person interview), skip punch-in
+        # so we don't zoom into one person and cut off the other.
+        if frames_with_faces > 0 and frames_with_multiple / frames_with_faces > 0.5:
+            return None
+        _, cx, cy, bot = best
+        return (cx, min(0.95, cy), min(0.95, bot))
+    except Exception:
+        return None
+
+
 def detect_face_bottom_frac(video_path, samples=8):
     """
     Sample frames and return the normalized y (0..1 from top) of the BOTTOM of the

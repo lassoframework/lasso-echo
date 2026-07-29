@@ -45,6 +45,13 @@ class Account:
     # (it may appear only in an internal do not publish appendix). Empty falls
     # back to "engagement", the safe framing.
     report_framing: str = ""
+    # Publish routing: which publish lane this account's approved posts go out
+    # through. "meta_direct" (default) is the Meta Graph path Echo has always
+    # used; "socialapi" routes through the SocialAPI.ai lane, but ONLY when
+    # AGENT_SOCIALAPI_ENABLED is also armed. LASSO's own accounts stay
+    # meta_direct. Changing this flips the publish step ONLY: drafting,
+    # approvals, calendar, trust ladder are all identical either way.
+    publish_route: str = "meta_direct"
 
     def get_token(self):
         """Read the token at call time. Never logged, never surfaced.

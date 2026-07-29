@@ -22,10 +22,24 @@ _streak_counters: dict = {}
 
 
 def _publisher_for(account):
-    """Route by platform: Google Business Profile -> gbp_publisher; everything else
-    (Instagram, Facebook) -> meta_publisher. The Meta path is unchanged."""
+    """Route the publish step.
+
+      - Google Business Profile           -> gbp_publisher
+      - publish_route == "socialapi"      -> socialapi_publisher  (ONLY when
+                                             AGENT_SOCIALAPI_ENABLED is armed)
+      - everything else (IG, FB)          -> meta_publisher       (unchanged)
+
+    The route flips the publish step ONLY. Drafting, approvals, gates, trust
+    ladder, and calendar are identical on either lane. LASSO's accounts default
+    to meta_direct, so they never change. When the SocialAPI flag is OFF, even a
+    socialapi-routed account falls back to meta_direct."""
     if account is not None and getattr(account, "platform", "") == Platform.GOOGLE_BUSINESS:
         return gbp_publisher
+    if (account is not None
+            and getattr(account, "publish_route", "meta_direct") == "socialapi"
+            and config.socialapi_enabled()):
+        from . import socialapi_publisher
+        return socialapi_publisher
     return meta_publisher
 
 
@@ -214,6 +228,9 @@ def handle_action(action, draft, actor_slack_id, note="",
             creative_key=creative_key,
             archetype=archetype,
             set_name=set_name,
+            # SocialAPI returns a permalink on the result; Meta's result has no
+            # such attr, so getattr keeps the Meta path byte-identical ("").
+            permalink=getattr(result, "permalink", "") or "",
         )
         # Publish confirmation loop: dormant behind AGENT_PUBLISH_CONFIRM_ENABLED
         # (returns None immediately when OFF, and only ever READS when ON).

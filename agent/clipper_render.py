@@ -155,12 +155,13 @@ def _probe_media_kind(path):
 
 
 def frame_vertical(input_path, output_path, media_kind=None, segments=None,
-                   width=REEL_W, height=REEL_H):
+                   width=REEL_W, height=REEL_H, face_center=None):
     """
     Reframe to width x height (default 9:16 1080x1920; pass 1080x1080 for 1:1):
-      video -> fill-scale to cover the target, center-safe crop (active speaker
-               tracking via segments is a Phase 2 enhancement; center crop when
-               segments are absent).
+      video -> fill-scale to cover the target, then crop. When face_center is
+               provided (cx_frac, cy_frac, bottom_frac), applies a 10% punch-in
+               crop centered on the face before scaling back to target size.
+               Falls back to center-crop when face_center is None.
       audio -> audiogram: navy canvas, animated red waveform centered,
                suitable for podcast/voiceover clips without a video source.
 
@@ -171,15 +172,40 @@ def frame_vertical(input_path, output_path, media_kind=None, segments=None,
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     if kind == "video":
-        # Fill-scale: scale so BOTH width >= W AND height >= H, then
-        # center-crop to exactly WxH. This never letterboxes.
-        vf = (
+        # Fill-scale so both dimensions cover the target, then crop.
+        _scale = (
             f"scale=w='if(gt(iw/ih,{width}/{height}),-2,{width})':"
             f"h='if(gt(iw/ih,{width}/{height}),{height},-2)',"
             f"scale=w='if(lt(iw,{width}),{width},iw)':"
-            f"h='if(lt(ih,{height}),{height},ih)',"
-            f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2"
+            f"h='if(lt(ih,{height}),{height},ih)'"
         )
+        if face_center:
+            # 10% punch-in: crop a tighter window centered on the face then
+            # scale back up, making the speaker appear closer and centered.
+            _PUNCH = 1.10
+            cw = int(width / _PUNCH)
+            ch = int(height / _PUNCH)
+            cx, cy = face_center[0], face_center[1]
+            # Clamp expressions without commas (ffmpeg parses commas as
+            # filter separators inside crop arguments):
+            #   min(a,b) = (a+b-abs(a-b))/2
+            #   max(r,0) = (r+abs(r))/2
+            def _clamp(val, hi):
+                inner = f"({val}+{hi}-abs({val}-{hi}))/2"
+                return f"({inner}+abs({inner}))/2"
+            crop_x = _clamp(f"{cx:.4f}*iw-{cw}/2", f"iw-{cw}")
+            crop_y = _clamp(f"{cy:.4f}*ih-{ch}/2", f"ih-{ch}")
+            vf = (
+                f"{_scale},"
+                f"crop={cw}:{ch}:{crop_x}:{crop_y},"
+                f"scale={width}:{height}"
+            )
+        else:
+            # Center-crop fallback (no face detected).
+            vf = (
+                f"{_scale},"
+                f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2"
+            )
         cmd = [
             _ffmpeg(), "-y", "-i", input_path,
             "-vf", vf,

@@ -3,12 +3,11 @@ Deployed Monday auto-ingest: pull the newest episode from the Drive folder, edit
 it, and schedule the week as HELD drafts. Runs HEADLESS on Railway (so the drafts
 land in the store the Slack listener reads and Approve works).
 
-Headless note: motion b-roll (Higgsfield) and the still-card Gemini path are the
-only interactive/keyed pieces. Motion b-roll is SKIPPED headless (no MCP in cron);
-the reels still get the approved technique headless: animated intro card, host +
-word-highlight captions, Treatment B side panels, and Nano Banana still cards
-(when AGENT_VIDEO_STILLS_ENABLED + AGENT_NANO_API_KEY are set). Nothing publishes;
-every clip is a held PENDING draft awaiting approval.
+Headless note: motion b-roll renders via Higgsfield (HF_API_KEY + HF_API_SECRET).
+Without those keys, overlays are skipped and reels still get: animated intro card,
+host + word-highlight captions, Treatment B side panels, and Nano Banana still
+cards (when AGENT_VIDEO_STILLS_ENABLED + AGENT_NANO_API_KEY are set). Nothing
+publishes; every clip is a held PENDING draft awaiting approval.
 
 All behind AGENT_PODCAST_AUTO_ENABLED (default OFF).
 """
@@ -62,10 +61,26 @@ def run(source=None, render=False, account_key=None, client=None, poster=None,
             os.path.join(config.clipper_cache_dir(), "episodes"))
     print(f"podcast-auto: source = {source}", flush=True)
 
-    # 2. edit the episode (headless treatment; motion b-roll skipped without MCP)
-    result = video_editor.edit_episode(source, render=render, client=client,
-                                       transcriber=transcriber, llm=llm,
-                                       account_key=accts[0])
+    # 2. edit the episode. Higgsfield renderer is preferred when HF credentials
+    # are set; falls back to fal.ai when only AGENT_FAL_API_KEY is set.
+    # No key -> overlays skipped (captions + cards still render).
+    from . import higgsfield_renderer as _hf, config as _cfg
+    _rndr = _hf.build_renderer()
+    if _rndr:
+        print("podcast-auto: renderer = higgsfield_renderer", flush=True)
+    else:
+        _hf_key_set = bool(_cfg.hf_api_key())
+        print(
+            f"podcast-auto: no renderer "
+            f"(HF_API_KEY={'SET' if _hf_key_set else 'NOT SET'}, "
+            f"HF_API_SECRET={'SET' if os.environ.get('HF_API_SECRET','').strip() else 'NOT SET'}) "
+            f"— overlays will be skipped",
+            flush=True,
+        )
+    _render = render or bool(_rndr)
+    result = video_editor.edit_episode(source, render=_render, renderer=_rndr,
+                                       client=client, transcriber=transcriber,
+                                       llm=llm, account_key=accts[0])
     if not result:
         print("podcast-auto: editor returned nothing (flag off or no clips).",
               flush=True)

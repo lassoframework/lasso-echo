@@ -157,7 +157,7 @@ Account(
 # ---------------------------------------------------------------------------
 
 def run(account_key, display_name, db_conn=None, voice_dir=None,
-        brains_dir=None, base_url=None):
+        brains_dir=None, base_url=None, socialapi_http=None):
     """
     Stand up a new gym end to end. Idempotent: re-running updates display_name
     if different, never re-mints unless rotate was called.
@@ -193,6 +193,7 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
         "publish_flag": "OFF",
         "creds_status": "NOT SET (by hand)",
         "upload_link": None,
+        "socialapi_brand_id": None,
         "pending_human_items": [],
     }
 
@@ -270,6 +271,31 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
             existing_row = db.gym_get(account_key) or {}
             result["upload_link"] = existing_row.get("upload_link")
 
+    # (g2) SocialAPI brand ------------------------------------------------
+    # When this gym is routed to the SocialAPI lane AND the lane is armed,
+    # create its brand once and store the id. Best-effort: a failure here never
+    # crashes onboard (the brand can be created by hand via `socialapi-onboard`).
+    # meta_direct gyms skip this entirely, so LASSO is untouched.
+    from .accounts import get_account as _get_account
+    _acct = _get_account(account_key)
+    if (_acct is not None
+            and getattr(_acct, "publish_route", "meta_direct") == "socialapi"
+            and config.socialapi_enabled()):
+        from . import socialapi_store as _sstore
+        existing_brand = _sstore.get_brand_id(account_key)
+        if existing_brand:
+            result["socialapi_brand_id"] = existing_brand
+        else:
+            try:
+                from . import socialapi_client as _sclient
+                brand_id = _sclient.create_brand(display_name, http=socialapi_http)
+                if brand_id:
+                    _sstore.set_brand_id(account_key, brand_id)
+                    result["socialapi_brand_id"] = brand_id
+            except Exception as _e:
+                print(f"[onboard] SocialAPI brand create deferred for "
+                      f"{account_key}: {type(_e).__name__}")
+
     # (h) Pending human items ---------------------------------------------
     pending = ["publish creds: NOT SET (by hand)"]
     gym_row = db.gym_get(account_key) or {}
@@ -280,6 +306,15 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     pending.append("first-month plan: PENDING")
     if result["token_minted"] is None:
         pending.append("intake token: requires AGENT_ONBOARD_AUTOMINT=true")
+    if _acct is not None and getattr(_acct, "publish_route", "meta_direct") == "socialapi":
+        if result["socialapi_brand_id"]:
+            pending.append("SocialAPI: gym must click the connect link "
+                           "(portal social-connect) to authorize IG + FB")
+        else:
+            pending.append("SocialAPI brand: NOT CREATED "
+                           "(arm AGENT_SOCIALAPI_ENABLED + AGENT_SOCIALAPI_KEY, "
+                           "then run: python -m agent socialapi-onboard --account "
+                           f"{account_key})")
     result["pending_human_items"] = pending
 
     return result

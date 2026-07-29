@@ -35,7 +35,7 @@ B2B_KEYS = [
 ]
 
 NEW_B2B_KEYS = B2B_KEYS[10:]  # the July 2026 batch
-PILLARS = {"All in one offer", "Sales are now", "The AI agents"}
+PILLARS = {"All in one offer", "Sales are now", "We do the heavy lifting"}
 
 # every dash family character: em, en, figure, horizontal bar, minus, hyphen
 _DASH_RE = re.compile(r"[‐‑‒–—―−-]")

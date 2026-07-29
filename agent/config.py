@@ -141,6 +141,41 @@ def publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PUBLISH_ENABLED", "false"))
 
 
+def socialapi_enabled() -> bool:
+    """
+    SocialAPI.ai publish-lane master switch. OFF by default. When OFF, EVERY
+    account publishes through meta_direct exactly as before, even one whose
+    publish_route is 'socialapi'. When ON, an account whose publish_route is
+    'socialapi' routes its publish step through the SocialAPI lane; meta_direct
+    accounts are untouched. This gates ROUTING only, never whether a post goes
+    out: the publish_enabled() draft-only gate still applies inside the lane.
+    Arm by hand in Railway env only.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIALAPI_ENABLED", "false"))
+
+
+def socialapi_key() -> str:
+    """The SocialAPI.ai API key, read lazily BY NAME every call so a rotation
+    takes effect without a reimport. Never logged, never stored on an object,
+    never returned in any card or report. Empty string when unset."""
+    return os.environ.get(SOCIALAPI_KEY_ENV, "")
+
+
+def socialapi_base_url() -> str:
+    """The SocialAPI.ai REST base URL (override for tests / a staging host)."""
+    return os.environ.get("AGENT_SOCIALAPI_BASE_URL", SOCIALAPI_BASE_URL_DEFAULT)
+
+
+def socialapi_max_per_day() -> int:
+    """Sanity ceiling on publishes per account per day for the SocialAPI lane.
+    One post/day is the norm; more than this is an upstream bug and fires a loud
+    ops alert. Default 3."""
+    try:
+        return int(os.environ.get("AGENT_SOCIALAPI_MAX_PER_DAY", "3"))
+    except ValueError:
+        return 3
+
+
 def creative_studio_enabled() -> bool:
     """
     Nano Banana image generation switch. OFF by default. When OFF, generate()
@@ -1144,6 +1179,61 @@ def video_jumpcuts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_VIDEO_JUMPCUTS", "false"))
 
 
+def video_punch_zoom_enabled() -> bool:
+    """Punch-in zoom centered on the detected face for podcast reels.
+    ON by default when render is enabled. Set AGENT_VIDEO_PUNCH_ZOOM=false to disable."""
+    return _truthy(os.environ.get("AGENT_VIDEO_PUNCH_ZOOM", "true"))
+
+
+# ---- fal.ai headless b-roll renderer ----------------------------------------
+
+def fal_api_key() -> str:
+    """API key for fal.ai headless b-roll rendering. Set AGENT_FAL_API_KEY in
+    Railway env. When set + AGENT_VIDEO_RENDER=true, motion overlays render
+    headlessly via fal.ai instead of requiring an interactive Higgsfield MCP session."""
+    return os.environ.get("AGENT_FAL_API_KEY", "").strip()
+
+
+def fal_video_model() -> str:
+    """fal.ai model for motion b-roll clips. Env AGENT_FAL_VIDEO_MODEL,
+    default fal-ai/kling-video/v1.6/standard/text-to-video."""
+    return (os.environ.get("AGENT_FAL_VIDEO_MODEL", "")
+            or "fal-ai/kling-video/v1.6/standard/text-to-video").strip()
+
+
+def fal_image_model() -> str:
+    """fal.ai model for still image overlays. Env AGENT_FAL_IMAGE_MODEL,
+    default fal-ai/flux/schnell."""
+    return (os.environ.get("AGENT_FAL_IMAGE_MODEL", "")
+            or "fal-ai/flux/schnell").strip()
+
+
+# ---- Higgsfield headless b-roll renderer ------------------------------------
+
+def hf_api_key() -> str:
+    """Higgsfield API key presence check. Set HF_API_KEY + HF_API_SECRET
+    (or HF_KEY) in Railway. When set, Higgsfield is preferred over fal.ai
+    for b-roll rendering."""
+    key = os.environ.get("HF_KEY", "").strip()
+    if key:
+        return key
+    return os.environ.get("HF_API_KEY", "").strip()
+
+
+def hf_video_app() -> str:
+    """Higgsfield SDK application path for text-to-video. Env AGENT_HF_VIDEO_APP.
+    Default: kling-video/v3.0/text-to-video."""
+    return (os.environ.get("AGENT_HF_VIDEO_APP", "")
+            or "kling-video/v3.0/text-to-video").strip()
+
+
+def hf_image_app() -> str:
+    """Higgsfield SDK application path for text-to-image. Env AGENT_HF_IMAGE_APP.
+    Default: bytedance/seedream/v4/text-to-image (confirmed from SDK docs)."""
+    return (os.environ.get("AGENT_HF_IMAGE_APP", "")
+            or "bytedance/seedream/v4/text-to-image").strip()
+
+
 def video_jumpcut_gap() -> float:
     """Inter-word gap (seconds) above which dead air is removed; the kept residual
     is video_jumpcut_keep(). Env AGENT_VIDEO_JUMPCUT_GAP, default 0.45."""
@@ -1303,3 +1393,14 @@ def onboard_automint_enabled() -> bool:
 # Generate a key once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Store it in Railway env only; never commit or log it.
 INTAKE_ENC_KEY_ENV = "AGENT_INTAKE_ENC_KEY"
+
+# ---- SocialAPI.ai publish lane ----------------------------------------------
+# The API key is read BY NAME only (never stored, never logged). Set it by hand
+# in Railway: AGENT_SOCIALAPI_KEY=sapi_key_...  Nothing in code writes it.
+SOCIALAPI_KEY_ENV = "AGENT_SOCIALAPI_KEY"           # name of the env var, not the value
+SOCIALAPI_BASE_URL_DEFAULT = "https://api.social-api.ai/v1"
+# Name of the env var holding the Fernet key for encrypting per-brand SocialAPI
+# material (brand id / connected account ids) at rest, same pattern as intake
+# tokens. When unset: values are stored in plaintext in the kv table (dev mode).
+# Generate once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+SOCIALAPI_ENC_KEY_ENV = "AGENT_SOCIALAPI_ENC_KEY"

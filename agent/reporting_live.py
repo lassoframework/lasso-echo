@@ -236,6 +236,47 @@ def fetch_post_metrics(media_id, token, http=None, platform="instagram",
     return out
 
 
+def snapshot_socialapi_account(account, today, http=None):
+    """Daily snapshot for a SocialAPI-routed account.
+
+    HONEST DATA SOURCE: SocialAPI exposes per-post likes/comments/saves/shares
+    only. It has NO account-level insights and NO impressions/reach/follower
+    count. So the account-level snapshot carries a data_source marker and none of
+    the reach/views/follower fields (they render as gaps, never fake zeros), and
+    per-post rows fill only the four engagement columns; views/reach stay NULL.
+    """
+    from . import socialapi_client
+    # Account-level snapshot: only the honest marker; no fabricated metrics.
+    snap = {"data_source": "socialapi",
+            "note": "engagement only; reach, impressions, followers not available"}
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO snapshots (account_key, date, metrics) "
+            "VALUES (?,?,?)", (account.key, today, json.dumps(snap)))
+        rows = conn.execute(
+            "SELECT id, media_id, published_at FROM posts WHERE account_key=? "
+            "AND mode='published' AND media_id != '' "
+            "AND published_at >= date(?, '-35 day')",
+            (account.key, today)).fetchall()
+        for row in rows:
+            try:
+                m = socialapi_client.get_post_metrics(row["media_id"], http=http)
+                tgts = m.get("targets") or []
+                src = tgts[0] if tgts else m
+                conn.execute(
+                    "UPDATE posts SET likes=?, comments=?, saves=?, shares=? "
+                    "WHERE id=?",
+                    (src.get("likes"), src.get("comments"), src.get("saves"),
+                     src.get("shares"), row["id"]))
+            except Exception as e:
+                reason = ops_alerts.scrub(str(e))
+                print(f"[reporting] socialapi post read skipped "
+                      f"{row['media_id']}: {reason}")
+                db.audit("insights_skip", row["media_id"], reason,
+                         account.key, today)
+        conn.commit()
+
+
 def snapshot_all(http=None, poster=None, now=None):
     """
     The daily snapshot pass. Returns {account: ok_bool} or None while
@@ -246,6 +287,19 @@ def snapshot_all(http=None, poster=None, now=None):
     today = (now or datetime.now(timezone.utc)).date().isoformat()
     results = {}
     for account in active_accounts():
+        # SocialAPI lane: read metrics from SocialAPI, never Meta. Only the four
+        # engagement metrics exist there; reach/impressions/followers stay NULL
+        # (PLANNED), which the monthly report renders as explicit gaps.
+        if (config.socialapi_enabled()
+                and getattr(account, "publish_route", "meta_direct") == "socialapi"):
+            try:
+                snapshot_socialapi_account(account, today, http=http)
+                results[account.key] = True
+            except Exception as e:
+                results[account.key] = False
+                ops_alerts.alert(f"reporting snapshot failed for {account.key} "
+                                 f"(socialapi): {type(e).__name__}: {e}")
+            continue
         token = account.get_token()
         if not token:
             results[account.key] = False
