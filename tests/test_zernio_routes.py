@@ -72,6 +72,13 @@ def test_map_status_defensive_on_garbage():
         assert out["platforms"]["instagram"]["connected"] is False
 
 
+def test_bare_account_without_signal_is_not_connected():
+    # A malformed/partial payload with only a platform must NOT read as connected.
+    assert z.account_state({"platform": "instagram"}) == "not_connected"
+    out = z.map_status({"accounts": [{"platform": "instagram"}]})
+    assert out["platforms"]["instagram"] == {"connected": False, "handle": None, "expired": False}
+
+
 def test_map_pages_renames_underscore_id():
     out = z.map_pages({"pages": [{"_id": "111", "name": "My Gym Page"}, {"_id": "", "name": "drop"}]})
     assert out == {"pages": [{"id": "111", "name": "My Gym Page"}]}

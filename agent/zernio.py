@@ -115,6 +115,15 @@ def account_state(acct, now=None):
     if acct.get("isActive") is False or acct.get("enabled") is False:
         return "expired"
     md = acct.get("metadata") or {}
+    # Require a POSITIVE connection signal — never optimistically claim "connected" on a bare or
+    # malformed payload. A real connected account carries at least one of these.
+    has_signal = (
+        acct.get("isActive") is True
+        or bool(acct.get("connectedAt"))
+        or bool(md.get("profileData"))
+    )
+    if not has_signal:
+        return "not_connected"
     exp = md.get("expires_in")
     connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
     if isinstance(exp, (int, float)) and connected_at is not None:
