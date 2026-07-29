@@ -23,7 +23,9 @@ Endpoint-level. One line per Echo endpoint the portal calls or will call.
 | `POST /api/approve/<key>/<draft_id>` | PLANNED | Portal cannot send approval actions until Echo ships this |
 | `GET /api/report/<key>?days=30` | PLANNED | Portal cannot display live report until Echo ships this |
 | `GET /portal/<token>/social-status` | PLANNED | Social Connections page holds until Echo ships; portal shows honest holding state |
-| `GET /portal/<token>/social-connect` | PLANNED | Portal cannot mint the OAuth connect link until Echo ships this |
+| `GET /portal/<token>/social-connect?platform=instagram\|facebook` | PLANNED | Now per-platform. Portal cannot mint the OAuth connect link until Echo ships this |
+| `GET /portal/<token>/facebook-pages` | PLANNED | Portal cannot show the Facebook Page picker until Echo ships this |
+| `POST /portal/<token>/facebook-page-select` | PLANNED | Portal cannot record the gym's chosen Facebook Page until Echo ships this |
 
 ---
 
@@ -38,6 +40,7 @@ What the portal CC is building next, in priority order:
 - [x] Reporting page — show "Reporting coming soon" holding card until `GET /api/report/<key>` is live; when live, display gaps explicitly, never substitute zero for a missing metric _(shipped portal PR #238 — /command-center/social-report; holding card live)_
 - [ ] Approval action buttons — Approve, Edit, Skip, Deny, Kill wired to `POST /api/approve/<key>/<draft_id>`; Kill requires a confirm dialog; do not build until that endpoint is in STATUS.md as LIVE
 - [x] Social Connections page — client /my tab; GET `/portal/<token>/social-status` for per-platform Instagram + Facebook state (connected / not connected / expired) and GET `/portal/<token>/social-connect` for the OAuth URL. Portal decrypts the gym token server-side, holds NO credentials. Built against the stub contract; shows an honest "coming soon" holding state until both endpoints are LIVE _(shipped portal branch feat/social-connections)_
+- [x] Social Connections — per-platform + Facebook Page picker adjustment _(portal branch feat/zernio-connect)_: (1) split the single connect button into per-platform Connect Instagram / Connect Facebook (and a per-platform Reconnect on expired), calling `GET /portal/<token>/social-connect?platform=instagram|facebook`; (2) after Facebook connects, a "Which Page is your gym?" picker calls `GET /portal/<token>/facebook-pages` and POSTs the choice to `POST /portal/<token>/facebook-page-select` (one-Page case auto-selects but requires a confirm, never a silent pick). Portal still decrypts the token server-side and holds NO credentials or Page ids. Honest holding state until all endpoints are LIVE
 
 ---
 
@@ -49,8 +52,19 @@ What Echo CC must ship before the portal can wire each item. Named dependency pa
 - [ ] `POST /api/approve/<key>/<draft_id>` — portal cannot send Approve/Edit/Skip/Deny/Kill actions until this ships; Slack is the only approval channel until then
 - [ ] `GET /api/report/<key>?days=30` — portal cannot display live 30-day report until this ships
 - [ ] `GET /portal/<token>/social-status` — the Social Connections page is built and waiting. Expected shape: `{ platforms: { instagram: { connected: bool, handle: string|null, expired: bool }, facebook: { connected: bool, handle: string|null, expired: bool } } }`. Portal degrades to a holding state until this is LIVE.
-- [ ] `GET /portal/<token>/social-connect` — mints the SocialAPI.ai OAuth URL for one-time Instagram + Facebook connect. Expected shape: `{ oauth_url: string }`. Portal shows the Connect button as "coming soon" until this is LIVE.
+- [ ] `GET /portal/<token>/social-connect?platform=instagram|facebook` — NOW PER-PLATFORM. Mints the OAuth URL for connecting ONE platform (Instagram or Facebook) at a time; the portal always passes an exact `platform` query param (validated server-side to be exactly `instagram` or `facebook`). Expected shape unchanged: `{ oauth_url: string }`. Portal shows each platform's Connect/Reconnect button as "coming soon" until this is LIVE.
+- [ ] `GET /portal/<token>/facebook-pages` — after Facebook OAuth, returns the Facebook Pages the gym's user manages so the gym can pick the right one. Expected shape: `{ pages: [ { id: string, name: string } ] }`. Portal degrades to a holding state (empty picker) until this is LIVE.
+- [ ] `POST /portal/<token>/facebook-page-select` — records the gym's chosen Page. Request body: `{ page_id: string }`. Expected response: `{ ok: bool }`. Echo owns the Page binding; the portal stores nothing. Portal cannot save a Page choice until this is LIVE.
 - Echo must update STATUS.md in every commit that changes any portal-facing endpoint, flag, or response shape
+
+### ZERNIO MAPPING (from docs.zernio.com/llms-full.txt, 2026-07-29) — Echo owns the translation; the portal contract above does NOT change
+Echo brokers Zernio; the portal never sees Zernio. Echo must fold Zernio responses into the portal shapes above:
+- **A gym = a Zernio profile.** Scope every call with the gym's `profileId`. Auth to Zernio is `Authorization: Bearer $ZERNIO_API_KEY` (portal never sees the key).
+- **Connect:** Zernio `GET /v1/connect/{platform}?profileId=...` returns `{ authUrl }`. Echo maps `authUrl` -> `oauth_url`. Flow (one OAuth per platform) matches.
+- **Status:** Zernio `GET /v1/accounts?profileId=...` returns a FLAT `accounts[]` with `{ _id, platform, username, status }`. Echo must fold this into `{ platforms: { instagram, facebook } }`, mapping `username` -> `handle` and `status`/webhook state -> `connected`.
+- **EXPIRY IS PUSH, NOT PULL (most important).** Zernio has no `expired`/`expiresAt` field. Echo must subscribe to the Zernio `account.disconnected` webhook (also `account.connected`; at-least-once, dedupe on event id, max 10 webhooks/team), persist per-account state, and DERIVE the `expired` bool the portal's amber "Needs Reconnect" reads. The portal cannot poll expiry.
+- **Facebook Page:** Zernio `GET /v1/accounts/{accountId}/facebook-page` returns `{ pages: [{ _id, name }] }` (id field is `_id`, map to `id`). Zernio has NO page-select endpoint — the Page is a default/per-post setting (`platformSpecificData.pageId`). Echo owns persisting the gym's chosen `page_id` and injecting it per post; the portal's `facebook-page-select` POST just hands Echo the choice.
+- **OPEN (confirm with Zernio):** whether Instagram connect REQUIRES a linked Facebook Page (Meta normally does; Zernio docs are silent). Zernio docs have no Instagram section yet — verify IG is supported before arming the IG connect button.
 
 ---
 
