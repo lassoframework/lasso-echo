@@ -22,10 +22,10 @@ Endpoint-level. One line per Echo endpoint the portal calls or will call.
 | `GET /api/calendar/<key>?month=YYYY-MM` | PLANNED | Portal cannot render live calendar until Echo ships this |
 | `POST /api/approve/<key>/<draft_id>` | PLANNED | Portal cannot send approval actions until Echo ships this |
 | `GET /api/report/<key>?days=30` | PLANNED | Portal cannot display live report until Echo ships this |
-| `GET /portal/<token>/social-status` | PLANNED | Social Connections page holds until Echo ships; portal shows honest holding state |
-| `GET /portal/<token>/social-connect?platform=instagram\|facebook` | PLANNED | Now per-platform. Portal cannot mint the OAuth connect link until Echo ships this |
-| `GET /portal/<token>/facebook-pages` | PLANNED | Portal cannot show the Facebook Page picker until Echo ships this |
-| `POST /portal/<token>/facebook-page-select` | PLANNED | Portal cannot record the gym's chosen Facebook Page until Echo ships this |
+| `GET /portal/<token>/social-status` | BUILT, DEPLOY PENDING | Echo branch feat/zernio-connect-endpoints; gated by ZERNIO_API_KEY (set in Railway). LIVE once deployed |
+| `GET /portal/<token>/social-connect?platform=instagram\|facebook` | BUILT, DEPLOY PENDING | Per-platform; returns {oauth_url} from Zernio authUrl. LIVE once deployed |
+| `GET /portal/<token>/facebook-pages` | BUILT, DEPLOY PENDING | Returns {pages:[{id,name}]}. LIVE once deployed |
+| `POST /portal/<token>/facebook-page-select` | BUILT, DEPLOY PENDING | Persists the gym's chosen page (Echo injects per post). LIVE once deployed |
 
 ---
 

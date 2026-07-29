@@ -125,6 +125,19 @@ def connect(path=None):
             conn.execute("ALTER TABLE gyms ADD COLUMN intake_token_encrypted TEXT")
         except Exception:
             pass
+    # additive gyms migration: Zernio per-gym profile binding + chosen default Facebook Page.
+    # zernio_profile_id maps a gym to its Zernio profile (tenant boundary); the FB page id is the
+    # gym's chosen Page, which Echo owns and injects per post. Existing rows stay null.
+    if "zernio_profile_id" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN zernio_profile_id TEXT")
+        except Exception:
+            pass
+    if "zernio_default_fb_page_id" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN zernio_default_fb_page_id TEXT")
+        except Exception:
+            pass
     return conn
 
 
@@ -255,6 +268,7 @@ def gym_upsert(account_key, display_name='', **fields):
         'display_name', 'gym_name', 'intake_token_hash', 'token_rotated_at',
         'token_revoked', 'intake_token_encrypted', 'upload_link', 'publish_flag',
         'publish_creds', 'publish_creds_status',
+        'zernio_profile_id', 'zernio_default_fb_page_id',
     }
     extra_cols = []
     extra_vals = []

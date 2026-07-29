@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 
 from . import config, ghl_intake, intake_tokens, whatsapp_intake
 from . import portal_routes as _pr
+from . import zernio_routes as _zr
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 _TRACKER_TOKEN_ENV = "AGENT_TRACKER_TOKEN"   # name only; value is set by hand
@@ -875,7 +876,8 @@ def build_server(port=None):
             sub is one of: calendar, library, approve, edit, deny, kill."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_-]{8,})/"
-                r"(calendar|library|approve|edit|deny|kill)$",
+                r"(calendar|library|approve|edit|deny|kill"
+                r"|social-connect|social-status|facebook-pages|facebook-page-select)$",
                 self.path.split("?")[0],
             )
             if m:
@@ -911,6 +913,22 @@ def build_server(port=None):
                     status, body = _pr.handle_portal_calendar(account_key, month)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
+                return self._send_json(body, status)
+
+            # Zernio social-connect read routes: social-connect (needs ?platform=),
+            # social-status, facebook-pages. Token resolves to account_key; gated by ZERNIO_API_KEY.
+            if pt_token is not None and pt_sub in ("social-connect", "social-status", "facebook-pages"):
+                account_key = client_for_token(pt_token)
+                if account_key is None:
+                    return self._deny(404)
+                if pt_sub == "social-connect":
+                    from urllib.parse import urlparse, parse_qs
+                    platform = (parse_qs(urlparse(self.path).query).get("platform") or [""])[0]
+                    status, body = _zr.handle_social_connect(account_key, platform)
+                elif pt_sub == "social-status":
+                    status, body = _zr.handle_social_status(account_key)
+                else:
+                    status, body = _zr.handle_facebook_pages(account_key)
                 return self._send_json(body, status)
 
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
@@ -1017,6 +1035,21 @@ def build_server(port=None):
                 status, resp = _pr.handle_portal_action(
                     pt_action, account_key, draft_id, actor_id, note=note
                 )
+                return self._send_json(resp, status)
+
+            # Zernio Facebook Page select: POST /portal/<token>/facebook-page-select {page_id}.
+            if pt_token is not None and pt_action == "facebook-page-select":
+                account_key = client_for_token(pt_token)
+                if account_key is None:
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                status, resp = _zr.handle_facebook_page_select(account_key, body.get("page_id", ""))
                 return self._send_json(resp, status)
 
             # GHL inbound webhook (POST /ghl/inbound).

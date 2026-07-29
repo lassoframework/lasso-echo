@@ -513,6 +513,22 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+# Zernio social-connect. The key was set in Railway as ZERNIO_API_KEY (no AGENT_ prefix), so we read
+# that exact name. The key's PRESENCE is the switch — no key means the endpoints are dark and return
+# a clean disabled response, so nothing accidentally calls a paid vendor without the credential.
+ZERNIO_API_KEY_ENV = "ZERNIO_API_KEY"
+
+
+def zernio_api_base() -> str:
+    """Zernio API base URL. Overridable for tests; defaults to the live host."""
+    return (os.environ.get("ZERNIO_API_BASE") or "https://api.zernio.com").rstrip("/")
+
+
+def zernio_enabled() -> bool:
+    """Zernio social-connect endpoints are enabled iff the API key is present."""
+    return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
+
+
 def backup_enabled() -> bool:
     """
     Nightly store backup switch. OFF by default. ON, a consistent sqlite
