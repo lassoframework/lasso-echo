@@ -54,7 +54,8 @@ def _build_key(local_path, tenant):
 
 
 def _public_url(key):
-    return f"{config.S3_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+    from urllib.parse import quote
+    return f"{config.S3_PUBLIC_BASE_URL.rstrip('/')}/{quote(key, safe='/')}"
 
 
 def key_for(local_path, tenant):
