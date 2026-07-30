@@ -107,6 +107,35 @@ def _load_folder_note(folder):
     return out
 
 
+def _concept_caption(concept_key):
+    """Extract caption body from a regen_library concept spec.
+
+    regen_library sidecars record which CONCEPT generated the image but write
+    no "note" field. Without a note, TemplateGenerator has no body text and
+    falls back to a generic voice-doc CTA that has nothing to do with the
+    image. This function reads the concept's approved caption lines so the
+    caption always matches what the card actually shows."""
+    try:
+        from .regen_library import CONCEPTS
+    except Exception:
+        return ""
+    spec = CONCEPTS.get(concept_key)
+    if not spec:
+        return ""
+    lines = []
+    for cite in spec.get("cite", []):
+        lines.append(cite.strip())
+    for entry in spec.get("concept", []):
+        for prefix in (
+            "Support copy (caption, never rendered):",
+            "CTA copy (caption, never rendered):",
+        ):
+            if entry.startswith(prefix):
+                lines.append(entry[len(prefix):].strip())
+                break
+    return "\n\n".join(lines)
+
+
 def _load_sidecar(library_path, media_name):
     """Load client-provided note + optional public_url. Never fabricated here."""
     stem = os.path.splitext(media_name)[0]
@@ -119,6 +148,12 @@ def _load_sidecar(library_path, media_name):
                 data = json.load(f)
             out["client_note"] = str(data.get("note", "")).strip()
             out["public_url"] = str(data.get("public_url", "")).strip()
+            # Backfill: regen_library sidecars have a "concept" key but no
+            # "note". Without a note the drafter has no body and writes a
+            # generic CTA that mismatches the image. Pull caption copy from
+            # the concept spec so the words always match the card.
+            if not out["client_note"] and data.get("concept"):
+                out["client_note"] = _concept_caption(data["concept"])
         except Exception:
             pass
     elif os.path.exists(txt):

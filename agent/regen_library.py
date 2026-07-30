@@ -1280,6 +1280,22 @@ def _run_batch(keys, dry_run, nano_client, s3_client, out_dir):
                 "archetype": spec.get("archetype", "flow"),
                 "set": spec.get("set", "brand"),
             }
+            # Caption copy (never rendered on the image). Written here so library.py
+            # picks it up as client_note and the drafter writes a caption that
+            # matches the card rather than a generic voice-doc CTA.
+            note_lines = []
+            for cite in spec.get("cite", []):
+                note_lines.append(cite.strip())
+            for entry in spec.get("concept", []):
+                for prefix in (
+                    "Support copy (caption, never rendered):",
+                    "CTA copy (caption, never rendered):",
+                ):
+                    if entry.startswith(prefix):
+                        note_lines.append(entry[len(prefix):].strip())
+                        break
+            if note_lines:
+                sidecar["note"] = "\n\n".join(note_lines)
             if spec.get("pillar"):
                 sidecar["pillar"] = spec["pillar"]
             if spec.get("cite"):
