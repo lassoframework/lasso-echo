@@ -308,6 +308,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             acct_lib = account.library_prefix or lib
 
             draft = None
+            # BOOK QUEUE (pre-made drafts from book_queue.py + book_manifest.json).
+            # Fires before any campaign builder. On a matching date, returns the
+            # exact pre-written Draft; runner auto-publishes it (AGENT_AUTO_APPROVE
+            # armed) without needing a Slack tap. No-ops when manifest is absent.
+            if account.key in ("lasso_ig", "lasso_fb"):
+                from .book_queue import build_book_queue_draft as _bq_draft
+                draft = _bq_draft(account, day_key)
+
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
             from .category_cap import is_allowed as _cap_allowed, record_win as _record_cap

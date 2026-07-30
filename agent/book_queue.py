@@ -270,10 +270,98 @@ def create_drafts(manifest=None):
     return created
 
 
+# ---- Daily runner hook -----------------------------------------------------
+
+def build_book_queue_draft(account, day_key):
+    """Return a Draft if this account has a scheduled book post for day_key.
+
+    Called by runner.run_daily() before the campaign builder chain. Returns
+    None when this is not a book queue day or the manifest is missing."""
+    if account.key not in ACCOUNTS:
+        return None
+    post = next((p for p in BOOK_POSTS if p["date"] == day_key), None)
+    if post is None:
+        return None
+    manifest = _load_manifest()
+    if not manifest:
+        return None
+    url = manifest.get(post["filename"])
+    if not url:
+        print(f"[book-queue] manifest missing URL for {post['filename']} — skipping")
+        return None
+    from . import schedule as sched
+    from .drafter import Draft, DraftStatus
+    did = _draft_id(account.key, post["filename"], day_key)
+    platform = getattr(account, "platform", account.key)
+    return Draft(
+        draft_id=did,
+        account_key=account.key,
+        platform=platform,
+        caption=post["caption"],
+        hashtags=[],
+        creative_path=post["filename"],
+        creative_public_url=url,
+        scheduled_for=sched.scheduled_for(day_key),
+        status=DraftStatus.PENDING,
+        day_key=day_key,
+        draft_type="feed",
+    )
+
+
+# ---- Expire existing Slack cards -------------------------------------------
+
+def expire_existing_drafts():
+    """Mark all PENDING book_ drafts EXPIRED so existing Slack cards are inert.
+
+    The daily runner re-surfaces each post on its scheduled date and
+    auto-publishes it (AGENT_AUTO_APPROVE_ENABLED). Run this once after the
+    initial book_manifest seeding so stale Slack cards can't be accidentally
+    approved early.
+
+    Usage (Railway CLI):
+      railway run .venv/bin/python -m agent book-queue --expire-book-queue
+    """
+    from .store import PendingStore
+    from .drafter import DraftStatus
+    from .slack_poster import SlackPoster
+
+    store = PendingStore()
+    poster = SlackPoster()
+    pending = getattr(store, "list_pending", None)
+    if pending is None:
+        print("PendingStore has no list_pending — nothing to expire.")
+        return 0
+
+    expired_n = 0
+    for d in pending():
+        if not (d.draft_id or "").startswith("book_"):
+            continue
+        if d.status != DraftStatus.PENDING:
+            continue
+        d.status = DraftStatus.EXPIRED
+        store.put(d)
+        try:
+            poster.mark_expired(d)
+        except Exception:
+            pass
+        print(f"  expired {d.draft_id} ({d.account_key}, {d.day_key})")
+        expired_n += 1
+
+    print(f"\n{expired_n} book_ draft(s) expired. "
+          "Existing Slack cards are now inert (approve tap is a no-op).\n"
+          "The daily runner will publish each post on its scheduled date.\n"
+          "You can now remove AGENT_BOOK_QUEUE_ON_START from Railway Variables.")
+    return expired_n
+
+
 # ---- CLI entry point -------------------------------------------------------
 
-def run(images_dir=None, from_manifest=False):
+def run(images_dir=None, from_manifest=False, expire_only=False):
     """Main entry point called from __main__.py."""
+    if expire_only:
+        expire_existing_drafts()
+        return
+
     manifest = _load_manifest()
 
     if not images_dir and not from_manifest:

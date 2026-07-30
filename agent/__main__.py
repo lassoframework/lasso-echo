@@ -2072,6 +2072,7 @@ def main(argv=None):
         from .book_queue import run as _bq_run
         _images_dir = None
         _from_manifest = False
+        _expire_bq = False
         _bq_args = argv[1:]
         i = 0
         while i < len(_bq_args):
@@ -2079,8 +2080,10 @@ def main(argv=None):
                 _images_dir = _bq_args[i + 1]; i += 2; continue
             if _bq_args[i] == "--from-manifest":
                 _from_manifest = True; i += 1; continue
+            if _bq_args[i] == "--expire-book-queue":
+                _expire_bq = True; i += 1; continue
             i += 1
-        _bq_run(images_dir=_images_dir, from_manifest=_from_manifest)
+        _bq_run(images_dir=_images_dir, from_manifest=_from_manifest, expire_only=_expire_bq)
     elif cmd in ("socialapi-onboard", "socialapi-connect", "socialapi-status"):
         _socialapi_cli(cmd, argv[1:])
     elif cmd == "send-card":
