@@ -425,18 +425,37 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 results.append(draft)
             feed_draft = draft if draft is not None else existing
 
+            # BOOK STORIES QUEUE: pre-made 9:16 story cards for The Full Gym launch.
+            # Fires before the auto-generated story; takes its slot on matching dates.
+            _book_story_posted = False
+            if account.key in ("lasso_ig",):
+                from .book_stories_queue import build_book_story_draft as _bsq_draft
+                bk_story = _bsq_draft(account, day_key)
+                if bk_story is not None:
+                    if idempotent:
+                        bk_story, _existing_bk = _reconcile(
+                            bk_story, day_key, "story", store, poster)
+                        if bk_story is None:
+                            results.append(_existing_bk)
+                    if bk_story is not None:
+                        _post_and_save(bk_story, store, poster, idempotent)
+                        results.append(bk_story)
+                    _book_story_posted = True
+
             # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one
             # 9:16 Story per account reusing the day's creative; PENDING, its own
-            # approval card, clearly labeled STORY. Nothing publishes here.
-            story = build_story_draft(account, day_key, feed_draft=feed_draft)
-            if story is not None:
-                if idempotent:
-                    story, existing_story = _reconcile(story, day_key, "story", store, poster)
-                    if story is None:
-                        results.append(existing_story)
+            # approval card, clearly labeled STORY. Book story takes this slot when
+            # scheduled; auto-generated story is skipped on book story days.
+            if not _book_story_posted:
+                story = build_story_draft(account, day_key, feed_draft=feed_draft)
                 if story is not None:
-                    _post_and_save(story, store, poster, idempotent)
-                    results.append(story)
+                    if idempotent:
+                        story, existing_story = _reconcile(story, day_key, "story", store, poster)
+                        if story is None:
+                            results.append(existing_story)
+                    if story is not None:
+                        _post_and_save(story, store, poster, idempotent)
+                        results.append(story)
 
         except Exception as e:
             print(f"[runner] {account.key} failed this cycle: "

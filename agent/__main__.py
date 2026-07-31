@@ -749,6 +749,7 @@ _COMMANDS = {
     "campaigns": [
         ("summit-queue", "upload + schedule LASSO Growth Summit infographic posts (--images-dir / --from-manifest)"),
         ("book-queue", "upload + schedule The Full Gym book launch infographic posts (--images-dir / --from-manifest)"),
+        ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "socialapi lane": [
@@ -1073,6 +1074,12 @@ def main(argv=None):
             from .book_queue import run as _bq_run_startup
             _bq_run_startup(from_manifest=True)
             print("[startup] book queue done.", flush=True)
+        if os.environ.get("AGENT_BOOK_STORIES_ON_START", "").lower() in ("1", "true"):
+            print("[startup] AGENT_BOOK_STORIES_ON_START detected — loading book stories queue…",
+                  flush=True)
+            from .book_stories_queue import run as _bsq_run_startup
+            _bsq_run_startup(from_manifest=True)
+            print("[startup] book stories queue done.", flush=True)
         from .listener import run_listener
         run_listener()
     elif cmd == "dry-run":
@@ -2084,6 +2091,22 @@ def main(argv=None):
                 _expire_bq = True; i += 1; continue
             i += 1
         _bq_run(images_dir=_images_dir, from_manifest=_from_manifest, expire_only=_expire_bq)
+    elif cmd == "book-stories":
+        from .book_stories_queue import run as _bsq_run
+        _images_dir = None
+        _from_manifest = False
+        _expire_bsq = False
+        _bsq_args = argv[1:]
+        i = 0
+        while i < len(_bsq_args):
+            if _bsq_args[i] == "--images-dir" and i + 1 < len(_bsq_args):
+                _images_dir = _bsq_args[i + 1]; i += 2; continue
+            if _bsq_args[i] == "--from-manifest":
+                _from_manifest = True; i += 1; continue
+            if _bsq_args[i] == "--expire-book-stories":
+                _expire_bsq = True; i += 1; continue
+            i += 1
+        _bsq_run(images_dir=_images_dir, from_manifest=_from_manifest, expire_only=_expire_bsq)
     elif cmd in ("socialapi-onboard", "socialapi-connect", "socialapi-status"):
         _socialapi_cli(cmd, argv[1:])
     elif cmd == "send-card":
