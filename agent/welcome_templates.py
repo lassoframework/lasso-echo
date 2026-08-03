@@ -188,52 +188,71 @@ def background_prompt(template):
     vert = "upper" if zy < SIZE * 0.4 else "middle"
     calm = (f"Keep the {vert} {side} region of the frame visually CALM: low detail, "
             f"low contrast, smooth and uncluttered, so a logo can sit there and read. ")
+    # RED is accent-aware. Composed-accent templates (word / block / rule) carry
+    # their single red in the PIL text layer, so the background must have NO red at
+    # all (else the card shows two reds). in_bg templates carry the one red in the
+    # art itself.
+    if t["accent"] == "in_bg":
+        red_feature = {
+            "red_streak": ("One dramatic diagonal red #FF0000 light streak sweeps across "
+                           "the frame as the single bold accent; no other red anywhere. "),
+            "diagonal_split": ("One side of the bold diagonal split is vivid red #FF0000 as "
+                               "the single color accent; no other red anywhere. "),
+            "split_panel": ("One crisp vertical red #FF0000 seam divides the two panels as "
+                            "the single accent; no other red anywhere. "),
+            "celebration": ("A cluster of red #FF0000 confetti particles in one area is the "
+                            "single accent; all other particles are sky blue #5EB9E6; no "
+                            "other red anywhere. "),
+        }[t["bg_style"]]
+    else:
+        red_feature = ("CRITICAL COLOR RULE: use ONLY navy #121E3C, cream #FAF6F0, and "
+                       "sky blue #5EB9E6. There must be ZERO red, crimson, scarlet, "
+                       "maroon, or orange anywhere in the image. The red accent is added "
+                       "separately in the layout, so the background carries none. ")
     common = (f"{_NO_TEXT_RULE} {calm}"
+              "Square 1:1 composition, full bleed. "
               "Premium B2B agency quality, editorial, clean, not busy. "
-              "Exactly one red element as the single accent, never a red background. "
+              f"{red_feature}"
               "This is a focal graphic background, not a scene with people's faces.")
     styles = {
         "editorial_navy": (
-            "A deep navy #121E3C background with a soft radial glow and a subtle "
-            "single sky-blue #5EB9E6 light gradient sweeping in from one side. "
-            "Minimal, spacious, one faint red #FF0000 spark of light as the lone accent. "),
+            "A deep navy #121E3C background with a soft radial glow and a subtle single "
+            "sky-blue #5EB9E6 light gradient sweeping in from one side. Minimal and "
+            "spacious with quiet atmospheric depth. "),
         "editorial_cream": (
-            "A warm cream #FAF6F0 background with a very soft navy depth wash in one "
-            "corner and gentle paper-grain texture. Spacious and calm, one small red "
-            "#FF0000 accent mark. "),
+            "A warm cream #FAF6F0 background with a very soft navy #121E3C depth wash in "
+            "one corner and gentle paper-grain texture. Spacious and calm. "),
         "block_cream": (
-            "A cream #FAF6F0 background, mostly flat and clean, with one bold red "
-            "#FF0000 geometric color block anchored in a corner as the single focal "
-            "graphic, and a faint navy depth wash opposite it. "),
+            "A cream #FAF6F0 background, mostly flat and clean, with one bold navy "
+            "#121E3C geometric color block anchored in a corner as a focal graphic and a "
+            "faint depth wash opposite it. "),
         "split_panel": (
             "A background split into a deep navy #121E3C panel on the left and a warm "
-            "cream #FAF6F0 field on the right, divided by one crisp red #FF0000 vertical "
-            "seam as the single accent. Clean, architectural, flat color fields. "),
+            "cream #FAF6F0 field on the right, a clean architectural divide with flat "
+            "color fields and subtle depth. "),
         "badge_cream": (
-            "A cream #FAF6F0 background with a soft centered navy medallion glow and a "
-            "faint concentric ring motif, one thin red #FF0000 ring accent. Refined, "
-            "award-like, uncluttered. "),
+            "A cream #FAF6F0 background with a soft centered navy #121E3C medallion glow "
+            "and a faint concentric ring motif. Refined, award-like, uncluttered. "),
         "duotone_interior": (
-            "A duotone photographic background of a modern empty boutique gym interior "
-            "at golden hour, treated entirely in navy #121E3C and cream #FAF6F0 duotone, "
-            "atmospheric depth, absolutely no people and no faces, one small red #FF0000 "
-            "accent light. Soft focus, cinematic. "),
+            "A duotone photographic background of a modern empty boutique gym interior at "
+            "golden hour, treated entirely in navy #121E3C and cream #FAF6F0 duotone, "
+            "atmospheric depth, absolutely no people and no faces. Heavy soft focus and "
+            "shallow depth of field so most of the frame is a smooth blurred wall with no "
+            "sharp objects; cinematic and very quiet. "),
         "red_streak": (
-            "A dark navy #121E3C background with one dramatic diagonal red #FF0000 light "
-            "streak sweeping across the frame as the single bold focal graphic, motion "
-            "blur, lens glow, deep shadow. Cinematic and energetic. "),
+            "A dark navy #121E3C background, cinematic and energetic with motion blur, "
+            "lens glow, and deep shadow. "),
         "topo_cream": (
-            "A cream #FAF6F0 background with a subtle topographic contour-line pattern "
-            "embossed faintly across it in navy #121E3C at low opacity, one small red "
-            "#FF0000 contour accent. Tactile, premium, quiet. "),
+            "A cream #FAF6F0 background with an elegant topographic contour-line relief "
+            "embossed across it in navy #121E3C at low opacity, denser toward one corner "
+            "and thinning to open space. Tactile, premium, quiet. "),
         "diagonal_split": (
-            "A background divided by one bold diagonal split from corner to corner: deep "
-            "navy #121E3C on one side and vivid red #FF0000 on the other as the single "
-            "color accent, crisp hard edge, flat modern color blocking. "),
+            "A background divided by one bold diagonal split from corner to corner, deep "
+            "navy #121E3C on one side, crisp hard edge, flat modern color blocking. "),
         "celebration": (
             "A deep navy #121E3C background with elegant abstract confetti-like particles "
-            "and light bokeh drifting upward in red #FF0000 and sky blue #5EB9E6, premium "
-            "and celebratory but restrained and tasteful, never cheesy. "),
+            "and light bokeh drifting upward, premium and celebratory but restrained and "
+            "tasteful, never cheesy. "),
     }
     return styles[t["bg_style"]] + common
 
@@ -432,26 +451,31 @@ def _cache_dir(cache_dir=None):
     return cache_dir or os.path.join(config.LIBRARY_PATH, "welcome_bg")
 
 
-def ensure_background(template, bg_client=None, cache_dir=None, force=False):
+def ensure_background(template, bg_client=None, cache_dir=None, force=False,
+                      prefer=None):
     """Return a path to this template's cached background PNG.
 
     If a Nano Pro client is available (and the flag/key are set), render real Pro
     art from background_prompt(); otherwise fall back to a procedural depth field.
-    Either way the result is cached on the persistent volume so a re-fill never
-    re-pays generation. Returns (path, mode) where mode is 'pro' or 'placeholder'.
+    prefer='placeholder' forces the procedural background even when a client exists
+    (used as the grade-fallback when Pro art will not comply). Either way the result
+    is cached on the persistent volume so a re-fill never re-pays generation.
+    Returns (path, mode) where mode is 'pro' or 'placeholder'.
     """
     t = template
     cdir = _cache_dir(cache_dir)
     os.makedirs(cdir, exist_ok=True)
 
     client = bg_client
-    if client is None:
+    if client is None and prefer != "placeholder":
         # only builds a real client when flag ON and key present; else None
         try:
             from .creative_studio import _default_client
             client = _default_client()
         except Exception:
             client = None
+    if prefer == "placeholder":
+        client = None
 
     mode = "pro" if client is not None else "placeholder"
     path = os.path.join(cdir, f"{t['id']}_{mode}.png")
@@ -463,8 +487,14 @@ def ensure_background(template, bg_client=None, cache_dir=None, force=False):
         img_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
         with open(path, "wb") as fh:
             fh.write(img_bytes)
-        # normalize to a square RGB canvas
-        Image.open(path).convert("RGB").resize((SIZE, SIZE)).save(path)
+        # normalize to a square RGB canvas: cover-crop center (never stretch), then
+        # resize to the canvas, so real Pro art keeps its proportions.
+        src = Image.open(path).convert("RGB")
+        w, h = src.size
+        s = min(w, h)
+        src = src.crop(((w - s) // 2, (h - s) // 2,
+                        (w - s) // 2 + s, (h - s) // 2 + s)).resize((SIZE, SIZE))
+        src.save(path)
     else:
         _procedural_background(t).convert("RGB").save(path)
     return path, mode
@@ -681,8 +711,9 @@ def _compose_text(img, template, gym_name, owner_name):
 # ==========================================================================
 
 def _render(template, gym_name, owner_name, logo_path, out_path,
-            bg_client=None, cache_dir=None):
-    bg_path, mode = ensure_background(template, bg_client=bg_client, cache_dir=cache_dir)
+            bg_client=None, cache_dir=None, prefer=None):
+    bg_path, mode = ensure_background(template, bg_client=bg_client,
+                                      cache_dir=cache_dir, prefer=prefer)
     img = Image.open(bg_path).convert("RGBA")
     if img.size != (SIZE, SIZE):
         img = img.resize((SIZE, SIZE))

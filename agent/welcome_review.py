@@ -192,45 +192,78 @@ def ocr_clean(bg_path, vision_client=None):
 # Render the full proof set
 # --------------------------------------------------------------------------
 
+def _resolve_client(bg_client):
+    if bg_client is not None:
+        return bg_client
+    try:
+        from .creative_studio import _default_client
+        return _default_client()
+    except Exception:
+        return None
+
+
+def _grade_blank(t, out_dir, cache_dir, bg_client, prefer):
+    """Render this template's blank against the chosen background and grade it
+    (composition + calm zone). Returns (blank_path, blank_text, grade, mode)."""
+    blank_path = os.path.join(out_dir, f"{t['id']}_blank.png")
+    _p, mode, blank_text = wt._render(t, "YOUR GYM NAME", "Owner Name", None,
+                                      blank_path, bg_client=bg_client,
+                                      cache_dir=cache_dir, prefer=prefer)
+    grade = grade_welcome(blank_path, blank_text, t)
+    bg_path, _ = wt.ensure_background(t, bg_client=bg_client, cache_dir=cache_dir,
+                                      prefer=prefer)
+    calm = wt.calm_zone_ok(Image.open(bg_path).convert("RGB"), t["logo_zone"])
+    grade["scores"]["calm_logo_zone"] = calm
+    if not calm:
+        grade["passed"] = False
+        grade["failed"] = list(grade["failed"]) + ["calm_logo_zone"]
+    return blank_path, blank_text, grade, mode
+
+
 def render_all(out_dir, cache_dir=None, bg_client=None):
     """Render 10 blank templates + 20 filled proofs (wide logo + square logo each),
-    grade every composed card, and return a manifest:
-      [{id, name, direction, blank_path, mode, proofs:[{logo, path, grade}], grade}]
+    grade every card, and return a manifest.
+
+    Per template: try real Pro art, and if the composed card fails grade (a second
+    red the model slipped in, a busy logo zone), regenerate the Pro background ONCE;
+    if it still fails, fall back to the premium procedural background (which passes
+    by construction). So every posted card is A-grade: Pro where it complies,
+    procedural where it will not. Records which background each template used.
     """
     os.makedirs(out_dir, exist_ok=True)
     wide_logo, square_logo = wt.make_test_logos(os.path.join(out_dir, "_test_logos"))
+    client = _resolve_client(bg_client)
     manifest = []
     for t in wt.TEMPLATES:
-        blank_path = os.path.join(out_dir, f"{t['id']}_blank.png")
-        _bp, mode = wt.render_blank(t["id"], blank_path, bg_client=bg_client,
-                                    cache_dir=cache_dir)
-        # grade the blank
-        _p, _m, blank_text = wt._render(t, "YOUR GYM NAME", "Owner Name", None,
-                                        blank_path, bg_client=bg_client,
-                                        cache_dir=cache_dir)
-        blank_grade = grade_welcome(blank_path, blank_text, t)
-        # calm zone check on the cached background, enforced as a real gate: a
-        # background whose logo zone is not calm fails the template (matters for
-        # real Pro art on Railway; procedural placeholders are calm by design).
-        bg_path, _ = wt.ensure_background(t, bg_client=bg_client, cache_dir=cache_dir)
-        calm = wt.calm_zone_ok(Image.open(bg_path).convert("RGB"), t["logo_zone"])
-        blank_grade["scores"]["calm_logo_zone"] = calm
-        if not calm:
-            blank_grade["passed"] = False
-            blank_grade["failed"] = list(blank_grade["failed"]) + ["calm_logo_zone"]
+        prefer = None
+        blank_path, blank_text, grade, mode = _grade_blank(
+            t, out_dir, cache_dir, client, prefer)
+        # regenerate the Pro background once on failure
+        if client is not None and not grade["passed"]:
+            wt.ensure_background(t, bg_client=client, cache_dir=cache_dir, force=True)
+            blank_path, blank_text, grade, mode = _grade_blank(
+                t, out_dir, cache_dir, client, prefer)
+        # still failing -> premium procedural fallback (passes by construction)
+        if client is not None and not grade["passed"]:
+            prefer = "placeholder"
+            wt.ensure_background(t, bg_client=client, cache_dir=cache_dir,
+                                 force=True, prefer=prefer)
+            blank_path, blank_text, grade, mode = _grade_blank(
+                t, out_dir, cache_dir, None, prefer)
 
         proofs = []
         for label, logo in (("wide", wide_logo), ("square", square_logo)):
             pp = os.path.join(out_dir, f"{t['id']}_proof_{label}.png")
             _pp, _mm, ptext = wt._render(t, "Iron Forge Fitness", "Jordan Blake",
-                                         logo, pp, bg_client=bg_client,
-                                         cache_dir=cache_dir)
+                                         logo, pp, bg_client=client,
+                                         cache_dir=cache_dir, prefer=prefer)
             proofs.append({"logo": label, "path": pp,
                            "grade": grade_welcome(pp, ptext, t)})
         manifest.append({
             "id": t["id"], "name": t["name"], "direction": t["direction"],
-            "blank_path": blank_path, "mode": mode, "calm_zone_ok": calm,
-            "grade": blank_grade, "proofs": proofs,
+            "blank_path": blank_path, "mode": mode,
+            "calm_zone_ok": grade["scores"].get("calm_logo_zone", True),
+            "grade": grade, "proofs": proofs,
         })
     return manifest
 
