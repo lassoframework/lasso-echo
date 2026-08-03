@@ -16,6 +16,10 @@ from agent import config, db, monthly_report  # noqa: E402
 
 ACCOUNT = "lasso_ig"
 MONTH = "2026-07"
+# Pin the report clock so the month is deterministic no matter when the suite runs
+# (run(now=None) would follow the wall clock and drift off MONTH after a rollover).
+from datetime import datetime, timezone  # noqa: E402
+FIXED_NOW = datetime(2026, 7, 31, tzinfo=timezone.utc)
 
 
 class FakeS3:
@@ -58,7 +62,7 @@ def test_run_uploads_html_to_r2(monkeypatch, tmp_path):
 
     s3 = FakeS3()
     out = monthly_report.run(account=ACCOUNT, upload=True, s3_client=s3,
-                             poster=FakePoster(), now=None)
+                             poster=FakePoster(), now=FIXED_NOW)
 
     assert ACCOUNT in out
     assert len(s3.puts) == 1
@@ -77,7 +81,8 @@ def test_run_posts_url_to_slack(monkeypatch, tmp_path):
 
     s3 = FakeS3()
     poster = FakePoster()
-    monthly_report.run(account=ACCOUNT, upload=True, s3_client=s3, poster=poster)
+    monthly_report.run(account=ACCOUNT, upload=True, s3_client=s3, poster=poster,
+                       now=FIXED_NOW)
 
     expected_url = (
         f"https://cdn.example.com/echo/reports/{ACCOUNT}_{MONTH}.html"

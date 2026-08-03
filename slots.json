@@ -1,0 +1,175 @@
+{
+  "canvas": {
+    "w": 1080,
+    "h": 1080
+  },
+  "margin": 96,
+  "min_logo_zone_fraction": 0.13,
+  "headline": "WELCOME TO LASSO",
+  "fill_fields": [
+    "gym_name",
+    "owner_name"
+  ],
+  "templates": {
+    "T1": {
+      "name": "Navy editorial",
+      "direction": "navy editorial, oversized headline, one red word",
+      "base": "navy",
+      "bg_style": "editorial_navy",
+      "accent": "word",
+      "eyebrow": "NOW PARTNERED WITH LASSO",
+      "logo_zone": {
+        "x": 560,
+        "y": 300,
+        "w": 424,
+        "h": 388,
+        "fraction": 0.141
+      },
+      "text_column": "left"
+    },
+    "T2": {
+      "name": "Cream editorial",
+      "direction": "cream editorial, calm depth, one red word",
+      "base": "cream",
+      "bg_style": "editorial_cream",
+      "accent": "word",
+      "eyebrow": "WELCOME TO THE FAMILY",
+      "logo_zone": {
+        "x": 560,
+        "y": 300,
+        "w": 424,
+        "h": 388,
+        "fraction": 0.141
+      },
+      "text_column": "left"
+    },
+    "T3": {
+      "name": "Red block",
+      "direction": "cream with a bold red block eyebrow tab",
+      "base": "cream",
+      "bg_style": "block_cream",
+      "accent": "block",
+      "eyebrow": "NEW PARTNER",
+      "logo_zone": {
+        "x": 560,
+        "y": 320,
+        "w": 424,
+        "h": 388,
+        "fraction": 0.141
+      },
+      "text_column": "left"
+    },
+    "T4": {
+      "name": "Split panel",
+      "direction": "navy left panel, cream right, thin red rule",
+      "base": "navy",
+      "bg_style": "split_panel",
+      "accent": "rule",
+      "eyebrow": "NOW WORKING WITH LASSO",
+      "logo_zone": {
+        "x": 566,
+        "y": 300,
+        "w": 420,
+        "h": 420,
+        "fraction": 0.1512
+      },
+      "text_column": "left"
+    },
+    "T5": {
+      "name": "Badge and proof",
+      "direction": "badge treatment with the 500+ owners proof line",
+      "base": "cream",
+      "bg_style": "badge_cream",
+      "accent": "rule",
+      "eyebrow": "OFFICIAL LASSO PARTNER",
+      "logo_zone": {
+        "x": 330,
+        "y": 300,
+        "w": 420,
+        "h": 400,
+        "fraction": 0.144
+      },
+      "text_column": "right"
+    },
+    "T6": {
+      "name": "Duotone interior",
+      "direction": "duotone gym interior, atmospheric, no faces",
+      "base": "navy",
+      "bg_style": "duotone_interior",
+      "accent": "word",
+      "eyebrow": "NOW PARTNERED WITH LASSO",
+      "logo_zone": {
+        "x": 566,
+        "y": 300,
+        "w": 420,
+        "h": 400,
+        "fraction": 0.144
+      },
+      "text_column": "left"
+    },
+    "T7": {
+      "name": "Red light streak",
+      "direction": "dark navy with a dramatic red light streak",
+      "base": "navy",
+      "bg_style": "red_streak",
+      "accent": "in_bg",
+      "eyebrow": "WELCOME TO LASSO",
+      "logo_zone": {
+        "x": 96,
+        "y": 300,
+        "w": 420,
+        "h": 400,
+        "fraction": 0.144
+      },
+      "text_column": "right"
+    },
+    "T8": {
+      "name": "Topographic cream",
+      "direction": "cream with a subtle topographic texture",
+      "base": "cream",
+      "bg_style": "topo_cream",
+      "accent": "word",
+      "eyebrow": "NOW PARTNERED WITH LASSO",
+      "logo_zone": {
+        "x": 560,
+        "y": 300,
+        "w": 424,
+        "h": 400,
+        "fraction": 0.1454
+      },
+      "text_column": "left"
+    },
+    "T9": {
+      "name": "Diagonal split",
+      "direction": "bold diagonal navy and red split",
+      "base": "navy",
+      "bg_style": "diagonal_split",
+      "accent": "in_bg",
+      "eyebrow": "NOW WORKING WITH LASSO",
+      "logo_zone": {
+        "x": 96,
+        "y": 300,
+        "w": 420,
+        "h": 400,
+        "fraction": 0.144
+      },
+      "text_column": "right"
+    },
+    "T10": {
+      "name": "Celebration",
+      "direction": "premium confetti energy, red and sky particles on navy",
+      "base": "navy",
+      "bg_style": "celebration",
+      "accent": "in_bg",
+      "eyebrow": "WELCOME TO THE FAMILY",
+      "logo_zone": {
+        "x": 566,
+        "y": 300,
+        "w": 420,
+        "h": 400,
+        "fraction": 0.144
+      },
+      "text_column": "left"
+    }
+  }
+}

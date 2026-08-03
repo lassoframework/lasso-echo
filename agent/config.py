@@ -217,6 +217,39 @@ def hosting_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_HOSTING_ENABLED", "false"))
 
 
+def welcome_templates_enabled() -> bool:
+    """
+    Welcome-post template surface switch. OFF by default. When OFF, the daily path
+    never draws a welcome-new-gym card. The `welcome-templates` operator command
+    (render the review set, post proofs to Slack) runs regardless; this flag only
+    gates any future automatic welcome-card path. Review posts never publish.
+    """
+    return _truthy(os.environ.get("AGENT_WELCOME_TEMPLATES_ENABLED", "false"))
+
+
+def podcast_doc_clips_enabled() -> bool:
+    """
+    Doc-first clip selection switch. OFF by default. When ON, the podcast clipper
+    takes its PRIMARY clip candidates from the show-notes doc (Episode Chapters +
+    Memorable Quotes, parsed by podcast_docparse) and uses the transcript only to
+    locate exact in/out points, falling back to transcript scoring only when the
+    doc has no usable quotes (and reporting the fallback). OFF = current
+    transcript-scored selection, unchanged.
+    """
+    return _truthy(os.environ.get("AGENT_PODCAST_DOC_CLIPS", "false"))
+
+
+def podcast_audit_enabled() -> bool:
+    """
+    Level-2 standing audit gate switch. OFF by default. When ON, every episode's
+    output set is checked by podcast_audit before it surfaces to Slack (quota,
+    caption ghost, intro animation, bottom treatment, no static takeover, caption
+    free variant, quote verbatim). A failing asset regenerates once, then surfaces
+    flagged with the failing check named. OFF = outputs surface unchecked (current).
+    """
+    return _truthy(os.environ.get("AGENT_PODCAST_AUDIT_ENABLED", "false"))
+
+
 def content_brain_enabled() -> bool:
     """
     Daily content brain switch. OFF by default. When OFF (or for a non-LASSO
