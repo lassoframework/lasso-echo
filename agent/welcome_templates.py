@@ -126,6 +126,15 @@ TEMPLATES = [
 
 _BY_ID = {t["id"]: t for t in TEMPLATES}
 
+# Blake's kept set (2026-08-03): T1, T2, T7, T8, T9, T10. Retired templates stay
+# defined for history but are never offered to a client during onboarding.
+RETIRED = {"T3", "T4", "T5", "T6"}
+
+
+def active_templates():
+    """The kept templates, in order. Onboarding draws welcome posts from these."""
+    return [t for t in TEMPLATES if t["id"] not in RETIRED]
+
 
 def get_template(template_id):
     t = _BY_ID.get(template_id)
@@ -796,6 +805,7 @@ def slots_dict():
     out = {"canvas": {"w": SIZE, "h": SIZE}, "margin": MARGIN,
            "min_logo_zone_fraction": _MIN_ZONE_FRAC,
            "headline": HEADLINE, "fill_fields": ["gym_name", "owner_name"],
+           "kept": [t["id"] for t in active_templates()],
            "templates": {}}
     for t in TEMPLATES:
         zx, zy, zw, zh = t["logo_zone"]

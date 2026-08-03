@@ -754,6 +754,7 @@ _COMMANDS = {
         ("book-queue", "upload + schedule The Full Gym book launch infographic posts (--images-dir / --from-manifest)"),
         ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
+        ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "podcast & opus (cont.)": [
@@ -1096,6 +1097,96 @@ def _welcome_templates(args):
     summary = _wr.post_review_set(manifest, poster, host_media)
     print(f"welcome-templates: posted {summary['count']} template messages "
           f"with threaded proofs. Review only, nothing published.")
+
+
+def _welcome_client(args):
+    """python -m agent welcome-client --template T8 --name "Gym" --owner "Owner"
+       --logo PATH [--account KEY] [--post]
+
+    Generate ONE real welcome-new-gym post from a kept template, using the gym's
+    real logo, and hold it for approval (a PENDING draft + Slack approval card).
+    Nothing publishes until approved (and only if publishing is armed). This is the
+    per-client onboarding step; run it once per new gym.
+    """
+    from . import welcome_templates as _wt
+    template = name = owner = logo = account_key = None
+    do_post = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--template" and i + 1 < len(args):
+            template = args[i + 1]; i += 2; continue
+        if a == "--name" and i + 1 < len(args):
+            name = args[i + 1]; i += 2; continue
+        if a == "--owner" and i + 1 < len(args):
+            owner = args[i + 1]; i += 2; continue
+        if a == "--logo" and i + 1 < len(args):
+            logo = args[i + 1]; i += 2; continue
+        if a == "--account" and i + 1 < len(args):
+            account_key = args[i + 1]; i += 2; continue
+        if a == "--post":
+            do_post = True; i += 1; continue
+        i += 1
+
+    acct = None
+    if account_key:
+        from .accounts import get_account
+        acct = get_account(account_key)
+        if acct is None:
+            print(f"welcome-client: account {account_key!r} not found")
+            return
+        if not name:
+            name = acct.display_name
+    if not template or template in _wt.RETIRED:
+        kept = ", ".join(t["id"] for t in _wt.active_templates())
+        print(f"welcome-client: pick a kept template (--template one of: {kept})")
+        return
+    if not name:
+        print('welcome-client: --name "<Gym Name>" is required (or pass --account)')
+        return
+    if not logo or not os.path.isfile(logo):
+        print("welcome-client: --logo PATH to the gym's real logo file is required "
+              "(png with transparency reads best).")
+        return
+
+    out_dir = os.path.join(config.LIBRARY_PATH, "welcome_client")
+    os.makedirs(out_dir, exist_ok=True)
+    safe = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    out_path = os.path.join(out_dir, f"welcome_{safe}_{template}.png")
+    path = _wt.make_welcome(template, name, owner or "", logo, out_path=out_path)
+    print(f"welcome-client: rendered {path}")
+
+    if not do_post:
+        print("Not posted. Re-run with --post to host to R2 and card it for approval.")
+        return
+    if not config.hosting_enabled():
+        print("welcome-client: AGENT_HOSTING_ENABLED not set; cannot host to R2. "
+              "Rendered locally only.")
+        return
+    from .media_host import host_media
+    from .slack_surface import SlackPoster
+    from .store import PendingStore
+    from .drafter import Draft, DraftStatus
+    import hashlib as _hl
+    url = host_media(path, "lasso_welcome")
+    day_key = _dt_today()
+    did = "wel_" + _hl.sha1(f"welcome|{account_key or name}|{template}".encode()).hexdigest()[:12]
+    caption = f"Welcome to the LASSO family, {name}. Let's grow."
+    draft = Draft(
+        draft_id=did, account_key=account_key or "lasso_ig",
+        platform=(acct.platform if acct else "instagram"),
+        caption=caption, hashtags=[], creative_path=path,
+        creative_public_url=url or "", scheduled_for=day_key,
+        status=DraftStatus.PENDING, day_key=day_key, draft_type="feed",
+    )
+    PendingStore().put(draft)
+    SlackPoster().post_approval_card(draft)
+    print(f"welcome-client: held for approval (draft {did}). Nothing published.")
+
+
+def _dt_today():
+    import datetime as _d
+    return _d.datetime.now(_d.timezone.utc).date().isoformat()
 
 
 def _podcast_quote_card(args):
@@ -2230,6 +2321,8 @@ def main(argv=None):
             print(f"  card sent: {_did}  ({_d.account_key}  {_d.day_key})")
     elif cmd == "welcome-templates":
         _welcome_templates(argv[1:])
+    elif cmd == "welcome-client":
+        _welcome_client(argv[1:])
     elif cmd == "podcast-quote-card":
         _podcast_quote_card(argv[1:])
     elif cmd in ("help", "--help", "-h"):

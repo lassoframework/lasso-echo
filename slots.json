@@ -10,6 +10,14 @@
     "gym_name",
     "owner_name"
   ],
+  "kept": [
+    "T1",
+    "T2",
+    "T7",
+    "T8",
+    "T9",
+    "T10"
+  ],
   "templates": {
     "T1": {
       "name": "Navy editorial",
@@ -61,10 +69,10 @@
     },
     "T4": {
       "name": "Split panel",
-      "direction": "navy left panel, cream right, thin red rule",
+      "direction": "navy left panel, cream right, red seam accent",
       "base": "navy",
       "bg_style": "split_panel",
-      "accent": "rule",
+      "accent": "in_bg",
       "eyebrow": "NOW WORKING WITH LASSO",
       "logo_zone": {
         "x": 566,
@@ -83,13 +91,13 @@
       "accent": "rule",
       "eyebrow": "OFFICIAL LASSO PARTNER",
       "logo_zone": {
-        "x": 330,
-        "y": 300,
-        "w": 420,
+        "x": 560,
+        "y": 292,
+        "w": 424,
         "h": 400,
-        "fraction": 0.144
+        "fraction": 0.1454
       },
-      "text_column": "right"
+      "text_column": "left"
     },
     "T6": {
       "name": "Duotone interior",
