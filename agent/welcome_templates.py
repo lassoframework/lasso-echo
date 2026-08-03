@@ -1,0 +1,787 @@
+"""
+Welcome-post templates for new gym announcements.
+
+Ten templates that announce a new gym partnership. The approach is split cleanly,
+same as the Summit cards, to kill the "model garbled the text / invented a logo"
+class of failure at the source:
+
+  BACKGROUND ART  ->  Nano Banana Pro (gemini-3-pro-image), the EXISTING creative
+                      studio image path. The prompt asks for depth, texture, and
+                      atmosphere ONLY: no text, no letters, no logos, no words.
+                      When no Nano key is present (local dev), a procedural PIL
+                      depth field stands in so every proof still renders and can be
+                      audited; the real Pro art swaps in on Railway, cached to the
+                      persistent volume so a re-fill never re-pays generation.
+
+  TEXT + LOGOS    ->  composed in code (this module, PIL). Eyebrow, the WELCOME TO
+                      LASSO headline, gym name, owner name, footer. The real LASSO
+                      wordmark asset is composited (tinted through its own alpha for
+                      contrast), never a generated logo. The new gym's own logo drops
+                      into a LOGO SAFE ZONE (>= 13% of canvas) that the background
+                      keeps visually calm so any gym logo reads on it.
+
+Two fill fields only: GYM NAME and OWNER NAME, composed at fixed positions.
+
+No dashes, no hyphens, no en/em dashes in any on-image copy (house style). Only
+verified stats (500+ gym owners). Palette + type: house style Section 2 and 8.
+
+Public API:
+  make_welcome(template_id, gym_name, owner_name, logo_path, ...) -> final PNG path
+  render_blank(template_id, ...)   -> template with placeholder fills, no gym logo
+  slots_dict() / write_slots_json  -> slots.json v2 (logo safe zones + text slots)
+  TEMPLATES                        -> the 10 template specs
+"""
+
+import json
+import os
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+from . import config
+from .summit_render import (
+    SIZE, MARGIN, CREAM, NAVY, RED, SKY, WHITE, MUTE_CREAM, MUTE_NAVY,
+    ANTON, OSWALD, MONT, _f, _tw, _th, _wrap, _tracked, _tracked_w,
+)
+
+# House-verified proof stat (brand_voice/knowledge/02_verified_stats.md).
+PROOF_STAT = "500+ GYM OWNERS TRUST LASSO"
+
+LOGO_WORDMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "assets", "brand", "lasso_wordmark.png")
+LOGO_MARK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "assets", "brand", "lasso_mark.png")
+
+HEADLINE = "WELCOME TO LASSO"
+
+# Logo safe zone must be >= 13% of the 1080x1080 canvas (151,632 px). Every zone
+# below clears that floor and sits in a region the background keeps calm.
+_MIN_ZONE_FRAC = 0.13
+
+
+# --------------------------------------------------------------------------
+# The 10 templates. 1 to 5 evolve the reference set; 6 to 10 are new.
+#   base:      canvas tone the text is composed against (navy or cream)
+#   bg_style:  drives the Pro prompt AND the procedural placeholder
+#   accent:    where the ONE red element lives
+#               "word"      -> one red word in the headline (composed)
+#               "block"     -> a red tab/block (composed)
+#               "rule"      -> a red hairline rule (composed)
+#               "in_bg"     -> the red lives in the background art (streak /
+#                              diagonal / particles); text adds NO red (Q3)
+#   logo_zone: (x, y, w, h) the gym-logo safe zone
+#   eyebrow:   the small caps label
+# --------------------------------------------------------------------------
+TEMPLATES = [
+    {"id": "T1", "name": "Navy editorial", "base": "navy",
+     "bg_style": "editorial_navy", "accent": "word",
+     "eyebrow": "NOW PARTNERED WITH LASSO",
+     "direction": "navy editorial, oversized headline, one red word",
+     "logo_zone": (560, 300, 424, 388)},
+    {"id": "T2", "name": "Cream editorial", "base": "cream",
+     "bg_style": "editorial_cream", "accent": "word",
+     "eyebrow": "WELCOME TO THE FAMILY",
+     "direction": "cream editorial, calm depth, one red word",
+     "logo_zone": (560, 300, 424, 388)},
+    {"id": "T3", "name": "Red block", "base": "cream",
+     "bg_style": "block_cream", "accent": "block",
+     "eyebrow": "NEW PARTNER",
+     "direction": "cream with a bold red block eyebrow tab",
+     "logo_zone": (560, 320, 424, 388)},
+    {"id": "T4", "name": "Split panel", "base": "navy",
+     "bg_style": "split_panel", "accent": "in_bg",
+     "eyebrow": "NOW WORKING WITH LASSO",
+     "direction": "navy left panel, cream right, red seam accent",
+     "logo_zone": (566, 300, 420, 420)},
+    {"id": "T5", "name": "Badge and proof", "base": "cream",
+     "bg_style": "badge_cream", "accent": "rule",
+     "eyebrow": "OFFICIAL LASSO PARTNER",
+     "direction": "badge treatment with the 500+ owners proof line",
+     "logo_zone": (560, 292, 424, 400)},
+    {"id": "T6", "name": "Duotone interior", "base": "navy",
+     "bg_style": "duotone_interior", "accent": "word",
+     "eyebrow": "NOW PARTNERED WITH LASSO",
+     "direction": "duotone gym interior, atmospheric, no faces",
+     "logo_zone": (566, 300, 420, 400)},
+    {"id": "T7", "name": "Red light streak", "base": "navy",
+     "bg_style": "red_streak", "accent": "in_bg",
+     "eyebrow": "WELCOME TO LASSO",
+     "direction": "dark navy with a dramatic red light streak",
+     "logo_zone": (96, 300, 420, 400)},
+    {"id": "T8", "name": "Topographic cream", "base": "cream",
+     "bg_style": "topo_cream", "accent": "word",
+     "eyebrow": "NOW PARTNERED WITH LASSO",
+     "direction": "cream with a subtle topographic texture",
+     "logo_zone": (560, 300, 424, 400)},
+    {"id": "T9", "name": "Diagonal split", "base": "navy",
+     "bg_style": "diagonal_split", "accent": "in_bg",
+     "eyebrow": "NOW WORKING WITH LASSO",
+     "direction": "bold diagonal navy and red split",
+     "logo_zone": (96, 300, 420, 400)},
+    {"id": "T10", "name": "Celebration", "base": "navy",
+     "bg_style": "celebration", "accent": "in_bg",
+     "eyebrow": "WELCOME TO THE FAMILY",
+     "direction": "premium confetti energy, red and sky particles on navy",
+     "logo_zone": (566, 300, 420, 400)},
+]
+
+_BY_ID = {t["id"]: t for t in TEMPLATES}
+
+
+def get_template(template_id):
+    t = _BY_ID.get(template_id)
+    if t is None:
+        raise KeyError(f"unknown welcome template {template_id!r} "
+                       f"(have {', '.join(_BY_ID)})")
+    return t
+
+
+def text_column(template):
+    """The (x, width) of the text column: opposite the logo zone, stopping a gap
+    short of it so composed text can never enter the zone. Single source of truth
+    shared by the compositor and the layout-overlap grade check."""
+    zx, _zy, zw, _zh = template["logo_zone"]
+    gap = 40
+    if zx > SIZE * 0.45:
+        col_x = MARGIN
+        col_w = zx - gap - col_x
+    else:
+        col_x = zx + zw + gap
+        col_w = SIZE - MARGIN - col_x
+    return col_x, col_w
+
+
+def _ink_for(base):
+    return WHITE if base == "navy" else NAVY
+
+
+def _mute_for(base):
+    return MUTE_NAVY if base == "navy" else MUTE_CREAM
+
+
+def _base_rgb(base):
+    return NAVY if base == "navy" else CREAM
+
+
+# ==========================================================================
+# BACKGROUND ART
+# ==========================================================================
+
+_NO_TEXT_RULE = (
+    "ABSOLUTELY NO text, NO letters, NO numbers, NO words, NO typography, NO logos, "
+    "NO watermarks, NO signage, NO UI, NO captions of any kind anywhere in the image. "
+    "Background art only."
+)
+
+
+def background_prompt(template):
+    """The Nano Banana Pro prompt for one template's BACKGROUND ART ONLY.
+
+    Every prompt: (1) forbids all text/letters/logos, (2) names the atmosphere,
+    (3) requires the logo safe-zone region to stay visually CALM (low detail, low
+    contrast) so a gym logo composited there stays legible, and (4) satisfies the
+    house grade heuristic (exactly one red element, a focal graphic, never a red
+    background)."""
+    t = template
+    zx, zy, zw, zh = t["logo_zone"]
+    # describe the calm zone in ninths so the model can place calm space
+    side = "right" if zx > SIZE * 0.45 else "left"
+    vert = "upper" if zy < SIZE * 0.4 else "middle"
+    calm = (f"Keep the {vert} {side} region of the frame visually CALM: low detail, "
+            f"low contrast, smooth and uncluttered, so a logo can sit there and read. ")
+    common = (f"{_NO_TEXT_RULE} {calm}"
+              "Premium B2B agency quality, editorial, clean, not busy. "
+              "Exactly one red element as the single accent, never a red background. "
+              "This is a focal graphic background, not a scene with people's faces.")
+    styles = {
+        "editorial_navy": (
+            "A deep navy #121E3C background with a soft radial glow and a subtle "
+            "single sky-blue #5EB9E6 light gradient sweeping in from one side. "
+            "Minimal, spacious, one faint red #FF0000 spark of light as the lone accent. "),
+        "editorial_cream": (
+            "A warm cream #FAF6F0 background with a very soft navy depth wash in one "
+            "corner and gentle paper-grain texture. Spacious and calm, one small red "
+            "#FF0000 accent mark. "),
+        "block_cream": (
+            "A cream #FAF6F0 background, mostly flat and clean, with one bold red "
+            "#FF0000 geometric color block anchored in a corner as the single focal "
+            "graphic, and a faint navy depth wash opposite it. "),
+        "split_panel": (
+            "A background split into a deep navy #121E3C panel on the left and a warm "
+            "cream #FAF6F0 field on the right, divided by one crisp red #FF0000 vertical "
+            "seam as the single accent. Clean, architectural, flat color fields. "),
+        "badge_cream": (
+            "A cream #FAF6F0 background with a soft centered navy medallion glow and a "
+            "faint concentric ring motif, one thin red #FF0000 ring accent. Refined, "
+            "award-like, uncluttered. "),
+        "duotone_interior": (
+            "A duotone photographic background of a modern empty boutique gym interior "
+            "at golden hour, treated entirely in navy #121E3C and cream #FAF6F0 duotone, "
+            "atmospheric depth, absolutely no people and no faces, one small red #FF0000 "
+            "accent light. Soft focus, cinematic. "),
+        "red_streak": (
+            "A dark navy #121E3C background with one dramatic diagonal red #FF0000 light "
+            "streak sweeping across the frame as the single bold focal graphic, motion "
+            "blur, lens glow, deep shadow. Cinematic and energetic. "),
+        "topo_cream": (
+            "A cream #FAF6F0 background with a subtle topographic contour-line pattern "
+            "embossed faintly across it in navy #121E3C at low opacity, one small red "
+            "#FF0000 contour accent. Tactile, premium, quiet. "),
+        "diagonal_split": (
+            "A background divided by one bold diagonal split from corner to corner: deep "
+            "navy #121E3C on one side and vivid red #FF0000 on the other as the single "
+            "color accent, crisp hard edge, flat modern color blocking. "),
+        "celebration": (
+            "A deep navy #121E3C background with elegant abstract confetti-like particles "
+            "and light bokeh drifting upward in red #FF0000 and sky blue #5EB9E6, premium "
+            "and celebratory but restrained and tasteful, never cheesy. "),
+    }
+    return styles[t["bg_style"]] + common
+
+
+# ---- procedural placeholder backgrounds (local dev, no Nano key) ----------
+# These stand in for Pro art so every proof renders and can be audited. They are
+# clearly-flat depth fields; they carry NO text (so OCR of a raw background is
+# trivially clean) and keep the logo zone calm by construction.
+
+def _grad_v(size, top, bottom):
+    img = Image.new("RGB", (size, size), top)
+    d = ImageDraw.Draw(img)
+    for y in range(size):
+        f = y / size
+        col = tuple(int(top[i] + (bottom[i] - top[i]) * f) for i in range(3))
+        d.line([(0, y), (size, y)], fill=col)
+    return img
+
+
+def _radial_glow(img, cx, cy, radius, color, strength=0.5):
+    glow = Image.new("RGB", img.size, (0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=color)
+    glow = glow.filter(ImageFilter.GaussianBlur(radius // 2))
+    return Image.blend(img, Image.blend(img, glow, strength), 0.6)
+
+
+def _lcg(seed):
+    """A tiny deterministic PRNG (Math.random is unavailable and re-render must be
+    stable). Returns a generator of floats in [0, 1)."""
+    s = seed & 0x7FFFFFFF
+
+    def nxt():
+        nonlocal s
+        s = (1103515245 * s + 12345) & 0x7FFFFFFF
+        return s / 0x7FFFFFFF
+    return nxt
+
+
+def _grain(img, amount=8, seed=1, zone=None, zone_amount=2):
+    """Fine paper/photo grain for depth. Lighter (zone_amount) inside the logo
+    zone so it stays calm. Deterministic by seed."""
+    rnd = _lcg(seed)
+    d = ImageDraw.Draw(img, "RGBA")
+    step = 3
+    zx = zy = zw = zh = -1
+    if zone is not None:
+        zx, zy, zw, zh = zone
+    for y in range(0, SIZE, step):
+        for x in range(0, SIZE, step):
+            in_zone = zx <= x <= zx + zw and zy <= y <= zy + zh
+            amp = zone_amount if in_zone else amount
+            v = int((rnd() - 0.5) * 2 * amp)
+            if v:
+                col = (255, 255, 255, abs(v) * 6) if v > 0 else (0, 0, 0, abs(v) * 6)
+                d.point((x, y), fill=col)
+    return img
+
+
+def _contours(img, color, focal, spacing=34, base_alpha=44, seed=7, zone=None):
+    """Draw a clean topographic relief: smooth concentric contour lines from one
+    focal point, spacing easing outward, drawn on their own layer then faded near
+    the top (text) and over the logo zone so those areas stay calm. Deterministic
+    and elegant rather than scribbly."""
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    fx, fy = focal
+    r = 70
+    i = 0
+    while r < SIZE * 1.7:
+        # every third line a touch heavier for relief depth
+        w = 3 if i % 3 == 0 else 2
+        ld.ellipse([fx - r, fy - r, fx + r, fy + r], outline=color + (base_alpha,),
+                   width=w)
+        r += spacing + int(spacing * 0.10 * i)   # ease spacing outward
+        i += 1
+    # vertical fade: contours strong at the bottom, fading toward the top text area
+    fade = Image.new("L", img.size, 0)
+    fd = ImageDraw.Draw(fade)
+    for y in range(SIZE):
+        fd.line([(0, y), (SIZE, y)], fill=int(40 + 215 * (y / SIZE)))
+    # calm the logo zone: knock the fade mask down where the plate will sit
+    if zone is not None:
+        zx, zy, zw, zh = zone
+        zmask = Image.new("L", img.size, 0)
+        ImageDraw.Draw(zmask).rounded_rectangle(
+            [zx - 24, zy - 24, zx + zw + 24, zy + zh + 24], radius=40, fill=90)
+        zmask = zmask.filter(ImageFilter.GaussianBlur(30))
+        fade = ImageChops.subtract(fade, zmask)
+    layer.putalpha(ImageChops.multiply(layer.split()[3], fade))
+    img.alpha_composite(layer)
+    return img
+
+
+def _procedural_background(template):
+    """A flat, text-free depth field standing in for Nano Pro art."""
+    t = template
+    style = t["bg_style"]
+    navy_deep = (12, 20, 42)
+    if style in ("editorial_navy", "duotone_interior"):
+        img = _grad_v(SIZE, (22, 37, 72), (9, 15, 32))
+        img = _radial_glow(img, int(SIZE * 0.72), int(SIZE * 0.30), 460, (34, 70, 128), 0.55)
+        img = _radial_glow(img, int(SIZE * 0.12), int(SIZE * 0.82), 380, (18, 40, 82), 0.4)
+        img = img.convert("RGBA")
+        _grain(img, amount=7, seed=11, zone=t["logo_zone"])
+        img = img.convert("RGB")
+    elif style == "red_streak":
+        img = _grad_v(SIZE, (16, 26, 52), (8, 12, 28))
+        d = ImageDraw.Draw(img, "RGBA")
+        for i, w in enumerate((70, 40, 18)):
+            d.line([(120, SIZE - 120), (SIZE - 160, 200)],
+                   fill=(255, 0, 0, 60 + i * 55), width=w)
+        img = img.filter(ImageFilter.GaussianBlur(6))
+    elif style == "diagonal_split":
+        img = Image.new("RGB", (SIZE, SIZE), navy_deep)
+        d = ImageDraw.Draw(img)
+        d.polygon([(SIZE, 0), (SIZE, SIZE), (int(SIZE * 0.32), SIZE)], fill=(210, 30, 34))
+        d.polygon([(0, 0), (SIZE, 0), (int(SIZE * 0.32), SIZE), (0, SIZE)], fill=navy_deep)
+    elif style == "celebration":
+        img = _grad_v(SIZE, (18, 30, 60), (9, 14, 30))
+        d = ImageDraw.Draw(img, "RGBA")
+        import hashlib
+        seed = int(hashlib.sha1(t["id"].encode()).hexdigest(), 16)
+        # sky-blue confetti scattered across the frame (decorative, not the accent)
+        for _i in range(80):
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            px = seed % SIZE
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            py = seed % SIZE
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            rr = 3 + seed % 9
+            d.ellipse([px, py, px + rr, py + rr], fill=(120, 200, 240, 160))
+        # ONE concentrated solid-red burst as the single accent, tucked in the
+        # upper-right above the logo zone (clear of the left text column)
+        bx, by = int(SIZE * 0.82), int(SIZE * 0.12)
+        for _i in range(22):
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            ox = (seed % 150) - 75
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            oy = (seed % 150) - 75
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            rr = 6 + seed % 12
+            d.ellipse([bx + ox, by + oy, bx + ox + rr, by + oy + rr],
+                      fill=(235, 30, 34, 255))
+        img = img.filter(ImageFilter.GaussianBlur(1))
+    elif style == "block_cream":
+        img = Image.new("RGB", (SIZE, SIZE), (250, 246, 240))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 300, 300], fill=(210, 30, 34))
+    elif style == "split_panel":
+        split = int(SIZE * 0.52)
+        # cream right panel with a soft vertical depth wash
+        img = _grad_v(SIZE, (252, 249, 244), (243, 236, 226))
+        d = ImageDraw.Draw(img)
+        # navy left panel with layered depth (glow + faint ghost arc)
+        navy_panel = _grad_v(SIZE, (24, 39, 74), (10, 17, 36))
+        navy_panel = _radial_glow(navy_panel, int(split * 0.35), int(SIZE * 0.28),
+                                  420, (36, 72, 132), 0.55)
+        nd = ImageDraw.Draw(navy_panel, "RGBA")
+        for rr in range(260, 900, 60):
+            nd.ellipse([split - 120 - rr, SIZE - rr, split - 120 + rr, SIZE + rr],
+                       outline=(60, 100, 165, 22), width=2)
+        img.paste(navy_panel.crop((0, 0, split, SIZE)), (0, 0))
+        img = img.convert("RGBA")
+        _grain(img, amount=6, seed=23)
+        d = ImageDraw.Draw(img, "RGBA")
+        # crisp red seam with a soft outer glow (the single accent)
+        glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.rectangle([split - 16, 0, split + 16, SIZE], fill=(210, 30, 34, 120))
+        img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(12)))
+        d.rectangle([split - 5, 0, split + 5, SIZE], fill=(214, 32, 36, 255))
+        img = img.convert("RGB")
+    elif style == "badge_cream":
+        img = Image.new("RGB", (SIZE, SIZE), (250, 246, 240))
+        img = _radial_glow(img, SIZE // 2, int(SIZE * 0.42), 300, (225, 220, 210), 0.4)
+    elif style == "topo_cream":
+        # premium topographic relief: organic navy contour lines from two focal
+        # points, dense at the lower right, thinning toward the calm text/logo
+        # areas, over a warm cream depth wash with fine paper grain.
+        img = _grad_v(SIZE, (252, 249, 244), (240, 232, 221)).convert("RGBA")
+        _contours(img, (18, 30, 60), focal=(int(SIZE * 0.94), int(SIZE * 0.96)),
+                  spacing=34, base_alpha=46, zone=t["logo_zone"])
+        _grain(img, amount=3, seed=31, zone=t["logo_zone"])
+        img = img.convert("RGB")
+    else:  # editorial_cream and any fallback
+        img = _grad_v(SIZE, (253, 250, 245), (240, 232, 221))
+        img = _radial_glow(img, int(SIZE * 0.74), int(SIZE * 0.30), 420,
+                           (255, 252, 247), 0.5).convert("RGBA")
+        _grain(img, amount=5, seed=19, zone=t["logo_zone"])
+        img = img.convert("RGB")
+    return img
+
+
+def _cache_dir(cache_dir=None):
+    return cache_dir or os.path.join(config.LIBRARY_PATH, "welcome_bg")
+
+
+def ensure_background(template, bg_client=None, cache_dir=None, force=False):
+    """Return a path to this template's cached background PNG.
+
+    If a Nano Pro client is available (and the flag/key are set), render real Pro
+    art from background_prompt(); otherwise fall back to a procedural depth field.
+    Either way the result is cached on the persistent volume so a re-fill never
+    re-pays generation. Returns (path, mode) where mode is 'pro' or 'placeholder'.
+    """
+    t = template
+    cdir = _cache_dir(cache_dir)
+    os.makedirs(cdir, exist_ok=True)
+
+    client = bg_client
+    if client is None:
+        # only builds a real client when flag ON and key present; else None
+        try:
+            from .creative_studio import _default_client
+            client = _default_client()
+        except Exception:
+            client = None
+
+    mode = "pro" if client is not None else "placeholder"
+    path = os.path.join(cdir, f"{t['id']}_{mode}.png")
+    if os.path.isfile(path) and not force:
+        return path, mode
+
+    if client is not None:
+        prompt = background_prompt(t)
+        img_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
+        with open(path, "wb") as fh:
+            fh.write(img_bytes)
+        # normalize to a square RGB canvas
+        Image.open(path).convert("RGB").resize((SIZE, SIZE)).save(path)
+    else:
+        _procedural_background(t).convert("RGB").save(path)
+    return path, mode
+
+
+# ==========================================================================
+# CALM ZONE + LOGO
+# ==========================================================================
+
+def _zone_frac(zone):
+    _, _, w, h = zone
+    return (w * h) / float(SIZE * SIZE)
+
+
+def calm_zone_ok(img, zone, std_threshold=60.0):
+    """True when the logo safe zone carries no busy, high-contrast detail (so a
+    composited gym logo reads). Smooth depth gradients are fine; only genuinely
+    noisy or cluttered zones fail. Checked on the background BEFORE the plate is
+    drawn (a Pro background must earn the zone; procedural ones pass by design)."""
+    x, y, w, h = zone
+    crop = img.convert("L").crop((x, y, x + w, y + h))
+    px = list(crop.getdata())
+    if not px:
+        return False
+    n = len(px)
+    mean = sum(px) / n
+    var = sum((p - mean) ** 2 for p in px) / n
+    return (var ** 0.5) <= std_threshold
+
+
+def _fit_into(logo, box_w, box_h, pad_frac=0.14):
+    pad_w, pad_h = int(box_w * pad_frac), int(box_h * pad_frac)
+    avail_w, avail_h = box_w - 2 * pad_w, box_h - 2 * pad_h
+    lw, lh = logo.size
+    scale = min(avail_w / lw, avail_h / lh)
+    return logo.resize((max(1, int(lw * scale)), max(1, int(lh * scale))))
+
+
+def _draw_zone_plate(img, zone, base, ghost=False):
+    """Draw the calm plate the gym logo sits on: a soft rounded card with a real
+    drop shadow so it reads as an intentional lockup area, not an empty hole. On
+    navy cards it is a cream plate so ANY gym logo (usually dark) reads; on cream
+    cards it is a subtle raised panel. When `ghost`, a faint "GYM LOGO" hint and a
+    clear-space frame show where the gym's mark will land (used on blank templates).
+    Not red, so it never competes for the single red accent."""
+    x, y, w, h = zone
+    # soft drop shadow (both bases) so the plate feels lifted and designed
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle([x + 6, y + 14, x + w + 6, y + h + 14], radius=30,
+                         fill=(0, 0, 0, 70 if base == "cream" else 95))
+    img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16)))
+
+    plate = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(plate)
+    fill = (250, 246, 240, 255) if base == "navy" else (255, 253, 250, 240)
+    pd.rounded_rectangle([0, 0, w - 1, h - 1], radius=30, fill=fill)
+    img.alpha_composite(plate, (x, y))
+
+    if ghost:
+        gd = ImageDraw.Draw(img, "RGBA")
+        # inner clear-space frame
+        pad = int(min(w, h) * 0.16)
+        gd.rounded_rectangle([x + pad, y + pad, x + w - pad, y + h - pad],
+                             radius=18, outline=(18, 30, 60, 60), width=2)
+        label = "GYM LOGO"
+        lf = _f(OSWALD, 30)
+        lw = _tracked_w(gd, label, lf, 5)
+        _tracked(gd, (x + (w - lw) // 2, y + h // 2 - 18), label, lf,
+                 (18, 30, 60, 120), 5)
+
+
+def place_gym_logo(img, logo_path, zone, base):
+    """Composite the gym's own logo into the safe zone, centered, on the calm plate.
+    Placed as-is (never recolored) so the gym's real mark is preserved. With no
+    logo (a blank review template) the plate shows a 'GYM LOGO' clear-space hint so
+    it reads as an intentional lockup area rather than an empty hole."""
+    has_logo = bool(logo_path) and os.path.isfile(logo_path)
+    _draw_zone_plate(img, zone, base, ghost=not has_logo)
+    if not has_logo:
+        return
+    x, y, w, h = zone
+    logo = Image.open(logo_path).convert("RGBA")
+    logo = _fit_into(logo, w, h)
+    lx = x + (w - logo.size[0]) // 2
+    ly = y + (h - logo.size[1]) // 2
+    img.alpha_composite(logo, (lx, ly))
+
+
+def _tinted_wordmark(color, target_h):
+    """The REAL LASSO wordmark asset, recolored through its own alpha to `color`
+    for contrast on dark or light footers. Shape is the real logo, never generated."""
+    if not os.path.isfile(LOGO_WORDMARK):
+        return None
+    src = Image.open(LOGO_WORDMARK).convert("RGBA")
+    w, h = src.size
+    scale = target_h / h
+    src = src.resize((max(1, int(w * scale)), target_h))
+    solid = Image.new("RGBA", src.size, color + (255,))
+    solid.putalpha(src.split()[3])
+    return solid
+
+
+# ==========================================================================
+# TEXT COMPOSITION
+# ==========================================================================
+
+def _fit_headline(d, text, max_w, max_lines, start, floor=64):
+    s = start
+    while s >= floor:
+        fo = _f(ANTON, s)
+        ls = _wrap(d, text, fo, max_w)
+        if len(ls) <= max_lines:
+            return fo, ls
+        s -= 4
+    fo = _f(ANTON, floor)
+    return fo, _wrap(d, text, fo, max_w)
+
+
+def _compose_text(img, template, gym_name, owner_name):
+    """Draw eyebrow, WELCOME TO LASSO headline, gym name, owner name, footer, and
+    the accent. All left-aligned, asymmetric, house style. Returns on-card text for
+    the copy scan / grade Q4."""
+    t = template
+    base = t["base"]
+    ink = _ink_for(base)
+    mute = _mute_for(base)
+    d = ImageDraw.Draw(img, "RGBA")
+
+    # text column sits opposite the logo zone and stops a gap short of it so
+    # composed text can never enter it (the T5-collision class of bug).
+    col_x, col_w = text_column(t)
+
+    shadow = (base == "navy") or t["bg_style"] in ("duotone_interior", "red_streak",
+                                                    "diagonal_split", "celebration")
+
+    def draw(x, y, text, font, fill):
+        if shadow:
+            d.text((x + 2, y + 2), text, font=font, fill=(6, 10, 20, 200))
+        d.text((x, y), text, font=font, fill=fill)
+
+    y = MARGIN
+
+    # --- accent: red block behind eyebrow (T3) ---
+    if t["accent"] == "block":
+        ef = _f(OSWALD, 30)
+        ew = _tracked_w(d, t["eyebrow"].upper(), ef, 5)
+        d.rectangle([col_x - 12, y - 10, col_x + ew + 24, y + 46], fill=RED)
+        _tracked(d, (col_x, y), t["eyebrow"].upper(), ef, WHITE, 5)
+    else:
+        eb_col = SKY if base == "navy" else NAVY
+        _tracked(d, (col_x, y), t["eyebrow"].upper(), _f(OSWALD, 30), eb_col, 5)
+    y += 74
+
+    # --- accent: red hairline rule (T4, T5) ---
+    if t["accent"] == "rule":
+        d.rectangle([col_x, y, col_x + 120, y + 8], fill=RED)
+        y += 34
+
+    # --- headline: WELCOME TO LASSO, one red word only when accent == word ---
+    hf, lines = _fit_headline(d, HEADLINE, col_w, 3, 132)
+    red_word = "LASSO" if t["accent"] == "word" else None
+    lh = _th(d, "AY", hf) + 6 + int(hf.size * 0.28)
+    for i, line in enumerate(lines):
+        cx = col_x
+        for word in line.split():
+            fill = RED if (red_word and word.strip(".,").upper() == red_word) else ink
+            if shadow:
+                d.text((cx + 3, y + i * lh + 3), word, font=hf, fill=(6, 10, 20, 220))
+            d.text((cx, y + i * lh), word, font=hf, fill=fill)
+            cx += _tw(d, word + " ", hf)
+    y += len(lines) * lh + 26
+
+    # --- gym name (fill field) ---
+    gym = (gym_name or "").strip().upper() or "YOUR GYM NAME"
+    gf, glines = _fit_headline(d, gym, col_w, 2, 68, floor=40)
+    for i, line in enumerate(glines):
+        gy = y + i * (gf.size + 8)
+        draw(col_x, gy, line, gf, ink)
+    y += len(glines) * (gf.size + 8) + 14
+
+    # --- owner name (fill field) ---
+    owner = (owner_name or "").strip()
+    if owner:
+        of = _f(MONT, 36)
+        owner_fill = (86, 94, 112) if base == "cream" else (206, 218, 236)
+        draw(col_x, y, f"with {owner}", of, owner_fill)
+        y += 52
+
+    # --- T5 proof line (verified stat), flowing below the owner line ---
+    if t["id"] == "T5":
+        pf = _f(OSWALD, 24)
+        _tracked(d, (col_x, y + 8), PROOF_STAT, pf, mute, 3)
+        y += 44
+
+    # --- footer: real LASSO wordmark + url ---
+    fy = SIZE - MARGIN - 6
+    wm = _tinted_wordmark(WHITE if base == "navy" else NAVY, 40)
+    fx = MARGIN
+    if wm is not None:
+        img.alpha_composite(wm, (fx, fy - 8))
+        fx += wm.size[0] + 20
+    url = "LASSOFRAMEWORK.COM"
+    uf = _f(OSWALD, 24)
+    d.text((SIZE - MARGIN - _tw(d, url, uf), fy + 4), url, font=uf, fill=mute)
+
+    on_card_text = " ".join([t["eyebrow"], HEADLINE, gym, (owner or ""),
+                             (PROOF_STAT if t["id"] == "T5" else ""), url])
+    return on_card_text
+
+
+# ==========================================================================
+# PUBLIC: make_welcome / render_blank
+# ==========================================================================
+
+def _render(template, gym_name, owner_name, logo_path, out_path,
+            bg_client=None, cache_dir=None):
+    bg_path, mode = ensure_background(template, bg_client=bg_client, cache_dir=cache_dir)
+    img = Image.open(bg_path).convert("RGBA")
+    if img.size != (SIZE, SIZE):
+        img = img.resize((SIZE, SIZE))
+    # logo zone first (plate sits under nothing but the gym logo), then text
+    place_gym_logo(img, logo_path, template["logo_zone"], template["base"])
+    on_card_text = _compose_text(img, template, gym_name, owner_name)
+    img.convert("RGB").save(out_path)
+    return out_path, mode, on_card_text
+
+
+def make_welcome(template_id, gym_name, owner_name, logo_path, out_path=None,
+                 bg_client=None, cache_dir=None):
+    """Compose a finished welcome post: cached background + gym logo + text.
+
+    This is the onboarding entry point. With a warm background cache it renders a
+    real gym's card in a fraction of a second and re-pays no Pro generation.
+    Returns the output PNG path.
+    """
+    t = get_template(template_id)
+    if out_path is None:
+        out_path = os.path.join(_cache_dir(cache_dir),
+                                f"welcome_{template_id}_filled.png")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    path, _mode, _text = _render(t, gym_name, owner_name, logo_path, out_path,
+                                 bg_client=bg_client, cache_dir=cache_dir)
+    return path
+
+
+def render_blank(template_id, out_path, bg_client=None, cache_dir=None):
+    """The empty template: placeholder fills, no gym logo (shows the calm safe zone
+    plate so Blake can see where a gym logo lands)."""
+    t = get_template(template_id)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    path, mode, _text = _render(t, "YOUR GYM NAME", "Owner Name", None, out_path,
+                                bg_client=bg_client, cache_dir=cache_dir)
+    return path, mode
+
+
+# ==========================================================================
+# TEST LOGOS (for the 20 filled proofs: one wide, one square, per template)
+# ==========================================================================
+
+def make_test_logos(out_dir):
+    """Two obviously-placeholder gym logos to prove the safe zone reads on both a
+    wide and a square mark. Dark marks on transparent, so they read on the calm
+    (light) plate of every template. Returns (wide_path, square_path)."""
+    os.makedirs(out_dir, exist_ok=True)
+    navy = (18, 30, 60, 255)
+    red = (210, 30, 34, 255)
+    wide = Image.new("RGBA", (900, 320), (0, 0, 0, 0))
+    wd = ImageDraw.Draw(wide)
+    wd.rounded_rectangle([6, 6, 894, 314], radius=40, outline=navy, width=10)
+    wf = _f(ANTON, 120)
+    tw = wd.textbbox((0, 0), "GYM LOGO", font=wf)
+    wd.text(((900 - (tw[2] - tw[0])) // 2, 90), "GYM LOGO", font=wf, fill=navy)
+    wd.ellipse([820, 40, 860, 80], fill=red)
+    wide_path = os.path.join(out_dir, "test_logo_wide.png")
+    wide.save(wide_path)
+
+    square = Image.new("RGBA", (500, 500), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(square)
+    sd.ellipse([10, 10, 490, 490], outline=navy, width=14)
+    sf = _f(ANTON, 200)
+    tb = sd.textbbox((0, 0), "GL", font=sf)
+    sd.text(((500 - (tb[2] - tb[0])) // 2, 120), "GL", font=sf, fill=navy)
+    sd.ellipse([360, 90, 410, 140], fill=red)
+    square_path = os.path.join(out_dir, "test_logo_square.png")
+    square.save(square_path)
+    return wide_path, square_path
+
+
+# ==========================================================================
+# slots.json v2
+# ==========================================================================
+
+def slots_dict():
+    """The slots.json v2 structure: per template, the logo safe zone and the fixed
+    text slots, in canvas pixel coords. Onboarding and any external tool read this
+    to know where fields land."""
+    out = {"canvas": {"w": SIZE, "h": SIZE}, "margin": MARGIN,
+           "min_logo_zone_fraction": _MIN_ZONE_FRAC,
+           "headline": HEADLINE, "fill_fields": ["gym_name", "owner_name"],
+           "templates": {}}
+    for t in TEMPLATES:
+        zx, zy, zw, zh = t["logo_zone"]
+        # matches _compose_text: text sits opposite the zone and stops short of it
+        text_side = "left" if zx > SIZE * 0.45 else "right"
+        out["templates"][t["id"]] = {
+            "name": t["name"], "direction": t["direction"],
+            "base": t["base"], "bg_style": t["bg_style"], "accent": t["accent"],
+            "eyebrow": t["eyebrow"],
+            "logo_zone": {"x": zx, "y": zy, "w": zw, "h": zh,
+                          "fraction": round(_zone_frac(t["logo_zone"]), 4)},
+            "text_column": text_side,
+        }
+    return out
+
+
+def write_slots_json(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(slots_dict(), fh, indent=2)
+    return path

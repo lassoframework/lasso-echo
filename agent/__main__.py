@@ -126,6 +126,9 @@ def _status():
     print(f"  client_sources : {config.client_sources_enabled()}  (env AGENT_CLIENT_SOURCES)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
+    print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
+    print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
+    print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
     _sapi_key = config.socialapi_key()
     print(f"  socialapi      : {config.socialapi_enabled()}  (env AGENT_SOCIALAPI_ENABLED)")
     print(f"  socialapi_key   : {'SET' if _sapi_key else 'NOT SET'}  (env AGENT_SOCIALAPI_KEY)")
@@ -750,7 +753,11 @@ _COMMANDS = {
         ("summit-queue", "upload + schedule LASSO Growth Summit infographic posts (--images-dir / --from-manifest)"),
         ("book-queue", "upload + schedule The Full Gym book launch infographic posts (--images-dir / --from-manifest)"),
         ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
+        ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
+    ],
+    "podcast & opus (cont.)": [
+        ("podcast-quote-card", "render one guest quote card (verbatim, real logo, CAPS emphasis)"),
     ],
     "socialapi lane": [
         ("socialapi-onboard", "create a gym's SocialAPI brand and store the id (--account <key>)"),
@@ -1035,6 +1042,100 @@ def _socialapi_cli(sub, argv):
         print(f"brand: {body.get('brand_id')}")
         for plat, st in (body.get("status") or {}).items():
             print(f"  {plat}: {st}")
+
+
+def _welcome_templates(args):
+    """python -m agent welcome-templates [--out-dir DIR] [--post]
+
+    Render the 10 welcome templates + 20 filled proofs (procedural backgrounds
+    locally; real Nano Pro art on Railway when AGENT_NANO_ENABLED + key are set,
+    cached to the volume). Grades every card. With --post, hosts each to R2 and
+    posts the review set to #echoclaude: 10 top-level messages, the two filled
+    proofs threaded under each. Review only, nothing publishes.
+    """
+    from . import welcome_review as _wr
+    from . import welcome_templates as _wt
+
+    out_dir = os.path.join(config.LIBRARY_PATH, "welcome_proofs")
+    do_post = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--out-dir" and i + 1 < len(args):
+            out_dir = args[i + 1]; i += 2; continue
+        if args[i] == "--post":
+            do_post = True; i += 1; continue
+        i += 1
+
+    # keep slots.json v2 current at the repo root
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _wt.write_slots_json(os.path.join(root, "slots.json"))
+
+    print("welcome-templates: rendering 10 templates + 20 proofs ...")
+    manifest = _wr.render_all(out_dir)
+    npass = sum(1 for m in manifest if m["grade"]["passed"]
+                and all(p["grade"]["passed"] for p in m["proofs"]))
+    mode = manifest[0]["mode"] if manifest else "?"
+    for m in manifest:
+        gp = "PASS" if m["grade"]["passed"] else f"FAIL {m['grade']['failed']}"
+        print(f"  {m['id']:3} {m['name']:18} bg={m['mode']:11} "
+              f"calm={m['calm_zone_ok']!s:5} grade={gp}")
+    print(f"welcome-templates: {npass}/10 templates fully pass "
+          f"(backgrounds: {mode}). Proofs in {out_dir}")
+
+    if not do_post:
+        print("Not posted. Re-run with --post to host to R2 and post to Slack.")
+        return
+    if not config.hosting_enabled():
+        print("welcome-templates: AGENT_HOSTING_ENABLED is not set; cannot host to "
+              "R2. Set it (and R2 creds) to post inline images. Nothing posted.")
+        return
+    from .media_host import host_media
+    from .slack_surface import SlackPoster
+    poster = SlackPoster()
+    print("welcome-templates: hosting to R2 and posting the review set to Slack ...")
+    summary = _wr.post_review_set(manifest, poster, host_media)
+    print(f"welcome-templates: posted {summary['count']} template messages "
+          f"with threaded proofs. Review only, nothing published.")
+
+
+def _podcast_quote_card(args):
+    """python -m agent podcast-quote-card --quote "..." --guest "Name" --episode N
+       [--canvas navy|cream] [--out PATH]
+
+    Render one guest quote card (pure PIL, real LASSO wordmark, one red accent,
+    CAPS emphasis opening). Verbatim: a dashed quote is refused. Draft artifact
+    only; nothing publishes."""
+    from .podcast_quote_card import render_quote_card
+    quote = guest = out = None
+    episode = "0"
+    canvas = "navy"
+    i = 0
+    while i < len(args):
+        if args[i] == "--quote" and i + 1 < len(args):
+            quote = args[i + 1]; i += 2; continue
+        if args[i] == "--guest" and i + 1 < len(args):
+            guest = args[i + 1]; i += 2; continue
+        if args[i] == "--episode" and i + 1 < len(args):
+            episode = args[i + 1]; i += 2; continue
+        if args[i] == "--canvas" and i + 1 < len(args):
+            canvas = args[i + 1]; i += 2; continue
+        if args[i] == "--out" and i + 1 < len(args):
+            out = args[i + 1]; i += 2; continue
+        i += 1
+    if not quote or not guest:
+        print('usage: python -m agent podcast-quote-card --quote "..." '
+              '--guest "Name" --episode N [--canvas navy|cream] [--out PATH]')
+        return
+    if out is None:
+        out = os.path.join(config.LIBRARY_PATH,
+                           f"quote_ep{episode}_{guest.split()[0].lower()}.png")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    try:
+        path = render_quote_card(quote, guest, episode, out, canvas=canvas)
+    except ValueError as e:
+        print(f"podcast-quote-card refused: {e}")
+        return
+    print(f"podcast-quote-card: wrote {path} (draft only, nothing published)")
 
 
 def main(argv=None):
@@ -2127,6 +2228,10 @@ def main(argv=None):
                 continue
             _poster.post_approval_card(_d)
             print(f"  card sent: {_did}  ({_d.account_key}  {_d.day_key})")
+    elif cmd == "welcome-templates":
+        _welcome_templates(argv[1:])
+    elif cmd == "podcast-quote-card":
+        _podcast_quote_card(argv[1:])
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
