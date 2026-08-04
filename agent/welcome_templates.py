@@ -786,6 +786,46 @@ def _fit_headline(d, text, max_w, max_lines, start, floor=64):
     return fo, _wrap(d, text, fo, max_w)
 
 
+# Story bottom block lives between the logo plate and the footer wordmark. These
+# constants and the fitter below are the SINGLE SOURCE OF TRUTH the compositor and
+# the story grade guard both use, so they can never disagree about where the gym
+# name + owner land (the feed guard pattern, applied to the tall frame).
+STORY_FOOTER_TOP = STORY_SAFE_BOTTOM - 46      # the wordmark baseline row
+STORY_BOTTOM_RESERVE = 30                      # gap kept clear above the footer
+STORY_OWNER_H = 60                             # vertical room the owner line takes
+
+
+def _story_bottom_fit(d, template, gym_name, owner_name):
+    """Fit the story bottom block (gym name, up to 2 lines, + optional owner line) so
+    it ALWAYS stays above the footer inside the 85% safe band. Shrinks the gym name
+    until the whole block fits; even a long two-line name cannot overrun. Returns
+    (gym_font, gym_lines, owner_font_or_None, top_y, bottom_y)."""
+    _zx, zy, _zw, zh = story_zone(template)
+    col_w = STORY_W - 2 * STORY_MARGIN
+    top = zy + zh + 64
+    owner = (owner_name or "").strip()
+    owner_h = STORY_OWNER_H if owner else 0
+    avail = (STORY_FOOTER_TOP - STORY_BOTTOM_RESERVE) - top - owner_h
+    gym = (gym_name or "").strip().upper() or "YOUR GYM NAME"
+    gf, glines = _fit_headline(d, gym, col_w, 2, 92, floor=44)
+    while gf.size > 44 and len(glines) * (gf.size + 10) > avail:
+        gf, glines = _fit_headline(d, gym, col_w, 2, gf.size - 6, floor=44)
+    gym_h = len(glines) * (gf.size + 10)
+    of = _f(MONT, 42) if owner else None
+    bottom = top + gym_h + owner_h
+    return gf, glines, of, top, bottom
+
+
+def story_bottom_bounds(template, gym_name, owner_name):
+    """The bottom y of the composed story bottom block for a given name. The grade
+    guard calls this (with a stress name) to verify the block clears the footer,
+    measuring the SAME way the compositor draws it."""
+    scratch = ImageDraw.Draw(Image.new("RGBA", (STORY_W, STORY_H)))
+    _gf, _gl, _of, _top, bottom = _story_bottom_fit(scratch, template, gym_name,
+                                                    owner_name)
+    return bottom
+
+
 def _compose_text(img, template, gym_name, owner_name):
     """Draw eyebrow, WELCOME TO LASSO headline, gym name, owner name, footer, and
     the accent. All left-aligned, asymmetric, house style. Returns on-card text for
@@ -926,12 +966,14 @@ def _compose_text_story(img, template, gym_name, owner_name):
     # text-column guard that stops composed text entering the logo zone.
     head_gap = 34
     avail_h = (zy - head_gap) - y
-    hf, lines = _fit_headline(d, HEADLINE, col_w, 3, 168, floor=104)
-    while hf.size > 104:
+    # story headline runs LARGER than feed: a two-line fit ("WELCOME TO" / "LASSO")
+    # at a bigger size, never below the feed size, still clearing the logo plate.
+    hf, lines = _fit_headline(d, HEADLINE, col_w, 2, 152, floor=132)
+    while hf.size > 132:
         lh_try = _th(d, "AY", hf) + 8 + int(hf.size * 0.28)
         if len(lines) * lh_try <= avail_h:
             break
-        hf, lines = _fit_headline(d, HEADLINE, col_w, 3, hf.size - 6, floor=104)
+        hf, lines = _fit_headline(d, HEADLINE, col_w, 2, hf.size - 6, floor=132)
     red_word = "LASSO" if t["accent"] == "word" else None
     lh = _th(d, "AY", hf) + 8 + int(hf.size * 0.28)
     for i, line in enumerate(lines):
@@ -943,20 +985,18 @@ def _compose_text_story(img, template, gym_name, owner_name):
             d.text((cx, y + i * lh), word, font=hf, fill=fill)
             cx += _tw(d, word + " ", hf)
 
-    # ---------- BOTTOM BLOCK: gym name + owner, anchored BELOW the logo plate ----------
-    y = zy + zh + 70
-    gym = (gym_name or "").strip().upper() or "YOUR GYM NAME"
-    gf, glines = _fit_headline(d, gym, col_w, 2, 96, floor=52)
+    # ---------- BOTTOM BLOCK: gym name + owner, height-clamped so it can never run
+    # past the footer / out of the 85% safe band, even for a long two-line name ----
+    gf, glines, of, y, _bottom = _story_bottom_fit(d, t, gym_name, owner_name)
     for i, line in enumerate(glines):
         draw(col_x, y + i * (gf.size + 10), line, gf, ink)
-    y += len(glines) * (gf.size + 10) + 16
+    y += len(glines) * (gf.size + 10) + 12
 
     owner = (owner_name or "").strip()
-    if owner:
-        of = _f(MONT, 42)
+    if of is not None and owner:
         owner_fill = (86, 94, 112) if base == "cream" else (206, 218, 236)
         draw(col_x, y, f"with {owner}", of, owner_fill)
-        y += 60
+        y += STORY_OWNER_H
 
     if t["id"] == "T5":
         pf = _f(OSWALD, 26)
@@ -972,6 +1012,7 @@ def _compose_text_story(img, template, gym_name, owner_name):
     uf = _f(OSWALD, 26)
     d.text((STORY_W - STORY_MARGIN - _tw(d, url, uf), fy + 4), url, font=uf, fill=mute)
 
+    gym = (gym_name or "").strip().upper() or "YOUR GYM NAME"
     on_card_text = " ".join([t["eyebrow"], HEADLINE, gym, (owner or ""),
                              (PROOF_STAT if t["id"] == "T5" else ""), url])
     return on_card_text

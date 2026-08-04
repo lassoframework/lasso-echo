@@ -188,6 +188,38 @@ def test_cost_reported_in_publish_message():
     assert "0.03" in out.message
 
 
+def test_publish_that_raises_degrades_to_blocked_not_crash():
+    # regression (audit MAJOR): blake_personal / a Graph error must not escape
+    def boom(account_key, asset, surfaces):
+        raise RuntimeError("Graph API cannot publish to a personal profile")
+    out = cp.route("post it", "blake_personal", BLAKE, asset={}, publish_fn=boom,
+                   gate_fn=lambda a: {"ok": True})
+    assert out.kind == "blocked" and "personal profile" in out.message
+
+
+def test_publish_error_result_is_blocked():
+    def errs(account_key, asset, surfaces):
+        return {"error": "no token set"}
+    out = cp.route("post it", "lasso_ig", BLAKE, asset={}, publish_fn=errs,
+                   gate_fn=lambda a: {"ok": True})
+    assert out.kind == "blocked" and "no token" in out.message
+
+
+def test_draft_only_mode_is_honest_not_published():
+    # regression (audit MINOR): publish flag off -> would_publish, not "published"
+    def draft_only(account_key, asset, surfaces):
+        return {"permalink": "", "media_ids": [], "mode": "would_publish"}
+    out = cp.route("post it", "lasso_ig", BLAKE, asset={}, publish_fn=draft_only,
+                   gate_fn=lambda a: {"ok": True})
+    assert out.kind == "would_publish" and "not armed" in out.message
+
+
+def test_meta_delete_media_is_noop_when_publish_disabled(monkeypatch):
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)
+    from agent import meta_publisher
+    assert meta_publisher.delete_media("lasso_fb", "123") is False
+
+
 # ---- live integration glue --------------------------------------------------
 
 @pytest.mark.parametrize("text,expected", [

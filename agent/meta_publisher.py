@@ -118,6 +118,33 @@ def publish(draft, account, http=None):
     return result
 
 
+def delete_media(account_key, media_id, http=None):
+    """Best-effort delete of a just-published post, for the 5-minute chat undo.
+    Returns True ONLY on a confirmed delete. The Graph API can delete a Facebook
+    Page post (DELETE /{post-id}); it cannot delete published Instagram media, so IG
+    and personal profiles return False and the caller tells Blake to remove it by
+    hand. Guarded by AGENT_PUBLISH_ENABLED so a draft-only environment never calls
+    Meta."""
+    if not config.publish_enabled():
+        return False
+    from .accounts import get_account
+    account = get_account(account_key)
+    if account is None:
+        return False
+    token = account.get_token()
+    if not token or not media_id:
+        return False
+    if account.platform != Platform.FACEBOOK_PAGE:
+        return False  # IG published media / personal profiles: no API delete
+    client = http or _requests()
+    try:
+        resp = client.delete(f"{config.GRAPH_API_BASE}/{media_id}",
+                             params={"access_token": token}, timeout=30)
+        return getattr(resp, "status_code", 500) < 300
+    except Exception:
+        return False
+
+
 def _compose_caption(draft):
     tags = (" " + " ".join(draft.hashtags)) if draft.hashtags else ""
     return (draft.caption + ("\n\n" + " ".join(draft.hashtags) if draft.hashtags else "")).strip()

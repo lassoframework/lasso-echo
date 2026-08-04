@@ -556,6 +556,10 @@ def run_listener():
         if message.get("bot_id") or message.get("subtype"):
             return
         actor = message.get("user", "")
+        # only Blake is ever engaged; every other user's chatter is left untouched
+        # (route() also gates on the approver, this just avoids replying to others)
+        if actor != config.APPROVER_SLACK_ID:
+            return
         text = message.get("text", "") or ""
         from . import chat_publish
         # cheap pre-filter: only engage on a publish/undo verb, so normal chatter is

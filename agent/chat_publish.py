@@ -213,7 +213,23 @@ def route(text, account_key, actor_slack_id, asset=None, *, publish_fn=None,
         reason = gate.get("reason") or "failed the content gate"
         return Outcome("blocked", f"Held back: {reason}. Nothing published.")
 
-    res = (publish_fn or _noop_publish)(account_key, asset, surfaces) or {}
+    # a publish that raises (e.g. a personal profile Graph API cannot post to) must
+    # degrade to a clean message, never a crash that escapes the listener
+    try:
+        res = (publish_fn or _noop_publish)(account_key, asset, surfaces) or {}
+    except Exception as e:
+        return Outcome("blocked", f"Couldn't publish to {account_key}: {e}. "
+                       "Nothing published.")
+    if res.get("error"):
+        return Outcome("blocked", f"Couldn't publish to {account_key}: "
+                       f"{res['error']}. Nothing published.")
+    # honest about draft-only: publishing armed vs not (AGENT_PUBLISH_ENABLED)
+    if res.get("mode") and res.get("mode") != "published":
+        return Outcome("would_publish",
+                       f"Draft-only: publishing is not armed (AGENT_PUBLISH_ENABLED "
+                       f"is off), so nothing was written to {account_key}. Arm it to "
+                       f"go live.", surfaces=surfaces)
+
     _remember_publish(actor_slack_id, account_key, res.get("media_ids", []),
                       surfaces, now)
     cost = res.get("cost")
@@ -319,8 +335,14 @@ def _real_publish_fn():
     def publish(account_key, draft, surfaces):
         from . import meta_publisher, publish_confirm
         from .accounts import get_account
+        if draft is None:
+            return {"error": "nothing staged to publish"}
         acct = get_account(account_key)
-        result = meta_publisher.publish(draft, acct)
+        try:
+            result = meta_publisher.publish(draft, acct)
+        except Exception as e:
+            # e.g. a personal profile the Graph API cannot post to
+            return {"error": str(e)}
         permalink = ""
         media_ids = []
         if getattr(result, "media_id", ""):
@@ -329,10 +351,8 @@ def _real_publish_fn():
                 permalink = publish_confirm.confirm_publish(draft, acct, result) or ""
             except Exception:
                 permalink = ""
-        mode = getattr(result, "mode", "")
-        note = "" if mode == "published" else " (draft-only: AGENT_PUBLISH_ENABLED is off)"
-        return {"permalink": permalink or note.strip(), "media_ids": media_ids,
-                "cost": None}
+        return {"permalink": permalink, "media_ids": media_ids, "cost": None,
+                "mode": getattr(result, "mode", "")}
     return publish
 
 

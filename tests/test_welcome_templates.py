@@ -281,6 +281,33 @@ def test_story_layout_guard_all_templates(tid):
     assert wr._story_layout_ok(wt.get_template(tid))
 
 
+# regression for the audit's CRITICAL: a TWO-LINE gym name must not run its owner
+# line past the footer / out of the 85% safe band (the story T5-collision class).
+@pytest.mark.parametrize("gym", [
+    "Orangetheory Fitness Studio Downtown",   # wraps to two lines
+    "CrossFit District H Strength and Conditioning",
+    "Iron Forge Fitness",                     # one line (control)
+])
+@pytest.mark.parametrize("tid", ["T1", "T8", "T9"])
+def test_story_two_line_gym_name_stays_in_safe_band(tmp_path, cache, tid, gym):
+    t = wt.get_template(tid)
+    wide, _sq = wt.make_test_logos(str(tmp_path / "logos"))
+    out = _out(tmp_path, f"{tid}_2line.png")
+    _p, _m, text = wt._render(t, gym, "Alexandra Fitzgerald", wide, out,
+                              cache_dir=cache, fmt="story")
+    # the composed bottom block clears the footer (measured the way it is drawn)
+    assert wt.story_bottom_bounds(t, gym, "Alexandra Fitzgerald") <= wt.STORY_FOOTER_TOP
+    # and the whole card still passes the story grade
+    assert wr.grade_welcome(out, text, t, fmt="story")["passed"]
+
+
+def test_story_guard_would_catch_an_overrunning_bottom_block(monkeypatch):
+    # prove the guard is real: force a tiny footer so even a short name overruns,
+    # and confirm the guard flips to False (it is not a rubber stamp)
+    monkeypatch.setattr(wt, "STORY_FOOTER_TOP", 800)
+    assert wr._story_layout_ok(wt.get_template("T1")) is False
+
+
 def test_story_red_region_check_is_aspect_correct(tmp_path, cache):
     # regression: the red-mask downscale must preserve aspect, else a tall story
     # frame is squashed ~1.8x and thin horizontal accents vanish (T5 rule bug).

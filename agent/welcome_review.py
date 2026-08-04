@@ -182,18 +182,21 @@ def _no_text_logo_overlap(template, tolerance=8):
 
 
 def _story_layout_ok(template):
-    """True when the story (9:16) layout is sound: the logo zone sits fully inside
-    the 15..85% safe band (so it clears the top/bottom 250px platform UI), is at
-    least 13% of the tall canvas, and leaves headroom above and below for the text
-    blocks the vertical stack draws (eyebrow+headline above, gym+owner below). This
-    is the story analogue of the feed text-column overlap guard."""
+    """True when the story (9:16) layout is sound. Beyond the static checks (zone in
+    the 15..85% safe band, >= 13% of the tall canvas, headroom above the plate), this
+    MEASURES the actual composed bottom block for a STRESS two-line gym name + owner,
+    the same way the compositor draws it (wt.story_bottom_bounds), and confirms it
+    still clears the footer. This is what catches the story analogue of the feed
+    T5-collision: a long name whose owner line would overrun the bottom safe band."""
     zx, zy, zw, zh = wt.story_zone(template)
     frac = (zw * zh) / float(wt.STORY_W * wt.STORY_H)
     in_band = zy >= wt.STORY_SAFE_TOP and (zy + zh) <= wt.STORY_SAFE_BOTTOM
-    # headroom for the top text block above the plate and the bottom block below it
     head_room = (zy - wt.STORY_SAFE_TOP) >= 240
-    foot_room = (wt.STORY_SAFE_BOTTOM - (zy + zh)) >= 200
-    return in_band and frac >= 0.13 and head_room and foot_room
+    # real composed-height check with a deliberately long two-line name + owner
+    stress_bottom = wt.story_bottom_bounds(
+        template, "Orangetheory Fitness Studio Downtown", "Alexandra Fitzgerald")
+    fits_footer = stress_bottom <= wt.STORY_FOOTER_TOP
+    return in_band and frac >= 0.13 and head_room and fits_footer
 
 
 def ocr_clean(bg_path, vision_client=None):

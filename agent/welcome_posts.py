@@ -313,6 +313,18 @@ class StripeReader:
         return list(by_cust.values())
 
 
+def portal_logo_override(account_key):
+    """A human-dropped logo for this gym wins over any scrape. Blake drops a file at
+    <logo_dir>/overrides/<account_key>.(png|jpg|jpeg|webp); the first match is used.
+    Returns a path or None."""
+    base = os.path.join(website_scan.logo_dir(None), "overrides")
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        p = os.path.join(base, account_key + ext)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def _portal_lookup(customer):
     """Best-effort match of a Stripe customer to an existing portal gym row, by an
     account_key derived from the email domain. Returns the gyms dict or None."""
@@ -408,7 +420,9 @@ def backfill(window_days=45, now=None, reader=None, scraper=None,
         entry["template"] = pick_template(key)
         ak = gym["account_key"] or ("cust_" + re.sub(r"[^a-z0-9]+", "_",
                                                      str(cust.get("id")).lower()))
-        logo = scraper(gym["website"], ak, out_dir=None)
+        # a human-dropped portal logo wins over any scrape
+        override = portal_logo_override(ak)
+        logo = scraper(gym["website"], ak, override_path=override, out_dir=None)
         entry["logo"] = {"status": logo.status, "source": logo.source,
                          "note": logo.note}
         if not logo.ok:
@@ -487,6 +501,11 @@ def surface_to_slack(report, poster, host_fn, channel=None):
                         {"type": "context", "elements": [
                             {"type": "mrkdwn", "text": f"{g['name']} STORY 1080x1920"}]}],
                 channel=ch, thread_ts=ts)
+        # stamp the ledger the moment a gym is actually surfaced, so a second
+        # backfill run never re-welcomes it (idempotency is self-contained here,
+        # not dependent on a downstream approval step). A dry run never reaches
+        # this path, so it never stamps.
+        mark_welcomed(g["gym_key"])
         posted += 1
 
     # roster summary so the logic is visible, not just the output

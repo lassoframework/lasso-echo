@@ -280,6 +280,47 @@ def test_surface_posts_feed_and_story_never_publishes(tmp_path):
                for p in poster.posts)
 
 
+def test_surface_stamps_ledger_so_second_run_skips(tmp_path):
+    # regression (audit CRITICAL): surfacing must stamp the ledger itself, so a
+    # second backfill run does NOT re-welcome the same gym.
+    png = _make_png(tmp_path)
+    reader = FakeReader([_cust("c1", [_sub(10)], business_name="Iron Forge Fitness")])
+    args = dict(now=NOW, reader=reader, scraper=_ok_scraper(png),
+                portal_lookup=lambda c: None,
+                out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "bg"))
+    rep1 = wp.backfill(**args)
+    poster = FakePoster()
+    wp.surface_to_slack(rep1, poster, lambda p, t: f"https://r2/{os.path.basename(p)}")
+    assert wp.already_welcomed(rep1["included"][0]["gym_key"])
+    # a second backfill now skips it as already-welcomed, generates no new post
+    rep2 = wp.backfill(**args)
+    assert not rep2["included"] and len(rep2["already_welcomed"]) == 1
+
+
+def test_portal_logo_override_is_used_over_scrape(tmp_path, monkeypatch):
+    # regression (audit MAJOR): a human-dropped portal logo must win over the scrape.
+    logo_root = tmp_path / "logos"
+    monkeypatch.setenv("AGENT_WELCOME_LOGO_DIR", str(logo_root))
+    override_dir = logo_root / "overrides"
+    override_dir.mkdir(parents=True)
+    from PIL import Image
+    Image.new("RGBA", (500, 500), (200, 20, 20, 255)).save(
+        str(override_dir / "ironforge_ig.png"))
+
+    used = {}
+
+    def spy_scraper(website, account_key, override_path=None, out_dir=None, **kw):
+        used["override_path"] = override_path
+        return website_scan.LogoResult(website_scan.STATUS_OK,
+                                       override_path or "scraped", "override", (500, 500))
+    reader = FakeReader([_cust("c1", [_sub(10)], business_name="Iron Forge")])
+    row = {"account_key": "ironforge_ig", "gym_name": "Iron Forge Fitness"}
+    wp.backfill(now=NOW, reader=reader, scraper=spy_scraper,
+                portal_lookup=lambda c: row,
+                out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "bg"))
+    assert used["override_path"] and used["override_path"].endswith("ironforge_ig.png")
+
+
 def test_surface_reports_blocked_when_no_stripe(tmp_path):
     poster = FakePoster()
     rep = {"error": "no Stripe key (set STRIPE_API_KEY ...)", "included": [],
