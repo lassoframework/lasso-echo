@@ -251,6 +251,20 @@ def welcome_posts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_WELCOME_POSTS_ENABLED", "false"))
 
 
+def welcome_queue_enabled() -> bool:
+    """
+    One-per-day welcome DRIP + the automatic new-client trigger. OFF by default.
+    When OFF, the daily runner's welcome hooks return None and the daily Stripe scan
+    no-ops: byte-for-byte current behavior. When ON, the runner scans Stripe each
+    cycle, enqueues every ready new-client welcome (feed + story, hosted), and serves
+    the OLDEST queued welcome one gym per day across lasso_ig + lasso_fb. Served
+    drafts are PENDING: they card for approval, or auto-publish only when
+    AGENT_AUTO_APPROVE_ENABLED is armed (the story also needs AGENT_STORIES_ENABLED).
+    Needs AGENT_HOSTING_ENABLED (R2) to host the cards. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_WELCOME_QUEUE_ENABLED", "false"))
+
+
 # The Stripe secret is read lazily BY NAME (never stored, never logged), same
 # pattern as every other token. Set STRIPE_API_KEY in Railway (a RESTRICTED,
 # read-only key: Customers, Subscriptions, Products, Prices). Empty => the welcome

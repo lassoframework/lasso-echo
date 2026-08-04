@@ -40,6 +40,26 @@ MIN_LONG_EDGE = 200          # anything smaller is a favicon / icon, rejected
 _FAVICON_HINT = re.compile(r"favicon|/icon[s]?/|apple-touch-icon-precomposed", re.I)
 _RASTER_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
+# Third-party domains that host affiliate badges / franchise marks — never the gym's own logo
+_BLOCKED_LOGO_DOMAINS = frozenset([
+    "crossfit.com", "www.crossfit.com",
+    "mindbodyonline.com", "www.mindbodyonline.com",
+    "zingfit.com", "www.zingfit.com",
+    "glofox.com", "www.glofox.com",
+])
+
+# Franchise / software brand keywords that flag a candidate as a partner badge, not the gym logo.
+# _FRANCHISE_BLOB_RE: word-boundary match for natural-language blobs (class/id/alt text).
+# _FRANCHISE_PATH_RE: no-boundary match for URL paths (handles camelCase filenames).
+_FRANCHISE_BLOB_RE = re.compile(
+    r"\b(?:crossfit|hyrox|wodify|mindbody|zingfit|glofox|pushpress|"
+    r"pikfit|trainerize|triib|sugarwod)\b",
+    re.I
+)
+_FRANCHISE_PATH_RE = re.compile(
+    r"(?i)crossfit|hyrox|wodify|mindbody|zingfit|glofox|pushpress|pikfit|trainerize|sugarwod"
+)
+
 STATUS_OK = "OK"
 STATUS_NOT_FOUND = "LOGO_NOT_FOUND"
 
@@ -118,21 +138,29 @@ def logo_candidates(html, base_url):
     """
     cands = []
 
-    def add(u, why):
+    def add(u, why, blob=""):
         if not u:
             return
         absu = urljoin(base_url, u)
+        if urlparse(absu).netloc in _BLOCKED_LOGO_DOMAINS:
+            return
+        # Reject franchise/partner badges: blob match for header-img; path match for all
+        if why == "header-img" and blob and _FRANCHISE_BLOB_RE.search(blob):
+            return
+        if _FRANCHISE_PATH_RE.search(urlparse(absu).path):
+            return
         if absu not in [c[0] for c in cands]:
             cands.append((absu, why))
 
     og_images = []
 
-    # 1. a header/nav <img> that looks like a logo (class/id/alt contains "logo")
+    # 1. a header/nav <img> that looks like a logo (class/id/alt contains "logo"),
+    #    but skip partner/franchise badges (CrossFit affiliate, Hyrox, Wodify, etc.)
     for tag in re.findall(r"<img\b[^>]*>", html, re.I):
         blob = " ".join([_attr(tag, "src"), _attr(tag, "class"),
                          _attr(tag, "id"), _attr(tag, "alt")]).lower()
         if "logo" in blob:
-            add(_attr(tag, "src") or _attr(tag, "data-src"), "header-img")
+            add(_attr(tag, "src") or _attr(tag, "data-src"), "header-img", blob=blob)
 
     # 2. apple-touch-icon
     for tag in re.findall(r"<link\b[^>]*>", html, re.I):
@@ -273,17 +301,41 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small {img.size}"))
             continue
-        # og:image is typically a landscape hero photo (e.g. 1200×630).
-        # Reject it when wider than 2.2:1 — real logos are square-ish or vertical.
+        # og:image is typically a landscape hero photo — reject very wide OR very large images.
+        # Rationale: fitness og:images are almost always athlete shots; logos are small and
+        # square-ish. Anything > 1400px on the long edge is a banner or full-bleed photo.
         if why == "og:image" and img.size[1] > 0:
             ratio = img.size[0] / img.size[1]
-            if ratio > 2.2:
+            if ratio > 2.2 or max(img.size) > 1400:
                 tried.append((why, f"landscape photo rejected ({img.size[0]}×{img.size[1]})"))
                 continue
-        img = _trim_alpha(_knockout_bg(img))
+        knocked = _knockout_bg(img)
+        alpha_vals = list(knocked.split()[3].getdata())
+        opaque_frac = sum(1 for a in alpha_vals if a > 127) / max(len(alpha_vals), 1)
+        if opaque_frac < 0.08:
+            # Knockout ate the marks — check if original has dark content visible on a white plate
+            orig_px = list(img.convert("RGBA").getdata())
+            dark_frac = sum(1 for px in orig_px
+                            if px[3] > 127 and px[0] < 200 and px[1] < 200 and px[2] < 200
+                            ) / max(len(orig_px), 1)
+            if dark_frac < 0.03:
+                # White logo on white bg — would be invisible on a white plate; try next candidate
+                tried.append((why, f"white-on-white logo skipped (dark {dark_frac:.0%})"))
+                continue
+            img = _trim_alpha(img)  # has dark marks on colored bg; keep original without knockout
+        else:
+            img = _trim_alpha(knocked)
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small after trim {img.size}"))
             continue
+        # Reject logos where most opaque pixels are white/near-white — invisible on the card plate
+        fin_px = list(img.getdata())
+        opaque_px = [px for px in fin_px if px[3] > 127]
+        if opaque_px:
+            white_count = sum(1 for px in opaque_px if px[0] > 200 and px[1] > 200 and px[2] > 200)
+            if white_count / len(opaque_px) > 0.40:
+                tried.append((why, f"white-on-plate logo ({white_count/len(opaque_px):.0%} white opaque)"))
+                continue
         img.save(dest)
         return LogoResult(STATUS_OK, dest, why, img.size)
 

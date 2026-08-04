@@ -705,13 +705,31 @@ def _fit_into(logo, box_w, box_h, pad_frac=0.14):
     return logo.resize((max(1, int(lw * scale)), max(1, int(lh * scale))))
 
 
-def _draw_zone_plate(img, zone, base, ghost=False):
+def _logo_needs_dark_plate(logo_path):
+    """Returns True when >40% of opaque pixels are near-white — the logo would vanish
+    on a light plate. Drives auto plate-color selection without recoloring the mark."""
+    if not logo_path or not os.path.isfile(logo_path):
+        return False
+    try:
+        img = Image.open(logo_path).convert("RGBA")
+        px = list(img.getdata())
+        opaque = [p for p in px if p[3] > 127]
+        if not opaque:
+            return False
+        white = sum(1 for p in opaque if p[0] > 200 and p[1] > 200 and p[2] > 200)
+        return white / len(opaque) > 0.40
+    except Exception:
+        return False
+
+
+def _draw_zone_plate(img, zone, base, ghost=False, dark_plate=False):
     """Draw the calm plate the gym logo sits on: a soft rounded card with a real
     drop shadow so it reads as an intentional lockup area, not an empty hole. On
     navy cards it is a cream plate so ANY gym logo (usually dark) reads; on cream
-    cards it is a subtle raised panel. When `ghost`, a faint "GYM LOGO" hint and a
-    clear-space frame show where the gym's mark will land (used on blank templates).
-    Not red, so it never competes for the single red accent."""
+    cards it is a subtle raised panel. When `dark_plate` is True, a near-navy fill
+    is used instead so white logos read clearly on any card base. When `ghost`, a
+    faint "GYM LOGO" hint and a clear-space frame show where the gym's mark will land
+    (used on blank templates). Not red, so it never competes for the single red accent."""
     x, y, w, h = zone
     # soft drop shadow (both bases) so the plate feels lifted and designed
     shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -722,7 +740,10 @@ def _draw_zone_plate(img, zone, base, ghost=False):
 
     plate = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     pd = ImageDraw.Draw(plate)
-    fill = (250, 246, 240, 255) if base == "navy" else (255, 253, 250, 240)
+    if dark_plate:
+        fill = (22, 26, 38, 255)               # near-navy: readable on both bases
+    else:
+        fill = (250, 246, 240, 255) if base == "navy" else (255, 253, 250, 240)
     pd.rounded_rectangle([0, 0, w - 1, h - 1], radius=30, fill=fill)
     img.alpha_composite(plate, (x, y))
 
@@ -741,11 +762,13 @@ def _draw_zone_plate(img, zone, base, ghost=False):
 
 def place_gym_logo(img, logo_path, zone, base):
     """Composite the gym's own logo into the safe zone, centered, on the calm plate.
-    Placed as-is (never recolored) so the gym's real mark is preserved. With no
-    logo (a blank review template) the plate shows a 'GYM LOGO' clear-space hint so
+    Placed as-is (never recolored) so the gym's real mark is preserved. Auto-selects
+    a dark plate when the logo is predominantly white so it always reads clearly. With
+    no logo (a blank review template) the plate shows a 'GYM LOGO' clear-space hint so
     it reads as an intentional lockup area rather than an empty hole."""
     has_logo = bool(logo_path) and os.path.isfile(logo_path)
-    _draw_zone_plate(img, zone, base, ghost=not has_logo)
+    dark_plate = _logo_needs_dark_plate(logo_path) if has_logo else False
+    _draw_zone_plate(img, zone, base, ghost=not has_logo, dark_plate=dark_plate)
     if not has_logo:
         return
     x, y, w, h = zone
@@ -891,10 +914,10 @@ def _compose_text(img, template, gym_name, owner_name):
     # --- owner name (fill field) ---
     owner = (owner_name or "").strip()
     if owner:
-        of = _f(MONT, 36)
-        owner_fill = (86, 94, 112) if base == "cream" else (206, 218, 236)
+        of = _f(MONT, 42)
+        owner_fill = (20, 26, 45) if base == "cream" else (255, 255, 255)
         draw(col_x, y, f"with {owner}", of, owner_fill)
-        y += 52
+        y += 56
 
     # --- T5 proof line (verified stat), flowing below the owner line ---
     if t["id"] == "T5":
@@ -994,7 +1017,7 @@ def _compose_text_story(img, template, gym_name, owner_name):
 
     owner = (owner_name or "").strip()
     if of is not None and owner:
-        owner_fill = (86, 94, 112) if base == "cream" else (206, 218, 236)
+        owner_fill = (20, 26, 45) if base == "cream" else (255, 255, 255)
         draw(col_x, y, f"with {owner}", of, owner_fill)
         y += STORY_OWNER_H
 
