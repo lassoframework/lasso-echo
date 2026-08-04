@@ -128,6 +128,7 @@ def _status():
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
+    print(f"  welcome_queue  : {config.welcome_queue_enabled()}  (env AGENT_WELCOME_QUEUE_ENABLED; one/day drip + new-client trigger, needs hosting)")
     print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
     print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
     print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
@@ -758,6 +759,7 @@ _COMMANDS = {
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
         ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
         ("welcome-backfill", "pull brand-new clients (last N days by subscription), scrape logos, make feed+story welcomes, surface held (--days/--post/--dry-run)"),
+        ("welcome-queue", "manage the one-per-day welcome drip: --build-manifest hosts the catch-up cards for Railway seeding, --seed enqueues locally, no args shows the queue (drip behind AGENT_WELCOME_QUEUE_ENABLED)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "podcast & opus (cont.)": [
@@ -1267,6 +1269,82 @@ def _welcome_backfill(args):
           f"held for approval. Nothing published.")
 
 
+def _welcome_queue(args):
+    """python -m agent welcome-queue [--seed] [--status]
+
+    Manage the one-per-day welcome DRIP. Default (no args) prints the queue.
+    --seed runs the Stripe scan once and enqueues every READY new-client welcome
+    (feed + story, hosted to R2) for the catch-up; the drip stays dark until
+    AGENT_WELCOME_QUEUE_ENABLED is armed by hand. Requires AGENT_HOSTING_ENABLED +
+    STRIPE_API_KEY for --seed.
+    """
+    from . import welcome_queue as _wq
+    if "--build-manifest" in args:
+        if not config.hosting_enabled():
+            print("welcome-queue: AGENT_HOSTING_ENABLED not set; cannot host cards. Run:\n"
+                  "  AGENT_HOSTING_ENABLED=true railway run .venv/bin/python -m agent "
+                  "welcome-queue --build-manifest")
+            return
+        extra = {}
+        if not os.path.isdir("/data"):
+            base = os.path.abspath(os.path.join(
+                os.path.dirname(__file__), "..", "content_library"))
+            local_logo_dir = os.path.join(base, "welcome_logos_local")
+            os.makedirs(local_logo_dir, exist_ok=True)
+            os.environ.setdefault("AGENT_WELCOME_LOGO_DIR", local_logo_dir)
+            local_out = os.path.join(base, "welcome_client_local")
+            local_cache = os.path.join(base, "welcome_bg_local")
+            os.makedirs(local_out, exist_ok=True)
+            os.makedirs(local_cache, exist_ok=True)
+            extra = {"out_dir": local_out, "cache_dir": local_cache}
+        print("welcome-queue: rendering + hosting the catch-up cards, writing manifest ...")
+        rows = _wq.build_manifest(**extra)
+        for r in rows:
+            print(f"  {r['name']:<34} feed+story hosted")
+        print(f"\nwelcome-queue: manifest has {len(rows)} welcome(s). Commit "
+              "welcome_queue_manifest.json, then set AGENT_WELCOME_QUEUE_ON_START=true "
+              "+ AGENT_WELCOME_QUEUE_ENABLED=true on Railway and deploy.")
+        return
+    if "--seed" in args:
+        if not config.hosting_enabled():
+            print("welcome-queue: AGENT_HOSTING_ENABLED not set; cannot host cards. "
+                  "Run with: AGENT_HOSTING_ENABLED=true railway run ... welcome-queue --seed")
+            return
+        # Local run: point the logo dir at the committed overrides + render locally,
+        # exactly like welcome-backfill, so dropped logos are honored off /data.
+        extra = {}
+        if not os.path.isdir("/data"):
+            base = os.path.abspath(os.path.join(
+                os.path.dirname(__file__), "..", "content_library"))
+            local_logo_dir = os.path.join(base, "welcome_logos_local")
+            os.makedirs(local_logo_dir, exist_ok=True)
+            os.environ.setdefault("AGENT_WELCOME_LOGO_DIR", local_logo_dir)
+            local_out = os.path.join(base, "welcome_client_local")
+            local_cache = os.path.join(base, "welcome_bg_local")
+            os.makedirs(local_out, exist_ok=True)
+            os.makedirs(local_cache, exist_ok=True)
+            extra = {"out_dir": local_out, "cache_dir": local_cache}
+        print("welcome-queue: scanning Stripe and enqueuing ready welcomes ...")
+        summary = _wq.scan_and_enqueue(force=True, **extra)
+        if not summary.get("scanned"):
+            print(f"welcome-queue: not scanned ({summary.get('reason')})")
+            return
+        print(f"welcome-queue: enqueued {summary['enqueued']} new welcome(s). "
+              f"{summary.get('needs_confirmation', 0)} need a name, "
+              f"{summary.get('needs_logo', 0)} need a logo, "
+              f"{summary.get('already_welcomed', 0)} already welcomed.")
+    rows = _wq.queue_status()
+    print(f"\n=== WELCOME DRIP QUEUE ({len(rows)} total) ===")
+    if not rows:
+        print("  (empty)")
+    for r in rows:
+        served = f"served {r['served_day']}" if r["status"] == "served" else "queued"
+        print(f"  {r['status']:<7} {r['name']:<28} {served}")
+    armed = config.welcome_queue_enabled()
+    print(f"\nDrip flag AGENT_WELCOME_QUEUE_ENABLED: {'ARMED' if armed else 'OFF'}"
+          f"{'' if armed else ' (nothing drips until armed by hand)'}")
+
+
 def _dt_today():
     import datetime as _d
     return _d.datetime.now(_d.timezone.utc).date().isoformat()
@@ -1349,6 +1427,12 @@ def main(argv=None):
             from .book_queue import run as _bq_run_startup
             _bq_run_startup(from_manifest=True)
             print("[startup] book queue done.", flush=True)
+        if os.environ.get("AGENT_WELCOME_QUEUE_ON_START", "").lower() in ("1", "true"):
+            print("[startup] AGENT_WELCOME_QUEUE_ON_START detected — seeding welcome drip queue…",
+                  flush=True)
+            from .welcome_queue import create_from_manifest as _wq_seed
+            _wq_seed()
+
         if os.environ.get("AGENT_BOOK_STORIES_ON_START", "").lower() in ("1", "true"):
             print("[startup] AGENT_BOOK_STORIES_ON_START detected — loading book stories queue…",
                   flush=True)
@@ -2408,6 +2492,8 @@ def main(argv=None):
         _welcome_client(argv[1:])
     elif cmd == "welcome-backfill":
         _welcome_backfill(argv[1:])
+    elif cmd == "welcome-queue":
+        _welcome_queue(argv[1:])
     elif cmd == "podcast-quote-card":
         _podcast_quote_card(argv[1:])
     elif cmd in ("help", "--help", "-h"):

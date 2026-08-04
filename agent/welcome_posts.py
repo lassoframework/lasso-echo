@@ -327,16 +327,56 @@ class StripeReader:
         return list(by_cust.values())
 
 
-def portal_logo_override(account_key):
+def portal_logo_override(account_key, gym_key=None):
     """A human-dropped logo for this gym wins over any scrape. Blake drops a file at
     <logo_dir>/overrides/<account_key>.(png|jpg|jpeg|webp); the first match is used.
+    Falls back to a sanitized gym_key filename (domain:foo.com -> domain_foo_com) so
+    Blake can also drop files named by domain without needing the Stripe customer ID.
     Returns a path or None."""
     base = os.path.join(website_scan.logo_dir(None), "overrides")
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = os.path.join(base, account_key + ext)
+        p = os.path.join(base, (account_key or "") + ext)
         if os.path.isfile(p):
             return p
+    if gym_key:
+        safe = re.sub(r"[^a-z0-9]+", "_", gym_key.lower()).strip("_")
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            p = os.path.join(base, safe + ext)
+            if os.path.isfile(p):
+                return p
     return None
+
+
+def portal_name_override(gym_key):
+    """Blake can drop a name_overrides.json at <logo_dir>/name_overrides.json to
+    correct INFERRED gym names before cards are generated. Keys are gym_dedupe_keys,
+    e.g. 'domain:bellhousecrossfit.com'. Returns the corrected name or None."""
+    import json
+    path = os.path.join(website_scan.logo_dir(None), "name_overrides.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh).get(gym_key)
+    except Exception:
+        return None
+
+
+def force_include_ids():
+    """Stripe customer ids Blake wants welcomed even though the classifier would skip
+    them (a returning client whose first-ever subscription predates the window, but who
+    Blake counts as a new relationship). Dropped as a JSON list at
+    <logo_dir>/welcome_force_include.json. Surgical: only listed ids are promoted to
+    NEW; every other customer is classified exactly as before. Returns a set."""
+    import json
+    path = os.path.join(website_scan.logo_dir(None), "welcome_force_include.json")
+    if not os.path.isfile(path):
+        return set()
+    try:
+        with open(path) as fh:
+            return set(json.load(fh))
+    except Exception:
+        return set()
 
 
 def _portal_lookup(customer):
@@ -385,10 +425,14 @@ def backfill(window_days=45, now=None, reader=None, scraper=None,
                             "read-only). Nothing read; roster not guessed.")
         return report
 
-    # 1. classify every customer
+    # 1. classify every customer (a Blake-listed id is promoted to NEW, nothing else)
+    forced = force_include_ids()
     news = []
     for cust in reader.customers():
         cls = classify(cust, cutoff_ts)
+        if cls["status"] != NEW and cust.get("id") in forced:
+            cls = {**cls, "status": NEW,
+                   "reason": "force-included by Blake (returning client welcomed as new)"}
         if cls["status"] != NEW:
             report["excluded"].append({"customer": cust.get("id"),
                                        "email": cust.get("email"),
@@ -415,6 +459,11 @@ def backfill(window_days=45, now=None, reader=None, scraper=None,
     for key, g in seen.items():
         cust, prow = g["cust"], g["portal"]
         gym = resolve_gym(cust, prow)
+        if gym["confidence"] == INFERRED:
+            corrected = portal_name_override(key)
+            if corrected:
+                gym["name"] = corrected
+                gym["confidence"] = CONFIRMED
         entry = {"gym_key": key, "name": gym["name"], "confidence": gym["confidence"],
                  "source": gym["source"], "owner": gym["owner"],
                  "website": gym["website"], "tier_label": g["cls"]["tier_label"],
@@ -435,8 +484,9 @@ def backfill(window_days=45, now=None, reader=None, scraper=None,
         entry["template"] = pick_template(key)
         ak = gym["account_key"] or ("cust_" + re.sub(r"[^a-z0-9]+", "_",
                                                      str(cust.get("id")).lower()))
-        # a human-dropped portal logo wins over any scrape
-        override = portal_logo_override(ak)
+        # a human-dropped portal logo wins over any scrape;
+        # also checks a gym_key-named file (domain_foo_com) as a fallback
+        override = portal_logo_override(ak, gym_key=key)
         logo = scraper(gym["website"], ak, override_path=override, out_dir=None)
         entry["logo"] = {"status": logo.status, "source": logo.source,
                          "note": logo.note}

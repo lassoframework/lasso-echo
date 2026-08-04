@@ -39,6 +39,29 @@ templates, surfaces held to the approval channel. NOTHING publishes. CLI: welcom
 - Action required by Blake (Railway): STRIPE_API_KEY (restricted read-only; copy from the
   Vercel "portal" project env) + AGENT_WELCOME_POSTS_ENABLED=true to run the 45-day backfill.
 
+### [~] One-per-day welcome DRIP + automatic new-client trigger (flag AGENT_WELCOME_QUEUE_ENABLED, OFF)
+`agent/welcome_queue.py`. Turns the backfill roster into a steady drip: the daily runner
+scans Stripe each cycle (the new-client TRIGGER; Stripe subscription only, portal enriches),
+enqueues every READY welcome (feed+story, hosted to R2, idempotent by gym_key, ledger-stamped),
+and serves the OLDEST queued welcome ONE gym/day cross-posted to lasso_ig+lasso_fb with its
+story on lasso_ig. Sits behind the dated book queue so book-launch dates keep their slot.
+Served drafts are PENDING: they auto-publish only when AGENT_AUTO_APPROVE_ENABLED is armed
+(story also needs AGENT_STORIES_ENABLED; a real Meta write needs AGENT_PUBLISH_ENABLED).
+Fixed dash-free caption over gym name + owner (no fabrication). CLI: welcome-queue.
+Names/logos/force-include carried by <logo_dir> override files (name_overrides.json,
+welcome_force_include.json, overrides/<key>.<ext>); All Kine (returning 2020 client) is
+force-included. Catch-up ships via a manifest like the book queue: `welcome-queue
+--build-manifest` renders + hosts the 9 ready cards from the Mac (where overrides live) and
+writes welcome_queue_manifest.json (committed); AGENT_WELCOME_QUEUE_ON_START seeds Railway's
+queue from it on deploy (no override files needed on Railway for the catch-up). Built + full
+suite green (1946); flag OFF = byte-for-byte current behavior.
+- 9-gym catch-up manifest built + hosted (All Kine, Op Ht, Catalyst, GritX, Mindbodysoul,
+  Pierce, Bell House, Sycamore, Bird Dog), oldest-first.
+- Action required by Blake (Railway): AGENT_WELCOME_QUEUE_ON_START=true (one-time seed) +
+  AGENT_WELCOME_QUEUE_ENABLED=true, then deploy. AUTO_APPROVE/PUBLISH/STORIES already on
+  (auto-approve is GLOBAL: all LASSO content auto-publishes, not just welcomes). Ongoing
+  new-client auto-pickup needs the override files on /data (catch-up does not).
+
 ### [x] Chat can publish, scoped by account ownership — SHA 7b563be (flag AGENT_CHAT_PUBLISH_ENABLED)
 Flag-gated @app.message handler. LASSO accounts (lasso_ig/lasso_fb/blake_personal):
 explicit publish verb -> direct publish + permalink. Client accounts: draft+schedule

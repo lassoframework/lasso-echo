@@ -1,0 +1,92 @@
+[
+  {
+    "gym_key": "cust:cus_GM4knJqxbv89RK",
+    "name": "All Kine Community and Fitness",
+    "owner": "",
+    "template": "T10",
+    "tier": "",
+    "caption": "Welcome to the LASSO family, All Kine Community and Fitness.\n\nWe are proud to partner with the All Kine Community and Fitness team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/73f44bb5532d6c95/welcome_all_kine_community_and_fitness.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/d9ffcae134c15bb6/welcome_all_kine_community_and_fitness_story.png"
+  },
+  {
+    "gym_key": "domain:op-ht.com",
+    "name": "Op Ht",
+    "owner": "Eric Hoeckberg",
+    "template": "T8",
+    "tier": "Launch",
+    "caption": "Welcome to the LASSO family, Op Ht.\n\nWe are proud to partner with Eric Hoeckberg and the Op Ht team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/6281656299f73ba4/welcome_op_ht.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/19d681fe8da08b98/welcome_op_ht_story.png"
+  },
+  {
+    "gym_key": "cust:cus_UlW2KwhG3q1azQ",
+    "name": "Catalyst Fitness",
+    "owner": "Katherine Kim",
+    "template": "T8",
+    "tier": "Launch",
+    "caption": "Welcome to the LASSO family, Catalyst Fitness.\n\nWe are proud to partner with Katherine Kim and the Catalyst Fitness team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/bb8944dd5abddffc/welcome_catalyst_fitness.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/4182f01c29466707/welcome_catalyst_fitness_story.png"
+  },
+  {
+    "gym_key": "domain:traingritx.com",
+    "name": "GritX",
+    "owner": "Ryan Parr",
+    "template": "T1",
+    "tier": "Apex",
+    "caption": "Welcome to the LASSO family, GritX.\n\nWe are proud to partner with Ryan Parr and the GritX team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/19bc4bb379af51f7/welcome_gritx.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/114f94a5a397e576/welcome_gritx_story.png"
+  },
+  {
+    "gym_key": "domain:mindbodysoulfitness.net",
+    "name": "Mindbodysoul Fitness",
+    "owner": "Eureka Fordham",
+    "template": "T2",
+    "tier": "Launch",
+    "caption": "Welcome to the LASSO family, Mindbodysoul Fitness.\n\nWe are proud to partner with Eureka Fordham and the Mindbodysoul Fitness team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/f4bc9499db1751a7/welcome_mindbodysoul_fitness.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/51fb67db88bd3a29/welcome_mindbodysoul_fitness_story.png"
+  },
+  {
+    "gym_key": "domain:piercewellness.ca",
+    "name": "Pierce Wellness",
+    "owner": "Bryan Pierce",
+    "template": "T1",
+    "tier": "Ascend",
+    "caption": "Welcome to the LASSO family, Pierce Wellness.\n\nWe are proud to partner with Bryan Pierce and the Pierce Wellness team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/af295396100458b7/welcome_pierce_wellness.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/8e011d55970e54f2/welcome_pierce_wellness_story.png"
+  },
+  {
+    "gym_key": "domain:bellhousecrossfit.com",
+    "name": "Bell House Fitness",
+    "owner": "Justin Christmas",
+    "template": "T7",
+    "tier": "Ascend",
+    "caption": "Welcome to the LASSO family, Bell House Fitness.\n\nWe are proud to partner with Justin Christmas and the Bell House Fitness team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/f4b4476721cffa5a/welcome_bell_house_fitness.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/e0493be4ccd8bd01/welcome_bell_house_fitness_story.png"
+  },
+  {
+    "gym_key": "domain:sycamorecrossfit.com",
+    "name": "Sycamore CrossFit",
+    "owner": "Carl Balentyne",
+    "template": "T2",
+    "tier": "Ascend",
+    "caption": "Welcome to the LASSO family, Sycamore CrossFit.\n\nWe are proud to partner with Carl Balentyne and the Sycamore CrossFit team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/99f23b39b475fe38/welcome_sycamore_crossfit.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/41ccbe6b5d6022fe/welcome_sycamore_crossfit_story.png"
+  },
+  {
+    "gym_key": "cust:cus_V0Sf8IwVARTfDH",
+    "name": "Bird Dog CrossFit",
+    "owner": "Patrick Wolf",
+    "template": "T10",
+    "tier": "Launch",
+    "caption": "Welcome to the LASSO family, Bird Dog CrossFit.\n\nWe are proud to partner with Patrick Wolf and the Bird Dog CrossFit team. Here is to more of the right members through your doors and a gym that grows on purpose.\n\nLet us go build something that lasts.",
+    "feed_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/c796e308f977e32a/welcome_bird_dog_crossfit.png",
+    "story_url": "https://pub-c4a3291534e146e2977e8cd3d4e7343f.r2.dev/echo/lasso_welcome/24c1b48b1dc59d9d/welcome_bird_dog_crossfit_story.png"
+  }
+]

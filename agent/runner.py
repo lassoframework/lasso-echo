@@ -261,6 +261,25 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # Idempotent daily drafts: OFF by default = behavior below is exactly today's.
     idempotent = config.idempotent_drafts_enabled()
 
+    # WELCOME TRIGGER (AGENT_WELCOME_QUEUE_ENABLED, OFF): once per cycle, scan Stripe
+    # for brand-new clients and enqueue any ready welcome (feed + story, hosted). This
+    # is the automatic new-client trigger and the 45-day catch-up in one; the drip
+    # below serves one/day. Fully guarded: a scan error never takes the draft run down.
+    if config.welcome_queue_enabled():
+        try:
+            from .welcome_queue import scan_and_enqueue
+            summary = scan_and_enqueue()
+            if summary.get("enqueued"):
+                print(f"[welcome-queue] scan enqueued {summary['enqueued']} new "
+                      f"welcome(s); {summary.get('needs_confirmation', 0)} need a name, "
+                      f"{summary.get('needs_logo', 0)} need a logo")
+            elif not summary.get("scanned"):
+                print(f"[welcome-queue] scan skipped: {summary.get('reason')}")
+        except Exception as e:
+            print(f"[welcome-queue] scan failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"welcome-queue daily scan failed: {type(e).__name__}: {e}. "
+                             "The drip continues from what is already queued.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's
@@ -315,6 +334,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             if account.key in ("lasso_ig", "lasso_fb"):
                 from .book_queue import build_book_queue_draft as _bq_draft
                 draft = _bq_draft(account, day_key)
+
+            # WELCOME DRIP (AGENT_WELCOME_QUEUE_ENABLED, OFF by default). One queued
+            # new-client welcome per day, cross-posted to lasso_ig + lasso_fb. Sits
+            # right behind the dated book queue so a book-launch date keeps its slot;
+            # fills any non-book-queue day. No-ops when the flag is off or empty.
+            if draft is None and account.key in ("lasso_ig", "lasso_fb"):
+                from .welcome_queue import build_welcome_queue_draft as _wq_draft
+                draft = _wq_draft(account, day_key)
 
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
@@ -440,6 +467,23 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                     if bk_story is not None:
                         _post_and_save(bk_story, store, poster, idempotent)
                         results.append(bk_story)
+                    _book_story_posted = True
+
+            # WELCOME STORY (AGENT_WELCOME_QUEUE_ENABLED, OFF). The 9:16 story for the
+            # SAME gym today's welcome feed served on lasso_ig; takes the story slot
+            # when the feed was a welcome. The publisher still needs AGENT_STORIES_ENABLED.
+            if not _book_story_posted and account.key == "lasso_ig":
+                from .welcome_queue import build_welcome_story_draft as _wq_story
+                wc_story = _wq_story(account, day_key, feed_draft=feed_draft)
+                if wc_story is not None:
+                    if idempotent:
+                        wc_story, _existing_wc = _reconcile(
+                            wc_story, day_key, "story", store, poster)
+                        if wc_story is None:
+                            results.append(_existing_wc)
+                    if wc_story is not None:
+                        _post_and_save(wc_story, store, poster, idempotent)
+                        results.append(wc_story)
                     _book_story_posted = True
 
             # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one

@@ -178,6 +178,29 @@ def test_backfill_includes_confirmed_new_client(tmp_path):
     assert os.path.isfile(g["posts"]["feed"]) and os.path.isfile(g["posts"]["story"])
 
 
+def test_force_include_promotes_returning_client(tmp_path, monkeypatch):
+    # A returning client (first-ever sub predates the window) is normally EXISTING and
+    # skipped; when Blake lists their id in welcome_force_include.json it is welcomed.
+    png = _make_png(tmp_path)
+    logo_dir = tmp_path / "logos"
+    logo_dir.mkdir()
+    monkeypatch.setenv("AGENT_WELCOME_LOGO_DIR", str(logo_dir))
+    (logo_dir / "welcome_force_include.json").write_text('["cus_returning"]')
+    # first sub 400 days ago (out of window), a recent add 5 days ago
+    cust = _cust("cus_returning", [_sub(400, sid="old"), _sub(5, sid="new")],
+                 business_name="All Kine Community and Fitness")
+    other = _cust("cus_skip", [_sub(400, sid="o1"), _sub(5, sid="o2")],
+                  business_name="Still Existing Gym")
+    reader = FakeReader([cust, other])
+    rep = wp.backfill(now=NOW, reader=reader, scraper=_ok_scraper(png),
+                      portal_lookup=lambda c: None,
+                      out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "bg"))
+    names = {g["name"] for g in rep["included"]}
+    assert "All Kine Community and Fitness" in names       # forced in
+    assert "Still Existing Gym" not in names               # everyone else unchanged
+    assert any(e["customer"] == "cus_skip" for e in rep["excluded"])
+
+
 def test_backfill_excludes_sponsor_and_delinquent(tmp_path):
     png = _make_png(tmp_path)
     reader = FakeReader([
