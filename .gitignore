@@ -34,3 +34,14 @@ brand_voice/*
 
 # claude-flow tooling state
 .claude-flow/
+
+# agent tooling + local worktrees + runtime/cache state (never commit)
+.agents/
+.claude/
+brains/
+content_library/welcome_bg/
+content_library/welcome_client/
+content_library/.regen_last.json
+dry_run_pending.json
+force_card.py
+skills-lock.json
