@@ -76,6 +76,13 @@ def normalize_owner(name):
     return " ".join(out)
 
 
+_FREEMAIL = frozenset([
+    "gmail.com", "yahoo.com", "yahoo.ca", "hotmail.com", "outlook.com",
+    "icloud.com", "me.com", "mac.com", "live.com", "msn.com",
+    "aol.com", "protonmail.com", "proton.me",
+])
+
+
 def _domain(email_or_url):
     s = (email_or_url or "").strip().lower()
     if not s:
@@ -182,11 +189,11 @@ def classify(customer, cutoff_ts, core_tiers=CORE_TIERS):
 
 def gym_dedupe_key(customer, portal_row=None):
     """The key two contacts at ONE gym must share so the gym is welcomed once. Portal
-    account_key wins; else the email/website domain; else the customer id."""
+    account_key wins; else a non-freemail domain; else the customer id."""
     if portal_row and portal_row.get("account_key"):
         return "portal:" + portal_row["account_key"]
     dom = _domain(customer.get("email") or customer.get("website"))
-    if dom:
+    if dom and dom not in _FREEMAIL:
         return "domain:" + dom
     return "cust:" + str(customer.get("id"))
 
@@ -281,33 +288,39 @@ class StripeReader:
         # status='all' so we see canceled/past_due history and can find the FIRST sub
         subs = stripe.Subscription.list(
             status="all", limit=100,
-            expand=["data.customer", "data.items.data.price.product"])
+            expand=["data.customer", "data.items.data.price"])
         for s in subs.auto_paging_iter():
-            cust = s.get("customer")
-            cid = cust.get("id") if isinstance(cust, dict) else cust
-            items = (s.get("items") or {}).get("data") or []
+            # Stripe v9 returns typed objects; use getattr with fallback, not .get()
+            cust = getattr(s, "customer", None)
+            cid = getattr(cust, "id", cust) if cust else None
+            if not cid:
+                continue
+            items_obj = getattr(s, "items", None)
+            items = getattr(items_obj, "data", []) or []
             product_id = None
             if items:
-                price = items[0].get("price") or {}
-                prod = price.get("product")
-                product_id = prod.get("id") if isinstance(prod, dict) else prod
+                price = getattr(items[0], "price", None)
+                if price:
+                    prod = getattr(price, "product", None)
+                    product_id = getattr(prod, "id", prod) if prod else None
+            meta = getattr(cust, "metadata", None) or {}
+            biz = (getattr(meta, "get", lambda k, d=None: None)("business_name")
+                   or getattr(cust, "name", None) or "")
+            web = (getattr(meta, "get", lambda k, d=None: None)("website") or "")
             rec = by_cust.setdefault(cid, {
                 "id": cid,
-                "email": (cust.get("email") if isinstance(cust, dict) else "") or "",
-                "name": (cust.get("name") if isinstance(cust, dict) else "") or "",
-                "business_name": (
-                    (cust.get("metadata", {}) or {}).get("business_name")
-                    or (cust.get("name") if isinstance(cust, dict) else "") or ""),
-                "website": ((cust.get("metadata", {}) or {}).get("website")
-                            if isinstance(cust, dict) else "") or "",
+                "email": getattr(cust, "email", "") or "",
+                "name": getattr(cust, "name", "") or "",
+                "business_name": biz,
+                "website": web,
                 "subs": [],
             })
             rec["subs"].append({
-                "id": s.get("id"),
-                "created": s.get("start_date") or s.get("created"),
-                "status": s.get("status"),
-                "canceled_at": s.get("canceled_at"),
-                "cancel_at": s.get("cancel_at"),
+                "id": getattr(s, "id", None),
+                "created": getattr(s, "start_date", None) or getattr(s, "created", None),
+                "status": getattr(s, "status", None),
+                "canceled_at": getattr(s, "canceled_at", None),
+                "cancel_at": getattr(s, "cancel_at", None),
                 "product_id": product_id,
             })
         return list(by_cust.values())

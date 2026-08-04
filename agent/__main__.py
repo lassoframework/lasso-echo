@@ -1219,7 +1219,21 @@ def _welcome_backfill(args):
               "Nothing read; roster not guessed.")
         return
     print(f"welcome-backfill: reading Stripe, window {days} days ...")
-    report = _wp.backfill(window_days=days, reader=reader)
+    local_run = not os.path.isdir("/data")
+    if local_run:
+        base = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "content_library"))
+        local_logo_dir = os.path.join(base, "welcome_logos_local")
+        local_out_dir = os.path.join(base, "welcome_client_local")
+        os.makedirs(local_logo_dir, exist_ok=True)
+        os.makedirs(local_out_dir, exist_ok=True)
+        os.environ.setdefault("AGENT_WELCOME_LOGO_DIR", local_logo_dir)
+    extra = {}
+    if local_run:
+        local_cache_dir = os.path.join(base, "welcome_bg_local")
+        os.makedirs(local_cache_dir, exist_ok=True)
+        extra = {"out_dir": local_out_dir, "cache_dir": local_cache_dir}
+    report = _wp.backfill(window_days=days, reader=reader, **extra)
 
     inc, exc = report["included"], report["excluded"]
     print(f"\n=== WELCOME BACKFILL (last {days} days) ===")

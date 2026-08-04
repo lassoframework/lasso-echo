@@ -40,7 +40,11 @@ brand_voice/*
 .claude/
 brains/
 content_library/welcome_bg/
+content_library/welcome_bg_local/
 content_library/welcome_client/
+content_library/welcome_client_local/
+content_library/welcome_logos/
+content_library/welcome_logos_local/
 content_library/.regen_last.json
 dry_run_pending.json
 force_card.py
