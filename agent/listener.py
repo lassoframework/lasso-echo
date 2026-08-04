@@ -544,6 +544,39 @@ def run_listener():
         out = run_daily(store=store)
         respond(f"Drafting: {out['status']} ({len(out.get('drafts', []))} card(s)) -> #echoclaude")
 
+    @app.message("")
+    def on_chat_message(message, say):
+        """Free-text chat: Blake can publish LASSO accounts directly (explicit verb),
+        client accounts only draft. Inert unless AGENT_CHAT_PUBLISH_ENABLED. Stays
+        SILENT on anything that is not an actionable publish/undo command so it never
+        spams the channel."""
+        if not config.chat_publish_enabled():
+            return
+        # ignore bot / edited / non-user events
+        if message.get("bot_id") or message.get("subtype"):
+            return
+        actor = message.get("user", "")
+        text = message.get("text", "") or ""
+        from . import chat_publish
+        # cheap pre-filter: only engage on a publish/undo verb, so normal chatter is
+        # untouched and non-Blake users are handled by the actor gate in route()
+        if chat_publish.classify_intent(text) in (chat_publish.GENERATE,
+                                                   chat_publish.NONE):
+            return
+        poster = None
+        try:
+            from .slack_surface import SlackPoster
+            poster = SlackPoster(token=os.environ.get(config.SLACK_BOT_TOKEN_ENV))
+        except Exception:
+            poster = None
+        out = chat_publish.handle_message(text, actor, store=store, poster=poster)
+        if out.kind in ("not_a_command", "disabled"):
+            return
+        try:
+            say(out.message)
+        except Exception:
+            pass
+
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
         print("Daily scheduler started.")

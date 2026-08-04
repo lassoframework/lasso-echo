@@ -227,6 +227,18 @@ def welcome_templates_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_WELCOME_TEMPLATES_ENABLED", "false"))
 
 
+def chat_publish_enabled() -> bool:
+    """
+    Chat-can-publish switch. OFF by default. When OFF, free-text chat never triggers
+    a publish (the listener's message handler is inert). When ON, Blake can publish
+    LASSO-owned accounts directly from chat with an EXPLICIT publish verb; client
+    accounts are only drafted + scheduled, never chat-published. Requires
+    AGENT_PUBLISH_ENABLED for a real Meta write; the ownership scoping and the
+    fabrication/grade/dash-vendor gates always apply. Arm by hand in Railway env only.
+    """
+    return _truthy(os.environ.get("AGENT_CHAT_PUBLISH_ENABLED", "false"))
+
+
 def welcome_posts_enabled() -> bool:
     """
     Auto welcome-posts-from-new-clients switch. OFF by default. When OFF, the

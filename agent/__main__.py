@@ -128,6 +128,7 @@ def _status():
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
+    print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
     print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
     print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
     _sapi_key = config.socialapi_key()
