@@ -1417,6 +1417,40 @@ def onboard_automint_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ONBOARD_AUTOMINT", "false"))
 
 
+# ---- Welcome posts for new paying clients (A+ loop) --------------------------
+# OFF by default. When OFF, welcome_new_clients never resolves a client, scrapes
+# a logo, generates a card, or posts to Slack. Arm by hand once the Stripe read
+# key is set and Blake has reviewed a dry run. This never publishes to Meta;
+# it only drafts and surfaces to Slack for a human tap (see welcome_new_clients.py).
+def welcome_posts_enabled() -> bool:
+    return _truthy(os.environ.get("AGENT_WELCOME_POSTS_ENABLED", "false"))
+
+
+# Stripe is READ-ONLY here: new-customer lookup + subscription status, to resolve
+# a gym name and exclude delinquent accounts. Never touches billing, pixel, or
+# CAPI config (that gate is unrelated and untouched). The key is read lazily by
+# NAME in stripe_client.py, never logged, never stored on an object.
+STRIPE_API_KEY_ENV = "AGENT_STRIPE_API_KEY"
+STRIPE_API_BASE = os.environ.get("AGENT_STRIPE_API_BASE", "https://api.stripe.com/v1")
+
+# Subscription statuses that block a welcome post outright: the payment is
+# failing or the account never activated. "canceled" is excluded separately
+# (not a delinquency; the customer simply is not an active paying client).
+STRIPE_DELINQUENT_STATUSES = ("past_due", "unpaid", "incomplete_expired")
+# The statuses that make a Stripe customer count as "a new paying client" at all.
+STRIPE_ACTIVE_STATUSES = ("active", "trialing")
+
+WELCOME_BACKFILL_DAYS = int(os.environ.get("AGENT_WELCOME_BACKFILL_DAYS", "45"))
+
+
+def welcome_logo_dir():
+    """Per-gym scraped/overridden logo storage, on the persistent volume in
+    production (override via AGENT_WELCOME_LOGO_DIR), same convention as
+    welcome_templates' background cache."""
+    return os.environ.get("AGENT_WELCOME_LOGO_DIR",
+                          os.path.join(LIBRARY_PATH, "welcome_logos"))
+
+
 # ---- Intake token encryption key ---------------------------------------------
 # Name of the env var holding the Fernet key for encrypting intake tokens at
 # rest. When set: intake_tokens.mint() stores the raw token encrypted so

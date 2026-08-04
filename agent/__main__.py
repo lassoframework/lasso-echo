@@ -13,6 +13,7 @@ testing the reply protocol locally.
 import os
 import re
 import sys
+import time
 
 
 def _load_dotenv():
@@ -127,6 +128,7 @@ def _status():
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
+    print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED)")
     print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
     print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
     _sapi_key = config.socialapi_key()
@@ -755,6 +757,8 @@ _COMMANDS = {
         ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
         ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
+        ("welcome-new-clients", "auto welcome post pipeline: new paying Stripe clients since last run (AGENT_WELCOME_POSTS_ENABLED)"),
+        ("welcome-backfill", "one-time welcome-post catch-up over the last N days (--days, default 45)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "podcast & opus (cont.)": [
@@ -1182,6 +1186,74 @@ def _welcome_client(args):
     PendingStore().put(draft)
     SlackPoster().post_approval_card(draft)
     print(f"welcome-client: held for approval (draft {did}). Nothing published.")
+
+
+_WELCOME_LAST_RUN_KV = "welcome_new_clients_last_run_ts"
+
+
+def _print_welcome_roster(result):
+    if result.get("error"):
+        print(f"welcome-new-clients: {result['error']}")
+        return
+    roster = result["roster"]
+    included = [r for r in roster if r["include"]]
+    excluded = [r for r in roster if not r["include"]]
+    print(f"welcome roster: {len(roster)} gym(s) ({result.get('customers_seen', '?')} "
+         f"Stripe customer(s) seen, {result.get('gyms_deduped', len(roster))} after dedupe)")
+    for r in included:
+        collapsed = f", {r['collapsed_contacts']} contact(s) collapsed" if r["collapsed_contacts"] > 1 else ""
+        print(f"  INCLUDE  {r['gym_name']!r} ({r['confidence']} via {r['source']}{collapsed})")
+    for r in excluded:
+        print(f"  EXCLUDE  {r['gym_name'] or r['gym_key']!r}: {r['exclude_reason']}")
+    for res in result.get("results", []):
+        if res["posted"]:
+            print(f"  posted   {res['gym_key']}: feed={res.get('feed_url')} "
+                 f"story={res.get('story_url')}")
+        else:
+            print(f"  held     {res['gym_key']}: {res['reason']}")
+
+
+def _welcome_new_clients(args):
+    """python -m agent welcome-new-clients [--since-ts N]
+
+    Runs the auto welcome-post pipeline (agent/welcome_new_clients.py) for every
+    new paying Stripe client since the last run (or --since-ts, unix seconds).
+    Behind AGENT_WELCOME_POSTS_ENABLED (default OFF). Nothing publishes; drafts
+    are held for approval exactly like every other card in this system.
+    """
+    from . import db, welcome_new_clients as _wnc
+    since_ts = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--since-ts" and i + 1 < len(args):
+            since_ts = int(args[i + 1]); i += 2; continue
+        i += 1
+    if since_ts is None:
+        last = db.kv_get(_WELCOME_LAST_RUN_KV, "")
+        since_ts = int(last) if last else int(time.time() - config.WELCOME_BACKFILL_DAYS * 86400)
+    run_ts = int(time.time())
+    result = _wnc.run_pipeline(since_ts)
+    _print_welcome_roster(result)
+    if not result.get("error"):
+        db.kv_set(_WELCOME_LAST_RUN_KV, str(run_ts))
+
+
+def _welcome_backfill(args):
+    """python -m agent welcome-backfill [--days 45]
+
+    One-time catch-up over new paying clients from the last N days (default
+    45, config.WELCOME_BACKFILL_DAYS). Same guards, same flag gate as the
+    forward-running welcome-new-clients command.
+    """
+    from . import welcome_new_clients as _wnc
+    days = config.WELCOME_BACKFILL_DAYS
+    i = 0
+    while i < len(args):
+        if args[i] == "--days" and i + 1 < len(args):
+            days = int(args[i + 1]); i += 2; continue
+        i += 1
+    result = _wnc.run_backfill(days=days)
+    _print_welcome_roster(result)
 
 
 def _dt_today():
@@ -2323,6 +2395,10 @@ def main(argv=None):
         _welcome_templates(argv[1:])
     elif cmd == "welcome-client":
         _welcome_client(argv[1:])
+    elif cmd == "welcome-new-clients":
+        _welcome_new_clients(argv[1:])
+    elif cmd == "welcome-backfill":
+        _welcome_backfill(argv[1:])
     elif cmd == "podcast-quote-card":
         _podcast_quote_card(argv[1:])
     elif cmd in ("help", "--help", "-h"):

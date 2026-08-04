@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS socialapi_claims (
   draft_id TEXT, account_key TEXT, status TEXT DEFAULT 'in_flight',
   post_id TEXT DEFAULT '', claimed_at TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (draft_id, account_key));
+CREATE TABLE IF NOT EXISTS welcome_ledger (
+  gym_key TEXT PRIMARY KEY,
+  gym_name TEXT, owner_name TEXT, account_key TEXT DEFAULT '',
+  confidence TEXT, source TEXT, template_id TEXT,
+  feed_url TEXT DEFAULT '', story_url TEXT DEFAULT '',
+  logo_source TEXT DEFAULT '', status TEXT DEFAULT 'posted_for_review',
+  posted_at TEXT DEFAULT (datetime('now')));
 """
 
 

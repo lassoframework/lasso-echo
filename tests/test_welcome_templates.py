@@ -41,6 +41,37 @@ def test_make_welcome_renders_1080(tmp_path, cache, tid):
     assert im.mode == "RGB"
 
 
+def test_make_welcome_story_format_is_1080x1920(tmp_path, cache):
+    out = _out(tmp_path, "story.png")
+    path = wt.make_welcome("T1", "Iron Forge Fitness", "Jordan Blake", None,
+                           out_path=out, cache_dir=cache, format="story")
+    assert path == out
+    im = Image.open(path)
+    assert im.size == wt.STORY_SIZE == (1080, 1920)
+
+
+def test_make_welcome_story_centers_the_feed_composition(tmp_path, cache):
+    feed_out = _out(tmp_path, "feed.png")
+    story_out = _out(tmp_path, "story.png")
+    feed_path = wt.make_welcome("T2", "Iron Forge Fitness", "Jordan Blake", None,
+                               out_path=feed_out, cache_dir=cache, format="feed")
+    story_path = wt.make_welcome("T2", "Iron Forge Fitness", "Jordan Blake", None,
+                                out_path=story_out, cache_dir=cache, format="story")
+    feed_img = Image.open(feed_path).convert("RGB")
+    story_img = Image.open(story_path).convert("RGB")
+    y = (wt.STORY_SIZE[1] - wt.SIZE) // 2
+    x = (wt.STORY_SIZE[0] - wt.SIZE) // 2
+    cropped = story_img.crop((x, y, x + wt.SIZE, y + wt.SIZE))
+    assert list(cropped.getdata()) == list(feed_img.getdata())
+
+
+def test_make_welcome_rejects_bad_format(tmp_path, cache):
+    with pytest.raises(ValueError):
+        wt.make_welcome("T1", "Gym", "Owner", None,
+                        out_path=_out(tmp_path, "x.png"), cache_dir=cache,
+                        format="square")
+
+
 @pytest.mark.parametrize("tid", [f"T{i}" for i in range(1, 11)])
 def test_logo_zone_at_least_13_percent(tid):
     t = wt.get_template(tid)

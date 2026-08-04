@@ -96,10 +96,14 @@ def _tracked_w(d, text, font, tracking=0):
 
 
 def _tracked(d, xy, text, font, fill, tracking=0):
-    """Draw `text` letter-spaced by `tracking` extra pixels between glyphs.
-    Returns the x position just past the last glyph drawn."""
+    """Draw `text` letter-spaced by `tracking` extra pixels between glyphs
+    (not after the last one, so the drawn extent matches `_tracked_w` exactly
+    and centering math using `_tracked_w` lines up with what is actually
+    drawn). Returns the x position just past the last glyph drawn."""
     x, y = xy
-    for ch in text:
+    for i, ch in enumerate(text):
         d.text((x, y), ch, font=font, fill=fill)
-        x += _tw(d, ch, font) + tracking
+        x += _tw(d, ch, font)
+        if i < len(text) - 1:
+            x += tracking
     return x

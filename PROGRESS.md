@@ -6,7 +6,112 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-22
+Last updated: 2026-08-04
+
+---
+
+## Auto welcome posts for new paying clients (2026-08-04)
+
+### Fixed first: `agent/summit_render.py` was missing from every branch's history
+
+Before touching the welcome-posts task, the suite would not even collect:
+`welcome_templates.py` and `podcast_quote_card.py` both `from .summit_render import
+...` (house palette, fonts, text-measure/tracking helpers), but that module was never
+committed anywhere -- not on main, not on the `welcome-templates-and-podcast-core`
+branch either. It looks like a prior session built it only in its own sandbox and
+never `git add`ed it (exactly the class of drift CLAUDE.md warns about). Reconstructed
+it from how the two consumers actually use it (colors as RGB tuples so `NAVY + (255,)`
+concatenation works, ANTON/OSWALD/MONT font paths, `_f/_tw/_th/_wrap/_tracked/
+_tracked_w`), added `tests/test_summit_render.py` to pin the contract, and fixed one
+real bug found while writing that test: `_tracked` was adding trailing letter-tracking
+after the LAST glyph, so `_tracked_w` (used for centering and background-rect sizing)
+under-measured the actual drawn width by one tracking step. Fixed to match.
+
+### What shipped (flag `AGENT_WELCOME_POSTS_ENABLED`, default OFF)
+
+Pipeline: new paying Stripe client -> resolve gym -> scrape logo -> generate feed +
+story welcome posts (reusing the existing 10-template system) -> surface to
+#echoclaude as normal PENDING draft cards for Blake's tap. Nothing publishes; the
+same Approve / Edit / Skip reply protocol and publish gate (`AGENT_PUBLISH_ENABLED`)
+that governs every other draft in this system governs these too.
+
+New modules:
+- `agent/stripe_client.py` -- READ-ONLY Stripe: new-customer list + subscription
+  status, stdlib urllib (no new dependency), key read lazily by name
+  (`AGENT_STRIPE_API_KEY`), never logged. Never touches billing, pixel, or CAPI.
+- `agent/website_scan.py` -- logo scrape: og:image -> nav/header `<img>` ->
+  apple-touch-icon -> `/logo/i` pattern match, in that order. Rejects below 200px on
+  the long edge or a bare favicon (LOGO NOT FOUND, never faked with text). Knocks out
+  a uniform solid white/black background via flood fill. Stdlib `html.parser`, zero
+  new dependency.
+- `agent/gym_resolve.py` -- resolution order: portal tenant record (CONFIRMED) ->
+  Stripe `customer.name` (CONFIRMED) -> email domain inference (INFERRED) -> web
+  search fallback (INFERRED; no search API is wired in this repo, so this tier is a
+  no-op until one is injected). `normalize_owner_name()` title-cases Stripe's
+  inconsistent casing (RYAN PARR -> Ryan Parr) including Mc/Mac/O'/hyphenated names.
+  An INFERRED name is NEVER rendered into a post -- `welcome_new_clients` posts a
+  plain yes/no confirmation request to Slack instead and stops.
+- `agent/welcome_ledger.py` -- the dedupe-by-gym + never-twice ledger (new
+  `welcome_ledger` table in `db.py`). `gym_key()` collapses two contacts at one gym to
+  one key (portal account_key wins when known, else a name slug).
+- `agent/welcome_new_clients.py` -- orchestrates the above: `build_roster()` applies
+  every guard (already-posted, delinquent, not-actively-paying, unresolved) and
+  returns include/exclude reasoning per gym; `generate_and_surface_gym()` renders feed
+  + story via `welcome_templates.make_welcome()`, hosts both to R2, and posts them as
+  two normal `Draft`s (is_story on the second) through the SAME `PendingStore` +
+  `SlackPoster.post_approval_card` path the existing manual `welcome-client --post`
+  command uses -- reused, not rebuilt, so Approve/Edit/Skip are the real, already-wired
+  reply protocol. `run_backfill(days=45)` is Part E's one-time catch-up.
+- `agent/welcome_templates.py` -- `make_welcome()` gained a `format="feed"|"story"`
+  parameter. Story (1080x1920) is the SAME reviewed feed composition centered on a
+  taller frame in the card's own base tone (never a second layout to keep in sync or
+  re-grade).
+
+New CLI: `welcome-new-clients` (since last run, tracked via kv) and `welcome-backfill
+--days N`.
+
+### Honest gaps versus the task's stated ground truth
+
+The task said to reuse "the existing website-scan capability" and "Stripe wiring."
+Neither existed anywhere in this repo (checked history on every branch) -- both were
+built new this session, described above. Also: portal tenant records
+(`brand_voice/tenants/<key>/tenant.json`) do not store a client email, and nothing
+guarantees a Stripe customer carries an `account_key` in its metadata, so
+`gym_resolve.match_portal_tenant()` can only match on an explicit metadata key or an
+exact (case-insensitive) name match today. Until Blake wires one of those two at
+checkout or intake, most new clients will resolve at tier 2 (Stripe business name) or
+tier 3 (domain, INFERRED) rather than tier 1 (portal, CONFIRMED). This is reported,
+not hidden.
+
+### Part E backfill: NOT run against live data this session
+
+`AGENT_STRIPE_API_KEY` is not set anywhere reachable from this session, and Stripe
+customer data is real client billing information -- per the non-negotiable secrets
+gate ("set by hand in env only") and the general rule of never touching production
+client data without the key set by the person who owns that decision, this session
+did not attempt to reach the real LASSO Stripe account. The pipeline is built, tested
+offline end to end (every guard has a test: dedupe, delinquency, already-posted,
+unresolved, INFERRED-holds-for-confirmation, story format), and verified visually
+(sample cards rendered and inspected, including the exact `birddogcrossfit.com` / "RYAN
+PARR" examples from the spec -- both resolve and normalize correctly).
+
+**Blake, by hand, to run the actual backfill:**
+1. Set `AGENT_STRIPE_API_KEY` in Railway (read-only Stripe key is sufficient; no
+   billing/pixel/CAPI scope needed).
+2. Confirm `AGENT_HOSTING_ENABLED` + R2 credentials are set (welcome posts need a
+   public URL exactly like every other creative).
+3. Set `AGENT_WELCOME_POSTS_ENABLED=true`.
+4. Run `python -m agent welcome-backfill --days 45` on the container. Expected result
+   per the spec is roughly 7 to 8 gyms after guards; the actual roster (who's
+   included, who's excluded and why) prints to stdout and every included gym's cards
+   land in #echoclaude.
+
+Suite: 1845 passed, 26 skipped, 2 failed (pre-existing, environment-only: this sandbox
+has no `ffmpeg` binary installed; unrelated to any file touched in this session).
+
+Grade: B+ (unchanged). A new flag does not move the grade. Two open decisions (brand
+palette; publish path) are unchanged and still unresolved -- flagging again per
+CLAUDE.md, not resolving them here.
 
 ---
 

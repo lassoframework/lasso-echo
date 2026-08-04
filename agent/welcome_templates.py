@@ -733,22 +733,49 @@ def _render(template, gym_name, owner_name, logo_path, out_path,
     return out_path, mode, on_card_text
 
 
+STORY_SIZE = (1080, 1920)
+
+
+def _story_canvas(feed_img, base):
+    """Compose the 1080x1920 Story frame from the finished 1080x1080 feed card:
+    centered, on the same base tone, so the exact reviewed feed composition
+    also IS the story (no separate layout to keep in sync or re-grade)."""
+    sw, sh = STORY_SIZE
+    bg = NAVY if base == "navy" else CREAM
+    canvas = Image.new("RGB", (sw, sh), bg)
+    y = (sh - SIZE) // 2
+    canvas.paste(feed_img.convert("RGB"), ((sw - SIZE) // 2, y))
+    return canvas
+
+
 def make_welcome(template_id, gym_name, owner_name, logo_path, out_path=None,
-                 bg_client=None, cache_dir=None):
+                 bg_client=None, cache_dir=None, format="feed"):
     """Compose a finished welcome post: cached background + gym logo + text.
 
-    This is the onboarding entry point. With a warm background cache it renders a
-    real gym's card in a fraction of a second and re-pays no Pro generation.
-    Returns the output PNG path.
+    format="feed" (default) returns the 1080x1080 card. format="story" composes
+    the SAME reviewed feed card centered on a 1080x1920 frame (never a separate
+    layout to re-grade). This is the onboarding entry point. With a warm
+    background cache it renders a real gym's card in a fraction of a second and
+    re-pays no Pro generation. Returns the output PNG path.
     """
+    if format not in ("feed", "story"):
+        raise ValueError(f"make_welcome: format must be 'feed' or 'story', got {format!r}")
     t = get_template(template_id)
     if out_path is None:
+        suffix = "_story" if format == "story" else ""
         out_path = os.path.join(_cache_dir(cache_dir),
-                                f"welcome_{template_id}_filled.png")
+                                f"welcome_{template_id}_filled{suffix}.png")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    path, _mode, _text = _render(t, gym_name, owner_name, logo_path, out_path,
+    if format == "feed":
+        path, _mode, _text = _render(t, gym_name, owner_name, logo_path, out_path,
+                                     bg_client=bg_client, cache_dir=cache_dir)
+        return path
+    feed_path = os.path.join(_cache_dir(cache_dir), f"welcome_{template_id}_filled.png")
+    path, _mode, _text = _render(t, gym_name, owner_name, logo_path, feed_path,
                                  bg_client=bg_client, cache_dir=cache_dir)
-    return path
+    story_img = _story_canvas(Image.open(path), t["base"])
+    story_img.save(out_path)
+    return out_path
 
 
 def render_blank(template_id, out_path, bg_client=None, cache_dir=None):

@@ -116,6 +116,16 @@ before this file existed.
 | AGENT_S3_PUBLIC_BASE_URL | (unset) | BLAKE | Public CDN base. |
 | AGENT_S3_MAX_RETRIES | code default | code | |
 
+## Welcome posts for new paying clients (auto A+ loop)
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_WELCOME_POSTS_ENABLED | false | BLAKE | Master switch for welcome_new_clients.py. |
+| AGENT_STRIPE_API_KEY | (unset) | BLAKE | READ-ONLY Stripe key; new-customer + subscription lookup only. Never logged. |
+| AGENT_STRIPE_API_BASE | https://api.stripe.com/v1 | code | Override for tests only. |
+| AGENT_WELCOME_BACKFILL_DAYS | 45 | code | Part E one-time catch-up window. |
+| AGENT_WELCOME_LOGO_DIR | content_library/welcome_logos | code | Scraped/override logo storage. |
+
 ## Intake (upload page + ingest worker)
 
 | Var | Default | Owner | Notes |
