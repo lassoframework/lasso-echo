@@ -62,3 +62,42 @@ def test_mark_status_updates_row(monkeypatch, tmp_path):
 def test_all_entries_empty_on_fresh_db(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path)
     assert wl.all_entries() == []
+
+
+def test_record_stores_bundle_draft_ids(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    key = wl.gym_key("Acme Gym")
+    wl.record_posted(key, "Acme Gym", "", "", "CONFIRMED", "portal", "T1",
+                     primary_draft_id="wel_1", ig_feed_draft_id="wel_1_ig_feed",
+                     fb_feed_draft_id="wel_1_fb_feed", ig_story_draft_id="wel_1_ig_story",
+                     fb_story_draft_id="wel_1_fb_story", stripe_customer_id="cus_1")
+    entry = wl.get_entry(key)
+    assert entry["stripe_customer_id"] == "cus_1"
+    assert entry["primary_draft_id"] == "wel_1"
+    assert all(entry[f] for f in wl.BUNDLE_FIELDS)
+
+
+def test_find_by_primary_draft_id(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    key = wl.gym_key("Acme Gym")
+    wl.record_posted(key, "Acme Gym", "", "", "CONFIRMED", "portal", "T1",
+                     primary_draft_id="wel_1")
+    found = wl.find_by_primary_draft_id("wel_1")
+    assert found["gym_key"] == key
+    assert wl.find_by_primary_draft_id("nope") is None
+    assert wl.find_by_primary_draft_id("") is None
+
+
+def test_set_primary_draft_id_repoints_lookup(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    key = wl.gym_key("Acme Gym")
+    wl.record_posted(key, "Acme Gym", "", "", "CONFIRMED", "portal", "T1",
+                     primary_draft_id="wel_1")
+    wl.set_primary_draft_id(key, "wel_1e")
+    assert wl.find_by_primary_draft_id("wel_1") is None
+    assert wl.find_by_primary_draft_id("wel_1e")["gym_key"] == key
+
+
+def test_get_entry_none_when_missing(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    assert wl.get_entry("name:nope") is None

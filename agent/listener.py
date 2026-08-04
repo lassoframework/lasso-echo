@@ -31,7 +31,10 @@ from .runner import run_daily
 
 
 def _redraft_with_note(old: Draft, note: str) -> Draft:
-    """Blake's edit note becomes the new caption, re-held for approval."""
+    """Blake's edit note becomes the new caption, re-held for approval.
+    draft_type / is_story are carried through: without this, editing a
+    special-cased draft (claim_promotion, welcome_multi) silently strips its
+    type and falls back to plain feed-approve behavior on the next tap."""
     acct = get_account(old.account_key)
     new = Draft(
         draft_id=old.draft_id + "e",
@@ -44,6 +47,8 @@ def _redraft_with_note(old: Draft, note: str) -> Draft:
         scheduled_for=old.scheduled_for,
         status=DraftStatus.PENDING,
         source_fragments=[note.strip()],
+        draft_type=old.draft_type,
+        is_story=old.is_story,
     )
     return new
 
@@ -472,6 +477,12 @@ def run_listener():
             # its own write path; the post approval flow stays untouched
             from . import podcast_promote
             res = podcast_promote.handle_promotion_action(kind, draft, actor)
+        elif getattr(draft, "draft_type", "") == "welcome_multi":
+            # auto welcome posts: one card, four real publishes (IG/FB feed +
+            # IG/FB story) fanned out from here; same approver gate, its own
+            # guards (ledger dedupe, consent, live subscription re-check)
+            from . import welcome_new_clients
+            res = welcome_new_clients.handle_welcome_approval(kind, draft, actor)
         else:
             res = handle_action(kind, draft, actor_slack_id=actor,
                                 account=get_account(draft.account_key))
@@ -536,7 +547,18 @@ def run_listener():
         store.remove(draft_id)
         store.put(new)
         from .slack_surface import SlackPoster
-        SlackPoster(token=os.environ.get(config.SLACK_BOT_TOKEN_ENV)).post_approval_card(new)
+        poster = SlackPoster(token=os.environ.get(config.SLACK_BOT_TOKEN_ENV))
+        if getattr(old, "draft_type", "") == "welcome_multi":
+            from . import welcome_ledger, welcome_new_clients
+            entry = welcome_ledger.find_by_primary_draft_id(draft_id)
+            if entry:
+                welcome_ledger.set_primary_draft_id(entry["gym_key"], new.draft_id)
+                welcome_new_clients.post_welcome_multi_card(
+                    poster, new.draft_id, entry["gym_name"], entry["owner_name"],
+                    entry["confidence"], entry["source"], entry["logo_source"],
+                    entry["feed_url"], entry["story_url"])
+                return
+        poster.post_approval_card(new)
 
     @app.command("/echo-draft")
     def on_draft_now(ack, respond):

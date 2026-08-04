@@ -113,6 +113,70 @@ Grade: B+ (unchanged). A new flag does not move the grade. Two open decisions (b
 palette; publish path) are unchanged and still unresolved -- flagging again per
 CLAUDE.md, not resolving them here.
 
+### ADDITION (same day): publish the story, not just render it
+
+Blake's follow-up: the welcome job must actually PUBLISH both the feed and the story
+(not stay draft-only forever), to both lasso_ig and lasso_fb, with one approval
+covering all four. Checked ground truth before building: "Zernio" as it exists in this
+repo (`zernio.py`, `zernio_routes.py`) is a connect/OAuth broker only (profile
+creation, connection status, Facebook page selection) with NO publish call
+implemented anywhere, and it is wired to the `gyms` table (per-client accounts), not
+to `lasso_ig`/`lasso_fb`. `meta_publisher.py` already has full, tested support for
+publishing feed AND story to both IG and FB via the Graph API direct lane
+(`meta_direct`) -- the same lane every other LASSO post uses. Confirmed with Blake to
+use `meta_direct`, not build an undocumented Zernio publish integration from a guess.
+
+**One card, four publishes.** `generate_and_surface_gym` now builds FOUR real
+per-target `Draft`s (IG feed, FB feed, IG story, FB story, all held un-carded in the
+normal `PendingStore`) plus a fifth, display-only `Draft` (`draft_type="welcome_multi"`)
+that IS the Slack card Blake actually sees, with both images inline and the same
+Approve / Edit / Skip buttons every other card uses (no new Slack wiring: these are
+the real, already-connected Socket Mode button handlers in `listener.py`, not a reply-
+text parser). `listener.py`'s `_act()` special-cases `draft_type == "welcome_multi"`
+exactly like the existing `claim_promotion` special case, routing to
+`welcome_new_clients.handle_welcome_approval()`, which fans out to the four real
+drafts via `approvals.handle_action()` -- so `AGENT_PUBLISH_ENABLED` and
+`AGENT_STORIES_ENABLED` still gate every actual network call, per-target, unchanged.
+
+**Guards re-checked at Approve time**, not just at drafting (minutes or hours can pass
+between a card landing and a tap): ledger dedupe again, Stripe subscription status
+again (delinquent-since-drafting is caught), and consent (see the OPEN DECISION
+below). A block never drops the drafts silently -- the reply names the reason and the
+bundle stays intact for a retry once resolved.
+
+**OPEN DECISION (flagging, not resolving): consent has no home yet.** There is no
+field anywhere in the portal/tenant scaffold for "this gym agreed to be announced
+publicly." `_consent_ok()` checks `tenant.json` for an explicit
+`welcome_post_consent: true` and BLOCKS when it is absent, including every gym
+resolved via Stripe/domain only (no portal record at all). This means, as shipped,
+NO gym can actually clear Approve today -- Blake needs to decide where this gets
+captured (at intake? a portal checkbox? Blake's own sign-off recorded some other way?)
+and either wire it or tell me to change the gate.
+
+**Known minor gap:** tapping Edit on a welcome card correctly re-cards (fixed a real
+latent bug found while wiring this: `_redraft_with_note` was dropping `draft_type` /
+`is_story` on every redraft, not just welcome's -- now preserves both, and the
+welcome-specific redraft re-hosts the same two-image card and repoints the ledger).
+Not yet covered: if Blake edits the CAPTION, the same caption is not currently pushed
+back onto the four per-target drafts (they keep the original caption) -- low priority
+since Stories carry no caption and the feed caption is a fixed one-liner, but flagging
+it rather than silently leaving it unclear.
+
+New: `welcome_ledger` gained the bundle columns (`primary_draft_id`,
+`ig_feed_draft_id`, `fb_feed_draft_id`, `ig_story_draft_id`, `fb_story_draft_id`,
+`stripe_customer_id`) plus `find_by_primary_draft_id` / `set_primary_draft_id` /
+`get_entry`. `welcome_new_clients` gained `welcome_multi_blocks`,
+`post_welcome_multi_card`, `handle_welcome_approval`, `_consent_ok`,
+`_subscription_ok`. No new flags; still gated by `AGENT_WELCOME_POSTS_ENABLED`,
+`AGENT_PUBLISH_ENABLED`, and `AGENT_STORIES_ENABLED` (Story publish specifically).
+
+Note per the addition: interactive story stickers and link stickers are not exposed
+by the Graph API Stories endpoint either, so none are specced or built here -- only
+the story media itself publishes, matching the addition's explicit instruction.
+
+Suite: 1859 passed, 26 skipped, 2 failed (same pre-existing, environment-only ffmpeg
+gap, unrelated).
+
 ---
 
 ## Stage 4 Python agent features built (2026-07-22, SHA ed26210)

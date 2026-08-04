@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS welcome_ledger (
   confidence TEXT, source TEXT, template_id TEXT,
   feed_url TEXT DEFAULT '', story_url TEXT DEFAULT '',
   logo_source TEXT DEFAULT '', status TEXT DEFAULT 'posted_for_review',
+  stripe_customer_id TEXT DEFAULT '',
+  primary_draft_id TEXT DEFAULT '',
+  ig_feed_draft_id TEXT DEFAULT '', fb_feed_draft_id TEXT DEFAULT '',
+  ig_story_draft_id TEXT DEFAULT '', fb_story_draft_id TEXT DEFAULT '',
   posted_at TEXT DEFAULT (datetime('now')));
 """
 
