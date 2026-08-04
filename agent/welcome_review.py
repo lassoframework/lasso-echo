@@ -37,7 +37,12 @@ def _red_mask_small(img, downscale=10, mask_zone=None):
         from PIL import ImageDraw as _ID
         x, y, zw, zh = mask_zone
         _ID.Draw(src).rectangle([x, y, x + zw, y + zh], fill=(0, 0, 0))
-    small = src.resize((wt.SIZE // downscale, wt.SIZE // downscale))
+    # downscale preserving ASPECT (a story card is 1080x1920, not square): a fixed
+    # square grid would squash the tall frame ~1.8x vertically and erase thin
+    # horizontal accents. The mask_zone was blanked on the full-res copy above, so
+    # it scales correctly with the image.
+    sw, sh = src.size
+    small = src.resize((max(1, sw // downscale), max(1, sh // downscale)))
     w, h = small.size
     px = small.load()
     grid = [[(px[xx, yy][0] >= 150 and px[xx, yy][1] <= 90 and px[xx, yy][2] <= 90)
@@ -100,8 +105,13 @@ def no_banned_copy(text):
     return not any(c in t for c in BANNED_CHARS)
 
 
-def grade_welcome(image_path, on_card_text, template, vision_client=None):
+def grade_welcome(image_path, on_card_text, template, vision_client=None, fmt="feed"):
     """Grade one composed card. Returns {scores, passed, failed, red_regions}.
+
+    Works for both formats: fmt 'feed' (square) grades against the feed logo zone
+    and the text-column overlap guard; fmt 'story' (9:16) grades against the story
+    logo zone and the story safe-band guard (zone inside 15..85% of height, clear of
+    the top/bottom 250px, and >= 13% of the tall canvas).
 
     Q3 is the real single-red-accent check, measured on the card chrome (the gym
     logo zone is excluded, since a client's own logo may contain red):
@@ -118,8 +128,9 @@ def grade_welcome(image_path, on_card_text, template, vision_client=None):
     left-alignment, scale contrast, and thumbnail legibility on the real Pro art.
     """
     from . import grade_gate
+    zone = wt.story_zone(template) if fmt == "story" else template["logo_zone"]
     img = Image.open(image_path).convert("RGB")
-    regions = red_regions(img, mask_zone=template["logo_zone"])
+    regions = red_regions(img, mask_zone=zone)
     if template["accent"] == "in_bg":
         q3 = regions >= 1
     else:
@@ -134,11 +145,12 @@ def grade_welcome(image_path, on_card_text, template, vision_client=None):
     q2 = canon.scores.get("Q2")
     q5 = canon.scores.get("Q5")
 
-    # real, offline LAYOUT guard: the text column must not overlap the logo zone.
-    # This is what catches a T5-class collision that the vision-optional Q1/Q2/Q5
-    # cannot see offline. Column and zone geometry come from the same source the
-    # compositor uses.
-    layout_ok = _no_text_logo_overlap(template)
+    # real, offline LAYOUT guard: text must not overlap the logo zone. Feed checks
+    # the text column vs the zone (the T5-collision class); story checks the safe
+    # band (zone in 15..85% of height, clear of the 250px UI bands, >= 13% canvas)
+    # which the vertical stack composition guarantees.
+    layout_ok = (_story_layout_ok(template) if fmt == "story"
+                 else _no_text_logo_overlap(template))
 
     scores = {
         "Q1_left_aligned": True if q1 is None else q1,
@@ -167,6 +179,21 @@ def _no_text_logo_overlap(template, tolerance=8):
     zx, _zy, zw, _zh = template["logo_zone"]
     overlap = min(col_x + col_w, zx + zw) - max(col_x, zx)
     return overlap <= tolerance and col_w >= MIN_TEXT_COL
+
+
+def _story_layout_ok(template):
+    """True when the story (9:16) layout is sound: the logo zone sits fully inside
+    the 15..85% safe band (so it clears the top/bottom 250px platform UI), is at
+    least 13% of the tall canvas, and leaves headroom above and below for the text
+    blocks the vertical stack draws (eyebrow+headline above, gym+owner below). This
+    is the story analogue of the feed text-column overlap guard."""
+    zx, zy, zw, zh = wt.story_zone(template)
+    frac = (zw * zh) / float(wt.STORY_W * wt.STORY_H)
+    in_band = zy >= wt.STORY_SAFE_TOP and (zy + zh) <= wt.STORY_SAFE_BOTTOM
+    # headroom for the top text block above the plate and the bottom block below it
+    head_room = (zy - wt.STORY_SAFE_TOP) >= 240
+    foot_room = (wt.STORY_SAFE_BOTTOM - (zy + zh)) >= 200
+    return in_band and frac >= 0.13 and head_room and foot_room
 
 
 def ocr_clean(bg_path, vision_client=None):
@@ -202,17 +229,20 @@ def _resolve_client(bg_client):
         return None
 
 
-def _grade_blank(t, out_dir, cache_dir, bg_client, prefer):
+def _grade_blank(t, out_dir, cache_dir, bg_client, prefer, fmt="feed"):
     """Render this template's blank against the chosen background and grade it
-    (composition + calm zone). Returns (blank_path, blank_text, grade, mode)."""
-    blank_path = os.path.join(out_dir, f"{t['id']}_blank.png")
+    (composition + calm zone) for a given format. Returns
+    (blank_path, blank_text, grade, mode)."""
+    suffix = "" if fmt == "feed" else f"_{fmt}"
+    blank_path = os.path.join(out_dir, f"{t['id']}_blank{suffix}.png")
     _p, mode, blank_text = wt._render(t, "YOUR GYM NAME", "Owner Name", None,
                                       blank_path, bg_client=bg_client,
-                                      cache_dir=cache_dir, prefer=prefer)
-    grade = grade_welcome(blank_path, blank_text, t)
+                                      cache_dir=cache_dir, prefer=prefer, fmt=fmt)
+    grade = grade_welcome(blank_path, blank_text, t, fmt=fmt)
+    zone = wt.story_zone(t) if fmt == "story" else t["logo_zone"]
     bg_path, _ = wt.ensure_background(t, bg_client=bg_client, cache_dir=cache_dir,
-                                      prefer=prefer)
-    calm = wt.calm_zone_ok(Image.open(bg_path).convert("RGB"), t["logo_zone"])
+                                      prefer=prefer, fmt=fmt)
+    calm = wt.calm_zone_ok(Image.open(bg_path).convert("RGB"), zone)
     grade["scores"]["calm_logo_zone"] = calm
     if not calm:
         grade["passed"] = False
@@ -259,11 +289,26 @@ def render_all(out_dir, cache_dir=None, bg_client=None):
                                          cache_dir=cache_dir, prefer=prefer)
             proofs.append({"logo": label, "path": pp,
                            "grade": grade_welcome(pp, ptext, t)})
+
+        # STORY (9:16): same design system, native tall background + vertical stack.
+        # One blank + one filled proof (wide logo) so Blake sees feed and story side
+        # by side. Story uses the same prefer/fallback ladder decided for feed.
+        story_blank_path, _sbt, story_grade, _sm = _grade_blank(
+            t, out_dir, cache_dir, client, prefer, fmt="story")
+        story_pp = os.path.join(out_dir, f"{t['id']}_proof_story.png")
+        _spp, _smm, sptext = wt._render(t, "Iron Forge Fitness", "Jordan Blake",
+                                        wide_logo, story_pp, bg_client=client,
+                                        cache_dir=cache_dir, prefer=prefer, fmt="story")
+        story_proof = {"logo": "wide", "path": story_pp,
+                       "grade": grade_welcome(story_pp, sptext, t, fmt="story")}
+
         manifest.append({
             "id": t["id"], "name": t["name"], "direction": t["direction"],
             "blank_path": blank_path, "mode": mode,
             "calm_zone_ok": grade["scores"].get("calm_logo_zone", True),
             "grade": grade, "proofs": proofs,
+            "story_blank_path": story_blank_path, "story_grade": story_grade,
+            "story_proof": story_proof,
         })
     return manifest
 
@@ -301,7 +346,7 @@ def post_review_set(manifest, poster, host_fn, channel=None, intro=None):
         resp = poster._chat_post(text=f"{m['id']} - {m['name']}", blocks=blocks,
                                  channel=ch)
         ts = (resp or {}).get("ts")
-        # thread the two filled proofs
+        # thread the two feed filled proofs (1080x1080)
         for p in m["proofs"]:
             purl = _host(p["path"], host_fn)
             g = p["grade"]
@@ -309,12 +354,27 @@ def post_review_set(manifest, poster, host_fn, channel=None, intro=None):
             pblocks = []
             if purl:
                 pblocks.append({"type": "image", "image_url": purl,
-                                "alt_text": f"{m['id']} filled proof, {p['logo']} logo"})
+                                "alt_text": f"{m['id']} feed proof, {p['logo']} logo"})
             pblocks.append({"type": "context", "elements": [
                 {"type": "mrkdwn",
-                 "text": f"{m['id']} filled proof - {p['logo']} logo - {grade_line}"}]})
-            poster._chat_post(text=f"{m['id']} proof ({p['logo']})",
+                 "text": f"{m['id']} FEED 1080x1080 - {p['logo']} logo - {grade_line}"}]})
+            poster._chat_post(text=f"{m['id']} feed proof ({p['logo']})",
                               blocks=pblocks, channel=ch, thread_ts=ts)
+        # thread the STORY proof (1080x1920) so feed + story sit side by side
+        sp = m.get("story_proof")
+        if sp:
+            surl = _host(sp["path"], host_fn)
+            sg = sp["grade"]
+            sgl = "grade PASS" if sg["passed"] else f"grade FAIL {sg['failed']}"
+            sblocks = []
+            if surl:
+                sblocks.append({"type": "image", "image_url": surl,
+                                "alt_text": f"{m['id']} story proof 9:16"})
+            sblocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn",
+                 "text": f"{m['id']} STORY 1080x1920 - {sgl}"}]})
+            poster._chat_post(text=f"{m['id']} story proof",
+                              blocks=sblocks, channel=ch, thread_ts=ts)
         posted.append({"id": m["id"], "ts": ts, "blank_url": blank_url})
     poster._chat_post(
         text="All 10 posted.",

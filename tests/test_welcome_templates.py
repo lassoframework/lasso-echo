@@ -221,3 +221,115 @@ def test_calm_zone_fails_on_noisy_region():
     for i in range(0, w, 8):
         d.rectangle([x + i, y, x + i + 4, y + h], fill=(255, 255, 255))
     assert not wt.calm_zone_ok(img, zone)
+
+
+# ==========================================================================
+# STORY FORMAT (9:16) — same design system, native tall background
+# ==========================================================================
+
+ALL = [f"T{i}" for i in range(1, 11)]
+
+
+@pytest.mark.parametrize("tid", ALL)
+def test_story_renders_1080x1920(tmp_path, cache, tid):
+    out = _out(tmp_path, f"{tid}_story.png")
+    path = wt.make_welcome(tid, "Iron Forge Fitness", "Jordan Blake", None,
+                           format="story", out_path=out, cache_dir=cache)
+    assert Image.open(path).size == (wt.STORY_W, wt.STORY_H) == (1080, 1920)
+
+
+def test_feed_still_1080_square_default_format(tmp_path, cache):
+    # the format param defaults to feed and feed dims are unchanged
+    out = _out(tmp_path, "feed.png")
+    path = wt.make_welcome("T1", "Iron Forge", "Sam", None, out_path=out,
+                           cache_dir=cache)
+    assert Image.open(path).size == (wt.SIZE, wt.SIZE)
+
+
+@pytest.mark.parametrize("tid", ALL)
+def test_story_logo_zone_at_least_13_percent(tid):
+    z = wt.story_zone(wt.get_template(tid))
+    frac = (z[2] * z[3]) / float(wt.STORY_W * wt.STORY_H)
+    assert frac >= 0.13
+
+
+@pytest.mark.parametrize("tid", ALL)
+def test_story_logo_zone_in_safe_band_and_middle_third(tid):
+    zx, zy, zw, zh = wt.story_zone(wt.get_template(tid))
+    # inside the 15..85% safe band (also clears the top/bottom 250px platform UI)
+    assert zy >= wt.STORY_SAFE_TOP >= 250
+    assert zy + zh <= wt.STORY_SAFE_BOTTOM <= wt.STORY_H - 250
+    # centered horizontally and sitting in the visual middle third
+    assert abs(zx - (wt.STORY_W - zw) // 2) <= 2
+    assert 640 <= zy and zy + zh <= 1300
+
+
+@pytest.mark.parametrize("tid", ALL)
+def test_story_grade_passes_blank_and_proof(tmp_path, cache, tid):
+    t = wt.get_template(tid)
+    wide, _sq = wt.make_test_logos(str(tmp_path / "logos"))
+    for label, logo in (("blank", None), ("proof", wide)):
+        out = _out(tmp_path, f"{tid}_story_{label}.png")
+        _p, _m, text = wt._render(t, "Iron Forge Fitness", "Jordan Blake", logo,
+                                  out, cache_dir=cache, fmt="story")
+        g = wr.grade_welcome(out, text, t, fmt="story")
+        assert g["passed"], f"{tid} story {label} failed: {g['failed']}"
+
+
+@pytest.mark.parametrize("tid", ALL)
+def test_story_layout_guard_all_templates(tid):
+    assert wr._story_layout_ok(wt.get_template(tid))
+
+
+def test_story_red_region_check_is_aspect_correct(tmp_path, cache):
+    # regression: the red-mask downscale must preserve aspect, else a tall story
+    # frame is squashed ~1.8x and thin horizontal accents vanish (T5 rule bug).
+    t = wt.get_template("T5")  # accent == rule (a thin red hairline)
+    out = _out(tmp_path, "t5_story.png")
+    wt._render(t, "Iron Forge", "Sam", None, out, cache_dir=cache, fmt="story")
+    assert wr.red_regions(Image.open(out), mask_zone=wt.story_zone(t)) == 1
+
+
+def test_story_background_native_not_square_crop(cache):
+    # story background is regenerated native to 9:16, never a crop of the square art
+    t = wt.get_template("T1")
+    bg_path, _ = wt.ensure_background(t, cache_dir=cache, fmt="story")
+    assert Image.open(bg_path).size == (wt.STORY_W, wt.STORY_H)
+    feed_bg, _ = wt.ensure_background(t, cache_dir=cache, fmt="feed")
+    assert Image.open(feed_bg).size == (wt.SIZE, wt.SIZE)
+    assert bg_path != feed_bg  # cached under separate keys
+
+
+def test_story_and_feed_backgrounds_cached_separately(cache):
+    t = wt.get_template("T2")
+    fp, _ = wt.ensure_background(t, cache_dir=cache, fmt="feed")
+    sp, _ = wt.ensure_background(t, cache_dir=cache, fmt="story")
+    assert os.path.isfile(fp) and os.path.isfile(sp)
+    assert Image.open(fp).size == (wt.SIZE, wt.SIZE)
+    assert Image.open(sp).size == (wt.STORY_W, wt.STORY_H)
+
+
+def test_invalid_format_raises():
+    with pytest.raises(KeyError):
+        wt.make_welcome("T1", "Gym", "Owner", None, format="square")
+
+
+def test_slots_json_has_per_format_zones():
+    d = wt.slots_dict()
+    assert set(d["formats"]) == {"feed", "story"}
+    assert d["formats"]["story"] == {"w": 1080, "h": 1920, "safe_top": 288,
+                                     "safe_bottom": 1632, "margin": 96}
+    for tid, spec in d["templates"].items():
+        assert spec["feed"]["logo_zone"]["fraction"] >= 0.13
+        assert spec["story"]["logo_zone"]["fraction"] >= 0.13
+        assert spec["story"]["logo_zone"]["h"] == 540
+        # back-compat flat keys still present
+        assert "logo_zone" in spec and "text_column" in spec
+
+
+def test_story_background_prompt_is_vertical_and_calm_center():
+    p = wt.background_prompt(wt.get_template("T1"), fmt="story")
+    assert "9:16" in p or "vertical" in p.lower()
+    assert "CENTER" in p or "middle third" in p.lower()
+    # still forbids all text/letters/logos
+    assert "NO text" in p and "NO logos" in p

@@ -57,6 +57,43 @@ HEADLINE = "WELCOME TO LASSO"
 # below clears that floor and sits in a region the background keeps calm.
 _MIN_ZONE_FRAC = 0.13
 
+# --------------------------------------------------------------------------
+# FORMATS. Feed is the square 1080x1080 (SIZE, from summit_render). Story is the
+# 9:16 vertical 1080x1920: SAME design system, background REGENERATED native to
+# the taller frame (never a crop of the square art), text stacked vertically.
+#   - Story safe band: all text + the logo live between 15% and 85% of frame
+#     height (288..1632), and nothing sits in the top 250px (platform UI) or the
+#     bottom 250px (reply bar / stickers).
+#   - The logo slot is centered and sits in the visual middle third, >= 13% of
+#     the canvas (1080x1920 = 2,073,600 px; the 540x540 zone is 14.06%).
+# --------------------------------------------------------------------------
+STORY_W, STORY_H = 1080, 1920
+STORY_MARGIN = 96
+STORY_SAFE_TOP = 288        # 15% of 1920 (also clears the 250px UI band)
+STORY_SAFE_BOTTOM = 1632    # 85% of 1920 (also clears the 250px reply band)
+# centered logo plate in the visual middle third (vertical 640..1280)
+STORY_LOGO_ZONE = (270, 730, 540, 540)
+
+FORMATS = {
+    "feed": {"w": SIZE, "h": SIZE},
+    "story": {"w": STORY_W, "h": STORY_H},
+}
+
+
+def _fmt_dims(fmt):
+    """(w, h) for a format id. Unknown formats fail loud."""
+    if fmt not in FORMATS:
+        raise KeyError(f"unknown welcome format {fmt!r} (have {', '.join(FORMATS)})")
+    return FORMATS[fmt]["w"], FORMATS[fmt]["h"]
+
+
+def story_zone(template):
+    """The story logo safe zone for a template. Shared centered middle-third zone
+    for every template (the tall frame stacks vertically, so the feed's left/right
+    variation does not apply); kept as a function so a per-template override can be
+    introduced later without touching callers."""
+    return template.get("story_zone", STORY_LOGO_ZONE)
+
 
 # --------------------------------------------------------------------------
 # The 10 templates. 1 to 5 evolve the reference set; 6 to 10 are new.
@@ -182,21 +219,33 @@ _NO_TEXT_RULE = (
 )
 
 
-def background_prompt(template):
+def background_prompt(template, fmt="feed"):
     """The Nano Banana Pro prompt for one template's BACKGROUND ART ONLY.
 
     Every prompt: (1) forbids all text/letters/logos, (2) names the atmosphere,
     (3) requires the logo safe-zone region to stay visually CALM (low detail, low
     contrast) so a gym logo composited there stays legible, and (4) satisfies the
     house grade heuristic (exactly one red element, a focal graphic, never a red
-    background)."""
+    background).
+
+    fmt selects the framing: 'feed' asks for a square 1:1 composition; 'story' asks
+    for a native vertical 9:16 composition with a calm CENTER band (the logo lands
+    in the middle third) and the accent pushed to the upper or lower third."""
     t = template
-    zx, zy, zw, zh = t["logo_zone"]
-    # describe the calm zone in ninths so the model can place calm space
-    side = "right" if zx > SIZE * 0.45 else "left"
-    vert = "upper" if zy < SIZE * 0.4 else "middle"
-    calm = (f"Keep the {vert} {side} region of the frame visually CALM: low detail, "
-            f"low contrast, smooth and uncluttered, so a logo can sit there and read. ")
+    if fmt == "story":
+        calm = ("Keep the CENTER of the frame, the whole middle third, visually CALM: "
+                "low detail, low contrast, smooth and uncluttered, so a logo can sit "
+                "centered there and read. Push all energy and the accent to the top "
+                "third or the bottom third. ")
+        shape = "Vertical 9:16 portrait composition, full bleed, native to a tall frame. "
+    else:
+        zx, zy, zw, zh = t["logo_zone"]
+        # describe the calm zone in ninths so the model can place calm space
+        side = "right" if zx > SIZE * 0.45 else "left"
+        vert = "upper" if zy < SIZE * 0.4 else "middle"
+        calm = (f"Keep the {vert} {side} region of the frame visually CALM: low detail, "
+                f"low contrast, smooth and uncluttered, so a logo can sit there and read. ")
+        shape = "Square 1:1 composition, full bleed. "
     # RED is accent-aware. Composed-accent templates (word / block / rule) carry
     # their single red in the PIL text layer, so the background must have NO red at
     # all (else the card shows two reds). in_bg templates carry the one red in the
@@ -219,7 +268,7 @@ def background_prompt(template):
                        "maroon, or orange anywhere in the image. The red accent is added "
                        "separately in the layout, so the background carries none. ")
     common = (f"{_NO_TEXT_RULE} {calm}"
-              "Square 1:1 composition, full bleed. "
+              f"{shape}"
               "Premium B2B agency quality, editorial, clean, not busy. "
               f"{red_feature}"
               "This is a focal graphic background, not a scene with people's faces.")
@@ -271,13 +320,15 @@ def background_prompt(template):
 # clearly-flat depth fields; they carry NO text (so OCR of a raw background is
 # trivially clean) and keep the logo zone calm by construction.
 
-def _grad_v(size, top, bottom):
-    img = Image.new("RGB", (size, size), top)
+def _grad_v(w, h, top, bottom):
+    """Vertical gradient on a w x h canvas. (Square feed passes w == h == SIZE, so
+    output is byte-identical to the original single-arg version.)"""
+    img = Image.new("RGB", (w, h), top)
     d = ImageDraw.Draw(img)
-    for y in range(size):
-        f = y / size
+    for y in range(h):
+        f = y / h
         col = tuple(int(top[i] + (bottom[i] - top[i]) * f) for i in range(3))
-        d.line([(0, y), (size, y)], fill=col)
+        d.line([(0, y), (w, y)], fill=col)
     return img
 
 
@@ -303,15 +354,17 @@ def _lcg(seed):
 
 def _grain(img, amount=8, seed=1, zone=None, zone_amount=2):
     """Fine paper/photo grain for depth. Lighter (zone_amount) inside the logo
-    zone so it stays calm. Deterministic by seed."""
+    zone so it stays calm. Deterministic by seed. Canvas size is read from the
+    image, so it works for the square feed and the tall story alike."""
     rnd = _lcg(seed)
     d = ImageDraw.Draw(img, "RGBA")
     step = 3
+    W, H = img.size
     zx = zy = zw = zh = -1
     if zone is not None:
         zx, zy, zw, zh = zone
-    for y in range(0, SIZE, step):
-        for x in range(0, SIZE, step):
+    for y in range(0, H, step):
+        for x in range(0, W, step):
             in_zone = zx <= x <= zx + zw and zy <= y <= zy + zh
             amp = zone_amount if in_zone else amount
             v = int((rnd() - 0.5) * 2 * amp)
@@ -326,12 +379,14 @@ def _contours(img, color, focal, spacing=34, base_alpha=44, seed=7, zone=None):
     focal point, spacing easing outward, drawn on their own layer then faded near
     the top (text) and over the logo zone so those areas stay calm. Deterministic
     and elegant rather than scribbly."""
+    W, H = img.size
     layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
     ld = ImageDraw.Draw(layer)
     fx, fy = focal
     r = 70
     i = 0
-    while r < SIZE * 1.7:
+    reach = max(W, H) * 1.7
+    while r < reach:
         # every third line a touch heavier for relief depth
         w = 3 if i % 3 == 0 else 2
         ld.ellipse([fx - r, fy - r, fx + r, fy + r], outline=color + (base_alpha,),
@@ -341,8 +396,8 @@ def _contours(img, color, focal, spacing=34, base_alpha=44, seed=7, zone=None):
     # vertical fade: contours strong at the bottom, fading toward the top text area
     fade = Image.new("L", img.size, 0)
     fd = ImageDraw.Draw(fade)
-    for y in range(SIZE):
-        fd.line([(0, y), (SIZE, y)], fill=int(40 + 215 * (y / SIZE)))
+    for y in range(H):
+        fd.line([(0, y), (W, y)], fill=int(40 + 215 * (y / H)))
     # calm the logo zone: knock the fade mask down where the plate will sit
     if zone is not None:
         zx, zy, zw, zh = zone
@@ -362,14 +417,14 @@ def _procedural_background(template):
     style = t["bg_style"]
     navy_deep = (12, 20, 42)
     if style in ("editorial_navy", "duotone_interior"):
-        img = _grad_v(SIZE, (22, 37, 72), (9, 15, 32))
+        img = _grad_v(SIZE, SIZE, (22, 37, 72), (9, 15, 32))
         img = _radial_glow(img, int(SIZE * 0.72), int(SIZE * 0.30), 460, (34, 70, 128), 0.55)
         img = _radial_glow(img, int(SIZE * 0.12), int(SIZE * 0.82), 380, (18, 40, 82), 0.4)
         img = img.convert("RGBA")
         _grain(img, amount=7, seed=11, zone=t["logo_zone"])
         img = img.convert("RGB")
     elif style == "red_streak":
-        img = _grad_v(SIZE, (16, 26, 52), (8, 12, 28))
+        img = _grad_v(SIZE, SIZE, (16, 26, 52), (8, 12, 28))
         d = ImageDraw.Draw(img, "RGBA")
         for i, w in enumerate((70, 40, 18)):
             d.line([(120, SIZE - 120), (SIZE - 160, 200)],
@@ -381,7 +436,7 @@ def _procedural_background(template):
         d.polygon([(SIZE, 0), (SIZE, SIZE), (int(SIZE * 0.32), SIZE)], fill=(210, 30, 34))
         d.polygon([(0, 0), (SIZE, 0), (int(SIZE * 0.32), SIZE), (0, SIZE)], fill=navy_deep)
     elif style == "celebration":
-        img = _grad_v(SIZE, (18, 30, 60), (9, 14, 30))
+        img = _grad_v(SIZE, SIZE, (18, 30, 60), (9, 14, 30))
         d = ImageDraw.Draw(img, "RGBA")
         import hashlib
         seed = int(hashlib.sha1(t["id"].encode()).hexdigest(), 16)
@@ -414,10 +469,10 @@ def _procedural_background(template):
     elif style == "split_panel":
         split = int(SIZE * 0.52)
         # cream right panel with a soft vertical depth wash
-        img = _grad_v(SIZE, (252, 249, 244), (243, 236, 226))
+        img = _grad_v(SIZE, SIZE, (252, 249, 244), (243, 236, 226))
         d = ImageDraw.Draw(img)
         # navy left panel with layered depth (glow + faint ghost arc)
-        navy_panel = _grad_v(SIZE, (24, 39, 74), (10, 17, 36))
+        navy_panel = _grad_v(SIZE, SIZE, (24, 39, 74), (10, 17, 36))
         navy_panel = _radial_glow(navy_panel, int(split * 0.35), int(SIZE * 0.28),
                                   420, (36, 72, 132), 0.55)
         nd = ImageDraw.Draw(navy_panel, "RGBA")
@@ -442,13 +497,13 @@ def _procedural_background(template):
         # premium topographic relief: organic navy contour lines from two focal
         # points, dense at the lower right, thinning toward the calm text/logo
         # areas, over a warm cream depth wash with fine paper grain.
-        img = _grad_v(SIZE, (252, 249, 244), (240, 232, 221)).convert("RGBA")
+        img = _grad_v(SIZE, SIZE, (252, 249, 244), (240, 232, 221)).convert("RGBA")
         _contours(img, (18, 30, 60), focal=(int(SIZE * 0.94), int(SIZE * 0.96)),
                   spacing=34, base_alpha=46, zone=t["logo_zone"])
         _grain(img, amount=3, seed=31, zone=t["logo_zone"])
         img = img.convert("RGB")
     else:  # editorial_cream and any fallback
-        img = _grad_v(SIZE, (253, 250, 245), (240, 232, 221))
+        img = _grad_v(SIZE, SIZE, (253, 250, 245), (240, 232, 221))
         img = _radial_glow(img, int(SIZE * 0.74), int(SIZE * 0.30), 420,
                            (255, 252, 247), 0.5).convert("RGBA")
         _grain(img, amount=5, seed=19, zone=t["logo_zone"])
@@ -456,22 +511,130 @@ def _procedural_background(template):
     return img
 
 
+def _procedural_background_story(template, W=STORY_W, H=STORY_H):
+    """A flat, text-free depth field NATIVE to the 9:16 story frame (never a crop
+    of the square art). Same palette + accent language as the feed placeholder, but
+    composed vertically: the accent lives in the upper or lower third and the middle
+    third (where the logo plate lands) is kept calm. Stands in for real Nano Pro 9:16
+    art on local dev so every story proof renders and can be audited."""
+    t = template
+    style = t["bg_style"]
+    zone = story_zone(t)
+    navy_deep = (12, 20, 42)
+    mid_y = H // 2
+
+    if style in ("editorial_navy", "duotone_interior"):
+        img = _grad_v(W, H, (22, 37, 72), (9, 15, 32))
+        img = _radial_glow(img, int(W * 0.72), int(H * 0.20), 520, (34, 70, 128), 0.55)
+        img = _radial_glow(img, int(W * 0.16), int(H * 0.86), 460, (18, 40, 82), 0.4)
+        img = img.convert("RGBA")
+        _grain(img, amount=7, seed=11, zone=zone)
+        img = img.convert("RGB")
+    elif style == "red_streak":
+        img = _grad_v(W, H, (16, 26, 52), (8, 12, 28))
+        d = ImageDraw.Draw(img, "RGBA")
+        # one dramatic red streak across the UPPER third, clear of the mid logo band
+        for i, w in enumerate((70, 40, 18)):
+            d.line([(80, int(H * 0.30)), (W - 120, int(H * 0.06))],
+                   fill=(255, 0, 0, 60 + i * 55), width=w)
+        img = img.filter(ImageFilter.GaussianBlur(6))
+    elif style == "diagonal_split":
+        img = Image.new("RGB", (W, H), navy_deep)
+        d = ImageDraw.Draw(img)
+        # bold diagonal: red wedge anchored to the BOTTOM, navy above (keeps the
+        # mid-frame logo band on calm navy)
+        d.polygon([(0, H), (W, H), (W, int(H * 0.72))], fill=(210, 30, 34))
+    elif style == "celebration":
+        img = _grad_v(W, H, (18, 30, 60), (9, 14, 30))
+        d = ImageDraw.Draw(img, "RGBA")
+        import hashlib
+        seed = int(hashlib.sha1((t["id"] + "story").encode()).hexdigest(), 16)
+        for _i in range(120):
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            px = seed % W
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            py = seed % H
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            rr = 3 + seed % 9
+            d.ellipse([px, py, px + rr, py + rr], fill=(120, 200, 240, 150))
+        # ONE concentrated solid-red burst in the upper third (the single accent)
+        bx, by = int(W * 0.74), int(H * 0.12)
+        for _i in range(26):
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            ox = (seed % 160) - 80
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            oy = (seed % 160) - 80
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            rr = 6 + seed % 12
+            d.ellipse([bx + ox, by + oy, bx + ox + rr, by + oy + rr],
+                      fill=(235, 30, 34, 255))
+        img = img.filter(ImageFilter.GaussianBlur(1))
+    elif style == "block_cream":
+        img = Image.new("RGB", (W, H), (250, 246, 240))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, int(W * 0.34), int(H * 0.18)], fill=(210, 30, 34))
+    elif style == "split_panel":
+        # horizontal band split works better in a tall frame: navy top, cream bottom
+        img = _grad_v(W, H, (252, 249, 244), (243, 236, 226)).convert("RGBA")
+        seam = int(H * 0.30)
+        navy_panel = _grad_v(W, seam, (24, 39, 74), (10, 17, 36))
+        img.paste(navy_panel, (0, 0))
+        d = ImageDraw.Draw(img, "RGBA")
+        glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(glow).rectangle([0, seam - 16, W, seam + 16],
+                                       fill=(210, 30, 34, 120))
+        img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(12)))
+        d.rectangle([0, seam - 5, W, seam + 5], fill=(214, 32, 36, 255))
+        _grain(img, amount=6, seed=23, zone=zone)
+        img = img.convert("RGB")
+    elif style == "badge_cream":
+        img = Image.new("RGB", (W, H), (250, 246, 240))
+        img = _radial_glow(img, W // 2, mid_y, 340, (225, 220, 210), 0.4)
+    elif style == "topo_cream":
+        img = _grad_v(W, H, (252, 249, 244), (240, 232, 221)).convert("RGBA")
+        _contours(img, (18, 30, 60), focal=(int(W * 0.94), int(H * 0.97)),
+                  spacing=40, base_alpha=46, zone=zone)
+        _grain(img, amount=3, seed=31, zone=zone)
+        img = img.convert("RGB")
+    else:  # editorial_cream and any fallback
+        img = _grad_v(W, H, (253, 250, 245), (240, 232, 221))
+        img = _radial_glow(img, int(W * 0.74), int(H * 0.18), 480,
+                           (255, 252, 247), 0.5).convert("RGBA")
+        _grain(img, amount=5, seed=19, zone=zone)
+        img = img.convert("RGB")
+    return img
+
+
+def _cover_crop(src, W, H):
+    """Cover-crop `src` to exactly W x H: scale so it fills the frame, center-crop
+    the overflow, never stretch. Works for square OR portrait targets."""
+    sw, sh = src.size
+    scale = max(W / sw, H / sh)
+    rw, rh = max(1, int(sw * scale)), max(1, int(sh * scale))
+    src = src.resize((rw, rh))
+    left, top = (rw - W) // 2, (rh - H) // 2
+    return src.crop((left, top, left + W, top + H))
+
+
 def _cache_dir(cache_dir=None):
     return cache_dir or os.path.join(config.LIBRARY_PATH, "welcome_bg")
 
 
 def ensure_background(template, bg_client=None, cache_dir=None, force=False,
-                      prefer=None):
-    """Return a path to this template's cached background PNG.
+                      prefer=None, fmt="feed"):
+    """Return a path to this template's cached background PNG for a given format.
 
     If a Nano Pro client is available (and the flag/key are set), render real Pro
     art from background_prompt(); otherwise fall back to a procedural depth field.
     prefer='placeholder' forces the procedural background even when a client exists
     (used as the grade-fallback when Pro art will not comply). Either way the result
     is cached on the persistent volume so a re-fill never re-pays generation.
+    fmt is 'feed' (square) or 'story' (9:16); story art is regenerated NATIVE to the
+    tall frame, never a crop of the square feed art, and cached under its own key.
     Returns (path, mode) where mode is 'pro' or 'placeholder'.
     """
     t = template
+    W, H = _fmt_dims(fmt)
     cdir = _cache_dir(cache_dir)
     os.makedirs(cdir, exist_ok=True)
 
@@ -487,25 +650,25 @@ def ensure_background(template, bg_client=None, cache_dir=None, force=False,
         client = None
 
     mode = "pro" if client is not None else "placeholder"
-    path = os.path.join(cdir, f"{t['id']}_{mode}.png")
+    # feed keeps the historical unsuffixed cache name (no churn); story is suffixed.
+    suffix = "" if fmt == "feed" else f"_{fmt}"
+    path = os.path.join(cdir, f"{t['id']}_{mode}{suffix}.png")
     if os.path.isfile(path) and not force:
         return path, mode
 
     if client is not None:
-        prompt = background_prompt(t)
+        prompt = background_prompt(t, fmt=fmt)
         img_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
         with open(path, "wb") as fh:
             fh.write(img_bytes)
-        # normalize to a square RGB canvas: cover-crop center (never stretch), then
-        # resize to the canvas, so real Pro art keeps its proportions.
-        src = Image.open(path).convert("RGB")
-        w, h = src.size
-        s = min(w, h)
-        src = src.crop(((w - s) // 2, (h - s) // 2,
-                        (w - s) // 2 + s, (h - s) // 2 + s)).resize((SIZE, SIZE))
+        # cover-crop center to the target frame (never stretch), so real Pro art
+        # keeps its proportions whether square (feed) or portrait (story).
+        src = _cover_crop(Image.open(path).convert("RGB"), W, H)
         src.save(path)
     else:
-        _procedural_background(t).convert("RGB").save(path)
+        bg = (_procedural_background_story(t, W, H) if fmt == "story"
+              else _procedural_background(t))
+        bg.convert("RGB").save(path)
     return path, mode
 
 
@@ -513,9 +676,9 @@ def ensure_background(template, bg_client=None, cache_dir=None, force=False,
 # CALM ZONE + LOGO
 # ==========================================================================
 
-def _zone_frac(zone):
+def _zone_frac(zone, canvas_w=SIZE, canvas_h=SIZE):
     _, _, w, h = zone
-    return (w * h) / float(SIZE * SIZE)
+    return (w * h) / float(canvas_w * canvas_h)
 
 
 def calm_zone_ok(img, zone, std_threshold=60.0):
@@ -715,49 +878,157 @@ def _compose_text(img, template, gym_name, owner_name):
     return on_card_text
 
 
+def _compose_text_story(img, template, gym_name, owner_name):
+    """Story (9:16) text: the SAME hierarchy as feed (eyebrow, WELCOME TO LASSO,
+    gym logo, gym name, owner name, footer) stacked vertically down the tall frame.
+    Text is left-aligned in a full-width column; the logo plate is centered in the
+    middle third (drawn separately). Everything stays inside the 15..85% safe band
+    and clear of the top/bottom 250px. Headline runs larger than feed. Returns the
+    on-card text for the copy scan / grade Q4."""
+    t = template
+    base = t["base"]
+    ink = _ink_for(base)
+    mute = _mute_for(base)
+    d = ImageDraw.Draw(img, "RGBA")
+
+    col_x = STORY_MARGIN
+    col_w = STORY_W - 2 * STORY_MARGIN
+    zx, zy, zw, zh = story_zone(t)
+
+    shadow = (base == "navy") or t["bg_style"] in ("duotone_interior", "red_streak",
+                                                   "diagonal_split", "celebration",
+                                                   "split_panel")
+
+    def draw(x, y, text, font, fill):
+        if shadow:
+            d.text((x + 2, y + 2), text, font=font, fill=(6, 10, 20, 200))
+        d.text((x, y), text, font=font, fill=fill)
+
+    # ---------- TOP BLOCK: eyebrow + headline, anchored at the top of the band ----------
+    y = STORY_SAFE_TOP
+    if t["accent"] == "block":
+        ef = _f(OSWALD, 34)
+        ew = _tracked_w(d, t["eyebrow"].upper(), ef, 5)
+        d.rectangle([col_x - 12, y - 10, col_x + ew + 24, y + 50], fill=RED)
+        _tracked(d, (col_x, y), t["eyebrow"].upper(), ef, WHITE, 5)
+    else:
+        eb_col = SKY if base == "navy" else NAVY
+        _tracked(d, (col_x, y), t["eyebrow"].upper(), _f(OSWALD, 34), eb_col, 5)
+    y += 84
+
+    if t["accent"] == "rule":
+        d.rectangle([col_x, y, col_x + 140, y + 9], fill=RED)
+        y += 40
+
+    # headline runs larger than feed (more vertical room) but must clear the logo
+    # plate: shrink until the whole block fits in the space above zy (with a gap),
+    # not just within the line-count cap. This is the story analogue of the feed
+    # text-column guard that stops composed text entering the logo zone.
+    head_gap = 34
+    avail_h = (zy - head_gap) - y
+    hf, lines = _fit_headline(d, HEADLINE, col_w, 3, 168, floor=104)
+    while hf.size > 104:
+        lh_try = _th(d, "AY", hf) + 8 + int(hf.size * 0.28)
+        if len(lines) * lh_try <= avail_h:
+            break
+        hf, lines = _fit_headline(d, HEADLINE, col_w, 3, hf.size - 6, floor=104)
+    red_word = "LASSO" if t["accent"] == "word" else None
+    lh = _th(d, "AY", hf) + 8 + int(hf.size * 0.28)
+    for i, line in enumerate(lines):
+        cx = col_x
+        for word in line.split():
+            fill = RED if (red_word and word.strip(".,").upper() == red_word) else ink
+            if shadow:
+                d.text((cx + 3, y + i * lh + 3), word, font=hf, fill=(6, 10, 20, 220))
+            d.text((cx, y + i * lh), word, font=hf, fill=fill)
+            cx += _tw(d, word + " ", hf)
+
+    # ---------- BOTTOM BLOCK: gym name + owner, anchored BELOW the logo plate ----------
+    y = zy + zh + 70
+    gym = (gym_name or "").strip().upper() or "YOUR GYM NAME"
+    gf, glines = _fit_headline(d, gym, col_w, 2, 96, floor=52)
+    for i, line in enumerate(glines):
+        draw(col_x, y + i * (gf.size + 10), line, gf, ink)
+    y += len(glines) * (gf.size + 10) + 16
+
+    owner = (owner_name or "").strip()
+    if owner:
+        of = _f(MONT, 42)
+        owner_fill = (86, 94, 112) if base == "cream" else (206, 218, 236)
+        draw(col_x, y, f"with {owner}", of, owner_fill)
+        y += 60
+
+    if t["id"] == "T5":
+        pf = _f(OSWALD, 26)
+        _tracked(d, (col_x, y + 8), PROOF_STAT, pf, mute, 3)
+
+    # ---------- FOOTER: real wordmark + url, inside the bottom safe line ----------
+    fy = STORY_SAFE_BOTTOM - 46
+    wm = _tinted_wordmark(WHITE if base == "navy" else NAVY, 44)
+    fx = STORY_MARGIN
+    if wm is not None:
+        img.alpha_composite(wm, (fx, fy - 8))
+    url = "LASSOFRAMEWORK.COM"
+    uf = _f(OSWALD, 26)
+    d.text((STORY_W - STORY_MARGIN - _tw(d, url, uf), fy + 4), url, font=uf, fill=mute)
+
+    on_card_text = " ".join([t["eyebrow"], HEADLINE, gym, (owner or ""),
+                             (PROOF_STAT if t["id"] == "T5" else ""), url])
+    return on_card_text
+
+
 # ==========================================================================
 # PUBLIC: make_welcome / render_blank
 # ==========================================================================
 
 def _render(template, gym_name, owner_name, logo_path, out_path,
-            bg_client=None, cache_dir=None, prefer=None):
+            bg_client=None, cache_dir=None, prefer=None, fmt="feed"):
+    W, H = _fmt_dims(fmt)
     bg_path, mode = ensure_background(template, bg_client=bg_client,
-                                      cache_dir=cache_dir, prefer=prefer)
+                                      cache_dir=cache_dir, prefer=prefer, fmt=fmt)
     img = Image.open(bg_path).convert("RGBA")
-    if img.size != (SIZE, SIZE):
-        img = img.resize((SIZE, SIZE))
+    if img.size != (W, H):
+        img = img.resize((W, H))
+    zone = story_zone(template) if fmt == "story" else template["logo_zone"]
     # logo zone first (plate sits under nothing but the gym logo), then text
-    place_gym_logo(img, logo_path, template["logo_zone"], template["base"])
-    on_card_text = _compose_text(img, template, gym_name, owner_name)
+    place_gym_logo(img, logo_path, zone, template["base"])
+    if fmt == "story":
+        on_card_text = _compose_text_story(img, template, gym_name, owner_name)
+    else:
+        on_card_text = _compose_text(img, template, gym_name, owner_name)
     img.convert("RGB").save(out_path)
     return out_path, mode, on_card_text
 
 
-def make_welcome(template_id, gym_name, owner_name, logo_path, out_path=None,
-                 bg_client=None, cache_dir=None):
+def make_welcome(template_id, gym_name, owner_name, logo_path, format="feed",
+                 out_path=None, bg_client=None, cache_dir=None):
     """Compose a finished welcome post: cached background + gym logo + text.
 
     This is the onboarding entry point. With a warm background cache it renders a
     real gym's card in a fraction of a second and re-pays no Pro generation.
+    format is 'feed' (1080x1080) or 'story' (1080x1920) off the SAME design system.
     Returns the output PNG path.
     """
     t = get_template(template_id)
+    _fmt_dims(format)  # validate early, fail loud on a bad format
     if out_path is None:
+        suffix = "" if format == "feed" else f"_{format}"
         out_path = os.path.join(_cache_dir(cache_dir),
-                                f"welcome_{template_id}_filled.png")
+                                f"welcome_{template_id}{suffix}_filled.png")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     path, _mode, _text = _render(t, gym_name, owner_name, logo_path, out_path,
-                                 bg_client=bg_client, cache_dir=cache_dir)
+                                 bg_client=bg_client, cache_dir=cache_dir, fmt=format)
     return path
 
 
-def render_blank(template_id, out_path, bg_client=None, cache_dir=None):
+def render_blank(template_id, out_path, bg_client=None, cache_dir=None, format="feed"):
     """The empty template: placeholder fills, no gym logo (shows the calm safe zone
     plate so Blake can see where a gym logo lands)."""
     t = get_template(template_id)
+    _fmt_dims(format)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     path, mode, _text = _render(t, "YOUR GYM NAME", "Owner Name", None, out_path,
-                                bg_client=bg_client, cache_dir=cache_dir)
+                                bg_client=bg_client, cache_dir=cache_dir, fmt=format)
     return path, mode
 
 
@@ -799,22 +1070,42 @@ def make_test_logos(out_dir):
 # ==========================================================================
 
 def slots_dict():
-    """The slots.json v2 structure: per template, the logo safe zone and the fixed
-    text slots, in canvas pixel coords. Onboarding and any external tool read this
-    to know where fields land."""
+    """The slots.json v2 structure: per template, PER FORMAT, the logo safe zone and
+    the text-slot layout, in canvas pixel coords. Onboarding and any external tool
+    read this to know where each field lands in feed (1080x1080) and story
+    (1080x1920)."""
     out = {"canvas": {"w": SIZE, "h": SIZE}, "margin": MARGIN,
            "min_logo_zone_fraction": _MIN_ZONE_FRAC,
            "headline": HEADLINE, "fill_fields": ["gym_name", "owner_name"],
+           "formats": {
+               "feed": {"w": SIZE, "h": SIZE},
+               "story": {"w": STORY_W, "h": STORY_H,
+                         "safe_top": STORY_SAFE_TOP, "safe_bottom": STORY_SAFE_BOTTOM,
+                         "margin": STORY_MARGIN},
+           },
            "kept": [t["id"] for t in active_templates()],
            "templates": {}}
     for t in TEMPLATES:
         zx, zy, zw, zh = t["logo_zone"]
         # matches _compose_text: text sits opposite the zone and stops short of it
         text_side = "left" if zx > SIZE * 0.45 else "right"
+        sx, sy, sw, sh = story_zone(t)
         out["templates"][t["id"]] = {
             "name": t["name"], "direction": t["direction"],
             "base": t["base"], "bg_style": t["bg_style"], "accent": t["accent"],
             "eyebrow": t["eyebrow"],
+            "feed": {
+                "logo_zone": {"x": zx, "y": zy, "w": zw, "h": zh,
+                              "fraction": round(_zone_frac(t["logo_zone"]), 4)},
+                "text_column": text_side,
+            },
+            "story": {
+                "logo_zone": {"x": sx, "y": sy, "w": sw, "h": sh,
+                              "fraction": round(_zone_frac((sx, sy, sw, sh),
+                                                           STORY_W, STORY_H), 4)},
+                "text_column": "full",
+            },
+            # back-compat: keep the flat feed keys the v2 readers already use
             "logo_zone": {"x": zx, "y": zy, "w": zw, "h": zh,
                           "fraction": round(_zone_frac(t["logo_zone"]), 4)},
             "text_column": text_side,

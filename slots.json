@@ -10,6 +10,19 @@
     "gym_name",
     "owner_name"
   ],
+  "formats": {
+    "feed": {
+      "w": 1080,
+      "h": 1080
+    },
+    "story": {
+      "w": 1080,
+      "h": 1920,
+      "safe_top": 288,
+      "safe_bottom": 1632,
+      "margin": 96
+    }
+  },
   "kept": [
     "T1",
     "T2",
@@ -26,6 +39,26 @@
       "bg_style": "editorial_navy",
       "accent": "word",
       "eyebrow": "NOW PARTNERED WITH LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 560,
+          "y": 300,
+          "w": 424,
+          "h": 388,
+          "fraction": 0.141
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 560,
         "y": 300,
@@ -42,6 +75,26 @@
       "bg_style": "editorial_cream",
       "accent": "word",
       "eyebrow": "WELCOME TO THE FAMILY",
+      "feed": {
+        "logo_zone": {
+          "x": 560,
+          "y": 300,
+          "w": 424,
+          "h": 388,
+          "fraction": 0.141
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 560,
         "y": 300,
@@ -58,6 +111,26 @@
       "bg_style": "block_cream",
       "accent": "block",
       "eyebrow": "NEW PARTNER",
+      "feed": {
+        "logo_zone": {
+          "x": 560,
+          "y": 320,
+          "w": 424,
+          "h": 388,
+          "fraction": 0.141
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 560,
         "y": 320,
@@ -74,6 +147,26 @@
       "bg_style": "split_panel",
       "accent": "in_bg",
       "eyebrow": "NOW WORKING WITH LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 566,
+          "y": 300,
+          "w": 420,
+          "h": 420,
+          "fraction": 0.1512
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 566,
         "y": 300,
@@ -90,6 +183,26 @@
       "bg_style": "badge_cream",
       "accent": "rule",
       "eyebrow": "OFFICIAL LASSO PARTNER",
+      "feed": {
+        "logo_zone": {
+          "x": 560,
+          "y": 292,
+          "w": 424,
+          "h": 400,
+          "fraction": 0.1454
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 560,
         "y": 292,
@@ -106,6 +219,26 @@
       "bg_style": "duotone_interior",
       "accent": "word",
       "eyebrow": "NOW PARTNERED WITH LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 566,
+          "y": 300,
+          "w": 420,
+          "h": 400,
+          "fraction": 0.144
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 566,
         "y": 300,
@@ -122,6 +255,26 @@
       "bg_style": "red_streak",
       "accent": "in_bg",
       "eyebrow": "WELCOME TO LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 96,
+          "y": 300,
+          "w": 420,
+          "h": 400,
+          "fraction": 0.144
+        },
+        "text_column": "right"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 96,
         "y": 300,
@@ -138,6 +291,26 @@
       "bg_style": "topo_cream",
       "accent": "word",
       "eyebrow": "NOW PARTNERED WITH LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 560,
+          "y": 300,
+          "w": 424,
+          "h": 400,
+          "fraction": 0.1454
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 560,
         "y": 300,
@@ -154,6 +327,26 @@
       "bg_style": "diagonal_split",
       "accent": "in_bg",
       "eyebrow": "NOW WORKING WITH LASSO",
+      "feed": {
+        "logo_zone": {
+          "x": 96,
+          "y": 300,
+          "w": 420,
+          "h": 400,
+          "fraction": 0.144
+        },
+        "text_column": "right"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 96,
         "y": 300,
@@ -170,6 +363,26 @@
       "bg_style": "celebration",
       "accent": "in_bg",
       "eyebrow": "WELCOME TO THE FAMILY",
+      "feed": {
+        "logo_zone": {
+          "x": 566,
+          "y": 300,
+          "w": 420,
+          "h": 400,
+          "fraction": 0.144
+        },
+        "text_column": "left"
+      },
+      "story": {
+        "logo_zone": {
+          "x": 270,
+          "y": 730,
+          "w": 540,
+          "h": 540,
+          "fraction": 0.1406
+        },
+        "text_column": "full"
+      },
       "logo_zone": {
         "x": 566,
         "y": 300,
