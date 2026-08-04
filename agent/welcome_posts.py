@@ -218,7 +218,7 @@ def resolve_gym(customer, portal_row=None, web_search=None):
     bn = (customer.get("business_name") or "").strip()
     if bn:
         return result(bn, CONFIRMED, "stripe_business_name")
-    if dom:
+    if dom and dom not in _FREEMAIL:
         return result(gym_name_from_domain(dom), INFERRED, "email_domain")
     if web_search:
         found = web_search(customer)
@@ -304,8 +304,9 @@ class StripeReader:
                     prod = getattr(price, "product", None)
                     product_id = getattr(prod, "id", prod) if prod else None
             meta = getattr(cust, "metadata", None) or {}
-            biz = (getattr(meta, "get", lambda k, d=None: None)("business_name")
-                   or getattr(cust, "name", None) or "")
+            # business_name is the Stripe metadata field only — never fall back to
+            # cust.name or the gym_name would become the owner's personal name
+            biz = getattr(meta, "get", lambda k, d=None: None)("business_name") or ""
             web = (getattr(meta, "get", lambda k, d=None: None)("website") or "")
             rec = by_cust.setdefault(cid, {
                 "id": cid,
@@ -424,8 +425,9 @@ def backfill(window_days=45, now=None, reader=None, scraper=None,
             report["already_welcomed"].append(entry)
             continue
 
-        # INFERRED names are surfaced for a yes/no BEFORE any post is generated
-        if gym["confidence"] == INFERRED or not gym["name"]:
+        # Empty name = can't make a card, hold for manual input
+        # INFERRED name from a real domain = generate card, Blake approves/skips in Slack
+        if not gym["name"]:
             entry["template"] = pick_template(key)
             report["needs_confirmation"].append(entry)
             continue

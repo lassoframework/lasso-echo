@@ -206,17 +206,30 @@ def test_backfill_dedupes_two_contacts_one_gym(tmp_path):
     assert len(rep["collapsed"]) == 1
 
 
-def test_backfill_inferred_name_needs_confirmation_no_post(tmp_path):
+def test_backfill_inferred_domain_name_gets_card(tmp_path):
     png = _make_png(tmp_path)
-    # no business name, only a domain => INFERRED => held for yes/no, no post generated
+    # no business name, real domain => INFERRED name inferred from domain => card IS generated
+    # (Blake reviews + approves/skips the INFERRED card in Slack rather than a separate yes/no)
     reader = FakeReader([_cust("c", [_sub(5)], email="o@birddogcrossfit.com",
+                               name="Sam", business_name="")])
+    rep = wp.backfill(now=NOW, reader=reader, scraper=_ok_scraper(png),
+                      portal_lookup=lambda c: None,
+                      out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "bg"))
+    assert len(rep["included"]) == 1
+    assert rep["included"][0]["confidence"] == wp.INFERRED
+    assert not rep["needs_confirmation"]
+
+
+def test_backfill_empty_name_no_name_held_for_confirmation(tmp_path):
+    png = _make_png(tmp_path)
+    # freemail + no business name => name is empty => held (can't generate without a name)
+    reader = FakeReader([_cust("c", [_sub(5)], email="owner@gmail.com",
                                name="Sam", business_name="")])
     rep = wp.backfill(now=NOW, reader=reader, scraper=_ok_scraper(png),
                       portal_lookup=lambda c: None,
                       out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "bg"))
     assert not rep["included"]
     assert len(rep["needs_confirmation"]) == 1
-    assert "posts" not in rep["needs_confirmation"][0]
 
 
 def test_backfill_logo_not_found_surfaces_needs_logo(tmp_path):
