@@ -227,6 +227,31 @@ def welcome_templates_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_WELCOME_TEMPLATES_ENABLED", "false"))
 
 
+def welcome_posts_enabled() -> bool:
+    """
+    Auto welcome-posts-from-new-clients switch. OFF by default. When OFF, the
+    pipeline never runs: no Stripe read, no logo scrape, no card. When ON, a brand
+    new paying client (first-ever subscription in the window, active, on a core
+    tier) gets a feed + story welcome post SURFACED to the approval channel, held
+    for Blake's tap. Nothing here publishes; a client account is never chat-published
+    to. Arm by hand in Railway env only.
+    """
+    return _truthy(os.environ.get("AGENT_WELCOME_POSTS_ENABLED", "false"))
+
+
+# The Stripe secret is read lazily BY NAME (never stored, never logged), same
+# pattern as every other token. Set STRIPE_API_KEY in Railway (a RESTRICTED,
+# read-only key: Customers, Subscriptions, Products, Prices). Empty => the welcome
+# pipeline reports "no Stripe key" and does nothing (it never guesses a roster).
+STRIPE_API_KEY_ENV = "STRIPE_API_KEY"  # name of the env var, not the value
+
+
+def stripe_api_key() -> str:
+    """The Stripe secret, read from env at each call so a rotation takes effect
+    without a reimport. Never logged, never returned in any card or report."""
+    return os.environ.get(STRIPE_API_KEY_ENV, "").strip()
+
+
 def podcast_doc_clips_enabled() -> bool:
     """
     Doc-first clip selection switch. OFF by default. When ON, the podcast clipper

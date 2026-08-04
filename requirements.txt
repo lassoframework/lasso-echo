@@ -14,3 +14,5 @@ google-api-python-client>=2.100  # Podcast auto-ingest Drive pull; imported lazi
 google-auth>=2.30  # Service-account creds for the Drive pull; imported lazily in podcast_source.py
 higgsfield-client>=0.1  # Higgsfield headless b-roll rendering; imported lazily in higgsfield_renderer.py
 httpx>=0.21,<0.29  # Required by higgsfield-client SDK
+
+stripe>=9.0  # Welcome pipeline: read-only customers/subscriptions for new-client detection (imported lazily in welcome_posts.py)

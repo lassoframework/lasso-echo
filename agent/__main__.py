@@ -127,6 +127,7 @@ def _status():
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
+    print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
     print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
     print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
     _sapi_key = config.socialapi_key()
@@ -755,6 +756,7 @@ _COMMANDS = {
         ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
         ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
+        ("welcome-backfill", "pull brand-new clients (last N days by subscription), scrape logos, make feed+story welcomes, surface held (--days/--post/--dry-run)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "podcast & opus (cont.)": [
@@ -1182,6 +1184,72 @@ def _welcome_client(args):
     PendingStore().put(draft)
     SlackPoster().post_approval_card(draft)
     print(f"welcome-client: held for approval (draft {did}). Nothing published.")
+
+
+def _welcome_backfill(args):
+    """python -m agent welcome-backfill [--days N] [--post] [--dry-run]
+
+    One-time (and re-runnable) pull of BRAND NEW paying clients from the last N days
+    (default 45), by SUBSCRIPTION not customer.created. Resolves each gym, scrapes a
+    logo, generates feed + story welcome posts, and (with --post) surfaces them to the
+    approval channel HELD for Blake's tap. Nothing publishes; a client account is
+    never published to. Requires AGENT_WELCOME_POSTS_ENABLED and STRIPE_API_KEY.
+    """
+    if not config.welcome_posts_enabled():
+        print("welcome-backfill: OFF (set AGENT_WELCOME_POSTS_ENABLED=true). Nothing done.")
+        return
+    from . import welcome_posts as _wp
+    days = 45
+    do_post = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--days" and i + 1 < len(args):
+            days = int(args[i + 1]); i += 2; continue
+        if a == "--post":
+            do_post = True; i += 1; continue
+        if a == "--dry-run":
+            do_post = False; i += 1; continue
+        i += 1
+
+    reader = _wp.StripeReader()
+    if not reader.available():
+        print("welcome-backfill: STRIPE_API_KEY not set (restricted read-only). "
+              "Nothing read; roster not guessed.")
+        return
+    print(f"welcome-backfill: reading Stripe, window {days} days ...")
+    report = _wp.backfill(window_days=days, reader=reader)
+
+    inc, exc = report["included"], report["excluded"]
+    print(f"\n=== WELCOME BACKFILL (last {days} days) ===")
+    print(f"included (ready): {len(inc)}   needs-confirm: {len(report['needs_confirmation'])}"
+          f"   needs-logo: {len(report['needs_logo'])}   excluded: {len(exc)}"
+          f"   collapsed: {len(report['collapsed'])}   already-welcomed: {len(report['already_welcomed'])}")
+    for g in inc:
+        print(f"  NEW  {g['name']:<28} {g['confidence']:<9} tier={g['tier_label']:<7} "
+              f"start={_wp._fmt_date(g['start_date'])} tmpl={g['template']} logo={g['logo']['source']}")
+    for g in report["needs_confirmation"]:
+        print(f"  ?    {g['name'] or '(unknown)':<28} INFERRED via {g['source']} - confirm y/n")
+    for g in report["needs_logo"]:
+        print(f"  LOGO {g['name']:<28} needs a manual logo ({g['logo']['note']})")
+    for e in exc:
+        print(f"  skip {(e.get('email') or e['customer']):<28} {e['status']} - {e['reason']}")
+
+    if not do_post:
+        print("\nDry run. Re-run with --post to host + surface to the approval channel.")
+        return
+    tok = os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
+    ch = os.environ.get("AGENT_SLACK_CHANNEL_ID", "")
+    if not (tok and ch and config.hosting_enabled()):
+        print("welcome-backfill: need AGENT_SLACK_BOT_TOKEN + AGENT_SLACK_CHANNEL_ID + "
+              "AGENT_HOSTING_ENABLED to surface. Generated locally only.")
+        return
+    from .slack_surface import SlackPoster
+    from .media_host import host_media
+    poster = SlackPoster(token=tok, channel=ch)
+    summary = _wp.surface_to_slack(report, poster, host_media, channel=ch)
+    print(f"welcome-backfill: surfaced {summary.get('posted', 0)} welcome post(s), "
+          f"held for approval. Nothing published.")
 
 
 def _dt_today():
@@ -2323,6 +2391,8 @@ def main(argv=None):
         _welcome_templates(argv[1:])
     elif cmd == "welcome-client":
         _welcome_client(argv[1:])
+    elif cmd == "welcome-backfill":
+        _welcome_backfill(argv[1:])
     elif cmd == "podcast-quote-card":
         _podcast_quote_card(argv[1:])
     elif cmd in ("help", "--help", "-h"):
