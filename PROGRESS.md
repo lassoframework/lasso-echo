@@ -6,7 +6,52 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-07-22
+Last updated: 2026-08-04
+
+---
+
+## Welcome story format + auto welcome posts + chat-publish (2026-08-04, SHA 102f11c)
+
+Three builds landed on main today, each behind an OFF-by-default flag, built to the
+big-build protocol (independent audit -> fix wave -> re-audit to zero CRITICAL/MAJOR).
+Suite 1782 -> 1928 green (+146 tests). Fresh audit agents (not the builders) verified
+each; the re-audit returned zero CRITICAL/MAJOR.
+
+### [x] Welcome templates now ship feed + story (9:16) — SHA 1f2a364
+`make_welcome(template_id, gym, owner, logo, format="feed"|"story")`. Feed 1080x1080
+unchanged (byte-identical); story 1080x1920 with a background REGENERATED native to the
+tall frame (not a crop), a vertical stack (eyebrow, WELCOME TO LASSO larger, centered
+logo plate in the middle third, gym name, owner, footer), safe band 15-85% clear of the
+top/bottom 250px, logo zone 14% of canvas. `slots.json` v2 carries per-format coords.
+Fixed: red-region check now preserves aspect on the tall frame; a shared height-clamped
+bottom-block fitter keeps a long two-line gym name inside the safe band, and the story
+grade guard measures the composed block (not just static geometry).
+
+### [x] Auto welcome posts from new clients — SHA 976ee67 (flag AGENT_WELCOME_POSTS_ENABLED)
+`agent/welcome_posts.py` + `agent/website_scan.py` (logo scraper). Brand-new-client is
+defined by SUBSCRIPTION (first-ever sub in window, active, not canceled, on a core tier
+Launch/Ascend/Apex), NOT customer.created (skips sponsors). Guards: delinquent excluded,
+dedupe by gym, kv ledger (never twice, stamped on surface), owner title-cased, CONFIRMED
+vs INFERRED (INFERRED held for yes/no before any post). Logo scrape order og:image ->
+nav img -> apple-touch-icon -> /logo/i, white/black knockout, <200px+favicon reject,
+stored on /data, portal-drop override wins. Generates feed+story rotating the 6 kept
+templates, surfaces held to the approval channel. NOTHING publishes. CLI: welcome-backfill.
+- Action required by Blake (Railway): STRIPE_API_KEY (restricted read-only; copy from the
+  Vercel "portal" project env) + AGENT_WELCOME_POSTS_ENABLED=true to run the 45-day backfill.
+
+### [x] Chat can publish, scoped by account ownership — SHA 7b563be (flag AGENT_CHAT_PUBLISH_ENABLED)
+Flag-gated @app.message handler. LASSO accounts (lasso_ig/lasso_fb/blake_personal):
+explicit publish verb -> direct publish + permalink. Client accounts: draft+schedule
+only, never chat-published. Generation words never publish; ambiguous -> one question;
+undo within 5 min (LASSO only, best-effort; FB deletable, IG -> manual). Only Blake's
+Slack id; fabrication + dash/vendor gate before every chat publish; draft-only returns an
+honest "would_publish". Requires AGENT_PUBLISH_ENABLED for a real Meta write.
+- Action required by Blake (Railway): AGENT_CHAT_PUBLISH_ENABLED=true when ready.
+
+### chore
+Removed accidentally-tracked agent-tooling/worktree/cache files (SHA 102f11c) and
+gitignored them; kept summit_render.py/summit_rebuild.py/summit_logo.png (real imports of
+welcome_templates + podcast_quote_card that had been untracked, so Railway needs them).
 
 ---
 
