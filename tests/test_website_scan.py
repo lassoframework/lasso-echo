@@ -39,9 +39,11 @@ def test_candidate_order_prefers_og_image():
     '''
     c = ws.logo_candidates(html, "https://x.com/")
     order = [why for _u, why in c]
-    assert order[0] == "og:image"
+    # logo-tagged header img must beat og:image (og:image is last resort on fitness sites)
     assert "header-img" in order
     assert "apple-touch-icon" in order
+    assert "og:image" in order
+    assert order.index("header-img") < order.index("og:image")
 
 
 def test_absolute_and_relative_urls_resolved():

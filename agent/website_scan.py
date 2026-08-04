@@ -110,7 +110,12 @@ def _attr(tag, name):
 
 def logo_candidates(html, base_url):
     """Ordered, de-duplicated absolute candidate URLs for the site's logo, best
-    first. Pure function over the HTML so it is trivially testable."""
+    first. Pure function over the HTML so it is trivially testable.
+
+    Priority: logo-tagged img > apple-touch-icon > logo-url > og:image (last resort).
+    og:image is a social-share hero — on fitness sites it is almost always an action
+    photo, not the brand mark. Only use it when nothing else exists.
+    """
     cands = []
 
     def add(u, why):
@@ -120,30 +125,35 @@ def logo_candidates(html, base_url):
         if absu not in [c[0] for c in cands]:
             cands.append((absu, why))
 
-    # 1. og:image
-    for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
-        prop = (_attr(tag, "property") or _attr(tag, "name")).lower()
-        if prop in ("og:image", "og:image:url", "twitter:image"):
-            add(_attr(tag, "content"), "og:image")
+    og_images = []
 
-    # 2. a header/nav <img> that looks like a logo
+    # 1. a header/nav <img> that looks like a logo (class/id/alt contains "logo")
     for tag in re.findall(r"<img\b[^>]*>", html, re.I):
         blob = " ".join([_attr(tag, "src"), _attr(tag, "class"),
                          _attr(tag, "id"), _attr(tag, "alt")]).lower()
         if "logo" in blob:
             add(_attr(tag, "src") or _attr(tag, "data-src"), "header-img")
 
-    # 3. apple-touch-icon
+    # 2. apple-touch-icon
     for tag in re.findall(r"<link\b[^>]*>", html, re.I):
         rel = _attr(tag, "rel").lower()
         if "apple-touch-icon" in rel:
             add(_attr(tag, "href"), "apple-touch-icon")
 
-    # 4. anything whose URL path matches /logo/i (img src or link href)
+    # 3. anything whose URL path matches /logo/i
     for tag in re.findall(r"<(?:img|link)\b[^>]*>", html, re.I):
         u = _attr(tag, "src") or _attr(tag, "href") or _attr(tag, "data-src")
         if u and re.search(r"logo", u, re.I):
             add(u, "logo-url")
+
+    # 4. og:image / twitter:image — last resort; often a hero photo on fitness sites
+    for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
+        prop = (_attr(tag, "property") or _attr(tag, "name")).lower()
+        if prop in ("og:image", "og:image:url", "twitter:image"):
+            og_images.append(_attr(tag, "content"))
+
+    for u in og_images:
+        add(u, "og:image")
 
     return cands
 
@@ -263,6 +273,13 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small {img.size}"))
             continue
+        # og:image is typically a landscape hero photo (e.g. 1200×630).
+        # Reject it when wider than 2.2:1 — real logos are square-ish or vertical.
+        if why == "og:image" and img.size[1] > 0:
+            ratio = img.size[0] / img.size[1]
+            if ratio > 2.2:
+                tried.append((why, f"landscape photo rejected ({img.size[0]}×{img.size[1]})"))
+                continue
         img = _trim_alpha(_knockout_bg(img))
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small after trim {img.size}"))
