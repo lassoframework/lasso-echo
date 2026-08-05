@@ -246,3 +246,47 @@ def test_every_cta_is_an_approved_lasso_now_cta():
     for post in dcq.DEMO_POSTS:
         assert post["cta"] in lasso_now, \
             f"post {post['num']} CTA is not an approved lasso_now CTA: {post['cta']!r}"
+
+
+# ---- card-only gate: demo posts ALWAYS card, never auto-publish -------------------------
+
+def test_demo_feed_and_story_drafts_force_approval(armed, monkeypatch, tmp_path):
+    """Every demo draft carries force_approval=True so it cards for approve/deny/edit
+    even when AGENT_AUTO_APPROVE_ENABLED is armed."""
+    _seed_manifest(monkeypatch, tmp_path)
+    feed = dcq.build_demo_calendar_draft(_ig(), _STORY_DAY)
+    assert feed is not None and feed.force_approval is True
+    story = dcq.build_demo_calendar_story_draft(_ig(), _STORY_DAY, feed_draft=feed)
+    assert story is not None and story.force_approval is True
+
+
+def test_force_approval_draft_cards_even_when_auto_approve_armed(monkeypatch):
+    """_post_and_save must NOT auto-publish a force_approval draft: it cards and stays
+    PENDING even with auto-approve (and trust autopublish) on. Guards the gate."""
+    from agent import runner, config
+    from agent.drafter import Draft, DraftStatus
+
+    monkeypatch.setattr(config, "auto_approve_enabled", lambda: True)
+    monkeypatch.setattr(config, "trust_dryrun_enabled", lambda: False)
+    monkeypatch.setattr(config, "trust_autopublish_enabled", lambda: False)
+
+    class _Poster:
+        def __init__(self): self.cards = []; self.notices = []
+        def post_approval_card(self, d): self.cards.append(d); return {"ok": True, "channel": "c", "ts": "t"}
+        def post_notice(self, m): self.notices.append(m)
+
+    class _Store:
+        def __init__(self): self.saved = []
+        def put(self, d): self.saved.append(d)
+
+    d = Draft(draft_id="demof_x", account_key="lasso_ig", platform="instagram",
+              caption="hook\n\nbody\n\ncta", hashtags=[], creative_path="x.png",
+              creative_public_url="https://cdn.test/x.png",
+              scheduled_for="2026-08-10T18:30:00Z", status=DraftStatus.PENDING,
+              day_key="2026-08-10", draft_type="feed", force_approval=True)
+    poster, store = _Poster(), _Store()
+    runner._post_and_save(d, store, poster, idempotent=False)
+
+    assert d.status == DraftStatus.PENDING          # never auto-approved/published
+    assert d in poster.cards                          # carded for a human
+    assert not poster.notices                          # no "Auto-published" notice

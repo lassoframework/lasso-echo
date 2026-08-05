@@ -465,6 +465,9 @@ def build_demo_calendar_draft(account, day_key):
         status=DraftStatus.PENDING,
         day_key=day_key,
         draft_type="feed",
+        # DEMO = always card for approve/deny/edit, never auto-publish, even when
+        # AGENT_AUTO_APPROVE_ENABLED is armed. Blake reviews every demo post.
+        force_approval=True,
     )
 
 
@@ -498,6 +501,7 @@ def build_demo_calendar_story_draft(account, day_key, feed_draft=None):
         day_key=day_key,
         draft_type="story",
         is_story=True,
+        force_approval=True,
     )
 
 

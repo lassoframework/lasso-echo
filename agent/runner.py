@@ -141,7 +141,8 @@ def _post_and_save(draft, store, poster, idempotent):
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
     # entirely. Drafts publish at schedule time; a lightweight notice goes to Slack
     # so Blake can see what went out without needing to tap anything.
-    if draft.status.value == "pending" and config.auto_approve_enabled():
+    if (draft.status.value == "pending" and config.auto_approve_enabled()
+            and not getattr(draft, "force_approval", False)):
         from . import db, postlog
         from .accounts import get_account
         from .meta_publisher import publish
@@ -162,7 +163,7 @@ def _post_and_save(draft, store, poster, idempotent):
             store.put(draft)
             return
     # Trust ladder wiring (both flags default OFF; nothing changes while off).
-    if draft.status.value == "pending" and (
+    if draft.status.value == "pending" and not getattr(draft, "force_approval", False) and (
             config.trust_dryrun_enabled() or config.trust_autopublish_enabled()):
         from . import db
         from .accounts import get_account
