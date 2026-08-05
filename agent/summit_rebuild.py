@@ -97,15 +97,14 @@ SUMMIT_CONCEPTS = [
         "eyebrow": "FUNNEL DIAGNOSTIC",
         "headline": "MORE AD SPEND WILL NOT FIX A BROKEN FUNNEL",
         "red_word": "BROKEN",
-        "deck": "Walk the four legs in order. The first fail is where 2027 hides.",
+        "deck": "Walk the three legs in order. The weakest is where 2027 hides.",
         "treatment_a": "navy canvas, oversized Anton headline with red BROKEN, single depth wash",
-        "treatment_b": "navy canvas, four labeled bars CLOSE 70, SHOW 50, BOOKING 50, LEAD VOLUME 40, one red accent on the first failing bar only",
+        "treatment_b": "navy canvas, three labeled bars LEADS TO BOOK 40, BOOK TO SHOW 50, SHOW TO CLOSE 70, one red accent on the weakest bar only",
         "caption": (
             "More ad spend will not fix a broken funnel.\n\n"
-            "Walk the four legs in order and stop at the first one that fails. Close "
-            "rate at 70 percent or better. Show rate at 50. Booking at 50. Lead volume "
-            "at 40.\n\n"
-            "Fix the broken leg. Then scale.\n\n"
+            "Walk the three legs and stop at the weakest one. Leads to book at 40 "
+            "percent or better. Book to show at 50. Show to close at 70.\n\n"
+            "Fix the weakest leg. Then scale.\n\n"
             "We build this together in Nashville.\n"
             "lassoframework.com/summit"
         ),

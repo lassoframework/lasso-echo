@@ -207,6 +207,14 @@ def test_carousel_publish_flow_when_armed(monkeypatch):
                     return {"id": "CID"}
             return R()
 
+        def get(self, url, params=None, timeout=None, **k):
+            # container status poll -> FINISHED; not recorded so the POST count holds
+            class R:
+                status_code = 200
+                def json(self_inner):
+                    return {"status_code": "FINISHED"}
+            return R()
+
     http = CaptureHTTP()
     d = Draft(draft_id="d", account_key="k", platform="instagram", caption="cap",
               hashtags=[], creative_path="/f", creative_public_url="",

@@ -60,6 +60,17 @@ class RecordingHTTP:
 
         return R()
 
+    def get(self, url, params=None, timeout=None, **k):
+        # container status poll; report FINISHED so publish proceeds. Not recorded
+        # in self.calls so the POST-shape assertions stay on the create/publish pair.
+        class R:
+            status_code = 200
+
+            def json(self):
+                return {"status_code": "FINISHED"}
+
+        return R()
+
 
 def _acct(platform=Platform.INSTAGRAM, key="lasso_ig"):
     return Account(key=key, display_name=key, platform=platform,

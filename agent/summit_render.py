@@ -257,8 +257,8 @@ _B_ELEMENTS = {
                            "The funnel diagnostic", "Offer and positioning",
                            "Lead generation", "The sales system", "Retention",
                            "Team and leadership", "Client value", "Capacity and pricing"]),
-    "04_funnel": ("bars", [("CLOSE RATE", 70), ("SHOW RATE", 50),
-                           ("BOOKING", 50), ("LEAD VOLUME", 40)]),
+    "04_funnel": ("bars", [("LEADS TO BOOK", 40), ("BOOK TO SHOW", 50),
+                           ("SHOW TO CLOSE", 70)]),
     "05_math": ("steps", ["Set your 2027 revenue target",
                           "Subtract today. That gap is the work",
                           "Divide by revenue per member",
@@ -327,10 +327,10 @@ POINTS = {
                   "The funnel diagnostic and the member math",
                   "Offer, positioning, and lead generation",
                   "Sales system, retention, team, and pricing"],
-    "04_funnel": ["Close rate 70%+ is the first leg",
-                  "Show rate 50%+ and booking 50%+",
-                  "Lead volume 40%+ comes last",
-                  "Fix the broken leg, then scale"],
+    "04_funnel": ["Leads to book 40%+ is leg one",
+                  "Book to show 50%+ is leg two",
+                  "Show to close 70%+ is leg three",
+                  "Fix the weakest leg, then scale"],
     "05_math": ["Set your 2027 revenue target",
                 "Subtract where you are today",
                 "Divide by revenue per member",
@@ -426,8 +426,8 @@ def render_card(concept, treatment, out_path, canvas=None, bg_path=None):
 
     if treatment == "a":
         red_tokens = set(w.strip(".,").upper() for w in concept["red_word"].split())
-        # cap the headline (3 lines / smaller) so the dense content band + strip fit
-        hf, lines = _fit(d, concept["headline"].upper(), cw, 3, 96)
+        # headline fills the top (big for short headlines; long ones auto-reduce to 3 lines)
+        hf, lines = _fit(d, concept["headline"].upper(), cw, 3, 104)
         y = _headline(d, MARGIN, y + 6, lines, hf, red_tokens, ink, shadow=bool(bg_path))
         y += 14
         df = _f(MONT_SB, 33)
@@ -447,7 +447,10 @@ def render_card(concept, treatment, out_path, canvas=None, bg_path=None):
         strip_y = SIZE - MARGIN - 60
         row = _POINT_ROW
         if len(pts) > 1:
-            row = max(46, min(_POINT_ROW, (strip_y - 58 - y) // (len(pts) - 1)))
+            # Spread the points to fill without crowding: comfortable pitch (cap 92) so
+            # short cards are not airy-empty and dense cards are not crammed; floor keeps
+            # the last point clear of the strip under a tall headline.
+            row = max(58, min(92, (strip_y - 56 - y) // (len(pts) - 1)))
         _points_band(d, y, pts, ink, row=row, on_photo=bool(bg_path))
         _fact_strip(d, strip_y, DEFAULT_FACTS, ink, on_photo=bool(bg_path))
     else:
@@ -504,3 +507,88 @@ def render_all(out_dir, bg_dir=None):
             render_card(c, t, p, bg_path=bg)
             paths.append(p)
     return paths
+
+
+# ---- speaker reveal cards (real headshot, type-led fallback if missing) -----
+
+def _cover(src, w, h):
+    src = src.convert("RGB")
+    sw, sh = src.size
+    scale = max(w / sw, h / sh)
+    src = src.resize((max(1, int(sw * scale)), max(1, int(sh * scale))))
+    nw, nh = src.size
+    return src.crop(((nw - w) // 2, (nh - h) // 2, (nw - w) // 2 + w, (nh - h) // 2 + h))
+
+
+def _rounded(img, radius):
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, img.size[0] - 1, img.size[1] - 1],
+                                           radius=radius, fill=255)
+    out = img.convert("RGBA")
+    out.putalpha(mask)
+    return out
+
+
+def render_reveal(name, track, company, session, points, out_path,
+                  headshot=None, red_name=None):
+    """Speaker reveal: real headshot top-right, name + company top-left, the verbatim
+    session title and 4+ points full width below, on clean navy. Never a generated face;
+    if no headshot resolves it falls back to a wider type-led name block."""
+    img = Image.new("RGB", (SIZE, SIZE), NAVY)
+    d = ImageDraw.Draw(img)
+    PW, PH = 400, 410
+    px, py = SIZE - MARGIN - PW, MARGIN + 4
+    has_photo = bool(headshot) and os.path.isfile(headshot)
+    if has_photo:
+        photo = _rounded(_cover(Image.open(headshot), PW, PH), 28)
+        img.paste(photo, (px, py), photo)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([px, py, px + PW, py + PH], radius=28, outline=(70, 92, 120), width=2)
+
+    lx = MARGIN
+    lw = (px - MARGIN - 44) if has_photo else (SIZE - 2 * MARGIN)
+    y = MARGIN + 6
+    _tracked(d, (lx, y), track.upper(), _f(OSWALD_B, 28), SKY, 5)
+    y += 58
+    red_tokens = {(red_name or name.split()[-1]).upper()}
+    hf, lines = _fit(d, name.upper(), lw, 3, 88)
+    y = _headline(d, lx, y, lines, hf, red_tokens, WHITE)
+    y += 12
+    cf = _f(MONT_SB, 26)
+    for ln in _wrap(d, company, cf, lw):
+        d.text((lx, y), ln, font=cf, fill=(212, 220, 232))
+        y += 34
+
+    y = max(y, py + PH) + 18
+    _tracked(d, (MARGIN, y), "SPEAKING ON", _f(OSWALD_B, 24), SKY, 4)
+    y += 44
+    sf = _f(OSWALD_B, 36)
+    for ln in _wrap(d, session, sf, SIZE - 2 * MARGIN):
+        d.text((MARGIN, y), ln, font=sf, fill=WHITE)
+        y += 46
+    y += 14
+
+    strip_top = SIZE - MARGIN - 88
+    # auto-fit: shrink the point font until all points clear the strip, even with wraps
+    fs = 28
+    while fs >= 22:
+        rf = _f(MONT_SB, fs)
+        lh = fs + 10
+        heights = [max(1, len(_wrap(d, r, rf, SIZE - 2 * MARGIN - 46))) * lh for r in points]
+        if y + sum(heights) + 8 * len(points) <= strip_top - 6 or fs == 22:
+            break
+        fs -= 2
+    gap = max(6, min(48, (strip_top - 12 - y - sum(heights)) // max(len(points), 1)))
+    for i, r in enumerate(points):
+        rl = _wrap(d, r, rf, SIZE - 2 * MARGIN - 46)
+        d.ellipse([MARGIN, y + 6, MARGIN + 18, y + 24], outline=SKY, width=3)
+        d.line([MARGIN + 4, y + 15, MARGIN + 8, y + 20], fill=SKY, width=3)
+        d.line([MARGIN + 8, y + 20, MARGIN + 15, y + 9], fill=SKY, width=3)
+        for j, ln in enumerate(rl):
+            d.text((MARGIN + 44, y + j * (fs + 10)), ln, font=rf, fill=(226, 232, 242))
+        y += heights[i] + gap
+
+    _fact_strip(d, strip_top, DEFAULT_FACTS, WHITE, on_photo=False)
+    _footer(d, WHITE, MUTE_NAVY)
+    img.save(out_path)
+    return out_path

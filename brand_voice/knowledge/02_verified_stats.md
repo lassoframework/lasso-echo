@@ -86,6 +86,15 @@ Rule: only lines marked USE are postable. Wording must match exactly.
 - RULE: public book CLAIMS come only from the waitlist page (above). Captions may draw VOICE from the
   Full Gym Google Doc, but no claim beyond this page. Cover art = the real cover asset only, never generated.
 
+## SUMMIT SPEAKERS — receipts (page-verified 2026-08-04). Each stat belongs to the SPEAKER, attributed to them, NEVER restated as a LASSO stat.
+- USE (Stu Brauer, Founder WTF Gym Talk & The Gym Real Estate Co.): "The #1 gym owner media platform. Advises owners on real estate and long term wealth." Session: "Scaling for Success: From Operator to Owner."
+- USE (Jeff Smith, Founder Tactical Empire): "Trained 500+ gym owners on leadership and team building. Creator of the Tactical Empire leadership framework." Session: "Leadership That Scales: From Coach to CEO."
+- USE (Andrew Charlesworth, CrossFit Affiliate Rep Midwest): "Direct line to affiliate performance data across the Midwest. Advises owners on positioning and market evolution." Session: "State of the Industry."
+- USE (Nicole Aucoin, Founder Healthy Steps Nutrition): "Helped 2,000+ gyms add nutrition coaching revenue. HSN clients average $8K+ per month in ancillary income." Session: "Increasing LTV Through Ancillary Services."
+- USE (Brian Alexander, Hiring & Operations Expert): "Developed the hiring framework used by 200+ gym operators. Reduced average time to hire by 60% for gym clients." Session: "Building a Predictable Hiring Machine."
+- USE (LASSO faculty sessions, agenda-verbatim): Blake Ruff "Meta Ads in 2026: What's Working Now (and What's Dead)"; Tommy Allen "The Math Behind Scaling: Know Your Levers"; Scott Rammage (Founder Hire VP) "Hiring That Scales Your Gym".
+- RULE: Jeff's 500+ is HIS training count and Nicole's 2,000+ is HERS; never conflate with LASSO's own "1,000+ gym owners." Speaker numbers stay on that speaker's card only.
+
 ## LOCKED — conflicts, do not post until Blake resolves
 - RESOLVED 2026-08-04 (Blake FINAL): gyms served = "1,000+ gym owners" everywhere.
   200+/400+/500+/700+ all retired from social assets. Use "1,000+" only.

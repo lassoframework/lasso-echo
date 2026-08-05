@@ -213,12 +213,12 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
     _raise_for_status(rp)
     parent_id = rp.json().get("id")
 
-    r2 = client.post(
-        f"{base}/{ig_id}/media_publish",
-        data={"creation_id": parent_id, "access_token": token},
-        timeout=30,
-    )
-    _raise_for_status(r2)
+    # Wait for the CAROUSEL parent to finish processing, then publish with the shared
+    # 9007 retry, or Meta returns "media not ready" (same fix as feed/story/reel).
+    _await_container_ready(client, base, parent_id, token, label="carousel",
+                           max_tries=IMG_POLL_MAX_TRIES, interval=IMG_POLL_INTERVAL_SEC,
+                           grace=POST_FINISH_GRACE_SEC)
+    r2 = _publish_container(client, base, ig_id, parent_id, token)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 
@@ -371,12 +371,13 @@ def _publish_instagram_story(client, account, draft, token):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
-    r2 = client.post(
-        f"{base}/{ig_id}/media_publish",
-        data={"creation_id": container_id, "access_token": token},
-        timeout=30,
-    )
-    _raise_for_status(r2)
+    # STORIES containers are processed asynchronously just like feed media: publishing
+    # immediately returns 9007 "media not ready". Poll to FINISHED, then publish through
+    # the shared 9007 retry (same as the feed path). This is what stopped posts going out.
+    _await_container_ready(client, base, container_id, token, label="story",
+                           max_tries=IMG_POLL_MAX_TRIES, interval=IMG_POLL_INTERVAL_SEC,
+                           grace=POST_FINISH_GRACE_SEC)
+    r2 = _publish_container(client, base, ig_id, container_id, token)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 

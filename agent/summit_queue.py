@@ -74,10 +74,10 @@ SUMMIT_POSTS = [
         "filename": "week04_v2_funnel.png",
         "caption": (
             "More ad spend will not fix a broken funnel.\n\n"
-            "Walk the four legs in order. The first fail is where 2027 hides.\n\n"
-            "Close rate at 70% or above. Show rate at 50% or above. Booking "
-            "behavior at 50% or above. Lead volume at 40% or above.\n\n"
-            "Fix the leg that is broken. Then scale.\n\n"
+            "Walk the three legs in order. The weakest is where 2027 hides.\n\n"
+            "Leads to book at 40% or above. Book to show at 50% or above. Show to "
+            "close at 70% or above.\n\n"
+            "Fix the weakest leg. Then scale.\n\n"
             "We build this together in Nashville. November 7 and 8.\n\n"
             "lassoframework.com/summit"
         ),
