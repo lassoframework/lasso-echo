@@ -2425,6 +2425,7 @@ def main(argv=None):
         from .summit_queue import run as _sq_run
         _images_dir = None
         _from_manifest = False
+        _sprint = False
         _sq_args = argv[1:]
         i = 0
         while i < len(_sq_args):
@@ -2432,8 +2433,10 @@ def main(argv=None):
                 _images_dir = _sq_args[i + 1]; i += 2; continue
             if _sq_args[i] == "--from-manifest":
                 _from_manifest = True; i += 1; continue
+            if _sq_args[i] == "--sprint":
+                _sprint = True; i += 1; continue
             i += 1
-        _sq_run(images_dir=_images_dir, from_manifest=_from_manifest)
+        _sq_run(images_dir=_images_dir, from_manifest=_from_manifest, sprint=_sprint)
     elif cmd == "book-queue":
         from .book_queue import run as _bq_run
         _images_dir = None
