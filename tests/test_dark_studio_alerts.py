@@ -72,8 +72,9 @@ def test_story_dark_studio_fires_ops_alert(monkeypatch, tmp_path):
     result = stories.build_story_draft(
         _acct(), "2026-07-01", feed_draft=feed, s3_client=FakeS3(),
     )
-    # Story still returns (using feed image fallback), but alert fires
-    assert result is not None
+    # Dark studio + no premade 9:16 sibling: the Story is SKIPPED (never a cropped
+    # feed card), and one ops alert fires naming the skipped story + the studio.
+    assert result is None
     alerts = [n for n in poster.notices if "ECHO ALERT:" in n]
     assert len(alerts) == 1
     assert "story" in alerts[0].lower()

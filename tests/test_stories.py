@@ -97,21 +97,37 @@ def test_flag_off_generates_no_story_drafts(monkeypatch):
     assert stories.build_story_draft(_acct(), DAY, feed_draft=_feed_draft()) is None
 
 
-# ---- 2. flag ON -> one PENDING Story per account, labeled, held --------------
-def test_flag_on_pending_story_per_account(monkeypatch):
+# ---- 2. flag ON -> one PENDING Story per account, from a GENUINE 9:16 asset ---
+def test_flag_on_pending_story_per_account(monkeypatch, tmp_path):
+    # A Story is only ever built from a genuine 9:16 asset, never a reused feed
+    # card. Provide a premade *_story sibling on disk so a real 9:16 asset exists,
+    # and assert the Story is produced from THAT (not the 4:5 feed image).
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
-    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)     # generation off:
-    monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)  # reuse feed image
+    monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")  # use the *_story sibling
+    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)    # no generation
+    monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)
+    # host_media returns a public URL for the genuine 9:16 sibling.
+    monkeypatch.setattr(
+        stories.media_host, "host_media",
+        lambda path, tenant, client=None: f"https://cdn.test/{os.path.basename(path)}",
+    )
     for platform, key in ((Platform.INSTAGRAM, "lasso_ig"),
                           (Platform.FACEBOOK_PAGE, "lasso_fb")):
-        fd = _feed_draft(account_key=key, platform=platform)
+        feed_png = tmp_path / f"nano_{key}.png"
+        feed_png.write_bytes(b"\x89PNG\r\n\x1a\nFEED")
+        story_png = tmp_path / f"nano_{key}_story.png"      # the genuine 9:16 sibling
+        story_png.write_bytes(b"\x89PNG\r\n\x1a\nSTORY")
+        fd = _feed_draft(account_key=key, platform=platform,
+                         creative_path=str(feed_png))
         story = stories.build_story_draft(_acct(platform, key), DAY, feed_draft=fd)
         assert story is not None
         assert story.is_story is True
         assert story.status == DraftStatus.PENDING       # held for approval
         assert story.caption == "" and story.hashtags == []
-        # reuses the day's approved creative, never invents one
-        assert story.creative_public_url == fd.creative_public_url
+        # built from the genuine 9:16 sibling, NOT the 4:5 feed image
+        assert story.creative_path == str(story_png)
+        assert story.creative_path != fd.creative_path
+        assert story.creative_public_url == f"https://cdn.test/{story_png.name}"
         # every fragment traces to the feed draft's approved text
         assert story.source_fragments == fd.source_fragments
 
@@ -173,9 +189,18 @@ def test_story_layout_true_vertical_feed_unchanged():
 
 
 # ---- 4. the card is clearly labeled STORY ------------------------------------
-def test_story_card_labeled(monkeypatch):
+def test_story_card_labeled(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
-    story = stories.build_story_draft(_acct(), DAY, feed_draft=_feed_draft())
+    monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
+    monkeypatch.setattr(
+        stories.media_host, "host_media",
+        lambda path, tenant, client=None: "https://cdn.test/story.png",
+    )
+    feed_png = tmp_path / "nano_leads_go_cold.png"
+    feed_png.write_bytes(b"\x89PNG\r\n\x1a\nFEED")
+    (tmp_path / "nano_leads_go_cold_story.png").write_bytes(b"\x89PNG\r\n\x1a\nSTORY")
+    story = stories.build_story_draft(
+        _acct(), DAY, feed_draft=_feed_draft(creative_path=str(feed_png)))
     blocks = build_card_blocks(story)
     header = blocks[0]["text"]["text"]
     assert "STORY" in header
@@ -239,13 +264,20 @@ def test_runner_flag_off_no_story_cards(monkeypatch, tmp_path):
 
 def test_runner_flag_on_one_story_card_per_account(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
-    # Stories require a public URL. Provide one via the creative sidecar so the
-    # feed draft carries it and build_story_draft can create the story draft.
+    # A Story needs a GENUINE 9:16 asset. Provide a premade *_story sibling next to
+    # the day's library creative so build_story_draft has a real vertical asset to
+    # use (never a reused/cropped feed image), and a public URL for it.
+    monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
+    monkeypatch.setattr(
+        stories.media_host, "host_media",
+        lambda path, tenant, client=None: "https://cdn.test/asset_story.png",
+    )
     lib = tmp_path / "lib"
     lib.mkdir(exist_ok=True)
     (lib / "asset.json").write_text(
         '{"public_url": "https://cdn.test/asset.png"}', encoding="utf-8"
     )
+    (lib / "asset_story.png").write_bytes(b"\x89PNG\r\n\x1a\nSTORY")  # genuine 9:16
     out, poster, store = _run_daily(tmp_path, monkeypatch)
     story_cards = [d for d in poster.cards if getattr(d, "is_story", False)]
     assert len(story_cards) == 1                     # one account -> one Story
@@ -288,7 +320,7 @@ def test_story_publish_endpoint_shape_when_both_armed(monkeypatch):
     assert http.calls[1][0].endswith("/1789/media_publish")
 
 
-# ---- 8. no public URL: block + alert; fallback hosting: story created ----------
+# ---- 8. no genuine 9:16 asset: skip + alert; a feed image is NEVER reused ------
 
 class _AlertCapture:
     def __init__(self):
@@ -299,32 +331,35 @@ class _AlertCapture:
         return None
 
 
-def test_story_no_url_blocks_draft_and_fires_alert(monkeypatch):
-    """Library creative with no public URL and hosting off: story is blocked and
-    ops_alert fires with a named reason instead of failing silently at publish."""
+def test_story_no_genuine_9_16_asset_skips_and_fires_alert(monkeypatch):
+    """Plain library feed creative with no genuine 9:16 asset: the Story is SKIPPED
+    (never a cropped feed card) and ops_alert fires with a named reason and the day,
+    instead of reusing/cropping the feed image."""
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
     monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)
     # Library creative: path does not start with 'nano_' so not a studio creative,
-    # and feed draft has no public URL set.
+    # and there is no *_story sibling on disk -> no genuine 9:16 asset.
     fd = _feed_draft(creative_path="library_asset.png", creative_public_url="",
                      source_fragments=[])
     capturer = _AlertCapture()
     import agent.stories as _stories
     monkeypatch.setattr(_stories.ops_alerts, "alert", capturer.alert)
     result = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
-    assert result is None, "story draft must be blocked when no public URL"
-    assert any("blocked" in m for m in capturer.messages), \
-        f"expected 'blocked' in alert messages, got: {capturer.messages}"
+    assert result is None, "story must be skipped when no genuine 9:16 asset exists"
+    assert any("skipped" in m for m in capturer.messages), \
+        f"expected 'skipped' in alert messages, got: {capturer.messages}"
     assert any(DAY in m for m in capturer.messages), \
-        "alert must name the day so ops can identify the draft"
+        "alert must name the day so ops can identify the skipped draft"
 
 
-def test_story_fallback_hosting_provides_url(monkeypatch):
-    """When feed draft has no URL but hosting succeeds, story draft is created
-    with the hosted URL instead of being blocked."""
+def test_story_never_reuses_feed_image(monkeypatch):
+    """Even when hosting the feed image would succeed, a plain (non-9:16) feed
+    creative is NEVER reused as a Story. The old fallback that cropped a 4:5 / 1:1
+    feed card into a Story frame is gone: the Story is skipped instead."""
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
     monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)
     import agent.stories as _stories
+    # Hosting the feed image would succeed if it were reused. It must NOT be.
     monkeypatch.setattr(
         _stories.media_host, "host_media",
         lambda path, tenant, client=None: "https://cdn.test/hosted.png",
@@ -332,7 +367,4 @@ def test_story_fallback_hosting_provides_url(monkeypatch):
     fd = _feed_draft(creative_path="library_asset.png", creative_public_url="",
                      source_fragments=[])
     story = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
-    assert story is not None, "story must be created when fallback hosting succeeds"
-    assert story.creative_public_url == "https://cdn.test/hosted.png"
-    assert story.is_story is True
-    assert story.status == DraftStatus.PENDING
+    assert story is None, "a plain feed image must never be reused/cropped as a Story"

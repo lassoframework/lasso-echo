@@ -7,13 +7,14 @@ account per posting day, PENDING and held for human approval through the same
 Slack card flow as every other draft, clearly labeled STORY so it can never be
 confused with a feed post.
 
-NO FABRICATION: a Story only ever reuses the day's approved feed creative. When
-that creative is a daily-studio infographic (its approved hook + body lines ride
-on the feed draft's source_fragments), Echo requests a purpose-built 9:16 variant
-from creative_studio using the SAME approved text; aspect is per-use, so the feed
-target stays 4:5. Otherwise (library asset, or generation/hosting unavailable)
-the Story reuses the feed image as-is; Meta letterboxes a non-9:16 image in a
-Story. Stories carry no caption text.
+NO FABRICATION, NO CROPPED FEED CARDS: a Story is only ever built from a GENUINE
+9:16 asset. Either a premade *_story sibling next to the day's approved creative,
+or a purpose-built 9:16 variant that creative_studio renders from the SAME
+approved text (its hook + body lines ride on the feed draft's source_fragments);
+aspect is per-use, so the feed target stays 4:5. If neither genuine 9:16 asset is
+available, Echo SKIPS the Story for the day (returns None) and fires one ops
+alert. It NEVER reuses or crops the day's 4:5 / 1:1 feed image into a Story frame.
+Stories carry no caption text.
 
 Publishing is unaffected here: this module never posts. A Story publish goes
 through meta_publisher, which requires BOTH the approval gate + publish flag AND
@@ -44,12 +45,15 @@ def _is_studio_creative(feed_draft):
 def build_story_draft(account, day_key, *, feed_draft=None,
                       nano_client=None, s3_client=None):
     """
-    Build one PENDING Story draft for `account` from the day's feed draft. Returns
-    None (fully dormant, no draft at all) when:
+    Build one PENDING Story draft for `account` from the day's feed draft. A Story
+    is ONLY ever built from a genuine 9:16 asset (a premade *_story sibling, or a
+    purpose-built 9:16 studio render). It NEVER reuses or crops the feed image.
+
+    Returns None (no Story at all) when:
       - AGENT_STORIES_ENABLED is OFF (the default), or
       - the schedule says this day does not post, or
-      - there is no PENDING feed draft to reuse a creative from (a Story never
-        invents its own creative).
+      - there is no PENDING feed draft to anchor the day's approved text/creative, or
+      - no genuine 9:16 asset is available (skipped, with one ops alert fired).
     """
     if not config.stories_enabled():
         return None
@@ -58,28 +62,32 @@ def build_story_draft(account, day_key, *, feed_draft=None,
     if feed_draft is None or feed_draft.status != DraftStatus.PENDING:
         return None
     if not (feed_draft.creative_public_url or feed_draft.creative_path):
-        return None  # nothing approved to reuse; a Story never fabricates a creative
+        return None  # nothing approved to anchor to; a Story never fabricates a creative
 
     draft_id = _make_id(account.key, "story", day_key)
-    creative_path = feed_draft.creative_path
-    creative_public_url = feed_draft.creative_public_url
     fragments = list(feed_draft.source_fragments or [])
 
     # PREMADE story variant first (AGENT_STORY_PREMADE_ENABLED, OFF): a *_story
     # render next to the day's creative (the regen-library convention) is used
-    # as-is, nothing generated. Flag OFF = behavior byte-identical to today.
+    # as-is, nothing generated. This is a genuine 9:16 asset, not a reused feed card.
     if config.story_premade_enabled():
         premade = _premade_story_variant(feed_draft)
         if premade is not None:
             hosted = media_host.host_media(premade, account.key, client=s3_client)
             if hosted:
-                creative_path, creative_public_url = premade, hosted
                 return _story_draft(account, day_key, draft_id, feed_draft,
-                                    creative_path, creative_public_url, fragments)
+                                    premade, hosted, fragments)
+            # Genuine 9:16 asset exists but could not be hosted: skip, do not reuse.
+            ops_alerts.alert(
+                f"story draft skipped for {account.key} on {day_key}: found premade "
+                f"9:16 variant {os.path.basename(premade)} but hosting returned no "
+                f"public URL. Enable AGENT_HOSTING_ENABLED or add public_url."
+            )
+            return None
 
-    # Purpose-built 9:16 variant from the SAME approved text, when available. Aspect
-    # is passed per-use so the feed's 4:5 target is untouched. Any unavailable step
-    # (flags off, no key, hosting down) falls back to reusing the feed image as-is.
+    # Purpose-built 9:16 variant from the SAME approved text. Aspect is passed
+    # per-use so the feed's 4:5 target is untouched. Only a daily-studio creative
+    # carries the approved headline + facts on source_fragments to re-render safely.
     if _is_studio_creative(feed_draft):
         headline, facts = fragments[0], fragments[1:]
         if facts:
@@ -94,33 +102,18 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                 hosted = media_host.host_media(art["path"], account.key,
                                                client=s3_client)
                 if hosted:
-                    creative_path, creative_public_url = art["path"], hosted
-            else:
-                ops_alerts.alert(
-                    f"story 9:16 render returned nothing for {account.key} "
-                    f"(studio dark or Gemini unavailable); reusing feed image."
-                )
+                    return _story_draft(account, day_key, draft_id, feed_draft,
+                                        art["path"], hosted, fragments)
 
-    # Fallback hosting for library creatives: if the feed sidecar had no URL
-    # and hosting is on, try uploading now.  Stories need a public URL; unlike
-    # feed posts there is no text-only fallback at publish time.
-    if not creative_public_url and creative_path:
-        hosted = media_host.host_media(creative_path, account.key, client=s3_client)
-        if hosted:
-            creative_public_url = hosted
-
-    # Hard block: a story without a public URL always raises PublishError inside
-    # the approval handler silently.  Surface the failure here instead.
-    if not creative_public_url:
-        ops_alerts.alert(
-            f"story draft blocked for {account.key} on {day_key}: "
-            f"no public URL for {os.path.basename(creative_path or '(no path)')}. "
-            f"Enable AGENT_HOSTING_ENABLED or add public_url to the creative sidecar."
-        )
-        return None
-
-    return _story_draft(account, day_key, draft_id, feed_draft,
-                        creative_path, creative_public_url, fragments)
+    # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
+    # crop the day's feed image into a Story frame. Fire one alert so ops knows.
+    ops_alerts.alert(
+        f"story draft skipped for {account.key} on {day_key}: no genuine 9:16 asset "
+        f"available (no premade *_story sibling for "
+        f"{os.path.basename(feed_draft.creative_path or '(no path)')}, and no "
+        f"purpose-built 9:16 studio render). A Story is never a cropped feed card."
+    )
+    return None
 
 
 def _premade_story_variant(feed_draft):
