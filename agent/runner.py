@@ -141,7 +141,8 @@ def _post_and_save(draft, store, poster, idempotent):
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
     # entirely. Drafts publish at schedule time; a lightweight notice goes to Slack
     # so Blake can see what went out without needing to tap anything.
-    if draft.status.value == "pending" and config.auto_approve_enabled():
+    if (draft.status.value == "pending" and config.auto_approve_enabled()
+            and not getattr(draft, "force_approval", False)):
         from . import db, postlog
         from .accounts import get_account
         from .meta_publisher import publish
@@ -162,7 +163,7 @@ def _post_and_save(draft, store, poster, idempotent):
             store.put(draft)
             return
     # Trust ladder wiring (both flags default OFF; nothing changes while off).
-    if draft.status.value == "pending" and (
+    if draft.status.value == "pending" and not getattr(draft, "force_approval", False) and (
             config.trust_dryrun_enabled() or config.trust_autopublish_enabled()):
         from . import db
         from .accounts import get_account
@@ -343,6 +344,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 from .welcome_queue import build_welcome_queue_draft as _wq_draft
                 draft = _wq_draft(account, day_key)
 
+            # DEMO CALENDAR (AGENT_DEMO_CALENDAR_ENABLED, OFF by default). The 30-day
+            # LASSO-brand done-for-you demo. Sits behind the dated book queue and the
+            # welcome drip so neither loses its slot; fills any other demo date. No-ops
+            # when the flag is off, the date has no seeded post, or the manifest is empty.
+            if draft is None and account.key in ("lasso_ig", "lasso_fb"):
+                from .demo_calendar_queue import build_demo_calendar_draft as _dc_draft
+                draft = _dc_draft(account, day_key)
+
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
             from .category_cap import is_allowed as _cap_allowed, record_win as _record_cap
@@ -484,6 +493,24 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                     if wc_story is not None:
                         _post_and_save(wc_story, store, poster, idempotent)
                         results.append(wc_story)
+                    _book_story_posted = True
+
+            # DEMO CALENDAR STORY (AGENT_DEMO_CALENDAR_ENABLED, OFF). The 9:16 story for
+            # the SAME demo post today's feed served on lasso_ig. Coupled to the demo feed
+            # draft id, so it only fires when today's feed was a demo feed. The publisher
+            # still needs AGENT_STORIES_ENABLED to actually send it.
+            if not _book_story_posted and account.key == "lasso_ig":
+                from .demo_calendar_queue import build_demo_calendar_story_draft as _dc_story
+                dc_st = _dc_story(account, day_key, feed_draft=feed_draft)
+                if dc_st is not None:
+                    if idempotent:
+                        dc_st, _existing_dc = _reconcile(
+                            dc_st, day_key, "story", store, poster)
+                        if dc_st is None:
+                            results.append(_existing_dc)
+                    if dc_st is not None:
+                        _post_and_save(dc_st, store, poster, idempotent)
+                        results.append(dc_st)
                     _book_story_posted = True
 
             # Stories: FULLY DORMANT unless AGENT_STORIES_ENABLED. Armed, draft one

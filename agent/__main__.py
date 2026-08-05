@@ -129,6 +129,7 @@ def _status():
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
     print(f"  welcome_queue  : {config.welcome_queue_enabled()}  (env AGENT_WELCOME_QUEUE_ENABLED; one/day drip + new-client trigger, needs hosting)")
+    print(f"  demo_calendar  : {config.demo_calendar_enabled()}  (env AGENT_DEMO_CALENDAR_ENABLED; 30-day done-for-you demo calendar, needs hosting)")
     print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
     print(f"  podcast_doc_clips: {config.podcast_doc_clips_enabled()}  (env AGENT_PODCAST_DOC_CLIPS)")
     print(f"  podcast_audit  : {config.podcast_audit_enabled()}  (env AGENT_PODCAST_AUDIT_ENABLED)")
@@ -760,6 +761,7 @@ _COMMANDS = {
         ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
         ("welcome-backfill", "pull brand-new clients (last N days by subscription), scrape logos, make feed+story welcomes, surface held (--days/--post/--dry-run)"),
         ("welcome-queue", "manage the one-per-day welcome drip: --build-manifest hosts the catch-up cards for Railway seeding, --seed enqueues locally, no args shows the queue (drip behind AGENT_WELCOME_QUEUE_ENABLED)"),
+        ("demo-calendar", "the 30-day done-for-you demo calendar: --images-dir hosts the rendered cards to R2 + writes the manifest, --from-manifest seeds the queue, no args shows status (behind AGENT_DEMO_CALENDAR_ENABLED)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
     "podcast & opus (cont.)": [
@@ -1432,6 +1434,12 @@ def main(argv=None):
                   flush=True)
             from .welcome_queue import create_from_manifest as _wq_seed
             _wq_seed()
+
+        if os.environ.get("AGENT_DEMO_CALENDAR_ON_START", "").lower() in ("1", "true"):
+            print("[startup] AGENT_DEMO_CALENDAR_ON_START detected — seeding demo calendar queue…",
+                  flush=True)
+            from .demo_calendar_queue import create_from_manifest as _dc_seed
+            _dc_seed()
 
         if os.environ.get("AGENT_BOOK_STORIES_ON_START", "").lower() in ("1", "true"):
             print("[startup] AGENT_BOOK_STORIES_ON_START detected — loading book stories queue…",
@@ -2450,6 +2458,19 @@ def main(argv=None):
                 _expire_bq = True; i += 1; continue
             i += 1
         _bq_run(images_dir=_images_dir, from_manifest=_from_manifest, expire_only=_expire_bq)
+    elif cmd == "demo-calendar":
+        from .demo_calendar_queue import run as _dc_run
+        _dc_images_dir = None
+        _dc_from_manifest = False
+        _dc_args = argv[1:]
+        i = 0
+        while i < len(_dc_args):
+            if _dc_args[i] == "--images-dir" and i + 1 < len(_dc_args):
+                _dc_images_dir = _dc_args[i + 1]; i += 2; continue
+            if _dc_args[i] == "--from-manifest":
+                _dc_from_manifest = True; i += 1; continue
+            i += 1
+        _dc_run(images_dir=_dc_images_dir, from_manifest=_dc_from_manifest)
     elif cmd == "book-stories":
         from .book_stories_queue import run as _bsq_run
         _images_dir = None

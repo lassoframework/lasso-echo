@@ -265,6 +265,21 @@ def welcome_queue_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_WELCOME_QUEUE_ENABLED", "false"))
 
 
+def demo_calendar_enabled() -> bool:
+    """
+    The done-for-you demo calendar: 30 pre-made dated LASSO drafts that flow through
+    Echo's real pipeline so onboarding a client onto done-for-you organic can be
+    experienced end to end. OFF by default. When OFF, the daily runner's demo hooks
+    return None and nothing is served: byte-for-byte current behavior. When ON, the
+    runner serves the day's dated demo post (feed cross-posted to lasso_ig + lasso_fb,
+    story on lasso_ig) as a PENDING draft. Served drafts card for approval, or
+    auto-publish only when AGENT_AUTO_APPROVE_ENABLED is armed (the story also needs
+    AGENT_STORIES_ENABLED). Needs AGENT_HOSTING_ENABLED (R2) to host the cards. Arm by
+    hand in Railway env. Isolated from the book / welcome / summit queues.
+    """
+    return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
+
+
 # The Stripe secret is read lazily BY NAME (never stored, never logged), same
 # pattern as every other token. Set STRIPE_API_KEY in Railway (a RESTRICTED,
 # read-only key: Customers, Subscriptions, Products, Prices). Empty => the welcome

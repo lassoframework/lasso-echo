@@ -78,6 +78,13 @@ class Draft:
     # day with no image yet. PENDING and held; a human adds a photo before it can
     # publish. NOT blocked. False for every other draft.
     needs_media: bool = False
+    # Force the approval card even when AGENT_AUTO_APPROVE_ENABLED is armed: this
+    # draft ALWAYS waits for a human to approve, deny, or edit it, and never
+    # auto-publishes. Used by the demo calendar so Blake experiences the review
+    # flow while the rest of the fleet keeps auto-publishing. Default False =
+    # every existing draft behaves exactly as before. This only ever STRENGTHENS
+    # the gate (adds a required approval); it never bypasses one.
+    force_approval: bool = False
 
 
 def _make_id(account_key, creative_path, scheduled_for):
