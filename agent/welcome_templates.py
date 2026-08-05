@@ -23,7 +23,7 @@ class of failure at the source:
 Two fill fields only: GYM NAME and OWNER NAME, composed at fixed positions.
 
 No dashes, no hyphens, no en/em dashes in any on-image copy (house style). Only
-verified stats (500+ gym owners). Palette + type: house style Section 2 and 8.
+verified stats (1,000+ gym owners). Palette + type: house style Section 2 and 8.
 
 Public API:
   make_welcome(template_id, gym_name, owner_name, logo_path, ...) -> final PNG path
@@ -44,7 +44,7 @@ from .summit_render import (
 )
 
 # House-verified proof stat (brand_voice/knowledge/02_verified_stats.md).
-PROOF_STAT = "500+ GYM OWNERS TRUST LASSO"
+PROOF_STAT = "1,000+ GYM OWNERS TRUST LASSO"
 
 LOGO_WORDMARK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "assets", "brand", "lasso_wordmark.png")
@@ -132,7 +132,7 @@ TEMPLATES = [
     {"id": "T5", "name": "Badge and proof", "base": "cream",
      "bg_style": "badge_cream", "accent": "rule",
      "eyebrow": "OFFICIAL LASSO PARTNER",
-     "direction": "badge treatment with the 500+ owners proof line",
+     "direction": "badge treatment with the 1,000+ owners proof line",
      "logo_zone": (560, 292, 424, 400)},
     {"id": "T6", "name": "Duotone interior", "base": "navy",
      "bg_style": "duotone_interior", "accent": "word",

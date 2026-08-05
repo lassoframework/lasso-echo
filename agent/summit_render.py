@@ -34,7 +34,10 @@ MUTE_NAVY = (168, 178, 198)
 _FD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
 ANTON = os.path.join(_FD, "Anton-Regular.ttf")
 OSWALD = os.path.join(_FD, "Oswald-Medium.ttf")
+OSWALD_B = os.path.join(_FD, "Oswald-Bold.ttf")
 MONT = os.path.join(_FD, "Montserrat-Medium.ttf")
+MONT_SB = os.path.join(_FD, "Montserrat-SemiBold.ttf")
+MONT_B = os.path.join(_FD, "Montserrat-Bold.ttf")
 
 DEFAULT_FACTS = ["NOV 7 + 8", "VIRGIN HOTEL NASHVILLE", "100 SEATS"]
 
@@ -53,10 +56,11 @@ def _th(d, text, font):
     return b[3] - b[1]
 
 
-def _tracked(d, xy, text, font, fill, tracking=6):
+def _tracked(d, xy, text, font, fill, tracking=6, stroke_width=0, stroke_fill=None):
     x, y = xy
     for ch in text:
-        d.text((x, y), ch, font=font, fill=fill)
+        d.text((x, y), ch, font=font, fill=fill,
+               stroke_width=stroke_width, stroke_fill=stroke_fill)
         x += _tw(d, ch, font) + tracking
     return x
 
@@ -128,13 +132,18 @@ def _fact_tiles(d, y, tiles, ink, mute, big=False, accent_first=False):
     vf = _f(ANTON, 44 if big else 34)
     for i, t in enumerate(tiles):
         x = MARGIN + i * (tw + gap)
-        # accent_first draws exactly ONE red element (the first tile's outline),
-        # used only on treatment-B tile cards whose headline carries no red.
-        outline = RED if (accent_first and i == 0) else ink
-        d.rectangle([x, y, x + tw, y + h], outline=outline, width=2)
         val = t.split("|")[0].strip()
+        # accent_first paints exactly ONE red element: the first tile as a SOLID red
+        # chip with white text. A deliberate accent that reads as designed, never an
+        # errant outline. Used only on treatment-B tile cards (headline carries no red).
+        if accent_first and i == 0:
+            d.rectangle([x, y, x + tw, y + h], fill=RED)
+            tile_ink = WHITE
+        else:
+            d.rectangle([x, y, x + tw, y + h], outline=ink, width=2)
+            tile_ink = ink
         for j, ln in enumerate(_wrap(d, val, vf, tw - 28)[:2]):
-            d.text((x + 16, y + 18 + j * (vf.size + 4)), ln, font=vf, fill=ink)
+            d.text((x + 16, y + 18 + j * (vf.size + 4)), ln, font=vf, fill=tile_ink)
     return y + h
 
 
@@ -284,21 +293,114 @@ def _base_with_bg(bg_path):
     # navy scrim: strong at top (headline) and bottom (footer), lighter middle
     scrim = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
     sd = ImageDraw.Draw(scrim)
-    h1, h2 = SIZE * 0.52, SIZE * 0.66
+    h1, h2 = SIZE * 0.60, SIZE * 0.84
     for y in range(SIZE):
-        # Strong through the headline+deck zone (top 52%), then lighten to reveal
-        # the crowd, then a bottom band for the tiles/footer.
+        # Hold a strong navy scrim through the entire text zone (headline, deck, and
+        # the dense checklist down to ~84%) so white supporting text always reads;
+        # the crowd still shows through, and the bottom band carries the fact strip.
         if y <= h1:
-            a = int(216 - (216 - 150) * (y / h1))        # 216 -> 150
+            a = int(224 - (224 - 176) * (y / h1))        # 224 -> 176
         elif y <= h2:
-            a = int(150 - (150 - 72) * ((y - h1) / (h2 - h1)))  # 150 -> 72
+            a = int(176 - (176 - 150) * ((y - h1) / (h2 - h1)))  # 176 -> 150
         else:
-            a = 72
+            a = 150
         bot = int((y - SIZE * 0.74) * 2.6) if y > SIZE * 0.74 else 0
         a = min(240, max(a, bot))
         sd.line([(0, y), (SIZE, y)], fill=(10, 18, 38, a))
     base = Image.alpha_composite(src.convert("RGBA"), scrim).convert("RGB")
     return base
+
+
+# Dense supporting content per concept — fills the middle so the type-led cards
+# carry real substance (the reframe, the diagnostic, the deliverables, the session
+# map, the member math), not open space. Sourced from 04_summit_campaign.md and the
+# approved captions. No blocked claims, no fabricated numbers.
+POINTS = {
+    "01_invitation": ["100 seats. When they are gone, they are gone",
+                      "10 industry leaders, one room, two days",
+                      "You leave with a plan, not a notebook"],
+    "02_deliverable": ["Your 2027 revenue target and the member math",
+                       "Your one broken funnel leg and the fix",
+                       "Your sales, retention, and team plays",
+                       "A 90 day action plan you run Monday"],
+    "03_agenda": ["Where you are now and your 2027 target",
+                  "The funnel diagnostic and the member math",
+                  "Offer, positioning, and lead generation",
+                  "Sales system, retention, team, and pricing"],
+    "04_funnel": ["Close rate 70%+ is the first leg",
+                  "Show rate 50%+ and booking 50%+",
+                  "Lead volume 40%+ comes last",
+                  "Fix the broken leg, then scale"],
+    "05_math": ["Set your 2027 revenue target",
+                "Subtract where you are today",
+                "Divide by revenue per member",
+                "Apply your close rate for leads"],
+    "06_room": ["100 serious operators, not hobbyists",
+                "No stage pitches, only real strategy",
+                "99 peers who get what you carry",
+                "The room is the ROI"],
+    "07_numbers": ["100 gym owners in one room",
+                   "10 industry leaders on stage",
+                   "2 days in Nashville",
+                   "1 finished 2027 plan"],
+    "13_audience": ["Established gym owners building 2027",
+                    "Not hobbyists, not tire kickers",
+                    "No stage pitches, real strategy",
+                    "From operators who have done it"],
+    "11_stakes": ["Closing under 70% vs 70% or better",
+                  "Burning ad spend vs a funnel that holds",
+                  "Doing it all yourself vs systems that run",
+                  "Most owners are one system away"],
+    "12_outcome": ["Your revenue target and member math",
+                   "Your broken funnel leg, fixed",
+                   "Your sales, retention, and team playbook",
+                   "A 90 day action plan, on paper"],
+}
+
+
+_POINT_ROW = 66
+
+
+def _overlay_dark(img, box, alpha):
+    """Composite a translucent dark rounded plate onto an RGB image; returns a new RGB
+    image. Used behind the checklist band so white text stays crisp over any photo."""
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle(box, radius=18, fill=(6, 12, 22, alpha))
+    return Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+
+
+def _points_band(d, y, points, ink, row=None, on_photo=False):
+    """A dense checklist that fills the middle of a type-led card. Sky/navy checks
+    (never a second red — the single red lives in the headline). Crisp white Oswald on
+    photo cards. `row` (vertical pitch) is set by the caller so the band always clears
+    the bottom fact strip, even under a tall headline."""
+    rf = _f(OSWALD_B, 33)  # bold grotesque reads crisp white over a photo
+    row = row or _POINT_ROW
+    accent = SKY if ink == WHITE else NAVY
+    for i, p in enumerate(points):
+        cy = y + i * row
+        r = 10
+        d.ellipse([MARGIN, cy + 9, MARGIN + 2 * r, cy + 9 + 2 * r], outline=accent, width=3)
+        d.line([MARGIN + 6, cy + 19, MARGIN + 9, cy + 24], fill=accent, width=3)
+        d.line([MARGIN + 9, cy + 24, MARGIN + 16, cy + 13], fill=accent, width=3)
+        if on_photo:
+            d.text((MARGIN + 46, cy), p, font=rf, fill=(255, 255, 255),
+                   stroke_width=1, stroke_fill=(6, 12, 22))
+        else:
+            d.text((MARGIN + 46, cy), p, font=rf, fill=ink)
+    return y + len(points) * row
+
+
+def _fact_strip(d, y, facts, ink, on_photo=False):
+    """One compact line of event facts at the bottom of a type-led card, so the middle
+    is free for the dense checklist. Replaces the three large tiles on the _a variant."""
+    f = _f(OSWALD_B, 27)
+    text = "      ".join(facts)
+    if on_photo:
+        _tracked(d, (MARGIN, y), text, f, (255, 255, 255), 2,
+                 stroke_width=2, stroke_fill=(6, 12, 22))
+    else:
+        _tracked(d, (MARGIN, y), text, f, ink, 2)
 
 
 def render_card(concept, treatment, out_path, canvas=None, bg_path=None):
@@ -319,25 +421,39 @@ def render_card(concept, treatment, out_path, canvas=None, bg_path=None):
         _ghost(d, bg, "".join(c for c in concept["headline"] if c.isdigit())[:3] or "26")
 
     y = MARGIN
-    _tracked(d, (MARGIN, y), concept["eyebrow"].upper(), _f(OSWALD, 30), mute, 5)
+    _tracked(d, (MARGIN, y), concept["eyebrow"].upper(), _f(OSWALD_B, 30), mute, 5)
     y += 62
 
     if treatment == "a":
         red_tokens = set(w.strip(".,").upper() for w in concept["red_word"].split())
-        hf, lines = _fit(d, concept["headline"].upper(), cw, 4, 128)
+        # cap the headline (3 lines / smaller) so the dense content band + strip fit
+        hf, lines = _fit(d, concept["headline"].upper(), cw, 3, 96)
         y = _headline(d, MARGIN, y + 6, lines, hf, red_tokens, ink, shadow=bool(bg_path))
-        y += 20
-        deck_fill = (232, 236, 242) if bg_path else mute
-        for ln in _wrap(d, concept["deck"], _f(MONT, 34), cw):
+        y += 14
+        df = _f(MONT_SB, 33)
+        for ln in _wrap(d, concept["deck"], df, cw):
             if bg_path:
-                d.text((MARGIN + 2, y + 2), ln, font=_f(MONT, 34), fill=(6, 10, 20))
-            d.text((MARGIN, y), ln, font=_f(MONT, 34), fill=deck_fill); y += 46
-        # fill the lower third with a receipted fact row
-        _fact_tiles(d, SIZE - MARGIN - 250, DEFAULT_FACTS, ink, mute)
+                # crisp white with a dark stroke so the deck reads over ANY photo zone
+                d.text((MARGIN, y), ln, font=df, fill=(255, 255, 255),
+                       stroke_width=2, stroke_fill=(6, 12, 22))
+            else:
+                d.text((MARGIN, y), ln, font=df, fill=mute)
+            y += 44
+        # dense supporting checklist fills the middle so there is no open space.
+        # Row pitch adapts to the space left above the fact strip so the last bullet
+        # never collides with it, even when a tall 3-line headline pushes it down.
+        y += 20
+        pts = POINTS.get(concept["id"], [])
+        strip_y = SIZE - MARGIN - 60
+        row = _POINT_ROW
+        if len(pts) > 1:
+            row = max(46, min(_POINT_ROW, (strip_y - 58 - y) // (len(pts) - 1)))
+        _points_band(d, y, pts, ink, row=row, on_photo=bool(bg_path))
+        _fact_strip(d, strip_y, DEFAULT_FACTS, ink, on_photo=bool(bg_path))
     else:
         hf, lines = _fit(d, concept["headline"].upper(), cw, 2, 82)
         y = _headline(d, MARGIN, y + 4, lines, hf, set(), ink)  # ink headline; red lives in data
-        y += 8
+        y += 20  # breathing room so the deck never crowds the headline baseline
         for ln in _wrap(d, concept["deck"], _f(MONT, 30), cw)[:2]:
             d.text((MARGIN, y), ln, font=_f(MONT, 30), fill=mute); y += 40
         y += 20
@@ -368,10 +484,10 @@ def render_card(concept, treatment, out_path, canvas=None, bg_path=None):
 # People-filled event photos on the community/room/who concepts (gym owners in
 # the room and meeting); atmospheric/venue on the methodology concepts.
 BG_MAP = {
-    "01_invitation": "skyline", "07_numbers": "audience", "02_deliverable": "meeting",
-    "13_audience": "speaker_room", "03_agenda": "desk", "06_room": "speaker_room",
-    "04_funnel": "abstract", "05_math": "desk", "11_stakes": "abstract",
-    "12_outcome": "musicrow",
+    "01_invitation": "audience", "02_deliverable": "venue", "03_agenda": "networking",
+    "04_funnel": "venue", "05_math": "networking", "06_room": "audience",
+    "07_numbers": "audience", "13_audience": "audience", "11_stakes": "venue",
+    "12_outcome": "networking",
 }
 
 

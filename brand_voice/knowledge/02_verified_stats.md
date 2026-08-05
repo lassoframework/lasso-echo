@@ -2,7 +2,9 @@
 Rule: only lines marked USE are postable. Wording must match exactly.
 
 ## USE — current homepage claims
-- USE: "Trusted by 500+ gym owners."
+- USE: "Trusted by 1,000+ gym owners." / "Worked with 1,000+ gym owners."
+  (FINAL ruling 2026-08-04: 500+ RETIRED from all social assets. "1,000+ gym owners"
+  is THE client-count claim in every caption and card. Source: fullgym.lassoframework.com/waitlist.)
 - USE: "train your sales team to close at 70%+" / "70%+ close rates."
 - USE: "Built by gym owners doing $50K+/month."
 
@@ -34,7 +36,7 @@ Rule: only lines marked USE are postable. Wording must match exactly.
   recent audit cycle flagged over $17,000."
 - USE: "Ad billing reconciled line by line twice a month."
 - USE: "A recent gym website audit found 7 dead buttons including the primary CTA."
-- 500+ gym owners: already a USE claim above (current homepage claims section).
+- 1,000+ gym owners: already a USE claim above (current homepage claims section).
   Cite that exact line, do not add a duplicate here.
 
 ## USE — speed to lead carousel (approved benchmarks)
@@ -42,9 +44,51 @@ Rule: only lines marked USE are postable. Wording must match exactly.
 - USE: "The benchmark is 60 percent show rate on cold traffic."
 - USE: "If your close rate is under 70 percent, the system is the problem, not the salesperson."
 
+## SUMMIT — LASSO Growth Summit (Blake approved 2026-08-04, ALL USE)
+- USE: "NOV 7 + 8" (event dates; always this format, never a dash).
+- USE: "Virgin Hotel Nashville" (venue).
+- USE: "lassoframework.com/summit" (registration link).
+- USE: "100 seats" (venue capacity; a fixed fact, not a scarcity claim).
+- USE: "Early bird $299 through AUG 31." (early-bird price + deadline.)
+- USE: "General admission $449 after AUG 31." / "Price goes up after AUG 31."
+  RULE: zero early-bird mentions after Aug 31; zero $449 before Aug 31 unless framed
+  as the post-early-bird price. Never show a general price without this framing.
+- PENDING (needs Blake per-date): all live scarcity claims — "half full", "last seats",
+  "moving fast", "final call", any countdown that implies a registration count. Hold each
+  until Blake confirms real registration numbers on its date. 100 seats capacity is fine.
+
+## CHATGPT ADS — platform facts (Blake approved 2026-08-04, education + service announcements)
+- USE: "ChatGPT ads launched February 9, 2026; self-serve went live May 6, 2026 at ads.openai.com."
+- USE: "$25 per day minimum, no account minimum."
+- USE: "Buying on CPC, CPM, and oCPC."
+- USE: "Contextual matching on the conversation topic, not keyword bidding."
+- USE: "Only Free and Go tier users see ads. Plus, Pro, Business, and Enterprise do not."
+- USE: "US only, 18 and up, logged in."
+- USE (service): "LASSO now runs ChatGPT ads." (service announcement, allowed per Blake.)
+- BLOCKED: any leads, CPL, ROI, spend, or client-outcome number from ChatGPT ads until a
+  real campaign exists in this file. No invented results, no implied performance.
+
+## BOOK — The Full Gym (Blake approved 2026-08-04; claims from fullgym.lassoframework.com/waitlist)
+- USE title: "The Full Gym" / subtitle "The Boutique Gym Owner's Guide to Predictable Monthly Growth."
+- USE authors: "Sherman Merricks and Blake Ruff." Release "SEP 8." CTA "Join the waitlist" ->
+  fullgym.lassoframework.com/waitlist (waitlist until launch day; Blake supplies the buy link at launch).
+- USE thesis: "Great coaching alone isn't enough to scale a gym." / "Growth shouldn't feel like a guessing game."
+- USE the five Inside bullets (verbatim from the page):
+  1. "The three levers that determine whether your gym grows or stays stuck"
+  2. "Why more leads won't solve the problem if your sales process is broken"
+  3. "How to know when it's finally time to invest in paid marketing"
+  4. "The messaging framework that attracts the right members instead of wasting time on the wrong ones"
+  5. "How to build a predictable system that consistently turns prospects into long-term members"
+- USE author receipts (from the page): Blake Ruff, StoryBrand Certified Guide, has managed more
+  than $2 million in Facebook ad spend for gyms and helped generate more than $30 million in tracked
+  client revenue, co-host of Gym Marketing Made Simple (135+ episodes), former gym owner. Sherman
+  Merricks, former gym owner, built the LASSO sales methodology, helped gyms reach 70%+ close rates.
+- RULE: public book CLAIMS come only from the waitlist page (above). Captions may draw VOICE from the
+  Full Gym Google Doc, but no claim beyond this page. Cover art = the real cover asset only, never generated.
+
 ## LOCKED — conflicts, do not post until Blake resolves
-- LOCKED: gyms served appears as 200+ (media kit), 400+ (old site), 500+
-  (current homepage), 700+ (a third party review). DEFAULT: 500+ only.
+- RESOLVED 2026-08-04 (Blake FINAL): gyms served = "1,000+ gym owners" everywhere.
+  200+/400+/500+/700+ all retired from social assets. Use "1,000+" only.
 - LOCKED: "80% more conversions" stat exists in three conflicting versions in
   the content library. Blake decides: kill or source.
 - LOCKED: any specific ad budget dollar recommendations as LASSO promises.

@@ -45,7 +45,7 @@ def test_no_dash_inside_any_receipt_quote():
 
 def test_the_headline_receipts_are_present():
     section = _proof_section()
-    for needle in ("$16 blended CPL", "71.9% booked", "$35K+", "70%+", "500+ gym owners"):
+    for needle in ("$16 blended CPL", "71.9% booked", "$35K+", "70%+", "1,000+ gym owners"):
         assert needle in section, f"missing headline receipt: {needle}"
 
 

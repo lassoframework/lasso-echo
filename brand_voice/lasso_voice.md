@@ -17,7 +17,7 @@
 LASSO Framework is a complete gym growth system built for boutique fitness owners.
 Not a traditional agency. Every person on the team is an active gym owner doing
 $50K or more per month in their own facility. LASSO installs paid advertising,
-sales systems, and growth mentorship into boutique gyms, and has helped 500+ gym
+sales systems, and growth mentorship into boutique gyms, and has helped 1,000+ gym
 owners scale.
 
 Founded by Blake Ruff and Sherman Merricks. Blake is a StoryBrand Certified Guide
@@ -31,7 +31,7 @@ The difference: most agencies deliver leads. LASSO delivers members.
 
 ### Proof points (use in content, never embellish)
 
-- 500+ boutique gyms scaled
+- 1,000+ boutique gyms scaled
 - $30M+ in tracked client revenue
 - 70%+ average close rate across clients
 - 8+ new members added per month on average
@@ -106,7 +106,7 @@ voice doc.)
 - Philosophical problem: hard working gym owners deserve a system that rewards the
   effort.
 - Guide: LASSO. Empathy first ("we have been there"), authority second ("we have
-  helped 500+ gyms crack this").
+  helped 1,000+ gyms crack this").
 - Plan: 1) book a call, 2) we audit your numbers and build the system, 3) your
   revenue becomes predictable.
 - CTA: "Apply to work with us" or "Take the 2 minute quiz."

@@ -90,7 +90,7 @@ def test_gate_still_blocks_uncited_and_near_miss_claims(monkeypatch):
 def test_500_claim_stays_single(monkeypatch):
     _arm(monkeypatch)
     stats = knowledge.usable_stats()
-    assert sum("Trusted by 500+ gym owners" in s for s in stats) == 1
+    assert sum("Trusted by 1,000+ gym owners" in s for s in stats) == 1
 
 
 def test_use_lines_dash_free_and_no_pricing():

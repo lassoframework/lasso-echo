@@ -50,8 +50,8 @@ def test_gate_clears_drafts_citing_each_receipt(monkeypatch):
 def test_500_claim_referenced_not_duplicated(monkeypatch):
     _arm(monkeypatch)
     stats = knowledge.usable_stats()
-    assert sum("Trusted by 500+ gym owners" in s for s in stats) == 1
-    assert rotation.is_gate_clean("Trusted by 500+ gym owners.",
+    assert sum("Trusted by 1,000+ gym owners" in s for s in stats) == 1
+    assert rotation.is_gate_clean("Trusted by 1,000+ gym owners.",
                                   rotation._approved_claims())
 
 

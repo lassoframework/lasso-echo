@@ -43,7 +43,7 @@ training and funnel diagnosis ride along every engagement.
 - USE: "70%+ trained close rates." (platform_2026_receipts)
 - USE: "A 25 point website launch audit on every build." (platform_2026_receipts)
 - USE: "7+ dead buttons on a typical audited gym site." (platform_2026_receipts)
-- 500+ gym owners: already a USE claim in the standing source (current
+- 1,000+ gym owners: already a USE claim in the standing source (current
   homepage claims section). Cite that exact line; never a duplicate here.
 
 ## USE — Case studies, named and verified (anchor platform_2026_cases)

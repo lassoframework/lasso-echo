@@ -18,7 +18,7 @@
   calendar, and train your sales team to close at 70%+."
 - "Built by gym owners doing $50K+/month."
 - "Built by gym owners, for gym owners."
-- "Trusted by 500+ gym owners."
+- "Trusted by 1,000+ gym owners."
 - "No guesswork. No bait and switch agencies. Just a proven system."
 
 ## Services (public wording)

@@ -1,6 +1,6 @@
 # BLAKE'S CONFIRMATION LIST (blocks removal)
-1. GYMS SERVED NUMBER: lock one. Recommendation: "500+ gym owners" (current
-   homepage). Retire 200+/400+/700+ everywhere.
+1. GYMS SERVED NUMBER: RESOLVED 2026-08-04 (Blake FINAL): "1,000+ gym owners"
+   everywhere. 200+/400+/500+/700+ all retired from social assets.
 2. SUMMIT DETAILS: ticket pricing and tiers, early bird deadline, registration
    CTA wording, confirmed speaker roster, agenda. Also confirm dates Nov 7-8
    (page) vs Nov 5-7 (podcast Ep 129).

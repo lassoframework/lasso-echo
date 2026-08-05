@@ -33,7 +33,7 @@ Portfolio receipts:
 - "71.9% booked vs an 18.5% industry average. Same leads. Very different outcomes." (platform_2026_receipts)
 - "$35K+ in ad spend saved and put back to work. Over $17,000 in one audit cycle alone." (platform_2026_receipts)
 - "70%+ trained close rates." (platform_2026_receipts)
-- "Trusted by 500+ gym owners." (verified_stats current homepage claims)
+- "Trusted by 1,000+ gym owners." (verified_stats current homepage claims; FINAL 2026-08-04)
 
 Named case studies (verified):
 - "Fit Mamas Tribe took monthly revenue from $19K to $47K on the LASSO system. Average client value up from $99 to $167 at the same time." (platform_2026_case_fit_mamas)

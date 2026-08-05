@@ -38,7 +38,7 @@ CASE_CONCEPTS = ("platform_fit_mamas", "platform_courage_million")
 # frozen definitions of the prior sets: any byte moved changes these
 HOUSE_SHA256 = "255e52f2eb8ee5b926dfd81f4b4782df87c6415cd142c7169d958074d81a25b5"
 # stat-slab retired 2026-07-16: b2b stat concepts remap stat_hero -> chart.
-B2B_SHA256 = "e1b0b6ba6772058a735ad59e55f9e653735ee5f811e065816662b104b3229bb8"
+B2B_SHA256 = "aaee91127e773754001d001d1ec6cc5639ba41e2e0b72fa78e212dab8a07a5ec"
 
 
 def _platform(key):
