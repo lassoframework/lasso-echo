@@ -69,6 +69,24 @@ _WEEKDAY_ABBR = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 FEED = "feed"
 STORY = "story"
 
+# The real pillar order the planner walks to FILL a slot whose primary builder
+# produced nothing. Every entry is a REAL LASSO content pillar with its own approved
+# builder+source; a slot only ever lands on a pillar whose builder returns a real
+# draft, so a fallback is never a fabricated card, only a different REAL pillar for
+# the day. Ordered so the everyday pillars (the varied rotation) fill first and the
+# dated/campaign pillars (book, welcome) are never pulled in by fallback (they are
+# only ever placed by their real dated override, never borrowed to fill a gap):
+#   podcast  -> a real month-ahead episode topic (podcast_month)
+#   platform -> the four platform PDFs
+#   b2b      -> regen_library gym-owner concepts
+#   doctrine -> lasso_now.md house pillars
+#   summit   -> the Growth Playbook (during the campaign window only; its builder
+#               returns None off-window, so fallback naturally stops using it after
+#               SUMMIT_END_DATE)
+# book and welcome are DELIBERATELY absent: those are dated, pre-written content that
+# take their own days via the override, never a gap-filler.
+_FALLBACK_ORDER = ("podcast", "platform", "b2b", "doctrine", "summit")
+
 
 @dataclass(frozen=True)
 class PlanSlot:
@@ -83,16 +101,43 @@ class PlanSlot:
     overridden: bool = False
 
 
+# The BALANCED month-plan weekly rotation. The live daily runner drives from
+# content_categories._DAILY_SCHEDULE (Mon/Thu/Sun podcast, Tue/Sat platform, Wed b2b,
+# Fri summit) which is deliberately podcast heavy and carries NO doctrine day. For the
+# FULL MONTH calendar Blake walks a prospect through, every everyday pillar must be
+# present and none may dominate, so the month plan uses this evenly spread driver:
+#   Mon platform, Tue doctrine, Wed b2b, Thu podcast, Fri summit, Sat platform, Sun podcast
+# Per week that is platform 2, doctrine 1, b2b 1, podcast 2, summit 1: all five everyday
+# pillars represented, none over a third of the week.
+#
+# Placement is deliberate so the two heavy DATED/feature overrides do not starve a
+# pillar: the summit run-up override falls on the summit weekday (config.SUMMIT_DAY, Tue
+# in the shipped config) which the month rotation spends on DOCTRINE, not platform, so the
+# recurring extra summit day never eats a platform slot; and platform keeps its Monday
+# slot even on weeks the real book queue takes a Saturday. Book and welcome ride in via
+# their real DATED overrides on top of this (never from the rotation), so those pillars
+# appear too on the days they really occur. This is a plan-shape choice, not new content:
+# every slot still resolves to a REAL builder and a dark pillar falls back to a real one.
+_MONTH_ROTATION = {
+    "mon": "platform",
+    "tue": "doctrine",
+    "wed": "b2b",
+    "thu": "podcast",
+    "fri": "summit",
+    "sat": "platform",
+    "sun": "podcast",
+}
+
+
 # ---- category resolution (pure) --------------------------------------------------------
 
 def _weekday_category(day_key):
-    """The weekly-rotation category for a date, from content_categories._DAILY_SCHEDULE.
-    Reads the schedule table directly (not schedule_for_day, which returns None while
-    AGENT_CATEGORY_ROTATION is OFF) so the month plan is well defined regardless of that
-    flag. Returns 'doctrine' for any weekday not in the table (defensive; all 7 are)."""
+    """The balanced month-plan weekly-rotation category for a date (_MONTH_ROTATION).
+    Pure and well defined regardless of any flag. Returns 'doctrine' for any weekday not
+    in the table (defensive; all 7 are). This is the month calendar's varied driver:
+    doctrine / platform / b2b / podcast / summit spread so no everyday pillar dominates."""
     abbr = _WEEKDAY_ABBR[date.fromisoformat(day_key).weekday()]
-    entry = _cats._DAILY_SCHEDULE.get(abbr)
-    return entry[0] if entry else "doctrine"
+    return _MONTH_ROTATION.get(abbr, "doctrine")
 
 
 def _override_category(day_key, base_category, *, book_dates=None,
@@ -119,17 +164,51 @@ def _override_category(day_key, base_category, *, book_dates=None,
 
 
 def _default_summit_day_fn(day_key):
-    """The default summit-day predicate: the summit weekly slot inside the campaign
-    window (through SUMMIT_END_DATE). Pure over config; the campaign flag is NOT read
-    here (the PLAN is well defined regardless), only the fixed weekly slot + end date.
+    """The default summit-day predicate: Summit is a recurring FEATURE, not a takeover.
+
+    Summit already owns its weekly Friday slot in the month rotation (_MONTH_ROTATION:
+    Fri = summit), which is the recurring feature. This override adds the "one extra day"
+    of the run-up cadence WITHOUT letting summit dominate or erase another pillar every
+    week: it fires on the summit weekday (config.SUMMIT_DAY, Tue in the shipped config)
+    only on ALTERNATE weeks (even ISO week number) and only inside the campaign window
+    (through SUMMIT_END_DATE). So across a month summit lands ~4 Fridays + ~2 extra days
+    (about a fifth of the month, never the plurality), and on the off weeks that weekday
+    keeps its own rotation pillar (doctrine) so doctrine stays represented.
+
+    After SUMMIT_END_DATE the override stops firing; the base Friday remains, but the
+    summit builder itself goes dark once the campaign auto-stops, so a post-campaign
+    Friday falls back to the next real pillar rather than sitting on a dead summit slot.
+
+    Pure over config; the campaign flag is NOT read here (the PLAN is well defined
+    regardless), only the fixed weekly slot, the alternate-week cadence, and the end date.
     A test injects its own predicate."""
-    abbr = _WEEKDAY_ABBR[date.fromisoformat(day_key).weekday()]
+    d = date.fromisoformat(day_key)
+    abbr = _WEEKDAY_ABBR[d.weekday()]
     if abbr != config.SUMMIT_DAY:
         return False
+    # Never double up on the base-rotation summit day: the extra summit day is only ever
+    # a SEPARATE weekday from the one the month rotation already spends on summit.
+    if abbr == _base_summit_weekday():
+        return False
+    # Alternate weeks only: one extra summit day every OTHER week, so the weekday it
+    # borrows keeps its own pillar on the off weeks (summit never eats it every week).
+    if d.isocalendar()[1] % 2 != 0:
+        return False
     try:
-        return date.fromisoformat(day_key) <= date.fromisoformat(config.SUMMIT_END_DATE)
+        return d <= date.fromisoformat(config.SUMMIT_END_DATE)
     except ValueError:
         return False
+
+
+def _base_summit_weekday():
+    """The weekday abbr the base weekly rotation already assigns to summit (Fri in the
+    shipped schedule). Read from the schedule table so the override stays in lockstep
+    with the rotation if the table ever changes. '' when summit is not in the base
+    rotation at all (then the override's extra day stands alone)."""
+    for abbr, entry in _cats._DAILY_SCHEDULE.items():
+        if entry and entry[0] == "summit":
+            return abbr
+    return ""
 
 
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
@@ -202,24 +281,31 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
     target = account if account is not None else None
 
     # First pass: build feed drafts, keyed by date so the story pass can anchor to them.
+    # Every day is FILLED when any real pillar can build for it: the slot's own category
+    # is tried first, then the real fallback pillars in order (_FALLBACK_ORDER), until a
+    # builder returns a real draft. A fallback is never fabricated content, only a
+    # DIFFERENT REAL pillar for the day, and the produced draft is stamped with the
+    # pillar that actually built it so the calendar shows the true pillar. A day is only
+    # ever left empty when NO real pillar has content for it (an honest exhaustion,
+    # logged), never a blank filled with invented copy.
     feed_by_date = {}
+    built_category = {}  # post_date -> the real category that actually built the feed
     drafts = []
     for slot in plan:
         if slot.fmt != FEED:
             continue
-        builder = builders.get(slot.category)
-        if builder is None:
-            log(f"skip {slot.post_date} {slot.category} feed: no builder wired "
-                f"for category {slot.category!r}")
-            continue
-        draft = _safe_call(builder, target, slot.post_date, log,
-                           f"{slot.post_date} {slot.category} feed")
+        draft, built_cat = _build_feed_with_fallback(
+            slot, builders, target, log)
         if draft is None:
-            log(f"skip {slot.post_date} {slot.category} feed: builder produced "
-                "nothing (missing source/creative); not fabricated")
+            log(f"skip {slot.post_date}: no real pillar could build a feed for the "
+                f"day (tried {slot.category} then fallbacks); left empty, not fabricated")
             continue
-        draft = _stamp(draft, slot, FEED)
+        # Re-point the slot's category to the pillar that really built it, so _stamp
+        # and to_calendar_rows show the true pillar (never the empty one).
+        eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
+        draft = _stamp(draft, eff_slot, FEED)
         feed_by_date[slot.post_date] = draft
+        built_category[slot.post_date] = built_cat
         drafts.append(draft)
 
     # Second pass: build the paired story for each date that got a feed draft.
@@ -240,9 +326,53 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             log(f"skip {slot.post_date} {slot.category} story: no genuine 9:16 asset "
                 "(never a cropped feed card)")
             continue
-        story = _stamp(story, slot, STORY)
+        # Pair the story to the pillar the FEED actually landed on (a fallback feed's
+        # story shows the same real pillar, never the empty rotation slot).
+        built_cat = built_category.get(slot.post_date, slot.category)
+        eff_slot = slot if built_cat == slot.category else _reslot(slot, built_cat)
+        story = _stamp(story, eff_slot, STORY)
         drafts.append(story)
     return drafts
+
+
+def _reslot(slot, category):
+    """A copy of `slot` re-pointed to `category` (the pillar that actually built the
+    day), keeping the original rotation category as base_category for audit and marking
+    it overridden. Never invents content: only relabels which real pillar filled the
+    day so the calendar row shows the truth."""
+    return PlanSlot(post_date=slot.post_date, category=category, fmt=slot.fmt,
+                    base_category=slot.base_category or slot.category,
+                    overridden=True)
+
+
+def _build_feed_with_fallback(slot, builders, target, log):
+    """Build a feed for `slot`: the slot's own category first, then the real fallback
+    pillars (_FALLBACK_ORDER) in order, until a builder returns a real draft. Returns
+    (draft, built_category) or (None, None) when NO real pillar has content for the day.
+
+    A fallback is never a fabricated card: each candidate is a REAL LASSO pillar with
+    its own approved builder+source, and a builder that cannot draft (missing source,
+    studio dark, nothing queued) simply returns None and the next real pillar is tried.
+    The day is left empty only when every real pillar is genuinely exhausted."""
+    tried = []
+    # The slot's own category leads; then the fallbacks, skipping the primary and any
+    # category with no builder wired. Dedupe preserves order.
+    order = [slot.category] + [c for c in _FALLBACK_ORDER if c != slot.category]
+    for cat in order:
+        if cat in tried:
+            continue
+        tried.append(cat)
+        builder = builders.get(cat)
+        if builder is None:
+            continue  # no builder wired for this pillar; try the next real one
+        draft = _safe_call(builder, target, slot.post_date, log,
+                           f"{slot.post_date} {cat} feed")
+        if draft is not None:
+            if cat != slot.category:
+                log(f"fill {slot.post_date}: {slot.category} had no content; the "
+                    f"{cat} pillar filled the day (real fallback, not fabricated)")
+            return draft, cat
+    return None, None
 
 
 def _safe_call(builder, target, day_key, log, label):

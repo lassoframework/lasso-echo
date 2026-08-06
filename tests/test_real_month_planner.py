@@ -110,19 +110,21 @@ def test_plan_month_two_slots_per_day_feed_and_story():
 
 
 def test_plan_month_weekday_categories():
-    # Mon..Sun from 2026-08-03, no overrides.
+    # Mon..Sun from 2026-08-03, no overrides. The BALANCED month rotation drives:
+    # doctrine / platform / b2b / podcast / summit spread so no everyday pillar dominates
+    # and doctrine (absent from the podcast-heavy live daily schedule) is present.
     plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
                           summit_day_fn=lambda d: False, welcome_dates=set())
     feeds = [s for s in plan if s.fmt == "feed"]
     got = [(s.post_date, s.category) for s in feeds]
     assert got == [
-        ("2026-08-03", "podcast"),   # Mon
-        ("2026-08-04", "platform"),  # Tue
+        ("2026-08-03", "platform"),  # Mon
+        ("2026-08-04", "doctrine"),  # Tue
         ("2026-08-05", "b2b"),       # Wed
-        ("2026-08-06", "podcast"),   # Thu (clip)
+        ("2026-08-06", "podcast"),   # Thu
         ("2026-08-07", "summit"),    # Fri
         ("2026-08-08", "platform"),  # Sat
-        ("2026-08-09", "podcast"),   # Sun (infographic)
+        ("2026-08-09", "podcast"),   # Sun
     ]
 
 
@@ -154,7 +156,8 @@ def test_plan_month_book_override_lands_on_book_dates():
 
 
 def test_plan_month_summit_override_lands_on_summit_days():
-    # Force Tuesdays to be summit days; 2026-08-04 is a Tue (platform in rotation).
+    # Force Tuesdays to be summit days; 2026-08-04 is a Tue (doctrine in the balanced
+    # month rotation).
     def _tue_summit(day_key):
         from datetime import date
         return date.fromisoformat(day_key).weekday() == 1
@@ -162,7 +165,7 @@ def test_plan_month_summit_override_lands_on_summit_days():
                           summit_day_fn=_tue_summit, welcome_dates=set())
     tue_feed = next(s for s in plan if s.post_date == "2026-08-04" and s.fmt == "feed")
     assert tue_feed.category == "summit"
-    assert tue_feed.base_category == "platform"
+    assert tue_feed.base_category == "doctrine"
     assert tue_feed.overridden is True
 
 
@@ -227,21 +230,46 @@ def test_build_story_is_9_16_and_feed_is_not():
     assert feed.draft_id != story.draft_id
 
 
-def test_build_missing_source_slot_is_skipped_not_faked():
-    # A builder that returns None (no approved source) must drop the slot AND its story,
-    # never fabricate. Only 'podcast' can build here; every other category returns None.
+def test_build_missing_source_slot_falls_back_to_real_pillar_not_faked():
+    # When a slot's own category has no builder, the day FILLS from the next REAL pillar
+    # with content (never a blank, never fabricated). Only 'podcast' can build here, so
+    # every non-podcast day falls back to the real podcast pillar and the whole week fills.
     plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
                           summit_day_fn=lambda d: False, welcome_dates=set())
     builders = {"podcast": _builders_all()["podcast"]}  # others absent -> no builder
     drafts = rmp.build_month_drafts(plan, builders, story_builder=_story_builder_ok)
-    # Mon/Thu/Sun are podcast in this window: 3 feed + 3 story built, the rest skipped.
     feeds = [d for d in drafts if not d.is_story]
     stories = [d for d in drafts if d.is_story]
-    assert len(feeds) == 3
-    assert len(stories) == 3
+    # every one of the 7 days fills (feed + story), all via the one real pillar available
+    assert len(feeds) == 7
+    assert len(stories) == 7
     assert all(d.category == "podcast" for d in drafts)
     # no fabricated caption ever appears: every draft came from the injected builder
     assert all(d.caption == "real caption" for d in drafts)
+
+
+def test_build_empty_when_no_pillar_has_content():
+    # No builder at all for any pillar: no real pillar can fill any day, so nothing is
+    # built and NOTHING is fabricated to fill the blanks.
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, {}, story_builder=_story_builder_ok)
+    assert drafts == []
+
+
+def test_build_fallback_relabels_pillar_to_the_one_that_built():
+    # A platform day with no platform builder but a b2b builder present fills from b2b,
+    # and the calendar row shows the TRUE pillar (b2b), feed and paired story alike.
+    # 2026-08-04 is a Tue (doctrine in the balanced month rotation).
+    plan = rmp.plan_month(ACCT, MON, days=2, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    builders = {"b2b": _builders_all()["b2b"]}  # only b2b can build
+    drafts = rmp.build_month_drafts(plan, builders, story_builder=_story_builder_ok)
+    tue = [d for d in drafts if d.day_key == "2026-08-04"]
+    assert tue and all(d.category == "b2b" for d in tue)
+    # the row mapping shows b2b (the real pillar that filled the day), not platform
+    rows = rmp.to_calendar_rows(tue, ACCT)
+    assert rows and all(r["pillar"] == "b2b" for r in rows)
 
 
 def test_build_story_skipped_when_no_genuine_9_16():
