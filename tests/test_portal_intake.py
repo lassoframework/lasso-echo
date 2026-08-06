@@ -119,6 +119,9 @@ def _ingest(r2, monkeypatch):
 # ---- 1. valid token lands pending sources for the right account -----------------
 def test_valid_token_lands_pending_sources(server, monkeypatch):
     monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    # No AGENT_UPLOAD_BASE_URL: the builder falls back to the canonical service
+    # origin (never a relative or placeholder link).
+    monkeypatch.delenv("AGENT_UPLOAD_BASE_URL", raising=False)
     r2 = FakeR2()
     monkeypatch.setattr(intake_web, "_default_r2", lambda: r2)
     status, _h, body = _post_json(server, f"/intake/{TOKEN}", _BODY)
@@ -127,7 +130,8 @@ def test_valid_token_lands_pending_sources(server, monkeypatch):
     assert resp["status"] == "received"
     assert resp["account_key"] == "gym_alpha_ig"
     assert resp["pending_source_count"] == _EXPECTED_FACTS
-    assert resp["upload_url"] == f"/u/{TOKEN}"
+    assert resp["upload_url"] == \
+        f"{intake_web._DEFAULT_UPLOAD_BASE_URL}/u/{TOKEN}"
     assert TOKEN not in json.dumps(json.loads(
         r2.objects[[k for k in r2.objects if k.endswith("_intake.json")][0]]))
 
@@ -156,6 +160,30 @@ def test_upload_url_uses_public_base_when_set(monkeypatch):
     assert status == 200
     assert resp["upload_url"] == \
         f"https://echo-intake-web.up.railway.app/u/{TOKEN}"
+
+
+def test_upload_url_ignores_setup_placeholder(monkeypatch):
+    # A forgotten setup placeholder must NEVER reach a client link; it falls back
+    # to the canonical service origin instead of "<paste ...>/u/<token>".
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "<paste the Step 7 domain here>")
+    r2 = FakeR2()
+    status, resp = handle_portal_intake(TOKEN, _BODY, r2=r2)
+    assert status == 200
+    assert resp["upload_url"] == \
+        f"{intake_web._DEFAULT_UPLOAD_BASE_URL}/u/{TOKEN}"
+    assert "<" not in resp["upload_url"] and "paste" not in resp["upload_url"]
+
+
+def test_upload_url_ignores_non_http_base(monkeypatch):
+    # A non-http value (e.g. a bare hostname) is also treated as unset.
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "echo-intake-web.up.railway.app")
+    r2 = FakeR2()
+    status, resp = handle_portal_intake(TOKEN, _BODY, r2=r2)
+    assert status == 200
+    assert resp["upload_url"] == \
+        f"{intake_web._DEFAULT_UPLOAD_BASE_URL}/u/{TOKEN}"
 
 
 # ---- 2. invalid token / flag off are the same 404 --------------------------------
