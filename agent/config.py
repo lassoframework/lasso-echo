@@ -305,6 +305,22 @@ def real_calendar_mirror_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_REAL_CALENDAR_MIRROR", "false"))
 
 
+def real_month_plan_enabled() -> bool:
+    """
+    REAL month planner switch. OFF by default = zero behavior change: the planner is
+    never invoked, so /social and the shared content_calendar keep whatever they
+    already hold (byte-for-byte today's behavior). ON, the planner can assemble a full
+    month of REAL LASSO drafts (two per day, one feed + one paired 9:16 story) spanning
+    every LASSO content type per the weekly rotation, plus book / summit / welcome
+    overrides on the days they occur, then upsert them as content_calendar rows for
+    gym_id='lasso' and clear ALL demo rows off that gym. The planner is pure and
+    injectable: it reuses the EXISTING category draft builders (never invents content),
+    a slot whose source or creative is missing is SKIPPED (never fabricated), and it
+    writes calendar rows only. It never publishes and adds no publish path. Arm by hand.
+    """
+    return _truthy(os.environ.get("AGENT_REAL_MONTH_PLAN", "false"))
+
+
 def portal_social_enabled() -> bool:
     """
     Portal client-social MASTER switch (Part A). OFF by default. When OFF, EVERY new

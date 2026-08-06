@@ -1,0 +1,359 @@
+"""
+Real month planner (agent/real_month_planner.py), all offline.
+
+plan_month emits exactly 2 slots/day (feed + story), the correct weekly-rotation
+category per weekday, is deterministic, folds book/summit/welcome overrides onto the
+right days, and is safe for days <= 0. build_month_drafts uses ONLY the injected
+builders, skips (never fakes) a missing-source slot, keeps feed and story as separate
+drafts with the correct format, and respects the 9:16 story assertion. to_calendar_rows
+has the content_calendar shape, is gym-scoped, status pending. apply_month_plan upserts
+the real rows and deletes ALL demo rows for the gym across the full planned span, never
+touches another gym, and leaves no demo id behind.
+
+Nothing here publishes, hosts, or writes to a live store: every store is an injected fake.
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from agent import real_month_planner as rmp  # noqa: E402
+from agent import demo_calendar_queue as demo  # noqa: E402
+from agent.drafter import Draft, DraftStatus  # noqa: E402
+
+ACCT = "lasso"
+# 2026-08-03 is a Monday, so a 7-day window from here walks Mon..Sun cleanly.
+MON = "2026-08-03"
+
+
+# ---- fakes ----------------------------------------------------------------
+
+def _draft(draft_id, *, day_key, category, platform="instagram",
+           caption="real caption", url="https://cdn/x.jpg", is_story=False,
+           draft_type="feed"):
+    return Draft(
+        draft_id=draft_id, account_key=ACCT, platform=platform, caption=caption,
+        hashtags=[], creative_path="x.png", creative_public_url=url,
+        scheduled_for="", status=DraftStatus.PENDING, is_story=is_story,
+        day_key=day_key, draft_type=draft_type, category=category)
+
+
+class _FakeSB:
+    """Stands in for SupabaseCalendarStore; records writes and enforces gym isolation."""
+
+    def __init__(self, rows=None):
+        self._rows = {r["id"]: dict(r) for r in (rows or [])}
+        self.upserts = []
+        self.deletes = []
+
+    def list_month(self, account_key, month):
+        return [dict(r) for r in self._rows.values()
+                if str(r.get("gym_id")) == str(account_key)
+                and (r.get("post_date") or "").startswith(month)]
+
+    def upsert_row(self, account_key, row):
+        assert str(row.get("gym_id")) == str(account_key), "cross-gym upsert"
+        self.upserts.append((account_key, dict(row)))
+        self._rows[row["id"]] = dict(row)
+        return dict(row)
+
+    def delete_row(self, account_key, row_id):
+        self.deletes.append((account_key, row_id))
+        r = self._rows.get(row_id)
+        if r is not None and str(r.get("gym_id")) == str(account_key):
+            del self._rows[row_id]
+            return 1
+        return 0
+
+
+def _builders_all(record=None):
+    """A builders map that produces a real feed draft for EVERY category. `record` (a
+    list) captures each (category, day) call so a test can prove the injected builder,
+    not the planner, produced the content."""
+    def _mk(category):
+        def _b(target, day_key):
+            if record is not None:
+                record.append((category, day_key))
+            return _draft(f"f_{category}_{day_key}", day_key=day_key,
+                          category=category, draft_type=category if category in
+                          ("podcast", "book", "summit", "b2b") else "feed")
+        return _b
+    cats = ("podcast", "platform", "b2b", "summit", "book", "doctrine", "welcome")
+    return {c: _mk(c) for c in cats}
+
+
+def _story_builder_ok(target, day_key, feed_draft):
+    """A story builder that always returns a genuine 9:16 story draft anchored to the
+    day's feed draft (mirrors stories.py output: is_story True, 9:16)."""
+    return _draft(f"s_{feed_draft.category}_{day_key}", day_key=day_key,
+                  category=feed_draft.category, is_story=True, draft_type="story",
+                  url="https://cdn/story.jpg")
+
+
+# ---- plan_month -----------------------------------------------------------
+
+def test_plan_month_two_slots_per_day_feed_and_story():
+    plan = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    assert len(plan) == 60  # exactly 2 per day
+    from collections import Counter
+    by_date = Counter(s.post_date for s in plan)
+    assert all(v == 2 for v in by_date.values())
+    for i in range(0, len(plan), 2):
+        assert plan[i].fmt == "feed"
+        assert plan[i + 1].fmt == "story"
+        assert plan[i].post_date == plan[i + 1].post_date
+        assert plan[i].category == plan[i + 1].category  # paired story shares pillar
+
+
+def test_plan_month_weekday_categories():
+    # Mon..Sun from 2026-08-03, no overrides.
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    feeds = [s for s in plan if s.fmt == "feed"]
+    got = [(s.post_date, s.category) for s in feeds]
+    assert got == [
+        ("2026-08-03", "podcast"),   # Mon
+        ("2026-08-04", "platform"),  # Tue
+        ("2026-08-05", "b2b"),       # Wed
+        ("2026-08-06", "podcast"),   # Thu (clip)
+        ("2026-08-07", "summit"),    # Fri
+        ("2026-08-08", "platform"),  # Sat
+        ("2026-08-09", "podcast"),   # Sun (infographic)
+    ]
+
+
+def test_plan_month_is_deterministic():
+    a = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
+                       summit_day_fn=lambda d: False, welcome_dates=set())
+    b = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
+                       summit_day_fn=lambda d: False, welcome_dates=set())
+    assert a == b
+
+
+def test_plan_month_days_zero_or_negative_safe():
+    assert rmp.plan_month(ACCT, MON, days=0) == []
+    assert rmp.plan_month(ACCT, MON, days=-5) == []
+    assert rmp.plan_month(ACCT, MON, days=None) == []
+
+
+def test_plan_month_book_override_lands_on_book_dates():
+    # 2026-08-05 is a Wed (b2b in the rotation); a dated book post overrides it to book.
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates={"2026-08-05"},
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    wed_feed = next(s for s in plan if s.post_date == "2026-08-05" and s.fmt == "feed")
+    assert wed_feed.category == "book"
+    assert wed_feed.base_category == "b2b"
+    assert wed_feed.overridden is True
+    # the paired story is overridden too
+    wed_story = next(s for s in plan if s.post_date == "2026-08-05" and s.fmt == "story")
+    assert wed_story.category == "book"
+
+
+def test_plan_month_summit_override_lands_on_summit_days():
+    # Force Tuesdays to be summit days; 2026-08-04 is a Tue (platform in rotation).
+    def _tue_summit(day_key):
+        from datetime import date
+        return date.fromisoformat(day_key).weekday() == 1
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=_tue_summit, welcome_dates=set())
+    tue_feed = next(s for s in plan if s.post_date == "2026-08-04" and s.fmt == "feed")
+    assert tue_feed.category == "summit"
+    assert tue_feed.base_category == "platform"
+    assert tue_feed.overridden is True
+
+
+def test_plan_month_welcome_override_lands_on_welcome_dates():
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=lambda d: False,
+                          welcome_dates={"2026-08-08"})  # a Sat (platform)
+    sat_feed = next(s for s in plan if s.post_date == "2026-08-08" and s.fmt == "feed")
+    assert sat_feed.category == "welcome"
+    assert sat_feed.base_category == "platform"
+
+
+def test_plan_month_override_precedence_book_over_summit_over_welcome():
+    # A single day flagged in all three sets resolves to book (highest precedence).
+    plan = rmp.plan_month(ACCT, MON, days=1, book_dates={MON},
+                          summit_day_fn=lambda d: True, welcome_dates={MON})
+    assert plan[0].category == "book"
+
+
+def test_plan_month_default_book_dates_from_book_queue():
+    # With defaults (no injected book_dates), the real dated book posts override their
+    # days. Pick a known BOOK_POSTS date and assert it reads 'book'.
+    from agent import book_queue
+    a_book_date = book_queue.BOOK_POSTS[0]["date"]
+    from datetime import date
+    start = date.fromisoformat(a_book_date)
+    plan = rmp.plan_month(ACCT, start.isoformat(), days=1)
+    assert plan[0].category == "book"
+
+
+# ---- build_month_drafts ---------------------------------------------------
+
+def test_build_uses_injected_builders_and_pairs_story():
+    record = []
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, _builders_all(record),
+                                    story_builder=_story_builder_ok, account=None)
+    # 7 feed + 7 story = 14 drafts
+    feeds = [d for d in drafts if not d.is_story]
+    stories = [d for d in drafts if d.is_story]
+    assert len(feeds) == 7
+    assert len(stories) == 7
+    # the injected builder produced the content, once per feed slot
+    assert len(record) == 7
+    # every story is a separate object anchored to the SAME day as a feed
+    feed_days = {d.day_key for d in feeds}
+    story_days = {d.day_key for d in stories}
+    assert feed_days == story_days
+
+
+def test_build_story_is_9_16_and_feed_is_not():
+    plan = rmp.plan_month(ACCT, MON, days=1, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, _builders_all(),
+                                    story_builder=_story_builder_ok)
+    feed = next(d for d in drafts if not d.is_story)
+    story = next(d for d in drafts if d.is_story)
+    assert feed.draft_type != "story"
+    assert story.is_story is True and story.draft_type == "story"
+    # feed and story are DIFFERENT draft objects
+    assert feed.draft_id != story.draft_id
+
+
+def test_build_missing_source_slot_is_skipped_not_faked():
+    # A builder that returns None (no approved source) must drop the slot AND its story,
+    # never fabricate. Only 'podcast' can build here; every other category returns None.
+    plan = rmp.plan_month(ACCT, MON, days=7, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    builders = {"podcast": _builders_all()["podcast"]}  # others absent -> no builder
+    drafts = rmp.build_month_drafts(plan, builders, story_builder=_story_builder_ok)
+    # Mon/Thu/Sun are podcast in this window: 3 feed + 3 story built, the rest skipped.
+    feeds = [d for d in drafts if not d.is_story]
+    stories = [d for d in drafts if d.is_story]
+    assert len(feeds) == 3
+    assert len(stories) == 3
+    assert all(d.category == "podcast" for d in drafts)
+    # no fabricated caption ever appears: every draft came from the injected builder
+    assert all(d.caption == "real caption" for d in drafts)
+
+
+def test_build_story_skipped_when_no_genuine_9_16():
+    # story_builder returns None (no genuine 9:16): the feed still builds, the story is
+    # dropped (never a cropped feed card).
+    plan = rmp.plan_month(ACCT, MON, days=1, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, _builders_all(),
+                                    story_builder=lambda t, d, f: None)
+    assert any(not d.is_story for d in drafts)
+    assert not any(d.is_story for d in drafts)
+
+
+def test_build_no_feed_means_no_story_for_that_day():
+    # If a day's feed builder returns None, its story slot has nothing to anchor to.
+    plan = rmp.plan_month(ACCT, MON, days=1, book_dates=set(),  # Mon -> podcast
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    builders = {}  # no builders at all
+    drafts = rmp.build_month_drafts(plan, builders, story_builder=_story_builder_ok)
+    assert drafts == []
+
+
+# ---- to_calendar_rows -----------------------------------------------------
+
+def test_rows_shape_gym_scoped_pending():
+    plan = rmp.plan_month(ACCT, MON, days=3, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, _builders_all(),
+                                    story_builder=_story_builder_ok)
+    rows = rmp.to_calendar_rows(drafts, ACCT)
+    assert rows, "expected calendar rows"
+    for r in rows:
+        assert set(r.keys()) >= {"gym_id", "account", "post_date", "pillar",
+                                 "format", "caption", "image_url", "status", "id"}
+        assert r["gym_id"] == ACCT
+        assert r["status"] == "pending"
+        assert r["format"] in ("feed", "story")
+        assert r["pillar"]  # the plan category rode through
+    # a feed row reads 'feed', a story row reads 'story'
+    fmts = {r["format"] for r in rows}
+    assert fmts == {"feed", "story"}
+
+
+def test_rows_drop_draft_with_no_post_date():
+    d = _draft("nodate", day_key="", category="podcast")
+    d.scheduled_for = ""
+    rows = rmp.to_calendar_rows([d], ACCT)
+    assert rows == []
+
+
+# ---- apply_month_plan -----------------------------------------------------
+
+def test_apply_upserts_real_and_deletes_all_demo_for_gym():
+    # Seed the store with demo rows for the gym across TWO months of the planned span,
+    # plus a real gym's rows on ANOTHER gym that must never be touched.
+    demo_feed_id = demo._draft_id(ACCT, "2026-08-10", "feed")   # demof_...
+    demo_story_id = demo._draft_id(ACCT, "2026-09-02", "story")  # demos_... next month
+    other_gym_id = "keep_me"
+    sb = _FakeSB(rows=[
+        {"id": demo_feed_id, "gym_id": ACCT, "post_date": "2026-08-10",
+         "format": "feed", "status": "pending"},
+        {"id": demo_story_id, "gym_id": ACCT, "post_date": "2026-09-02",
+         "format": "story", "status": "pending"},
+        {"id": other_gym_id, "gym_id": "northside_ig", "post_date": "2026-08-10",
+         "format": "feed", "status": "pending"},
+    ])
+    assert demo.is_demo_draft_id(demo_feed_id)
+    assert demo.is_demo_draft_id(demo_story_id)
+
+    plan = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
+                          summit_day_fn=lambda d: False, welcome_dates=set())
+    drafts = rmp.build_month_drafts(plan, _builders_all(),
+                                    story_builder=_story_builder_ok)
+    span = rmp.plan_span_months(MON, days=30)  # sweeps Aug AND Sep
+    out = rmp.apply_month_plan(ACCT, drafts, sb, span_months=span)
+
+    assert out["ok"] is True
+    assert out["upserted"] == len(drafts) > 0
+    # BOTH demo rows deleted (including the next-month one the mirror's narrow sweep
+    # would have missed) -> the month-range gap is closed.
+    assert demo_feed_id in out["delete_ids"]
+    assert demo_story_id in out["delete_ids"]
+    assert out["deleted"] == 2
+    # no demo id survives on the gym
+    surviving = [r for r in sb._rows.values() if str(r.get("gym_id")) == ACCT]
+    assert not any(demo.is_demo_draft_id(r["id"]) for r in surviving)
+    # the other gym's row is untouched
+    assert other_gym_id in sb._rows
+    # every delete was scoped to our gym
+    assert all(acct == ACCT for acct, _ in sb.deletes)
+    # every upsert carried our gym_id
+    assert all(str(row["gym_id"]) == ACCT for _, row in sb.upserts)
+
+
+def test_apply_refuses_demo_gym_id():
+    sb = _FakeSB()
+    from agent import config
+    out = rmp.apply_month_plan(config.demo_calendar_gym_id(), [], sb)
+    assert out["ok"] is False
+    assert not sb.upserts and not sb.deletes
+
+
+def test_apply_missing_store_is_safe():
+    out = rmp.apply_month_plan(ACCT, [], None)
+    assert out["ok"] is False
+
+
+def test_apply_never_upserts_a_demo_id():
+    # Even if a demo-id draft somehow reached apply, it is filtered out of the upserts.
+    sb = _FakeSB()
+    d = _draft(demo._draft_id(ACCT, "2026-08-10", "feed"),
+               day_key="2026-08-10", category="podcast")
+    out = rmp.apply_month_plan(ACCT, [d], sb, span_months=["2026-08"])
+    assert out["upserted"] == 0
+    assert not sb.upserts

@@ -132,6 +132,7 @@ def _status():
     print(f"  demo_calendar  : {config.demo_calendar_enabled()}  (env AGENT_DEMO_CALENDAR_ENABLED; 30-day done-for-you demo calendar, needs hosting)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
     print(f"  real_cal_mirror: {config.real_calendar_mirror_enabled()}  (env AGENT_REAL_CALENDAR_MIRROR; fold a real gym's real drafts into the shared content_calendar, clear demo rows off real gyms; needs Supabase creds; no publish)")
+    print(f"  real_month_plan: {config.real_month_plan_enabled()}  (env AGENT_REAL_MONTH_PLAN; assemble a full month of REAL LASSO drafts, 2/day feed+9:16 story, into content_calendar for gym_id='lasso' and clear ALL demo rows off that gym; reuses existing builders, skips missing sources; no publish)")
     print(f"  zernio_analytics: {config.zernio_analytics_enabled()}  (env AGENT_ZERNIO_ANALYTICS_ENABLED; Part C metrics pull; OFF => portal metrics return the shape with null values)")
     print(f"  monthly_report : {config.monthly_report_enabled()}  (env AGENT_MONTHLY_REPORT_ENABLED; Part D before/after story; OFF => report shape only, gaps never zeros)")
     print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
