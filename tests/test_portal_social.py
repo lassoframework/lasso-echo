@@ -143,6 +143,18 @@ def test_no_customer_id_is_not_active(db_env, monkeypatch):
     assert ps.is_social_active("gymA", reader=_ActiveReader()) is False
 
 
+def test_billing_delegated_bypasses_stripe_gate(db_env, monkeypatch):
+    # When the portal owns billing, Echo trusts it: is_social_active is True even with
+    # no Stripe customer / no reader, so /social stops 402'ing. Token auth + flag still apply.
+    _register(monkeypatch, _account("gymA"))  # no stripe_customer_id, no reader
+    monkeypatch.setenv("AGENT_SOCIAL_BILLING_DELEGATED", "true")
+    assert ps.is_social_active("gymA") is True
+    assert ps.handle_social("gymA", "2026-08")[0] != 402
+    # unset -> old fail-closed behavior is preserved
+    monkeypatch.delenv("AGENT_SOCIAL_BILLING_DELEGATED", raising=False)
+    assert ps.is_social_active("gymA", reader=_ActiveReader()) is False
+
+
 def test_stripe_read_error_fails_closed(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
     _mark_stripe_customer("gymA")

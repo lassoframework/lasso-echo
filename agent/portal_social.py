@@ -137,7 +137,14 @@ def is_social_active(account_key, reader=None):
     """True iff this gym has an ACTIVE social-product subscription. Fails CLOSED:
     no product id configured, no customer id on the gym, no Stripe key, or any read
     error => not active (the portal gets a clean 402 empty state, never a live
-    calendar). A reader is injectable for tests."""
+    calendar). A reader is injectable for tests.
+
+    EXCEPTION: when billing is delegated to the portal (AGENT_SOCIAL_BILLING_DELEGATED),
+    the portal has already enforced the subscription/entitlement before calling Echo,
+    so Echo trusts that gate and does not re-check Stripe here. The token auth and the
+    AGENT_PORTAL_SOCIAL_ENABLED flag still gate every request."""
+    if config.social_billing_delegated():
+        return True
     product_id = social_product_id()
     if not product_id:
         return False

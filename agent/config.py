@@ -664,6 +664,16 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def social_billing_delegated() -> bool:
+    """The LASSO portal now owns the $99.99/mo social subscription and enforces
+    entitlement (isSocialEntitled) BEFORE it ever calls Echo. When this flag is ON,
+    Echo stops double-gating on its own Stripe check (which fails closed for gyms that
+    have no Echo-side Stripe customer, since billing moved to the portal) and trusts
+    the portal's gate. Default OFF preserves the standalone Stripe gate. The token
+    auth + AGENT_PORTAL_SOCIAL_ENABLED flag still apply either way."""
+    return _truthy(os.environ.get("AGENT_SOCIAL_BILLING_DELEGATED", "false"))
+
+
 # ---- Portal onboard endpoint shared key --------------------------------------
 # The LASSO portal authenticates the self-serve onboard call (POST /portal/onboard)
 # with a shared secret in the X-Portal-Key header, compared in constant time. The
