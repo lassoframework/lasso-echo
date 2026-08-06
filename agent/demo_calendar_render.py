@@ -1,8 +1,9 @@
 """
 demo_calendar_render.py — PIL compositor for the 30-day demo calendar cards.
 
-Renders the 30 feed cards (1080x1080) and the 6 story cards (1080x1920) for the
-done-for-you demo calendar to content_library/demo_calendar/. Pure PIL: no API key,
+Renders the 30 feed cards (1080x1080) and 30 paired story cards (1080x1920), two posts
+per day, for the done-for-you demo calendar to content_library/demo_calendar/. Pure PIL:
+no API key,
 no network, no model-rendered (garble-prone) text. Reuses the summit_render font set
 and text helpers so type is house style and dash-safe.
 
@@ -19,15 +20,16 @@ Design rules honored here:
     sources and pixel-gated there), never on the image. A startup assertion enforces
     that no card text contains a digit.
 
-DISTINCT ART (Blake ruling): all 30 feed cards + all 6 story cards must be DISTINCT
-images. Same pillar MAY share a visual FAMILY (headline vocabulary, palette lineage,
+DISTINCT ART (Blake ruling): all 30 feed cards + all 30 story cards (60 total) must be
+DISTINCT images. Same pillar MAY share a visual FAMILY (headline vocabulary, palette lineage,
 data vocabulary) but NEVER a byte-identical or visually-identical image. The pillar
 copy bank repeats hooks across days (e.g. six All-in-one days), so the compositor can
 no longer key art off the pillar alone. Instead every card derives a deterministic
 VARIANT from (pillar, num): a ground shade, a layout composition, and an accent
 placement. Same-pillar cards are clearly kin (same palette lineage + labels) but no
 two are identical. render_all() hashes every emitted file and RAISES on any collision
-so a regression can never reintroduce duplicate art.
+so a regression can never reintroduce duplicate art. A day's feed and its paired story
+render at different aspect ratios (1080x1080 vs 1080x1920), so they are never identical.
 
 Entry point: render_all(out_dir) renders every card and returns the paths.
 """
@@ -382,10 +384,13 @@ def _render_one(post, w, h, out_path):
 
 
 def render_all(out_dir):
-    """Render all 30 feed cards + the 6 story cards to out_dir. Returns the paths.
+    """Render all 30 feed cards + all 30 story cards (2 posts/day) to out_dir. Returns
+    the paths.
 
     Distinct-art gate (Blake ruling): every emitted file is hashed by its bytes and any
-    collision RAISES. Same-pillar cards share a family but must never be identical."""
+    collision RAISES. Same-pillar cards share a family but must never be identical, and
+    a day's feed and its paired story must differ too (they render at different aspect
+    ratios). All 60 emitted files must be distinct."""
     paths = []
     for post in DEMO_POSTS:
         feed_path = os.path.join(out_dir, post["filename"])
@@ -404,7 +409,7 @@ def render_all(out_dir):
             raise AssertionError(
                 "demo calendar produced duplicate art: "
                 f"{os.path.basename(p)} is byte-identical to "
-                f"{os.path.basename(seen[h])}. Every one of the 30 feed cards + 6 "
-                "story cards must be a DISTINCT image.")
+                f"{os.path.basename(seen[h])}. Every one of the 30 feed cards + 30 "
+                "story cards (60 total) must be a DISTINCT image.")
         seen[h] = p
     return paths

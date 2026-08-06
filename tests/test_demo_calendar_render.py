@@ -1,14 +1,16 @@
 """
 Demo calendar RENDER tests. Offline, pure PIL (no network, no R2).
 
-Guards the Blake ruling that every one of the 30 feed cards + 6 story cards is a
-DISTINCT image. The pillar copy bank repeats hooks across days (six All-in-one days,
-etc.), so the compositor derives a deterministic per-post VARIANT from (pillar, num):
-a ground shade, a layout composition, and an accent placement. Same-pillar cards stay
-a family; no two are byte-identical.
+Guards two Blake rulings: (a) the calendar serves TWO posts per day, so every one of
+the 30 days emits BOTH a feed card and a paired 9:16 story; (b) every one of the 30 feed
+cards + 30 story cards (60 total) is a DISTINCT image. The pillar copy bank repeats hooks
+across days (six All-in-one days, etc.), so the compositor derives a deterministic
+per-post VARIANT from (pillar, num): a ground shade, a layout composition, and an accent
+placement. Same-pillar cards stay a family; no two are byte-identical. A day's feed and
+its story render at different aspect ratios, so they differ too.
 
 Asserts:
-  * render_all emits exactly 36 files (30 feed + 6 story) and they are ALL distinct by
+  * render_all emits exactly 60 files (30 feed + 30 story) and they are ALL distinct by
     content hash (the core anti-duplication contract).
   * the render_all built-in collision gate raises if any two files ever match.
   * every card is a distinct member of its pillar family: same-pillar cards differ.
@@ -40,22 +42,32 @@ def _hashes_by_name(tmp_path):
     return {os.path.basename(p): _hash(p) for p in paths}, paths
 
 
-# ---- the core contract: 36 files, all distinct -----------------------------------------
+# ---- the core contract: 60 files (2/day), all distinct ---------------------------------
 
-def test_render_all_emits_30_feed_plus_6_story(tmp_path):
+def test_render_all_emits_30_feed_plus_30_story(tmp_path):
     _, paths = _hashes_by_name(tmp_path)
     feed = [p for p in paths if not p.endswith("_story.png")]
     story = [p for p in paths if p.endswith("_story.png")]
     assert len(feed) == 30
-    assert len(story) == 6
-    assert len(paths) == 36
+    assert len(story) == 30
+    assert len(paths) == 60
 
 
-def test_all_36_cards_are_distinct_images(tmp_path):
+def test_every_feed_day_has_a_paired_story(tmp_path):
+    """Two posts per day: for every rendered feed card there is a matching _story card."""
+    _, paths = _hashes_by_name(tmp_path)
+    names = {os.path.basename(p) for p in paths}
+    for post in DEMO_POSTS:
+        assert post["filename"] in names, f"missing feed card for post {post['num']}"
+        assert _story_filename(post["filename"]) in names, \
+            f"missing paired story for post {post['num']}"
+
+
+def test_all_60_cards_are_distinct_images(tmp_path):
     by_name, paths = _hashes_by_name(tmp_path)
     hashes = list(by_name.values())
-    # the whole point: no two of the 36 files share an image hash
-    assert len(set(hashes)) == 36, (
+    # the whole point: no two of the 60 files share an image hash
+    assert len(set(hashes)) == 60, (
         "duplicate art: only "
         f"{len(set(hashes))} distinct images across {len(hashes)} files")
 
@@ -73,13 +85,16 @@ def test_render_all_raises_on_any_collision(tmp_path, monkeypatch):
 
 def test_same_pillar_cards_are_all_distinct(tmp_path):
     by_name, _ = _hashes_by_name(tmp_path)
-    by_pillar = {}
-    for post in DEMO_POSTS:
-        by_pillar.setdefault(post["pillar"], []).append(by_name[post["filename"]])
-    for pillar, hs in by_pillar.items():
-        assert len(set(hs)) == len(hs), (
-            f"pillar {pillar!r} has duplicate feed cards: {len(hs)} files, "
-            f"{len(set(hs))} distinct")
+    # both feed cards AND story cards must be distinct within a pillar family
+    for kind, key in (("feed", lambda p: p["filename"]),
+                      ("story", lambda p: _story_filename(p["filename"]))):
+        by_pillar = {}
+        for post in DEMO_POSTS:
+            by_pillar.setdefault(post["pillar"], []).append(by_name[key(post)])
+        for pillar, hs in by_pillar.items():
+            assert len(set(hs)) == len(hs), (
+                f"pillar {pillar!r} has duplicate {kind} cards: {len(hs)} files, "
+                f"{len(set(hs))} distinct")
 
 
 def test_variation_is_deterministic(tmp_path):
