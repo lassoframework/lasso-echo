@@ -194,6 +194,21 @@ def _post_and_save(draft, store, poster, idempotent):
                 "would auto-publish at current trust (dry run: still needs your tap)"]
             db.audit("trust_dryrun", draft.draft_id, why, draft.account_key,
                      draft.day_key)
+    # APPROVAL SURFACE ROUTING (Part A, AGENT_PORTAL_SOCIAL_ENABLED, OFF by default).
+    # LASSO accounts approve in Slack (a card); client gyms approve in the PORTAL, so
+    # their Slack approval CARD is SKIPPED. One draft lifecycle, two surfaces. This
+    # never weakens a gate: the client draft is still PENDING + force_approval=True and
+    # waits for a human on the portal. ops_alerts (failures) STILL go to Slack for every
+    # gym. Flag OFF -> surface is always "slack", byte-for-byte today's behavior.
+    from .accounts import get_account as _get_acct
+    from .gym_calendar_queue import approval_surface_for as _surface_for
+    _surface = _surface_for(_get_acct(draft.account_key))
+    if _surface == "portal":
+        if idempotent:
+            draft.slack_channel = ""
+            draft.slack_ts = ""
+        store.put(draft)
+        return
     resp = poster.post_approval_card(draft) or {}
     # A hard send failure (transport down, rate limit past every retry) must be
     # LOUD for this one account and invisible to the rest of the fan-out: one

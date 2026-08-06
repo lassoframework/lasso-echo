@@ -44,6 +44,45 @@ What the portal CC is building next, in priority order:
 
 ---
 
+## PART A — PORTAL CLIENT-SOCIAL BACKEND (per-gym calendar + routing)
+
+Behind the master flag `AGENT_PORTAL_SOCIAL_ENABLED` (default OFF; flag off = every
+new hook inert, pipeline byte-for-byte unchanged). Branch `feat/portal-social-partA`.
+Endpoints stay PLANNED until deploy; this section tracks the BACKEND ENGINE only.
+
+- [x] Per-gym calendar ENGINE — `agent/gym_calendar_queue.py`. Generalizes the demo
+  calendar to per-gym dated queues keyed by (gym_id, account_key, day_key), each row
+  carrying gym_id + zernio_profile_id + account_key. New table `gym_calendar_queue`
+  mirrors the demo queue shape; the served-once-per-day lock is kept (new
+  `served_ledger` table: at most one served post per (account_key, day_key)). The
+  LASSO demo is one gym; client gyms are additional gyms. Client CONTENT generation is
+  OUT OF SCOPE for Part A (later phase).
+- [x] RULING 1 collision-shift (Blake ruled) — the live book queue
+  (`book_queue.build_book_queue_draft`, dates in `book_queue.BOOK_POSTS`) WINS any
+  contested served_day for a LASSO account. When the calendar engine would serve on a
+  day the book queue already occupies (or the served ledger already records a post for
+  that account that day), Echo SHIFTS to the NEXT open day in the pillar rotation.
+  NEVER two posts on one served_day per account. Regression:
+  `tests/test_gym_calendar_queue.py::test_calendar_shifts_off_every_book_overlap_date`
+  seeds the overlap dates 2026-08-12/15/19/22/26 and asserts the shift.
+- [x] approval_surface ROUTING — `gym_calendar_queue.approval_surface_for(account)`
+  returns "slack" for LASSO accounts (key starts "lasso") and "portal" for client
+  gyms. `runner._post_and_save` SKIPS the Slack approval card for portal-surface
+  drafts (they are approved on the portal) but STILL saves them PENDING +
+  force_approval=True. ops_alerts (failures) STILL go to Slack for every gym. One
+  draft lifecycle, two surfaces.
+- [x] BASELINE capture (Part D dependency) — `baseline_posts_per_week` +
+  `baseline_captured_at` columns added to the `gyms` table (additive migration);
+  `db.set_baseline_posts_per_week(account_key, posts_per_week, captured_at=None)` and
+  `db.get_baseline_posts_per_week(account_key)`. Timestamped on the gym record.
+  Accepts a manual/explicit value now; the Zernio-history source is Part C.
+
+NOTE: the per-gym approval ENDPOINTS the portal calls (`POST /api/approve/...`,
+`GET /api/calendar/...`) remain PLANNED below. Part A ships the engine + routing that
+those endpoints will drive; the endpoints themselves are a later phase (do not wire).
+
+---
+
 ## ECHO OWES
 
 What Echo CC must ship before the portal can wire each item. Named dependency pairs.

@@ -280,6 +280,23 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+def portal_social_enabled() -> bool:
+    """
+    Portal client-social MASTER switch (Part A). OFF by default. When OFF, EVERY new
+    portal-social hook is inert: the per-gym calendar engine serves nothing, the
+    collision-shift never runs, and approval_surface routing collapses to today's
+    behavior (Slack for everyone) so the pipeline is byte-for-byte unchanged. When ON,
+    Echo may key calendars per gym (gym_id + zernio_profile_id), SHIFT a calendar post
+    off any day the dated book queue (or another queue) already occupies for an account,
+    and route CLIENT-gym drafts to the portal approval surface instead of a Slack card
+    (ops_alerts on failures still go to Slack for every gym). Client CONTENT generation
+    is out of scope for Part A: this flag arms the ENGINE + per-gym keying + the
+    served-once-per-day lock only. Mirrors demo_calendar_enabled: arm by hand in Railway
+    env. Every other gate is untouched; no new publish path is added.
+    """
+    return _truthy(os.environ.get("AGENT_PORTAL_SOCIAL_ENABLED", "false"))
+
+
 # The Stripe secret is read lazily BY NAME (never stored, never logged), same
 # pattern as every other token. Set STRIPE_API_KEY in Railway (a RESTRICTED,
 # read-only key: Customers, Subscriptions, Products, Prices). Empty => the welcome
