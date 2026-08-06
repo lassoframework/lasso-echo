@@ -69,6 +69,21 @@ _MIN_ZONE_FRAC = 0.13
 # --------------------------------------------------------------------------
 STORY_W, STORY_H = 1080, 1920
 STORY_MARGIN = 96
+
+# The single source of truth for a genuine story asset size. Every guard layer
+# (render assert, host guard, publish backstop) checks against this exact tuple so
+# a square feed image (1080x1080) can NEVER masquerade as a 9:16 story.
+STORY_SIZE = (STORY_W, STORY_H)
+
+
+def is_story_size(size):
+    """True only for an exact genuine 9:16 story render (1080x1920). A square feed
+    image, a None, or any off-size asset is rejected. Shared by the render assert,
+    the host guard, and the publish backstop so they can never disagree."""
+    try:
+        return tuple(size) == STORY_SIZE
+    except TypeError:
+        return False
 STORY_SAFE_TOP = 288        # 15% of 1920 (also clears the 250px UI band)
 STORY_SAFE_BOTTOM = 1632    # 85% of 1920 (also clears the 250px reply band)
 # centered logo plate in the visual middle third (vertical 640..1280)
@@ -1037,7 +1052,16 @@ def _render(template, gym_name, owner_name, logo_path, out_path,
         on_card_text = _compose_text_story(img, template, gym_name, owner_name)
     else:
         on_card_text = _compose_text(img, template, gym_name, owner_name)
-    img.convert("RGB").save(out_path)
+    final = img.convert("RGB")
+    # GUARD (layer a, render): a story asset MUST be a genuine 9:16 (1080x1920). If
+    # anything upstream produced a square (or any off-size) frame, refuse to write a
+    # story that would center-crop to garbage. A square can never leave here as a story.
+    if fmt == "story" and not is_story_size(final.size):
+        raise ValueError(
+            f"welcome story render is {final.size}, expected {STORY_SIZE}; "
+            f"refusing to write a non-9:16 story (a square feed image would crop). "
+            f"template={template['id']}")
+    final.save(out_path)
     return out_path, mode, on_card_text
 
 
@@ -1059,6 +1083,16 @@ def make_welcome(template_id, gym_name, owner_name, logo_path, format="feed",
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     path, _mode, _text = _render(t, gym_name, owner_name, logo_path, out_path,
                                  bg_client=bg_client, cache_dir=cache_dir, fmt=format)
+    # GUARD (layer a, render): make_welcome MUST return a story that is exactly
+    # 1080x1920. Re-open the written file and assert, so a square can never be the
+    # thing this function hands back as a story (defense in depth over _render).
+    if format == "story":
+        with Image.open(path) as _im:
+            if not is_story_size(_im.size):
+                raise ValueError(
+                    f"make_welcome story is {_im.size}, expected {STORY_SIZE}; "
+                    f"a non-9:16 story would center-crop and cut off the gym name/logo. "
+                    f"template={template_id}")
     return path
 
 

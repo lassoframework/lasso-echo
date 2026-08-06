@@ -30,6 +30,8 @@ import hashlib
 import os
 import re
 
+from PIL import Image
+
 from . import config, db, welcome_templates as wt, website_scan
 
 # Blake-confirmed core tiers (2026-08-04). Only a FIRST subscription on one of these
@@ -263,6 +265,15 @@ def generate_posts(template_id, gym_name, owner_name, logo_path, out_dir,
         out[fmt] = wt.make_welcome(template_id, gym_name, owner_name, logo_path,
                                    format=fmt, out_path=p, bg_client=bg_client,
                                    cache_dir=cache_dir)
+    # GUARD (layer a, render): the story file that leaves this pipeline MUST be a
+    # genuine 9:16 (1080x1920). This makes a re-render on the worker safe: a square
+    # can never be written out as a story and then hosted. Raise loudly if it is not.
+    with Image.open(out["story"]) as _im:
+        if not wt.is_story_size(_im.size):
+            raise ValueError(
+                f"generate_posts story {out['story']} is {_im.size}, expected "
+                f"{wt.STORY_SIZE}; a non-9:16 story would center-crop and cut off "
+                f"the gym name/logo. gym={gym_name!r} template={template_id}")
     return out
 
 

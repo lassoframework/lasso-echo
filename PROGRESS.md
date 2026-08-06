@@ -144,6 +144,22 @@ suite green (1946); flag OFF = byte-for-byte current behavior.
   (auto-approve is GLOBAL: all LASSO content auto-publishes, not just welcomes). Ongoing
   new-client auto-pickup needs the override files on /data (catch-up does not).
 
+### [x] Two recurring welcome defects fixed permanently, with regression tests (2026-08-06)
+Defect 1 (welcome STORY posted at square size, cutting off the gym name/logo — hit All Kine
+and GritX): THREE layers of guard now make a non-9:16 story impossible. (a) RENDER: a new
+`wt.is_story_size` / `STORY_SIZE`; `_render` + `make_welcome(format="story")` assert exactly
+1080x1920 before returning; `welcome_posts.generate_posts` re-opens the story file and raises
+if it is not 9:16 (so a worker re-render is safe). (b) HOST: `welcome_queue._local_story_is_9_16`
+gates every story host, so `enqueue` and `build_manifest` never host a square/None/off-size as
+a story_url (feed still queues; story_url stays empty + a loud log). (c) PUBLISH backstop
+(mirrors 2c21a10): `build_welcome_story_draft` returns None when story_url is missing, and with
+an optional cheap dimension probe blocks + fires ONE ops alert on a non-9:16 hosted asset.
+Defect 2 (identical captions across clients): `welcome_caption` now selects 1 of 7 on-brand
+StoryBrand variants deterministically by a stable hash of the gym name (same gym stable, gyms
+differ). All dash-free, no "vendor", gym name + owner the only fills, no fabrication.
+Regression tests in tests/test_welcome_story_guards.py (fail if any guard is removed). Full
+suite green. Gates unchanged; nothing publishes from this work.
+
 ### [x] Chat can publish, scoped by account ownership — SHA 7b563be (flag AGENT_CHAT_PUBLISH_ENABLED)
 Flag-gated @app.message handler. LASSO accounts (lasso_ig/lasso_fb/blake_personal):
 explicit publish verb -> direct publish + permalink. Client accounts: draft+schedule

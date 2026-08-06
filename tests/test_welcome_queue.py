@@ -128,8 +128,16 @@ def test_feed_hook_ignores_non_lasso_accounts(armed):
     assert welcome_queue.build_welcome_queue_draft(client, "2026-08-05") is None
 
 
-def test_story_couples_to_feed(armed):
-    welcome_queue.enqueue(_entry("domain:f.com", "Gym F"), host_fn=_fake_host)
+def test_story_couples_to_feed(armed, tmp_path):
+    # The host guard (defense-in-depth layer b) only hosts a GENUINE 9:16 story, so a
+    # real 1080x1920 asset must exist on disk for a story_url to be written and the
+    # story to couple to the feed (mirrors the 2c21a10 "genuine 9:16 asset" contract).
+    from PIL import Image
+    story_path = str(tmp_path / "Gym F_story.png")
+    Image.new("RGB", (1080, 1920), (12, 20, 42)).save(story_path)
+    entry = _entry("domain:f.com", "Gym F")
+    entry["posts"]["story"] = story_path
+    welcome_queue.enqueue(entry, host_fn=_fake_host)
     feed = welcome_queue.build_welcome_queue_draft(_ig(), "2026-08-05")
     story = welcome_queue.build_welcome_story_draft(_ig(), "2026-08-05", feed_draft=feed)
     assert story is not None

@@ -35,7 +35,10 @@ import hashlib
 import json
 import os
 
-from . import config, db, media_host, schedule, welcome_posts
+from PIL import Image
+
+from . import config, db, media_host, ops_alerts, schedule, welcome_posts
+from . import welcome_templates as wt
 from .drafter import Draft, DraftStatus
 
 ACCOUNTS = ["lasso_ig", "lasso_fb"]      # feed cross-post targets
@@ -70,21 +73,92 @@ def _conn():
     return conn
 
 
+# ---- story asset guard (defense in depth, host layer) ----------------------------------
+
+def _local_story_is_9_16(story_path):
+    """GUARD (layer b, host): True only when the LOCAL story render is a genuine 9:16
+    (1080x1920). A missing path, a None, or any off-size image (a square feed image
+    at 1080x1080) returns False so the caller never hosts a square as a story_url. A
+    story_url must always point at a real 9:16 asset, never a cropped feed card."""
+    if not story_path or not os.path.isfile(story_path):
+        return False
+    try:
+        with Image.open(story_path) as im:
+            return wt.is_story_size(im.size)
+    except Exception:
+        return False
+
+
 # ---- caption (fixed, no fabrication, no dashes) ----------------------------------------
 
+# Welcome caption variants. StoryBrand voice: welcome the gym, name the
+# partnership, a forward-looking line. The ONLY variables are the gym name and the
+# owner (via {name} and {who}); NO invented facts, offers, prices, stats, or member
+# numbers. Every variant is DASH-FREE (no em/en dash, no hyphen-as-punctuation) and
+# never uses the word "vendor". A given gym always draws the SAME variant (stable
+# hash of the gym name), but different gyms differ, so no two welcomes read identical.
+_WELCOME_VARIANTS = (
+    ("Welcome to the LASSO family, {name}.\n\n"
+     "We are proud to partner with {who}. Here is to more of the right members "
+     "through your doors and a gym that grows on purpose.\n\n"
+     "Let us go build something that lasts."),
+
+    ("{name} is officially part of the LASSO family.\n\n"
+     "It is an honor to be in your corner. Working with {who}, we are focused on "
+     "bringing the right people through your doors and building growth that holds.\n\n"
+     "The best is ahead."),
+
+    ("Say hello to our newest partner, {name}.\n\n"
+     "We could not be more excited to work with {who}. Together we are going after "
+     "steady, dependable growth and a community that keeps coming back.\n\n"
+     "Let us get to work."),
+
+    ("A big LASSO welcome to {name}.\n\n"
+     "Partnering with {who} is a privilege, and we are all in on your success. More "
+     "of the right members, a stronger community, a gym that grows with intention.\n\n"
+     "Here is to the road ahead."),
+
+    ("We are proud to welcome {name} to LASSO.\n\n"
+     "Behind every great gym is a team that shows up, and {who} do exactly that. "
+     "Now we build the kind of growth that lasts and a membership that feels like "
+     "home.\n\n"
+     "Onward."),
+
+    ("{name}, welcome to LASSO.\n\n"
+     "Standing alongside {who} means everything to us. Our promise is simple: the "
+     "right members, real momentum, and a gym that grows the way you always wanted "
+     "it to.\n\n"
+     "Let us build it together."),
+
+    ("Thrilled to have {name} in the LASSO family.\n\n"
+     "Getting to work with {who} is why we do this. We are set on bringing the right "
+     "people through your doors and turning that into growth you can count on.\n\n"
+     "This is just the beginning."),
+)
+
+
+def _welcome_variant_index(name):
+    """Deterministic variant index for a gym: a stable hash of the gym name, so the
+    SAME gym always draws the SAME caption on a re-run, while different gyms differ.
+    Hashed on the normalized name (lowercased, whitespace-collapsed) so trivial
+    spacing differences do not shift the pick."""
+    key = " ".join((name or "").lower().split())
+    h = int(hashlib.sha1(key.encode()).hexdigest(), 16)
+    return h % len(_WELCOME_VARIANTS)
+
+
 def welcome_caption(name, owner=""):
-    """The welcome-post caption: a fixed, on-brand template over the gym name and
-    owner only. No invented facts, offers, or stats. Deliberately dash-free so it
-    never violates the published-copy rule (the gym name is a proper noun and is
-    passed through as-is)."""
+    """The welcome-post caption: one of several on-brand StoryBrand variants selected
+    DETERMINISTICALLY per gym (stable hash of the gym name), so no two gyms read
+    identically but a given gym is stable across re-runs. The ONLY fill values are the
+    gym name and the owner. No invented facts, offers, prices, or stats. Every variant
+    is deliberately dash-free (never an em/en dash or a hyphen-as-punctuation) so it
+    can never violate the published-copy rule; the gym name is a proper noun passed
+    through as-is."""
     who = f"{owner.strip()} and the {name} team" if (owner or "").strip() \
         else f"the {name} team"
-    return (
-        f"Welcome to the LASSO family, {name}.\n\n"
-        f"We are proud to partner with {who}. Here is to more of the right members "
-        f"through your doors and a gym that grows on purpose.\n\n"
-        f"Let us go build something that lasts."
-    )
+    template = _WELCOME_VARIANTS[_welcome_variant_index(name)]
+    return template.format(name=name, who=who)
 
 
 # ---- enqueue: a rendered welcome enters the drip ---------------------------------------
@@ -114,7 +188,16 @@ def enqueue(entry, host_fn=None):
 
     host = host_fn or (lambda p: media_host.host_media(p, "lasso_welcome"))
     feed_url = host(feed_path)
-    story_url = host(story_path) if story_path else ""
+    # GUARD (layer b, host): only host the story if the LOCAL render is a genuine 9:16
+    # (1080x1920). A square/None/off-size story is skipped loudly; story_url stays
+    # empty, so a cropped feed card can never enter the queue as a story_url.
+    if story_path and _local_story_is_9_16(story_path):
+        story_url = host(story_path)
+    else:
+        story_url = ""
+        if story_path:
+            print(f"[welcome-queue] story for {entry['name']} is not a genuine 9:16 "
+                  f"({story_path}); NOT hosting a square/off-size as a story_url")
     if not feed_url:
         print(f"[welcome-queue] hosting failed for {entry['name']}; left un-queued "
               "(next scan retries)")
@@ -204,7 +287,17 @@ def build_manifest(reader=None, scraper=None, host_fn=None, window_days=45,
     for e in included:
         posts = e.get("posts") or {}
         feed_url = host(posts["feed"]) if posts.get("feed") else ""
-        story_url = host(posts["story"]) if posts.get("story") else ""
+        # GUARD (layer b, host): only host the story if the LOCAL render is a genuine
+        # 9:16 (1080x1920). A square/None/off-size story is skipped loudly and its
+        # story_url stays empty, so a cropped feed card can never reach R2 as a story.
+        story_path = posts.get("story")
+        if story_path and _local_story_is_9_16(story_path):
+            story_url = host(story_path)
+        else:
+            story_url = ""
+            if story_path:
+                print(f"[welcome-queue] story for {e['name']} is not a genuine 9:16 "
+                      f"({story_path}); NOT hosting a square/off-size as a story_url")
         if not feed_url:
             print(f"[welcome-queue] host failed for {e['name']}; skipped")
             continue
@@ -271,11 +364,19 @@ def build_welcome_queue_draft(account, day_key):
     )
 
 
-def build_welcome_story_draft(account, day_key, feed_draft=None):
+def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=None):
     """The 9:16 welcome STORY for lasso_ig, matched to the SAME gym the feed served
     today. Returns None unless this run's feed draft is a welcome draft (so a story
-    never pops a gym the feed did not post) and a story image exists. The publisher
-    still requires AGENT_STORIES_ENABLED to actually send it."""
+    never pops a gym the feed did not post) and a GENUINE 9:16 story asset exists. The
+    publisher still requires AGENT_STORIES_ENABLED to actually send it.
+
+    GUARD (layer c, publish backstop, mirrors commit 2c21a10): a welcome story draft
+    is ONLY ever produced from a genuine 9:16 asset. story_url is populated upstream
+    ONLY by the host guard (layer b), which refuses to host a square/off-size render,
+    so an empty story_url means no genuine 9:16 asset was ever hosted; we return None
+    rather than post a cropped feed card. When `verify_dims(url) -> (w, h)` is provided
+    (a cheap dimension probe), a non-9:16 hosted asset is BLOCKED and one ops alert is
+    fired naming the account/day, instead of going out."""
     if not config.welcome_queue_enabled():
         return None
     if account.key not in STORY_ACCOUNTS:
@@ -285,8 +386,27 @@ def build_welcome_story_draft(account, day_key, feed_draft=None):
             and (feed_draft.draft_id or "").startswith("welcf_")):
         return None
     item = next_for_day(day_key)
-    if item is None or not item.get("story_url"):
+    if item is None:
         return None
+    story_url = item.get("story_url")
+    # A missing/empty story_url means no genuine 9:16 asset was hosted (layer b never
+    # hosts a square). Never build a story draft from a None/square/feed asset.
+    if not story_url:
+        return None
+    # Optional cheap publish-time dimension verification: if a probe is supplied and it
+    # reports a non-9:16 hosted asset, block + ops-alert rather than post a bad story.
+    if verify_dims is not None:
+        try:
+            dims = verify_dims(story_url)
+        except Exception:
+            dims = None
+        if dims is not None and not wt.is_story_size(dims):
+            ops_alerts.alert(
+                f"welcome story blocked for {account.key} on {day_key}: hosted story "
+                f"asset for {item.get('name')} is {tuple(dims)}, not 9:16 "
+                f"{wt.STORY_SIZE}. A story is never a cropped feed card."
+            )
+            return None
     platform = getattr(account, "platform", account.key)
     return Draft(
         draft_id=_draft_id(account.key, item["gym_key"], "story"),
@@ -295,7 +415,7 @@ def build_welcome_story_draft(account, day_key, feed_draft=None):
         caption=item["caption"],
         hashtags=[],
         creative_path=f"welcome_{item['gym_key']}_story.png",
-        creative_public_url=item["story_url"],
+        creative_public_url=story_url,
         scheduled_for=schedule.scheduled_for(day_key),
         status=DraftStatus.PENDING,
         day_key=day_key,
