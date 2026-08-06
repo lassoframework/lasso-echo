@@ -705,7 +705,14 @@ def _live_metrics(account_key, days, zclient):
         # Overlay the flags the pure mapper leaves to the caller (report flag; gaps note
         # only when analytics is unavailable, which it is not on this real path).
         payload["report_available"] = config.monthly_report_enabled()
-        payload["gaps"] = []
+        # Honesty: if the analytics pull hit its page cap, the totals cover only the
+        # most recent posts in the window, so say so rather than present a partial
+        # total as complete.
+        payload["gaps"] = (
+            ["These totals cover the most recent posts in the window; some older "
+             "posts were not included."]
+            if (analytics_json or {}).get("_pages_capped") else []
+        )
         return payload
     except Exception:
         return None  # fail to the honest null shape, never a 500 and never a fake number
