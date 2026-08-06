@@ -592,3 +592,316 @@ def render_reveal(name, track, company, session, points, out_path,
     _footer(d, WHITE, MUTE_NAVY)
     img.save(out_path)
     return out_path
+
+
+# ---- agenda cards (Day 1 / Day 2) -------------------------------------------
+# Sourced ONLY from 02_verified_stats.md "SUMMIT SPEAKERS — receipts": each
+# session title is verbatim from that block, attributed to the speaker it belongs
+# to. Event runs NOV 7 + 8 at Virgin Hotel Nashville (both verified).
+#
+# FABRICATION GUARD: the verified source gives session titles and speakers but
+# does NOT publish session TIMES or a per-day running order. So these cards carry
+# NO times, and the day split is a THEMATIC grouping (growth track / business
+# track), never a claim that "session X runs at time Y on day N". The card labels
+# the day by its verified DATE only (Day 1 = NOV 7, Day 2 = NOV 8). Whether Blake
+# wants specific sessions locked to specific days is a BLOCK item (see the sprint
+# report), not something invented here.
+
+# Each session is (speaker, verbatim session title). Titles are verbatim from the
+# SUMMIT SPEAKERS receipts block. Grouped by theme, not by a fabricated schedule.
+AGENDA_DAY1 = {
+    "day": "DAY ONE",
+    "date": "NOV 7",
+    "theme": "THE GROWTH ENGINE",
+    "sessions": [
+        ("Andrew Charlesworth", "State of the Industry"),
+        ("Blake Ruff", "Meta Ads in 2026: What's Working Now (and What's Dead)"),
+        ("Tommy Allen", "The Math Behind Scaling: Know Your Levers"),
+        ("Stu Brauer", "Scaling for Success: From Operator to Owner"),
+    ],
+}
+
+AGENDA_DAY2 = {
+    "day": "DAY TWO",
+    "date": "NOV 8",
+    "theme": "THE BUSINESS ENGINE",
+    "sessions": [
+        ("Jeff Smith", "Leadership That Scales: From Coach to CEO"),
+        ("Scott Rammage", "Hiring That Scales Your Gym"),
+        ("Brian Alexander", "Building a Predictable Hiring Machine"),
+        ("Nicole Aucoin", "Increasing LTV Through Ancillary Services"),
+    ],
+}
+
+
+def render_agenda(spec, out_path):
+    """One agenda day card on navy: eyebrow (GROWTH SUMMIT AGENDA), the day label
+    with its verified date, a themed track name carrying the single red accent, then
+    the verbatim sessions (title + speaker) as numbered rows. No times, ever."""
+    img = Image.new("RGB", (SIZE, SIZE), NAVY)
+    d = ImageDraw.Draw(img)
+    ink, mute = WHITE, MUTE_NAVY
+
+    y = MARGIN
+    _tracked(d, (MARGIN, y), "GROWTH SUMMIT AGENDA", _f(OSWALD_B, 30), mute, 5)
+    y += 66
+
+    # Day label + verified date on one line; the date is the only day claim.
+    df = _f(ANTON, 92)
+    d.text((MARGIN, y), spec["day"], font=df, fill=ink)
+    dxr = MARGIN + _tw(d, spec["day"], df) + 30
+    d.text((dxr, y + 30), spec["date"], font=_f(OSWALD_B, 44), fill=mute)
+    y += 116
+
+    # themed track name is the one red element on the card
+    tf = _f(ANTON, 58)
+    d.text((MARGIN, y), spec["theme"], font=tf, fill=RED)
+    y += 104
+
+    # sessions: numbered navy chip (never a second red), verbatim title, speaker
+    nf = _f(ANTON, 34)
+    stf = _f(OSWALD_B, 34)
+    spf = _f(MONT_SB, 26)
+    cw = SIZE - 2 * MARGIN
+    box = 56
+    strip_y = SIZE - MARGIN - 60
+    n = len(spec["sessions"])
+    row = max(120, (strip_y - 40 - y) // max(n, 1))
+    for i, (speaker, title) in enumerate(spec["sessions"]):
+        cy = y + i * row
+        d.rectangle([MARGIN, cy, MARGIN + box, cy + box], fill=SKY)
+        num = f"{i + 1:02d}"
+        d.text((MARGIN + (box - _tw(d, num, nf)) // 2, cy + 6), num, font=nf, fill=NAVY)
+        tx = MARGIN + box + 26
+        ty = cy - 2
+        for ln in _wrap(d, title, stf, cw - box - 26)[:2]:
+            d.text((tx, ty), ln, font=stf, fill=ink)
+            ty += 42
+        d.text((tx, ty + 2), speaker, font=spf, fill=mute)
+
+    _fact_strip(d, strip_y, ["NOV 7 + 8", "VIRGIN HOTEL NASHVILLE", "100 SEATS"], ink)
+    _footer(d, ink, mute)
+    img.save(out_path)
+    return out_path
+
+
+# ---- panel card (Future of Gym Growth) --------------------------------------
+# Panelists are Streamfit, HireVP, and Tommy (Blake ruling). PushPress is NOT a
+# panelist and must never appear. Only the panelist names + the panel title go on
+# the card; no fabricated bios, no invented session time.
+
+PANEL = {
+    "eyebrow": "SUMMIT PANEL",
+    "title": "THE FUTURE OF GYM GROWTH",
+    "red_word": "FUTURE",
+    "deck": "Three operators on where boutique fitness goes next.",
+    "panelists": ["Streamfit", "HireVP", "Tommy Allen"],
+}
+
+
+def render_panel(spec, out_path):
+    """Panel card on navy: eyebrow, oversized headline (one red word), deck, then the
+    three panelist names in equal tiles (first tile solid red as the single accent)."""
+    img = Image.new("RGB", (SIZE, SIZE), NAVY)
+    d = ImageDraw.Draw(img)
+    ink, mute = WHITE, MUTE_NAVY
+    cw = SIZE - 2 * MARGIN
+
+    y = MARGIN
+    _tracked(d, (MARGIN, y), spec["eyebrow"], _f(OSWALD_B, 30), mute, 5)
+    y += 66
+
+    # ink headline; the single red accent lives on the first panelist tile below
+    # (never two reds on one card).
+    hf, lines = _fit(d, spec["title"].upper(), cw, 3, 104)
+    y = _headline(d, MARGIN, y + 6, lines, hf, set(), ink)
+    y += 18
+
+    df = _f(MONT_SB, 33)
+    for ln in _wrap(d, spec["deck"], df, cw):
+        d.text((MARGIN, y), ln, font=df, fill=mute)
+        y += 46
+    y += 30
+
+    _tracked(d, (MARGIN, y), "ON THE PANEL", _f(OSWALD_B, 26), SKY, 4)
+    y += 60
+
+    # three panelist tiles stacked; first tile solid red (the one accent), rest outlined
+    names = spec["panelists"]
+    tf = _f(ANTON, 46)
+    th = 118
+    gap = 26
+    strip_y = SIZE - MARGIN - 60
+    avail = strip_y - 40 - y
+    th = min(th, (avail - gap * (len(names) - 1)) // len(names))
+    for i, name in enumerate(names):
+        ty = y + i * (th + gap)
+        if i == 0:
+            d.rectangle([MARGIN, ty, MARGIN + cw, ty + th], fill=RED)
+            tile_ink = WHITE
+        else:
+            d.rectangle([MARGIN, ty, MARGIN + cw, ty + th], outline=ink, width=2)
+            tile_ink = ink
+        d.text((MARGIN + 28, ty + (th - tf.size) // 2 - 6), name.upper(),
+               font=tf, fill=tile_ink)
+
+    _fact_strip(d, strip_y, ["NOV 7 + 8", "VIRGIN HOTEL NASHVILLE", "100 SEATS"], ink)
+    _footer(d, ink, mute)
+    img.save(out_path)
+    return out_path
+
+
+# ---- 1080x1920 STORY versions ----------------------------------------------
+# Paired vertical (9:16) versions of the feed cards so the sprint can run a story
+# alongside a feed post on the same day (up to 3 feed posts/day, stories sit on top).
+# Native-tall composition, NOT a crop: the same house vocabulary (Anton headline
+# with one red word, Oswald deck, checklist / data element) laid out for the frame,
+# with a top+bottom safe band so nothing lands under IG's chrome. Same fabrication
+# rules: verified facts only, no dashes, one red accent.
+
+STORY_W, STORY_H = 1080, 1920
+STORY_MARGIN = 96
+STORY_SAFE_TOP = 250      # clear of the IG top chrome / profile row
+STORY_SAFE_BOT = 320      # clear of the caption / reply bar
+
+
+def _story_footer(d, ink, mute, y):
+    ex = _tracked(d, (STORY_MARGIN, y), "LASSO", _f(ANTON, 34), ink, 8)
+    d.text((ex + 14, y + 8), "GROWTH SUMMIT", font=_f(OSWALD, 22), fill=mute)
+    url = "LASSOFRAMEWORK.COM/SUMMIT"
+    d.text((STORY_MARGIN, y + 48), url, font=_f(OSWALD, 24), fill=mute)
+
+
+def _story_base_with_bg(bg_path):
+    """A 1080x1920 canvas from a Higgsfield background, cover-cropped to the tall
+    frame (never squashed), with a navy legibility scrim holding through the whole
+    text column so white text always reads. Text is still PIL-drawn over this."""
+    src = Image.open(bg_path).convert("RGB")
+    src = _cover(src, STORY_W, STORY_H)
+    scrim = Image.new("RGBA", (STORY_W, STORY_H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(scrim)
+    for y in range(STORY_H):
+        # strong at top (headline band) easing to a steady mid, then strong again
+        # at the bottom fact strip; the athleisure crowd shows through the middle.
+        if y <= STORY_H * 0.46:
+            a = int(228 - (228 - 168) * (y / (STORY_H * 0.46)))
+        elif y <= STORY_H * 0.74:
+            a = 168
+        else:
+            a = min(240, int(168 + (y - STORY_H * 0.74) * 0.7))
+        sd.line([(0, y), (STORY_W, y)], fill=(10, 18, 38, a))
+    return Image.alpha_composite(src.convert("RGBA"), scrim).convert("RGB")
+
+
+def _story_data_element(d, y, concept, ink, mute):
+    """Draw the treatment-B data element for a concept in the story frame. Reuses the
+    feed data-element vocabulary; MARGIN is shared so the elements land full width."""
+    kind, data = _B_ELEMENTS[concept["id"]]
+    if kind == "tiles":
+        return _fact_tiles(d, y, data, ink, mute, big=True, accent_first=True)
+    fn = {"check": _checklist, "steps": _steps, "bars": _bars, "grid": _grid,
+          "contrast": _contrast, "bignums": _bignums}[kind]
+    return fn(d, y, data, ink, mute)
+
+
+def render_card_story(concept, treatment, out_path, bg_path=None):
+    """Story (1080x1920) version of one summit feed card.
+      A = type-led: photo (or navy) background, oversized headline with one red word,
+          deck, dense checklist, bottom fact strip.
+      B = data-led: navy, ink headline (red lives in the data element), the concept's
+          data element (bars / checklist / steps / grid / contrast / tiles / bignums)."""
+    on_photo = bool(bg_path) and treatment == "a"
+    if on_photo:
+        img = _story_base_with_bg(bg_path)
+    else:
+        img = Image.new("RGB", (STORY_W, STORY_H), NAVY)
+    d = ImageDraw.Draw(img)
+    ink = WHITE
+    mute = MUTE_NAVY
+    cw = STORY_W - 2 * STORY_MARGIN
+
+    y = STORY_SAFE_TOP
+    _tracked(d, (STORY_MARGIN, y), concept["eyebrow"].upper(), _f(OSWALD_B, 32), mute, 5)
+    y += 74
+
+    if treatment == "a":
+        red_tokens = set(w.strip(".,").upper() for w in concept["red_word"].split())
+        # _wrap / _headline take an explicit width, so the wider story column just works.
+        s = 128
+        while s >= 64:
+            fo = _f(ANTON, s)
+            ls = _wrap(d, concept["headline"].upper(), fo, cw)
+            if len(ls) <= 4:
+                break
+            s -= 4
+        y = _headline(d, STORY_MARGIN, y + 6, ls, fo, red_tokens, ink,
+                      shadow=on_photo)
+        y += 22
+        df = _f(MONT_SB, 36)
+        for ln in _wrap(d, concept["deck"], df, cw):
+            if on_photo:
+                d.text((STORY_MARGIN, y), ln, font=df, fill=(255, 255, 255),
+                       stroke_width=2, stroke_fill=(6, 12, 22))
+            else:
+                d.text((STORY_MARGIN, y), ln, font=df, fill=mute)
+            y += 50
+        y += 40
+        pts = POINTS.get(concept["id"], [])
+        strip_y = STORY_H - STORY_SAFE_BOT
+        row = _POINT_ROW
+        if len(pts) > 1:
+            row = max(70, min(140, (strip_y - 90 - y) // (len(pts) - 1)))
+        # story checklist: bigger type for the taller frame
+        rf = _f(OSWALD_B, 40)
+        accent = SKY
+        for i, p in enumerate(pts):
+            cy = y + i * row
+            r = 12
+            d.ellipse([STORY_MARGIN, cy + 8, STORY_MARGIN + 2 * r, cy + 8 + 2 * r],
+                      outline=accent, width=3)
+            d.line([STORY_MARGIN + 7, cy + 20, STORY_MARGIN + 11, cy + 26], fill=accent, width=3)
+            d.line([STORY_MARGIN + 11, cy + 26, STORY_MARGIN + 20, cy + 14], fill=accent, width=3)
+            if on_photo:
+                d.text((STORY_MARGIN + 54, cy), p, font=rf, fill=(255, 255, 255),
+                       stroke_width=1, stroke_fill=(6, 12, 22))
+            else:
+                d.text((STORY_MARGIN + 54, cy), p, font=rf, fill=ink)
+        _fact_strip(d, strip_y, DEFAULT_FACTS, ink, on_photo=on_photo)
+        _story_footer(d, ink, mute, strip_y + 56)
+    else:
+        s = 104
+        while s >= 60:
+            fo = _f(ANTON, s)
+            ls = _wrap(d, concept["headline"].upper(), fo, cw)
+            if len(ls) <= 3:
+                break
+            s -= 4
+        y = _headline(d, STORY_MARGIN, y + 4, ls, fo, set(), ink)
+        y += 28
+        for ln in _wrap(d, concept["deck"], _f(MONT, 34), cw)[:3]:
+            d.text((STORY_MARGIN, y), ln, font=_f(MONT, 34), fill=mute)
+            y += 46
+        y += 40
+        _story_data_element(d, y, concept, ink, mute)
+        strip_y = STORY_H - STORY_SAFE_BOT
+        _fact_strip(d, strip_y, DEFAULT_FACTS, ink)
+        _story_footer(d, ink, mute, strip_y + 56)
+
+    img.save(out_path)
+    return out_path
+
+
+def render_all_stories(out_dir, bg_dir=None):
+    """Render the paired story versions of every feed concept (both treatments)."""
+    from .summit_rebuild import SUMMIT_CONCEPTS
+    paths = []
+    for c in SUMMIT_CONCEPTS:
+        for t in ("a", "b"):
+            p = os.path.join(out_dir, f"{c['id']}_{t}_story.png")
+            bg = None
+            if t == "a" and bg_dir and c["id"] in BG_MAP:
+                cand = os.path.join(bg_dir, BG_MAP[c["id"]] + ".png")
+                bg = cand if os.path.isfile(cand) else None
+            render_card_story(c, t, p, bg_path=bg)
+            paths.append(p)
+    return paths

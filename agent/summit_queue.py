@@ -212,6 +212,118 @@ SUMMIT_POSTS = [
 ACCOUNTS = ["lasso_ig", "lasso_fb"]
 
 
+# ---- Sprint calendar (backward-anchored 5-cycle ramp) ----------------------
+# Blake ruling 2026-08-05: the summit runs as a backward-anchored sprint that
+# tightens as the event nears, then goes dark on the event days.
+#
+#   Cycle 1   Aug 21 -> Aug 30
+#   Cycle 2   Sep 7  -> Sep 16
+#   Cycle 3   Sep 24 -> Oct 3
+#   Continuous Oct 11 -> Nov 6   (runs every day, no gaps)
+#   Nov 7 + 8                    DARK (the event itself; no promo posts)
+#
+# Cadence ruling (Blake, today): up to 3 FEED posts per day is fine during the
+# sprint. The welcome / new-client post is NOT a summit post and does NOT count
+# toward this cadence — it sits on top (its own queue owns its slot). Stories run
+# alongside feed posts (they also sit on top of the 3-feed cadence).
+#
+# This calendar is DORMANT behind AGENT_SUMMIT_CAMPAIGN_ENABLED (default OFF); it
+# emits ordered slots but nothing is drafted or published until the flag is armed,
+# and even then every draft is HELD for approval.
+
+SPRINT_CYCLES = [
+    ("2026-08-21", "2026-08-30"),   # cycle 1
+    ("2026-09-07", "2026-09-16"),   # cycle 2
+    ("2026-09-24", "2026-10-03"),   # cycle 3
+    ("2026-10-11", "2026-11-06"),   # continuous run to the eve of the event
+]
+
+# Event days: no summit promo posts (the room is live).
+SPRINT_DARK_DAYS = {"2026-11-07", "2026-11-08"}
+
+# Max FEED posts per sprint day (Blake: up to 3). The welcome post does NOT count.
+SPRINT_MAX_FEED_PER_DAY = 3
+
+# Local sprint slot times (a 3rd midday slot on top of the shared morning/primary
+# pair, so a day can carry up to 3 feed posts). HH:MM in POSTING_TIMEZONE.
+SPRINT_SLOT_TIMES = ["07:30", "12:30", "18:30"]
+
+
+def date_fromisoformat(s):
+    from datetime import date
+    return date.fromisoformat(s)
+
+
+def _daterange(start_iso, end_iso):
+    """Inclusive list of YYYY-MM-DD strings from start to end."""
+    from datetime import date, timedelta
+    s = date.fromisoformat(start_iso)
+    e = date.fromisoformat(end_iso)
+    out, cur = [], s
+    while cur <= e:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+def sprint_days():
+    """Every posting day across the sprint cycles, in order, with the event days
+    (Nov 7 + 8) removed. Ordered earliest to latest."""
+    days = []
+    for start, end in SPRINT_CYCLES:
+        for d in _daterange(start, end):
+            if d not in SPRINT_DARK_DAYS:
+                days.append(d)
+    return days
+
+
+def _sprint_scheduled_for(day_key, hhmm):
+    """ISO datetime in POSTING_TIMEZONE for a sprint slot (DST-correct)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from . import config
+    d = date_fromisoformat(day_key)
+    hh, mm = hhmm.split(":")
+    tz = ZoneInfo(config.POSTING_TIMEZONE)
+    return datetime(d.year, d.month, d.day, int(hh), int(mm), tzinfo=tz).isoformat()
+
+
+def sprint_calendar(assets, posts_per_day=SPRINT_MAX_FEED_PER_DAY):
+    """Map an ordered list of feed asset filenames onto the sprint calendar.
+
+    Returns a list of slot dicts, one per (day, slot):
+        {"date", "slot_index", "scheduled_for", "filename"}
+    Assets cycle in order and repeat across the run (the sprint is longer than the
+    card set by design, so cards recur; the rotation guard downstream keeps the same
+    card from landing twice in a row). `posts_per_day` is capped at 3 (Blake).
+
+    Pure and side-effect free: this is the schedule, not the drafts. Nothing here
+    checks the flag or writes anything; callers gate on AGENT_SUMMIT_CAMPAIGN_ENABLED.
+    """
+    if not assets:
+        return []
+    posts_per_day = max(1, min(posts_per_day, SPRINT_MAX_FEED_PER_DAY))
+    plan = []
+    ai = 0
+    prev = None
+    for day in sprint_days():
+        for slot in range(posts_per_day):
+            # avoid the same card twice in a row across the day/slot boundary
+            fname = assets[ai % len(assets)]
+            if fname == prev and len(assets) > 1:
+                ai += 1
+                fname = assets[ai % len(assets)]
+            plan.append({
+                "date": day,
+                "slot_index": slot,
+                "scheduled_for": _sprint_scheduled_for(day, SPRINT_SLOT_TIMES[slot]),
+                "filename": fname,
+            })
+            prev = fname
+            ai += 1
+    return plan
+
+
 # ---- Helpers ---------------------------------------------------------------
 
 def _draft_id(account_key, filename, date):
@@ -335,11 +447,138 @@ def create_drafts(manifest=None):
     return created
 
 
+# ---- Sprint drafts (approved-caption path, flag-gated) ---------------------
+# The sprint feed posts draw captions from the Blake-approved SUMMIT_CONCEPTS
+# (agent/summit_rebuild.py) plus the agenda and panel captions below (verified
+# facts only). This is separate from the legacy SUMMIT_POSTS block above, which
+# carries pre-ruling scarcity/pricing copy and is NOT used by the sprint.
+
+# Captions for the assets that are not in SUMMIT_CONCEPTS. Verified facts only:
+# NOV 7 + 8, Virgin Hotel Nashville, 100 seats, lassoframework.com/summit. No
+# times (source has none). Session titles are verbatim from 02_verified_stats.md.
+_SPRINT_EXTRA_CAPTIONS = {
+    "08_agenda_day1.png": (
+        "Day one of the LASSO Growth Summit.\n\n"
+        "State of the industry with Andrew Charlesworth. Meta ads in 2026 with Blake "
+        "Ruff. The math behind scaling with Tommy Allen. Scaling from operator to "
+        "owner with Stu Brauer.\n\n"
+        "November 7 and 8. Virgin Hotel Nashville. 100 seats.\n\n"
+        "Claim your seat.\n"
+        "lassoframework.com/summit"
+    ),
+    "09_agenda_day2.png": (
+        "Day two of the LASSO Growth Summit.\n\n"
+        "Leadership that scales with Jeff Smith. Hiring that scales your gym with Scott "
+        "Rammage. Building a predictable hiring machine with Brian Alexander. "
+        "Increasing LTV through ancillary services with Nicole Aucoin.\n\n"
+        "November 7 and 8. Virgin Hotel Nashville. 100 seats.\n\n"
+        "Claim your seat.\n"
+        "lassoframework.com/summit"
+    ),
+    "22_panel_future.png": (
+        "The future of gym growth, live on the panel.\n\n"
+        "Three operators on where boutique fitness goes next. Streamfit, HireVP, and "
+        "Tommy Allen.\n\n"
+        "November 7 and 8. Virgin Hotel Nashville. 100 seats.\n\n"
+        "Claim your seat.\n"
+        "lassoframework.com/summit"
+    ),
+}
+
+
+def sprint_assets():
+    """Ordered (filename, caption) for the sprint FEED cards, arc-ordered. Both
+    treatments of each concept share that concept's approved caption; the agenda and
+    panel cards use the verified-facts captions above. Story files are paired 1:1 to
+    their feed card by name (<file>_story.png) and inherit the same caption."""
+    from .summit_rebuild import SUMMIT_CONCEPTS, ARC_ORDER
+    by_id = {c["id"]: c for c in SUMMIT_CONCEPTS}
+    out = []
+    for cid in ARC_ORDER:
+        c = by_id.get(cid)
+        if not c:
+            continue
+        for t in ("a", "b"):
+            out.append((f"{cid}_{t}.png", c["caption"]))
+    # agenda + panel ride the sprint too
+    for fname in ("08_agenda_day1.png", "09_agenda_day2.png", "22_panel_future.png"):
+        out.append((fname, _SPRINT_EXTRA_CAPTIONS[fname]))
+    return out
+
+
+def create_sprint_drafts(manifest=None, posts_per_day=SPRINT_MAX_FEED_PER_DAY):
+    """Create HELD sprint drafts across the backward-anchored calendar.
+
+    Gated on AGENT_SUMMIT_CAMPAIGN_ENABLED (default OFF): with the flag off this is a
+    no-op that reports and returns 0, so nothing is queued. With the flag on, every
+    draft is still PENDING (held for approval); nothing publishes automatically.
+    Cross-posts each slot to lasso_ig + lasso_fb. Requires a sprint manifest mapping
+    each rendered filename to its hosted URL."""
+    from . import config, accounts as _accts
+    from .drafter import Draft, DraftStatus
+    from .store import PendingStore
+
+    if not config.summit_campaign_enabled():
+        print("AGENT_SUMMIT_CAMPAIGN_ENABLED is OFF. Sprint calendar is dormant; "
+              "no drafts queued. (Set the flag to arm; drafts still held for approval.)")
+        return 0
+
+    if manifest is None:
+        manifest = _load_manifest()
+
+    assets = sprint_assets()
+    caption_by_file = dict(assets)
+    filenames = [f for f, _ in assets]
+
+    missing = [f for f in filenames if f not in (manifest or {})]
+    if missing:
+        raise RuntimeError(
+            "sprint manifest is missing hosted URLs for: " + ", ".join(missing) +
+            "\nUpload the rendered sprint cards first (see summit-queue --images-dir)."
+        )
+
+    _store = PendingStore()
+    _acct_objs = {a: _accts.get_account(a) for a in ACCOUNTS}
+
+    created = 0
+    for slot in sprint_calendar(filenames, posts_per_day=posts_per_day):
+        fname = slot["filename"]
+        url = manifest[fname]
+        for acct in ACCOUNTS:
+            acct_obj = _acct_objs[acct]
+            did = _draft_id(acct, f"sprint|{fname}|{slot['slot_index']}", slot["date"])
+            d = Draft(
+                draft_id=did,
+                account_key=acct,
+                platform=acct_obj.platform if acct_obj else acct,
+                caption=caption_by_file[fname],
+                hashtags=[],
+                creative_path=fname,
+                creative_public_url=url,
+                scheduled_for=slot["scheduled_for"],
+                status=DraftStatus.PENDING,
+                day_key=slot["date"],
+                draft_type="summit",
+            )
+            _store.put(d)
+            created += 1
+
+    print(f"\n{created} sprint drafts created across {len(sprint_days())} days. "
+          "All HELD for approval. Nothing published.")
+    return created
+
+
 # ---- CLI entry point -------------------------------------------------------
 
-def run(images_dir=None, from_manifest=False):
+def run(images_dir=None, from_manifest=False, sprint=False):
     """Main entry point called from __main__.py."""
+    from . import config
     manifest = _load_manifest()
+
+    if sprint:
+        # Backward-anchored sprint calendar. Gated on AGENT_SUMMIT_CAMPAIGN_ENABLED.
+        create_sprint_drafts(manifest)
+        return
 
     if not images_dir and not from_manifest:
         # Status report
@@ -350,11 +589,19 @@ def run(images_dir=None, from_manifest=False):
             for post in SUMMIT_POSTS:
                 status = "uploaded" if post["filename"] in manifest else "MISSING"
                 print(f"    week {post['week']:02d} {post['date']} {status}")
+        _days = sprint_days()
+        print("\nSprint calendar (backward-anchored, flag "
+              f"AGENT_SUMMIT_CAMPAIGN_ENABLED={config.summit_campaign_enabled()}):")
+        print(f"  {len(_days)} posting days, {len(_days) * SPRINT_MAX_FEED_PER_DAY} "
+              f"feed slots at up to {SPRINT_MAX_FEED_PER_DAY}/day "
+              f"({_days[0]} -> {_days[-1]}; Nov 7 + 8 dark).")
         print("\nUsage:")
         print("  Step 1 (upload, run from Mac):")
         print('    railway run python -m agent summit-queue --images-dir "PATH_TO_IMAGES"')
-        print("  Step 2 (create drafts, run on Railway):")
+        print("  Step 2a (legacy weekly drafts, run on Railway):")
         print("    python -m agent summit-queue --from-manifest")
+        print("  Step 2b (sprint calendar drafts, needs AGENT_SUMMIT_CAMPAIGN_ENABLED):")
+        print("    python -m agent summit-queue --sprint")
         return
 
     if images_dir:

@@ -6,7 +6,46 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
+
+---
+
+## Summit sprint: agenda + panel + story cards + backward-anchored calendar (2026-08-05, branch summit-finish)
+
+Finishes the summit sprint asset set and wires the sprint calendar. Everything stays
+dormant behind AGENT_SUMMIT_CAMPAIGN_ENABLED (default OFF); every draft is still HELD.
+
+### [~] Agenda cards (Day 1 / Day 2) — summit_render.render_agenda
+Two navy agenda cards. Session titles are VERBATIM from 02_verified_stats.md SUMMIT
+SPEAKERS receipts, attributed to each speaker. Day 1 = NOV 7, Day 2 = NOV 8 (both
+verified). FABRICATION GUARD: the verified source publishes session titles but NO
+session times and NO per-day running order, so the cards carry NO times and the day
+split is a THEMATIC grouping (growth engine / business engine), not a scheduling
+claim. Whether specific sessions lock to specific days is a BLOCK item for Blake.
+
+### [~] Future of Gym Growth panel card — summit_render.render_panel
+Panelists Streamfit, HireVP, Tommy Allen (Blake ruling). PushPress does NOT appear
+anywhere (asserted in tests). Ink headline, single red accent on the first panelist
+tile, verified fact strip.
+
+### [~] Paired 1080x1920 story cards — summit_render.render_card_story / render_all_stories
+Native-tall (not a crop) story version of every feed concept, both treatments (20
+stories). Photo A cards keep the athleisure crowd behind a tall legibility scrim;
+data B cards carry the concept's data element (bars / checklist / steps / grid /
+contrast / tiles / bignums). Top+bottom safe bands clear IG chrome. Bold readable
+type, one red accent, verified facts only, no dashes. Lets the sprint run a story
+alongside a feed post (stories sit on top of the feed cadence).
+
+### [~] Backward-anchored sprint calendar — summit_queue.sprint_calendar / create_sprint_drafts
+Cycles: Aug 21-30, Sep 7-16, Sep 24-Oct 3, continuous Oct 11-Nov 6 (57 posting days);
+Nov 7 + 8 DARK (event days). Up to 3 feed posts/day (Blake); welcome / new-client
+does NOT count toward the cadence (own queue, sits on top); stories sit on top too.
+Slot times 07:30 / 12:30 / 18:30 in POSTING_TIMEZONE (DST correct). No card lands
+twice in a row. Feed captions come from the Blake-approved SUMMIT_CONCEPTS + verified
+agenda/panel captions (NOT the legacy SUMMIT_POSTS block, which still carries
+pre-ruling scarcity/pricing copy and is untouched). create_sprint_drafts is a no-op
+with the flag OFF; ON, every draft is PENDING. CLI: summit-queue --sprint.
+Tests: tests/test_summit_sprint.py (+ existing suite green, 1946 before this branch).
 
 ---
 
