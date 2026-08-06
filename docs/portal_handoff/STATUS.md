@@ -1,6 +1,6 @@
 # Echo Portal Status
 
-**Last updated:** 2026-07-29 | **SHA:** 698e7948 (portal PR #238) + social connections (portal, LIVE) + Zernio connect (Echo). Blake ruling 2026-07-29: **Zernio is the social vendor; SocialAPI.ai connect is retired** (its publish lane + book-launch queue stay pending a separate migration).
+**Last updated:** 2026-08-06 | **SHA:** 9fe4162 — PART A merged (per-gym calendar engine + 3-tier collision + approval-surface routing + baseline capture, all behind `AGENT_PORTAL_SOCIAL_ENABLED`, default OFF) + demo distinct-art fix. Independent audit: A+, zero critical/major; full suite 2008 passed. Prior: 698e7948 (portal PR #238) + Zernio connect (Echo). Blake ruling 2026-07-29: **Zernio is the social vendor; SocialAPI.ai connect is retired** (publish lane + book-launch queue pending a separate migration).
 
 This is a standing coordination file. Any Echo build that changes the portal-facing contract must update this file in the same commit. The portal CC reads this at the start of every session and updates PORTAL OWES when it ships something.
 
@@ -123,3 +123,22 @@ Items that cannot move until Blake takes a manual action:
 - **SocialAPI lane arm** — the lane is built but dark. To use it Blake must: (1) set `AGENT_SOCIALAPI_KEY` in Railway env, (2) set `AGENT_SOCIALAPI_ENABLED=true`, (3) set `publish_route="socialapi"` on the gym's Account in `agent/accounts.py`, (4) run `python -m agent socialapi-onboard --account <key>` then hand the gym the `socialapi-connect` link. LASSO's own accounts stay `meta_direct`.
 - **SocialAPI vendor confirmation (in writing)** — before arming, get written confirmation from SocialAPI.ai that their approved Meta app covers ORGANIC IG feed + IG Stories + FB Page publishing on CLIENT-owned accounts (their public docs confirm the API capability; the app-permission scope on client accounts is the business assurance to secure). This is the gate that lets Echo publish for clients without Blake's own Meta App Review.
 - **SocialAPI redirect URI** — register the OAuth callback with the vendor dashboard and set `AGENT_SOCIALAPI_REDIRECT_URI` so the connect links return the gym to the portal.
+
+---
+
+## PART A — MERGED 2026-08-06 (SHA 9fe4162), independent audit A+
+
+**Shipped (Echo internal — NO new portal endpoints; all behind `AGENT_PORTAL_SOCIAL_ENABLED`, default OFF):**
+- `agent/gym_calendar_queue.py` — per-gym calendar engine. Table `gym_calendar_queue` UNIQUE(gym_id, account_key, day_key), each row carries gym_id + zernio_profile_id + account_key. Draft ids `gcalf_`/`gcals_` (never collide with book_/demo_/welc_). Cross-queue served-once-per-day lock in a separate `served_ledger` table PK(account_key, day_key).
+- Three-tier collision priority: **book queue > welcome queue > gym/demo calendar**. The calendar has its OWN slot (does not wait for the welcome queue to drain) but SHIFTS to the next open day in pillar rotation when book or welcome owns the day; never displaces either; never two posts per account per served_day. Build-time re-guard prevents same-cycle doubling.
+- `approval_surface` routing: "slack" for LASSO (`key.startswith("lasso")`), "portal" for client gyms. Client drafts are saved PENDING + returned BEFORE any `post_approval_card` — client drafts NEVER card to #echoclaude. `ops_alerts` still fire to Slack. `force_approval=True` on all client posts (gate strengthened, no new publish path).
+- `baseline_posts_per_week` + `baseline_captured_at` on the gym record (`db.set/get_baseline_posts_per_week`), manual/explicit now; Zernio-history source lands in Part C.
+- Demo distinct-art fix: `agent/demo_calendar_render.py` renders 36 unique images (per-post variant keyed on (pillar, position)); `render_all` raises on any duplicate hash; no-digit/no-dash on-image asserts intact; one red per card.
+
+**Descopes ruled INTENDED for Part A (not defects):** the engine is dormant in prod even flag-ON — `build_gym_calendar_draft` is not yet called by the runner and nothing seeds client gym rows; wiring lands with the content/endpoints phase. Client-caption dash/"vendor" gate and the empty-caption end-to-end interaction also belong to the content phase.
+
+---
+
+## PART B HANDOFF (paste as ground truth for the next session)
+
+Part A shipped the per-gym calendar ENGINE, the 3-tier collision rule (book > welcome > gym calendar, shift-not-displace, served_ledger lock), approval-surface routing (clients never card to Slack; force_approval holds them), and baseline storage — all behind `AGENT_PORTAL_SOCIAL_ENABLED` (default OFF), merged at SHA 9fe4162, independent-audit A+, full suite 2008 green. The Zernio CONNECT lane (`zernio.py`/`zernio_routes.py`) and the account-scoped approve/edit/deny/kill FUNCTIONS (`portal_approvals.py`, gated by `AGENT_PORTAL_APPROVALS`) already exist from the prior portal build — EXTEND them, do not rebuild. Part B builds the token-scoped HTTP endpoints: `GET /portal/<token>/social` (month calendar: posts, statuses, pillar, format, image public_urls, recreate-budget state, low_creative flag + days_remaining), `POST /portal/<token>/posts/<id>/{approve|edit|deny|kill}` (approve idempotent; edit re-runs the fabrication gate -> 422; deny decrements a server-enforced 15/month recreate budget -> 409 when exhausted; kill permanent+free+confirm=true), and `GET /portal/<token>/metrics` (payload shape = Part D). Every route: per-gym portal token auth, Stripe social product must be ACTIVE else 402/empty, and TOKEN ISOLATION is the hardest audit line — gym A's token must never read or act on gym B's anything, proven by a test on EVERY route. Flags stay OFF (`AGENT_PORTAL_SOCIAL_ENABLED`, `AGENT_ZERNIO_ANALYTICS_ENABLED`, `AGENT_MONTHLY_REPORT_ENABLED`). Start Part B with the full opener (git status, pull, suite, SHA, ground-truth re-read incl. this file). Blake by-hand still pending: confirm the Zernio Analytics ADD-ON is enabled on the account (Part C dead without it).
