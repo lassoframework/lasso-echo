@@ -73,6 +73,40 @@ class ZernioClient:
         """GET /v1/accounts?profileId=... -> {accounts:[...]}."""
         return self._get("/v1/accounts", {"profileId": profile_id})
 
+    def list_profiles(self):
+        """GET /v1/profiles -> {profiles:[{_id,name,...}], total, skip, limit}.
+
+        LASSO is already provisioned in Zernio, so profiles pre-exist; the connect path must
+        REUSE an existing profile, never re-create it (Zernio 409s on a duplicate name). Verified
+        live 2026-08-06 against api.zernio.com: `{"profiles":[{"_id"(24 char),"name",...}]}`.
+        """
+        return self._get("/v1/profiles", {"limit": 100})
+
+    def find_profile_id(self, name):
+        """The `_id` of the existing Zernio profile whose name matches `name`, or None.
+
+        Match is exact first, then case-insensitive (Zernio names are user-set, e.g. "lasso").
+        Pure over the list response so it stays testable with a fake http client.
+        """
+        if not name:
+            return None
+        profiles = (self.list_profiles() or {}).get("profiles") or []
+        want = str(name).strip()
+        want_lower = want.lower()
+        fallback = None
+        for p in profiles:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("_id") or p.get("id")
+            pname = p.get("name")
+            if not pid or not pname:
+                continue
+            if str(pname) == want:
+                return str(pid)
+            if fallback is None and str(pname).strip().lower() == want_lower:
+                fallback = str(pid)
+        return fallback
+
     def list_facebook_pages(self, account_id):
         """GET /v1/accounts/{id}/facebook-page -> {pages:[{_id,name}]}."""
         return self._get(f"/v1/accounts/{account_id}/facebook-page")
@@ -81,9 +115,9 @@ class ZernioClient:
     def create_profile(self, name):
         """POST /v1/profiles {name} -> {..._id}. Per-gym provisioning.
 
-        NOTE: the create-profile request shape is per Zernio's documented convention and is
-        UNVERIFIED against the live API (we do not create junk profiles in tests). Verify once
-        before fleet provisioning; it is only reached from the connect path, never a read.
+        Only reached when find_profile_id found NO existing profile of that name — Zernio 409s
+        ("profile_name_conflict") on a duplicate, so the connect path finds-before-create and
+        falls back to find on a 409. Never a read path.
         """
         return self._post("/v1/profiles", {"name": name})
 

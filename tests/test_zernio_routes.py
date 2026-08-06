@@ -90,15 +90,61 @@ def test_facebook_account_id_picks_fb():
     assert z.facebook_account_id({"accounts": [CONNECTED_IG]}) is None
 
 
+# ---- profile find-by-name (client method over a fake http GET) ---------------
+class _FakeHttp:
+    """Minimal requests-like stub: records the GET, returns a canned /v1/profiles body."""
+    def __init__(self, profiles):
+        self._profiles = profiles
+        self.last = None
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.last = (url, params)
+        return self._Resp({"profiles": self._profiles, "total": len(self._profiles)})
+
+
+def test_find_profile_id_exact_match():
+    # Real-shape /v1/profiles list (matches the live 2026-08-06 probe: _id 24-char, name).
+    http = _FakeHttp([
+        {"_id": "6a69fc000000000000000001", "name": "Default"},
+        {"_id": "6a721f000000000000000002", "name": "district"},
+        {"_id": "6a74a3000000000000000003", "name": "lasso"},
+    ])
+    c = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http)
+    assert c.find_profile_id("lasso") == "6a74a3000000000000000003"
+    # hits the profiles endpoint
+    assert http.last[0].endswith("/v1/profiles")
+
+
+def test_find_profile_id_case_insensitive_and_missing():
+    http = _FakeHttp([{"_id": "id1", "name": "Lasso"}])
+    c = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http)
+    assert c.find_profile_id("lasso") == "id1"     # case-insensitive fallback
+    assert c.find_profile_id("nope") is None
+
+
 # =============================================================================
 # HANDLERS
 # =============================================================================
 class _FakeClient:
-    def __init__(self, accounts=None, connect=None, pages=None, profile=None):
+    def __init__(self, accounts=None, connect=None, pages=None, profile=None,
+                 existing_profiles=None, create_conflict=False):
         self._accounts = accounts if accounts is not None else {"accounts": []}
         self._connect = connect or {"authUrl": "https://www.instagram.com/oauth/authorize?x=1"}
         self._pages = pages or {"pages": []}
         self._profile = profile or {"_id": "new_profile"}
+        # existing_profiles: list of {_id,name} the Zernio account already holds.
+        self._existing = list(existing_profiles or [])
+        # create_conflict: when True, create_profile raises Zernio 409 (name already exists).
+        self._create_conflict = create_conflict
         self.calls = []
 
     def connect_url(self, pid, platform):
@@ -110,8 +156,21 @@ class _FakeClient:
     def list_facebook_pages(self, aid):
         self.calls.append(("pages", aid)); return self._pages
 
+    def list_profiles(self):
+        self.calls.append(("list_profiles",))
+        return {"profiles": list(self._existing), "total": len(self._existing)}
+
+    def find_profile_id(self, name):
+        # Delegate to the real client's pure matcher over our fake list response.
+        return z.ZernioClient.find_profile_id(self, name)
+
     def create_profile(self, name):
-        self.calls.append(("create", name)); return self._profile
+        self.calls.append(("create", name))
+        if self._create_conflict:
+            # Simulate the profile appearing (as if a concurrent/prior create won the race).
+            self._existing.append({"_id": "found_after_409", "name": name})
+            raise z.ZernioError(409, 'A profile with this name already exists ... profile_name_conflict')
+        return self._profile
 
 
 @pytest.fixture
@@ -139,14 +198,48 @@ def test_connect_validates_platform(db_env):
     assert "platform" in body["error"]
 
 
-def test_connect_returns_oauth_url_and_provisions(db_env):
+def test_connect_creates_when_no_profile_exists(db_env):
+    # No stored binding AND no existing Zernio profile of this name -> create one.
     fake = _FakeClient(connect={"authUrl": "https://www.facebook.com/v24.0/dialog/oauth?x=1"})
     status, body = zr.handle_social_connect("gymA", "facebook", client=fake)
     assert status == 200
     assert body["oauth_url"].startswith("https://www.facebook.com/")
-    # provisioned a profile (no prior binding) and stored it
+    # tried find-by-name first, found none, then created and stored it
+    assert ("list_profiles",) in fake.calls
     assert ("create", "gymA") in fake.calls
     assert (_db.gym_get("gymA") or {}).get("zernio_profile_id") == "new_profile"
+
+
+def test_connect_reuses_existing_profile_no_create(db_env):
+    # LASSO already provisioned in Zernio: reuse the existing profile, never create (would 409).
+    fake = _FakeClient(
+        connect={"authUrl": "https://www.instagram.com/oauth/authorize?x=1"},
+        existing_profiles=[{"_id": "lasso_pid_24charxxxxxx", "name": "lasso"}],
+    )
+    status, body = zr.handle_social_connect("lasso", "instagram", client=fake)
+    assert status == 200
+    assert body["oauth_url"].startswith("https://www.instagram.com/")
+    # found by name, reused its _id, and NEVER created a duplicate
+    assert ("list_profiles",) in fake.calls
+    assert not any(c[0] == "create" for c in fake.calls)
+    assert ("connect", "lasso_pid_24charxxxxxx", "instagram") in fake.calls
+    assert (_db.gym_get("lasso") or {}).get("zernio_profile_id") == "lasso_pid_24charxxxxxx"
+
+
+def test_connect_create_409_falls_back_to_find(db_env):
+    # Belt-and-suspenders: find missed (e.g. a race), create 409s, re-find resolves the profile.
+    fake = _FakeClient(
+        connect={"authUrl": "https://www.instagram.com/oauth/authorize?x=1"},
+        existing_profiles=[],       # find returns nothing on the first pass
+        create_conflict=True,       # create raises Zernio 409, then the profile "appears"
+    )
+    status, body = zr.handle_social_connect("gymB", "instagram", client=fake)
+    assert status == 200
+    assert body["oauth_url"].startswith("https://www.instagram.com/")
+    # create was attempted, 409'd, then a second find resolved the id
+    assert ("create", "gymB") in fake.calls
+    assert fake.calls.count(("list_profiles",)) >= 2
+    assert (_db.gym_get("gymB") or {}).get("zernio_profile_id") == "found_after_409"
 
 
 def test_status_not_provisioned_is_all_not_connected_no_client_call(db_env):

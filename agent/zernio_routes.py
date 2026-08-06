@@ -35,19 +35,45 @@ def _resolve_profile_id(account_key):
     return row.get("zernio_profile_id") or None
 
 
-def _ensure_profile_id(account_key, client):
-    """Stored profile id, or provision a new Zernio profile for this gym and store it.
+def _created_profile_id(created):
+    """Pull the _id out of a create_profile response ({_id} or {profile:{_id}})."""
+    return (created or {}).get("_id") or ((created or {}).get("profile") or {}).get("_id")
 
-    Only the connect path calls this (connecting implies the gym needs a profile). Reads never
-    provision, so a passive status poll never mutates Zernio.
+
+def _ensure_profile_id(account_key, client):
+    """Stored profile id, else REUSE an existing Zernio profile by name, else create one; persist it.
+
+    LASSO (and other gyms) are already set up in Zernio, so the profile pre-exists and Zernio 409s
+    ("profile_name_conflict") on a duplicate create. Order:
+      1. stored zernio_profile_id (no Zernio call);
+      2. find an existing profile by this gym's name and reuse its _id;
+      3. only if none exists, create one;
+      4. belt-and-suspenders: if create still 409s (a race, or a name we did not match), fall back
+         to find-by-name.
+    Only the connect path calls this; reads never provision, so a passive status poll never mutates
+    Zernio.
     """
     pid = _resolve_profile_id(account_key)
     if pid:
         return pid
     row = _db.gym_get(account_key) or {}
     name = row.get("gym_name") or row.get("display_name") or account_key
-    created = client.create_profile(name)
-    pid = (created or {}).get("_id") or ((created or {}).get("profile") or {}).get("_id")
+
+    # 2) reuse an existing profile of this name (the common case: LASSO already provisioned)
+    pid = client.find_profile_id(name)
+
+    # 3) none found -> create; 4) 409 -> the profile exists, re-find it
+    if not pid:
+        try:
+            pid = _created_profile_id(client.create_profile(name))
+        except _z.ZernioError as exc:
+            if exc.status == 409:
+                pid = client.find_profile_id(name)
+            else:
+                raise
+            if not pid:
+                raise
+
     if pid:
         # Preserve the gym's existing display_name (gym_upsert rewrites it every call).
         _db.gym_upsert(account_key, display_name=row.get("display_name") or "", zernio_profile_id=str(pid))
