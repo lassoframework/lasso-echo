@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 
 from . import config, db as _db
 from . import portal_approvals as _pa
+from . import portal_calendar_store as _pcs
 from . import rotation as _rotation
 from .drafter import DraftStatus
 
@@ -264,6 +265,52 @@ def _calendar_post(row):
     }
 
 
+def _content_calendar_post(row):
+    """One shared content_calendar row folded into the portal post shape. Carries a
+    STABLE id (content_calendar.id) that the portal POSTs back to /posts/<id>/... .
+    format is the row's own 'feed'/'story' value (never derived); a row with no format
+    stays 'feed'. No field is invented: empty caption / image stay empty strings."""
+    fmt = (row.get("format") or "").strip().lower()
+    if fmt not in ("feed", "story"):
+        fmt = "feed"
+    return {
+        "id": row.get("id"),
+        "day_key": row.get("post_date"),
+        "status": row.get("status") or "",
+        "pillar": row.get("pillar") or "",
+        "format": fmt,
+        "image_public_url": row.get("image_url") or "",
+        "caption": row.get("caption") or "",
+    }
+
+
+def _handle_social_supabase(account_key, month, now=None):
+    """/social from the SHARED content_calendar table (the live portal data plane).
+    Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
+    powers /calendar, returns each with a stable id + real format + image_public_url +
+    caption. low_creative is honest: true only when NO row in the month carries a
+    non-empty image_public_url; posts are never filtered out for a missing image."""
+    try:
+        sb = _pcs.SupabaseCalendarStore()
+        rows = sb.list_month(account_key, month)
+        posts = [_content_calendar_post(r) for r in rows]
+    except Exception as exc:
+        return 500, {"error": f"store error: {type(exc).__name__}"}
+
+    low_creative = not any((p.get("image_public_url") or "") for p in posts)
+    _, days_remaining = _low_creative_and_days(
+        account_key, month, today=(now.date() if now else None))
+    return 200, {
+        "account_key": account_key,
+        "month": month,
+        "active": True,
+        "posts": posts,
+        "recreate_budget": _budget_state(account_key, now=now),
+        "low_creative": low_creative,
+        "days_remaining": days_remaining,
+    }
+
+
 def handle_social(account_key, month, reader=None, now=None):
     """GET /portal/<token>/social?month=YYYY-MM (month optional; defaults to the
     current UTC month). Returns THIS gym's month calendar: posts, statuses, pillar,
@@ -284,6 +331,12 @@ def handle_social(account_key, month, reader=None, now=None):
 
     if not is_social_active(account_key, reader=reader):
         return 402, _empty_calendar(account_key, month)
+
+    # Shared Supabase content_calendar wins when creds are present (the live portal
+    # data plane, same source /calendar reads). No creds -> the existing
+    # gym_calendar_queue path below, byte for byte, so every existing test stays green.
+    if config.portal_calendar_supabase_enabled():
+        return _handle_social_supabase(account_key, month, now=now)
 
     from . import gym_calendar_queue as _gcq
     prefix = month + "-"
@@ -333,31 +386,160 @@ def _load_owned_draft(account_key, draft_id, store):
     return draft, None
 
 
+def _action_gates(account_key, draft_id, actor_id, reader):
+    """The flag / ids / Stripe-active gates shared by BOTH data planes. Returns None to
+    proceed, or (status, body) to short-circuit. Ownership is checked separately (the
+    two planes prove ownership against different stores)."""
+    if not config.portal_social_enabled():
+        return _disabled("action")
+    if not account_key:
+        return (400, {"ok": False, "error": "missing account_key"})
+    if not draft_id:
+        return (400, {"ok": False, "error": "draft_id required"})
+    if not actor_id:
+        return (400, {"ok": False, "error": "actor_id required"})
+    if not is_social_active(account_key, reader=reader):
+        return (402, {"ok": False, "error": "social plan is not active",
+                      "account_key": account_key})
+    return None
+
+
 def _action_preamble(account_key, draft_id, actor_id, store, reader):
     """Shared gate for every POST action: flag, ids, Stripe-active, ownership.
     Returns (draft, None) to proceed, or (None, (status, body)) to short-circuit."""
-    if not config.portal_social_enabled():
-        return None, _disabled("action")
-    if not account_key:
-        return None, (400, {"ok": False, "error": "missing account_key"})
-    if not draft_id:
-        return None, (400, {"ok": False, "error": "draft_id required"})
-    if not actor_id:
-        return None, (400, {"ok": False, "error": "actor_id required"})
-    if not is_social_active(account_key, reader=reader):
-        return None, (402, {"ok": False, "error": "social plan is not active",
-                            "account_key": account_key})
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return None, short
     return _load_owned_draft(account_key, draft_id, store)
+
+
+# ==========================================================================
+# Supabase content_calendar action path (the live portal data plane)
+# ==========================================================================
+#
+# When SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are both set, actions read and write
+# the SHARED content_calendar table via SupabaseCalendarStore (the same source
+# /calendar and /social use), NOT the local ephemeral SQLite drafts. NOTHING here
+# publishes: approve only flips a row's status to 'approved'; a separate human armed
+# publish path (untouched) owns any real post.
+#
+# TOKEN ISOLATION is double guarded: get_row is scoped by gym_id, and set_status
+# filters the PATCH by BOTH id and gym_id. A row whose gym_id differs (or a missing
+# row) is a 404 that never reveals it exists and never issues a write.
+
+def _sb_load_owned_row(account_key, draft_id, sb_store):
+    """(row, None) when the row exists AND belongs to account_key, else
+    (None, (404 body)). get_row is gym scoped, so a cross gym id can never load."""
+    row = sb_store.get_row(account_key, draft_id)
+    if row is None:
+        return None, (404, {"ok": False, "error": "draft not found",
+                            "draft_id": draft_id})
+    return row, None
+
+
+def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        # idempotent: an already approved row is a clean no-op (never a re-publish).
+        if (row.get("status") or "") == _pcs.action_status("approve"):
+            return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
+                         "detail": "Already approved.", "idempotent": True}
+        updated = sb_store.set_status(account_key, draft_id,
+                                      _pcs.action_status("approve"))
+        if updated is None:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        return 200, {"ok": True, "action": "approve", "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+
+
+def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store):
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    # the fabrication gate runs BEFORE any store touch: an unsupported claim is refused
+    # 422 whether or not the row exists, so a stat can never reach the caption.
+    if not _rotation.is_gate_clean(note):
+        return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                     "error": "fabrication gate: the note carries a claim with no "
+                              "approved receipt. Cite an approved source or drop the "
+                              "figure."}
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        # Keep status pending (do not alter the schema; just echo the note). No write.
+        return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
+                     "note": note or ""}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+
+
+def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_store):
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if recreate_remaining(account_key) <= 0:
+        return 409, {"ok": False, "action": "deny", "draft_id": draft_id,
+                     "error": "recreate budget for this month is used up",
+                     "recreate_budget": _budget_state(account_key)}
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        updated = sb_store.set_status(account_key, draft_id,
+                                      _pcs.action_status("deny"))
+        if updated is None:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # Charge the budget only after a successful deny (never on a 404 or store error).
+    spend_recreate(account_key)
+    return 200, {"ok": True, "action": "deny", "draft_id": draft_id,
+                 "recreate_budget": _budget_state(account_key)}
+
+
+def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if not confirm:
+        return 400, {"ok": False, "action": "kill", "draft_id": draft_id,
+                     "error": "kill is permanent and requires confirm=true"}
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        updated = sb_store.set_status(account_key, draft_id,
+                                      _pcs.action_status("kill"))
+        if updated is None:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        return 200, {"ok": True, "action": "kill", "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
 
 
 # ==========================================================================
 # POST /portal/<token>/posts/<id>/approve  (idempotent)
 # ==========================================================================
 
-def handle_approve(account_key, draft_id, actor_id, store=None, reader=None):
+def handle_approve(account_key, draft_id, actor_id, store=None, reader=None, sb_store=None):
     """Approve a post. Idempotent: approving an already-APPROVED post is a clean 200
-    no-op (never a double publish). Delegates to portal_approvals.approve, which runs
-    the same gated publish Slack uses."""
+    no-op (never a double publish). With Supabase creds present, flips the shared
+    content_calendar row's status to 'approved' (NO publish). Otherwise delegates to
+    portal_approvals.approve, which runs the same gated publish Slack uses."""
+    if config.portal_calendar_supabase_enabled():
+        return _handle_approve_supabase(account_key, draft_id, actor_id, reader,
+                                        sb_store or _pcs.SupabaseCalendarStore())
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short
@@ -373,11 +555,16 @@ def handle_approve(account_key, draft_id, actor_id, store=None, reader=None):
 # POST /portal/<token>/posts/<id>/edit  (note; re-runs the fabrication gate -> 422)
 # ==========================================================================
 
-def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=None):
+def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=None, sb_store=None):
     """Request a revision with a note. The note is re-run through the fabrication gate
     (rotation.is_gate_clean): a note that introduces a stat, percentage, or price with
     no approved receipt is REFUSED with 422 so an unsupported claim can never enter the
-    caption. A clean note delegates to portal_approvals.edit."""
+    caption. With Supabase creds present, a clean note keeps the shared row 'pending'
+    and echoes the note (no schema change, no publish). Otherwise delegates to
+    portal_approvals.edit."""
+    if config.portal_calendar_supabase_enabled():
+        return _handle_edit_supabase(account_key, draft_id, actor_id, note, reader,
+                                     sb_store or _pcs.SupabaseCalendarStore())
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short
@@ -394,11 +581,15 @@ def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=Non
 # POST /portal/<token>/posts/<id>/deny  (decrements the 15/month budget -> 409)
 # ==========================================================================
 
-def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None):
+def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None, sb_store=None):
     """Deny a post with a reason. Each deny burns one unit of the server-enforced
     15/month recreate budget; the 16th deny in a month is refused with 409 (the gym
     asks for a fresh concept instead). The budget is spent ONLY when the underlying
-    deny succeeds, so a failed deny never costs the gym a unit."""
+    deny succeeds, so a failed deny never costs the gym a unit. With Supabase creds
+    present, a successful deny flips the shared row's status to 'denied' (NO publish)."""
+    if config.portal_calendar_supabase_enabled():
+        return _handle_deny_supabase(account_key, draft_id, actor_id, note, reader,
+                                     sb_store or _pcs.SupabaseCalendarStore())
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short
@@ -419,10 +610,14 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
 # POST /portal/<token>/posts/<id>/kill  (permanent, free, requires confirm=true)
 # ==========================================================================
 
-def handle_kill(account_key, draft_id, actor_id, confirm=False, store=None, reader=None):
+def handle_kill(account_key, draft_id, actor_id, confirm=False, store=None, reader=None, sb_store=None):
     """Permanently ban this creative concept for THIS gym only. Free (never charges the
     recreate budget) and permanent. Requires confirm=true; without it, 400 and nothing
-    happens. Delegates to portal_approvals.kill (confirmed=True)."""
+    happens. With Supabase creds present, flips the shared row's status to 'killed' (NO
+    publish). Otherwise delegates to portal_approvals.kill (confirmed=True)."""
+    if config.portal_calendar_supabase_enabled():
+        return _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader,
+                                     sb_store or _pcs.SupabaseCalendarStore())
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short
