@@ -13,11 +13,16 @@ WHAT THIS MODULE IS (Part A scope):
   * per-gym KEYING: (gym_id, zernio_profile_id) with account_key on the gym row.
   * the served-once-per-day LOCK: at most one served post per (account_key, day_key),
     order-independent and idempotent, same as the demo queue's served_day lock.
-  * RULING 1 collision-shift: the live book queue (book_queue.build_book_queue_draft)
-    WINS any contested served_day for a LASSO account. When this engine would serve on
-    a day the book queue already occupies (or any queue already served that account
-    that day), Echo SHIFTS its post to the NEXT open day in the same pillar rotation.
-    NEVER two posts on one served_day per account.
+  * THREE-TIER collision priority (Blake ruling; supersedes the earlier "book wins,
+    shift" rule): the gym/demo calendar gets its OWN daily slot but is SUBORDINATE.
+    Priority on any contested served_day per account:
+      (1) the live book queue      (book_queue.build_book_queue_draft)  FIRST
+      (2) the welcome queue         (welcome_queue.build_welcome_queue_draft) SECOND
+      (3) the demo/gym calendar     THIRD
+    The calendar serves its own slot and does NOT wait for the welcome queue to drain,
+    BUT if book OR welcome already occupies/served that account's day, the calendar
+    SHIFTS to the NEXT open day in the same pillar rotation. It never displaces book or
+    welcome, and NEVER two posts on one served_day per account.
 
 WHAT THIS MODULE IS NOT (out of scope for Part A):
   * client CONTENT generation. Nothing here writes a client caption or invents a fact.
@@ -142,22 +147,51 @@ def mark_account_served(account_key, day_key, source=""):
 
 
 def _book_queue_occupies(account_key, day_key):
-    """True if the live dated book queue owns this account+day. The book queue WINS
-    (Ruling 1): its dates are read from book_queue.BOOK_POSTS so a book-launch date is
-    always contested and this engine yields it, regardless of ledger seeding order."""
+    """TIER 1: the live dated book queue owns this account+day. The book queue is
+    FIRST priority: its dates are read from book_queue.BOOK_POSTS so a book-launch date
+    is always contested and this engine yields it, regardless of ledger seeding order.
+    The gym calendar NEVER displaces the book queue."""
     from . import book_queue
     if account_key not in book_queue.ACCOUNTS:
         return False
     return any(p["date"] == day_key for p in book_queue.BOOK_POSTS)
 
 
+def _welcome_queue_occupies(account_key, day_key):
+    """TIER 2: the welcome queue has served (or is serving) an item on this day. The
+    welcome queue is SECOND priority: it serves the SAME item to both LASSO feed
+    accounts on a served_day (it is not per-account), so a welcome served_day contests
+    both lasso_ig and lasso_fb. Read straight off the welcome_queue table so a welcome
+    that popped earlier in the same cycle (welcome runs before the gym calendar in the
+    runner) is seen. The gym calendar NEVER displaces the welcome queue. No-ops for a
+    non-LASSO account (the welcome queue only serves LASSO)."""
+    from . import welcome_queue
+    if account_key not in welcome_queue.ACCOUNTS:
+        return False
+    try:
+        with welcome_queue._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM welcome_queue WHERE served_day=? LIMIT 1",
+                (day_key,)).fetchone()
+        return row is not None
+    except Exception:
+        # the welcome table may not exist yet (welcome never armed); treat as clear.
+        return False
+
+
 def _day_contested(account_key, day_key, conn=None):
-    """A day is contested for an account when the book queue owns it OR the served
-    ledger already records a post for that account that day. Either means: do not add
-    a second post; shift to the next open day."""
-    if _book_queue_occupies(account_key, day_key):
+    """THREE-TIER collision priority (Blake ruling): the gym/demo calendar is TIER 3,
+    subordinate to (1) the live book queue and (2) the welcome queue. A day is contested
+    for an account when ANY higher tier owns it, OR the served ledger already records a
+    post for that account that day (the one-post-per-day-per-account lock). Contested
+    means: do not add a second post; SHIFT to the next open day. The calendar serves its
+    OWN slot and does not wait for the welcome queue to DRAIN, but it never displaces
+    book or welcome and never doubles up on a served day."""
+    if _book_queue_occupies(account_key, day_key):           # tier 1
         return True
-    return account_served_on(account_key, day_key, conn=conn)
+    if _welcome_queue_occupies(account_key, day_key):        # tier 2
+        return True
+    return account_served_on(account_key, day_key, conn=conn)  # ledger lock
 
 
 def _next_open_day(account_key, day_key, conn=None):
@@ -248,11 +282,13 @@ def build_gym_calendar_draft(gym_id, account, day_key):
     """The gym's dated calendar post for day_key as a PENDING draft, or None (flag off,
     no seeded row, or the day is contested and no open day exists ahead).
 
-    RULING 1 (collision-shift): the live book queue WINS. If day_key is contested for
-    this account (the book queue owns it, or the served ledger already records a post
-    that day), Echo SHIFTS to the NEXT open day in the pillar rotation and serves there
-    instead. NEVER two posts on one served_day per account. The served ledger is then
-    claimed for the day it actually served on, so a second queue that same day yields.
+    THREE-TIER collision priority: the calendar is TIER 3, subordinate to the book
+    queue (tier 1) and the welcome queue (tier 2). If day_key is contested for this
+    account (a higher tier owns it, or the served ledger already records a post that
+    day), Echo SHIFTS to the NEXT open day in the pillar rotation and serves there
+    instead. NEVER two posts on one served_day per account, and the calendar never
+    displaces book or welcome. The served ledger is then claimed for the day it
+    actually served on, so a second queue that same day yields.
 
     Content generation is out of scope: the draft carries whatever caption/feed_url the
     row already holds (may be empty in Part A). force_approval is always True."""
@@ -272,12 +308,12 @@ def build_gym_calendar_draft(gym_id, account, day_key):
             return None
 
     # Claim the slot (idempotent). The FIRST queue to serve this account today wins;
-    # if another queue beat us to serve_day between the check and here, yield.
-    mark_account_served(account.key, serve_day, source="gym_calendar")
-    if serve_day != day_key and _book_queue_occupies(account.key, serve_day):
-        # extraordinarily unlikely (we only shift to an OPEN day) but never risk a
-        # double post: if the resolved day turns out book-owned, yield.
+    # if a higher tier beat us to serve_day between the check and here, yield rather
+    # than risk a double post (we only ever shift to an OPEN day, so this is a guard).
+    if _book_queue_occupies(account.key, serve_day) or \
+            _welcome_queue_occupies(account.key, serve_day):
         return None
+    mark_account_served(account.key, serve_day, source="gym_calendar")
 
     _mark_row_served(gym_id, account.key, day_key, serve_day)
 

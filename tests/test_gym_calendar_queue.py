@@ -129,12 +129,33 @@ def test_mark_and_check_ledger(armed):
     gcq.mark_account_served("lasso_ig", "2026-08-07", source="test2")
 
 
-# ---- RULING 1: book queue WINS the overlap dates; calendar shifts -----------------------
+# ---- THREE-TIER collision priority: book(1) > welcome(2) > gym calendar(3) --------------
+
+def _seed_welcome_served(day_key):
+    """Mark a welcome_queue row served on day_key so the welcome queue (tier 2) occupies
+    that day for the LASSO feed accounts (the welcome queue is not per-account)."""
+    from agent import welcome_queue
+    with welcome_queue._conn() as conn:
+        conn.execute(
+            "INSERT INTO welcome_queue (gym_key, name, status, served_day) "
+            "VALUES (?,?, 'served', ?)", (f"gymkey_{day_key}", "Some Gym", day_key))
+        conn.commit()
+
+
+def test_both_clear_serves_same_day(armed):
+    """Neither book nor welcome occupies the day -> the calendar serves its OWN slot on
+    that exact day (it does not wait for the welcome queue to drain)."""
+    day = "2026-08-07"  # not a book date, no welcome served
+    gcq.upsert_gym_post(_LASSO_GYM, "lasso_ig", day, num=1, pillar="All in one offer",
+                        caption="c", feed_url="u")
+    d = gcq.build_gym_calendar_draft(_LASSO_GYM, _lasso_ig(), day)
+    assert d is not None and d.day_key == day
+
 
 def test_calendar_shifts_off_every_book_overlap_date(armed):
-    """Seed a calendar slot on each demo overlap date the book queue occupies. The
-    calendar post must SHIFT to the next open day (never the book-owned day) and never
-    double up on an account's served day."""
+    """TIER 1: seed a calendar slot on each demo overlap date the book queue occupies.
+    The calendar post must SHIFT to the next open day (never the book-owned day) and
+    never double up on an account's served day."""
     for day in _BOOK_DAYS:
         gcq.upsert_gym_post(_LASSO_GYM, "lasso_ig", day, num=1,
                             pillar="Proof", caption=f"cap {day}",
@@ -143,13 +164,53 @@ def test_calendar_shifts_off_every_book_overlap_date(armed):
     for day in _BOOK_DAYS:
         d = gcq.build_gym_calendar_draft(_LASSO_GYM, _lasso_ig(), day)
         assert d is not None, f"expected a shifted draft for {day}"
-        # the book queue owns `day`; the calendar must not serve on it
         assert d.day_key != day, f"calendar doubled up on book-owned {day}"
         assert not gcq._book_queue_occupies("lasso_ig", d.day_key), \
             f"shifted onto another book-owned day {d.day_key}"
-        # never two calendar posts on one served day for this account
         assert d.day_key not in served_days, f"double post on {d.day_key}"
         served_days.add(d.day_key)
+
+
+def test_calendar_shifts_off_a_welcome_occupied_day(armed):
+    """TIER 2: the welcome queue served a gym on the day. The calendar must SHIFT off
+    it (never displace welcome) and land on the next open day."""
+    day = "2026-08-07"  # not a book date
+    _seed_welcome_served(day)
+    gcq.upsert_gym_post(_LASSO_GYM, "lasso_ig", day, num=1, pillar="All in one offer",
+                        caption="c", feed_url="u")
+    d = gcq.build_gym_calendar_draft(_LASSO_GYM, _lasso_ig(), day)
+    assert d is not None
+    assert d.day_key != day, "calendar displaced the welcome queue"
+    assert not gcq._welcome_queue_occupies("lasso_ig", d.day_key)
+
+
+def test_shift_lands_on_next_open_day_preserving_rotation(armed):
+    """The shift lands on the NEXT open day (the immediately following uncontested
+    day), which carries the next pillar's turn in the rotation. Here Aug 12 is book
+    owned and Aug 13 is open, so the post lands exactly on Aug 13."""
+    day = "2026-08-12"  # book owned
+    assert gcq._book_queue_occupies("lasso_ig", day)
+    assert not gcq._book_queue_occupies("lasso_ig", "2026-08-13")  # next day open
+    gcq.upsert_gym_post(_LASSO_GYM, "lasso_ig", day, num=1, pillar="Proof",
+                        caption="c", feed_url="u")
+    d = gcq.build_gym_calendar_draft(_LASSO_GYM, _lasso_ig(), day)
+    assert d is not None and d.day_key == "2026-08-13"
+
+
+def test_priority_book_beats_welcome_beats_calendar(armed):
+    """All three tiers contest the same account. Book (tier 1) and welcome (tier 2)
+    both occupy their days; the calendar (tier 3) yields to both and never doubles up."""
+    book_day = "2026-08-12"          # tier 1
+    welcome_day = "2026-08-13"       # tier 2 (next to the book day)
+    _seed_welcome_served(welcome_day)
+    gcq.upsert_gym_post(_LASSO_GYM, "lasso_ig", book_day, num=1, pillar="Proof",
+                        caption="c", feed_url="u")
+    d = gcq.build_gym_calendar_draft(_LASSO_GYM, _lasso_ig(), book_day)
+    assert d is not None
+    # must clear BOTH the book day and the welcome day
+    assert d.day_key not in (book_day, welcome_day)
+    assert not gcq._book_queue_occupies("lasso_ig", d.day_key)
+    assert not gcq._welcome_queue_occupies("lasso_ig", d.day_key)
 
 
 def test_book_queue_wins_is_flag_gated(monkeypatch):

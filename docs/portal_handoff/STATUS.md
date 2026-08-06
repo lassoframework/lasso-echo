@@ -57,14 +57,20 @@ Endpoints stay PLANNED until deploy; this section tracks the BACKEND ENGINE only
   `served_ledger` table: at most one served post per (account_key, day_key)). The
   LASSO demo is one gym; client gyms are additional gyms. Client CONTENT generation is
   OUT OF SCOPE for Part A (later phase).
-- [x] RULING 1 collision-shift (Blake ruled) — the live book queue
-  (`book_queue.build_book_queue_draft`, dates in `book_queue.BOOK_POSTS`) WINS any
-  contested served_day for a LASSO account. When the calendar engine would serve on a
-  day the book queue already occupies (or the served ledger already records a post for
-  that account that day), Echo SHIFTS to the NEXT open day in the pillar rotation.
-  NEVER two posts on one served_day per account. Regression:
-  `tests/test_gym_calendar_queue.py::test_calendar_shifts_off_every_book_overlap_date`
-  seeds the overlap dates 2026-08-12/15/19/22/26 and asserts the shift.
+- [x] THREE-TIER collision priority (Blake ruling; supersedes the earlier "book wins,
+  shift") — the gym/demo calendar gets its own daily slot but is subordinate. Priority
+  on any contested served_day per account: (1) live book queue FIRST, (2) welcome queue
+  SECOND, (3) demo/gym calendar THIRD. The calendar serves its own slot and does NOT
+  wait for the welcome queue to drain, but if book OR welcome occupies/served that
+  account's day it SHIFTS to the next open day in the pillar rotation. It never
+  displaces book or welcome and NEVER two posts on one served_day per account. Tiering
+  lives in `gym_calendar_queue._day_contested` (`_book_queue_occupies` reads
+  `book_queue.BOOK_POSTS`; `_welcome_queue_occupies` reads served rows off the
+  welcome_queue table; the `served_ledger` table is the per-account per-day lock).
+  Regression matrix in `tests/test_gym_calendar_queue.py`: both clear -> serves same
+  day; book occupies (2026-08-12/15/19/22/26) -> shift; welcome occupies -> shift;
+  shift lands on the next open day preserving rotation; book beats welcome beats
+  calendar.
 - [x] approval_surface ROUTING — `gym_calendar_queue.approval_surface_for(account)`
   returns "slack" for LASSO accounts (key starts "lasso") and "portal" for client
   gyms. `runner._post_and_save` SKIPS the Slack approval card for portal-surface
