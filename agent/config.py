@@ -680,6 +680,30 @@ def zernio_enabled() -> bool:
     return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
 
 
+def zernio_analytics_enabled() -> bool:
+    """
+    Zernio ANALYTICS pull switch (Part C dependency). OFF by default. When OFF, the
+    portal metrics endpoint returns the Part D payload SHAPE with every value null /
+    empty (no live numbers, never a fabricated 0). When ON (and the Zernio analytics
+    add-on is enabled on the account, a by-hand Blake step), Part C wires the real
+    per-post numbers into the same shape. This flag arms the READ only; nothing here
+    publishes. Mirrors zernio_enabled: the analytics add-on is a paid capability, so
+    the default is dark until Blake confirms it on the account.
+    """
+    return _truthy(os.environ.get("AGENT_ZERNIO_ANALYTICS_ENABLED", "false"))
+
+
+def monthly_report_enabled() -> bool:
+    """
+    Monthly client report switch (Part D). OFF by default. When OFF, the portal
+    metrics endpoint answers with the report SHAPE only (null / empty values); no
+    before/after story is assembled. When ON, Part D fills the shape from the
+    baseline record + the Zernio analytics pull. Missing metrics MUST show as gaps
+    ("not available on this account"), never a fabricated 0. Arm by hand in Railway.
+    """
+    return _truthy(os.environ.get("AGENT_MONTHLY_REPORT_ENABLED", "false"))
+
+
 def backup_enabled() -> bool:
     """
     Nightly store backup switch. OFF by default. ON, a consistent sqlite

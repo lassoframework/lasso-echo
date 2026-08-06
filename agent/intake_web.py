@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 
 from . import config, ghl_intake, intake_tokens, whatsapp_intake
 from . import portal_routes as _pr
+from . import portal_social as _ps
 from . import zernio_routes as _zr
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
@@ -1010,6 +1011,33 @@ def build_server(port=None):
                 return m.group(1), m.group(2)
             return None, None
 
+        def _portal_clientsocial_route(self):
+            """Part B token-scoped client-social READ routes.
+            Returns (token, sub) for /portal/<token>/social and /portal/<token>/metrics,
+            else (None, None). sub is 'social' or 'metrics'. Gated by
+            AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/(social|metrics)$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2)
+            return None, None
+
+        def _portal_post_action_route(self):
+            """Part B token-scoped client-social ACTION routes.
+            Returns (token, post_id, action) for
+            /portal/<token>/posts/<id>/{approve|edit|deny|kill}, else (None,None,None).
+            Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
+                r"(approve|edit|deny|kill)$",
+                self.path.split("?")[0],
+            )
+            if m:
+                return m.group(1), m.group(2), m.group(3)
+            return None, None, None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -1058,6 +1086,26 @@ def build_server(port=None):
                     status, body = _zr.handle_social_status(account_key)
                 else:
                     status, body = _zr.handle_facebook_pages(account_key)
+                return self._send_json(body, status)
+
+            # Part B client-social READ routes: /portal/<token>/social (month calendar)
+            # and /portal/<token>/metrics (Part D report shape). Gated by
+            # AGENT_PORTAL_SOCIAL_ENABLED (handler returns 404 when off). Token->account;
+            # unknown/revoked token = 404 (indistinguishable). TOKEN ISOLATION is enforced
+            # inside the handlers, which scope every read to account_key.
+            cs_token, cs_sub = self._portal_clientsocial_route()
+            if cs_token is not None:
+                account_key = client_for_token(cs_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                if cs_sub == "social":
+                    month = (qs.get("month") or [""])[0]
+                    status, body = _ps.handle_social(account_key, month)
+                else:
+                    days = (qs.get("days") or ["30"])[0]
+                    status, body = _ps.handle_metrics(account_key, days)
                 return self._send_json(body, status)
 
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
@@ -1179,6 +1227,42 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 status, resp = _zr.handle_facebook_page_select(account_key, body.get("page_id", ""))
+                return self._send_json(resp, status)
+
+            # Part B client-social ACTION routes: POST /portal/<token>/posts/<id>/{approve
+            # |edit|deny|kill}. Gated by AGENT_PORTAL_SOCIAL_ENABLED (handler returns 404
+            # when off). Token->account_key; unknown/revoked token = 404. Body is JSON:
+            # {actor_id, note?, confirm?}. TOKEN ISOLATION: the handler proves the draft
+            # belongs to account_key before acting (a cross-gym id is a 404, never acted on).
+            ps_token, ps_post_id, ps_action = self._portal_post_action_route()
+            if ps_token is not None:
+                account_key = client_for_token(ps_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                actor_id = body.get("actor_id", "")
+                note = body.get("note", "")
+                confirm = bool(body.get("confirm", False))
+                from .store import PendingStore
+                store = PendingStore()
+                if ps_action == "approve":
+                    status, resp = _ps.handle_approve(account_key, ps_post_id, actor_id,
+                                                      store=store)
+                elif ps_action == "edit":
+                    status, resp = _ps.handle_edit(account_key, ps_post_id, actor_id,
+                                                   note=note, store=store)
+                elif ps_action == "deny":
+                    status, resp = _ps.handle_deny(account_key, ps_post_id, actor_id,
+                                                   note=note, store=store)
+                else:  # kill
+                    status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
+                                                   confirm=confirm, store=store)
                 return self._send_json(resp, status)
 
             # GHL inbound webhook (POST /ghl/inbound).

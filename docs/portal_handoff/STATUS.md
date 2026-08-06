@@ -27,6 +27,12 @@ Endpoint-level. One line per Echo endpoint the portal calls or will call.
 | `GET /portal/<token>/facebook-pages` | LIVE (Zernio) | Returns `{pages:[{id,name}]}` |
 | `POST /portal/<token>/facebook-page-select` | LIVE (Zernio) | Persists the gym's chosen page (Echo injects per post) |
 | ~~`GET /portal/<token>/social-connect` (SocialAPI.ai)~~ | RETIRED | Superseded by the Zernio per-platform routes above (Blake ruling 2026-07-29). SocialAPI connect handlers remain as dead code pending the full SocialAPI purge. |
+| `GET /portal/<token>/social?month=YYYY-MM` | BUILT-behind-flag | `AGENT_PORTAL_SOCIAL_ENABLED` (default OFF => 404). Stripe social product ACTIVE else 402+empty. Month calendar for THIS gym: `{account_key,month,active,posts:[{day_key,status,pillar,format,image_public_url,caption}],recreate_budget:{limit,used,remaining},low_creative,days_remaining}`. Token isolation: every row scoped to account_key. |
+| `POST /portal/<token>/posts/<id>/approve` | BUILT-behind-flag | Same flag+Stripe gate. Idempotent (already APPROVED => 200 no-op). Delegates to portal_approvals (gated publish, no new path). |
+| `POST /portal/<token>/posts/<id>/edit` | BUILT-behind-flag | Body `{actor_id,note}`. Re-runs the fabrication gate on the note => 422 on an unsupported claim. |
+| `POST /portal/<token>/posts/<id>/deny` | BUILT-behind-flag | Body `{actor_id,note}`. Decrements a SERVER-enforced 15/month recreate budget (kv, per account+month) => 409 when exhausted; budget charged only on a successful deny. |
+| `POST /portal/<token>/posts/<id>/kill` | BUILT-behind-flag | Body `{actor_id,confirm}`. Permanent + FREE (never charges budget); requires `confirm=true` else 400. |
+| `GET /portal/<token>/metrics?days=N` | BUILT-behind-flag (shape only) | Same flag+Stripe gate. Returns the PART D payload SHAPE with values null/empty (Zernio analytics pull is Part C). Missing metrics are GAPS, never a fabricated 0. `analytics_available`/`report_available` read `AGENT_ZERNIO_ANALYTICS_ENABLED`/`AGENT_MONTHLY_REPORT_ENABLED` (both OFF). |
 
 ---
 
@@ -136,6 +142,74 @@ Items that cannot move until Blake takes a manual action:
 - Demo distinct-art fix: `agent/demo_calendar_render.py` renders 36 unique images (per-post variant keyed on (pillar, position)); `render_all` raises on any duplicate hash; no-digit/no-dash on-image asserts intact; one red per card.
 
 **Descopes ruled INTENDED for Part A (not defects):** the engine is dormant in prod even flag-ON — `build_gym_calendar_draft` is not yet called by the runner and nothing seeds client gym rows; wiring lands with the content/endpoints phase. Client-caption dash/"vendor" gate and the empty-caption end-to-end interaction also belong to the content phase.
+
+---
+
+## PART B — TOKEN-SCOPED PORTAL ENDPOINTS (built behind flag, NOT merged)
+
+Branch `feat/portal-social-partB`. All six endpoints BUILT behind the SAME master flag
+`AGENT_PORTAL_SOCIAL_ENABLED` (default OFF => routes 404, byte-for-byte current behavior).
+Endpoints stay PLANNED->BUILT-behind-flag until deploy; the contract is fixed above.
+
+- [x] `agent/portal_social.py` — the six handlers. Every route: (1) master flag ON else
+  disabled/404; (2) the gym's Stripe SOCIAL product ACTIVE else 402 + empty-state payload
+  (fail closed: no product id configured / no customer id / no key / any read error =>
+  not active, never a live calendar); (3) TOKEN ISOLATION proven on every route — reads
+  scope every calendar/metric row to account_key; actions load the draft then REJECT it
+  as 404 unless `draft.account_key == account_key` (a cross-gym id never even confirms the
+  other gym's draft exists). `store.get(draft_id)` is not account-scoped, so this ownership
+  re-check is the isolation guard.
+- [x] `GET /social` — month calendar from `gym_calendar_queue`, scoped to account_key.
+  `low_creative` = no queued (unserved) row left this month; `days_remaining` = whole days
+  left in the calendar month (null when today is outside the month). recreate_budget state
+  included.
+- [x] `POST /posts/<id>/approve` — idempotent (already APPROVED => 200 no-op, never a double
+  publish). Delegates to `portal_approvals.approve` -> `approvals.handle_action` (same gated
+  publish Slack uses; NO new publish path).
+- [x] `POST /posts/<id>/edit` — re-runs `rotation.is_gate_clean(note)`; a note carrying a
+  stat/percent/price with no approved receipt => 422. Clean note delegates to
+  `portal_approvals.edit`.
+- [x] `POST /posts/<id>/deny` — server-enforced 15/month recreate budget in
+  `portal_social.spend_recreate` (kv key `portal_recreate_spent_<account>_<YYYY-MM>`); 409
+  when exhausted; the budget is charged ONLY after a successful deny (a failed/unauthorized
+  deny never costs a unit). Per-account isolated (key carries account_key).
+- [x] `POST /posts/<id>/kill` — permanent + FREE (never touches the budget); requires
+  `confirm=true` else 400. Delegates to `portal_approvals.kill(confirmed=True)`.
+- [x] `GET /metrics` — the Part D payload SHAPE with null/empty values (documented in
+  `_metrics_shape`). Missing metrics are GAPS ("no numbers are shown rather than a made up
+  zero"), never a fabricated 0. The real baseline (Part A) is included so Part D's
+  before/after has its "before" the moment analytics land.
+- [x] Wiring: `agent/intake_web.py` routes `/portal/<token>/social`, `/portal/<token>/metrics`
+  (GET) and `/portal/<token>/posts/<id>/{approve|edit|deny|kill}` (POST). Token->account via
+  the existing `client_for_token`; unknown/revoked token = 404 (indistinguishable).
+- [x] `portal_approvals` gate EXTENDED (not rebuilt): the account-scoped functions are now
+  callable when EITHER `AGENT_PORTAL_APPROVALS` OR `AGENT_PORTAL_SOCIAL_ENABLED` is armed, so
+  Part B's master flag alone is enough. Both OFF => inert, unchanged.
+- [x] Migrations (additive): `gyms.stripe_customer_id` (gym -> Stripe customer for the
+  active-product check). Flags: `AGENT_ZERNIO_ANALYTICS_ENABLED`, `AGENT_MONTHLY_REPORT_ENABLED`
+  (both default OFF), plus env `STRIPE_SOCIAL_PRODUCT_ID` (the social product id; empty =>
+  no gym reads as active).
+- [x] Copy rules: no em/en/hyphen dashes and never "vendor" in any client-facing string
+  (runtime message test + source-literal grep). Verified stats only.
+- [x] Tests: `tests/test_portal_social.py` (25) — flag-off disabled, Stripe-not-active 402,
+  token isolation on EVERY route (social/metrics reads + approve/edit/deny/kill actions +
+  per-gym budget), budget 15 + 409 exhausted + free kill + failed-deny-no-charge, kill
+  confirm, edit fabrication 422, approve idempotent, metrics gaps-not-zeros, HTTP layer
+  (unknown token 404, flag-off 404, action routing carries the resolved account_key,
+  kill confirm plumbed). Full suite 2033 green.
+
+**Descopes ruled INTENDED for Part B (numbered for Blake, none block the contract):**
+1. Metrics returns the SHAPE only; the live Zernio analytics numbers are Part C (behind
+   `AGENT_ZERNIO_ANALYTICS_ENABLED`, dead until Blake confirms the analytics add-on).
+2. `stripe_customer_id` is set by hand / by onboarding; nothing in Part B provisions it. A
+   gym with no customer id reads as not-active (402), which is correct until onboarding
+   fills it.
+3. Client CONTENT (captions/images) is still a later phase; `/social` shows whatever the
+   Part A engine rows already hold (may be empty), never a fabricated caption.
+
+BLAKE RULINGS NEEDED (numbered): (a) confirm `STRIPE_SOCIAL_PRODUCT_ID` is the correct
+Stripe product id for the client-social subscription, and (b) confirm 15/month is the
+recreate budget (currently a code constant `MONTHLY_RECREATE_BUDGET`, not per-gym tunable).
 
 ---
 

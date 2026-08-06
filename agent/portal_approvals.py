@@ -20,6 +20,15 @@ from .accounts import get_account
 from .drafter import DraftStatus
 
 
+def _gate_open():
+    """The account-scoped approval functions are callable when EITHER the original
+    portal-approvals flag OR the Part B client-social master flag is armed. Part B's
+    token-scoped endpoints run under AGENT_PORTAL_SOCIAL_ENABLED and delegate here, so
+    the master flag alone is enough to act; the older AGENT_PORTAL_APPROVALS lane keeps
+    working exactly as before. Both OFF -> the functions are inert (unchanged)."""
+    return config.portal_approvals_enabled() or config.portal_social_enabled()
+
+
 def _flag_off_response(action):
     return {"ok": False, "detail": "AGENT_PORTAL_APPROVALS is OFF", "action": action}
 
@@ -51,7 +60,7 @@ def _result(ok, action, draft_id, detail):
 
 def approve(account_key, draft_id, actor_id, store=None, **kwargs):
     """Approve a draft for this gym. Actor must be authorized for account_key."""
-    if not config.portal_approvals_enabled():
+    if not _gate_open():
         return _flag_off_response("approve")
     account = get_account(account_key)
     if account is None:
@@ -69,7 +78,7 @@ def approve(account_key, draft_id, actor_id, store=None, **kwargs):
 
 def edit(account_key, draft_id, actor_id, note="", store=None, **kwargs):
     """Request a revision for a draft for this gym."""
-    if not config.portal_approvals_enabled():
+    if not _gate_open():
         return _flag_off_response("edit")
     account = get_account(account_key)
     if account is None:
@@ -87,7 +96,7 @@ def edit(account_key, draft_id, actor_id, note="", store=None, **kwargs):
 
 def deny(account_key, draft_id, actor_id, note="", store=None, **kwargs):
     """Deny a draft for this gym. Marks it BLOCKED and costs one recreate."""
-    if not config.portal_approvals_enabled():
+    if not _gate_open():
         return _flag_off_response("deny")
     account = get_account(account_key)
     if account is None:
@@ -106,7 +115,7 @@ def deny(account_key, draft_id, actor_id, note="", store=None, **kwargs):
 def kill(account_key, draft_id, actor_id, confirmed=False, store=None, **kwargs):
     """Permanently ban the creative concept for this gym only.
     Requires confirmed=True. Actor must be authorized for account_key."""
-    if not config.portal_approvals_enabled():
+    if not _gate_open():
         return _flag_off_response("kill")
     account = get_account(account_key)
     if account is None:
