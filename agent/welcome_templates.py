@@ -705,71 +705,48 @@ def _fit_into(logo, box_w, box_h, pad_frac=0.14):
     return logo.resize((max(1, int(lw * scale)), max(1, int(lh * scale))))
 
 
-def _logo_needs_dark_plate(logo_path):
-    """Returns True when >40% of opaque pixels are near-white — the logo would vanish
-    on a light plate. Drives auto plate-color selection without recoloring the mark."""
-    if not logo_path or not os.path.isfile(logo_path):
-        return False
-    try:
-        img = Image.open(logo_path).convert("RGBA")
-        px = list(img.getdata())
-        opaque = [p for p in px if p[3] > 127]
-        if not opaque:
-            return False
-        white = sum(1 for p in opaque if p[0] > 200 and p[1] > 200 and p[2] > 200)
-        return white / len(opaque) > 0.40
-    except Exception:
-        return False
+# NOTE: the cream/navy logo PLATE was removed on 2026-08-06 (Blake's ruling: kill
+# the plate everywhere). The gym logo now sits directly on the open background. The
+# old _draw_zone_plate and its _logo_needs_dark_plate helper are gone; blank review
+# templates use _draw_zone_hint below (a fill-less clear-space hint) instead.
 
-
-def _draw_zone_plate(img, zone, base, ghost=False, dark_plate=False):
-    """Draw the calm plate the gym logo sits on: a soft rounded card with a real
-    drop shadow so it reads as an intentional lockup area, not an empty hole. On
-    navy cards it is a cream plate so ANY gym logo (usually dark) reads; on cream
-    cards it is a subtle raised panel. When `dark_plate` is True, a near-navy fill
-    is used instead so white logos read clearly on any card base. When `ghost`, a
-    faint "GYM LOGO" hint and a clear-space frame show where the gym's mark will land
-    (used on blank templates). Not red, so it never competes for the single red accent."""
+def _draw_zone_hint(img, zone, base):
+    """Blake killed the logo plate (2026-08-06): a real gym logo now sits directly on
+    the open background, no cream/navy box behind it. On the BLANK review template
+    (no logo) we still need to show WHERE the logo lands, but NOT a filled box that
+    would read as part of the design. So we draw only a thin dashed clear-space frame
+    and a faint 'GYM LOGO' label, tinted to the base so it reads without competing.
+    Nothing is filled; the background shows through."""
     x, y, w, h = zone
-    # soft drop shadow (both bases) so the plate feels lifted and designed
-    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle([x + 6, y + 14, x + w + 6, y + h + 14], radius=30,
-                         fill=(0, 0, 0, 70 if base == "cream" else 95))
-    img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16)))
-
-    plate = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    pd = ImageDraw.Draw(plate)
-    if dark_plate:
-        fill = (22, 26, 38, 255)               # near-navy: readable on both bases
-    else:
-        fill = (250, 246, 240, 255) if base == "navy" else (255, 253, 250, 240)
-    pd.rounded_rectangle([0, 0, w - 1, h - 1], radius=30, fill=fill)
-    img.alpha_composite(plate, (x, y))
-
-    if ghost:
-        gd = ImageDraw.Draw(img, "RGBA")
-        # inner clear-space frame
-        pad = int(min(w, h) * 0.16)
-        gd.rounded_rectangle([x + pad, y + pad, x + w - pad, y + h - pad],
-                             radius=18, outline=(18, 30, 60, 60), width=2)
-        label = "GYM LOGO"
-        lf = _f(OSWALD, 30)
-        lw = _tracked_w(gd, label, lf, 5)
-        _tracked(gd, (x + (w - lw) // 2, y + h // 2 - 18), label, lf,
-                 (18, 30, 60, 120), 5)
+    d = ImageDraw.Draw(img, "RGBA")
+    ink = (250, 246, 240) if base == "navy" else (18, 30, 60)
+    pad = int(min(w, h) * 0.16)
+    # dashed rounded frame so it reads as a placeholder, not a solid plate
+    fx0, fy0, fx1, fy1 = x + pad, y + pad, x + w - pad, y + h - pad
+    dash, gap = 18, 12
+    step = dash + gap
+    for sx in range(fx0, fx1, step):
+        d.line([(sx, fy0), (min(sx + dash, fx1), fy0)], fill=ink + (70,), width=2)
+        d.line([(sx, fy1), (min(sx + dash, fx1), fy1)], fill=ink + (70,), width=2)
+    for sy in range(fy0, fy1, step):
+        d.line([(fx0, sy), (fx0, min(sy + dash, fy1))], fill=ink + (70,), width=2)
+        d.line([(fx1, sy), (fx1, min(sy + dash, fy1))], fill=ink + (70,), width=2)
+    label = "GYM LOGO"
+    lf = _f(OSWALD, 30)
+    lw = _tracked_w(d, label, lf, 5)
+    _tracked(d, (x + (w - lw) // 2, y + h // 2 - 18), label, lf, ink + (120,), 5)
 
 
 def place_gym_logo(img, logo_path, zone, base):
-    """Composite the gym's own logo into the safe zone, centered, on the calm plate.
-    Placed as-is (never recolored) so the gym's real mark is preserved. Auto-selects
-    a dark plate when the logo is predominantly white so it always reads clearly. With
-    no logo (a blank review template) the plate shows a 'GYM LOGO' clear-space hint so
-    it reads as an intentional lockup area rather than an empty hole."""
+    """Composite the gym's own logo directly into the safe zone, centered, over the
+    open background. Placed as-is (never recolored) so the gym's real mark is
+    preserved. Blake killed the logo plate everywhere (2026-08-06): there is NO cream
+    or navy box behind the logo now. With no logo (a blank review template) a subtle
+    dashed clear-space hint shows where the gym's mark will land, without a filled
+    plate that would read as part of the design."""
     has_logo = bool(logo_path) and os.path.isfile(logo_path)
-    dark_plate = _logo_needs_dark_plate(logo_path) if has_logo else False
-    _draw_zone_plate(img, zone, base, ghost=not has_logo, dark_plate=dark_plate)
     if not has_logo:
+        _draw_zone_hint(img, zone, base)
         return
     x, y, w, h = zone
     logo = Image.open(logo_path).convert("RGBA")
@@ -1054,7 +1031,7 @@ def _render(template, gym_name, owner_name, logo_path, out_path,
     if img.size != (W, H):
         img = img.resize((W, H))
     zone = story_zone(template) if fmt == "story" else template["logo_zone"]
-    # logo zone first (plate sits under nothing but the gym logo), then text
+    # gym logo goes down first (directly on the open background, no plate), then text
     place_gym_logo(img, logo_path, zone, template["base"])
     if fmt == "story":
         on_card_text = _compose_text_story(img, template, gym_name, owner_name)
@@ -1086,8 +1063,8 @@ def make_welcome(template_id, gym_name, owner_name, logo_path, format="feed",
 
 
 def render_blank(template_id, out_path, bg_client=None, cache_dir=None, format="feed"):
-    """The empty template: placeholder fills, no gym logo (shows the calm safe zone
-    plate so Blake can see where a gym logo lands)."""
+    """The empty template: placeholder fills, no gym logo (shows a subtle clear-space
+    hint, no plate, so Blake can see where a gym logo lands)."""
     t = get_template(template_id)
     _fmt_dims(format)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)

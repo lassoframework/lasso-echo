@@ -192,6 +192,108 @@ def test_ocr_clean_procedural_background(cache):
     assert res["clean"] is True
 
 
+# ==========================================================================
+# NO LOGO PLATE (Blake ruling 2026-08-06): a real logo sits directly on the open
+# background; there is NO cream/navy box behind it, and the blank template shows a
+# fill-less clear-space hint, not a filled placeholder box.
+# ==========================================================================
+
+_CREAM_PLATE = (250, 246, 240)   # the OLD plate fill; must never appear behind a logo
+_DARK_PLATE = (22, 26, 38)       # the OLD white-logo dark plate fill
+
+
+def _small_transparent_logo(tmp_path, name="logo.png", size=(360, 360),
+                            fill=(18, 30, 60, 255)):
+    """A compact opaque mark centered on a fully transparent field, so the zone
+    corners are transparent and should show the background through, not a plate."""
+    im = Image.new("RGBA", size, (0, 0, 0, 0))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(im)
+    w, h = size
+    d.ellipse([w * 0.30, h * 0.30, w * 0.70, h * 0.70], fill=fill)
+    p = str(tmp_path / name)
+    im.save(p)
+    return p
+
+
+def _near(a, b, tol=10):
+    return all(abs(a[i] - b[i]) <= tol for i in range(3))
+
+
+def _zone_bg_side_points(zone):
+    """Sample points inside the logo zone on the side AWAY from the text column, plus
+    the vertical center of that side. T1's zone is on the right (text on the left), so
+    these points are clear of any composed headline glyphs and read only the logo
+    layer over the background. The old plate covered the ENTIRE zone, so if any of
+    these still shows the background, the plate is gone."""
+    x, y, w, h = zone
+    return [(x + int(w * 0.62), y + 8),
+            (x + w - 8, y + 8),
+            (x + int(w * 0.62), y + h - 8),
+            (x + w - 8, y + h - 8),
+            (x + int(w * 0.85), y + h // 2)]
+
+
+def test_real_logo_has_no_plate_fill_behind_it(tmp_path, cache):
+    # T1 is a navy card. With the plate GONE, the open area of the logo zone must show
+    # the navy background, never the old cream/navy plate fill, when a transparent
+    # logo (transparent at its corners) is composited there.
+    t = wt.get_template("T1")
+    logo = _small_transparent_logo(tmp_path)
+    # background alone at the same points = the ground truth to match
+    bg_path, _ = wt.ensure_background(t, cache_dir=cache)
+    bg = Image.open(bg_path).convert("RGB")
+    out = _out(tmp_path, "t1_nplate.png")
+    wt._render(t, "Iron Forge", "Sam", logo, out, cache_dir=cache)
+    card = Image.open(out).convert("RGB")
+    for px in _zone_bg_side_points(t["logo_zone"]):
+        cpx = card.getpixel(px)
+        # still shows the background (no plate painted over it) ...
+        assert _near(cpx, bg.getpixel(px)), f"zone point {px} changed: {cpx}"
+        # ... and is emphatically NOT either old plate fill
+        assert not _near(cpx, _CREAM_PLATE), f"cream plate leaked at {px}: {cpx}"
+        assert not _near(cpx, _DARK_PLATE), f"dark plate leaked at {px}: {cpx}"
+
+
+def test_white_logo_gets_no_dark_plate(tmp_path, cache):
+    # a predominantly-white logo used to trigger a near-navy dark plate; that path is
+    # gone. The open zone must still be the plain navy background, not a dark plate.
+    t = wt.get_template("T1")
+    logo = _small_transparent_logo(tmp_path, name="white.png",
+                                   fill=(255, 255, 255, 255))
+    bg_path, _ = wt.ensure_background(t, cache_dir=cache)
+    bg = Image.open(bg_path).convert("RGB")
+    out = _out(tmp_path, "t1_white.png")
+    wt._render(t, "Iron Forge", "Sam", logo, out, cache_dir=cache)
+    card = Image.open(out).convert("RGB")
+    for px in _zone_bg_side_points(t["logo_zone"]):
+        cpx = card.getpixel(px)
+        assert _near(cpx, bg.getpixel(px)), f"zone point {px} changed: {cpx}"
+        assert not _near(cpx, _DARK_PLATE), f"dark plate leaked at {px}: {cpx}"
+        assert not _near(cpx, _CREAM_PLATE), f"cream plate leaked at {px}: {cpx}"
+
+
+def test_blank_template_hint_is_not_a_filled_plate(tmp_path, cache):
+    # the blank (no-logo) review template shows WHERE the logo lands, but with a
+    # fill-less hint: the open zone must remain the background, not a filled box.
+    t = wt.get_template("T1")
+    bg_path, _ = wt.ensure_background(t, cache_dir=cache)
+    bg = Image.open(bg_path).convert("RGB")
+    out = _out(tmp_path, "t1_blank.png")
+    wt._render(t, "YOUR GYM NAME", "Owner Name", None, out, cache_dir=cache)
+    card = Image.open(out).convert("RGB")
+    for px in _zone_bg_side_points(t["logo_zone"]):
+        cpx = card.getpixel(px)
+        assert _near(cpx, bg.getpixel(px)), f"blank zone point {px} filled: {cpx}"
+        assert not _near(cpx, _CREAM_PLATE), f"cream plate on blank at {px}: {cpx}"
+
+
+def test_plate_helpers_removed():
+    # the plate is dead: neither the drawing helper nor its white-logo detector exist.
+    assert not hasattr(wt, "_draw_zone_plate")
+    assert not hasattr(wt, "_logo_needs_dark_plate")
+
+
 def test_unknown_template_raises():
     with pytest.raises(KeyError):
         wt.get_template("T99")
