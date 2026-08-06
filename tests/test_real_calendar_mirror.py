@@ -12,6 +12,7 @@ publish.
 
 import os
 import sys
+import uuid as _uuid
 
 import pytest
 
@@ -21,6 +22,19 @@ from agent import real_calendar_mirror as rcm
 from agent import demo_calendar_queue as demo
 from agent import portal_social as ps
 from agent.drafter import Draft, DraftStatus
+
+
+def _reject_non_uuid_id(row):
+    """Model the real DB: an insert that carries an `id` at all is rejected. The insert
+    path MUST omit id so gen_random_uuid fires; a draft id is a non-uuid string Postgres
+    would refuse with 22P02. A fake that silently accepted it hid the live bug."""
+    if "id" in row and row.get("id") not in (None, ""):
+        try:
+            _uuid.UUID(str(row["id"]))
+        except (ValueError, AttributeError, TypeError):
+            raise AssertionError(
+                f"non-uuid id sent to insert (22P02 in real DB): {row.get('id')!r}")
+        raise AssertionError("insert must not send id; the DB generates the uuid")
 
 
 # ---- fakes ----------------------------------------------------------------
@@ -47,12 +61,19 @@ class _FakeStore:
 
 
 class _FakeSB:
-    """Stands in for SupabaseCalendarStore. Enforces gym_id isolation on every write
-    and RECORDS every upsert / delete so a test can prove no cross-gym write happens."""
+    """Stands in for SupabaseCalendarStore. Enforces gym_id isolation on every write and
+    RECORDS every insert / delete so a test can prove no cross-gym write happens. Models
+    the REAL schema: content_calendar.id is a DB-generated uuid, so insert_rows REJECTS a
+    row that carries an id (a non-uuid draft id would be 22P02 in Postgres) and generates
+    the uuid itself."""
 
     def __init__(self, rows=None):
-        self._rows = {r["id"]: dict(r) for r in (rows or [])}
+        self._rows = {}
+        for r in (rows or []):
+            rid = r.get("id") or _uuid.uuid4().hex
+            self._rows[rid] = dict(r, id=rid)
         self.upserts = []
+        self.inserts = []
         self.deletes = []
 
     def list_month(self, account_key, month):
@@ -60,11 +81,26 @@ class _FakeSB:
                 if str(r.get("gym_id")) == str(account_key)
                 and (r.get("post_date") or "").startswith(month)]
 
-    def upsert_row(self, account_key, row):
-        assert str(row.get("gym_id")) == str(account_key), "cross-gym upsert"
-        self.upserts.append((account_key, dict(row)))
-        self._rows[row["id"]] = dict(row)
-        return dict(row)
+    def insert_rows(self, account_key, rows):
+        out = []
+        for row in (rows or []):
+            _reject_non_uuid_id(row)  # a fake that accepted a draft id hid the live bug
+            assert str(row.get("gym_id")) == str(account_key), "cross-gym insert"
+            rid = _uuid.uuid4().hex  # DB-generated uuid
+            saved = dict(row, id=rid, gym_id=account_key)
+            self._rows[rid] = saved
+            self.inserts.append((account_key, dict(saved)))
+            out.append(dict(saved))
+        return out
+
+    def delete_month(self, account_key, month):
+        victims = [rid for rid, r in self._rows.items()
+                   if str(r.get("gym_id")) == str(account_key)
+                   and (r.get("post_date") or "").startswith(month)]
+        for rid in victims:
+            del self._rows[rid]
+        self.deletes.append((account_key, month, len(victims)))
+        return len(victims)
 
     def delete_row(self, account_key, row_id):
         self.deletes.append((account_key, row_id))
@@ -97,12 +133,14 @@ def test_collect_excludes_demo_ids():
     demo_feed = _draft(demo._draft_id("northside_ig", "2026-08-06", "feed"))
     demo_story = _draft(demo._draft_id("northside_ig", "2026-08-06", "story"),
                         is_story=True, draft_type="story")
-    real = _draft("realf_9")
+    real = _draft("realf_9", caption="only real")
     rows = rcm.collect_real_drafts("northside_ig",
                                    _FakeStore([demo_feed, demo_story, real]))
-    ids = [r["id"] for r in rows]
-    assert ids == ["realf_9"]
-    assert not any(demo.is_demo_draft_id(i) for i in ids)
+    # Rows carry NO id (the DB generates the uuid); the demo drafts are excluded up front
+    # by their id namespace, so only the one real draft's row survives.
+    assert all("id" not in r for r in rows), "row must not carry an id"
+    assert len(rows) == 1
+    assert rows[0]["caption"] == "only real"
 
 
 def test_collect_skips_draft_without_hosted_url():
@@ -120,7 +158,7 @@ def test_collect_uses_scheduled_for_when_no_day_key():
 # ---- mirror_plan ----------------------------------------------------------
 
 def test_plan_upserts_real_deletes_demo_gym_scoped():
-    real = _draft("realf_1", account_key="northside_ig")
+    real = _draft("realf_1", account_key="northside_ig", caption="the real one")
     store = _FakeStore([real])
     existing = [
         {"id": demo._draft_id("northside_ig", "2026-08-06", "feed"),
@@ -130,7 +168,10 @@ def test_plan_upserts_real_deletes_demo_gym_scoped():
          "gym_id": "othergym", "post_date": "2026-08-06"},
     ]
     plan = rcm.mirror_plan("northside_ig", store, existing)
-    assert [r["id"] for r in plan["upsert"]] == ["realf_1"]
+    # The one real draft's row is queued to write; it carries no id (DB generates it).
+    assert len(plan["upsert"]) == 1
+    assert plan["upsert"][0]["caption"] == "the real one"
+    assert "id" not in plan["upsert"][0]
     assert plan["delete_ids"] == [existing[0]["id"]]
     assert existing[1]["id"] not in plan["delete_ids"], "other gym untouched"
 
@@ -145,7 +186,8 @@ def test_plan_never_upserts_a_demo_id():
 # ---- mirror_to_supabase (applies the plan) --------------------------------
 
 def test_mirror_applies_and_leaves_zero_demo_ids():
-    real = _draft("realf_1", account_key="northside_ig", day_key="2026-08-06")
+    real = _draft("realf_1", account_key="northside_ig", day_key="2026-08-06",
+                  caption="the real row")
     demo_id = demo._draft_id("northside_ig", "2026-08-06", "feed")
     sb = _FakeSB(rows=[{"id": demo_id, "gym_id": "northside_ig",
                         "post_date": "2026-08-06", "account": "instagram",
@@ -153,13 +195,16 @@ def test_mirror_applies_and_leaves_zero_demo_ids():
                         "pillar": "p", "format": "feed"}])
     summary = rcm.mirror_to_supabase("northside_ig", _FakeStore([real]), sb)
     assert summary["ok"] is True
-    assert summary["upserted"] == 1
-    assert summary["deleted"] == 1
-    # After the mirror the gym holds the real row and ZERO demo ids.
+    assert summary["inserted"] == 1
+    assert summary["deleted"] == 1  # the whole Aug month wiped, then the real row inserted
+    # After the mirror the gym holds the real row (a DB-generated uuid, NOT the draft id)
+    # and ZERO demo ids: the delete-then-insert cleared the demo row.
     remaining = sb.list_month("northside_ig", "2026-08")
+    assert len(remaining) == 1
+    assert remaining[0]["caption"] == "the real row"
     ids = [r["id"] for r in remaining]
-    assert "realf_1" in ids
     assert not any(demo.is_demo_draft_id(i) for i in ids)
+    assert _uuid.UUID(remaining[0]["id"])  # a real uuid, not the draft id
 
 
 def test_mirror_refuses_demo_gym_id(monkeypatch):
@@ -167,14 +212,15 @@ def test_mirror_refuses_demo_gym_id(monkeypatch):
     sb = _FakeSB()
     summary = rcm.mirror_to_supabase("lasso_demo", _FakeStore([]), sb)
     assert summary["ok"] is False
-    assert sb.upserts == [] and sb.deletes == []
+    assert sb.inserts == [] and sb.deletes == []
 
 
 def test_mirror_never_writes_another_gyms_row():
     real = _draft("realf_1", account_key="northside_ig", day_key="2026-08-06")
     sb = _FakeSB()
     rcm.mirror_to_supabase("northside_ig", _FakeStore([real]), sb)
-    for account_key, row in sb.upserts:
+    assert sb.inserts, "the real row was inserted"
+    for account_key, row in sb.inserts:
         assert account_key == "northside_ig"
         assert row["gym_id"] == "northside_ig"
 
@@ -233,16 +279,20 @@ def test_mirrored_draft_action_roundtrips_with_isolation(monkeypatch):
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc")
     monkeypatch.setenv("AGENT_SOCIAL_BILLING_DELEGATED", "true")
 
-    # A real draft mirrored to content_calendar for northside_ig.
+    # A real draft mirrored to content_calendar for northside_ig. The row is inserted
+    # WITHOUT an id and the DB assigns a uuid; the portal action keys off THAT uuid (the
+    # value /social read back), never the draft id.
     real = _draft("realf_1", account_key="northside_ig", day_key="2026-08-06")
     row = rcm.collect_real_drafts("northside_ig", _FakeStore([real]))[0]
-    sb = _ActionSB([row])
+    assert "id" not in row
+    row_uuid = _uuid.uuid4().hex
+    sb = _ActionSB([dict(row, id=row_uuid)])
 
-    status, body = ps.handle_approve("northside_ig", "realf_1", "actor-1", sb_store=sb)
+    status, body = ps.handle_approve("northside_ig", row_uuid, "actor-1", sb_store=sb)
     assert status == 200
     assert body["ok"] is True and body["action"] == "approve"
-    assert sb.get_row("northside_ig", "realf_1")["status"] == "approved"
+    assert sb.get_row("northside_ig", row_uuid)["status"] == "approved"
 
     # Token isolation: another gym's token can never act on this row.
-    s2, b2 = ps.handle_approve("othergym", "realf_1", "actor-2", sb_store=sb)
+    s2, b2 = ps.handle_approve("othergym", row_uuid, "actor-2", sb_store=sb)
     assert s2 == 404 and b2["ok"] is False

@@ -18,7 +18,9 @@ DESIGN (three layers, first two are PURE, no I/O):
      rows to UPSERT (the real drafts) and which existing DEMO rows to DELETE for this
      gym. No I/O, no ordering surprises.
   3. mirror_to_supabase(account_key, store, sb_store) -> applies the plan through the
-     injectable SupabaseCalendarStore (upsert real rows, delete demo rows), GYM SCOPED.
+     injectable SupabaseCalendarStore, DELETE-then-INSERT and GYM SCOPED: per month the
+     real drafts land in, delete all the gym's rows (demo and prior real) then insert the
+     fresh real rows WITHOUT an id (the DB generates the uuid).
 
 HARD GUARDS:
   * Demo content is valid ONLY for the demo gym id (config.demo_calendar_gym_id(),
@@ -83,7 +85,13 @@ def _pillar(draft):
 def _real_row(account_key, draft):
     """One real draft folded into the content_calendar row shape. gym_id == account_key;
     account == the draft's platform; format from is_story/draft_type. No field invented:
-    an empty caption stays empty."""
+    an empty caption stays empty.
+
+    The row carries NO `id`: content_calendar.id is a Postgres uuid the DB generates
+    (gen_random_uuid), and there is no draft_id column, so writing a draft's id as the
+    row id fails with 22P02 and writes 0 rows. The write path is delete-then-insert, and
+    /social + the approve/deny actions key off the DB-returned uuid, not the draft id.
+    The draft's own id is exposed separately via _row_source_id for the demo-id guard."""
     return {
         "gym_id": account_key,
         "account": getattr(draft, "platform", "") or "",
@@ -93,11 +101,13 @@ def _real_row(account_key, draft):
         "caption": getattr(draft, "caption", "") or "",
         "image_url": getattr(draft, "creative_public_url", "") or "",
         "status": _draft_status(draft),
-        # The draft id travels as the row id so an action on the mirrored row round
-        # trips to the same draft, and re-mirroring the same draft is an UPSERT (not a
-        # duplicate). The portal PATCHes /posts/<id>/... with exactly this id.
-        "id": getattr(draft, "draft_id", "") or "",
     }
+
+
+def _row_source_id(draft):
+    """The draft's own id (the demo-id guard reads this; it is NOT written to the row).
+    Empty when the draft has none."""
+    return getattr(draft, "draft_id", "") or ""
 
 
 def collect_real_drafts(account_key, store):
@@ -167,12 +177,14 @@ def mirror_plan(account_key, store, existing_rows):
 
 
 def mirror_to_supabase(account_key, store, sb_store):
-    """Apply the mirror plan through the injectable SupabaseCalendarStore.
+    """Apply the mirror through the injectable SupabaseCalendarStore: DELETE-then-INSERT,
+    gym scoped, per month the real drafts land in.
 
-    Reads the gym's current content_calendar rows (sb_store.list_month is month scoped,
-    so we sweep the months the real drafts land in PLUS whatever months already hold demo
-    rows), computes the plan, upserts the real rows, and deletes the demo rows. Writes
-    calendar rows only: NOTHING here publishes.
+    For every month a real draft lands in, DELETE all of the gym's rows in that month
+    (both demo and prior real, so a re-run replaces the month cleanly and idempotently),
+    then INSERT the fresh real rows WITHOUT an `id` (the DB generates the uuid; sending a
+    non-uuid draft id is what raised 22P02 and wrote 0 rows). Writes calendar rows only:
+    NOTHING here publishes.
 
     GUARD: refuses to run for the demo gym id (that gym is the ONE place demo content is
     valid, behind AGENT_DEMO_CALENDAR_ENABLED). Returns a summary dict; never raises out
@@ -186,45 +198,28 @@ def mirror_to_supabase(account_key, store, sb_store):
         return {"ok": False, "reason": "refusing to mirror the demo gym id",
                 "upserted": 0, "deleted": 0}
 
-    real_rows = collect_real_drafts(account_key, store)
+    # Real rows, gym-forced, with any stray id stripped (belt and braces; _real_row no
+    # longer emits one). A real gym never carries a demo id, so a demo-id row is dropped.
+    real_rows = [{k: v for k, v in row.items() if k != "id"}
+                 for row in collect_real_drafts(account_key, store)
+                 if not _demo.is_demo_draft_id(row.get("id"))
+                 and str(row.get("gym_id")) == str(account_key)]
     # Months to reconcile: every month a real draft lands in.
     months = sorted({r["post_date"][:7] for r in real_rows if r.get("post_date")})
 
-    existing = []
-    seen_ids = set()
-    try:
-        for month in months:
-            for r in (sb_store.list_month(account_key, month) or []):
-                rid = r.get("id")
-                if rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                existing.append(r)
-    except Exception as exc:
-        return {"ok": False, "reason": f"store read failed: {type(exc).__name__}",
-                "upserted": 0, "deleted": 0}
-
-    plan = mirror_plan(account_key, store, existing)
-
-    upserted = 0
     deleted = 0
+    inserted = 0
     try:
-        upsert = getattr(sb_store, "upsert_row", None)
-        for row in plan["upsert"]:
-            # Belt-and-braces gym scope: never hand the store a row for another gym.
-            if str(row.get("gym_id")) != str(account_key):
-                continue
-            if upsert is not None:
-                upsert(account_key, row)
-                upserted += 1
-        delete = getattr(sb_store, "delete_row", None)
-        for rid in plan["delete_ids"]:
-            if delete is not None:
-                delete(account_key, rid)
-                deleted += 1
+        delete_month = getattr(sb_store, "delete_month", None)
+        for month in months:
+            if delete_month is not None:
+                deleted += delete_month(account_key, month) or 0
+        insert_rows = getattr(sb_store, "insert_rows", None)
+        if insert_rows is not None and real_rows:
+            inserted += len(insert_rows(account_key, real_rows) or [])
     except Exception as exc:
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": upserted, "deleted": deleted}
+                "upserted": inserted, "deleted": deleted}
 
-    return {"ok": True, "upserted": upserted, "deleted": deleted,
-            "delete_ids": list(plan["delete_ids"])}
+    return {"ok": True, "upserted": inserted, "inserted": inserted,
+            "deleted": deleted, "months": months}

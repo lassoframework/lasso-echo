@@ -37,10 +37,13 @@ class _Resp:
 class _FakeHTTP:
     """Records every call; returns canned responses keyed by method."""
 
-    def __init__(self, get_resp=None, patch_resp=None):
+    def __init__(self, get_resp=None, patch_resp=None, post_resp=None,
+                 delete_resp=None):
         self.calls = []
         self._get_resp = get_resp or _Resp(200, [])
         self._patch_resp = patch_resp or _Resp(200, [])
+        self._post_resp = post_resp or _Resp(201, [])
+        self._delete_resp = delete_resp or _Resp(200, [])
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append(("get", url, params or {}, headers or {}))
@@ -49,6 +52,14 @@ class _FakeHTTP:
     def patch(self, url, params=None, headers=None, json=None, timeout=None):
         self.calls.append(("patch", url, params or {}, headers or {}, json or {}))
         return self._patch_resp
+
+    def post(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append(("post", url, params or {}, headers or {}, json))
+        return self._post_resp
+
+    def delete(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append(("delete", url, params or {}, headers or {}, json))
+        return self._delete_resp
 
 
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
@@ -293,3 +304,65 @@ def test_service_key_never_in_error(monkeypatch):
     assert status == 500
     # The handler returns only the exception type name, never the detail text.
     assert "svc-key-secret" not in str(body)
+
+
+# ---- 7. insert_rows: NO id sent, DB uuid returned; delete_month gym+month scoped ----
+# These prove the fix for the 22P02 bug: content_calendar.id is a DB-generated uuid, so
+# a write must NOT send `id`. The apply path is delete-then-insert.
+
+def test_insert_rows_sends_no_id_and_forces_gym(monkeypatch):
+    import uuid
+    new_id = str(uuid.uuid4())
+    returned = [{"id": new_id, "gym_id": "lasso", "post_date": "2026-08-06",
+                 "account": "instagram", "status": "pending", "caption": "hi",
+                 "image_url": "u", "pillar": "proof", "format": "feed"}]
+    http = _FakeHTTP(post_resp=_Resp(201, returned))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc-key-secret", http=http)
+    # Caller hands rows that (defensively) include a non-uuid id and a foreign gym; both
+    # must be corrected: id stripped, gym forced.
+    rows = [{"id": "demof_lasso_2026-08-06_feed", "gym_id": "someone_else",
+             "post_date": "2026-08-06", "caption": "hi", "format": "feed"}]
+    out = store.insert_rows("lasso", rows)
+
+    post_call = [c for c in http.calls if c[0] == "post"][0]
+    sent = post_call[4]
+    assert isinstance(sent, list) and len(sent) == 1
+    assert "id" not in sent[0], "insert must NOT send id (DB generates the uuid)"
+    assert sent[0]["gym_id"] == "lasso", "gym_id forced to the account key"
+    # on_conflict/upsert is gone: a plain insert, no query params.
+    assert post_call[2] == {}
+    # The DB-returned uuid comes back.
+    assert out == returned
+    assert uuid.UUID(out[0]["id"])
+
+
+def test_insert_rows_empty_is_noop(monkeypatch):
+    http = _FakeHTTP()
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    assert store.insert_rows("lasso", []) == []
+    assert not [c for c in http.calls if c[0] == "post"], "no POST for empty rows"
+
+
+def test_delete_month_scoped_by_gym_and_month(monkeypatch):
+    deleted = [{"id": "u1", "gym_id": "lasso", "post_date": "2026-08-10"}]
+    http = _FakeHTTP(delete_resp=_Resp(200, deleted))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    n = store.delete_month("lasso", "2026-08")
+    assert n == 1
+    del_call = [c for c in http.calls if c[0] == "delete"][0]
+    params = del_call[2]
+    assert params["gym_id"] == "eq.lasso", "gym scope on the DELETE"
+    assert params["post_date"] == ["gte.2026-08-01", "lte.2026-08-31"], "month bounds"
+
+
+def test_delete_month_ignores_foreign_gym_rows_in_response(monkeypatch):
+    # Defensive: even if the DELETE echoed a foreign gym row, it is not counted.
+    resp = [{"id": "u1", "gym_id": "lasso", "post_date": "2026-08-10"},
+            {"id": "u2", "gym_id": "other", "post_date": "2026-08-11"}]
+    http = _FakeHTTP(delete_resp=_Resp(200, resp))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    assert store.delete_month("lasso", "2026-08") == 1

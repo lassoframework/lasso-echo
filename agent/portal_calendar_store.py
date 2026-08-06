@@ -156,31 +156,64 @@ class SupabaseCalendarStore:
 
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
-    def upsert_row(self, account_key, row):
-        """UPSERT one content_calendar row for account_key. The row's gym_id is FORCED
-        to account_key here so a caller can never write another gym's row through this
-        store. Uses PostgREST upsert (on_conflict=id, merge-duplicates) so re-mirroring
-        the same draft id updates in place rather than duplicating. Returns the written
-        row dict, or None."""
-        payload = dict(row or {})
-        payload["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+    def insert_rows(self, account_key, rows):
+        """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
+        DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
+        (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
+        caused 22P02 "invalid input syntax for type uuid" and wrote 0 rows. There is no
+        draft_id column, so a draft's id is simply not persisted as the row id: /social
+        and the approve/deny actions key off the DB-returned uuid, not the draft id.
+
+        Every row's gym_id is FORCED to account_key (a caller can never write another
+        gym's row through this store) and any stray `id` key is STRIPPED before the POST.
+        No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
+        and idempotent. Returns the list of inserted row dicts (each with its new uuid)."""
+        payload = []
+        for row in (rows or []):
+            clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
+            clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+            payload.append(clean)
+        if not payload:
+            return []
         r = self._client().post(
             self._rest(_TABLE),
-            params={"on_conflict": "id"},
             headers=self._headers({
                 "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=representation",
+                "Prefer": "return=representation",
             }),
             json=payload,
             timeout=30,
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        out = r.json() or []
+        return [x for x in out if str(x.get("gym_id")) == str(account_key)]
+
+    def delete_month(self, account_key, month):
+        """DELETE every content_calendar row for account_key whose post_date falls inside
+        the calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
+        gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
+        gym (or outside the month) is never touched. Used by the delete-then-insert apply
+        so a re-run replaces the month cleanly and idempotently. Returns the number of the
+        gym's rows deleted."""
+        year = int(month[:4])
+        mon = int(month[5:7])
+        last_day = _calendar.monthrange(year, mon)[1]
+        first = f"{month}-01"
+        last = f"{month}-{last_day:02d}"
+        r = self._client().delete(
+            self._rest(_TABLE),
+            params={
+                "gym_id": f"eq.{account_key}",
+                "post_date": [f"gte.{first}", f"lte.{last}"],
+            },
+            headers=self._headers({"Prefer": "return=representation"}),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        for out in rows:
-            if str(out.get("gym_id")) == str(account_key):
-                return out
-        return None
+        return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
 
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that

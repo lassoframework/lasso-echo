@@ -6,15 +6,17 @@ category per weekday, is deterministic, folds book/summit/welcome overrides onto
 right days, and is safe for days <= 0. build_month_drafts uses ONLY the injected
 builders, skips (never fakes) a missing-source slot, keeps feed and story as separate
 drafts with the correct format, and respects the 9:16 story assertion. to_calendar_rows
-has the content_calendar shape, is gym-scoped, status pending. apply_month_plan upserts
-the real rows and deletes ALL demo rows for the gym across the full planned span, never
-touches another gym, and leaves no demo id behind.
+has the content_calendar shape (NO id: the DB generates the uuid), is gym-scoped, status
+pending. apply_month_plan is DELETE-then-INSERT: it deletes ALL of the gym's rows across
+the full planned span (demo and prior real) then inserts the fresh real rows without an
+id, never touches another gym, and leaves no demo id behind.
 
 Nothing here publishes, hosts, or writes to a live store: every store is an injected fake.
 """
 
 import os
 import sys
+import uuid as _uuid
 
 import pytest
 
@@ -27,6 +29,19 @@ from agent.drafter import Draft, DraftStatus  # noqa: E402
 ACCT = "lasso"
 # 2026-08-03 is a Monday, so a 7-day window from here walks Mon..Sun cleanly.
 MON = "2026-08-03"
+
+
+def _reject_non_uuid_id(row):
+    """Model the real DB: an insert that carries an `id` at all is rejected. The insert
+    path MUST omit id so gen_random_uuid fires; a draft id is a non-uuid string that
+    Postgres would refuse with 22P02. A fake that silently accepted it hid the live bug."""
+    if "id" in row and row.get("id") not in (None, ""):
+        try:
+            _uuid.UUID(str(row["id"]))
+        except (ValueError, AttributeError, TypeError):
+            raise AssertionError(
+                f"non-uuid id sent to insert (22P02 in real DB): {row.get('id')!r}")
+        raise AssertionError("insert must not send id; the DB generates the uuid")
 
 
 # ---- fakes ----------------------------------------------------------------
@@ -42,11 +57,18 @@ def _draft(draft_id, *, day_key, category, platform="instagram",
 
 
 class _FakeSB:
-    """Stands in for SupabaseCalendarStore; records writes and enforces gym isolation."""
+    """Stands in for SupabaseCalendarStore; records writes, enforces gym isolation, and
+    models the REAL schema: content_calendar.id is a DB-generated uuid. insert_rows MUST
+    NOT receive an id (a non-uuid id would be rejected 22P02 by Postgres); the fake
+    generates the uuid itself, exactly as gen_random_uuid would."""
 
     def __init__(self, rows=None):
-        self._rows = {r["id"]: dict(r) for r in (rows or [])}
+        self._rows = {}
+        for r in (rows or []):
+            rid = r.get("id") or _uuid.uuid4().hex
+            self._rows[rid] = dict(r, id=rid)
         self.upserts = []
+        self.inserts = []
         self.deletes = []
 
     def list_month(self, account_key, month):
@@ -54,11 +76,29 @@ class _FakeSB:
                 if str(r.get("gym_id")) == str(account_key)
                 and (r.get("post_date") or "").startswith(month)]
 
-    def upsert_row(self, account_key, row):
-        assert str(row.get("gym_id")) == str(account_key), "cross-gym upsert"
-        self.upserts.append((account_key, dict(row)))
-        self._rows[row["id"]] = dict(row)
-        return dict(row)
+    def insert_rows(self, account_key, rows):
+        out = []
+        for row in (rows or []):
+            # The real DB rejects a non-uuid id (22P02). The insert path must send NO id
+            # so the DB can generate one; a fake that accepts a draft id would have hidden
+            # the live bug, so this fake REJECTS any id here.
+            _reject_non_uuid_id(row)
+            assert str(row.get("gym_id")) == str(account_key), "cross-gym insert"
+            rid = _uuid.uuid4().hex  # DB-generated uuid
+            saved = dict(row, id=rid, gym_id=account_key)
+            self._rows[rid] = saved
+            self.inserts.append((account_key, dict(saved)))
+            out.append(dict(saved))
+        return out
+
+    def delete_month(self, account_key, month):
+        victims = [rid for rid, r in self._rows.items()
+                   if str(r.get("gym_id")) == str(account_key)
+                   and (r.get("post_date") or "").startswith(month)]
+        for rid in victims:
+            del self._rows[rid]
+        self.deletes.append((account_key, month, len(victims)))
+        return len(victims)
 
     def delete_row(self, account_key, row_id):
         self.deletes.append((account_key, row_id))
@@ -303,7 +343,8 @@ def test_rows_shape_gym_scoped_pending():
     assert rows, "expected calendar rows"
     for r in rows:
         assert set(r.keys()) >= {"gym_id", "account", "post_date", "pillar",
-                                 "format", "caption", "image_url", "status", "id"}
+                                 "format", "caption", "image_url", "status"}
+        assert "id" not in r, "row must not carry an id (the DB generates the uuid)"
         assert r["gym_id"] == ACCT
         assert r["status"] == "pending"
         assert r["format"] in ("feed", "story")
@@ -347,21 +388,23 @@ def test_apply_upserts_real_and_deletes_all_demo_for_gym():
     out = rmp.apply_month_plan(ACCT, drafts, sb, span_months=span)
 
     assert out["ok"] is True
-    assert out["upserted"] == len(drafts) > 0
-    # BOTH demo rows deleted (including the next-month one the mirror's narrow sweep
-    # would have missed) -> the month-range gap is closed.
-    assert demo_feed_id in out["delete_ids"]
-    assert demo_story_id in out["delete_ids"]
+    assert out["inserted"] == len(drafts) > 0
+    # DELETE-then-INSERT swept the WHOLE Aug AND Sep months for the gym, so BOTH demo rows
+    # (including the next-month one a narrow sweep would have missed) are gone -> the
+    # month-range gap is closed and a re-run is idempotent.
     assert out["deleted"] == 2
     # no demo id survives on the gym
     surviving = [r for r in sb._rows.values() if str(r.get("gym_id")) == ACCT]
     assert not any(demo.is_demo_draft_id(r["id"]) for r in surviving)
+    # every surviving gym row carries a real DB uuid, never a draft/demo id
+    for r in surviving:
+        assert _uuid.UUID(r["id"])
     # the other gym's row is untouched
     assert other_gym_id in sb._rows
     # every delete was scoped to our gym
-    assert all(acct == ACCT for acct, _ in sb.deletes)
-    # every upsert carried our gym_id
-    assert all(str(row["gym_id"]) == ACCT for _, row in sb.upserts)
+    assert all(acct == ACCT for acct, *_ in sb.deletes)
+    # every insert carried our gym_id and NO id was sent
+    assert all(str(row["gym_id"]) == ACCT for _, row in sb.inserts)
 
 
 def test_apply_refuses_demo_gym_id():
@@ -369,7 +412,7 @@ def test_apply_refuses_demo_gym_id():
     from agent import config
     out = rmp.apply_month_plan(config.demo_calendar_gym_id(), [], sb)
     assert out["ok"] is False
-    assert not sb.upserts and not sb.deletes
+    assert not sb.inserts and not sb.deletes
 
 
 def test_apply_missing_store_is_safe():
@@ -377,11 +420,12 @@ def test_apply_missing_store_is_safe():
     assert out["ok"] is False
 
 
-def test_apply_never_upserts_a_demo_id():
-    # Even if a demo-id draft somehow reached apply, it is filtered out of the upserts.
+def test_apply_never_inserts_a_demo_id():
+    # Even if a demo-id draft somehow reached apply, it is filtered out before insert
+    # (keyed off the draft's OWN id, since the row no longer carries one).
     sb = _FakeSB()
     d = _draft(demo._draft_id(ACCT, "2026-08-10", "feed"),
                day_key="2026-08-10", category="podcast")
     out = rmp.apply_month_plan(ACCT, [d], sb, span_months=["2026-08"])
-    assert out["upserted"] == 0
-    assert not sb.upserts
+    assert out["inserted"] == 0
+    assert not sb.inserts

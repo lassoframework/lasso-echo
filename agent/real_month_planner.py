@@ -31,12 +31,12 @@ THREE PURE LAYERS + a thin apply (all injectable, offline-testable):
      feed|story, caption, image_url, status='pending'). Reuses real_calendar_mirror's
      row mapping so the shape is identical to the live mirror.
 
-  4. apply_month_plan(account_key, drafts, sb_store) -> upsert the real rows through the
-     injectable SupabaseCalendarStore AND delete ALL demo rows for the gym (closing the
-     month-range gap the mirror audit flagged: the mirror only swept the months real
-     drafts landed in; here we sweep the FULL planned span PLUS every month that holds a
-     demo row for the gym). Gym-scoped: never touches another gym. Writes calendar rows
-     only; NOTHING here publishes.
+  4. apply_month_plan(account_key, drafts, sb_store) -> DELETE-then-INSERT through the
+     injectable SupabaseCalendarStore: for the FULL planned span PLUS every month a real
+     row lands in, delete ALL of the gym's rows (demo and prior real) then insert the
+     fresh real rows WITHOUT an id (the DB generates the uuid). Idempotent: a re-run
+     replaces the month cleanly. Gym-scoped: never touches another gym. Writes calendar
+     rows only; NOTHING here publishes.
 
 HARD RULES (never weakened):
   * NO fabricated facts, stats, offers, or prices. Every draft is produced by an
@@ -465,15 +465,17 @@ def plan_span_months(start_date, days=30):
 
 
 def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
-    """Upsert the real planned rows AND delete ALL demo rows for the gym, through the
-    injectable SupabaseCalendarStore. GYM SCOPED: only ever touches account_key's rows.
+    """Apply the real month plan through the injectable SupabaseCalendarStore:
+    DELETE-then-INSERT, GYM SCOPED, across the full planned span.
 
-    Refuses to run for the demo gym id (demo content's one valid home). Reconciles across
-    every month the real rows land in PLUS the full planned span (`span_months`, from
-    plan_span_months) so a demo row anywhere in the planned window is cleared, closing the
-    month-range gap where the live mirror only swept months a real draft happened to land
-    in. Every existing DEMO row for the gym (is_demo_draft_id) in those months is deleted;
-    a real gym never keeps a demo id after apply.
+    Refuses to run for the demo gym id (demo content's one valid home). For every month
+    the real rows land in PLUS the full planned span (`span_months`, from
+    plan_span_months), DELETE all of the gym's rows in that month (both demo and prior
+    real, closing the month-range gap AND making a re-run replace the month cleanly and
+    idempotently), then INSERT the fresh real rows WITHOUT an `id`. content_calendar.id
+    is a DB-generated uuid and there is no draft_id column, so sending a draft's non-uuid
+    id as the row id is what raised 22P02 and wrote 0 rows; the rows now carry no id and
+    /social + approve/deny key off the DB-returned uuid.
 
     Writes calendar rows only. NOTHING here publishes. Returns a summary dict; never
     raises out (a store error is reported, not a partial silent failure)."""
@@ -484,48 +486,32 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
 
-    rows = [r for r in to_calendar_rows(drafts, account_key)
-            # belt and braces: a planner row must never carry a demo id, and gym scope
-            # is forced here too so a foreign gym_id can never be upserted.
-            if not _mirror._demo.is_demo_draft_id(r.get("id"))
-            and str(r.get("gym_id")) == str(account_key)]
+    # Drop any demo-id draft up front (a real gym never carries a demo id), keying off the
+    # draft's OWN id since the row no longer carries one. Then map to id-less rows and
+    # force gym scope so a foreign gym_id can never be written.
+    real_drafts = [d for d in (drafts or [])
+                   if not _mirror._demo.is_demo_draft_id(_mirror._row_source_id(d))]
+    rows = [{k: v for k, v in r.items() if k != "id"}
+            for r in to_calendar_rows(real_drafts, account_key)
+            if str(r.get("gym_id")) == str(account_key)]
 
+    # Reconcile the FULL planned span plus every month a real row lands in: DELETE all of
+    # the gym's rows there first (demo and prior real), so a re-run is idempotent.
     months = _months_in_span(rows, extra_months=span_months)
 
-    # Read the gym's current rows across every month we reconcile, so we can find the
-    # demo rows to delete (mirror._existing_demo_ids is gym-scoped + id-namespaced).
-    existing = []
-    seen_ids = set()
-    try:
-        for month in months:
-            for r in (sb_store.list_month(account_key, month) or []):
-                rid = r.get("id")
-                if rid in seen_ids:
-                    continue
-                seen_ids.add(rid)
-                existing.append(r)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"store read failed: {type(exc).__name__}",
-                "upserted": 0, "deleted": 0}
-
-    delete_ids = _mirror._existing_demo_ids(account_key, existing)
-
-    upserted = 0
     deleted = 0
+    inserted = 0
     try:
-        upsert = getattr(sb_store, "upsert_row", None)
-        for row in rows:
-            if upsert is not None:
-                upsert(account_key, row)
-                upserted += 1
-        delete = getattr(sb_store, "delete_row", None)
-        for rid in delete_ids:
-            if delete is not None:
-                delete(account_key, rid)
-                deleted += 1
+        delete_month = getattr(sb_store, "delete_month", None)
+        for month in months:
+            if delete_month is not None:
+                deleted += delete_month(account_key, month) or 0
+        insert_rows = getattr(sb_store, "insert_rows", None)
+        if insert_rows is not None and rows:
+            inserted += len(insert_rows(account_key, rows) or [])
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
-                "upserted": upserted, "deleted": deleted}
+                "upserted": inserted, "deleted": deleted}
 
-    return {"ok": True, "upserted": upserted, "deleted": deleted,
-            "delete_ids": list(delete_ids), "months": months}
+    return {"ok": True, "upserted": inserted, "inserted": inserted,
+            "deleted": deleted, "months": months}
