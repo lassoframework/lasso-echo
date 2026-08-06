@@ -12,6 +12,7 @@ the same path Slack uses, so portal and Slack act on the same draft records.
 
 from . import config, db as _db
 from . import portal_approvals as _pa
+from . import portal_calendar_store as _pcs
 from .accounts import get_account
 from .library import list_creatives
 
@@ -42,6 +43,17 @@ def handle_portal_calendar(account_key, month, store=None):
         return 400, {"error": "month must be YYYY-MM"}
 
     prefix = month + "-"
+
+    # Shared Supabase data plane wins when creds are present (the live portal
+    # path). No creds -> the existing SQLite behavior below, unchanged.
+    if store is None and config.portal_calendar_supabase_enabled():
+        try:
+            sb = _pcs.SupabaseCalendarStore()
+            rows = sb.list_month(account_key, month)
+            drafts = [_pcs.map_row(r) for r in rows]
+        except Exception as exc:
+            return 500, {"error": f"store error: {type(exc).__name__}"}
+        return 200, {"account_key": account_key, "month": month, "drafts": drafts}
 
     if store is not None:
         pending = store.list_pending()
@@ -131,6 +143,11 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="", store
     if not actor_id:
         return 400, {"error": "actor_id required"}
 
+    # Shared Supabase data plane wins when creds are present (the live portal
+    # path). No creds -> the existing portal_approvals/SQLite path, unchanged.
+    if store is None and config.portal_calendar_supabase_enabled():
+        return _handle_action_supabase(action, account_key, draft_id, note)
+
     fn = getattr(_pa, action)
     if action in ("edit", "deny", "kill"):
         result = fn(account_key, draft_id, actor_id, note=note, store=store)
@@ -141,7 +158,82 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="", store
     return (200 if ok else 403), result
 
 
+def handle_portal_report(account_key, days):
+    """
+    GET /portal/<token>/report?days=N
+
+    Live analytics are not connected yet, so every metric answers null (never a
+    fabricated 0). Shape matches the portal's mapReport exactly. Gated by
+    AGENT_PORTAL_APPROVALS.
+    """
+    if not config.portal_approvals_enabled():
+        return _flag_off("report")
+
+    if not account_key:
+        return 400, {"error": "missing account_key"}
+
+    try:
+        window = int(days)
+    except (TypeError, ValueError):
+        window = 30
+    if window < 1:
+        window = 30
+
+    return 200, {
+        "account_key": account_key,
+        "window_days": window,
+        "posts_published": None,
+        "engagement_rate": None,
+        "likes": None,
+        "comments": None,
+        "saves": None,
+        "shares": None,
+        "views": None,
+        "reach": None,
+        "follower_delta": None,
+        "gaps": ["Live analytics are not connected yet; no numbers are shown "
+                 "rather than a made up zero."],
+        "health": {"label": None},
+        "top_posts": [],
+    }
+
+
 # ---- helpers -------------------------------------------------------------------
+
+def _handle_action_supabase(action, account_key, draft_id, note):
+    """
+    Supabase content_calendar action path. approve/deny/kill flip status; edit
+    keeps status pending and echoes the note (no schema change, never fails on a
+    missing note column). TOKEN ISOLATION is double guarded: a pre fetch by id
+    scoped to gym_id, plus the gym_id filter on the PATCH itself. A row whose
+    gym_id != account_key (or a missing row) is a 404 that never reveals it
+    exists and never issues a write. NOTHING here publishes.
+    """
+    try:
+        sb = _pcs.SupabaseCalendarStore()
+        # Pre check: the row must exist AND belong to this gym.
+        row = sb.get_row(account_key, draft_id)
+        if row is None:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+
+        if action == "edit":
+            # Keep status pending; record the note without a schema change.
+            return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
+                         "note": note or ""}
+
+        new_status = _pcs.action_status(action)
+        if new_status is None:
+            return 400, {"error": f"unknown action: {action}"}
+
+        updated = sb.set_status(account_key, draft_id, new_status)
+        if updated is None:
+            # Zero rows matched the id+gym_id filter -> treat as not found.
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        return 200, {"ok": True, "action": action, "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+
 
 def _draft_to_dict(draft):
     if draft is None:

@@ -1,0 +1,295 @@
+"""
+Tests for the Supabase-backed portal calendar data plane.
+
+All offline: a fake HTTP client stands in for `requests`; no network, no db.
+
+Invariants:
+  1. calendar read maps content_calendar rows -> the exact portal shape.
+  2. month filter is correct (gte first-of-month, lte last-of-month).
+  3. approve/deny/kill PATCH the status, filtered by BOTH id AND gym_id.
+  4. cross-gym draft_id (gym B row, gym A key) -> 404, NO write issued.
+  5. report returns the null shape (never a fabricated 0).
+  6. when creds absent, handle_portal_calendar keeps the SQLite path (unchanged).
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from agent import portal_routes, portal_calendar_store as pcs
+
+
+# ---- fake HTTP client (mimics requests: get/patch -> response obj) -------------
+
+class _Resp:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else []
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class _FakeHTTP:
+    """Records every call; returns canned responses keyed by method."""
+
+    def __init__(self, get_resp=None, patch_resp=None):
+        self.calls = []
+        self._get_resp = get_resp or _Resp(200, [])
+        self._patch_resp = patch_resp or _Resp(200, [])
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(("get", url, params or {}, headers or {}))
+        return self._get_resp
+
+    def patch(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append(("patch", url, params or {}, headers or {}, json or {}))
+        return self._patch_resp
+
+
+def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
+         status="pending", caption="hello", image_url="https://cdn/x.jpg",
+         pillar="education"):
+    return {
+        "id": row_id, "gym_id": gym_id, "post_date": post_date,
+        "account": account, "status": status, "caption": caption,
+        "image_url": image_url, "pillar": pillar,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _creds(monkeypatch):
+    # Portal flag ON + Supabase creds present by default; individual tests
+    # override where they need the SQLite path.
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key-secret")
+
+
+# ---- 1. read maps rows -> exact portal shape ----------------------------------
+
+def test_calendar_maps_rows_to_portal_shape(monkeypatch):
+    rows = [_row("id-1", caption="cap", image_url="https://cdn/1.jpg", pillar="proof")]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+    assert status == 200
+    assert body["account_key"] == "lasso"
+    assert body["month"] == "2026-08"
+    d = body["drafts"][0]
+    assert d == {
+        "draft_id": "id-1", "day_key": "2026-08-06", "status": "pending",
+        "platform": "instagram", "caption": "cap",
+        "creative_public_url": "https://cdn/1.jpg", "scheduled_for": None,
+        "blocked_reason": None, "pillar": "proof",
+    }
+    for key in ("draft_id", "day_key", "status", "platform", "caption",
+                "creative_public_url", "scheduled_for", "blocked_reason", "pillar"):
+        assert key in d
+
+
+def test_calendar_null_caption_and_image(monkeypatch):
+    rows = [_row("id-2", caption="", image_url="", pillar="")]
+    http = _FakeHTTP(get_resp=_Resp(200, rows))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+    d = body["drafts"][0]
+    assert d["caption"] is None
+    assert d["creative_public_url"] is None
+    assert d["pillar"] is None
+
+
+# ---- 2. month filter correctness ----------------------------------------------
+
+def test_calendar_month_filter_bounds(monkeypatch):
+    http = _FakeHTTP(get_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    portal_routes.handle_portal_calendar("lasso", "2026-08")
+    method, url, params, headers = http.calls[0]
+    assert method == "get"
+    assert url.endswith("/rest/v1/content_calendar")
+    assert params["gym_id"] == "eq.lasso"
+    # August has 31 days.
+    assert params["post_date"] == ["gte.2026-08-01", "lte.2026-08-31"]
+    assert params["order"] == "post_date"
+
+
+def test_calendar_month_filter_february(monkeypatch):
+    http = _FakeHTTP(get_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    portal_routes.handle_portal_calendar("lasso", "2026-02")
+    _, _, params, _ = http.calls[0]
+    assert params["post_date"] == ["gte.2026-02-01", "lte.2026-02-28"]
+
+
+# ---- 3. approve/deny/kill PATCH status with id+gym_id filter -------------------
+
+@pytest.mark.parametrize("action,expected_status", [
+    ("approve", "approved"),
+    ("deny", "denied"),
+    ("kill", "killed"),
+])
+def test_action_patches_status_with_isolation_filter(monkeypatch, action, expected_status):
+    pre = _Resp(200, [_row("id-9", gym_id="lasso")])
+    patched = _Resp(200, [_row("id-9", gym_id="lasso", status=expected_status)])
+    http = _FakeHTTP(get_resp=pre, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action(action, "lasso", "id-9", "actor-1")
+    assert status == 200
+    assert body == {"ok": True, "action": action, "draft_id": "id-9"}
+
+    # One GET (pre-check) then one PATCH; both scoped by gym_id.
+    get_call = [c for c in http.calls if c[0] == "get"][0]
+    patch_call = [c for c in http.calls if c[0] == "patch"][0]
+    assert get_call[2]["id"] == "eq.id-9"
+    assert get_call[2]["gym_id"] == "eq.lasso"
+    assert patch_call[2]["id"] == "eq.id-9"
+    assert patch_call[2]["gym_id"] == "eq.lasso", "isolation filter must be on the PATCH"
+    assert patch_call[4] == {"status": expected_status}
+
+
+def test_action_edit_keeps_pending_and_echoes_note(monkeypatch):
+    pre = _Resp(200, [_row("id-e", gym_id="lasso", status="pending")])
+    http = _FakeHTTP(get_resp=pre)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action(
+        "edit", "lasso", "id-e", "actor-1", note="please shorten")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["action"] == "edit"
+    assert body["note"] == "please shorten"
+    # edit issues NO write.
+    assert not [c for c in http.calls if c[0] == "patch"]
+
+
+# ---- 4. CROSS-GYM isolation: gym B row, gym A key -> 404, NO write -------------
+
+def test_cross_gym_action_returns_404_and_no_write(monkeypatch):
+    # Pre-check scoped to gym A returns nothing (the row is gym B's).
+    http = _FakeHTTP(get_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action("approve", "gymA", "id-of-gymB", "actor")
+    assert status == 404
+    assert body == {"ok": False, "error": "draft not found", "draft_id": "id-of-gymB"}
+    # Critical: no PATCH ever issued.
+    assert not [c for c in http.calls if c[0] == "patch"]
+
+
+def test_action_patch_zero_rows_returns_404(monkeypatch):
+    # Row passes the pre-check but the PATCH matches zero rows (e.g. a race):
+    # still a 404, never a false success.
+    pre = _Resp(200, [_row("id-x", gym_id="lasso")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action("approve", "lasso", "id-x", "actor")
+    assert status == 404
+    assert body["ok"] is False
+
+
+def test_action_patch_wrong_gym_in_response_returns_404(monkeypatch):
+    # Defensive: even if a PATCH somehow echoed a foreign gym_id, reject it.
+    pre = _Resp(200, [_row("id-x", gym_id="lasso")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=_Resp(200, [_row("id-x", gym_id="other")]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action("approve", "lasso", "id-x", "actor")
+    assert status == 404
+
+
+# ---- 5. report returns the null shape (no zeros) ------------------------------
+
+def test_report_null_shape(monkeypatch):
+    status, body = portal_routes.handle_portal_report("lasso", "14")
+    assert status == 200
+    assert body["account_key"] == "lasso"
+    assert body["window_days"] == 14
+    for key in ("posts_published", "engagement_rate", "likes", "comments",
+                "saves", "shares", "views", "reach", "follower_delta"):
+        assert body[key] is None, f"{key} must be null, never a fabricated 0"
+    assert body["health"] == {"label": None}
+    assert body["top_posts"] == []
+    assert isinstance(body["gaps"], list) and body["gaps"]
+
+
+def test_report_flag_off_returns_403(monkeypatch):
+    monkeypatch.delenv("AGENT_PORTAL_APPROVALS", raising=False)
+    status, body = portal_routes.handle_portal_report("lasso", "30")
+    assert status == 403
+
+
+# ---- 6. no creds -> SQLite path unchanged -------------------------------------
+
+def test_no_creds_uses_sqlite_path(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    assert config_supabase_disabled()
+
+    # If it tried Supabase it would need a client; instead it must hit the db
+    # path. Force the db.connect to prove the SQLite branch is taken.
+    hit = {"db": False}
+
+    class _FakeConn:
+        def __enter__(self):
+            hit["db"] = True
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            class _Cur:
+                def fetchall(self_inner):
+                    return []
+            return _Cur()
+
+    monkeypatch.setattr("agent.portal_routes._db.connect", lambda: _FakeConn())
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+    assert status == 200
+    assert hit["db"] is True, "SQLite path must run when creds absent"
+    assert body["drafts"] == []
+
+
+def test_no_creds_action_uses_portal_approvals(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    calls = []
+
+    def _fake_approve(account_key, draft_id, actor_id, store=None, **kw):
+        calls.append((account_key, draft_id, actor_id))
+        return {"ok": True, "action": "approve", "draft_id": draft_id}
+
+    monkeypatch.setattr("agent.portal_routes._pa.approve", _fake_approve)
+    status, body = portal_routes.handle_portal_action("approve", "lasso", "d1", "actor")
+    assert status == 200
+    assert calls == [("lasso", "d1", "actor")], "must delegate to portal_approvals when no creds"
+
+
+def config_supabase_disabled():
+    from agent import config
+    return not config.portal_calendar_supabase_enabled()
+
+
+# ---- secret hygiene -----------------------------------------------------------
+
+def test_service_key_never_in_error(monkeypatch):
+    # A 500 from Supabase must not leak the key even if the body echoes it.
+    err_text = "boom svc-key-secret boom"
+    http = _FakeHTTP(get_resp=_Resp(500, [], text=err_text))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_calendar("lasso", "2026-08")
+    assert status == 500
+    # The handler returns only the exception type name, never the detail text.
+    assert "svc-key-secret" not in str(body)

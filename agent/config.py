@@ -664,6 +664,32 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+# ---- Portal calendar data plane (Supabase content_calendar) ------------------
+# The live portal calendar reads/writes the SHARED Supabase content_calendar table
+# instead of the local, ephemeral SQLite drafts table. There is NO separate flag:
+# the PRESENCE of both creds is the switch. When either is absent, portal_routes
+# keeps its existing SQLite path unchanged (so every existing test stays green).
+# The service key is read lazily by NAME every call, never logged, never stored.
+def supabase_url() -> str:
+    """Supabase project REST base (e.g. https://<ref>.supabase.co). Empty when unset."""
+    return os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+
+
+def supabase_service_key() -> str:
+    """Supabase service role key, read lazily so a rotation needs no reimport.
+    Never logged, never printed, never returned in any card or report."""
+    return os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+
+def portal_calendar_supabase_enabled() -> bool:
+    """
+    Use the shared Supabase content_calendar as the portal data plane iff BOTH
+    SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set. No separate flag: creds
+    present = use Supabase; creds absent = the existing SQLite behavior, unchanged.
+    """
+    return bool(supabase_url()) and bool(supabase_service_key())
+
+
 # Zernio social-connect. The key was set in Railway as ZERNIO_API_KEY (no AGENT_ prefix), so we read
 # that exact name. The key's PRESENCE is the switch — no key means the endpoints are dark and return
 # a clean disabled response, so nothing accidentally calls a paid vendor without the credential.

@@ -991,7 +991,7 @@ def build_server(port=None):
             sub is one of: calendar, library, approve, edit, deny, kill."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_-]{8,})/"
-                r"(calendar|library|approve|edit|deny|kill"
+                r"(calendar|library|report|approve|edit|deny|kill"
                 r"|social-connect|social-status|facebook-pages|facebook-page-select)$",
                 self.path.split("?")[0],
             )
@@ -1057,7 +1057,7 @@ def build_server(port=None):
             # Portal token routes: /portal/<token>/calendar and /portal/<token>/library.
             # Token resolves to account_key; unknown/revoked token = 404 (indistinguishable).
             pt_token, pt_sub = self._portal_token_route()
-            if pt_token is not None and pt_sub in ("calendar", "library"):
+            if pt_token is not None and pt_sub in ("calendar", "library", "report"):
                 account_key = client_for_token(pt_token)
                 if account_key is None:
                     return self._deny(404)
@@ -1065,6 +1065,10 @@ def build_server(port=None):
                     from urllib.parse import urlparse, parse_qs
                     month = (parse_qs(urlparse(self.path).query).get("month") or [""])[0]
                     status, body = _pr.handle_portal_calendar(account_key, month)
+                elif pt_sub == "report":
+                    from urllib.parse import urlparse, parse_qs
+                    days = (parse_qs(urlparse(self.path).query).get("days") or ["30"])[0]
+                    status, body = _pr.handle_portal_report(account_key, days)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
                 return self._send_json(body, status)
