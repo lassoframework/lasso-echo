@@ -172,6 +172,63 @@ def test_cross_gym_rejected(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# test_ownership_backstop_rejects_foreign_draft
+# ---------------------------------------------------------------------------
+
+def test_ownership_backstop_rejects_foreign_draft(monkeypatch):
+    """Defense-in-depth backstop: even when the upstream _load_owned_draft guard
+    is bypassed (simulated here by handing portal_approvals a store that returns a
+    draft belonging to ANOTHER gym under the requested id), portal_approvals must
+    reject the action instead of mutating the foreign draft.
+
+    This mutation-proves the backstop: the actor IS a valid approver for the
+    passed account_key (gym_a), so the existing authority check PASSES. The only
+    thing standing between the caller and gym_b's draft is the ownership backstop.
+    Remove the `_owns_draft` check in portal_approvals and this test fails
+    (deny would succeed and flip draft_b to BLOCKED)."""
+    gym_a = _account("gym_a", approvers=["U_gym_a_owner"])
+    gym_b = _account("gym_b", approvers=["U_gym_b_owner"])
+    monkeypatch.setattr("agent.accounts.ACCOUNTS", [gym_a, gym_b])
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_ENABLED", "false")
+
+    # Store returns gym_b's draft when queried by id, simulating a regressed
+    # (non-account-scoped) load path leaking a foreign draft into portal_approvals.
+    draft_b = _draft(draft_id="draft-x", account_key="gym_b",
+                     status=DraftStatus.PENDING)
+    store = _make_store(draft_b)
+
+    from agent import portal_approvals
+
+    for fn_name, kwargs in [
+        ("approve", {}),
+        ("edit", {"note": "cross the fence"}),
+        ("deny", {"note": "cross the fence"}),
+        ("kill", {"confirmed": True}),
+    ]:
+        fn = getattr(portal_approvals, fn_name)
+        result = fn(
+            account_key="gym_a",          # caller's own (authorized) gym
+            draft_id="draft-x",
+            actor_id="U_gym_a_owner",     # authorized for gym_a -> authority check passes
+            store=store,
+            **kwargs,
+        )
+        assert result["ok"] is False, (
+            f"portal.{fn_name}: backstop should REJECT a foreign draft, got {result}"
+        )
+        # Same not-found shape as an unknown id: never confirm the other gym's draft exists.
+        assert "not found" in result["detail"].lower(), (
+            f"portal.{fn_name}: expected not-found detail (no cross-gym leak), "
+            f"got {result['detail']!r}"
+        )
+        # The foreign draft must be untouched.
+        assert draft_b.status == DraftStatus.PENDING, (
+            f"portal.{fn_name}: foreign draft was mutated to {draft_b.status}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # test_portal_flag_off_returns_error
 # ---------------------------------------------------------------------------
 

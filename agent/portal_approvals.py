@@ -58,6 +58,17 @@ def _result(ok, action, draft_id, detail):
     return {"ok": ok, "action": action, "draft_id": draft_id, "detail": detail}
 
 
+def _owns_draft(draft, account_key):
+    """Defense-in-depth cross-gym ownership backstop. The draft is loaded via
+    _load_draft (store.get is NOT account-scoped), and authority is checked
+    against the CALLER's own account_key, so a regression in the upstream
+    _load_owned_draft guard would otherwise let gym A act on gym B's draft.
+    This is a SECOND, independent gate: the loaded draft must belong to the
+    passed account_key. Callers reject with the same not-found result shape,
+    so a cross-gym id never confirms the other gym's draft exists."""
+    return (getattr(draft, "account_key", None) or "") == account_key
+
+
 def approve(account_key, draft_id, actor_id, store=None, **kwargs):
     """Approve a draft for this gym. Actor must be authorized for account_key."""
     if not _gate_open():
@@ -70,6 +81,10 @@ def approve(account_key, draft_id, actor_id, store=None, **kwargs):
                        f"Denied: {actor_id} is not authorized for {account_key}.")
     draft = _load_draft(account_key, draft_id, store=store)
     if draft is None:
+        return _result(False, "approve", draft_id,
+                       f"Draft {draft_id} not found for account {account_key}.")
+    if not _owns_draft(draft, account_key):
+        # Cross-gym backstop: same not-found shape, never confirm it exists elsewhere.
         return _result(False, "approve", draft_id,
                        f"Draft {draft_id} not found for account {account_key}.")
     result = handle_action("approve", draft, actor_id, account=account, **kwargs)
@@ -90,6 +105,10 @@ def edit(account_key, draft_id, actor_id, note="", store=None, **kwargs):
     if draft is None:
         return _result(False, "edit", draft_id,
                        f"Draft {draft_id} not found for account {account_key}.")
+    if not _owns_draft(draft, account_key):
+        # Cross-gym backstop: same not-found shape, never confirm it exists elsewhere.
+        return _result(False, "edit", draft_id,
+                       f"Draft {draft_id} not found for account {account_key}.")
     result = handle_action("edit", draft, actor_id, note=note, account=account, **kwargs)
     return _result(result.ok, result.action, result.draft_id, result.detail)
 
@@ -106,6 +125,10 @@ def deny(account_key, draft_id, actor_id, note="", store=None, **kwargs):
                        f"Denied: {actor_id} is not authorized for {account_key}.")
     draft = _load_draft(account_key, draft_id, store=store)
     if draft is None:
+        return _result(False, "deny", draft_id,
+                       f"Draft {draft_id} not found for account {account_key}.")
+    if not _owns_draft(draft, account_key):
+        # Cross-gym backstop: same not-found shape, never confirm it exists elsewhere.
         return _result(False, "deny", draft_id,
                        f"Draft {draft_id} not found for account {account_key}.")
     result = handle_action("deny", draft, actor_id, note=note, account=account, **kwargs)
@@ -125,6 +148,10 @@ def kill(account_key, draft_id, actor_id, confirmed=False, store=None, **kwargs)
                        f"Denied: {actor_id} is not authorized for {account_key}.")
     draft = _load_draft(account_key, draft_id, store=store)
     if draft is None:
+        return _result(False, "kill", draft_id,
+                       f"Draft {draft_id} not found for account {account_key}.")
+    if not _owns_draft(draft, account_key):
+        # Cross-gym backstop: same not-found shape, never confirm it exists elsewhere.
         return _result(False, "kill", draft_id,
                        f"Draft {draft_id} not found for account {account_key}.")
     result = handle_action("kill", draft, actor_id, account=account,
