@@ -156,6 +156,15 @@ def connect(path=None):
             conn.execute("ALTER TABLE gyms ADD COLUMN baseline_captured_at TEXT")
         except Exception:
             pass
+    # additive gyms migration (Part B): the gym's Stripe customer id, used to check
+    # whether the gym's SOCIAL product subscription is ACTIVE before the portal
+    # serves a live calendar. Set by hand / by onboarding; existing rows stay null
+    # (a null customer id reads as not-active, fail closed). Never a token or secret.
+    if "stripe_customer_id" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN stripe_customer_id TEXT")
+        except Exception:
+            pass
     return conn
 
 
@@ -360,6 +369,7 @@ def gym_upsert(account_key, display_name='', **fields):
         'publish_creds', 'publish_creds_status',
         'zernio_profile_id', 'zernio_default_fb_page_id',
         'baseline_posts_per_week', 'baseline_captured_at',
+        'stripe_customer_id',
     }
     extra_cols = []
     extra_vals = []
