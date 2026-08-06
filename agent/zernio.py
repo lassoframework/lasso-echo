@@ -14,7 +14,7 @@ Field renames Echo owns (portal contract never changes): Zernio `authUrl`->`oaut
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import config
 
@@ -110,6 +110,74 @@ class ZernioClient:
     def list_facebook_pages(self, account_id):
         """GET /v1/accounts/{id}/facebook-page -> {pages:[{_id,name}]}."""
         return self._get(f"/v1/accounts/{account_id}/facebook-page")
+
+    def analytics(self, profile_id, skip=0, limit=50):
+        """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
+
+        Shape (probed live): {hasAnalyticsAccess, overview, accounts:[...], posts:[...],
+        pagination}. `posts` is a page of up to `limit` (newest first); pass `skip` to page.
+        """
+        params = {"profileId": profile_id, "skip": int(skip), "limit": int(limit)}
+        return self._get("/v1/analytics", params)
+
+    def analytics_window(self, profile_id, days, page_limit=50, max_pages=20):
+        """Fetch ONE merged analytics JSON whose `posts` cover the last `days`.
+
+        Pages through `posts` (newest first) accumulating until a page's OLDEST post is
+        already before the window start, or `pagination.total` is reached, or a page comes
+        back empty, or `max_pages` is hit (defensive cap; flagged as `_pages_capped`). The
+        first page's top-level fields (hasAnalyticsAccess, overview, accounts, pagination)
+        are kept as is; only `posts` accumulate. Read-only: no writes ever issued.
+
+        A post with no parseable publishedAt is KEPT (never dropped by the pager) so the
+        pure mapper's in-window filter is the single place inclusion is decided.
+        """
+        cutoff = None
+        if isinstance(days, (int, float)) and days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=float(days))
+
+        first = self.analytics(profile_id, skip=0, limit=page_limit) or {}
+        merged = dict(first)
+        posts = list(first.get("posts") or [])
+        pagination = first.get("pagination") or {}
+        pages_capped = False
+
+        def _page_oldest(page_posts):
+            oldest = None
+            for p in page_posts:
+                if not isinstance(p, dict):
+                    continue
+                ts = _parse_iso(p.get("publishedAt"))
+                if ts is not None and (oldest is None or ts < oldest):
+                    oldest = ts
+            return oldest
+
+        last_posts = posts
+        page = 1
+        while True:
+            # Stop once the newest-first stream has crossed the window boundary.
+            if cutoff is not None:
+                oldest = _page_oldest(last_posts)
+                if oldest is not None and oldest < cutoff:
+                    break
+            total = pagination.get("total")
+            if not isinstance(total, (int, float)) or len(posts) >= int(total):
+                break
+            if page >= max_pages:
+                pages_capped = True
+                break
+            nxt = self.analytics(profile_id, skip=len(posts), limit=page_limit) or {}
+            more = list(nxt.get("posts") or [])
+            if not more:
+                break
+            posts.extend(more)
+            last_posts = more
+            pagination = nxt.get("pagination") or pagination
+            page += 1
+
+        merged["posts"] = posts
+        merged["_pages_capped"] = pages_capped
+        return merged
 
     # ---- writes (provisioning) ---------------------------------------------
     def create_profile(self, name):

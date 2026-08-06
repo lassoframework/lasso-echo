@@ -677,13 +677,51 @@ def _metrics_shape(account_key, days):
     }
 
 
-def handle_metrics(account_key, days=30, reader=None):
-    """GET /portal/<token>/metrics?days=N. Returns the Part D report SHAPE for THIS
-    gym with values null / empty (the Zernio analytics pull is Part C; Part D fills
-    the numbers). Documented shape lives in _metrics_shape.
+def _live_metrics(account_key, days, zclient):
+    """Try a LIVE Zernio analytics pull for this gym, folded into the metrics SHAPE.
+
+    Returns the real payload when the gym resolves to a Zernio profile AND that profile
+    holds the analytics add-on (hasAnalyticsAccess). Returns None (so the caller falls
+    back to the honest null shape) when the profile can't be resolved, Zernio errors, or
+    the add-on is off. NEVER raises: a Zernio failure must never 500 this endpoint.
+
+    Read-only: only ZernioClient.analytics_window is called (a GET). No writes, no
+    publish. The Zernio key stays inside the client and is never logged here."""
+    from . import zernio as _z
+    from . import zernio_routes as _zr
+    from . import zernio_analytics as _za
+
+    try:
+        client = zclient if zclient is not None else _z.ZernioClient()
+        pid = _zr._resolve_profile_id(account_key) or client.find_profile_id(account_key)
+        if not pid:
+            return None
+        analytics_json = client.analytics_window(pid, days)
+        if not (analytics_json or {}).get("hasAnalyticsAccess"):
+            return None
+        baseline_ppw, baseline_at = _db.get_baseline_posts_per_week(account_key)
+        payload = _za.map_metrics(analytics_json, days, baseline_ppw, baseline_at,
+                                  account_key=account_key)
+        # Overlay the flags the pure mapper leaves to the caller (report flag; gaps note
+        # only when analytics is unavailable, which it is not on this real path).
+        payload["report_available"] = config.monthly_report_enabled()
+        payload["gaps"] = []
+        return payload
+    except Exception:
+        return None  # fail to the honest null shape, never a 500 and never a fake number
+
+
+def handle_metrics(account_key, days=30, reader=None, zclient=None):
+    """GET /portal/<token>/metrics?days=N. Returns the Part D report SHAPE for THIS gym.
+
+    When AGENT_ZERNIO_ANALYTICS_ENABLED is ON and the gym's Zernio profile holds the
+    analytics add-on, the shape carries REAL Zernio numbers (per _live_metrics +
+    zernio_analytics.map_metrics). Otherwise every value stays null / empty (a GAP,
+    never a fabricated 0). The Zernio client is injectable (zclient) so tests run offline.
 
     Gates: flag OFF -> disabled; Stripe social product not ACTIVE -> 402; TOKEN
-    ISOLATION -> the baseline read and the whole payload are keyed to account_key."""
+    ISOLATION -> the baseline read, the profile resolution, and the whole payload are
+    keyed to account_key. A Zernio error can never 500 this route (it falls to null)."""
     if not config.portal_social_enabled():
         return _disabled("metrics")
     if not account_key:
@@ -698,4 +736,10 @@ def handle_metrics(account_key, days=30, reader=None):
         return 402, {"account_key": account_key, "active": False,
                      "window_days": days, "posts": [], "totals": {}, "audience": {},
                      "frequency": {}, "gaps": ["Social plan is not active."]}
+
+    if config.zernio_analytics_enabled():
+        live = _live_metrics(account_key, days, zclient)
+        if live is not None:
+            return 200, live
+
     return 200, _metrics_shape(account_key, days)
