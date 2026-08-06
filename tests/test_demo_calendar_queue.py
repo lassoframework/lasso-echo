@@ -4,7 +4,8 @@ Demo calendar queue tests. Offline (no network, no R2). Mirrors test_welcome_que
 Asserts: the runner hooks are inert while AGENT_DEMO_CALENDAR_ENABLED is OFF; on a demo
 date they produce a PENDING feed draft with the correct verbatim caption + hosted URL,
 cross-posted to BOTH lasso accounts as the SAME served item; a non-demo date is None; a
-non-LASSO account is None; the story fires only when this run's feed was a demo feed
+non-LASSO account is None; TWO POSTS PER DAY: every demo day is is_story so a paired story
+fires on lasso_ig for every demo feed day, but only when this run's feed was a demo feed
 draft AND a story URL exists, and never when the feed was another queue's post; a missing
 manifest is a no-op that never raises; create_from_manifest is idempotent by day_key; and
 every hook + body substring in the copy bank exists in an approved source (no fabrication).
@@ -24,9 +25,10 @@ from agent.accounts import Account, Platform  # noqa: E402
 
 _DASH = re.compile(r"[‐-―−\-]")  # em/en/figure dashes + hyphen-minus
 
-# a real demo date + its post (post 1, an All in one offer feed day) and a proof/story day
-_FEED_DAY = "2026-08-06"     # post 1, is_story False
-_STORY_DAY = "2026-08-10"    # post 5, is_story True
+# two real demo dates. Every demo day is now is_story (2 posts/day), so both dates pair a
+# story; post 1 (All in one offer) and post 5 (Proof) exercise different pillars.
+_FEED_DAY = "2026-08-06"     # post 1, All in one offer, is_story True
+_STORY_DAY = "2026-08-10"    # post 5, Proof, is_story True
 _NON_DEMO_DAY = "2026-07-01"
 
 
@@ -85,6 +87,12 @@ def test_thirty_posts_dates_unique_and_ordered():
     assert len(dcq.DEMO_POSTS) == 30
     assert len(set(dates)) == 30
     assert dates == sorted(dates)
+
+
+def test_every_demo_day_carries_a_story():
+    """Two posts per day: every one of the 30 days is is_story so it pairs a story."""
+    assert all(p["is_story"] for p in dcq.DEMO_POSTS)
+    assert sum(1 for p in dcq.DEMO_POSTS if p["is_story"]) == 30
 
 
 # ---- runner hooks: flag gating ---------------------------------------------------------
@@ -152,11 +160,30 @@ def test_story_refuses_when_feed_was_not_a_demo(armed, monkeypatch, tmp_path):
     assert dcq.build_demo_calendar_story_draft(_ig(), _STORY_DAY, feed_draft=_D()) is None
 
 
-def test_story_none_on_a_non_story_day(armed, monkeypatch, tmp_path):
+def test_every_demo_feed_day_pairs_a_story(armed, monkeypatch, tmp_path):
+    """Two posts per day: EVERY demo feed day (not just Proof days) now pairs a story on
+    lasso_ig. Exercise a non-Proof day (post 1) to prove the story is no longer gated to
+    a subset of days."""
     _seed_manifest(monkeypatch, tmp_path)
-    feed = dcq.build_demo_calendar_draft(_ig(), _FEED_DAY)  # post 1 has no story
-    assert feed is not None
-    assert dcq.build_demo_calendar_story_draft(_ig(), _FEED_DAY, feed_draft=feed) is None
+    feed = dcq.build_demo_calendar_draft(_ig(), _FEED_DAY)  # post 1, All in one offer
+    assert feed is not None and feed.draft_id.startswith("demof_")
+    story = dcq.build_demo_calendar_story_draft(_ig(), _FEED_DAY, feed_draft=feed)
+    assert story is not None
+    assert story.is_story and story.draft_type == "story"
+    assert story.creative_public_url.endswith("_story.png")
+
+
+def test_all_thirty_days_fire_feed_and_story(armed, monkeypatch, tmp_path):
+    """End to end: every one of the 30 dated days serves BOTH a feed draft on both LASSO
+    accounts AND a paired story draft on lasso_ig = two posts per day."""
+    _seed_manifest(monkeypatch, tmp_path)
+    for post in dcq.DEMO_POSTS:
+        day = post["date"]
+        ig_feed = dcq.build_demo_calendar_draft(_ig(), day)
+        fb_feed = dcq.build_demo_calendar_draft(_fb(), day)
+        assert ig_feed is not None and fb_feed is not None, f"no feed on {day}"
+        story = dcq.build_demo_calendar_story_draft(_ig(), day, feed_draft=ig_feed)
+        assert story is not None and story.is_story, f"no story on {day}"
 
 
 def test_story_ignores_non_story_account(armed, monkeypatch, tmp_path):

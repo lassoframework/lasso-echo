@@ -15,6 +15,10 @@ Mirrors two proven patterns:
     BOTH lasso_ig + lasso_fb exactly once across the fan-out, and its story on lasso_ig
     is coupled to that day's feed.
 
+TWO POSTS PER DAY (Blake ruling): every one of the 30 days serves BOTH a feed post AND
+a paired 9:16 story on lasso_ig (2 posts/day). Every DEMO_POSTS entry carries is_story,
+so a story fires on every demo feed day, coupled to that day's feed draft.
+
 Hard rules (unchanged):
   * Behind AGENT_DEMO_CALENDAR_ENABLED, default OFF. OFF -> every runner hook returns
     None: byte-for-byte current behavior. Isolated from the book / welcome / summit
@@ -63,30 +67,31 @@ HASHTAGS = ["#LASSOFramework", "#GymMarketingMadeSimple", "#GymOwner",
 # All in one offer / Sales are now / We do the heavy lifting / The portal / Proof.
 # hook + body are verbatim from the cited approved source; cta is one of the approved
 # lasso_now CTAs (lines 86 to 90), cycled in order. filename -> the rendered card.
-# is_story marks the Proof days that also get a 9:16 story on lasso_ig.
+# is_story is True on EVERY day: every demo feed day is paired with a 9:16 story on
+# lasso_ig, so the calendar serves two posts per day (feed + story).
 DEMO_POSTS = [
     {"num": 1, "date": "2026-08-06", "pillar": "All in one offer",
-     "filename": "demo_01_all_in_one.png", "is_story": False,
+     "filename": "demo_01_all_in_one.png", "is_story": True,
      "hook": "The 5 tools running your gym should be one.",
      "body": ("Ads, lead nurture, your website, your social, and your reporting. "
               "LASSO puts it all in one place, done for you, so you stop duct taping "
               "tools together."),
      "cta": "Save this for later."},
     {"num": 2, "date": "2026-08-07", "pillar": "Sales are now",
-     "filename": "demo_02_sales_now.png", "is_story": False,
+     "filename": "demo_02_sales_now.png", "is_story": True,
      "hook": "You did not open a gym to run ads at 11pm.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 3, "date": "2026-08-08", "pillar": "We do the heavy lifting",
-     "filename": "demo_03_heavy_lifting.png", "is_story": False,
+     "filename": "demo_03_heavy_lifting.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 4, "date": "2026-08-09", "pillar": "The portal",
-     "filename": "demo_04_portal.png", "is_story": False,
+     "filename": "demo_04_portal.png", "is_story": True,
      "hook": "Every lead, every post, every result. One screen.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -98,26 +103,26 @@ DEMO_POSTS = [
               "guesswork and no bait and switch. Just the system, run for you."),
      "cta": "Take the 2 minute quiz."},
     {"num": 6, "date": "2026-08-11", "pillar": "All in one offer",
-     "filename": "demo_06_six_engines.png", "is_story": False,
+     "filename": "demo_06_six_engines.png", "is_story": True,
      "hook": "Six engines. One job: your MRR.",
      "body": ("Paid ads, Google, AI nurture plus live bookers, a website built to book, "
               "done for you social, and the LASSO Portal. One login."),
      "cta": "Save this for later."},
     {"num": 7, "date": "2026-08-12", "pillar": "Sales are now",
-     "filename": "demo_07_we_chase.png", "is_story": False,
+     "filename": "demo_07_we_chase.png", "is_story": True,
      "hook": "We chase. You close.",
      "body": ("Leads do not die in your ads. They die in the handoffs. More leads never "
               "fix a broken sales conversation."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 8, "date": "2026-08-13", "pillar": "We do the heavy lifting",
-     "filename": "demo_08_heavy_lifting_b.png", "is_story": False,
+     "filename": "demo_08_heavy_lifting_b.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 9, "date": "2026-08-14", "pillar": "The portal",
-     "filename": "demo_09_cockpit.png", "is_story": False,
+     "filename": "demo_09_cockpit.png", "is_story": True,
      "hook": "Agencies send reports. LASSO hands you the cockpit.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -129,27 +134,27 @@ DEMO_POSTS = [
               "different outcomes."),
      "cta": "Take the 2 minute quiz."},
     {"num": 11, "date": "2026-08-16", "pillar": "All in one offer",
-     "filename": "demo_11_all_in_one_b.png", "is_story": False,
+     "filename": "demo_11_all_in_one_b.png", "is_story": True,
      "hook": "The 5 tools running your gym should be one.",
      "body": ("Ads, lead nurture, your website, your social, and your reporting. "
               "LASSO puts it all in one place, done for you, so you stop duct taping "
               "tools together."),
      "cta": "Save this for later."},
     {"num": 12, "date": "2026-08-17", "pillar": "Sales are now",
-     "filename": "demo_12_signing_up.png", "is_story": False,
+     "filename": "demo_12_signing_up.png", "is_story": True,
      "hook": "Your only job is signing people up.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 13, "date": "2026-08-18", "pillar": "We do the heavy lifting",
-     "filename": "demo_13_plan_draft_track.png", "is_story": False,
+     "filename": "demo_13_plan_draft_track.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 14, "date": "2026-08-19", "pillar": "The portal",
-     "filename": "demo_14_one_screen_b.png", "is_story": False,
+     "filename": "demo_14_one_screen_b.png", "is_story": True,
      "hook": "Every lead, every post, every result. One screen.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -160,26 +165,26 @@ DEMO_POSTS = [
      "body": "More than $35K in wasted ad spend saved; $17K flagged in one cycle.",
      "cta": "Take the 2 minute quiz."},
     {"num": 16, "date": "2026-08-21", "pillar": "All in one offer",
-     "filename": "demo_16_six_engines_b.png", "is_story": False,
+     "filename": "demo_16_six_engines_b.png", "is_story": True,
      "hook": "Six engines. One job: your MRR.",
      "body": ("Paid ads, Google, AI nurture plus live bookers, a website built to book, "
               "done for you social, and the LASSO Portal. One login."),
      "cta": "Save this for later."},
     {"num": 17, "date": "2026-08-22", "pillar": "Sales are now",
-     "filename": "demo_17_11pm_b.png", "is_story": False,
+     "filename": "demo_17_11pm_b.png", "is_story": True,
      "hook": "You did not open a gym to run ads at 11pm.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 18, "date": "2026-08-23", "pillar": "We do the heavy lifting",
-     "filename": "demo_18_human_approves.png", "is_story": False,
+     "filename": "demo_18_human_approves.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 19, "date": "2026-08-24", "pillar": "The portal",
-     "filename": "demo_19_cockpit_b.png", "is_story": False,
+     "filename": "demo_19_cockpit_b.png", "is_story": True,
      "hook": "Agencies send reports. LASSO hands you the cockpit.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -190,27 +195,27 @@ DEMO_POSTS = [
      "body": "Average client value up from $99 to $167 at the same time.",
      "cta": "Take the 2 minute quiz."},
     {"num": 21, "date": "2026-08-26", "pillar": "All in one offer",
-     "filename": "demo_21_all_in_one_c.png", "is_story": False,
+     "filename": "demo_21_all_in_one_c.png", "is_story": True,
      "hook": "The 5 tools running your gym should be one.",
      "body": ("Ads, lead nurture, your website, your social, and your reporting. "
               "LASSO puts it all in one place, done for you, so you stop duct taping "
               "tools together."),
      "cta": "Save this for later."},
     {"num": 22, "date": "2026-08-27", "pillar": "Sales are now",
-     "filename": "demo_22_we_chase_b.png", "is_story": False,
+     "filename": "demo_22_we_chase_b.png", "is_story": True,
      "hook": "We chase. You close.",
      "body": ("Leads do not die in your ads. They die in the handoffs. More leads never "
               "fix a broken sales conversation."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 23, "date": "2026-08-28", "pillar": "We do the heavy lifting",
-     "filename": "demo_23_plan_grid.png", "is_story": False,
+     "filename": "demo_23_plan_grid.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 24, "date": "2026-08-29", "pillar": "The portal",
-     "filename": "demo_24_one_screen_c.png", "is_story": False,
+     "filename": "demo_24_one_screen_c.png", "is_story": True,
      "hook": "Every lead, every post, every result. One screen.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -222,26 +227,26 @@ DEMO_POSTS = [
               "included."),
      "cta": "Take the 2 minute quiz."},
     {"num": 26, "date": "2026-08-31", "pillar": "All in one offer",
-     "filename": "demo_26_six_engines_c.png", "is_story": False,
+     "filename": "demo_26_six_engines_c.png", "is_story": True,
      "hook": "Six engines. One job: your MRR.",
      "body": ("Paid ads, Google, AI nurture plus live bookers, a website built to book, "
               "done for you social, and the LASSO Portal. One login."),
      "cta": "Save this for later."},
     {"num": 27, "date": "2026-09-01", "pillar": "Sales are now",
-     "filename": "demo_27_signing_up_b.png", "is_story": False,
+     "filename": "demo_27_signing_up_b.png", "is_story": True,
      "hook": "Your only job is signing people up.",
      "body": ("The job is closing members, not building funnels. We get the leads and "
               "nurture them. You do the one thing only you can do: sell."),
      "cta": "Send this to a gym owner who needs it."},
     {"num": 28, "date": "2026-09-02", "pillar": "We do the heavy lifting",
-     "filename": "demo_28_plan_draft_track_b.png", "is_story": False,
+     "filename": "demo_28_plan_draft_track_b.png", "is_story": True,
      "hook": "We run your social media for you.",
      "body": ("We plan the month, draft every post, and track what is working. A human "
               "approves every post before it goes live. You get the results without "
               "doing the work."),
      "cta": "Tag a gym owner who needs this."},
     {"num": 29, "date": "2026-09-03", "pillar": "The portal",
-     "filename": "demo_29_cockpit_c.png", "is_story": False,
+     "filename": "demo_29_cockpit_c.png", "is_story": True,
      "hook": "Agencies send reports. LASSO hands you the cockpit.",
      "body": ("Your leads, your content, and your reporting live in one place. One login "
               "runs your whole growth engine."),
@@ -314,7 +319,7 @@ def _save_manifest(data):
 
 
 def upload_images(images_dir):
-    """Host each rendered card (feed + the 6 story files) to R2 and record the URLs in
+    """Host each rendered card (all 30 feed + all 30 story files) to R2 and record the URLs in
     demo_calendar_manifest.json, keyed by filename. Requires AGENT_HOSTING_ENABLED.
     Safe to re-run; already-uploaded files are skipped and content-addressed dedupe in
     media_host means the same asset is never stored twice."""
