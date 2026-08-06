@@ -204,3 +204,38 @@ def test_portal_endpoint_flag_off_returns_403(monkeypatch):
     status_code, body = intake_web.handle_portal_gym_status("anygym")
     assert status_code == 403
     assert "disabled" in body["error"]
+
+
+# ---- 5. Route regex accepts SIGNED (dotted) tokens -----------------------------
+# Regression for the 404 that hid every minted token: a signed token is
+# base64url(account).signature, so it contains a '.'. If _portal_token_route's
+# char class excludes the dot, the path never matches and the request 404s BEFORE
+# client_for_token runs — so calendar/report/social-status/approve/kill are all
+# dead for onboarded gyms while only legacy dotless env tokens work. Drives the
+# real handler method, not a copy of the pattern.
+
+def _make_portal_handler():
+    """The real request handler class, reached via the build_server() factory.
+    We bind port 0 (never serve) and read RequestHandlerClass off the server."""
+    server = intake_web.build_server(0)
+    try:
+        return server.RequestHandlerClass
+    finally:
+        server.server_close()
+
+
+def test_portal_token_route_accepts_signed_dotted_token():
+    signed = "Y3Jvc3NmaXRuZXd0b3du.wU6hFMgriJWdA0W8g5zm-k1bMiY"  # base64url(acct).sig
+    dotless = "a" * 43  # legacy env token
+    Handler = _make_portal_handler()
+    assert Handler is not None, "portal request handler not found on intake_web"
+    inst = Handler.__new__(Handler)  # skip __init__: it wants a live socket
+    for sub in ("calendar", "report", "social-status", "social-connect",
+                "facebook-pages", "approve", "edit", "deny", "kill"):
+        inst.path = f"/portal/{signed}/{sub}"
+        tok, got = inst._portal_token_route()
+        assert tok == signed and got == sub, f"signed token dropped for {sub}: {tok!r},{got!r}"
+    # legacy dotless tokens must still route
+    inst.path = f"/portal/{dotless}/social-status"
+    tok, got = inst._portal_token_route()
+    assert tok == dotless and got == "social-status"

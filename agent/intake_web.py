@@ -988,9 +988,14 @@ def build_server(port=None):
 
         def _portal_token_route(self):
             """Returns (token, sub) for /portal/<token>/<sub> routes, else (None, None).
-            sub is one of: calendar, library, approve, edit, deny, kill."""
+            sub is one of: calendar, library, approve, edit, deny, kill.
+
+            The token class allows '.' because SIGNED (minted) tokens are
+            base64url(account).signature — the dot is the separator. Legacy
+            per-gym env tokens are dotless and still match. Without the dot
+            every minted token 404s here before client_for_token is reached."""
             m = re.match(
-                r"^/portal/([A-Za-z0-9_-]{8,})/"
+                r"^/portal/([A-Za-z0-9_.-]{8,})/"
                 r"(calendar|library|report|approve|edit|deny|kill"
                 r"|social-connect|social-status|facebook-pages|facebook-page-select)$",
                 self.path.split("?")[0],
