@@ -6,7 +6,50 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-05
+Last updated: 2026-08-06
+
+---
+
+## Portal go-live: intake upload-URL fix + encrypted portal tokens written (2026-08-06, SHA 587177b)
+
+Executed the portal go-live handoff so the client Social Media page turns on.
+
+### [x] Step 1 — intake upload-URL domain fixed (SHA 587177b, merged to main)
+Root cause was NOT code: `AGENT_UPLOAD_BASE_URL` on the `echo-intake-web` Railway
+service held the literal setup placeholder `<paste the Step 7 domain here>`, so
+portal intake returned `upload_url = "<paste ...>/u/<token>"`. Corrected the env
+var to `https://echo-intake-web-production.up.railway.app` (redeploy confirmed
+live) AND hardened the code: new `intake_web._upload_base_url()` treats a blank,
+placeholder (`<`/`paste`), or non-http value as unset and falls back to the
+canonical service origin, so a forgotten env var can never leak a broken link
+again. Routed link_for / handle_portal_intake / handle_portal_gym_status through
+it. Live in-container submit now returns
+`upload_url = https://echo-intake-web-production.up.railway.app/u/<token>`, no
+placeholder. Full suite green (1984). +3 tests.
+
+### [x] Step 4 — encrypted portal tokens written (portal Supabase ooqcvmcjspeltuuhcvlh)
+`echo_intake_tokens` had 2 rows with `intake_token_encrypted` NULL. On the
+echo-intake-web container, Fernet-encrypted each gym's raw token with the shared
+`AGENT_INTAKE_ENC_KEY` (round-trip verified True in-container) and wrote the
+ciphertext to Supabase: gym_id 31a41f5f… (lasso) and 2459ca79… (districth), both
+now non-null (len 140, `gAAAAAB…`). VERIFIED end-to-end: decrypt stored blob ->
+raw token -> `GET {base}/portal/<token>/social-status` returns HTTP 200 with real
+JSON (ig/fb connected:false, nothing fabricated) for BOTH gyms. The portal Social
+Media page now resolves.
+
+### [x] Step 5 — LASSO Zernio connect links generated (dogfood; OAuth needs Blake)
+Live `GET {base}/portal/<lasso_token>/social-connect?platform=…` returns HTTP 200
+with real Meta OAuth URLs via Zernio for both instagram and facebook. Links +
+by-hand OAuth steps handed to Blake. After Blake connects, "plan a month" for the
+connected account lights up the calendar + Approve/Deny/Kill.
+
+### [ ] Step 2 — report endpoint: BLOCKED (branch does not exist)
+`feat/portal-report-endpoint @89e70ad` was not pushed — absent locally, on origin,
+and the SHA is not a valid object. No `/portal/<token>/report` route exists in
+main. Cannot review/merge a nonexistent branch. Not built fresh here: it would
+call `_pr`/`day30.assemble` and touch the do_GET dispatcher that Part B is
+actively editing in portal_routes.py — building now risks clobbering in-flight
+work. Awaiting the real branch (or Blake's OK to build it fresh after Part B lands).
 
 ---
 
