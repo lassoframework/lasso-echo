@@ -32,6 +32,7 @@ directory listing (only /u/<token> and /intake/<token> exist; every other path
 """
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -592,6 +593,96 @@ def handle_portal_gym_status(account_key, r2=None):
         "upload_count": upload_count,
         "intake_status": token_status_val,
     }
+
+
+# Account keys are lowercase slugs: the env-suffix convention (mint() lowercases
+# before signing) and the same charset onboard.run() writes files under.
+_ONBOARD_KEY_RE = re.compile(r"^[a-z0-9]+$")
+
+
+def handle_portal_onboard(body):
+    """
+    The LASSO portal's self-serve onboard call, pure and offline-testable.
+    Auth and the AGENT_PORTAL_APPROVALS gate are enforced by the caller (do_POST)
+    BEFORE this runs. Returns (status_code, response_dict).
+
+    Request body (already-parsed JSON):
+      account_key   - lowercase [a-z0-9] slug (rejected otherwise -> 400)
+      display_name  - required, non-empty gym name
+
+    On success returns 200 with:
+      account_key  - the slug
+      raw_token    - the signed intake token (the portal encrypts + stores it)
+      publish_off  - always True (publishing is OFF for every new gym)
+      onboarded    - always True
+
+    IDEMPOTENT: mint() is deterministic (HMAC-SHA256 of the lowercased key under the
+    shared signing secret), so onboarding an already-onboarded gym returns the SAME
+    live token, never rotating it and never erroring. onboard.run() itself is
+    idempotent (it skips existing files and never re-randomizes).
+
+    The raw token is NEVER logged. On any onboard failure a generic 500 is returned
+    with no token and no secret detail.
+    """
+    if not isinstance(body, dict):
+        return 400, {"error": "invalid body"}
+    account_key = str(body.get("account_key", "")).strip()
+    display_name = str(body.get("display_name", "")).strip()
+    if not account_key or not _ONBOARD_KEY_RE.match(account_key):
+        return 400, {"error": "invalid account_key: must be a lowercase [a-z0-9] slug"}
+    if not display_name:
+        return 400, {"error": "display_name is required"}
+
+    # Force automint FOR THIS CALL ONLY so a token is minted the same way the CLI
+    # does when AGENT_ONBOARD_AUTOMINT is armed. The signing secret must exist for
+    # a real token; onboard.run() mints deterministically when it does. We restore
+    # the prior env value afterward so we never leave the flag flipped globally.
+    from . import onboard as _onboard
+    _AUTOMINT = "AGENT_ONBOARD_AUTOMINT"
+    _prev = os.environ.get(_AUTOMINT)
+    os.environ[_AUTOMINT] = "true"
+    try:
+        result = _onboard.run(account_key, display_name, base_url=_upload_base_url())
+    except Exception as exc:
+        # Generic failure: no token, no secret, no internals leaked to the portal.
+        print(f"[portal] onboard failed for {account_key}: {type(exc).__name__}")
+        return 500, {"error": "onboard failed"}
+    finally:
+        if _prev is None:
+            os.environ.pop(_AUTOMINT, None)
+        else:
+            os.environ[_AUTOMINT] = _prev
+
+    # onboard.run sets token_minted to the raw token on a fresh mint, False on an
+    # idempotent re-run (DB-backed mode), or None when minting was skipped. Since
+    # mint() is deterministic, we ALWAYS recover the current live token from the
+    # key so an idempotent re-run returns the same valid token, never nothing.
+    raw_token = result.get("token_minted")
+    if not isinstance(raw_token, str) or not raw_token:
+        raw_token = _current_token_for(account_key)
+    if not raw_token:
+        # No signing secret configured: onboarding cannot mint a link.
+        print(f"[portal] onboard for {account_key}: no signing secret, token unavailable")
+        return 500, {"error": "onboard failed"}
+
+    return 200, {
+        "account_key": account_key,
+        "raw_token": raw_token,
+        "publish_off": True,
+        "onboarded": True,
+    }
+
+
+def _current_token_for(account_key):
+    """The gym's CURRENT valid signed token, recomputed from the shared secret, or
+    None when no secret is configured. Deterministic: same token every call, so an
+    already-onboarded gym gets its live token back without rotation. Never logged."""
+    try:
+        if not intake_tokens.secret_present():
+            return None
+        return intake_tokens.mint(account_key)
+    except Exception:
+        return None
 
 
 def _is_socialapi_account(account_key):
@@ -1200,6 +1291,32 @@ def build_server(port=None):
             self.end_headers()
 
         def do_POST(self):
+            # Self-serve onboard: POST /portal/onboard {account_key, display_name}.
+            # Auth: X-Portal-Key must equal AGENT_PORTAL_ONBOARD_KEY (constant-time
+            # compare). Missing/wrong key -> 401. Also gated by AGENT_PORTAL_APPROVALS
+            # (403 when off), mirroring every other portal route. The body is always
+            # read first so the socket stays clean on an early return. Idempotent:
+            # onboarding an already-onboarded gym returns its CURRENT live token.
+            if self.path.split("?")[0] == "/portal/onboard":
+                # Consume the body up front (bounded), regardless of the outcome.
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                # Auth FIRST: a wrong/missing key never reveals the flag state.
+                shared_key = config.portal_onboard_key()
+                supplied = self.headers.get("X-Portal-Key", "") or ""
+                if (not shared_key) or (not hmac.compare_digest(supplied, shared_key)):
+                    return self._send_json({"error": "unauthorized"}, 401)
+                if not config.portal_approvals_enabled():
+                    return self._send_json({"error": "portal access is disabled"}, 403)
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                status, resp = handle_portal_onboard(body)
+                return self._send_json(resp, status)
+
             # Portal draft actions: /portal/<token>/{approve|edit|deny|kill}
             # Gated by AGENT_PORTAL_APPROVALS. Token resolves to account_key.
             # Unknown/revoked token = 404. Body is JSON: {draft_id, actor_id, note?}.

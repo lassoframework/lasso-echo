@@ -664,6 +664,21 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+# ---- Portal onboard endpoint shared key --------------------------------------
+# The LASSO portal authenticates the self-serve onboard call (POST /portal/onboard)
+# with a shared secret in the X-Portal-Key header, compared in constant time. The
+# key is read lazily BY NAME every call (so a rotation takes effect without a
+# reimport), never logged, never stored on an object. Empty => the endpoint refuses
+# every request (401), so a forgotten env var fails CLOSED, never open.
+PORTAL_ONBOARD_KEY_ENV = "AGENT_PORTAL_ONBOARD_KEY"  # name of the env var, not the value
+
+
+def portal_onboard_key() -> str:
+    """The shared portal onboard key, read from env at each call. Empty when unset.
+    Never logged, never returned in any response."""
+    return os.environ.get(PORTAL_ONBOARD_KEY_ENV, "").strip()
+
+
 # ---- Portal calendar data plane (Supabase content_calendar) ------------------
 # The live portal calendar reads/writes the SHARED Supabase content_calendar table
 # instead of the local, ephemeral SQLite drafts table. There is NO separate flag:
