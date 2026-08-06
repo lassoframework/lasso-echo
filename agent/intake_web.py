@@ -158,6 +158,26 @@ def unrevoke(client_key, r2=None, now=None):
     return _write_denylist(client_key, r2, now, add=False)
 
 
+# The canonical public origin of THIS service (echo-intake-web on Railway). Used
+# as the fallback when AGENT_UPLOAD_BASE_URL is unset or still carries a setup
+# placeholder, so a forgotten env var can never leak a "<paste ...>/u/<token>"
+# link to a client. Override by setting AGENT_UPLOAD_BASE_URL to a real https URL.
+_DEFAULT_UPLOAD_BASE_URL = "https://echo-intake-web-production.up.railway.app"
+
+
+def _upload_base_url():
+    """The absolute base URL for tokenized links, always without a trailing slash.
+    Reads AGENT_UPLOAD_BASE_URL; a blank value, a value that is not http(s), or a
+    leftover setup placeholder (contains '<' or the word 'paste') is treated as
+    unset and falls back to the canonical service origin. This is the ONE place the
+    base URL is resolved, so every link builder gets the same guard."""
+    raw = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip()
+    if (not raw) or ("<" in raw) or ("paste" in raw.lower()) \
+            or not raw.lower().startswith(("http://", "https://")):
+        return _DEFAULT_UPLOAD_BASE_URL
+    return raw.rstrip("/")
+
+
 def link_for(client_key, kind="u"):
     """The full signed intake link for a client key, or '' when it cannot be built
     (no signing secret set). kind='u' is the media upload page; kind='intake' is
@@ -170,8 +190,8 @@ def link_for(client_key, kind="u"):
     except ValueError:
         return ""
     path = "intake" if kind == "intake" else "u"
-    base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip().rstrip("/")
-    return f"{base}/{path}/{token}" if base else f"/{path}/{token}"
+    base = _upload_base_url()
+    return f"{base}/{path}/{token}"
 
 
 # ---- basic per-IP rate limit (in-memory; this is one small service) -----------
@@ -488,12 +508,12 @@ def handle_portal_intake(token, body, r2=None, now=None):
             client, stamp, list(answers.keys()),
         )
 
-    base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip().rstrip("/")
+    base = _upload_base_url()
     resp = {
         "status": "received",
         "account_key": client,
         "pending_source_count": _count_source_facts(answers),
-        "upload_url": f"{base}/u/{token}" if base else f"/u/{token}",
+        "upload_url": f"{base}/u/{token}",
     }
     return 200, resp
 
@@ -535,9 +555,7 @@ def handle_portal_gym_status(account_key, r2=None):
         from . import intake_tokens as _it
         raw = _it.decrypt_token(account_key)
         if raw:
-            base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").rstrip("/")
-            if base:
-                upload_link = base + "/u/" + raw
+            upload_link = _upload_base_url() + "/u/" + raw
     except Exception:
         pass  # encryption unavailable: use stored plaintext link
 

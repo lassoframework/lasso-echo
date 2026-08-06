@@ -37,9 +37,13 @@ def test_link_for_mints_absolute_when_base_set(monkeypatch):
     assert SECRET not in upload and SECRET not in form
 
 
-def test_link_for_relative_when_no_base():
+def test_link_for_defaults_to_service_origin_when_no_base(monkeypatch):
+    # With no AGENT_UPLOAD_BASE_URL, link_for falls back to the canonical service
+    # origin so a link is always absolute and clickable (never relative, never a
+    # setup placeholder).
+    monkeypatch.delenv("AGENT_UPLOAD_BASE_URL", raising=False)
     upload = intake_web.link_for("gym_alpha_ig", kind="u")
-    assert upload.startswith("/u/")
+    assert upload.startswith(intake_web._DEFAULT_UPLOAD_BASE_URL + "/u/")
 
 
 def test_minted_link_round_trips_to_client_key(monkeypatch):
