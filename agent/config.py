@@ -280,6 +280,31 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+# The gym_id the DEMO calendar content is valid for. The demo manifest drafts only
+# ever belong to THIS gym in the shared content_calendar. A real gym id must never
+# be this value, so the real-calendar mirror can prove it never leaves demo rows on a
+# real gym. Default "lasso_demo" (matches the demo tenant used by media_host). Set by
+# hand only if the demo gym id ever changes.
+def demo_calendar_gym_id() -> str:
+    """The one gym_id demo content is allowed on. Never a real gym."""
+    return (os.environ.get("AGENT_DEMO_CALENDAR_GYM_ID", "lasso_demo") or "").strip()
+
+
+def real_calendar_mirror_enabled() -> bool:
+    """
+    Real-drafts calendar mirror switch. OFF by default = zero behavior change: the
+    runner never mirrors, and the shared content_calendar keeps whatever it already
+    holds (byte-for-byte today's behavior). ON, each daily cycle folds a real gym's
+    REAL Echo drafts (the ones carrying a hosted creative URL) into the shared
+    content_calendar so /social and /calendar serve the gym's actual plan instead of
+    demo content, and clears any demo-manifest rows off a real gym. Gym-scoped: the
+    mirror only ever touches ONE gym_id per call and never another gym's rows. It
+    writes calendar rows only; it never publishes and adds no publish path. Arm by
+    hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_REAL_CALENDAR_MIRROR", "false"))
+
+
 def portal_social_enabled() -> bool:
     """
     Portal client-social MASTER switch (Part A). OFF by default. When OFF, EVERY new

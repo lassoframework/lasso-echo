@@ -590,4 +590,31 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 print(f"[review-cycle] refresh ask failed for {account.key}: "
                       f"{type(e).__name__}: {e}")
 
+    # REAL-CALENDAR MIRROR (AGENT_REAL_CALENDAR_MIRROR, OFF by default). Armed, fold
+    # each REAL gym's real drafts into the shared Supabase content_calendar so the
+    # client portal serves the gym's actual plan (and demo rows are cleared off a real
+    # gym). Flag OFF -> this block is skipped entirely: byte-for-byte today's behavior.
+    # Needs the Supabase creds (the portal data plane); no creds -> nothing to mirror.
+    # LASSO's own accounts and the demo gym id are never mirrored. Writes calendar rows
+    # only; nothing here publishes. A mirror error never takes the draft run down.
+    if config.real_calendar_mirror_enabled() and config.portal_calendar_supabase_enabled():
+        from .real_calendar_mirror import mirror_to_supabase
+        from .portal_calendar_store import SupabaseCalendarStore
+        _demo_gym = config.demo_calendar_gym_id()
+        _sb = SupabaseCalendarStore()
+        for account in (accounts or active_accounts()):
+            if account.key.startswith("lasso") or account.key == _demo_gym:
+                continue
+            try:
+                summary = mirror_to_supabase(account.key, store, _sb)
+                if not summary.get("ok"):
+                    print(f"[real-mirror] {account.key}: {summary.get('reason')}")
+                elif summary.get("upserted") or summary.get("deleted"):
+                    print(f"[real-mirror] {account.key}: upserted "
+                          f"{summary['upserted']}, deleted {summary['deleted']} demo row(s)")
+            except Exception as e:
+                print(f"[real-mirror] {account.key}: {type(e).__name__}: {e}")
+                ops_alerts.alert(f"real-calendar mirror failed for {account.key}: "
+                                 f"{type(e).__name__}: {e}. The draft run is unaffected.")
+
     return {"status": "drafted", "drafts": results}

@@ -198,6 +198,21 @@ class PendingStore:
             return None
         return _row_to_draft(row)
 
+    def list_for_account(self, account_key):
+        """Every draft for this account_key, ANY status, most recent first. Read
+        only; scoped to the one account so a caller can never sweep another gym's
+        drafts. Used by the real-calendar mirror to fold a gym's REAL drafts into
+        the shared content_calendar. Unreadable rows are skipped (never crash)."""
+        if not account_key:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT {_SELECT} FROM drafts WHERE account_key=? "
+                "ORDER BY updated_at DESC, rowid DESC",
+                (account_key,)).fetchall()
+        drafts = (_row_to_draft(r) for r in rows)
+        return [d for d in drafts if d is not None]
+
     def find_pending(self, account_key, day_key, draft_type):
         """The PENDING draft for (account, day, type), or None: the idempotency
         lookup, exactly as before. Older records without day_key never match."""

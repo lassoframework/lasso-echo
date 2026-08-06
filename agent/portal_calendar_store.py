@@ -154,6 +154,49 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    # ---- mirror writes (real-drafts calendar mirror) ------------------------
+    # These write calendar rows only. NOTHING here publishes to any social account.
+    def upsert_row(self, account_key, row):
+        """UPSERT one content_calendar row for account_key. The row's gym_id is FORCED
+        to account_key here so a caller can never write another gym's row through this
+        store. Uses PostgREST upsert (on_conflict=id, merge-duplicates) so re-mirroring
+        the same draft id updates in place rather than duplicating. Returns the written
+        row dict, or None."""
+        payload = dict(row or {})
+        payload["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+        r = self._client().post(
+            self._rest(_TABLE),
+            params={"on_conflict": "id"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            }),
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        for out in rows:
+            if str(out.get("gym_id")) == str(account_key):
+                return out
+        return None
+
+    def delete_row(self, account_key, row_id):
+        """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
+        belongs to another gym can never be deleted through this account_key. Returns the
+        number of rows deleted (0 or 1)."""
+        r = self._client().delete(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            headers=self._headers({"Prefer": "return=representation"}),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
 
 # ---------------------------------------------------------------------------
 # PURE mappers, no I/O.

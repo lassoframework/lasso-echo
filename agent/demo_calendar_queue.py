@@ -300,6 +300,18 @@ def _draft_id(account_key, day_key, kind):
     return f"demo{kind[0]}_{h}"
 
 
+# The namespace every demo draft id carries (demof_ feed, demos_ story). Kept here,
+# next to _draft_id, so any consumer that must EXCLUDE demo drafts (the real-calendar
+# mirror) tests the same prefix the ids are minted with, never a hard-coded literal.
+DEMO_ID_PREFIX = "demo"
+
+
+def is_demo_draft_id(draft_id):
+    """True iff draft_id was minted by the demo calendar (demof_/demos_). Used to keep
+    demo-manifest drafts OUT of any real gym's mirrored calendar."""
+    return bool(draft_id) and str(draft_id).startswith(DEMO_ID_PREFIX)
+
+
 # ---- manifest (Mac builds + hosts, Railway seeds) --------------------------------------
 
 def _load_manifest():

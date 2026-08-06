@@ -186,6 +186,62 @@ def test_data_source_and_available_flag():
 
 
 # ---------------------------------------------------------------------------
+# metrics honesty gate (Part B)
+# ---------------------------------------------------------------------------
+
+def test_map_metrics_narrative_null_and_no_invented_prose():
+    """map_metrics never emits invented narrative prose; narrative is null even on a
+    live (hasAnalyticsAccess) payload because Echo composes no metrics prose."""
+    on = za.map_metrics({"hasAnalyticsAccess": True, "accounts": [], "posts": []},
+                        14, None, None)
+    assert on["narrative"] is None
+    off = za.map_metrics({"hasAnalyticsAccess": False, "accounts": [], "posts": []},
+                         14, None, None)
+    assert off["narrative"] is None
+
+
+def test_follower_delta_null_when_only_total_present():
+    """followers is a TOTAL from accounts[].followersCount; follower_delta stays null
+    (never a delta derived from the total)."""
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [{"platform": "instagram", "followersCount": 1200}],
+        "posts": [],
+    }
+    out = za.map_metrics(aj, 14, None, None)
+    assert out["audience"]["followers"] == 1200      # the real total survives
+    assert out["audience"]["follower_delta"] is None  # no fabricated 30-day delta
+
+
+def test_seed_shape_data_source_none_and_narrative_null(monkeypatch):
+    """The SEED / unavailable shape (portal_social._metrics_shape) carries data_source
+    None (not 'zernio' just because the flag is on), narrative null, follower_delta null,
+    and only real-or-null numbers (never a fabricated 0)."""
+    monkeypatch.setenv("AGENT_ZERNIO_ANALYTICS_ENABLED", "true")
+    shape = ps._metrics_shape("gymX", 30)
+    assert shape["data_source"] is None
+    assert shape["narrative"] is None
+    assert shape["audience"]["followers"] is None
+    assert shape["audience"]["follower_delta"] is None
+    for k in ("likes", "comments", "saves", "shares", "posts_published"):
+        assert shape["totals"][k] is None, f"{k} must be null, never a fabricated 0"
+
+
+def test_rhythm_from_real_publishes_not_a_constant():
+    """current_posts_per_week is computed from ACTUAL in-window published posts, not a
+    seeded 14 or 35; baseline_posts_per_week is the passed real baseline."""
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [_post(1), _post(3), _post(5), _post(50)],  # 3 in a 14d window
+    }
+    out = za.map_metrics(aj, 14, baseline_ppw=0.25, baseline_at="2026-07-01T00:00:00Z")
+    assert out["frequency"]["current_posts_per_week"] == 1.5   # 3 / (14/7)
+    assert out["frequency"]["baseline_posts_per_week"] == 0.25
+    assert out["frequency"]["current_posts_per_week"] not in (14, 35)
+
+
+# ---------------------------------------------------------------------------
 # analytics_window — pages until out of window, stops on total, offline
 # ---------------------------------------------------------------------------
 

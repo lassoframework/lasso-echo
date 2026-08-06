@@ -172,6 +172,10 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
         "analytics_available": available,
         "report_available": None,  # caller overlays the real report flag
         "data_source": "zernio" if available else None,
+        # NARRATIVE GATE: Echo emits NO invented prose from metrics. The portal composes
+        # any narrative. narrative would only ever carry text when data_source == "zernio"
+        # (real numbers); today it stays null because Echo writes no metrics prose at all.
+        "narrative": None,
         "posts": posts_list,
         "totals": {
             "posts_published": posts_published,
@@ -181,7 +185,12 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
             "shares": shares,
         },
         "audience": {
+            # followers is a TOTAL (sum of accounts[].followersCount), NOT a 30-day
+            # delta. follower_delta is a genuine 30-day change; no trustworthy delta
+            # exists from a single analytics snapshot, so it stays null (the portal
+            # shows "coming soon"). We NEVER derive a delta from the total.
             "followers": followers,
+            "follower_delta": None,
             "reach": reach,
             "impressions": impressions,
         },

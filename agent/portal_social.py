@@ -649,7 +649,16 @@ def _metrics_shape(account_key, days):
         "window_days": days,
         "analytics_available": config.zernio_analytics_enabled(),
         "report_available": config.monthly_report_enabled(),
-        "data_source": "zernio" if config.zernio_analytics_enabled() else None,
+        # DATA SOURCE HONESTY: "zernio" is reserved for numbers that came from a LIVE
+        # Zernio pull (map_metrics on a hasAnalyticsAccess payload). This is the
+        # SEED / unavailable shape: it carries no live numbers, so its data_source is
+        # None. Labeling this "zernio" merely because the flag is on would brand a seed
+        # payload as real data, which is the fabrication the honesty gate forbids.
+        "data_source": None,
+        # NARRATIVE GATE (the caption fabrication gate applied to metrics prose): Echo
+        # emits NO invented narrative here. The portal composes any prose. narrative
+        # stays null unless the numbers came from a live Zernio pull.
+        "narrative": None,
         # per-post engagement metrics Zernio DOES expose (Part C fills the list)
         "posts": [],
         "totals": {
@@ -659,9 +668,13 @@ def _metrics_shape(account_key, days):
             "saves": None,
             "shares": None,
         },
-        # follower / reach / impressions may be unavailable per account: GAPS, not 0s
+        # follower / reach / impressions may be unavailable per account: GAPS, not 0s.
+        # followers is a TOTAL (from Zernio accounts[].followersCount) when it lands;
+        # follower_delta is a genuine 30-day change and stays null until one exists (the
+        # portal shows "coming soon"), NEVER a delta computed from the total.
         "audience": {
             "followers": None,
+            "follower_delta": None,
             "reach": None,
             "impressions": None,
         },
