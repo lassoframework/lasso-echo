@@ -295,6 +295,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             print(f"[welcome-queue] scan failed: {type(e).__name__}: {e}")
             ops_alerts.alert(f"welcome-queue daily scan failed: {type(e).__name__}: {e}. "
                              "The drip continues from what is already queued.")
+        # PORTAL source (same gate): portal-added clients have no Stripe record, so the
+        # Stripe scan above never welcomes them. Scan the portal gyms table too. Creds
+        # absent -> this no-ops and the Stripe path is byte-for-byte unchanged.
+        try:
+            from .welcome_queue import scan_portal_and_enqueue
+            psummary = scan_portal_and_enqueue()
+            if psummary.get("enqueued"):
+                print(f"[welcome-queue] portal scan enqueued {psummary['enqueued']} new "
+                      f"welcome(s); {psummary.get('needs_logo', 0)} need a logo, "
+                      f"{psummary.get('deduped_with_stripe', 0)} already covered by Stripe")
+            elif not psummary.get("scanned"):
+                print(f"[welcome-queue] portal scan skipped: {psummary.get('reason')}")
+        except Exception as e:
+            print(f"[welcome-queue] portal scan failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"welcome-queue portal scan failed: {type(e).__name__}: {e}. "
+                             "The drip continues from what is already queued.")
 
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
