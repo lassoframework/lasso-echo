@@ -34,11 +34,13 @@ Hard rules (unchanged):
 import hashlib
 import json
 import os
+import re
 
 from PIL import Image
 
-from . import config, db, media_host, ops_alerts, schedule, welcome_posts
+from . import config, db, media_host, ops_alerts, portal_gyms, schedule, welcome_posts
 from . import welcome_templates as wt
+from . import website_scan
 from .drafter import Draft, DraftStatus
 
 ACCOUNTS = ["lasso_ig", "lasso_fb"]      # feed cross-post targets
@@ -463,4 +465,106 @@ def scan_and_enqueue(reader=None, scraper=None, host_fn=None, window_days=45,
         "needs_confirmation": len(report.get("needs_confirmation", [])),
         "needs_logo": len(report.get("needs_logo", [])),
         "already_welcomed": len(report.get("already_welcomed", [])),
+    }
+
+
+# ---- the SECOND trigger: scan the portal gyms table and enqueue ready welcomes ---------
+
+def _norm_name(name):
+    """Normalized gym name for cross-source dedup: lowercased, whitespace-collapsed."""
+    return " ".join((name or "").lower().split())
+
+
+def _queue_has_name(name):
+    """True when a welcome_queue row (queued OR already-served) carries this gym name
+    (normalized). The queue row is never deleted once it exists, so this catches a gym
+    that Stripe already queued/served under a domain/cust key, preventing a second
+    welcome of the SAME gym via the portal source (dedup Stripe + portal)."""
+    target = _norm_name(name)
+    if not target:
+        return False
+    with _conn() as conn:
+        rows = conn.execute("SELECT name FROM welcome_queue").fetchall()
+    return any(_norm_name(r["name"]) == target for r in rows)
+
+
+def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days=45,
+                            bg_client=None, force=False, out_dir=None, cache_dir=None):
+    """Scan the PORTAL `gyms` table for recently added clients and enqueue every READY
+    welcome the SAME way the Stripe scan does (feed + a genuine 9:16 story, hosted).
+    This is the fix for portal-added clients who have no Stripe record and so were
+    never welcomed by the Stripe-only trigger.
+
+    Idempotent and deduped:
+      * already in the ledger (portal:<gym_id>) -> skipped.
+      * same gym already in welcome_queue (by normalized name, from either source) ->
+        skipped, so a client present in BOTH Stripe and portal is welcomed exactly once.
+      * a gym with no usable logo (no override AND no scrapable domain) is reported
+        needs_logo and NOT enqueued (never a logo-less card).
+
+    Creds absent (no SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY) -> list is empty and this
+    no-ops: the Stripe path is byte-for-byte unchanged. Requires AGENT_HOSTING_ENABLED to
+    host the cards; `force=True` bypasses the flag gate for manual CLI seeding (the drip
+    still stays dark until AGENT_WELCOME_QUEUE_ENABLED is armed)."""
+    if not force and not config.welcome_queue_enabled():
+        return {"scanned": False, "reason": "AGENT_WELCOME_QUEUE_ENABLED off"}
+    if not config.hosting_enabled():
+        return {"scanned": False, "reason": "AGENT_HOSTING_ENABLED off (cannot host cards)"}
+
+    scraper = scraper or website_scan.fetch_logo
+    out_dir = out_dir or os.path.join(cache_dir or wt._cache_dir(None), "welcome_client")
+
+    try:
+        gyms = portal_gyms.list_recent_portal_gyms(days=window_days, reader=reader)
+    except Exception as e:
+        return {"scanned": False, "reason": f"portal read failed: {type(e).__name__}: {e}"}
+
+    enqueued = needs_logo = already = deduped = 0
+    for g in gyms:
+        try:
+            gym_id = g.get("gym_id")
+            gym_key = "portal:" + str(gym_id)
+            # resolve the name: a portal name override wins, else the portal name
+            name = welcome_posts.portal_name_override(gym_key) or g["name"]
+
+            # idempotent: this gym already welcomed under its portal key
+            if welcome_posts.already_welcomed(gym_key):
+                already += 1
+                continue
+            # cross-source dedup: the SAME gym is already in the queue (Stripe or portal)
+            if _queue_has_name(name):
+                deduped += 1
+                continue
+
+            # resolve the logo: human-dropped override wins; else scrape a domain IF the
+            # portal carries one (it does not today); else needs_logo, NOT enqueued.
+            ak = "portal_" + re.sub(r"[^a-z0-9]+", "_", str(gym_id).lower()).strip("_")
+            override = welcome_posts.portal_logo_override(ak, gym_key=gym_key)
+            domain = (g.get("domain") or "").strip()
+            logo = scraper(domain, ak, override_path=override, out_dir=None)
+            if not logo.ok:
+                needs_logo += 1
+                print(f"[welcome-queue] portal gym {name} has no usable logo "
+                      f"(override/scrape); NOT enqueued (drop a logo override)")
+                continue
+
+            template = welcome_posts.pick_template(gym_key)
+            posts = welcome_posts.generate_posts(template, name, "", logo.path,
+                                                 out_dir, bg_client=bg_client,
+                                                 cache_dir=cache_dir)
+            entry = {"gym_key": gym_key, "name": name, "owner": "",
+                     "template": template, "tier_label": "", "posts": posts}
+            if enqueue(entry, host_fn=host_fn):
+                enqueued += 1
+        except Exception as e:  # one bad gym never stops the scan
+            print(f"[welcome-queue] portal enqueue failed for {g.get('name')}: "
+                  f"{type(e).__name__}: {e}")
+    return {
+        "scanned": True,
+        "source": "portal",
+        "enqueued": enqueued,
+        "portal_seen": len(gyms),
+        "needs_logo": needs_logo,
+        "already_welcomed": already,
+        "deduped_with_stripe": deduped,
     }
