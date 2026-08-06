@@ -142,6 +142,20 @@ def connect(path=None):
             conn.execute("ALTER TABLE gyms ADD COLUMN zernio_default_fb_page_id TEXT")
         except Exception:
             pass
+    # additive gyms migration (Part A): trailing-90d posting baseline captured at
+    # onboarding. baseline_posts_per_week is the number Echo's before/after story
+    # reads from; baseline_captured_at timestamps when it was set. Existing rows
+    # stay null (no baseline) until a setter fills them.
+    if "baseline_posts_per_week" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN baseline_posts_per_week REAL")
+        except Exception:
+            pass
+    if "baseline_captured_at" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN baseline_captured_at TEXT")
+        except Exception:
+            pass
     return conn
 
 
@@ -345,6 +359,7 @@ def gym_upsert(account_key, display_name='', **fields):
         'token_revoked', 'intake_token_encrypted', 'upload_link', 'publish_flag',
         'publish_creds', 'publish_creds_status',
         'zernio_profile_id', 'zernio_default_fb_page_id',
+        'baseline_posts_per_week', 'baseline_captured_at',
     }
     extra_cols = []
     extra_vals = []
@@ -398,6 +413,30 @@ def gym_list(conn=None):
         return _list(conn)
     with connect() as c:
         return _list(c)
+
+
+# ---- Part A: per-gym posting baseline (trailing-90d, captured at onboarding) ----
+
+def set_baseline_posts_per_week(account_key, posts_per_week, captured_at=None):
+    """Store a gym's trailing-90d posting baseline (posts/week) and stamp when it
+    was captured. Part D's before/after story reads this. The value is a manual /
+    explicit number now (the Zernio history source is Part C); accept it as given.
+    Creates the gyms row if it does not exist. Timestamped on the gym record."""
+    from datetime import datetime, timezone
+    ts = captured_at or datetime.now(timezone.utc).isoformat()
+    gym_upsert(account_key,
+               baseline_posts_per_week=float(posts_per_week),
+               baseline_captured_at=ts)
+    return ts
+
+
+def get_baseline_posts_per_week(account_key, conn=None):
+    """The gym's stored baseline as (posts_per_week, captured_at), or (None, None)
+    when no baseline has been captured for this gym yet."""
+    row = gym_get(account_key, conn=conn)
+    if not row:
+        return None, None
+    return row.get("baseline_posts_per_week"), row.get("baseline_captured_at")
 
 
 def audit_rows(day=None, account_key=None, limit=500):
