@@ -73,6 +73,12 @@ def test_ghl_legacy_env_override_wins(monkeypatch):
         "https://intake.lasso.test/u/pinned_legacy_tok"
 
 
-def test_ghl_empty_without_base(monkeypatch):
+def test_ghl_defaults_to_service_origin_when_no_base(monkeypatch):
+    # A forgotten/unset AGENT_UPLOAD_BASE_URL must NOT drop the link; it falls
+    # back to the canonical service origin (same guard intake_web.link_for uses),
+    # so a video reply never carries a dead placeholder or an empty URL.
     monkeypatch.delenv("AGENT_UPLOAD_BASE_URL", raising=False)
-    assert ghl_intake.upload_link_for("gym_alpha_ig") == ""
+    link = ghl_intake.upload_link_for("gym_alpha_ig")
+    assert link.startswith(intake_web._DEFAULT_UPLOAD_BASE_URL + "/u/")
+    token = link.rsplit("/u/", 1)[1]
+    assert intake_web.client_for_token(token) == "gym_alpha_ig"
