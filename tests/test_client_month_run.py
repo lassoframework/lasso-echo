@@ -1,10 +1,15 @@
 """
-Per-client MONTH builder (client_month_run). Fully OFFLINE: an injected store + fake
-feed/story template_fns (no Gemini, no host, no Supabase). Asserts:
+Per-client MONTH builder (client_month_run). Fully OFFLINE: an injected store + a tmp
+media library (fake image files). NEW RULE: a CLIENT gym's calendar is built ONLY from
+its OWN uploaded photos/videos. Echo NEVER renders an infographic-only calendar for a
+client; a client with no media WAITS. Asserts:
   * flag OFF -> ok:False and the store is never touched
-  * a stocked no-library client produces PAUSED rows, gym_id = the BASE, IG+FB for
-    feeds and IG-only for stories, image_url set from the template url, NO id, status
+  * NO MEDIA -> Echo WAITS: ok:False, awaiting_media True, 0 rows, store UNTOUCHED
+    (no delete, no insert), and NO infographic is ever produced
+  * a stocked media library -> PAUSED real-photo rows, gym_id = the BASE, IG+FB for
+    feeds and IG-only for stories, image_url is the gym's OWN photo url, NO id, status
     'pending'
+  * a day with no photo is SKIPPED (never infographic-filled)
   * a source whose caption carries a banned word is DROPPED (never in the output),
     and a different clean source still fills the day
   * the four gritx/topfuel accounts exist and are inactive
@@ -17,7 +22,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent import client_month_run as cmr, client_sources as cs  # noqa: E402
+from agent import client_content, client_month_run as cmr, client_sources as cs  # noqa: E402
 from agent.accounts import Account, Platform, get_account  # noqa: E402
 from agent.voice import VoiceDoc  # noqa: E402
 
@@ -55,12 +60,18 @@ def _account():
                    token_env="T", target_id_env="TID")
 
 
-def _feed_fn(account, source, day_key):
-    return "https://cdn.example/feed.png"
-
-
-def _story_fn(account, source, day_key):
-    return "https://cdn.example/story.png"
+def _lib(tmp_path, n=6):
+    """A gym's OWN uploaded media library: n fake image files, each with a .json sidecar
+    carrying a public_url (as Blake-by-hand hosting sets). The sidecar public_url is what
+    makes the draft a portal-ready real-photo card offline (no S3 / network needed)."""
+    import json
+    lib = tmp_path / "gritx_lib"
+    lib.mkdir(exist_ok=True)
+    for i in range(n):
+        (lib / f"photo_{i:02d}.jpg").write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        (lib / f"photo_{i:02d}.json").write_text(
+            json.dumps({"public_url": f"https://gritx.media/photo_{i:02d}.jpg"}))
+    return str(lib)
 
 
 def _stock_clean(account_key):
@@ -70,36 +81,92 @@ def _stock_clean(account_key):
 
 
 # ---- 1. flag OFF -> nothing touched ----------------------------------------------
-def test_flag_off_touches_nothing(monkeypatch):
+def test_flag_off_touches_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CLIENT_MONTH", "false")
     _stock_clean("gritx_ig")
+    lib = _lib(tmp_path)
     store = _FakeStore()
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
-        library_path=None, feed_template_fn=_feed_fn, story_template_fn=_story_fn,
-        store=store, banned_words=())
+        library_path=lib, store=store, banned_words=())
     assert out["ok"] is False
     assert store.deleted == [] and store.inserted == []
 
 
-# ---- 2. stocked no-library client -> PAUSED rows, IG+FB feed, IG story, no id -----
-def test_builds_paused_rows_with_fb_mirror():
+# ---- 2. NO MEDIA -> Echo WAITS, store untouched, no infographic -------------------
+def test_no_media_waits_and_touches_nothing(tmp_path):
     _stock_clean("gritx_ig")
+    store = _FakeStore()
+    empty = tmp_path / "empty_lib"      # exists but no media files
+    empty.mkdir()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=str(empty), store=store, banned_words=())
+    assert out["ok"] is False
+    assert out["awaiting_media"] is True
+    assert out["upserted"] == 0
+    assert out["days"] == 0
+    assert out["skipped_banned"] == 0
+    # store COMPLETELY untouched: no delete, no insert
+    assert store.deleted == []
+    assert store.inserted == []
+
+
+def test_missing_library_path_waits(tmp_path):
+    _stock_clean("gritx_ig")
+    store = _FakeStore()
+    # library_path=None (never uploaded) and a non-existent path both count as no media
+    out_none = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=None, store=store, banned_words=())
+    out_missing = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=str(tmp_path / "does_not_exist"), store=store, banned_words=())
+    for out in (out_none, out_missing):
+        assert out["ok"] is False and out["awaiting_media"] is True
+    assert store.deleted == [] and store.inserted == []
+
+
+def test_client_awaiting_media_helper(tmp_path):
+    assert cmr.client_awaiting_media("gritx", None) is True
+    empty = tmp_path / "e"
+    empty.mkdir()
+    assert cmr.client_awaiting_media("gritx", str(empty)) is True
+    lib = _lib(tmp_path)
+    assert cmr.client_awaiting_media("gritx", lib) is False
+
+
+def test_media_count_counts_images_and_videos(tmp_path):
+    lib = tmp_path / "mixed"
+    lib.mkdir()
+    (lib / "a.jpg").write_bytes(b"x")
+    (lib / "b.PNG").write_bytes(b"x")
+    (lib / "c.mp4").write_bytes(b"x")
+    (lib / "d.mov").write_bytes(b"x")
+    (lib / "notes.txt").write_bytes(b"x")     # sidecar, not counted
+    (lib / "sub").mkdir()                       # dir, not counted
+    assert cmr._client_media_count(str(lib)) == 4
+
+
+# ---- 3. stocked media library -> PAUSED real-photo rows, IG+FB feed, IG story -----
+def test_builds_paused_real_photo_rows_with_fb_mirror(tmp_path):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
-        library_path=None, feed_template_fn=_feed_fn, story_template_fn=_story_fn,
-        store=store, banned_words=())
+        library_path=lib, store=store, banned_words=())
     assert out["ok"] is True
     rows = store.inserted
     assert rows, "no rows inserted"
-    # every row: gym_id = BASE, PAUSED, no id, image_url from a template
+    # every row: gym_id = BASE, PAUSED, no id, image_url is the gym's OWN uploaded photo
     for r in rows:
         assert r["gym_id"] == "gritx"
         assert r["status"] == "pending"          # PAUSED, never approved/published
         assert "id" not in r
-        assert r["image_url"] in ("https://cdn.example/feed.png",
-                                  "https://cdn.example/story.png")
+        assert r["image_url"], "row must carry the gym's real photo url"
+        # NEVER an infographic/template card: the url is a real hosted/public library url
+        assert "cdn.example" not in r["image_url"]
     # feeds appear on BOTH instagram and facebook; stories instagram-only
     feed_ig = [r for r in rows if r["format"] == "feed" and r["account"] == "instagram"]
     feed_fb = [r for r in rows if r["format"] == "feed" and r["account"] == "facebook"]
@@ -111,66 +178,86 @@ def test_builds_paused_rows_with_fb_mirror():
     assert ("gritx", "2026-08") in store.deleted
 
 
-# ---- 3. a banned-word caption is DROPPED; a clean source still fills the day ------
-def test_banned_word_dropped_never_emitted():
-    # one banned source + clean sources. The guard must never emit the banned word.
+# ---- 4. a day with no photo is SKIPPED, never infographic-filled ------------------
+def test_day_with_no_photo_is_skipped_never_infographic(tmp_path, monkeypatch):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+
+    real = client_content.build_client_draft
+
+    def _sometimes_no_photo(account, day_key, voice, library_path, **kw):
+        # Force the 2nd calendar day (2026-08-02) to have NO usable photo, so its draft
+        # comes back as needs-media. Every other day builds a real-photo draft.
+        d = real(account, day_key, voice, library_path, **kw)
+        if d is not None and str(day_key).startswith("2026-08-02"):
+            d.needs_media = True
+            d.creative_public_url = ""
+        return d
+
+    monkeypatch.setattr(cmr.client_content, "build_client_draft", _sometimes_no_photo)
+
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    # 2026-08-02 produced NO row at all (skipped), and certainly no infographic card
+    for r in store.inserted:
+        assert r["post_date"] != "2026-08-02", "a no-photo day must be skipped, not filled"
+        assert r["image_url"], "no blank/infographic card ever emitted"
+    # the other two days still produced real rows
+    assert any(r["post_date"] == "2026-08-01" for r in store.inserted)
+
+
+# ---- 5. a banned-word caption is DROPPED; a clean source still fills the day ------
+def test_banned_word_dropped_never_emitted(tmp_path):
     cs.add_source("gritx_ig", "service", "High Intensity CrossFit style Cardio", "client social intake")
     _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     banned = ["crossfit", "bootcamp", "cardio", "hyrox", "intensity", "compete"]
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=14, voice=_voice(),
-        library_path=None, feed_template_fn=_feed_fn, story_template_fn=_story_fn,
-        store=store, banned_words=banned)
+        library_path=lib, store=store, banned_words=banned)
     assert out["ok"] is True
-    # NO row caption contains any banned word
     for r in store.inserted:
         cap = r["caption"].lower()
         for w in banned:
             assert w not in cap, f"banned word {w!r} leaked: {r['caption']!r}"
-    # clean sources still produced a real month
     assert out["upserted"] > 0
 
 
-def test_all_sources_banned_drops_every_day():
-    # ONLY banned sources: every day drops, nothing emitted, no leak.
+def test_all_sources_banned_drops_every_day(tmp_path):
     cs.add_source("gritx_ig", "service", "CrossFit Cardio Intensity", "client social intake")
     cs.add_source("gritx_ig", "offer", "Bootcamp Hyrox Compete", "client social intake")
+    lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     banned = ["crossfit", "cardio", "intensity", "bootcamp", "hyrox", "compete"]
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
-        library_path=None, feed_template_fn=_feed_fn, story_template_fn=_story_fn,
-        store=store, banned_words=banned)
+        library_path=lib, store=store, banned_words=banned)
     assert out["ok"] is True
     assert out["skipped_banned"] == 5      # the guard fired every day
     assert out["upserted"] == 0
     assert store.inserted == []
 
 
-# ---- 4. works with library_path=None (infographic path) --------------------------
-def test_no_library_uses_infographic_template():
+# ---- 6. no infographic is EVER produced (no template card url in any row) ---------
+def test_never_produces_an_infographic(tmp_path):
     _stock_clean("gritx_ig")
-    seen = {"feed": 0, "story": 0}
-
-    def feed_fn(account, source, day_key):
-        seen["feed"] += 1
-        return "https://cdn.example/feed.png"
-
-    def story_fn(account, source, day_key):
-        seen["story"] += 1
-        return "https://cdn.example/story.png"
-
+    lib = _lib(tmp_path, n=6)
     store = _FakeStore()
     out = cmr.build_client_month(
-        _account(), "gritx", "2026-08-01", days=6, voice=_voice(),
-        library_path=None, feed_template_fn=feed_fn, story_template_fn=story_fn,
-        store=store, banned_words=())
+        _account(), "gritx", "2026-08-01", days=12, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
     assert out["ok"] is True
-    assert seen["feed"] > 0 and seen["story"] > 0   # the infographic template_fn ran
+    for r in store.inserted:
+        # every image is a real uploaded photo url, never a template_card fallback
+        assert r["image_url"]
+        assert "template" not in r["image_url"].lower()
 
 
-# ---- 5. the four client accounts exist and are inactive --------------------------
+# ---- 7. the four client accounts exist and are inactive --------------------------
 def test_accounts_exist_inactive():
     for key in ("gritx_ig", "gritx_fb", "topfuel_ig", "topfuel_fb"):
         a = get_account(key)
@@ -178,7 +265,7 @@ def test_accounts_exist_inactive():
         assert a.active is False, f"{key} must be inactive"
 
 
-# ---- 6. banned-word matcher is word-boundary (no false positives) ----------------
+# ---- 8. banned-word matcher is word-boundary (no false positives) ----------------
 def test_banned_word_boundary():
     assert cmr._has_banned_word("we compete weekly", ["compete"])
     assert not cmr._has_banned_word("we are competent coaches", ["compete"])

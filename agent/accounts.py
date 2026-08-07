@@ -143,9 +143,11 @@ ACCOUNTS = [
         active=False,                # arm after tokens + voice doc are filled
         # trust defaults to FULL_APPROVAL (level 0). Do not change here.
     ),
-    # ---- No-photo-library CLIENT gyms (social-intake onboarded). These draft the
-    # month as house infographics from their OWN approved sources (client_month_run),
-    # behind AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES. Three keys per gym: the tenant
+    # ---- CLIENT gyms (social-intake onboarded). These draft the month from their OWN
+    # uploaded photos/videos paired with their OWN approved sources (client_month_run),
+    # behind AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES. A gym with no uploaded media gets
+    # no calendar (Echo waits; the portal shows a red "upload your media" banner) and is
+    # NEVER given an infographic-only calendar. Three keys per gym: the tenant
     # base ("gritx") is echo_social_intake.client_key AND content_calendar.gym_id; the
     # _ig account is the generation key; the _fb account is the Facebook mirror. All
     # active=False so the daily runner never auto-drafts/publishes them. Tokens + voice

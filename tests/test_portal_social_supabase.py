@@ -325,3 +325,59 @@ def test_no_creds_action_uses_drafts_store(tmp_path, monkeypatch):
 def db_tmp(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     yield
+
+
+# ===========================================================================
+# RED-BANNER SIGNAL: /social carries awaiting_media + upload_url for a CLIENT
+# gym with no calendar (Echo is waiting on the gym's uploaded media). The LASSO
+# gym is NEVER flagged awaiting_media. Additive fields (existing contract intact).
+# ===========================================================================
+
+@pytest.fixture
+def _upload_env(monkeypatch):
+    """The signing secret + a real upload base so upload_link_for mints a live link."""
+    monkeypatch.setenv("AGENT_INTAKE_SIGNING_SECRET", "test-signing-secret")
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "https://upload.lassoframework.com")
+    yield
+
+
+def test_client_gym_no_posts_flags_awaiting_media(monkeypatch, _upload_env):
+    store = _FakeStore([])          # a CLIENT gym with an EMPTY calendar
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    status, body = ps.handle_social("gritx", "2026-08")
+    assert status == 200
+    assert body["posts"] == []
+    assert body["awaiting_media"] is True
+    assert body["upload_url"], "a client awaiting media must get a non-empty upload_url"
+    assert body["upload_url"].startswith("https://upload.lassoframework.com/u/")
+
+
+def test_client_gym_with_posts_not_awaiting_media(monkeypatch, _upload_env):
+    store = _FakeStore([_row("uuid-1", gym_id="gritx", post_date="2026-08-05")])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    status, body = ps.handle_social("gritx", "2026-08")
+    assert status == 200
+    assert body["posts"], "the client has a calendar"
+    assert body["awaiting_media"] is False
+    assert body["upload_url"] == ""
+
+
+def test_lasso_gym_never_flagged_awaiting_media(monkeypatch, _upload_env):
+    store = _FakeStore([])          # LASSO's OWN calendar, empty this month
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    status, body = ps.handle_social("lasso", "2026-08")
+    assert status == 200
+    assert body["posts"] == []
+    # the LASSO gym is its own dogfood calendar: NEVER an "upload your media" banner
+    assert body["awaiting_media"] is False
+    assert body["upload_url"] == ""
+
+
+def test_lasso_framework_llc_key_never_flagged(monkeypatch, _upload_env):
+    # the live dogfood key is 'lasso-framework-llc' (still a LASSO key): never flagged
+    store = _FakeStore([])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    status, body = ps.handle_social("lasso-framework-llc", "2026-08")
+    assert status == 200
+    assert body["awaiting_media"] is False
+    assert body["upload_url"] == ""
