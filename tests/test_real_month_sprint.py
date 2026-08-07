@@ -113,50 +113,67 @@ def test_window_overlaps_cycle1():
     assert min(sd) == "2026-08-21"
 
 
-# ---- SPRINT days run the sprint, up to 3/day, not platform ----------------------------
+# ---- SPRINT days: 1 summit feed + 1 varied slot (Blake's dialed cadence) --------------
 
-def test_sprint_days_serve_summit_up_to_three_feed_not_platform():
+def test_sprint_days_serve_one_summit_feed_plus_a_varied_slot():
+    # Blake's dialed cadence (ratified 2026-08-07): ONE summit sprint feed a day through the
+    # sprint, and the day's OTHER slot stays a varied, real, non-summit pillar so the sprint
+    # never buries the calendar. The summit card is a real hosted asset, never platform.
     plan, drafts = _build()
     sprint_days = set(_sprint_days_in_window())
     feeds = [d for d in drafts if not d.is_story]
-    by_day = Counter(f.day_key for f in feeds)
     for day in sprint_days:
         day_feeds = [f for f in feeds if f.day_key == day]
-        assert day_feeds, f"sprint day {day} served no feed"
-        # up to 3 feed posts a day (2 is acceptable when the calendar yields fewer)
-        assert 2 <= by_day[day] <= sq.SPRINT_MAX_FEED_PER_DAY, (day, by_day[day])
-        # every sprint-day feed is a real summit sprint card, NEVER platform / rotation
-        for f in day_feeds:
-            assert f.category == "summit", (day, f.category)
-            assert f.draft_type == "summit"
-            assert f.creative_public_url and f.creative_public_url.startswith("https://cdn.test/")
+        summit_feeds = [f for f in day_feeds if f.category == "summit"]
+        other_feeds = [f for f in day_feeds if f.category != "summit"]
+        # exactly one real summit sprint card
+        assert len(summit_feeds) == 1, (day, [f.category for f in day_feeds])
+        f = summit_feeds[0]
+        assert f.draft_type == "summit"
+        assert f.creative_public_url and f.creative_public_url.startswith("https://cdn.test/")
+        # and exactly one varied, real, non-summit pillar in the second slot
+        assert len(other_feeds) == 1, (day, [f.category for f in day_feeds])
+        assert other_feeds[0].category in (
+            "podcast", "platform", "b2b", "doctrine", "book", "welcome")
 
 
-def test_sprint_days_carry_paired_9_16_stories():
+def test_sprint_days_carry_paired_9_16_summit_story():
     plan, drafts = _build()
     sprint_days = set(_sprint_days_in_window())
     stories = [d for d in drafts if d.is_story]
     for day in sprint_days:
-        day_stories = [s for s in stories if s.day_key == day]
-        assert day_stories, f"sprint day {day} served no 9:16 story"
-        for s in day_stories:
+        summit_stories = [s for s in stories if s.day_key == day and s.category == "summit"]
+        assert summit_stories, f"sprint day {day} served no summit 9:16 story"
+        for s in summit_stories:
             assert s.is_story and s.draft_type == "story" and s.category == "summit"
             assert s.creative_path.endswith("_story.png")
 
 
-def test_sprint_overrides_rotation_and_weekly_summit():
-    # On a sprint day the plan category is summit+is_sprint even though the base weekday
-    # rotation (and a would-be weekly summit override) said something else.
+def test_sprint_day_carries_summit_sprint_plus_varied_second_slot():
+    # A sprint day carries ONE summit+is_sprint feed (+ paired story) AND a second slot that
+    # is a varied, non-summit, NON-sprint pillar. The sprint no longer owns the whole day.
     plan, _ = _build()
     sprint_days = set(_sprint_days_in_window())
-    for s in plan:
-        if s.post_date in sprint_days:
-            assert s.is_sprint and s.category == "summit", (s.post_date, s.category)
+    for day in sprint_days:
+        day_slots = [s for s in plan if s.post_date == day]
+        sprint_slots = [s for s in day_slots if s.is_sprint]
+        other_slots = [s for s in day_slots if not s.is_sprint]
+        assert sprint_slots, (day, "no sprint slot")
+        for s in sprint_slots:
+            assert s.category == "summit"
+        # exactly one summit sprint FEED a day (dialed to 1)
+        assert len([s for s in sprint_slots if s.fmt == rmp.FEED]) == 1, day
+        # the other slot is varied, real, NOT summit and NOT a sprint slot
+        assert other_slots, (day, "no varied slot")
+        for s in other_slots:
+            assert not s.is_sprint
+            assert s.category != "summit", (day, s.category)
 
 
 def test_missing_sprint_asset_is_skipped_never_platform_never_fabricated():
-    # A manifest with only SOME sprint feed cards hosted: slots whose asset is not hosted
-    # are skipped. They are NEVER filled with platform or any rotation pillar.
+    # A manifest with only SOME sprint feed cards hosted: a sprint slot whose asset is not
+    # hosted is SKIPPED (never platform-padded, never fabricated). The day's varied second
+    # slot still fills, so a missing sprint asset never leaves a hole.
     assets = sq.sprint_assets()
     partial = {}
     for i, (fname, _cap) in enumerate(assets):
@@ -166,13 +183,14 @@ def test_missing_sprint_asset_is_skipped_never_platform_never_fabricated():
     sprint_days = set(_sprint_days_in_window())
     for day in sprint_days:
         day_feeds = [d for d in drafts if not d.is_story and d.day_key == day]
-        # whatever landed is a real hosted summit card; nothing platform / fabricated
-        for f in day_feeds:
-            assert f.category == "summit"
+        summit_feeds = [f for f in day_feeds if f.category == "summit"]
+        # at most one summit sprint feed a day; every summit card that landed is a real
+        # hosted asset (never fabricated, never platform-padded into the sprint slot)
+        assert len(summit_feeds) <= 1, (day, len(summit_feeds))
+        for f in summit_feeds:
             assert f.creative_public_url in partial.values()
-        # no other pillar ever appears on a sprint day
-        cats = {f.category for f in day_feeds}
-        assert cats <= {"summit"}, (day, cats)
+        # the varied slot still fills the day (a skipped sprint asset never leaves it empty)
+        assert day_feeds, (day, "day left empty when sprint asset missing")
 
 
 # ---- NON-sprint days: 2/day, filled, platform capped ~1/3 -----------------------------

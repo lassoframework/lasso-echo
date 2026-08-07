@@ -234,14 +234,23 @@ def _default_sprint_days():
         return set()
 
 
+# Blake's dialed sprint cadence: ONE summit feed a day through the sprint window, with the
+# day's other slot kept as a varied non-sprint pillar (see plan_month). This keeps the
+# sprint present every day without burying the rest of the calendar. summit_queue's
+# SPRINT_MAX_FEED_PER_DAY (3) still governs the separate held-drafts path, not this plan.
+SPRINT_FEED_PER_DAY = 1
+
+
 def _default_sprint_feed_count(day_key):
-    """How many FEED posts the sprint serves on `day_key`: SPRINT_MAX_FEED_PER_DAY (3),
-    from summit_queue. The actual per-slot serve still skips a slot with no rendered asset
-    (never fabricated), so a day can land fewer than this; this is the ceiling the plan
-    lays out. Missing/broken queue -> 0 (the day is then not treated as a sprint day)."""
+    """How many summit FEED posts the month plan lays out on a sprint `day_key`:
+    SPRINT_FEED_PER_DAY (1). The day's OTHER slot stays a varied non-sprint pillar
+    (plan_month), so the sprint never buries the calendar. The per-slot serve still skips a
+    slot with no rendered asset (never fabricated). Missing/broken summit queue -> 0 (the
+    date is then not treated as a sprint day and the base rotation stands)."""
     try:
         from . import summit_queue
-        return int(summit_queue.SPRINT_MAX_FEED_PER_DAY)
+        _ = summit_queue.SPRINT_MAX_FEED_PER_DAY  # queue-presence check (raises if absent)
+        return SPRINT_FEED_PER_DAY
     except Exception:
         return 0
 
@@ -303,7 +312,10 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             d, base, book_dates=book_dates, summit_day_fn=summit_day_fn,
             welcome_dates=welcome_dates, sprint_day_fn=sprint_day_fn)
         if sprint_day_fn(d):
-            # SPRINT day: up to N feed posts + N paired stories, all real sprint assets.
+            # SPRINT day: N summit feed posts + N paired stories from the real sprint
+            # assets, AND the day's other slot stays VARIED (the base rotation pillar for
+            # the date) so the sprint never buries the calendar. Blake's cadence: 1 summit
+            # feed a day through the sprint, the second slot a real non-sprint pillar.
             n = max(1, int(sprint_feed_count_fn(d) or 0))
             for si in range(n):
                 slots.append(PlanSlot(post_date=d, category="summit", fmt=FEED,
@@ -313,6 +325,27 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
                 slots.append(PlanSlot(post_date=d, category="summit", fmt=STORY,
                                       base_category=base, overridden=True,
                                       slot_index=si, is_sprint=True))
+            # The varied second slot: the pillar the day would carry if it were NOT a
+            # sprint day (book / welcome / weekly rotation), resolved with the sprint
+            # override turned off so it never doubles up on summit. is_sprint=False so it
+            # is a normal slot and stays subject to _cap_platform. A missing source for
+            # this pillar is skipped by the builder later, never fabricated.
+            varied_cat, varied_over = _override_category(
+                d, base, book_dates=book_dates, summit_day_fn=None,
+                welcome_dates=welcome_dates, sprint_day_fn=None)
+            if varied_cat == "summit":
+                # The weekday rotation itself lands on summit (e.g. Friday); during the
+                # sprint the second slot must stay VARIED, so re-point it to a deterministic
+                # non-summit pillar (spread by date so it is not always the same one). A
+                # dark pillar still falls back to a real one in build_month_drafts; never
+                # fabricated, never a second summit on the same sprint day.
+                _alt = [c for c in _FALLBACK_ORDER if c != "summit"]
+                varied_cat = _alt[date.fromisoformat(d).toordinal() % len(_alt)]
+                varied_over = True
+            slots.append(PlanSlot(post_date=d, category=varied_cat, fmt=FEED,
+                                  base_category=base, overridden=varied_over))
+            slots.append(PlanSlot(post_date=d, category=varied_cat, fmt=STORY,
+                                  base_category=base, overridden=varied_over))
             continue
         slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                               base_category=base, overridden=overridden))
