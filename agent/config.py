@@ -1095,12 +1095,15 @@ def client_month_enabled() -> bool:
     behavior change: build_client_month returns ok:False and touches nothing (no
     render, no host, no calendar write). When ON (and client_sources_enabled() is
     also armed), Echo may assemble a full month of APPROVABLE DRAFT calendar rows for
-    a client gym with NO photo library, rendering each day as a house infographic
-    from that gym's OWN approved sources, and upsert them to the shared
-    content_calendar (gym_id = the tenant base). Every row is PAUSED (pending) and
-    held for human approval; a caption carrying any of the gym's banned words is
-    DROPPED, never emitted. Nothing here publishes and no gate is weakened. Arm by
-    hand in Railway env.
+    a client gym FROM THAT GYM'S OWN UPLOADED PHOTOS/VIDEOS, pairing each day's approved
+    fact with a real uploaded image, and upsert them to the shared content_calendar
+    (gym_id = the tenant base). A client with NO uploaded media gets NO calendar: the
+    builder WAITS (writes nothing, awaiting_media) and the portal shows a red "upload
+    your media" banner. Echo NEVER renders an infographic-only calendar for a client;
+    the house-infographic fallback is LASSO's OWN dogfood calendar only. Every row is
+    PAUSED (pending) and held for human approval; a caption carrying any of the gym's
+    banned words is DROPPED, never emitted. Nothing here publishes and no gate is
+    weakened. Arm by hand in Railway env.
     """
     return _truthy(os.environ.get("AGENT_CLIENT_MONTH", "false"))
 

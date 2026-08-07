@@ -1,16 +1,29 @@
 """
 client_month_run.py: assemble a full month of APPROVABLE DRAFT calendar rows for a
-CLIENT gym that has NO photo library, rendering each day as a house INFOGRAPHIC from
-that gym's OWN approved sources, and upsert them to the shared content_calendar.
+CLIENT gym FROM THAT GYM'S OWN UPLOADED PHOTOS/VIDEOS, and upsert them to the shared
+content_calendar.
+
+NEW RULE (Blake, 2026-08): a CLIENT gym's Organic Social calendar is built ONLY from
+the gym's OWN uploaded media. Echo NEVER renders an infographic-only calendar for a
+client. A client with NO uploaded media does not get a calendar at all: the builder
+WAITS (writes nothing) and reports awaiting_media, so the portal shows a red "upload
+your media" banner. The house-infographic fallback is for LASSO's OWN dogfood calendar
+only, never a client.
 
 Behind AGENT_CLIENT_MONTH (config.client_month_enabled(), default OFF) AND it also
 requires config.client_sources_enabled(). Flag off -> build_client_month returns
 ok:False and touches nothing: no render, no host, no calendar write.
 
 WHAT IT DOES (mirrors real_month_planner / real_calendar_mirror exactly):
-  * For each of `days` days, build a FEED draft and a paired STORY draft via the
-    existing client_content.build_client_draft, passing an infographic template_fn
-    (these gyms have no library, so the thin-library grace path renders the house card).
+  * MEDIA-REQUIRED GUARD: before anything, count the gym's uploaded media files in
+    library_path. Zero usable media -> WAIT: return {ok:False, awaiting_media:True}
+    and touch nothing (no render, no host, no calendar write, no delete).
+  * With media, for each of `days` days build a FEED draft and a paired STORY draft
+    via client_content.build_client_draft (NO template_fn: the day uses the gym's
+    REAL uploaded photo via client_content.pick_image). A day is emitted ONLY when its
+    draft carries a REAL creative (creative_public_url set AND not needs_media). A day
+    with no photo is SKIPPED and logged ("held: no client photo for the day"), NEVER
+    infographic-filled.
   * BANNED-WORD GUARD: a draft whose caption contains any of the gym's banned words
     (case-insensitive, word-boundary) is DROPPED for the day and logged: the word is
     NEVER emitted. The guard first tries the OTHER approved sources/categories for the
@@ -27,71 +40,19 @@ THREE KEYS (do not conflate): read intake by BASE; generate under Account.key
 (gritx_ig); write content_calendar rows with gym_id = BASE (gritx).
 
 HARD RULES: no fabrication (captions come only from approved sources; a banned word is
-never emitted), nothing publishes, no gate weakened, every draft PAUSED for approval.
-Studio / host are injectable so the whole path is offline-testable.
+never emitted), NO infographic is ever produced for a client, nothing publishes, no
+gate weakened, every draft PAUSED for approval. The store is injectable so the whole
+path is offline-testable.
 """
 
+import os
 import re
 
 from . import client_content, config
 from . import real_calendar_mirror as _mirror
 
-
-def infographic_template_fn(account, *, brand=None, studio=None, host=None,
-                            is_story=False):
-    """Build a `template_fn(account, source, day_key) -> url` that renders the house
-    infographic from source.text and returns its hosted public url (or None).
-
-    Rendering path (each piece injectable for tests):
-      1. studio.generate(headline, facts, ...) -> {"path": ...} the Gemini Pro house
-         card. aspect/pixels are the FEED size (1:1, 1080x1080) or, when is_story,
-         the STORY size (9:16, 1080x1920). Default studio is creative_studio.
-      2. summit_rebuild._normalize_to_canvas(path, expected) forces the exact canvas
-         (Gemini returns its native ~928x1152, so normalize before use).
-      3. host.host_media(path, base_tenant) -> public url. Default host is media_host.
-
-    The `account` bound here names the tenant base for hosting (its _ig/_fb suffix is
-    stripped) so a client's cards host under its own tenant prefix. No fabrication: the
-    card's only text is the approved source.text passed through; an empty render or a
-    failed host returns None (the draft then falls back to needs-media, never a blank
-    published card)."""
-    if studio is None:
-        from . import creative_studio as studio  # noqa: PLW0127
-    if host is None:
-        from . import media_host as host  # noqa: PLW0127
-
-    if is_story:
-        aspect, pixels, expected = "9:16", "1080x1920", (1080, 1920)
-        surface = "story"
-    else:
-        aspect, pixels, expected = "1:1", "1080x1080", (1080, 1080)
-        surface = "feed"
-
-    base_tenant = _base_of(getattr(account, "key", "") or "")
-
-    def _template_fn(acct, source, day_key):
-        text = (getattr(source, "text", "") or "").strip()
-        if not text:
-            return None
-        result = studio.generate(
-            headline=text, facts=[text], aspect=aspect, pixels=pixels,
-            surface=surface, account_key=getattr(acct, "key", None))
-        if not result:
-            return None
-        path = result.get("path") if isinstance(result, dict) else result
-        if not path:
-            return None
-        try:
-            from . import summit_rebuild
-            summit_rebuild._normalize_to_canvas(path, expected)
-        except Exception:
-            # A normalization failure is not fabrication; the render still exists.
-            # Host it as-is rather than dropping (the size guard lives on the render
-            # path, not here). But a genuinely absent file cannot host, handled below.
-            pass
-        return host.host_media(path, base_tenant)
-
-    return _template_fn
+# Media extensions that count as a client having uploaded usable creative.
+_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
 
 
 def _base_of(account_key):
@@ -101,6 +62,33 @@ def _base_of(account_key):
         if account_key.endswith(suffix):
             return account_key[: -len(suffix)]
     return account_key
+
+
+def _client_media_count(library_path):
+    """Count the gym's uploaded media files (images + videos) in library_path.
+
+    Counts only regular files whose extension is in _MEDIA_EXTS. A missing, empty, or
+    unreadable directory (or an empty/None path) is 0. Never raises."""
+    path = library_path
+    if not path or not os.path.isdir(path):
+        return 0
+    count = 0
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            if not os.path.isfile(full):
+                continue
+            if os.path.splitext(name)[1].lower() in _MEDIA_EXTS:
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def client_awaiting_media(base_key, library_path):
+    """True when a CLIENT gym has NO usable uploaded media (so Echo must WAIT and the
+    portal must show the red "upload your media" banner). Callers/signal use this."""
+    return _client_media_count(library_path) <= 0
 
 
 def _has_banned_word(text, banned_words):
@@ -119,46 +107,52 @@ def _has_banned_word(text, banned_words):
     return False
 
 
-def _clean_draft_for_day(account, day_key, voice, library_path, template_fn,
-                         banned_words, log):
-    """Build a draft for the day whose caption carries NO banned word, preferring a
-    different approved source/category over dropping the day.
+def _has_real_creative(draft):
+    """True when the draft carries a REAL uploaded creative: a hosted/public url AND it
+    is NOT a needs-media (no-image) draft. This is what makes a day emit a row; a day
+    with no client photo has no real creative and is skipped, never infographic-filled."""
+    if draft is None:
+        return False
+    if getattr(draft, "needs_media", False):
+        return False
+    return bool((getattr(draft, "creative_public_url", "") or "").strip())
 
-    client_content.build_client_draft rotates category+source deterministically per
-    day. To try the OTHER sources for the day without duplicating that private logic,
-    we ask the builder for the day; if its caption is banned, we temporarily HIDE the
-    offending source's category from the account's present-set by shifting the day key
-    by whole weeks (which advances the source cycle within/around the categories) and
-    re-ask, up to a bounded number of attempts. Any draft whose caption still carries a
-    banned word is DROPPED (never emitted).
+
+def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log):
+    """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
+    whose caption carries NO banned word, preferring a different approved source/category
+    over dropping the day.
+
+    client_content.build_client_draft rotates category+source deterministically per day
+    and pairs the day's fact with a real image from the gym's library (pick_image). To
+    try the OTHER sources for the day without duplicating that private logic, we ask the
+    builder for the day; if its caption is banned, we walk neighbouring day keys (same
+    weekday cadence advances the source cycle) and re-ask, up to a bounded number of
+    attempts, re-homing the clean draft onto the real day. Any draft whose caption still
+    carries a banned word is DROPPED (never emitted).
 
     Returns (draft, dropped_reason). draft is None when no clean draft could be built."""
-    # Primary attempt on the real day.
-    draft = build_fn = None
-    build_fn = template_fn
-    draft = client_content.build_client_draft(
-        account, day_key, voice, library_path, template_fn=build_fn)
+    # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
+    draft = client_content.build_client_draft(account, day_key, voice, library_path)
     if draft is None:
         return None, None
     if not _has_banned_word(draft.caption, banned_words):
         return draft, None
 
     # The day's rotated source hit a banned word. Try alternative approved sources by
-    # walking neighbouring day keys (same weekday cadence advances source cycle) so a
-    # DIFFERENT real approved source fills the day before we drop it. Bounded, no I/O
-    # beyond the same builder call, never fabricated.
+    # walking neighbouring day keys so a DIFFERENT real approved source fills the day
+    # before we drop it. Bounded, no I/O beyond the same builder call, never fabricated.
     from datetime import date, timedelta
     base = date.fromisoformat(str(day_key)[:10])
     for step in range(1, 8):
         alt_key = (base + timedelta(days=step)).isoformat()
-        alt = client_content.build_client_draft(
-            account, alt_key, voice, library_path, template_fn=build_fn)
+        alt = client_content.build_client_draft(account, alt_key, voice, library_path)
         if alt is None:
             continue
         if not _has_banned_word(alt.caption, banned_words):
             # Re-home the alternative draft onto the real day so the calendar row sits
-            # on day_key (only the day is re-pointed; the caption/source are the real
-            # approved ones the builder produced).
+            # on day_key (only the day is re-pointed; the caption/source/photo are the
+            # real approved ones the builder produced).
             alt.day_key = day_key
             alt.scheduled_for = draft.scheduled_for
             return alt, None
@@ -173,23 +167,25 @@ def _row_from_draft(base_key, draft):
 
 
 def build_client_month(account, base_key, start_date, days=30, *, voice,
-                       library_path=None, feed_template_fn, story_template_fn,
-                       store, banned_words=(), logger=None):
-    """Assemble a month of PAUSED client calendar rows and apply them via `store`.
+                       library_path=None, store, banned_words=(), logger=None):
+    """Assemble a month of PAUSED client calendar rows FROM THE GYM'S OWN UPLOADED
+    MEDIA and apply them via `store`.
 
     account       the GENERATION Account (e.g. gritx_ig) build_client_draft is keyed by.
     base_key      the TENANT base (e.g. gritx): content_calendar.gym_id AND the delete/
                   insert scope.
     start_date    'YYYY-MM-DD' (or date). days consecutive days from it.
     voice         a loaded VoiceDoc for the account.
-    library_path  None for these no-library gyms (the infographic path fills the slot).
-    feed/story_template_fn  the infographic renderers (see infographic_template_fn);
-                  injectable so tests pass fakes and no Gemini/host call happens.
+    library_path  the gym's uploaded media folder. NO media -> Echo WAITS (see below).
     store         an injectable SupabaseCalendarStore (delete_month + insert_rows).
     banned_words  the gym's never-use words; a caption carrying one is DROPPED.
 
+    MEDIA-REQUIRED: a client with no uploaded photos/videos gets NO calendar. The
+    builder returns {ok:False, awaiting_media:True, ...} and writes NOTHING (no render,
+    no host, no delete, no insert). A client NEVER gets an infographic-only calendar.
+
     Returns {ok, upserted, days, skipped_banned, months}: or {ok:False, reason} when a
-    flag is off or an input is missing (and nothing is touched)."""
+    flag is off, an input is missing, or the gym is awaiting media (nothing touched)."""
     log = logger or (lambda m: print(f"[client-month] {m}"))
     if not config.client_month_enabled():
         return {"ok": False, "reason": "AGENT_CLIENT_MONTH off", "upserted": 0,
@@ -204,6 +200,15 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         return {"ok": False, "reason": "days must be > 0", "upserted": 0, "days": 0,
                 "skipped_banned": 0}
 
+    # MEDIA-REQUIRED GUARD: a client with no uploaded media gets no calendar. WAIT and
+    # write nothing (no render, no host, no delete, no insert). Never an infographic.
+    if _client_media_count(library_path) <= 0:
+        log(f"{base_key}: waiting for client media (no photos/videos uploaded yet); "
+            "nothing rendered, nothing written")
+        return {"ok": False,
+                "reason": "waiting for client media (no photos/videos uploaded yet)",
+                "awaiting_media": True, "upserted": 0, "days": 0, "skipped_banned": 0}
+
     from datetime import date, timedelta
     start = start_date if isinstance(start_date, date) \
         else date.fromisoformat(str(start_date)[:10])
@@ -216,8 +221,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         day_key = (start + timedelta(days=i)).isoformat()
 
         feed, feed_drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, feed_template_fn,
-            banned_words, log)
+            account, day_key, voice, library_path, banned_words, log)
         if feed is None:
             if feed_drop:
                 skipped_banned += 1
@@ -225,19 +229,26 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             else:
                 log(f"skip {day_key} feed: no approved source could build the day")
             continue
+        # MEDIA-ONLY: emit a day only when it carries a REAL uploaded creative. A day
+        # with no client photo is SKIPPED (held), NEVER infographic-filled.
+        if not _has_real_creative(feed):
+            log(f"held: no client photo for the day {day_key} feed")
+            continue
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
 
         story, story_drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, story_template_fn,
-            banned_words, log)
+            account, day_key, voice, library_path, banned_words, log)
         if story is None:
             if story_drop:
                 skipped_banned += 1
                 log(f"drop {day_key} story: {story_drop}")
             else:
                 log(f"skip {day_key} story: no approved source could build the day")
+            continue
+        if not _has_real_creative(story):
+            log(f"held: no client photo for the day {day_key} story")
             continue
         _mark_story(story)
         drafts.append(story)

@@ -8,7 +8,11 @@ AGENT_PORTAL_SOCIAL_ENABLED (default OFF). Flag OFF -> every handler here is ine
 and returns a disabled response, so the service is byte-for-byte its current self.
 
 Endpoints (each token->account_key resolved in intake_web BEFORE these handlers):
-  GET  /portal/<token>/social              -> the month calendar for THIS gym
+  GET  /portal/<token>/social              -> the month calendar for THIS gym.
+       Additive signal fields for the red upload banner: awaiting_media (bool, True when
+       a CLIENT gym has no posts because Echo is waiting on its uploaded media) and
+       upload_url (str, the per-gym tokenized upload link when awaiting_media, else "").
+       The LASSO gym is NEVER flagged awaiting_media.
   POST /portal/<token>/posts/<id>/approve  -> idempotent approve
   POST /portal/<token>/posts/<id>/edit     -> note; re-runs the fabrication gate (422 on fail)
   POST /portal/<token>/posts/<id>/deny     -> reason; decrements the 15/month recreate budget (409 when out)
@@ -309,6 +313,48 @@ def _with_display_image(post, tenant=None):
     return post
 
 
+def _is_lasso_gym(account_key):
+    """True for the LASSO gym itself (its own dogfood calendar). LASSO's OWN calendar
+    is allowed to be infographic-driven and is NEVER flagged awaiting_media. Every LASSO
+    key starts with 'lasso' (e.g. 'lasso', 'lasso_ig', 'lasso-framework-llc'); a client
+    gym uses its own slug and never carries this prefix."""
+    return str(account_key or "").strip().lower().startswith("lasso")
+
+
+def _awaiting_media_signal(account_key, posts):
+    """The red-banner SIGNAL for the portal. Returns (awaiting_media, upload_url):
+
+      * awaiting_media (bool): True when this is a CLIENT gym (NOT the LASSO gym) AND it
+        has NO posts in the calendar (Echo is WAITING on the gym's uploaded media before
+        it builds anything). False for the LASSO gym always, and False whenever the gym
+        has any posts.
+      * upload_url (str): when awaiting_media is True, the gym's per-gym tokenized upload
+        link (ghl_intake.upload_link_for, placeholder-safe); else "".
+
+    Additive: this only computes the two signal fields; it never filters or mutates
+    posts and never publishes."""
+    if _is_lasso_gym(account_key) or (posts or []):
+        return False, ""
+    from . import ghl_intake as _ghl
+    base_key = _base_of_account(account_key)
+    try:
+        upload_url = _ghl.upload_link_for(base_key) or ""
+    except Exception:
+        upload_url = ""
+    return True, upload_url
+
+
+def _base_of_account(account_key):
+    """The tenant base for an account key ('gritx_ig' -> 'gritx'). The /social handler's
+    account_key is already the tenant base in the live content_calendar path, but strip a
+    stray _ig/_fb suffix defensively so the upload link is minted for the tenant."""
+    key = str(account_key or "").strip()
+    for suffix in ("_ig", "_fb"):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
@@ -325,6 +371,7 @@ def _handle_social_supabase(account_key, month, now=None):
     low_creative = not any((p.get("image_public_url") or "") for p in posts)
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -333,6 +380,10 @@ def _handle_social_supabase(account_key, month, now=None):
         "recreate_budget": _budget_state(account_key, now=now),
         "low_creative": low_creative,
         "days_remaining": days_remaining,
+        # Red-banner SIGNAL (additive): a CLIENT gym with no calendar is awaiting its
+        # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
+        "awaiting_media": awaiting_media,
+        "upload_url": upload_url,
     }
 
 
@@ -377,6 +428,7 @@ def handle_social(account_key, month, reader=None, now=None):
 
     low_creative, days_remaining = _low_creative_and_days(account_key, month,
                                                           today=(now.date() if now else None))
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -385,6 +437,10 @@ def handle_social(account_key, month, reader=None, now=None):
         "recreate_budget": _budget_state(account_key, now=now),
         "low_creative": low_creative,
         "days_remaining": days_remaining,
+        # Red-banner SIGNAL (additive): a CLIENT gym with no calendar is awaiting its
+        # uploaded media; upload_url is the per-gym tokenized link. LASSO is never flagged.
+        "awaiting_media": awaiting_media,
+        "upload_url": upload_url,
     }
 
 
