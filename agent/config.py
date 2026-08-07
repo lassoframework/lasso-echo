@@ -321,6 +321,23 @@ def real_month_plan_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_REAL_MONTH_PLAN", "false"))
 
 
+def no_creative_fallback_enabled() -> bool:
+    """
+    No-creative fallback switch (the client calendar card image). OFF by default =
+    zero behavior change: a calendar row with no usable creative image keeps its empty
+    image_public_url exactly as today (the portal renders its existing empty state).
+    When ON, a row whose creative image is missing / None (a Gemini or Nano render that
+    failed or was skipped, or a DAM with nothing) degrades to a clean, on-brand WEBSITE
+    STYLE INFOGRAPHIC rendered from that row's OWN approved text (caption / pillar) via
+    the house PIL renderer, so every calendar day shows a presentable, approvable card
+    instead of a blank or broken one. NO FABRICATION: the infographic text comes only
+    from the row's approved caption / pillar; a row with NO text renders nothing (the
+    upstream still blocks / shows its empty state, never a blank card and never invented
+    copy). Nothing here publishes and no gate is weakened. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_NO_CREATIVE_FALLBACK", "false"))
+
+
 def portal_social_enabled() -> bool:
     """
     Portal client-social MASTER switch (Part A). OFF by default. When OFF, EVERY new
