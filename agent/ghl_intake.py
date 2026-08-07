@@ -53,12 +53,20 @@ def upload_link_for(tenant_key):
     then says the link is coming rather than sending a dead URL). The link is
     SIGNED with the shared secret, so no per-tenant env var is needed. A legacy
     AGENT_INTAKE_TOKEN_<KEY> value, if still set, is honored as a pinned override
-    so a tenant already on the old link keeps it during the cutover."""
-    base = os.environ.get("AGENT_UPLOAD_BASE_URL", "").rstrip("/")
-    if not base:
+    ONLY for the EXACT tenant key it names (the key is baked into the env var
+    name), so a legacy override can never be applied across tenants.
+
+    The base URL comes from intake_web's ONE placeholder-safe resolver, so an
+    unset, non-http, or leftover setup-placeholder AGENT_UPLOAD_BASE_URL falls
+    back to the real service origin and never emits a dead placeholder link."""
+    tenant_key = (tenant_key or "").strip()
+    if not tenant_key:
         return ""
+    from . import intake_web  # lazy: avoids an import cycle (intake_web imports us)
+    base = intake_web._upload_base_url()   # ONE placeholder-safe source of truth
     legacy = os.environ.get(f"{_UPLOAD_TOKEN_ENV_PREFIX}{tenant_key.upper()}", "")
     if legacy:
+        # Pinned to the exact tenant the env var names, never applied elsewhere.
         return f"{base}/u/{legacy}"
     try:
         return f"{base}/u/{intake_tokens.mint(tenant_key)}"
