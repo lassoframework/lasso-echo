@@ -17,6 +17,8 @@ Endpoints (each token->account_key resolved in intake_web BEFORE these handlers)
   POST /portal/<token>/posts/<id>/edit     -> note; re-runs the fabrication gate (422 on fail)
   POST /portal/<token>/posts/<id>/deny     -> reason; decrements the 15/month recreate budget (409 when out)
   POST /portal/<token>/posts/<id>/kill     -> permanent, free, requires confirm=true
+  POST /portal/<token>/autonomy            -> flip per-account autonomy; ON auto-approves
+                                              every currently-pending post + future posts
   GET  /portal/<token>/metrics             -> the Part D report SHAPE (null values until Part C/D)
 
 THREE HARD GATES on every action + read route:
@@ -707,6 +709,109 @@ def handle_kill(account_key, draft_id, actor_id, confirm=False, store=None, read
                      "error": "kill is permanent and requires confirm=true"}
     result = _pa.kill(account_key, draft_id, actor_id, confirmed=True, store=store)
     return (200 if result.get("ok") else 403), result
+
+
+# ==========================================================================
+# POST /portal/<token>/autonomy  -> flip per-account autonomy on/off
+# ==========================================================================
+
+def _autonomy_actor(account_key):
+    """The actor id an autonomous auto-approve acts AS. The gym owner flipped the
+    toggle in the portal, so the approval is made on the account's OWN authority: its
+    first configured approver, falling back to the global approver (the same fallback
+    account.approver_ids() already uses). This keeps every auto-approve inside the
+    existing approver gate rather than bypassing it."""
+    from .accounts import get_account as _get_acct
+    acct = _get_acct(account_key)
+    if acct is not None:
+        try:
+            ids = acct.approver_ids()
+            if ids:
+                return ids[0]
+        except Exception:
+            pass
+    return config.APPROVER_SLACK_ID
+
+
+def _pending_ids_for(account_key, store):
+    """Draft ids of THIS account's currently-PENDING posts. Scoped to account_key
+    (isolation: gym A never sees gym B's pending). Tolerates a store without
+    list_pending (returns none, so the flip still succeeds with approved_count 0)."""
+    lister = getattr(store, "list_pending", None)
+    if lister is None:
+        return []
+    try:
+        pending = lister() or []
+    except Exception:
+        return []
+    ids = []
+    for d in pending:
+        if (getattr(d, "account_key", None) or "") != account_key:
+            continue  # TOKEN ISOLATION: only this account's drafts
+        if getattr(d, "status", None) != DraftStatus.PENDING:
+            continue
+        did = getattr(d, "draft_id", "") or ""
+        if did:
+            ids.append(did)
+    return ids
+
+
+def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=None):
+    """POST /portal/<token>/autonomy  body {"autonomous": true|false}.
+
+    Flips per-account autonomy. On ON: persist the flag, then auto-approve EVERY
+    currently-pending post for THIS account through the SAME gated approve path a
+    manual approve uses (so publishing behaves identically and still obeys
+    AGENT_PUBLISH_ENABLED inside publish()). On OFF: clear the flag and un-approve
+    NOTHING. Returns {ok, autonomous, approved_count}.
+
+    Idempotent + null-safe: flipping ON twice re-persists ON and only approves posts
+    that are STILL pending (already-approved posts are not in the pending sweep, so
+    they never double publish and are not re-counted). A bad/empty account or an
+    approve failure never 500s: it returns a clean body.
+
+    Gates: flag OFF -> disabled (404); missing account -> 400; Stripe social product
+    not ACTIVE -> 402. TOKEN ISOLATION: only this account's pending drafts are ever
+    touched (a draft belonging to another gym is skipped)."""
+    if not config.portal_social_enabled():
+        return _disabled("autonomy")
+    if not account_key:
+        return 400, {"ok": False, "error": "missing account_key"}
+    if not is_social_active(account_key, reader=reader):
+        return 402, {"ok": False, "error": "social plan is not active",
+                     "account_key": account_key,
+                     "autonomous": _db.is_autonomous(account_key)}
+
+    want_on = bool(autonomous)
+    # Persist first so a later approve crash cannot leave the flag unset while posts
+    # went out under it (the flag is the durable record of the client's choice).
+    try:
+        _db.set_autonomy(account_key, want_on)
+    except Exception as exc:
+        return 500, {"ok": False,
+                     "error": f"could not persist autonomy: {type(exc).__name__}",
+                     "account_key": account_key}
+
+    if not want_on:
+        # Manual restored: clear only. Never un-approve anything already published.
+        return 200, {"ok": True, "autonomous": False, "approved_count": 0,
+                     "account_key": account_key}
+
+    # ON: auto-approve every currently-pending post for THIS account via the same
+    # gated approve path a manual approve uses. Never fabricates a publish.
+    actor = actor_id or _autonomy_actor(account_key)
+    approved = 0
+    for draft_id in _pending_ids_for(account_key, store):
+        try:
+            result = _pa.approve(account_key, draft_id, actor, store=store)
+            if result.get("ok"):
+                approved += 1
+        except Exception:
+            # One bad draft never aborts the sweep or 500s the flip; the rest still
+            # auto-approve and the flag stays ON for future posts.
+            continue
+    return 200, {"ok": True, "autonomous": True, "approved_count": approved,
+                 "account_key": account_key}
 
 
 # ==========================================================================

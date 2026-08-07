@@ -136,6 +136,60 @@ def _expire_stale(day_key, store, poster):
     return expire_past_due(store, poster)
 
 
+def _autonomous_publish(draft, store, poster):
+    """PER-ACCOUNT AUTONOMY future-post path. When the draft's account has autonomy ON,
+    auto-approve+publish it through the SAME gated approve path a portal/Slack approve
+    uses (approvals.handle_action -> publisher.publish), then persist the resulting
+    status. Returns True when it handled the draft (approved), False when autonomy is
+    OFF or the attempt could not run, so the caller stores the draft PENDING as before.
+
+    Honesty + safety:
+      - The publisher's own AGENT_PUBLISH_ENABLED guard still applies inside publish():
+        with it OFF the result is a would_publish (no network write), never a fake live.
+      - A MediaNotReady / unauthorized-actor / unknown-account outcome returns False so
+        the draft is stored PENDING and can still be approved manually (never lost).
+    """
+    from . import db as _db
+    account_key = getattr(draft, "account_key", "") or ""
+    if not _db.is_autonomous(account_key):
+        return False
+    from .accounts import get_account as _get_acct
+    from .approvals import handle_action
+    acct = _get_acct(account_key)
+    if acct is None:
+        return False
+    # Act AS the account's own approver (falls back to the global approver), so the
+    # autonomous approve stays inside the existing approver gate, never around it.
+    try:
+        actor = (acct.approver_ids() or [config.APPROVER_SLACK_ID])[0]
+    except Exception:
+        actor = config.APPROVER_SLACK_ID
+    try:
+        result = handle_action("approve", draft, actor, account=acct)
+    except Exception as e:
+        # A real publish failure already alerted inside handle_action; hold the draft
+        # PENDING for a manual retry rather than dropping it.
+        print(f"[autonomy] approve failed for {account_key} {draft.draft_id}: "
+              f"{type(e).__name__}: {e}; holding PENDING")
+        return False
+    if not getattr(result, "ok", False):
+        # e.g. media not ready / not authorized: hold PENDING, do not fake success.
+        return False
+    # handle_action set draft.status to APPROVED on success; persist that record.
+    store.put(draft)
+    from . import db
+    db.audit("autonomy_autopublish", draft.draft_id, result.detail,
+             account_key, getattr(draft, "day_key", ""))
+    try:
+        preview = (draft.caption or "")[:80].replace("\n", " ")
+        poster.post_notice(
+            f"Autonomous ({result.detail}): *{account_key}* | "
+            f"{preview}{'...' if len(draft.caption or '') > 80 else ''}")
+    except Exception:
+        pass  # a Slack notice failure never blocks or un-publishes the post
+    return True
+
+
 def _post_and_save(draft, store, poster, idempotent):
     """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
@@ -207,6 +261,23 @@ def _post_and_save(draft, store, poster, idempotent):
         if idempotent:
             draft.slack_channel = ""
             draft.slack_ts = ""
+        # PER-ACCOUNT AUTONOMY: when the gym has flipped "Autonomous" ON, a
+        # portal-surface draft that would otherwise wait on the client is instead
+        # auto-approved and published through the SAME gated approve path a portal
+        # approve uses (approvals.handle_action -> publisher.publish). The publisher's
+        # own AGENT_PUBLISH_ENABLED guard still applies inside publish(), so autonomy
+        # auto-APPROVES but never bypasses the global publish kill switch.
+        #
+        # Client calendar drafts carry force_approval=True (they must never be caught
+        # by the PORTFOLIO-WIDE AGENT_AUTO_APPROVE / trust-ladder auto-publish above).
+        # Per-account autonomy is the OPPOSITE: an explicit, gym-owner-initiated opt-in
+        # for THIS one gym, so it deliberately overrides force_approval here. A gym that
+        # has NOT flipped autonomy is unchanged: the draft is stored PENDING and waits
+        # on the portal. Any failure falls back to storing PENDING (the post is never
+        # lost, only held for a manual approve).
+        if (draft.status == DraftStatus.PENDING
+                and _autonomous_publish(draft, store, poster)):
+            return
         store.put(draft)
         return
     resp = poster.post_approval_card(draft) or {}

@@ -556,3 +556,166 @@ def test_http_kill_confirm_flows_through(db_env, monkeypatch):
         assert seen == [True]
     finally:
         server.shutdown()
+
+
+# ===========================================================================
+# 11. PER-ACCOUNT AUTONOMY — POST /portal/<token>/autonomy
+# ===========================================================================
+
+class _ListStore(_DictStore):
+    """A _DictStore that also exposes list_pending (the autonomy sweep needs it)."""
+    def list_pending(self):
+        return [d for d in self._d.values() if d.status == DraftStatus.PENDING]
+
+
+def test_autonomy_flag_off_is_404(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.delenv("AGENT_PORTAL_SOCIAL_ENABLED", raising=False)
+    assert ps.handle_autonomy("gymA", True)[0] == 404
+    assert ps.handle_autonomy("gymA", False)[0] == 404
+
+
+def test_autonomy_not_active_returns_402(db_env, monkeypatch):
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    status, body = ps.handle_autonomy("gymA", True, reader=_InactiveReader())
+    assert status == 402
+    assert body["ok"] is False
+
+
+def test_autonomy_missing_account_is_400(db_env, monkeypatch):
+    status, body = ps.handle_autonomy("", True)
+    assert status == 400
+    assert body["ok"] is False
+
+
+def test_autonomy_on_persists_flag_and_auto_approves_pending(db_env, monkeypatch):
+    """Flipping ON persists the flag AND auto-approves every currently-pending post
+    for the account through the real approve path (would_publish with the publish flag
+    off is a real approval, not a fabricated live)."""
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)  # would_publish path
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    store = _ListStore(_draft("d1", "gymA"), _draft("d2", "gymA"))
+    status, body = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())
+    assert status == 200
+    assert body["ok"] is True
+    assert body["autonomous"] is True
+    assert body["approved_count"] == 2
+    # flag is durably persisted
+    assert _db.is_autonomous("gymA") is True
+    # both drafts are now APPROVED through the real path (no fabricated publish)
+    assert store.get("d1").status == DraftStatus.APPROVED
+    assert store.get("d2").status == DraftStatus.APPROVED
+
+
+def test_autonomy_off_clears_flag_and_unapproves_nothing(db_env, monkeypatch):
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    _db.set_autonomy("gymA", True)
+    approved = _draft("d1", "gymA", status=DraftStatus.APPROVED)
+    store = _ListStore(approved, _draft("d2", "gymA"))
+    status, body = ps.handle_autonomy("gymA", False, store=store, reader=_ActiveReader())
+    assert status == 200
+    assert body["autonomous"] is False
+    assert body["approved_count"] == 0
+    assert _db.is_autonomous("gymA") is False
+    # nothing is un-approved; the pending one is left pending (manual restored)
+    assert store.get("d1").status == DraftStatus.APPROVED
+    assert store.get("d2").status == DraftStatus.PENDING
+
+
+def test_autonomy_isolation_only_own_pending(db_env, monkeypatch):
+    """gymA turning autonomy ON must never approve gymB's pending draft."""
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)
+    _register(monkeypatch, _account("gymA"), _account("gymB"))
+    _mark_stripe_customer("gymA")
+    _mark_stripe_customer("gymB")
+    store = _ListStore(_draft("dA", "gymA"), _draft("dB", "gymB"))
+    status, body = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())
+    assert status == 200
+    assert body["approved_count"] == 1  # only gymA's draft
+    assert store.get("dA").status == DraftStatus.APPROVED
+    assert store.get("dB").status == DraftStatus.PENDING  # gymB untouched
+    assert _db.is_autonomous("gymB") is False  # gymB's flag never set
+
+
+def test_autonomy_on_is_idempotent(db_env, monkeypatch):
+    """Flipping ON twice re-persists ON and never double-approves an already-approved
+    post (already-approved drafts are not in the pending sweep, so approved_count is 0
+    on the second call)."""
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    store = _ListStore(_draft("d1", "gymA"))
+    first = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
+    assert first["approved_count"] == 1
+    second = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())[1]
+    assert second["approved_count"] == 0  # nothing left pending to approve
+    assert _db.is_autonomous("gymA") is True
+
+
+def test_autonomy_store_without_list_pending_still_flips(db_env, monkeypatch):
+    """A store lacking list_pending never crashes: the flag still flips, count is 0."""
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    store = _DictStore(_draft("d1", "gymA"))  # no list_pending
+    status, body = ps.handle_autonomy("gymA", True, store=store, reader=_ActiveReader())
+    assert status == 200
+    assert body["approved_count"] == 0
+    assert _db.is_autonomous("gymA") is True
+
+
+def test_autonomy_no_dashes_or_vendor_in_messages(db_env, monkeypatch):
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    msgs = []
+    msgs += _message_strings(ps.handle_autonomy("gymA", True, reader=_InactiveReader())[1])
+    msgs += _message_strings(ps.handle_autonomy("", True)[1])
+    for s in msgs:
+        for bad in ("—", "–", "-", "vendor"):
+            assert bad not in s, f"client message contains banned token {bad!r}: {s!r}"
+
+
+def test_http_autonomy_routes_and_persists(db_env, monkeypatch):
+    """End to end: the HTTP layer resolves the token to account_key and the flag lands."""
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)
+    _register(monkeypatch, _account("gymA"))
+    _mark_stripe_customer("gymA")
+    monkeypatch.setattr("agent.intake_web.client_for_token", lambda t: "gymA")
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda k: False)
+    monkeypatch.setattr("agent.portal_social.is_social_active",
+                        lambda ak, reader=None: True)
+    import urllib.request, json
+    server, port = _serve(monkeypatch)
+    try:
+        payload = json.dumps({"autonomous": True}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/portal/validtoken123/autonomy",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        resp = urllib.request.urlopen(req)
+        body = json.loads(resp.read())
+        assert body["ok"] is True
+        assert body["autonomous"] is True
+        assert _db.is_autonomous("gymA") is True
+    finally:
+        server.shutdown()
+
+
+def test_http_autonomy_flag_off_is_404(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.delenv("AGENT_PORTAL_SOCIAL_ENABLED", raising=False)
+    monkeypatch.setattr("agent.intake_web.client_for_token", lambda t: "gymA")
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda k: False)
+    import urllib.request, urllib.error, json
+    server, port = _serve(monkeypatch)
+    try:
+        payload = json.dumps({"autonomous": True}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/portal/validtoken123/autonomy",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(req)
+        assert ei.value.code == 404
+    finally:
+        server.shutdown()

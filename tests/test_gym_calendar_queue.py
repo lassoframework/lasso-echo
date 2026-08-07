@@ -292,6 +292,53 @@ def test_client_draft_no_slack_card_lasso_draft_has_one(armed, monkeypatch):
     assert lasso_draft in poster2.cards              # slack card as always
 
 
+def test_autonomous_client_draft_auto_approves_no_card(armed, monkeypatch):
+    """PER-ACCOUNT AUTONOMY: when the client gym has autonomy ON, a future portal-surface
+    draft is auto-approved+published through the real approve path (would_publish with
+    AGENT_PUBLISH_ENABLED off = a real approval, not a fabricated live) and NO approval
+    card is posted. A NON-autonomous client gym is unchanged (stored PENDING)."""
+    from agent import runner
+    monkeypatch.delenv("AGENT_PUBLISH_ENABLED", raising=False)  # would_publish path
+    monkeypatch.setattr(config, "auto_approve_enabled", lambda: False)
+    monkeypatch.setattr(config, "trust_dryrun_enabled", lambda: False)
+    monkeypatch.setattr(config, "trust_autopublish_enabled", lambda: False)
+    _fake_client_account(monkeypatch)
+    db.set_autonomy("acme_ig", True)  # gym owner flipped Autonomous ON
+
+    d = Draft(draft_id="gcalf_auto", account_key="acme_ig", platform="instagram",
+              caption="cap", hashtags=[], creative_path="x.png",
+              creative_public_url="https://cdn.test/x.png",
+              scheduled_for="2026-08-07T18:30:00Z", status=DraftStatus.PENDING,
+              day_key="2026-08-07", draft_type="feed", force_approval=True)
+    poster, store = _Poster(), _Store()
+    runner._post_and_save(d, store, poster, idempotent=False)
+    assert d not in poster.cards                 # NO approval card
+    assert d.status is DraftStatus.APPROVED      # real approval through the gate
+    assert d in store.saved                       # persisted as APPROVED
+
+
+def test_non_autonomous_client_draft_still_waits(armed, monkeypatch):
+    """A client gym WITHOUT autonomy is unchanged: the draft is stored PENDING and no
+    card is posted (it waits on the portal), exactly as before this feature."""
+    from agent import runner
+    monkeypatch.setattr(config, "auto_approve_enabled", lambda: False)
+    monkeypatch.setattr(config, "trust_dryrun_enabled", lambda: False)
+    monkeypatch.setattr(config, "trust_autopublish_enabled", lambda: False)
+    _fake_client_account(monkeypatch)
+    db.set_autonomy("acme_ig", False)  # explicitly manual
+
+    d = Draft(draft_id="gcalf_manual", account_key="acme_ig", platform="instagram",
+              caption="cap", hashtags=[], creative_path="x.png",
+              creative_public_url="https://cdn.test/x.png",
+              scheduled_for="2026-08-07T18:30:00Z", status=DraftStatus.PENDING,
+              day_key="2026-08-07", draft_type="feed", force_approval=True)
+    poster, store = _Poster(), _Store()
+    runner._post_and_save(d, store, poster, idempotent=False)
+    assert d not in poster.cards               # portal surface: still no card
+    assert d.status is DraftStatus.PENDING     # unchanged: waits for the client
+    assert d in store.saved
+
+
 def test_post_and_save_flag_off_client_still_cards(monkeypatch):
     """FLAG OFF: byte-for-byte current behavior. A client account's draft still posts
     a Slack approval card (surface routing collapses to slack), so nothing about

@@ -1120,6 +1120,16 @@ def build_server(port=None):
                 return m.group(1), m.group(2)
             return None, None
 
+        def _portal_autonomy_route(self):
+            """Part B per-account autonomy toggle: POST /portal/<token>/autonomy.
+            Returns the token, else None. Gated by AGENT_PORTAL_SOCIAL_ENABLED at the
+            handler; a disabled route 404s. Body is JSON {"autonomous": true|false}."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/autonomy$",
+                self.path.split("?")[0],
+            )
+            return m.group(1) if m else None
+
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
@@ -1353,6 +1363,29 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 status, resp = _zr.handle_facebook_page_select(account_key, body.get("page_id", ""))
+                return self._send_json(resp, status)
+
+            # Part B per-account autonomy toggle: POST /portal/<token>/autonomy.
+            # Gated by AGENT_PORTAL_SOCIAL_ENABLED (handler 404s when off). Token->account;
+            # unknown/revoked token = 404. Body is JSON {"autonomous": true|false}. On true
+            # the handler auto-approves every currently-pending post for THIS account through
+            # the same gated approve path (isolation: only this account's drafts are touched).
+            au_token = self._portal_autonomy_route()
+            if au_token is not None:
+                account_key = client_for_token(au_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                autonomous = bool(body.get("autonomous", False))
+                from .store import PendingStore
+                status, resp = _ps.handle_autonomy(account_key, autonomous,
+                                                   store=PendingStore())
                 return self._send_json(resp, status)
 
             # Part B client-social ACTION routes: POST /portal/<token>/posts/<id>/{approve

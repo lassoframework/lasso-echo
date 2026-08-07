@@ -253,6 +253,35 @@ def kv_set(key, value):
         conn.commit()
 
 
+# ---- per-account autonomy flag ----------------------------------------------------
+# A gym owner flips "Autonomous" in the portal. When ON, Echo stops requiring a
+# per-post approval for THAT account: currently-pending posts are auto-approved and
+# future generated posts land as approved (still gated by AGENT_PUBLISH_ENABLED for
+# the actual publish). Stored in the shared kv table, keyed per account_key, so the
+# flag is durable across restarts and scoped to one gym (gym A's flag never touches
+# gym B's). NEVER a token or secret. Default (no row) = manual/approve-each.
+
+def _autonomy_key(account_key):
+    return f"portal_autonomy_{account_key or ''}"
+
+
+def set_autonomy(account_key, on):
+    """Persist the autonomy flag for one account. on truthy -> "1" (autonomous),
+    falsy -> "0" (manual). Null-safe: an empty account_key is a harmless no-op key."""
+    kv_set(_autonomy_key(account_key), "1" if on else "0")
+
+
+def is_autonomous(account_key):
+    """True iff the account's autonomy flag is ON. Null-safe: a missing row, an empty
+    account_key, or an unreadable value reads as False (manual, the safe default)."""
+    if not account_key:
+        return False
+    try:
+        return str(kv_get(_autonomy_key(account_key), "0")).strip() == "1"
+    except Exception:
+        return False
+
+
 def counter_bump(name, day):
     """Increment and return the (name, day) counter. Idempotent schema, atomic."""
     with _lock, connect() as conn:
