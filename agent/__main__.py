@@ -124,6 +124,7 @@ def _status():
     print(f"  category_rotation: {config.category_rotation_enabled()}  "
           f"(env AGENT_CATEGORY_ROTATION)")
     print(f"  client_sources : {config.client_sources_enabled()}  (env AGENT_CLIENT_SOURCES)")
+    print(f"  client_month   : {config.client_month_enabled()}  (env AGENT_CLIENT_MONTH)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
     print(f"  welcome_tmpl   : {config.welcome_templates_enabled()}  (env AGENT_WELCOME_TEMPLATES_ENABLED)")

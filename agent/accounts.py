@@ -143,6 +143,57 @@ ACCOUNTS = [
         active=False,                # arm after tokens + voice doc are filled
         # trust defaults to FULL_APPROVAL (level 0). Do not change here.
     ),
+    # ---- No-photo-library CLIENT gyms (social-intake onboarded). These draft the
+    # month as house infographics from their OWN approved sources (client_month_run),
+    # behind AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES. Three keys per gym: the tenant
+    # base ("gritx") is echo_social_intake.client_key AND content_calendar.gym_id; the
+    # _ig account is the generation key; the _fb account is the Facebook mirror. All
+    # active=False so the daily runner never auto-drafts/publishes them. Tokens + voice
+    # docs are filled by hand before arming.
+    Account(
+        key="gritx_ig",
+        display_name="GritX IG",
+        platform=Platform.INSTAGRAM,
+        token_env="AGENT_GRITX_IG_TOKEN",
+        target_id_env="AGENT_GRITX_IG_ID",
+        voice_doc="brand_voice/gritx/lasso_voice.md",
+        social_proof_doc="brand_voice/gritx/social_proof.md",
+        library_prefix="content_library/gritx",
+        active=False,
+    ),
+    Account(
+        key="gritx_fb",
+        display_name="GritX Facebook Page",
+        platform=Platform.FACEBOOK_PAGE,
+        token_env="AGENT_GRITX_FB_TOKEN",
+        target_id_env="AGENT_GRITX_FB_PAGE_ID",
+        voice_doc="brand_voice/gritx/lasso_voice.md",
+        social_proof_doc="brand_voice/gritx/social_proof.md",
+        library_prefix="content_library/gritx",
+        active=False,
+    ),
+    Account(
+        key="topfuel_ig",
+        display_name="Top Fuel IG",
+        platform=Platform.INSTAGRAM,
+        token_env="AGENT_TOPFUEL_IG_TOKEN",
+        target_id_env="AGENT_TOPFUEL_IG_ID",
+        voice_doc="brand_voice/topfuel/lasso_voice.md",
+        social_proof_doc="brand_voice/topfuel/social_proof.md",
+        library_prefix="content_library/topfuel",
+        active=False,
+    ),
+    Account(
+        key="topfuel_fb",
+        display_name="Top Fuel Facebook Page",
+        platform=Platform.FACEBOOK_PAGE,
+        token_env="AGENT_TOPFUEL_FB_TOKEN",
+        target_id_env="AGENT_TOPFUEL_FB_PAGE_ID",
+        voice_doc="brand_voice/topfuel/lasso_voice.md",
+        social_proof_doc="brand_voice/topfuel/social_proof.md",
+        library_prefix="content_library/topfuel",
+        active=False,
+    ),
     # Kept as an INACTIVE record for history. Meta ended personal-profile publishing
     # in 2018 (Graph API cannot post to a personal profile), so this account can never
     # publish and must not generate daily draft cards. active=False excludes it from
