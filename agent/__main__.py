@@ -760,6 +760,7 @@ _COMMANDS = {
     ],
     "campaigns": [
         ("summit-queue", "upload + schedule LASSO Growth Summit infographic posts (--images-dir / --from-manifest)"),
+        ("summit-rebuild", "render + host the SUMMIT SPRINT concept cards (feed + 9:16 story) into the summit manifest so the sprint fires (--images-dir; behind AGENT_SUMMIT_CAMPAIGN_ENABLED + hosting)"),
         ("book-queue", "upload + schedule The Full Gym book launch infographic posts (--images-dir / --from-manifest)"),
         ("book-stories", "upload + schedule The Full Gym book launch story cards (--images-dir / --from-manifest)"),
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
@@ -2450,6 +2451,20 @@ def main(argv=None):
                 _sprint = True; i += 1; continue
             i += 1
         _sq_run(images_dir=_images_dir, from_manifest=_from_manifest, sprint=_sprint)
+    elif cmd == "summit-rebuild":
+        # Render + host the SUMMIT SPRINT concept cards (feed via the studio, paired
+        # 9:16 stories, agenda/panel feed-only) into summit_queue's manifest so the
+        # laid-out sprint can serve them. Gated on AGENT_SUMMIT_CAMPAIGN_ENABLED +
+        # hosting; idempotent (already-hosted files skipped); no fabrication.
+        from .summit_rebuild import render_and_host_all as _sr_render
+        _images_dir = os.path.join(config.LIBRARY_PATH, "summit_sprint")
+        _sr_args = argv[1:]
+        i = 0
+        while i < len(_sr_args):
+            if _sr_args[i] == "--images-dir" and i + 1 < len(_sr_args):
+                _images_dir = _sr_args[i + 1]; i += 2; continue
+            i += 1
+        _sr_render(_images_dir)
     elif cmd == "book-queue":
         from .book_queue import run as _bq_run
         _images_dir = None
