@@ -27,9 +27,23 @@ No dashes/hyphens anywhere. "NOV 7 + 8" on art, "November 7 and 8" in captions.
 No week numbers or post dates baked into art; the schedule owns dates.
 """
 
+import os
+
 LOGO_ASSET = "agent/assets/summit_logo.png"
 CTA_URL = "lassoframework.com/summit"
 ACCOUNTS = ["lasso_ig", "lasso_fb"]
+
+# Feed cards are square 1080; stories are 9:16 tall. Asserted on every render so a
+# cropped or mis-sized card can never enter the sprint (a story is a native-tall
+# composition, never a cropped feed).
+FEED_SIZE = (1080, 1080)
+STORY_SIZE = (1080, 1920)
+HOST_BUCKET = "lasso_summit"
+
+# The three sprint assets that are NOT concept cards: the two agenda days and the
+# panel. summit_render owns their PIL renderers (verified facts only), never the
+# studio, and they have NO paired story (honestly skipped downstream).
+AGENDA_PANEL_FILES = ("08_agenda_day1.png", "09_agenda_day2.png", "22_panel_future.png")
 
 # Each concept renders TWO treatments:
 #   A = type-led editorial (Anton oversized headline, ONE red word, Oswald
@@ -247,3 +261,191 @@ def build_schedule(start_slots):
                 plan.append((date, concept_id, treatment, acct))
             slot += 1
     return plan
+
+
+# ---- render + host loop ----------------------------------------------------
+# Turns the laid-out sprint from a list of filenames into hosted URLs in
+# summit_queue's manifest, so sprint_assets()/sprint_builders() actually serve
+# something. Every render + host + manifest-store is injectable so the whole loop
+# runs offline in tests (no live Gemini, no live R2). Idempotent: a filename
+# already in the manifest is skipped (no re-render, no re-host), so a re-run only
+# fills the gaps. No fabrication: a concept whose facts resolve empty renders
+# NOTHING (the studio returns None); its filename is left out of the manifest.
+
+
+def _concept_facts(concept):
+    """The APPROVED lines passed to the studio as concept context for one card.
+
+    Built ONLY from the concept's own spec: its deck, its optional support line,
+    and the verified event facts. Nothing invented. If every line is empty the
+    result is empty and the caller renders NOTHING (the no-fabrication contract,
+    mirrored from creative_studio.generate: empty facts -> None)."""
+    from .summit_render import DEFAULT_FACTS
+    lines = []
+    for key in ("deck", "support"):
+        val = str(concept.get(key, "") or "").strip()
+        if val:
+            lines.append(val)
+    lines.extend(DEFAULT_FACTS)
+    return [ln for ln in lines if str(ln).strip()]
+
+
+def _assert_size(path, expected, label):
+    """Verify a rendered PNG is exactly the expected (w, h). Never crops or resizes
+    to fit: a wrong size is a hard error so a cropped feed can never reach the sprint."""
+    from PIL import Image
+    with Image.open(path) as im:
+        size = im.size
+    if size != expected:
+        raise ValueError(
+            f"{label} {os.path.basename(path)} is {size}, expected {expected}. "
+            "Refusing to host a mis-sized card (a story is never a cropped feed)."
+        )
+
+
+def _concept_by_treatment():
+    """Ordered (concept, treatment, feed_filename, has_story) for every non-deferred
+    concept card, arc-ordered exactly like sprint_assets(). Concept cards always
+    have a paired story; the agenda/panel cards (handled separately) never do."""
+    by_id = {c["id"]: c for c in SUMMIT_CONCEPTS}
+    out = []
+    for cid in ARC_ORDER:
+        c = by_id.get(cid)
+        if not c:
+            continue
+        for t in ("a", "b"):
+            out.append((c, t, f"{cid}_{t}.png", True))
+    return out
+
+
+def render_and_host_all(images_dir, *, studio=None, story_renderer=None,
+                        agenda_renderer=None, panel_renderer=None, host=None,
+                        load_manifest=None, save_manifest=None):
+    """Render every non-deferred sprint asset, host it, and write filename -> URL
+    into summit_queue's manifest so sprint_assets()/sprint_builders() serve them.
+
+    For each non-deferred concept x treatment (a, b): render the 1080x1080 FEED card
+    via the studio (creative_studio.generate; headline + facts from that concept's
+    spec), render the paired 1080x1920 STORY via the summit stories renderer, host
+    BOTH, and record both filenames. The three agenda/panel FEED cards are rendered
+    by summit_render's own PIL renderers and hosted feed-only (no paired story:
+    honestly skipped). The scarcity concepts (08/09/10 half full / moving fast /
+    last seats) are DEFERRED and never rendered here.
+
+    Gated: AGENT_SUMMIT_CAMPAIGN_ENABLED must be armed AND hosting enabled; otherwise
+    this is a no-op that reports and returns an empty summary. Idempotent: a filename
+    already in the manifest is skipped (no re-render, no re-host). No fabrication: a
+    concept whose facts resolve empty renders nothing (studio None) and is left out.
+
+    Every render/host/manifest hook is injectable so tests run fully offline with no
+    live Gemini and no live R2.
+    """
+    from . import config
+    from . import creative_studio, media_host, summit_render, summit_queue
+
+    studio = studio or creative_studio
+    story_renderer = story_renderer or summit_render.render_card_story
+    agenda_renderer = agenda_renderer or summit_render.render_agenda
+    panel_renderer = panel_renderer or summit_render.render_panel
+    host = host or media_host.host_media
+    load_manifest = load_manifest or summit_queue._load_manifest
+    save_manifest = save_manifest or summit_queue._save_manifest
+
+    summary = {"rendered": [], "hosted": [], "skipped_hosted": [],
+               "skipped_story": [], "deferred": list(DEFERRED_SCARCITY),
+               "none_facts": []}
+
+    if not config.summit_campaign_enabled():
+        print("AGENT_SUMMIT_CAMPAIGN_ENABLED is OFF. Summit rebuild is dormant; "
+              "nothing rendered or hosted. (Arm the flag to run; nothing publishes.)")
+        return summary
+    if not config.hosting_enabled():
+        print("AGENT_HOSTING_ENABLED is OFF. Cannot host rendered cards; nothing done.")
+        return summary
+
+    os.makedirs(images_dir, exist_ok=True)
+    manifest = load_manifest() or {}
+    dirty = False
+
+    def _host_and_record(fname, path, kind, expected):
+        """Assert size, host, and record fname -> url in the manifest. Returns True
+        when a new URL was written."""
+        nonlocal dirty
+        _assert_size(path, expected, kind)
+        url = host(path, HOST_BUCKET)
+        if not url:
+            print(f"  host FAILED: {fname} (left out of manifest)")
+            return False
+        manifest[fname] = url
+        summary["hosted"].append(fname)
+        dirty = True
+        print(f"  hosted {fname} -> {url}")
+        return True
+
+    # ---- concept cards: feed via studio + paired 9:16 story ----------------
+    for concept, treatment, feed_name, _has_story in _concept_by_treatment():
+        story_name = f"{concept['id']}_{treatment}_story.png"
+
+        # FEED (idempotent: skip a filename already hosted)
+        if feed_name in manifest:
+            summary["skipped_hosted"].append(feed_name)
+            print(f"  already hosted: {feed_name}")
+        else:
+            facts = _concept_facts(concept)
+            feed_path = os.path.join(images_dir, feed_name)
+            result = studio.generate(
+                concept["headline"], facts, out_path=feed_path,
+                aspect="1:1", pixels="1080x1080",
+                surface="summit feed post", account_key=None)
+            if not result:
+                # empty facts / flag off / no client: render NOTHING, never faked.
+                summary["none_facts"].append(feed_name)
+                print(f"  studio returned None (no fabrication): {feed_name}")
+            else:
+                summary["rendered"].append(feed_name)
+                _host_and_record(feed_name, feed_path, "FEED", FEED_SIZE)
+
+        # STORY (paired 9:16; concept cards always have one)
+        if story_name in manifest:
+            summary["skipped_hosted"].append(story_name)
+            print(f"  already hosted: {story_name}")
+        elif feed_name in summary["none_facts"]:
+            # if the feed had no facts we do not fabricate a story either
+            summary["skipped_story"].append(story_name)
+        else:
+            story_path = os.path.join(images_dir, story_name)
+            story_renderer(concept, treatment, story_path)
+            summary["rendered"].append(story_name)
+            _host_and_record(story_name, story_path, "STORY", STORY_SIZE)
+
+    # ---- agenda + panel cards: feed only, PIL-rendered, NO story -----------
+    _agenda_panel = (
+        ("08_agenda_day1.png", agenda_renderer, summit_render.AGENDA_DAY1),
+        ("09_agenda_day2.png", agenda_renderer, summit_render.AGENDA_DAY2),
+        ("22_panel_future.png", panel_renderer, summit_render.PANEL),
+    )
+    for fname, renderer, spec in _agenda_panel:
+        summary["skipped_story"].append(_story_stem(fname))  # honest: never a story
+        if fname in manifest:
+            summary["skipped_hosted"].append(fname)
+            print(f"  already hosted: {fname}")
+            continue
+        path = os.path.join(images_dir, fname)
+        renderer(spec, path)
+        summary["rendered"].append(fname)
+        _host_and_record(fname, path, "FEED", FEED_SIZE)
+
+    if dirty:
+        save_manifest(manifest)
+    print(f"\nsummit-rebuild: {len(summary['hosted'])} hosted, "
+          f"{len(summary['skipped_hosted'])} already hosted, "
+          f"{len(summary['none_facts'])} skipped (no facts), "
+          f"deferred {len(summary['deferred'])} scarcity concepts (never rendered).")
+    return summary
+
+
+def _story_stem(feed_filename):
+    """The paired story filename an agenda/panel card would have if it had one
+    (it does not). Reported so the honest skip is visible in the summary."""
+    stem, ext = os.path.splitext(feed_filename)
+    return f"{stem}_story{ext or '.png'}"
