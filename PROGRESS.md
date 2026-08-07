@@ -6,7 +6,83 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
+
+---
+
+## FIX: Stories posting the wrong image size, permanently (2026-08-05)
+
+Blake reported (with a screenshot) a live IG Story -- `b2b_five_companies`,
+"Five companies. Five invoices. Zero answers." -- with its footer URL cropped:
+"RAMEWORK.COM" instead of "LASSOFRAMEWORK.COM". He'd had this "fixed" before and
+it was still happening. It was: a real fix (`769a0da`, "stories: true 9:16
+vertical composition") landed on a side branch back on 2026-07-01 and never got
+merged to main, so Railway never had it -- the exact class of drift CLAUDE.md
+warns about. But that wasn't even the live root cause: `creative_studio.py` on
+main already has the proper `STORY_LAYOUT` composition. The actual bug is one
+level up, in how a Story creative gets CHOSEN:
+
+- `stories.py`'s purpose-built 9:16 re-render only fires when
+  `_is_studio_creative()` is true (filename starts with `nano_`). Every
+  `regen_library.py` concept saves as `lasso_v2_<key>.png`, so this check is
+  false for ALL of them -- the daily-studio path and the library path are two
+  different pipelines and only one of them ever got the fix.
+- The other way to get a real 9:16 asset, the premade `*_story.png` sibling
+  lookup, is gated behind `AGENT_STORY_PREMADE_ENABLED` (default OFF, per
+  `docs/ENV.md`) AND requires `regen_library.py`'s per-concept `"story": True`
+  flag. Checked: **65 of 67 concepts ship `"story": False`**, including
+  `b2b_five_companies`. So even arming the flag would not have produced a
+  sibling file for this card -- it was never generated.
+
+With both purpose-built paths closed, Stories were falling through to "reuse
+the feed image as-is." The module's own docstring said "Meta letterboxes a
+non-9:16 image in a Story" -- that assumption is wrong. Meta zoom-crops to
+fill, cutting content off the left and right edges. That is the screenshot.
+
+### The permanent fix
+
+Rather than fix the data (flip 65 booleans and re-spend Nano credits
+regenerating the whole library) or the flag (one more thing to remember to
+arm), `agent/stories.py` gained `ensure_story_safe(path)`: a deterministic,
+local, zero-cost PIL check applied to WHATEVER creative survives the existing
+branches (premade, studio-regenerated, or the plain feed reuse), right before
+hosting. It checks the actual pixel aspect ratio -- not the filename, not a
+flag, not a per-concept switch -- and pads anything that is not genuinely
+1080x1920 onto a true 9:16 canvas (scaled to fill width or height as
+appropriate, padded in a color sampled from the image's own top edge so the
+seam is invisible), then re-hosts the padded file under its own URL. An
+already-9:16 asset (premade or studio) passes through completely unchanged, so
+this never re-processes or re-hosts something that was already correct.
+
+This closes the bug class permanently: it cannot regress because a flag gets
+left OFF, or because a new concept forgets `"story": True`, or because a
+future content pipeline saves under some other filename convention. Every
+Story creative is checked at the pixel level, every time, with no opt-out.
+
+`agent/stories.py`'s premade branch no longer returns early (it now falls
+through like the studio branch already did) so the safety net sees whatever
+it produced too -- defense in depth, since Nano/Gemini generation is not
+guaranteed to return exactly 1080x1920 even when asked for it.
+
+10 new tests in `tests/test_stories.py`: `ensure_story_safe` pads a 4:5 feed
+image, a square image, and a taller-than-9:16 source; no-ops on an already-9:16
+canvas, a missing file, and a video path; never mutates the source file; pads
+in the image's own edge color. Plus two end-to-end tests on `build_story_draft`
+itself: a real non-9:16 library asset (the exact production shape of the
+bug) must NOT reach the final draft with its original 4:5 public URL, and a
+correctly-sized premade variant must NOT be needlessly re-padded or re-hosted.
+
+Suite: 1869 passed, 26 skipped, 2 failed (same two pre-existing, environment-
+only ffmpeg failures, unrelated).
+
+**Not touched, on purpose:** the 65 `"story": False` entries in
+`regen_library.py` and the `AGENT_STORY_PREMADE_ENABLED` flag are left as they
+are. They still control whether a card gets the NICER, purpose-built AI-
+rendered 9:16 variant; `ensure_story_safe` is the correctness floor underneath
+all of that, not a replacement for it. Blake: if you want the premium 9:16
+renders (not just the safe pad) for specific concepts, flip their `"story"` to
+`True` and re-run `regen-library` for those keys -- that is a real Nano spend,
+so I did not do it unprompted for all 65.
 
 ---
 

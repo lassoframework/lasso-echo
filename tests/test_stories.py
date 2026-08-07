@@ -325,3 +325,131 @@ def test_story_fallback_hosting_provides_url(monkeypatch):
     assert story.creative_public_url == "https://cdn.test/hosted.png"
     assert story.is_story is True
     assert story.status == DraftStatus.PENDING
+
+
+# ---- 9. ensure_story_safe: guaranteed 9:16, the permanent fix -----------------
+# Root cause (2026-08-05): regen_library ships "story": False for 65 of its 67
+# concepts, and AGENT_STORY_PREMADE_ENABLED defaults OFF, so almost every real
+# library card fell through to "reuse the feed image as-is" -- and Meta does
+# NOT letterbox a non-9:16 Story image, it zoom-crops it, cutting content off
+# the edges (confirmed against a real published b2b_five_companies Story whose
+# footer URL was cropped). These tests pin the fix so it cannot silently
+# regress again regardless of any flag or per-concept config.
+
+from PIL import Image  # noqa: E402
+
+
+def _make_png(path, size, color=(250, 246, 240)):
+    Image.new("RGB", size, color).save(path)
+    return str(path)
+
+
+def test_ensure_story_safe_pads_a_4x5_feed_image_to_true_9x16(tmp_path):
+    src = _make_png(tmp_path / "lasso_v2_b2b_five_companies.png", (1080, 1350))
+    out = stories.ensure_story_safe(src)
+    assert out != src
+    im = Image.open(out)
+    assert im.size == (stories.STORY_TARGET_W, stories.STORY_TARGET_H)
+
+
+def test_ensure_story_safe_pads_a_square_image(tmp_path):
+    src = _make_png(tmp_path / "square.png", (1080, 1080))
+    out = stories.ensure_story_safe(src)
+    im = Image.open(out)
+    assert im.size == (1080, 1920)
+
+
+def test_ensure_story_safe_pads_sides_for_a_taller_than_9x16_source(tmp_path):
+    src = _make_png(tmp_path / "very_tall.png", (600, 1920))  # narrower than 9:16
+    out = stories.ensure_story_safe(src)
+    im = Image.open(out)
+    assert im.size == (1080, 1920)
+
+
+def test_ensure_story_safe_noop_when_already_9x16(tmp_path):
+    src = _make_png(tmp_path / "already_9x16.png", (1080, 1920))
+    out = stories.ensure_story_safe(src)
+    assert out == src, "an already-correct canvas must not be re-padded or renamed"
+
+
+def test_ensure_story_safe_noop_for_missing_file():
+    assert stories.ensure_story_safe("") == ""
+    assert stories.ensure_story_safe("/nope/does/not/exist.png") == "/nope/does/not/exist.png"
+
+
+def test_ensure_story_safe_noop_for_video():
+    assert stories.ensure_story_safe("clip.mp4") == "clip.mp4"
+
+
+def test_ensure_story_safe_never_mutates_the_source_file(tmp_path):
+    src = _make_png(tmp_path / "feed.png", (1080, 1350))
+    before = Image.open(src).size
+    stories.ensure_story_safe(src)
+    assert Image.open(src).size == before
+
+
+def test_ensure_story_safe_pad_color_matches_top_edge(tmp_path):
+    src = _make_png(tmp_path / "navy_feed.png", (1080, 1350), color=(18, 30, 60))
+    out = stories.ensure_story_safe(src)
+    im = Image.open(out)
+    assert im.getpixel((5, 5)) == (18, 30, 60)  # in the padded band, not the art
+
+
+# ---- 10. build_story_draft actually applies the safety net end to end --------
+
+def test_build_story_draft_pads_a_real_non_9x16_library_asset(monkeypatch, tmp_path):
+    """The exact production bug: a library feed image (4:5, already hosted, no
+    'nano_' prefix, story=False upstream) must NOT reach the final draft
+    unpadded. This is the regression test for the cropped-Story incident."""
+    monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)
+    monkeypatch.delenv("AGENT_STORY_PREMADE_ENABLED", raising=False)
+    asset = _make_png(tmp_path / "lasso_v2_b2b_five_companies.png", (1080, 1350))
+
+    hosted_urls = {}
+
+    def fake_host(path, tenant, client=None):
+        url = f"https://cdn.test/{os.path.basename(path)}"
+        hosted_urls[path] = url
+        return url
+
+    import agent.stories as _stories
+    monkeypatch.setattr(_stories.media_host, "host_media", fake_host)
+
+    fd = _feed_draft(creative_path=asset,
+                     creative_public_url="https://cdn.test/original_4x5.png",
+                     source_fragments=[])
+    story = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
+    assert story is not None
+    # must NOT reuse the original 4:5 public URL verbatim -- that is the bug
+    assert story.creative_public_url != fd.creative_public_url
+    assert story.creative_path.endswith("_story_safe.png")
+    im = Image.open(story.creative_path)
+    assert im.size == (1080, 1920)
+
+
+def test_build_story_draft_leaves_an_already_9x16_premade_untouched(monkeypatch, tmp_path):
+    """A properly-sized premade story variant is hosted as-is -- the safety net
+    must not re-pad (and re-host under a different name) a correct asset."""
+    monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
+    monkeypatch.delenv("AGENT_NANO_ENABLED", raising=False)
+    feed_path = tmp_path / "lasso_v2_platform.png"
+    _make_png(feed_path, (1080, 1350))
+    _make_png(tmp_path / "lasso_v2_platform_story.png", (1080, 1920))
+
+    hosts = []
+
+    def fake_host(path, tenant, client=None):
+        hosts.append(path)
+        return f"https://cdn.test/{os.path.basename(path)}"
+
+    import agent.stories as _stories
+    monkeypatch.setattr(_stories.media_host, "host_media", fake_host)
+
+    fd = _feed_draft(creative_path=str(feed_path), creative_public_url="", source_fragments=[])
+    story = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
+    assert story is not None
+    assert story.creative_path == str(tmp_path / "lasso_v2_platform_story.png")
+    # hosted exactly once (the premade file itself), never re-padded/re-hosted
+    assert hosts == [str(tmp_path / "lasso_v2_platform_story.png")]
