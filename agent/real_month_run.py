@@ -124,11 +124,101 @@ def _real_story_builder(account):
     return _story
 
 
+def _story_filename_for(feed_filename):
+    """The paired 9:16 story filename for a sprint FEED card, by the render convention
+    `<stem>_story.png` (summit_render.render_all_stories). Concept cards have a paired
+    story render; the agenda / panel cards do NOT (they are feed only), so their story
+    slot is honestly skipped downstream."""
+    import os as _os
+    stem, ext = _os.path.splitext(feed_filename)
+    return f"{stem}_story{ext or '.png'}"
+
+
+def _sprint_slot_map(posts_per_day=None):
+    """Map (date, slot_index) -> {filename, caption, scheduled_for} across the whole laid
+    out sprint, from summit_queue's own sprint serve path. Reuses summit_queue.sprint_assets
+    (filename + approved caption) and summit_queue.sprint_calendar (the day/slot schedule),
+    so the sprint is NOT re-implemented here. Pure over the queue."""
+    from . import summit_queue as _sq
+    assets = _sq.sprint_assets()
+    caption_by_file = dict(assets)
+    filenames = [f for f, _ in assets]
+    ppd = posts_per_day if posts_per_day is not None else _sq.SPRINT_MAX_FEED_PER_DAY
+    out = {}
+    for slot in _sq.sprint_calendar(filenames, posts_per_day=ppd):
+        out[(slot["date"], slot["slot_index"])] = {
+            "filename": slot["filename"],
+            "caption": caption_by_file.get(slot["filename"], ""),
+            "scheduled_for": slot["scheduled_for"],
+        }
+    return out
+
+
+def sprint_builders(account, manifest=None, posts_per_day=None):
+    """Return (sprint_feed_builder, sprint_story_builder) that serve the laid-out summit
+    sprint from summit_queue's real rendered assets. A slot with no hosted URL for its
+    rendered file (or, for a story, no paired *_story render) is SKIPPED (returns None):
+    never fabricated, never platform-padded. `manifest` maps rendered filename -> hosted
+    URL (defaults to summit_queue's on-disk manifest)."""
+    from . import summit_queue as _sq
+    from .drafter import Draft, DraftStatus
+
+    acct = account
+    if isinstance(account, str):
+        from . import accounts as _accts
+        acct = _accts.get_account(account)
+    platform = getattr(acct, "platform", None) or getattr(acct, "key", "") or ""
+    acct_key = getattr(acct, "key", "") or (account if isinstance(account, str) else "")
+
+    man = manifest if manifest is not None else _sq._load_manifest()
+    slot_map = _sprint_slot_map(posts_per_day=posts_per_day)
+
+    def _feed(_target, day_key, slot_index):
+        info = slot_map.get((day_key, slot_index))
+        if not info:
+            return None
+        url = (man or {}).get(info["filename"])
+        if not url:
+            return None  # rendered asset not hosted yet: skip, never fabricate
+        did = _sq._draft_id(acct_key, f"sprint|{info['filename']}|{slot_index}", day_key)
+        return Draft(
+            draft_id=did, account_key=acct_key, platform=platform,
+            caption=info["caption"], hashtags=[],
+            creative_path=info["filename"], creative_public_url=url,
+            scheduled_for=info["scheduled_for"], status=DraftStatus.PENDING,
+            day_key=day_key, draft_type="summit", category="summit",
+            slides=[], slide_urls=[])
+
+    def _story(_target, day_key, slot_index, feed_draft):
+        info = slot_map.get((day_key, slot_index))
+        if not info:
+            return None
+        story_file = _story_filename_for(info["filename"])
+        url = (man or {}).get(story_file)
+        if not url:
+            # No paired 9:16 render for this card (agenda/panel, or not yet hosted):
+            # honestly skip the story. A story is NEVER a cropped feed card.
+            return None
+        did = _sq._draft_id(acct_key, f"sprint_story|{story_file}|{slot_index}", day_key)
+        return Draft(
+            draft_id=did, account_key=acct_key, platform=platform,
+            caption="", hashtags=[],
+            creative_path=story_file, creative_public_url=url,
+            scheduled_for=info["scheduled_for"], status=DraftStatus.PENDING,
+            day_key=day_key, is_story=True, draft_type="story", category="summit",
+            source_fragments=list(getattr(feed_draft, "source_fragments", []) or []))
+
+    return _feed, _story
+
+
 def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
-                   summit_day_fn=None, welcome_dates=None, account=None, logger=None):
-    """Plan and build the REAL month for `account_key`: a feed + paired 9:16 story per day,
-    every day filled when any real pillar can build for it, all pillars represented via the
-    varied base rotation plus book/summit/welcome overrides, no pillar dominating.
+                   summit_day_fn=None, welcome_dates=None, account=None, logger=None,
+                   sprint_day_fn=None, sprint_feed_count_fn=None, sprint_manifest=None):
+    """Plan and build the REAL month for `account_key`: a feed + paired 9:16 story per day
+    on non-sprint days, and the laid-out SUMMIT SPRINT (up to 3 feed/day plus paired 9:16
+    stories, served from summit_queue's real rendered assets) on its cycle dates. Every day
+    filled when any real pillar can build for it; platform is capped on non-sprint days; all
+    pillars represented; no pillar dominating.
 
     Behind AGENT_REAL_MONTH_PLAN: flag OFF -> [] and NOTHING is invoked (byte-for-byte
     today). Returns the flat list of real Drafts (feed + story), skipped/exhausted slots
@@ -142,8 +232,14 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
         acct = _accts.get_account(account_key)
 
     plan = _rmp.plan_month(account_key, start_date, days, book_dates=book_dates,
-                           summit_day_fn=summit_day_fn, welcome_dates=welcome_dates)
+                           summit_day_fn=summit_day_fn, welcome_dates=welcome_dates,
+                           sprint_day_fn=sprint_day_fn,
+                           sprint_feed_count_fn=sprint_feed_count_fn)
     builders = real_builders_map(acct if acct is not None else account_key)
     story_builder = _real_story_builder(acct if acct is not None else account_key)
+    sprint_feed, sprint_story = sprint_builders(
+        acct if acct is not None else account_key, manifest=sprint_manifest)
     return _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
-                                   account=None, logger=logger)
+                                   account=None, logger=logger,
+                                   sprint_builder=sprint_feed,
+                                   sprint_story_builder=sprint_story)

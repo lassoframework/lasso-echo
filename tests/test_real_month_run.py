@@ -179,8 +179,11 @@ def test_30_day_dryrun_fills_all_and_all_pillars_present():
     # summit on its extra weekday during the run-up (the default predicate).
     book_dates = {"2026-08-05", "2026-08-08", "2026-08-12", "2026-08-15"}
     welcome_dates = {"2026-08-11", "2026-08-20"}
+    # This test exercises the NON-sprint rotation/fallback path; sprint days have their own
+    # coverage in test_real_month_sprint.py, so hold the sprint off here.
     plan = rmp.plan_month(ACCT, MON, days=30, book_dates=book_dates,
-                          welcome_dates=welcome_dates)  # default summit predicate
+                          welcome_dates=welcome_dates,  # default summit predicate
+                          sprint_day_fn=lambda d: False)
     # Every pillar can build (the real, armed-fleet case): the whole month fills.
     builders = _all_pillar_builders(
         {"podcast", "platform", "b2b", "summit", "book", "doctrine", "welcome"})
@@ -208,7 +211,8 @@ def test_30_day_dryrun_fills_via_fallback_when_a_pillar_is_dark():
     # book, welcome dark (their builders return None). Every day STILL fills from the
     # available real pillars via fallback; nothing is fabricated, no blank days.
     plan = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
-                          summit_day_fn=lambda d: False, welcome_dates=set())
+                          summit_day_fn=lambda d: False, welcome_dates=set(),
+                          sprint_day_fn=lambda d: False)
     builders = _all_pillar_builders({"podcast", "platform", "b2b", "doctrine"})
     drafts = rmp.build_month_drafts(plan, builders, story_builder=_fake_story)
     feeds = [d for d in drafts if not d.is_story]

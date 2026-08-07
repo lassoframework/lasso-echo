@@ -93,12 +93,25 @@ class PlanSlot:
     """One planned slot. post_date is YYYY-MM-DD; category is the resolved content
     category (rotation slot with book/summit/welcome overrides applied); fmt is
     'feed' or 'story'; base_category is the underlying weekly-rotation category before
-    any override (kept for audit, never invented). Pure data, no I/O."""
+    any override (kept for audit, never invented). slot_index is 0 on a normal 2/day
+    date and 0..N-1 on a SUMMIT SPRINT day carrying up to 3 feed posts; is_sprint marks
+    a day the laid-out summit sprint owns (served from summit_queue's real sprint assets,
+    never the base rotation, never platform-padded). Pure data, no I/O."""
     post_date: str
     category: str
     fmt: str
     base_category: str = ""
     overridden: bool = False
+    slot_index: int = 0
+    is_sprint: bool = False
+
+
+# The non-sprint platform cap: platform may own at most this fraction of the NON-sprint
+# days in the plan. Over the cap, the excess platform days are re-pointed to the next real
+# pillar with content (the fallback order) so the month reads varied instead of platform
+# heavy. A cap choice, not new content: every re-pointed day still resolves to a REAL
+# builder (or an honest skip), never a fabricated card.
+PLATFORM_CAP_FRACTION = 1.0 / 3.0
 
 
 # The BALANCED month-plan weekly rotation. The live daily runner drives from
@@ -141,19 +154,27 @@ def _weekday_category(day_key):
 
 
 def _override_category(day_key, base_category, *, book_dates=None,
-                       summit_day_fn=None, welcome_dates=None):
-    """Resolve the day's category after folding in the book / summit / welcome overrides.
+                       summit_day_fn=None, welcome_dates=None, sprint_day_fn=None):
+    """Resolve the day's category after folding in the sprint / book / summit / welcome
+    overrides.
 
     Override precedence (a day only ever carries ONE category, so overrides are ordered):
+      0. SUMMIT SPRINT: a date inside a sprint cycle (sprint_day_fn(day_key) is True)
+         becomes 'summit' and OVERRIDES everything else. The laid-out sprint owns the day;
+         it is served from summit_queue's real rendered sprint assets (up to 3 feed/day),
+         never the base rotation and never the weekly-summit override.
       1. book-release-day content: a date that has a dated book_queue post (book_dates)
          becomes 'book'. This is REAL, pre written, dated content and takes its day.
       2. summit run-up: a date that is a summit day inside the campaign window
          (summit_day_fn(day_key) is True) becomes 'summit'.
       3. new-client welcome: a date flagged in welcome_dates becomes 'welcome'.
-    None of these INVENT a day: the caller passes the real dated sets. When no override
-    applies, the weekly-rotation base_category stands. Pure.
+    None of these INVENT a day: the caller passes the real dated sets/predicates. When no
+    override applies, the weekly-rotation base_category stands. Pure.
 
-    Returns (category, overridden)."""
+    Returns (category, overridden). Sprint days are handled for their MULTI-slot cadence in
+    plan_month; this only resolves the single category label."""
+    if sprint_day_fn is not None and sprint_day_fn(day_key):
+        return "summit", True
     if book_dates and day_key in book_dates:
         return "book", True
     if summit_day_fn is not None and summit_day_fn(day_key):
@@ -200,6 +221,31 @@ def _default_summit_day_fn(day_key):
         return False
 
 
+def _default_sprint_days():
+    """The laid-out summit sprint's posting days, as a set, from summit_queue. These are
+    the cycle dates (Cycle 1 Aug 21..30, Cycle 2 Sep 7..16, Cycle 3 Sep 24..Oct 3,
+    continuous Oct 11..Nov 6) with the event days (Nov 7 + 8) removed. Read lazily so
+    importing the planner never drags summit_queue in; a missing/broken queue degrades to
+    NO sprint days (the base rotation stands, never fabricated). Pure over the queue."""
+    try:
+        from . import summit_queue
+        return set(summit_queue.sprint_days())
+    except Exception:
+        return set()
+
+
+def _default_sprint_feed_count(day_key):
+    """How many FEED posts the sprint serves on `day_key`: SPRINT_MAX_FEED_PER_DAY (3),
+    from summit_queue. The actual per-slot serve still skips a slot with no rendered asset
+    (never fabricated), so a day can land fewer than this; this is the ceiling the plan
+    lays out. Missing/broken queue -> 0 (the day is then not treated as a sprint day)."""
+    try:
+        from . import summit_queue
+        return int(summit_queue.SPRINT_MAX_FEED_PER_DAY)
+    except Exception:
+        return 0
+
+
 def _base_summit_weekday():
     """The weekday abbr the base weekly rotation already assigns to summit (Fri in the
     shipped schedule). Read from the schedule table so the override stays in lockstep
@@ -212,22 +258,40 @@ def _base_summit_weekday():
 
 
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
-               summit_day_fn=None, welcome_dates=None):
+               summit_day_fn=None, welcome_dates=None, sprint_day_fn=None,
+               sprint_feed_count_fn=None):
     """A deterministic month plan: for each of `days` consecutive dates from start_date,
-    the resolved category (weekly rotation + book/summit/welcome overrides) and BOTH a
-    feed slot and a paired story slot.
+    the resolved category (weekly rotation + sprint/book/summit/welcome overrides) and its
+    feed + paired story slots.
+
+    SUMMIT SPRINT days (sprint_day_fn(day_key) True) RUN THE SPRINT: they carry up to
+    sprint_feed_count_fn(day_key) feed slots (SPRINT_MAX_FEED_PER_DAY, 3) plus one paired
+    9:16 story per feed, all category 'summit' and is_sprint=True. The sprint OVERRIDES the
+    base rotation AND the weekly-summit run-up override on those days. Every OTHER day
+    carries exactly two slots (one feed + one paired story), 2/day.
+
+    A non-sprint PLATFORM CAP is then applied: platform may own at most PLATFORM_CAP_FRACTION
+    (about a third) of the non-sprint days; excess platform days are re-pointed to the next
+    real fallback pillar so the month reads varied. Re-pointing changes only the plan label,
+    never content: the day still resolves through a REAL builder downstream (or an honest
+    skip), never a fabricated card.
 
     PURE: no I/O, no Date.now, no writes. `start_date` is YYYY-MM-DD (a date or str).
-    days <= 0 -> []. The book/summit/welcome inputs are injectable sets/predicates so
+    days <= 0 -> []. The sprint/book/summit/welcome inputs are injectable sets/predicates so
     the plan is fully deterministic and testable; the defaults use the real dated sets.
 
-    Returns a flat list ordered date-ascending, feed then story within each date, so it
-    always contains exactly 2 * max(days, 0) slots."""
+    Returns a flat list ordered date-ascending, feed(s) then paired story(ies) within each
+    date."""
     if days is None or days <= 0:
         return []
     start = start_date if isinstance(start_date, date) else date.fromisoformat(str(start_date))
     if summit_day_fn is None:
         summit_day_fn = _default_summit_day_fn
+    if sprint_day_fn is None:
+        _sprint = _default_sprint_days()
+        sprint_day_fn = lambda dk: dk in _sprint  # noqa: E731
+    if sprint_feed_count_fn is None:
+        sprint_feed_count_fn = _default_sprint_feed_count
     book_dates = set(book_dates) if book_dates is not None else _default_book_dates()
     welcome_dates = set(welcome_dates or ())
 
@@ -237,12 +301,60 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         base = _weekday_category(d)
         category, overridden = _override_category(
             d, base, book_dates=book_dates, summit_day_fn=summit_day_fn,
-            welcome_dates=welcome_dates)
+            welcome_dates=welcome_dates, sprint_day_fn=sprint_day_fn)
+        if sprint_day_fn(d):
+            # SPRINT day: up to N feed posts + N paired stories, all real sprint assets.
+            n = max(1, int(sprint_feed_count_fn(d) or 0))
+            for si in range(n):
+                slots.append(PlanSlot(post_date=d, category="summit", fmt=FEED,
+                                      base_category=base, overridden=True,
+                                      slot_index=si, is_sprint=True))
+            for si in range(n):
+                slots.append(PlanSlot(post_date=d, category="summit", fmt=STORY,
+                                      base_category=base, overridden=True,
+                                      slot_index=si, is_sprint=True))
+            continue
         slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                               base_category=base, overridden=overridden))
         slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                               base_category=base, overridden=overridden))
-    return slots
+    return _cap_platform(slots)
+
+
+def _cap_platform(slots):
+    """Re-point non-sprint PLATFORM feed/story days beyond the cap to the next real
+    fallback pillar, deterministically (earliest days keep platform; later excess days are
+    re-pointed). Book/summit/welcome/sprint days are untouched (they are dated/campaign
+    content, never platform). Pure: relabels the plan, never invents content."""
+    # Non-sprint days that resolved to platform, in date order (feed slot is the anchor).
+    plat_days = sorted({s.post_date for s in slots
+                        if s.category == "platform" and not s.is_sprint})
+    non_sprint_days = {s.post_date for s in slots if not s.is_sprint}
+    if not plat_days or not non_sprint_days:
+        return slots
+    cap = int(len(non_sprint_days) * PLATFORM_CAP_FRACTION)
+    if len(plat_days) <= cap:
+        return slots
+    # Keep the earliest `cap` platform days as platform; re-point the rest.
+    over = plat_days[cap:]
+    # The next real pillar after platform, in fallback order (skip platform itself).
+    alt_order = [c for c in _FALLBACK_ORDER if c != "platform"]
+    reassigned = {}
+    for j, day in enumerate(over):
+        # Deterministic spread across the non-platform fallback pillars so the re-pointed
+        # days stay varied instead of all landing on one pillar.
+        reassigned[day] = alt_order[j % len(alt_order)] if alt_order else "platform"
+    out = []
+    for s in slots:
+        if s.post_date in reassigned and s.category == "platform" and not s.is_sprint:
+            newcat = reassigned[s.post_date]
+            out.append(PlanSlot(post_date=s.post_date, category=newcat, fmt=s.fmt,
+                                base_category=s.base_category or s.category,
+                                overridden=True, slot_index=s.slot_index,
+                                is_sprint=False))
+        else:
+            out.append(s)
+    return out
 
 
 def _default_book_dates():
@@ -259,7 +371,7 @@ def _default_book_dates():
 # ---- draft assembly (injectable builders; missing source is SKIPPED, never faked) -----
 
 def build_month_drafts(plan, builders, *, story_builder=None, account=None,
-                       logger=None):
+                       logger=None, sprint_builder=None, sprint_story_builder=None):
     """For each slot in `plan`, produce a real Draft via the injected builder for that
     slot's category. Feed and story become SEPARATE Draft objects.
 
@@ -275,24 +387,51 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
     only ever emits a genuine 9:16 asset). A story slot with no feed draft for its date,
     or whose story_builder returns None, is SKIPPED (a story is never a cropped feed).
 
+    SUMMIT SPRINT slots (slot.is_sprint) are served DIRECTLY from the sprint path, NOT the
+    rotation/fallback: `sprint_builder(account_or_key, day_key, slot_index) -> Draft|None`
+    returns the real rendered sprint FEED card for that day/slot (from summit_queue's sprint
+    assets + captions), and `sprint_story_builder(account_or_key, day_key, slot_index,
+    feed_draft) -> Draft|None` its paired 9:16 story. A sprint slot with no rendered asset is
+    SKIPPED (never fabricated) and NEVER falls back to platform or any other pillar; the
+    sprint owns the day.
+
     PURE-ISH: no network here beyond whatever the injected builders do; no writes. Returns
     a flat list of real Draft objects (feed + story), skipped slots omitted."""
     log = logger or (lambda m: print(f"[real-month-planner] {m}"))
     target = account if account is not None else None
 
-    # First pass: build feed drafts, keyed by date so the story pass can anchor to them.
-    # Every day is FILLED when any real pillar can build for it: the slot's own category
-    # is tried first, then the real fallback pillars in order (_FALLBACK_ORDER), until a
-    # builder returns a real draft. A fallback is never fabricated content, only a
-    # DIFFERENT REAL pillar for the day, and the produced draft is stamped with the
-    # pillar that actually built it so the calendar shows the true pillar. A day is only
-    # ever left empty when NO real pillar has content for it (an honest exhaustion,
-    # logged), never a blank filled with invented copy.
-    feed_by_date = {}
+    # First pass: build feed drafts. Non-sprint days key by date (one feed/day) so the
+    # story pass can anchor; sprint days key by (date, slot_index) since a sprint day carries
+    # up to 3 feeds. Every non-sprint day is FILLED when any real pillar can build for it (the
+    # slot's own category first, then the fallback pillars in _FALLBACK_ORDER); a sprint slot
+    # is served ONLY from the sprint path and skipped (never platform-padded) when its asset
+    # is missing. A fallback is never fabricated content, only a DIFFERENT REAL pillar, and the
+    # produced draft is stamped with the pillar that actually built it. A day is left empty
+    # only when NO real pillar has content (an honest exhaustion, logged).
+    feed_by_date = {}                    # non-sprint: post_date -> feed Draft
+    sprint_feed_by_slot = {}             # sprint: (post_date, slot_index) -> feed Draft
     built_category = {}  # post_date -> the real category that actually built the feed
     drafts = []
     for slot in plan:
         if slot.fmt != FEED:
+            continue
+        if slot.is_sprint:
+            if sprint_builder is None:
+                log(f"skip {slot.post_date} sprint feed slot {slot.slot_index}: no "
+                    "sprint_builder wired")
+                continue
+            draft = _safe_call_sprint(sprint_builder, target, slot.post_date,
+                                      slot.slot_index, log,
+                                      f"{slot.post_date} summit sprint feed "
+                                      f"slot {slot.slot_index}")
+            if draft is None:
+                log(f"skip {slot.post_date} summit sprint feed slot {slot.slot_index}: "
+                    "no rendered sprint asset for the slot (skipped, never platform, "
+                    "never fabricated)")
+                continue
+            draft = _stamp(draft, slot, FEED)
+            sprint_feed_by_slot[(slot.post_date, slot.slot_index)] = draft
+            drafts.append(draft)
             continue
         draft, built_cat = _build_feed_with_fallback(
             slot, builders, target, log)
@@ -308,9 +447,30 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         built_category[slot.post_date] = built_cat
         drafts.append(draft)
 
-    # Second pass: build the paired story for each date that got a feed draft.
+    # Second pass: build the paired story for each feed that got built.
     for slot in plan:
         if slot.fmt != STORY:
+            continue
+        if slot.is_sprint:
+            feed_draft = sprint_feed_by_slot.get((slot.post_date, slot.slot_index))
+            if feed_draft is None:
+                log(f"skip {slot.post_date} summit sprint story slot "
+                    f"{slot.slot_index}: no sprint feed for the slot to pair to")
+                continue
+            if sprint_story_builder is None:
+                log(f"skip {slot.post_date} summit sprint story slot "
+                    f"{slot.slot_index}: no sprint_story_builder wired")
+                continue
+            story = _safe_call_sprint_story(
+                sprint_story_builder, target, slot.post_date, slot.slot_index,
+                feed_draft, log,
+                f"{slot.post_date} summit sprint story slot {slot.slot_index}")
+            if story is None:
+                log(f"skip {slot.post_date} summit sprint story slot "
+                    f"{slot.slot_index}: no genuine 9:16 sprint asset (never a cropped feed)")
+                continue
+            story = _stamp(story, slot, STORY)
+            drafts.append(story)
             continue
         feed_draft = feed_by_date.get(slot.post_date)
         if feed_draft is None:
@@ -333,6 +493,25 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         story = _stamp(story, eff_slot, STORY)
         drafts.append(story)
     return drafts
+
+
+def _safe_call_sprint(sprint_builder, target, day_key, slot_index, log, label):
+    """Call a sprint feed builder (target, day_key, slot_index). Any exception is logged
+    and the slot is skipped; a sprint slot NEVER falls back to another pillar."""
+    try:
+        return sprint_builder(target, day_key, slot_index)
+    except Exception as exc:  # noqa: BLE001 - one bad slot must not sink the month
+        log(f"skip {label}: sprint builder raised {type(exc).__name__}: {exc}")
+        return None
+
+
+def _safe_call_sprint_story(sprint_story_builder, target, day_key, slot_index,
+                            feed_draft, log, label):
+    try:
+        return sprint_story_builder(target, day_key, slot_index, feed_draft)
+    except Exception as exc:  # noqa: BLE001
+        log(f"skip {label}: sprint story builder raised {type(exc).__name__}: {exc}")
+        return None
 
 
 def _reslot(slot, category):

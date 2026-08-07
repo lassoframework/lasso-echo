@@ -137,7 +137,8 @@ def _story_builder_ok(target, day_key, feed_draft):
 
 def test_plan_month_two_slots_per_day_feed_and_story():
     plan = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
-                          summit_day_fn=lambda d: False, welcome_dates=set())
+                          summit_day_fn=lambda d: False, welcome_dates=set(),
+                          sprint_day_fn=lambda d: False)
     assert len(plan) == 60  # exactly 2 per day
     from collections import Counter
     by_date = Counter(s.post_date for s in plan)
@@ -381,7 +382,8 @@ def test_apply_upserts_real_and_deletes_all_demo_for_gym():
     assert demo.is_demo_draft_id(demo_story_id)
 
     plan = rmp.plan_month(ACCT, MON, days=30, book_dates=set(),
-                          summit_day_fn=lambda d: False, welcome_dates=set())
+                          summit_day_fn=lambda d: False, welcome_dates=set(),
+                          sprint_day_fn=lambda d: False)
     drafts = rmp.build_month_drafts(plan, _builders_all(),
                                     story_builder=_story_builder_ok)
     span = rmp.plan_span_months(MON, days=30)  # sweeps Aug AND Sep
