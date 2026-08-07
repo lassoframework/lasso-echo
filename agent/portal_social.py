@@ -684,6 +684,17 @@ def _metrics_shape(account_key, days):
             "baseline_captured_at": baseline_at,
             "current_posts_per_week": None,
         },
+        # proof of growth (Part D). Until a live Zernio pull lands, every leg is null so
+        # the portal renders "coming soon" rather than a fabricated 0. followers stays
+        # null even when analytics land (no dated follower series to derive a rate from).
+        "before_after": {
+            "followers_per_month": {"before": None, "after": None},
+            "reach_per_month": {"before": None, "after": None},
+            "saves_per_month": {"before": None, "after": None},
+        },
+        # what performed best: null (not a shell of zeros) until a published month of
+        # real data exists, so the portal shows "coming soon".
+        "learnings": None,
         # explicit gap notes so the portal never substitutes a zero for missing data
         "gaps": ["Live analytics are not connected yet; no numbers are shown "
                  "rather than a made up zero."] if not config.zernio_analytics_enabled() else [],

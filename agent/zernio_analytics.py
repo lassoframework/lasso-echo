@@ -89,6 +89,227 @@ def _post_status(p):
     return (p or {}).get("status") or ""
 
 
+def _post_metric(p, key):
+    """One post's analytics[key] as a real number, else None (bools rejected)."""
+    a = (p or {}).get("analytics") or {}
+    v = a.get(key)
+    if isinstance(v, bool):
+        return None
+    return v if isinstance(v, (int, float)) else None
+
+
+def _post_caption(p):
+    """The post's caption text. Zernio may put it under 'caption' or 'content'.
+    Returns a stripped string, or "" when neither is present (never invented)."""
+    for key in ("caption", "content"):
+        v = (p or {}).get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _post_topic(p):
+    """The topic/pillar of a post from Zernio's OWN fields only (never invented).
+
+    Prefers an explicit category/pillar/topic field; returns None when the post carries
+    no topic signal. Caption text is NOT parsed into a topic here because that would
+    fabricate a category the client never set; a post with only a caption contributes
+    no topic. Returns a stripped string or None.
+    """
+    for key in ("category", "pillar", "topic"):
+        v = (p or {}).get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _months_span(days):
+    """A window of `days` expressed in months (30-day months). None when days<=0."""
+    if not isinstance(days, (int, float)) or days <= 0:
+        return None
+    return float(days) / 30.0
+
+
+def _per_month(total, months):
+    """total normalized to a per-month rate. None when total is None or months falsy.
+    A real 0 total over a real span stays 0 (null-not-zero: only a MISSING total is
+    null; a present 0 is a real rate of 0)."""
+    if total is None or not months:
+        return None
+    return round(total / months, 2)
+
+
+def _echo_cutoff(baseline_at, echo_start=None):
+    """The 'Echo start' cutoff that splits the posts history into before vs after.
+
+    Precedence:
+      1. An explicit echo_start (aware datetime or ISO string) if given.
+      2. baseline_captured_at (the moment Echo's baseline was captured == the moment
+         Echo began managing the account).
+      3. None when neither is available -> the caller leaves the 'before' legs null
+         (we never guess a cutoff).
+    Returns an aware datetime or None.
+    """
+    if echo_start is not None:
+        if isinstance(echo_start, datetime):
+            return echo_start
+        parsed = _parse_iso(echo_start) if isinstance(echo_start, str) else None
+        if parsed is not None:
+            return parsed
+    parsed = _parse_iso(baseline_at) if isinstance(baseline_at, str) else None
+    if parsed is not None:
+        return parsed
+    return None
+
+
+def _sum_present_range(posts, key, lo, hi):
+    """Sum posts[].analytics[key] over present numeric values whose publishedAt is in
+    [lo, hi) (lo/hi may be None = open). Gap (no present value in range) -> None."""
+    total = 0
+    seen = False
+    for p in posts:
+        ts = _parse_iso((p or {}).get("publishedAt"))
+        if ts is None:
+            continue
+        if lo is not None and ts < lo:
+            continue
+        if hi is not None and ts >= hi:
+            continue
+        v = _post_metric(p, key)
+        if v is not None:
+            total += v
+            seen = True
+    return total if seen else None
+
+
+def _months_between(lo, hi):
+    """Months (30-day) between lo and hi (both aware). None when either is None or the
+    span is non-positive."""
+    if lo is None or hi is None:
+        return None
+    secs = (hi - lo).total_seconds()
+    if secs <= 0:
+        return None
+    return secs / (30.0 * 24 * 3600)
+
+
+def _before_after(all_posts, in_window, days, cutoff, now):
+    """The proof-of-growth block: per-month reach/saves/followers before vs after Echo.
+
+    after  = the current per-month rate from the recent IN-WINDOW posts, normalized
+             from the window length to a 30-day month.
+    before = the average per-month rate over the posts published BEFORE the cutoff
+             (the pre-Echo era), computed from the real posts history.
+
+    null-not-zero: any leg with no real data is None (never a fabricated 0). A leg with
+    a genuine present-0 total over a real span stays 0. When cutoff is None the 'before'
+    era can't be bounded, so every 'before' leg is None.
+    """
+    months_window = _months_span(days)
+
+    reach_after = _per_month(_sum_present(in_window, "reach"), months_window)
+    saves_after = _per_month(_sum_present(in_window, "saves"), months_window)
+
+    reach_before = None
+    saves_before = None
+    if cutoff is not None:
+        # bound the 'before' era from the earliest pre-cutoff post up to the cutoff.
+        stamps = []
+        for p in all_posts:
+            ts = _parse_iso((p or {}).get("publishedAt"))
+            if ts is not None and ts < cutoff:
+                stamps.append(ts)
+        earliest = min(stamps) if stamps else None
+        before_months = _months_between(earliest, cutoff)
+        reach_before = _per_month(
+            _sum_present_range(all_posts, "reach", None, cutoff), before_months)
+        saves_before = _per_month(
+            _sum_present_range(all_posts, "saves", None, cutoff), before_months)
+
+    return {
+        # followers per month: Zernio's analytics snapshot carries a follower TOTAL,
+        # not a dated growth series, so a trustworthy per-month follower rate cannot be
+        # derived here. Both legs stay null (the portal shows "coming soon") rather than
+        # inventing a growth number. Wired null-not-zero, ready for a real follower time
+        # series when Zernio exposes one.
+        "followers_per_month": {"before": None, "after": None},
+        "reach_per_month": {"before": reach_before, "after": reach_after},
+        "saves_per_month": {"before": saves_before, "after": saves_after},
+    }
+
+
+def _learnings(published):
+    """What performed best, from the IN-WINDOW published posts' real analytics.
+
+    Returns None (not a shell of zeros) when no published post carries a usable metric,
+    so the portal renders "coming soon" until a real month of data lands. best_post =
+    max reach; most_saved = max saves; most_shared = max shares. top_topics are the real
+    categories/pillars of the top posts; next_month_focus restates them as actions.
+    Nothing is invented: a post with no caption contributes an empty caption, a post
+    with no topic contributes no topic.
+    """
+    def _best(key):
+        best = None
+        best_val = None
+        for p in published:
+            v = _post_metric(p, key)
+            if v is None:
+                continue
+            if best_val is None or v > best_val:
+                best_val = v
+                best = p
+        return best, best_val
+
+    best_reach_post, best_reach = _best("reach")
+    most_saved_post, most_saved = _best("saves")
+    most_shared_post, most_shared = _best("shares")
+
+    # No published post carried ANY of reach/saves/shares -> no learnings at all.
+    if best_reach_post is None and most_saved_post is None and most_shared_post is None:
+        return None
+
+    best_post = None
+    if best_reach_post is not None:
+        best_post = {
+            "caption": _post_caption(best_reach_post),
+            "metric_label": "reach",
+            "metric_value": best_reach,
+        }
+    most_saved_out = None
+    if most_saved_post is not None:
+        most_saved_out = {
+            "caption": _post_caption(most_saved_post),
+            "metric_value": most_saved,
+        }
+    most_shared_out = None
+    if most_shared_post is not None:
+        most_shared_out = {
+            "caption": _post_caption(most_shared_post),
+            "metric_value": most_shared,
+        }
+
+    # top_topics: the real topics of the top posts, de-duplicated in priority order
+    # (best reach, then most saved, then most shared). Only real topics; a top post
+    # with no topic contributes nothing.
+    top_topics = []
+    for p in (best_reach_post, most_saved_post, most_shared_post):
+        if p is None:
+            continue
+        topic = _post_topic(p)
+        if topic and topic not in top_topics:
+            top_topics.append(topic)
+
+    next_month_focus = [f"more {t}" for t in top_topics]
+
+    return {
+        "top_topics": top_topics,
+        "best_post": best_post,
+        "most_saved": most_saved_out,
+        "most_shared": most_shared_out,
+        "next_month_focus": next_month_focus,
+    }
+
+
 def _compact_post(p):
     """A small per-post row for the portal list. Only fields Zernio actually returns;
     missing metrics stay null (never 0)."""
@@ -112,7 +333,7 @@ def _compact_post(p):
 
 
 def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
-                account_key=None, now=None, include_posts=True):
+                account_key=None, now=None, include_posts=True, echo_start=None):
     """Fold a Zernio analytics JSON into the portal metrics SHAPE with REAL values.
 
     - analytics_available = hasAnalyticsAccess. data_source = "zernio" when available,
@@ -125,6 +346,10 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
       in-window published count over days/7 (None when days<=0).
     - engagement_rate (top level) = mean of in-window engagementRate values, else None.
     - benchmark: always None (no trustworthy source; the portal renders "coming soon").
+    - before_after: per-month reach/saves/followers before vs after the Echo-start cutoff
+      (echo_start else baseline_captured_at); a leg with no real data stays null.
+    - learnings: best_post/most_saved/most_shared + top_topics from the in-window
+      published posts; None when no published post carries a usable metric.
     - gaps: empty when analytics is available (real numbers shown); the honest
       unavailable note is emitted by the caller's null shape when it is not.
 
@@ -166,6 +391,13 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
     if include_posts:
         posts_list = [_compact_post(p) for p in in_window]
 
+    # before_after (proof of growth) + learnings (what performed best). The Echo-start
+    # cutoff comes from echo_start else baseline_captured_at; when neither exists the
+    # 'before' legs stay null. learnings is None until a published month of data exists.
+    echo_cut = _echo_cutoff(baseline_at, echo_start=echo_start)
+    before_after = _before_after(all_posts, in_window, days, echo_cut, now)
+    learnings = _learnings(published)
+
     return {
         "account_key": account_key,
         "window_days": days,
@@ -201,5 +433,9 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
         },
         "engagement_rate": engagement_rate,
         "benchmark": None,  # no trustworthy source; never fabricated
+        # proof of growth: per-month before vs after Echo (null legs -> "coming soon")
+        "before_after": before_after,
+        # what performed best this window; None until a published month of data lands
+        "learnings": learnings,
         "gaps": [],
     }
