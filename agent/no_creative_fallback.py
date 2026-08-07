@@ -19,8 +19,20 @@ Two hard guarantees, mirrored from the rest of Echo:
     pillar to render, it returns None and lets the upstream BLOCK / show its empty
     state — it never emits a blank card and never makes up copy.
 
-Pure PIL: no API key, no network, no model-rendered (garble-prone) text. Nothing here
-publishes and no gate is weakened; this only decides a calendar card's DISPLAY image.
+Pure PIL: no API key, no model-rendered (garble-prone) text. The card is rendered
+locally, then HOSTED to object storage so the client portal (a separate service with no
+local filesystem access to the worker's disk) can display it: display_image_for returns
+the PUBLIC hosted url, never a local path. Hosting is content-addressed (media_host),
+so an identical render for the same text is deduped, not re-uploaded; a short in-process
+cache also skips re-rendering the same post on repeated page loads. If hosting is off or
+returns nothing, display_image_for returns None (a clean empty state beats an unshowable
+local path). Nothing here publishes and no gate is weakened; this only decides a calendar
+card's DISPLAY image.
+
+The brand fonts (summit_render.ANTON / OSWALD / MONT) load from repo-bundled files under
+agent/assets/fonts/ (resolved relative to the package), so they ship on every service. A
+render or font failure never raises into the web request: it degrades to None (the empty
+state), so a missing font can never 500 a portal page.
 
 HARD COPY RULES (grep-asserted in tests): no em / en / hyphen dashes and never the word
 "vendor" in any on-image text.
@@ -28,6 +40,7 @@ HARD COPY RULES (grep-asserted in tests): no em / en / hyphen dashes and never t
 
 import os
 import re
+import tempfile
 
 from . import config, summit_render as sr
 
@@ -191,29 +204,59 @@ def _render_infographic(eyebrow, headline, deck, out_path, is_story=False):
     return out_path
 
 
-def display_image_for(post, *, out_dir=None, renderer=None):
+# A short in-process cache so repeated /social page loads do not re-render + re-host the
+# same card. Keyed by the post's IDENTITY (id, caption, pillar, format): a changed
+# caption / pillar renders a fresh card, an unchanged one reuses the last hosted url.
+# Process-local + tiny; it holds only public urls (never secrets) and never persists.
+_URL_CACHE = {}
+_URL_CACHE_MAX = 512
+
+
+def _cache_key(post, is_story):
+    return (
+        str(post.get("id") or ""),
+        _clean(post.get("caption")),
+        _clean(post.get("pillar")),
+        "story" if is_story else "feed",
+    )
+
+
+def _tenant_for(post, tenant):
+    """The hosting tenant (media_host scopes every key to it, so one gym's fallback
+    card never collides with another's). Prefer an explicit tenant, else the post's
+    account_key, else a stable shared bucket segment."""
+    return str(tenant or post.get("account_key") or "no_creative").strip() or "no_creative"
+
+
+def display_image_for(post, *, out_dir=None, renderer=None, host=None, tenant=None):
     """Decide a calendar card's DISPLAY image, degrading a missing creative to a clean
-    website-style infographic built from the post's OWN approved text.
+    website-style infographic built from the post's OWN approved text and HOSTED so the
+    client portal (a service with no access to the worker's local disk) can display it.
 
-    `post` is a mapping carrying (any of): caption, pillar, format ('feed' | 'story'),
-    image_url (or image_public_url). Returns:
+    `post` is a mapping carrying (any of): id, caption, pillar, format ('feed' |
+    'story'), image_url (or image_public_url), account_key. Returns:
 
-      - the existing image_url when it is present and usable   (no render, unchanged)
-      - a path to a rendered infographic built from caption / pillar, when the flag is
-        ON, the image is absent, AND there is approved text to render
-      - None when the flag is OFF (fallback disabled, current behavior), OR when there
-        is no caption / pillar text to render (the upstream BLOCKS / shows its empty
-        state; never a blank card, never fabricated copy)
+      - the existing image_url when it is present and usable  (no render, unchanged)
+      - a PUBLIC hosted url for an infographic rendered from caption / pillar, when the
+        flag is ON, the image is absent, AND there is approved text to render
+      - None when: the flag is OFF (fallback disabled, current behavior); there is no
+        caption / pillar text to render; hosting is off or returns nothing; or the
+        render / font step fails. In every None case the caller keeps its existing
+        empty-state (a clean blank beats a blank card, a fabricated photo, or an
+        unshowable local path).
 
     NO FABRICATION: the infographic text comes only from the post's approved caption /
-    pillar. Nothing here publishes and no gate is weakened. `renderer` is injectable for
-    tests (defaults to the house PIL renderer above); `out_dir` overrides where the
-    rendered card lands (defaults to config.LIBRARY_PATH)."""
+    pillar. Nothing here publishes and no gate is weakened.
+
+    Injection seams for tests: `renderer` (defaults to the house PIL renderer above),
+    `host` (defaults to agent.media_host.host_media, the same content-addressed hosting
+    primitive summit_rebuild uses), `tenant` (hosting scope), `out_dir` (temp render dir).
+    """
     image_url = post.get("image_url")
     if image_url is None:
         image_url = post.get("image_public_url")
 
-    # An existing, usable image is returned unchanged — no render, ever.
+    # An existing, usable image is returned unchanged: no render, no host, ever.
     if _has_usable_image(image_url):
         return image_url
 
@@ -229,10 +272,59 @@ def display_image_for(post, *, out_dir=None, renderer=None):
 
     is_story = str(post.get("format") or "feed").strip().lower() == "story"
 
-    out_dir = out_dir or config.LIBRARY_PATH
-    slug = re.sub(r"[^a-z0-9]+", "_", headline.lower()).strip("_")[:60] or "infographic"
-    suffix = "story" if is_story else "feed"
-    out_path = os.path.join(out_dir, f"no_creative_{slug}_{suffix}.png")
+    # Repeated page loads of the same unchanged post reuse the last hosted url instead
+    # of re-rendering + re-hosting blindly.
+    ck = _cache_key(post, is_story)
+    cached = _URL_CACHE.get(ck)
+    if cached:
+        return cached
 
     render = renderer or _render_infographic
-    return render(eyebrow, headline, deck, out_path, is_story=is_story)
+    host_media = host or _default_host
+
+    slug = re.sub(r"[^a-z0-9]+", "_", headline.lower()).strip("_")[:60] or "infographic"
+    suffix = "story" if is_story else "feed"
+    filename = f"no_creative_{slug}_{suffix}.png"
+
+    # Render locally (to out_dir when given, else a throwaway temp dir), then host and
+    # return the PUBLIC url. A render / font failure NEVER raises into the caller (a web
+    # request): it degrades to None (empty state). The local file is only an input to
+    # hosting; the portal is served the hosted url, never a local path.
+    tmp = None
+    try:
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, filename)
+        else:
+            tmp = tempfile.mkdtemp(prefix="echo_no_creative_")
+            out_path = os.path.join(tmp, filename)
+        try:
+            rendered = render(eyebrow, headline, deck, out_path, is_story=is_story)
+        except Exception:
+            # A missing font or any PIL error must never 500 a portal page.
+            return None
+        if not rendered:
+            return None
+
+        hosted = host_media(rendered, _tenant_for(post, tenant))
+        # Hosting off / no creds / upload failed -> None (empty state), never a local
+        # path the portal cannot show.
+        if not hosted:
+            return None
+
+        if len(_URL_CACHE) >= _URL_CACHE_MAX:
+            _URL_CACHE.clear()  # tiny, simple bound: drop the whole cache when full
+        _URL_CACHE[ck] = hosted
+        return hosted
+    finally:
+        if tmp:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _default_host(local_path, tenant):
+    """Default hosting seam: media_host.host_media (content-addressed R2 upload). When
+    hosting is off (config.hosting_enabled() False) or no creds are present, host_media
+    returns None on its own, so display_image_for degrades to the empty state."""
+    from . import media_host
+    return media_host.host_media(local_path, tenant)
