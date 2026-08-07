@@ -38,7 +38,7 @@ import re
 
 from PIL import Image
 
-from . import config, db, media_host, ops_alerts, portal_gyms, schedule, welcome_posts
+from . import config, db, media_host, ops_alerts, portal_domains, portal_gyms, schedule, welcome_posts
 from . import welcome_templates as wt
 from . import website_scan
 from .drafter import Draft, DraftStatus
@@ -536,11 +536,13 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
                 deduped += 1
                 continue
 
-            # resolve the logo: human-dropped override wins; else scrape a domain IF the
-            # portal carries one (it does not today); else needs_logo, NOT enqueued.
+            # resolve the logo: human-dropped override wins; else scrape a domain. The
+            # portal carries no domain column, so fall back to the curated portal_domains
+            # registry (real domains the agent looks up, so no human need send a site);
+            # else needs_logo, NOT enqueued.
             ak = "portal_" + re.sub(r"[^a-z0-9]+", "_", str(gym_id).lower()).strip("_")
             override = welcome_posts.portal_logo_override(ak, gym_key=gym_key)
-            domain = (g.get("domain") or "").strip()
+            domain = (g.get("domain") or "").strip() or portal_domains.domain_for(name, gym_id)
             logo = scraper(domain, ak, override_path=override, out_dir=None)
             if not logo.ok:
                 needs_logo += 1

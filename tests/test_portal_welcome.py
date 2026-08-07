@@ -227,6 +227,57 @@ def test_portal_gym_logoless_is_needs_logo_not_enqueued(armed, creds, monkeypatc
     assert not welcome_posts.already_welcomed("portal:nolomo")
 
 
+# ---- portal_domains registry: agent-looked-up domains, no human sends a site -----------
+
+def test_portal_domains_registry_normalizes_name():
+    from agent import portal_domains
+    # case / punctuation insensitive match to a real, looked-up domain
+    assert portal_domains.domain_for("WESTWOOD ATHLETICS") == "westwoodathletics.com"
+    assert portal_domains.domain_for("Project Evolve Personal Training") == \
+        "projectevolvenaples.com"
+    # an un-recorded gym returns "" (stays needs_logo; never a fabricated domain)
+    assert portal_domains.domain_for("Some Gym Not In The Registry") == ""
+
+
+def test_registry_domain_is_passed_to_scraper_for_known_gym(armed, creds, monkeypatch, tmp_path):
+    # A portal gym with NO domain column but whose NAME is in portal_domains resolves its
+    # real domain from the registry, so the logo scrape runs and it enqueues WITHOUT a human
+    # sending the site.
+    _stub_render(monkeypatch, tmp_path)
+    seen = {}
+
+    def _capture(domain, ak, override_path=None, out_dir=None):
+        seen["domain"] = domain
+        return _ok_logo()
+
+    row = {"id": "pe_reg_known", "name": "Project Evolve Personal Training",
+           "created_at": "2026-08-06T00:00:00+00:00"}
+    reader = portal_gyms.PortalGymsReader(http=_FakeHTTP(_sample(), [row]))
+    out = welcome_queue.scan_portal_and_enqueue(reader=reader, scraper=_capture,
+                                                host_fn=_fake_host)
+    assert out["enqueued"] == 1
+    assert seen["domain"] == "projectevolvenaples.com"  # from the registry, not ""
+
+
+def test_registry_unknown_gym_passes_empty_domain_and_needs_logo(armed, creds, monkeypatch,
+                                                                 tmp_path):
+    # A gym NOT in the registry passes "" to the scraper (no fabricated domain) and stays
+    # needs_logo when the scrape finds nothing.
+    _stub_render(monkeypatch, tmp_path)
+    seen = {}
+
+    def _capture(domain, ak, override_path=None, out_dir=None):
+        seen["domain"] = domain
+        return _no_logo()
+
+    row = {"id": "unk_reg", "name": "Totally Unknown Gym ZZ", "created_at": "2026-08-06"}
+    reader = portal_gyms.PortalGymsReader(http=_FakeHTTP(_sample(), [row]))
+    out = welcome_queue.scan_portal_and_enqueue(reader=reader, scraper=_capture,
+                                                host_fn=_fake_host)
+    assert seen["domain"] == ""
+    assert out["needs_logo"] == 1 and out["enqueued"] == 0
+
+
 def test_portal_scan_is_idempotent_on_rerun(armed, creds, monkeypatch, tmp_path):
     _stub_render(monkeypatch, tmp_path)
     row = {"id": "g9", "name": "Repeat Gym", "created_at": "2026-08-05"}
