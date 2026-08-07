@@ -144,14 +144,16 @@ def test_benchmark_always_null():
 
 
 def test_current_posts_per_week_math():
-    # 4 published posts in a 14-day window -> 14/7 = 2 weeks -> 2.0 posts/week.
+    # 4 published posts in a 14-day window -> 14/7 = 2 weeks -> 2 posts/week (a whole int).
     aj = {
         "hasAnalyticsAccess": True,
         "accounts": [],
         "posts": [_post(i, analytics={"likes": 1}) for i in (1, 3, 5, 7)],
     }
     out = za.map_metrics(aj, 14, 3, "2026-07-01T00:00:00Z")
-    assert out["frequency"]["current_posts_per_week"] == 2.0
+    ppw = out["frequency"]["current_posts_per_week"]
+    assert ppw == 2
+    assert isinstance(ppw, int) and not isinstance(ppw, bool)  # whole int, never 2.0
     assert out["frequency"]["baseline_posts_per_week"] == 3
     assert out["frequency"]["baseline_captured_at"] == "2026-07-01T00:00:00Z"
 
@@ -160,6 +162,55 @@ def test_current_ppw_null_when_days_nonpositive():
     aj = {"hasAnalyticsAccess": True, "accounts": [], "posts": [_post(1, analytics={"likes": 1})]}
     out = za.map_metrics(aj, 0, None, None)
     assert out["frequency"]["current_posts_per_week"] is None
+
+
+def test_current_ppw_is_whole_int_never_fractional():
+    """A normal window yields a sensible whole-number weekly cadence, never a fraction
+    like 58.33. 5 posts over a 14-day (2 week) window -> round(5/2) = 2 (an int)."""
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [_post(i) for i in (1, 3, 5, 7, 9)],  # 5 published in a 14d window
+    }
+    out = za.map_metrics(aj, 14, None, None)
+    ppw = out["frequency"]["current_posts_per_week"]
+    assert ppw == 2                                    # round(5 / (14/7)) = round(2.5) = 2
+    assert isinstance(ppw, int) and not isinstance(ppw, bool)
+    assert not isinstance(ppw, float)                  # never 2.5 / 58.33-style fractions
+
+
+def test_current_ppw_all_time_over_short_window_is_null_not_absurd():
+    """The old bug: many posts counted over a too-small window extrapolated to an absurd
+    fractional weekly rate (e.g. 58.33). An implausible cadence (> 21/week) is now null,
+    not a fabricated number. 25 posts all inside a 3-day window would extrapolate to
+    ~58/week -> null."""
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [_post(0) for _ in range(25)],  # 25 published, all within a 3d window
+    }
+    out = za.map_metrics(aj, 3, None, None)
+    ppw = out["frequency"]["current_posts_per_week"]
+    assert ppw is None                                 # implausible -> null (not 58.33)
+
+
+def test_current_ppw_plausible_cadence_survives_at_boundary():
+    """A cadence right at the plausibility ceiling (21/week) survives as a whole int; one
+    above it drops to null."""
+    at_ceiling = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [_post(0) for _ in range(21)],  # 21 in a 7d (1 week) window -> 21/week
+    }
+    out = za.map_metrics(at_ceiling, 7, None, None)
+    assert out["frequency"]["current_posts_per_week"] == 21
+    over = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [_post(0) for _ in range(22)],  # 22 in a 7d window -> 22/week -> null
+    }
+    out2 = za.map_metrics(over, 7, None, None)
+    assert out2["frequency"]["current_posts_per_week"] is None
 
 
 def test_posts_published_counts_only_published_in_window():
@@ -296,6 +347,77 @@ def test_before_after_no_cutoff_before_all_null():
     assert ba["saves_per_month"]["before"] is None
 
 
+def test_before_after_engagement_metrics_split_by_cutoff():
+    """likes/comments/shares mirror reach/saves: after = per-month rate from the recent
+    in-window posts; before = per-month avg over the pre-cutoff era. All real numbers."""
+    cutoff_iso = _iso(UTCNOW - timedelta(days=60))  # Echo started 60 days ago
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [
+            # AFTER (in a 30d window == 1 month): likes 300 -> 300/mo, comments 30 -> 30,
+            # shares 12 -> 12
+            _dated_post(2, analytics={"likes": 200, "comments": 20, "shares": 8}),
+            _dated_post(5, analytics={"likes": 100, "comments": 10, "shares": 4}),
+            # BEFORE (pre-cutoff, 90d..150d ago): a positive per-month rate for each
+            _dated_post(90, analytics={"likes": 300, "comments": 30, "shares": 12}),
+            _dated_post(150, analytics={"likes": 300, "comments": 30, "shares": 12}),
+        ],
+    }
+    out = za.map_metrics(aj, 30, None, None, echo_start=cutoff_iso)
+    ba = out["before_after"]
+    assert ba["likes_per_month"]["after"] == 300.0
+    assert ba["comments_per_month"]["after"] == 30.0
+    assert ba["shares_per_month"]["after"] == 12.0
+    for m in ("likes_per_month", "comments_per_month", "shares_per_month"):
+        assert ba[m]["before"] is not None and ba[m]["before"] > 0, m
+
+
+def test_before_after_engagement_leg_null_and_present_zero():
+    """null-not-zero for the new legs: an absent metric leg is None; a genuine present-0
+    total over a real span stays 0; and with no cutoff every before leg is None."""
+    cutoff_iso = _iso(UTCNOW - timedelta(days=60))
+    aj = {
+        "hasAnalyticsAccess": True,
+        "accounts": [],
+        "posts": [
+            # after: likes present as a real 0, comments/shares absent
+            _dated_post(2, analytics={"likes": 0}),
+            # before: comments present, likes/shares absent
+            _dated_post(90, analytics={"comments": 5}),
+        ],
+    }
+    out = za.map_metrics(aj, 30, None, None, echo_start=cutoff_iso)
+    ba = out["before_after"]
+    assert ba["likes_per_month"]["after"] == 0            # present 0 -> real 0
+    assert ba["comments_per_month"]["after"] is None      # absent -> null
+    assert ba["shares_per_month"]["after"] is None        # absent -> null
+    assert ba["comments_per_month"]["before"] is not None  # present before
+    assert ba["likes_per_month"]["before"] is None        # absent before -> null
+    assert ba["shares_per_month"]["before"] is None       # absent before -> null
+
+    # no cutoff -> every before leg (including the new metrics) is null
+    out2 = za.map_metrics({"hasAnalyticsAccess": True, "accounts": [], "posts": [
+        _dated_post(2, analytics={"likes": 10, "comments": 2, "shares": 1})]}, 30, None, None)
+    ba2 = out2["before_after"]
+    for m in ("likes_per_month", "comments_per_month", "shares_per_month"):
+        assert ba2[m]["before"] is None, m
+        assert ba2[m]["after"] is not None, m
+
+
+def test_before_after_no_overall_key():
+    """_before_after returns only the six per-month metrics; the portal derives 'overall'
+    from the four engagement metrics, so no 'overall' key is emitted here."""
+    aj = {"hasAnalyticsAccess": True, "accounts": [], "posts": [
+        _dated_post(2, analytics={"reach": 10})]}
+    ba = za.map_metrics(aj, 30, None, None)["before_after"]
+    assert "overall" not in ba
+    assert set(ba.keys()) == {
+        "followers_per_month", "reach_per_month", "saves_per_month",
+        "likes_per_month", "comments_per_month", "shares_per_month",
+    }
+
+
 def test_learnings_from_top_posts():
     """best_post=max reach, most_saved=max saves, most_shared=max shares; top_topics
     from the real categories; next_month_focus restates them as actions."""
@@ -365,8 +487,14 @@ def test_seed_shape_before_after_all_null_learnings_null(monkeypatch):
     monkeypatch.setenv("AGENT_ZERNIO_ANALYTICS_ENABLED", "true")
     shape = ps._metrics_shape("gymX", 30)
     ba = shape["before_after"]
-    for metric in ("followers_per_month", "reach_per_month", "saves_per_month"):
+    for metric in ("followers_per_month", "reach_per_month", "saves_per_month",
+                   "likes_per_month", "comments_per_month", "shares_per_month"):
         assert ba[metric] == {"before": None, "after": None}, metric
+    # the seed shape carries no 'overall' key (the portal derives it) and only these keys
+    assert set(ba.keys()) == {
+        "followers_per_month", "reach_per_month", "saves_per_month",
+        "likes_per_month", "comments_per_month", "shares_per_month",
+    }
     assert shape["learnings"] is None
 
 
@@ -414,16 +542,19 @@ def test_seed_shape_data_source_none_and_narrative_null(monkeypatch):
 
 def test_rhythm_from_real_publishes_not_a_constant():
     """current_posts_per_week is computed from ACTUAL in-window published posts, not a
-    seeded 14 or 35; baseline_posts_per_week is the passed real baseline."""
+    seeded 14 or 35; baseline_posts_per_week is the passed real baseline. The rate is a
+    whole int (3 / (14/7) = 1.5 -> rounds to 2), never a fraction like 1.5."""
     aj = {
         "hasAnalyticsAccess": True,
         "accounts": [],
         "posts": [_post(1), _post(3), _post(5), _post(50)],  # 3 in a 14d window
     }
     out = za.map_metrics(aj, 14, baseline_ppw=0.25, baseline_at="2026-07-01T00:00:00Z")
-    assert out["frequency"]["current_posts_per_week"] == 1.5   # 3 / (14/7)
+    ppw = out["frequency"]["current_posts_per_week"]
+    assert ppw == 2                                            # round(3 / (14/7)) = 2
+    assert isinstance(ppw, int) and not isinstance(ppw, bool)
     assert out["frequency"]["baseline_posts_per_week"] == 0.25
-    assert out["frequency"]["current_posts_per_week"] not in (14, 35)
+    assert ppw not in (14, 35)
 
 
 # ---------------------------------------------------------------------------

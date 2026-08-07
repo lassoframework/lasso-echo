@@ -194,7 +194,8 @@ def _months_between(lo, hi):
 
 
 def _before_after(all_posts, in_window, days, cutoff, now):
-    """The proof-of-growth block: per-month reach/saves/followers before vs after Echo.
+    """The proof-of-growth block: per-month reach/saves/likes/comments/shares/followers
+    before vs after Echo.
 
     after  = the current per-month rate from the recent IN-WINDOW posts, normalized
              from the window length to a 30-day month.
@@ -209,9 +210,15 @@ def _before_after(all_posts, in_window, days, cutoff, now):
 
     reach_after = _per_month(_sum_present(in_window, "reach"), months_window)
     saves_after = _per_month(_sum_present(in_window, "saves"), months_window)
+    likes_after = _per_month(_sum_present(in_window, "likes"), months_window)
+    comments_after = _per_month(_sum_present(in_window, "comments"), months_window)
+    shares_after = _per_month(_sum_present(in_window, "shares"), months_window)
 
     reach_before = None
     saves_before = None
+    likes_before = None
+    comments_before = None
+    shares_before = None
     if cutoff is not None:
         # bound the 'before' era from the earliest pre-cutoff post up to the cutoff.
         stamps = []
@@ -225,6 +232,12 @@ def _before_after(all_posts, in_window, days, cutoff, now):
             _sum_present_range(all_posts, "reach", None, cutoff), before_months)
         saves_before = _per_month(
             _sum_present_range(all_posts, "saves", None, cutoff), before_months)
+        likes_before = _per_month(
+            _sum_present_range(all_posts, "likes", None, cutoff), before_months)
+        comments_before = _per_month(
+            _sum_present_range(all_posts, "comments", None, cutoff), before_months)
+        shares_before = _per_month(
+            _sum_present_range(all_posts, "shares", None, cutoff), before_months)
 
     return {
         # followers per month: Zernio's analytics snapshot carries a follower TOTAL,
@@ -235,6 +248,9 @@ def _before_after(all_posts, in_window, days, cutoff, now):
         "followers_per_month": {"before": None, "after": None},
         "reach_per_month": {"before": reach_before, "after": reach_after},
         "saves_per_month": {"before": saves_before, "after": saves_after},
+        "likes_per_month": {"before": likes_before, "after": likes_after},
+        "comments_per_month": {"before": comments_before, "after": comments_after},
+        "shares_per_month": {"before": shares_before, "after": shares_after},
     }
 
 
@@ -380,10 +396,20 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
     # posts_published: a real 0 is honest here (an in-window count, not a summed metric).
     posts_published = len(published)
 
+    # current_posts_per_week: an HONEST whole-number weekly cadence. Count the published
+    # posts IN THE ANALYSIS WINDOW, divide by the window length in weeks, and round to the
+    # nearest whole integer (an organic gym cadence is a small integer, not 58.33). The old
+    # round(...,2) here emitted implausible fractional rates (e.g. 58.33) when the window
+    # was too small or an all-time count landed over a short window; the int + plausibility
+    # guard below keeps it honest. null-not-zero: too small a window / too little data ->
+    # null, and an implausible rate (> 21 posts/week for an organic gym) -> null, never a
+    # fabricated number.
     current_ppw = None
     if isinstance(days, (int, float)) and days > 0:
         weeks = float(days) / 7.0
-        current_ppw = round(len(published) / weeks, 2) if weeks > 0 else None
+        if weeks > 0:
+            rate = int(round(len(published) / weeks))
+            current_ppw = rate if rate <= 21 else None
 
     engagement_rate = _mean_engagement(in_window)
 

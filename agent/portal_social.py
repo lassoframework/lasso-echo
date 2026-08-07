@@ -716,6 +716,9 @@ def _metrics_shape(account_key, days):
             "followers_per_month": {"before": None, "after": None},
             "reach_per_month": {"before": None, "after": None},
             "saves_per_month": {"before": None, "after": None},
+            "likes_per_month": {"before": None, "after": None},
+            "comments_per_month": {"before": None, "after": None},
+            "shares_per_month": {"before": None, "after": None},
         },
         # what performed best: null (not a shell of zeros) until a published month of
         # real data exists, so the portal shows "coming soon".
