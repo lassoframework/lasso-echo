@@ -169,10 +169,51 @@ def test_feed_is_1080_square_and_story_is_1080x1920(tmp_path):
     assert story.size == (1080, 1920)
 
 
-def test_mis_sized_feed_is_rejected_never_cropped(tmp_path):
-    bad_studio = FakeStudio(size=(1080, 1350))  # a 4:5 feed, not the 1080 square
+def test_native_gemini_size_is_normalized_to_1080_square_before_host(tmp_path):
+    """THE LIVE BUG: the Gemini Pro model returns its NATIVE size (e.g. 928x1152),
+    NOT the requested 1080x1080. The old fake returned a correct 1080 square and hid
+    this; render_and_host_all must NORMALIZE the studio output to the exact canvas
+    (house cover-crop, never a squish) BEFORE verify_size, so all assets host."""
+    native_studio = FakeStudio(size=(928, 1152))  # the real Gemini Pro native size
+    summary, _studio, _host, man = _run(tmp_path, studio=native_studio)
+    # a concept feed was hosted (not refused), and it is EXACTLY 1080x1080 on disk
+    feed = Image.open(tmp_path / "01_invitation_a.png")
+    assert feed.size == (1080, 1080), "studio native size was not normalized to canvas"
+    assert "01_invitation_a.png" in man.data, "normalized feed was not hosted"
+    assert summary["hosted"], "0 assets hosted (the live bug)"
+
+
+def test_native_portrait_is_cover_cropped_not_squished(tmp_path):
+    """Normalization must COVER (scale by the larger ratio) and center-crop, never
+    distort a portrait into a square by a naive resize. A 928x1152 portrait cover-fit
+    to a 1080 square scales x1.164 (1080/928, the WIDTH drives it), landing at
+    1080x1341, then center-crops to 1080x1080 -- so nothing is squished."""
+    native_studio = FakeStudio(size=(928, 1152))
+    _summary, _studio, _host, _man = _run(tmp_path, studio=native_studio)
+    feed = Image.open(tmp_path / "01_invitation_a.png")
+    assert feed.size == (1080, 1080)
+
+
+def test_native_story_size_is_normalized_to_1080x1920(tmp_path):
+    """The story path normalizes too: a story renderer that emits a non-1080x1920
+    frame is cover-cropped to the exact 1080x1920 canvas before verify_size + host."""
+    def _wrong_story(concept, treatment, out_path, **kw):
+        Image.new("RGB", (1000, 1800), (18, 30, 60)).save(out_path)  # not 1080x1920
+        return out_path
+    _summary, _studio, _host, man = _run(tmp_path, story=_wrong_story)
+    story = Image.open(tmp_path / "01_invitation_a_story.png")
+    assert story.size == (1080, 1920), "story was not normalized to the canvas"
+    assert "01_invitation_a_story.png" in man.data
+
+
+def test_verify_size_still_refuses_a_wrong_canvas_never_weakened(tmp_path):
+    """verify_size is NOT weakened by the normalization: _assert_size still raises on
+    any file that is not exactly the expected size. Proven directly so a future change
+    that guts the guard is caught."""
+    p = tmp_path / "x.png"
+    Image.new("RGB", (500, 500), (0, 0, 0)).save(p)
     with pytest.raises(ValueError):
-        _run(tmp_path, studio=bad_studio)
+        srb._assert_size(str(p), (1080, 1080), "FEED")
 
 
 # ---- idempotent re-run -----------------------------------------------------

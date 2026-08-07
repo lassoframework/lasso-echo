@@ -290,9 +290,39 @@ def _concept_facts(concept):
     return [ln for ln in lines if str(ln).strip()]
 
 
+def _normalize_to_canvas(path, expected):
+    """Normalize a studio-generated image to EXACTLY the expected (w, h) canvas,
+    in place, using the SAME house cover-crop the daily renderers use
+    (summit_render._cover): scale to cover by the larger ratio (never squish a
+    portrait into a square), then center-crop to the exact size (symmetric edge
+    trim only, so the safe zone at the center survives).
+
+    Why this exists: the live Gemini Pro model returns its NATIVE size (e.g.
+    928x1152), not the requested pixels. The house path composites the model
+    output onto a fixed canvas, so those cards land at an exact size; the summit
+    feed path wrote the raw studio bytes straight to disk, so the native size
+    tripped _assert_size and 0 of the sprint assets hosted. This restores the
+    missing normalization so verify_size passes legitimately.
+
+    A file already at the exact size is left byte for byte (no resave, no
+    recompression). No fabrication: this only reframes the pixels the studio
+    already produced; it never invents content."""
+    from PIL import Image
+    from .summit_render import _cover
+    with Image.open(path) as im:
+        if im.size == tuple(expected):
+            return
+        normalized = _cover(im, expected[0], expected[1])
+    normalized.save(path)
+
+
 def _assert_size(path, expected, label):
-    """Verify a rendered PNG is exactly the expected (w, h). Never crops or resizes
-    to fit: a wrong size is a hard error so a cropped feed can never reach the sprint."""
+    """Verify a rendered PNG is exactly the expected (w, h). By the time this runs
+    the studio card has been normalized to the canvas (_normalize_to_canvas); this
+    guard still REFUSES anything not exactly the expected size, so a genuinely
+    mis-sized card (a renderer that produced the wrong canvas) can never reach the
+    sprint. The guard is never weakened: normalization makes it pass legitimately,
+    never by disabling the check."""
     from PIL import Image
     with Image.open(path) as im:
         size = im.size
@@ -368,9 +398,17 @@ def render_and_host_all(images_dir, *, studio=None, story_renderer=None,
     dirty = False
 
     def _host_and_record(fname, path, kind, expected):
-        """Assert size, host, and record fname -> url in the manifest. Returns True
-        when a new URL was written."""
+        """Normalize to the exact canvas, assert size, host, and record fname -> url
+        in the manifest. Returns True when a new URL was written.
+
+        Normalization first (the SAME house cover-crop daily uses): the live Gemini
+        Pro model returns its native size, not the requested pixels, so the studio
+        feed is reframed to the exact canvas here BEFORE _assert_size. The PIL story
+        / agenda / panel renderers already produce exact sizes, so their normalize
+        is a no-op. _assert_size still enforces the exact size afterward (never
+        weakened): a genuinely wrong canvas cover-crop would be caught."""
         nonlocal dirty
+        _normalize_to_canvas(path, expected)
         _assert_size(path, expected, kind)
         url = host(path, HOST_BUCKET)
         if not url:
