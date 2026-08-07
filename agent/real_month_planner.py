@@ -616,6 +616,16 @@ def to_calendar_rows(drafts, account_key):
         # status is normalized to the portal vocabulary by the mirror; the planner's
         # freshly built drafts are PENDING, so this reads 'pending'.
         rows.append(row)
+        # Cross-post: a FEED goes to both Instagram AND Facebook (the same cross-post
+        # the daily runner does to lasso_ig + lasso_fb), so the client calendar shows FB
+        # coverage and never reads as Instagram-only. Stories are Instagram-only in Echo
+        # (STORY_ACCOUNTS), so they are NOT duplicated. Emit a paired Facebook row for
+        # each Instagram feed; never double a row that is already Facebook.
+        if row.get("format") == "feed" and (row.get("account") or "").lower() in (
+                "instagram", "ig", ""):
+            fb = dict(row)
+            fb["account"] = "facebook"
+            rows.append(fb)
     return rows
 
 

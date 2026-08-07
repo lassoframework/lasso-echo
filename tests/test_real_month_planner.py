@@ -390,7 +390,10 @@ def test_apply_upserts_real_and_deletes_all_demo_for_gym():
     out = rmp.apply_month_plan(ACCT, drafts, sb, span_months=span)
 
     assert out["ok"] is True
-    assert out["inserted"] == len(drafts) > 0
+    # Feeds cross-post to Instagram AND Facebook, so the emitted row count exceeds the
+    # draft count; inserted must equal the rows to_calendar_rows actually produces.
+    _rows = rmp.to_calendar_rows(drafts, ACCT)
+    assert out["inserted"] == len(_rows) > len(drafts) > 0
     # DELETE-then-INSERT swept the WHOLE Aug AND Sep months for the gym, so BOTH demo rows
     # (including the next-month one a narrow sweep would have missed) are gone -> the
     # month-range gap is closed and a re-run is idempotent.
