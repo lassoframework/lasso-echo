@@ -50,6 +50,80 @@ import re
 from . import config
 
 
+# A single Gemini render call must never stall the whole calendar. Each network
+# call gets a hard wall clock budget and a small bounded retry. A 90+ day render
+# is many calls back to back; one hung call used to block for minutes with no
+# ceiling. The budget is a module constant, overridable per environment via
+# AGENT_RENDER_TIMEOUT_SECS (safe default below). Retries cover a hung call
+# (timeout) or a transient error; on the final failure the call returns None so
+# the existing None handling path runs (draft falls back to needs media or the
+# day is skipped). It NEVER hangs, NEVER raises into the caller, NEVER fabricates.
+_RENDER_TIMEOUT_DEFAULT_SECS = 120.0
+_RENDER_MAX_RETRIES = 2          # up to 2 retries after the first attempt (3 tries max)
+_RENDER_RETRY_BACKOFF_SECS = 1.0  # small backoff, multiplied by the attempt number
+
+
+def _render_timeout_secs() -> float:
+    """
+    Per call wall clock budget for a single model render, read fresh each call so
+    the env override applies without a reimport. Falls back to the safe default on
+    a missing or unparseable value; a value at or below zero also falls back so a
+    bad env can never disable the guard.
+    """
+    raw = os.environ.get("AGENT_RENDER_TIMEOUT_SECS")
+    if raw is None:
+        return _RENDER_TIMEOUT_DEFAULT_SECS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _RENDER_TIMEOUT_DEFAULT_SECS
+    return val if val > 0 else _RENDER_TIMEOUT_DEFAULT_SECS
+
+
+def _render_with_timeout(call):
+    """
+    Run a zero argument render callable with a hard timeout and a bounded retry.
+
+    Thread based (concurrent.futures) so it works off the main thread: the render
+    runs inside worker threads, where signal.alarm would fail. On timeout or a
+    transient error the call is retried up to _RENDER_MAX_RETRIES with a small
+    backoff. If every attempt times out or errors, returns None so the caller's
+    existing None handling runs. Never raises into the caller, never hangs past
+    the budget, never fabricates output.
+    """
+    import concurrent.futures as _futures
+    import logging as _logging
+    import time as _time
+
+    _log = _logging.getLogger(__name__)
+    timeout = _render_timeout_secs()
+    attempts = _RENDER_MAX_RETRIES + 1
+
+    for attempt in range(1, attempts + 1):
+        executor = _futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(call)
+        try:
+            result = future.result(timeout=timeout)
+            executor.shutdown(wait=False)
+            return result
+        except _futures.TimeoutError:
+            # The hung call keeps running in its orphaned thread; we stop waiting
+            # on it (do not block shutdown on the stuck worker) and move on.
+            future.cancel()
+            executor.shutdown(wait=False)
+            _log.error("[render] timeout after %.1fs (attempt %d of %d)",
+                       timeout, attempt, attempts)
+        except Exception as exc:  # transient network / API error
+            executor.shutdown(wait=False)
+            _log.error("[render] error (attempt %d of %d): %r",
+                       attempt, attempts, str(exc))
+        if attempt < attempts:
+            _time.sleep(_RENDER_RETRY_BACKOFF_SECS * attempt)
+
+    _log.error("[render] gave up after %d attempts; returning None", attempts)
+    return None
+
+
 # LOCKED LASSO V3 brand palette for infographic styling. The directive tells the model
 # HOW to use each color (role + usage), not just lists hexes, so images come out on
 # brand (navy/red/sky/cream) instead of navy/gray/white.
@@ -641,7 +715,11 @@ def generate_social_proof(kind, main_line, support_line="", attribution="",
     if client is None:
         return None
 
-    image_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
+    image_bytes = _render_with_timeout(
+        lambda: client.generate_image(prompt=prompt, model=config.NANO_MODEL)
+    )
+    if image_bytes is None:
+        return None
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", str(main_line).lower()).strip("_")[:60] or "proof"
@@ -888,9 +966,14 @@ def generate(headline, facts, client=None, out_path=None,
     print(f"[creative-studio] model route: {route}")
 
     def _do_generate(p):
-        return client.generate_image(prompt=p, model=model)
+        # Wrapped with a hard timeout + bounded retry so one hung Gemini call
+        # can never stall a long render. Returns None on the final timeout /
+        # failure; the caller treats None as "no image" and skips the day.
+        return _render_with_timeout(lambda: client.generate_image(prompt=p, model=model))
 
     image_bytes = _do_generate(prompt)
+    if image_bytes is None:
+        return None
 
     if config.style_gate_enabled() or config.image_grade_enabled():
         from . import grade_gate as _gg
@@ -925,6 +1008,8 @@ def generate(headline, facts, client=None, out_path=None,
                                   surface=surface, archetype=archetype, palette=palette,
                                   canvas=canvas, layout=layout)
             image_bytes = _do_generate(prompt)
+            if image_bytes is None:
+                return None
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"
