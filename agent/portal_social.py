@@ -273,7 +273,7 @@ def _content_calendar_post(row):
     fmt = (row.get("format") or "").strip().lower()
     if fmt not in ("feed", "story"):
         fmt = "feed"
-    return {
+    post = {
         "id": row.get("id"),
         "day_key": row.get("post_date"),
         "status": row.get("status") or "",
@@ -282,6 +282,28 @@ def _content_calendar_post(row):
         "image_public_url": row.get("image_url") or "",
         "caption": row.get("caption") or "",
     }
+    return _with_display_image(post)
+
+
+def _with_display_image(post):
+    """No-creative fallback hook (AGENT_NO_CREATIVE_FALLBACK, default OFF). Flag OFF ->
+    the post is returned byte-for-byte (current behavior). Flag ON and the row has NO
+    usable creative image -> its image_public_url degrades to a clean website-style
+    infographic rendered from the post's OWN approved caption / pillar (never a blank
+    card, never a fabricated photo). A row with a usable image is untouched; a row with
+    no approved text to render is also untouched (empty stays empty, the portal shows
+    its existing empty state). Thin + isolated: this only decides the DISPLAY image, it
+    never publishes and touches no other field or gate."""
+    if not config.no_creative_fallback_enabled():
+        return post
+    if (post.get("image_public_url") or "").strip():
+        return post
+    from . import no_creative_fallback as _ncf
+    fallback = _ncf.display_image_for(post)
+    if fallback:
+        post = dict(post)
+        post["image_public_url"] = fallback
+    return post
 
 
 def _handle_social_supabase(account_key, month, now=None):
