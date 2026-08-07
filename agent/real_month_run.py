@@ -99,8 +99,15 @@ def _voice_for(account):
 
 def _library_for(account):
     """The account's creative library path (rotation reads b2b concept cards from here).
-    Defaults to config.LIBRARY_PATH."""
-    return getattr(account, "library_path", None) or config.LIBRARY_PATH
+    Defaults to config.LIBRARY_PATH. account.library_path may be a method (bound
+    accessor) rather than a string, so call it when callable before falling back."""
+    lib = getattr(account, "library_path", None)
+    if callable(lib):
+        try:
+            lib = lib()
+        except Exception:
+            lib = None
+    return lib or config.LIBRARY_PATH
 
 
 def _real_story_builder(account):
