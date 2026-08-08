@@ -107,10 +107,11 @@ def _build(available=None, manifest=None, book_dates=None, welcome_dates=None):
 
 def test_window_overlaps_cycle1():
     sd = _sprint_days_in_window()
-    # Aug 21..30 are the Cycle 1 posting days and all fall in the 30-day window.
-    for d in ("2026-08-21", "2026-08-25", "2026-08-30"):
+    # The kickoff sprint (Aug 10..19) and Cycle 1 (Aug 21..30) both fall in the window.
+    for d in ("2026-08-10", "2026-08-19", "2026-08-21", "2026-08-25", "2026-08-30"):
         assert d in sd, f"expected sprint day {d} in window"
-    assert min(sd) == "2026-08-21"
+    # earliest sprint day in the window is the kickoff sprint's Monday start.
+    assert min(sd) == "2026-08-10"
 
 
 # ---- SPRINT days: 1 summit feed + 1 varied slot (Blake's dialed cadence) --------------

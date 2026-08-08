@@ -216,6 +216,7 @@ ACCOUNTS = ["lasso_ig", "lasso_fb"]
 # Blake ruling 2026-08-05: the summit runs as a backward-anchored sprint that
 # tightens as the event nears, then goes dark on the event days.
 #
+#   Kickoff   Aug 10 -> Aug 19   (Blake, 2026-08-08: a 10-day sprint starting Monday)
 #   Cycle 1   Aug 21 -> Aug 30
 #   Cycle 2   Sep 7  -> Sep 16
 #   Cycle 3   Sep 24 -> Oct 3
@@ -232,6 +233,7 @@ ACCOUNTS = ["lasso_ig", "lasso_fb"]
 # and even then every draft is HELD for approval.
 
 SPRINT_CYCLES = [
+    ("2026-08-10", "2026-08-19"),   # kickoff sprint (10 days, starts Monday Aug 10)
     ("2026-08-21", "2026-08-30"),   # cycle 1
     ("2026-09-07", "2026-09-16"),   # cycle 2
     ("2026-09-24", "2026-10-03"),   # cycle 3
