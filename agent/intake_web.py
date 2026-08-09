@@ -83,6 +83,38 @@ def client_for_token(token):
     return None
 
 
+# The token charset: b64url alphabet plus the '.' that separates a signed
+# token's payload from its signature. Anchored, slash-free, so no path traversal.
+_TOKEN_CHARS = re.compile(r"^[A-Za-z0-9_.-]{8,}$")
+
+
+def token_from_path(path, prefix):
+    """The token in /`prefix`/<token>, or None. Pure and unit-testable.
+
+    A signed token is b64url(account_key).b64url(sig): the DOT is load-bearing.
+    A gym opens this link from a text message, and messaging clients, link
+    previewers, and some HTTP stacks routinely percent-encode the '.' (to %2E),
+    append a trailing slash, or tack on trailing whitespace (a stray %0A/%20).
+    Any of those made the raw-path regex miss and returned a 404 on a perfectly
+    valid link (this is the Dale Suslick 'not found' bug). So we:
+      1. drop the query string,
+      2. URL-decode the path once (so %2E becomes '.', %20 becomes ' '),
+      3. strip one trailing slash and surrounding whitespace,
+    THEN match the anchored token charset. The token itself is never widened:
+    only in-transit mangling is undone, so a genuinely bad path still 404s and
+    the value never reaches client_for_token unverified."""
+    from urllib.parse import unquote
+    raw = (path or "").split("?", 1)[0]
+    marker = f"/{prefix}/"
+    if not raw.startswith(marker):
+        return None
+    tail = unquote(raw[len(marker):])
+    tail = tail.strip().rstrip("/").strip()
+    if "/" in tail:               # never span a path segment (no traversal)
+        return None
+    return tail if _TOKEN_CHARS.match(tail) else None
+
+
 # ---- per-gym revocation (an R2 denylist; this service touches R2 only) ----------
 # Rotating the shared secret kills EVERY link; the denylist kills ONE gym's link
 # without touching the rest. It lives in R2 (never /data) so the intake-web
@@ -259,11 +291,18 @@ def _safe_name(filename):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", base) or "upload"
 
 
-def handle_upload(token, files, note="", r2=None, now=None):
+def handle_upload(token, files, note="", captions=None, r2=None, now=None):
     """
     The whole upload decision, pure and offline-testable. Returns (status, body).
     404 whenever the feature is off or the token is unknown (indistinguishable on
     purpose); 429 rate-limited (handled by the HTTP layer); 400 bad files; 200 ok.
+
+    captions: an optional list, one caption per file IN THE SAME ORDER as `files`
+    (the gallery page sends one caption field per media field). Each caption is the
+    gym's one line about that specific photo or video. It is optional and never
+    required: a missing or blank caption is simply omitted. The sidecar keeps a
+    per-file `captions` map keyed by the STORED basename, alongside the existing
+    batch-wide `note`, so a plain single `note` still works with nothing else set.
     """
     if not config.intake_enabled():
         return 404, {"error": "not found"}
@@ -295,12 +334,20 @@ def handle_upload(token, files, note="", r2=None, now=None):
     if quotas.over_quota(client, used, incoming):
         return 413, {"error": "storage quota exceeded; ask us to raise it"}
 
+    captions = list(captions or [])
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     stored = []
-    for filename, ctype, data in files:
+    caption_map = {}
+    for idx, (filename, ctype, data) in enumerate(files):
         key = f"intake/{client}/incoming/{stamp}_{_safe_name(filename)}"
         r2.put_bytes(key, data, content_type=ctype)
-        stored.append(os.path.basename(key))
+        base = os.path.basename(key)
+        stored.append(base)
+        cap = ""
+        if idx < len(captions):
+            cap = (captions[idx] or "").strip()[:200]
+        if cap:
+            caption_map[base] = cap
     sidecar = {
         "note": (note or "").strip()[:500],
         "client": client,
@@ -308,6 +355,9 @@ def handle_upload(token, files, note="", r2=None, now=None):
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "timestamp": stamp,
         "filenames": stored,
+        # per-file caption map (STORED basename -> the gym's one line about it);
+        # backward compatible: absent/empty when the client sent only a batch note.
+        "captions": caption_map,
     }
     r2.put_bytes(f"intake/{client}/incoming/{stamp}_upload.json",
                  json.dumps(sidecar).encode("utf-8"), content_type="application/json")
@@ -845,25 +895,162 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Send content</title>
 <style>
- body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#121E3C;color:#FAF6F0;
-      margin:0;padding:24px;display:flex;justify-content:center}
- .card{max-width:440px;width:100%%}
- h1{font-size:22px;margin:0 0 6px} p{color:#D8E3EE;font-size:14px;margin:0 0 18px}
- input[type=file],textarea{width:100%%;box-sizing:border-box;background:#FAF6F0;color:#121E3C;
-      border:none;border-radius:10px;padding:12px;font-size:15px;margin:0 0 12px}
- textarea{min-height:70px}
- button{width:100%%;background:#FF0000;color:#fff;border:none;border-radius:10px;
-      padding:14px;font-size:16px;font-weight:700}
- .ok{color:#5EB9E6;font-weight:700}
+ :root{--navy:#121E3C;--red:#FF2A2A;--sky:#5EB9E6;--cream:#FAF6F0;--steel:#D8E3EE}
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,'Inter',Helvetica,Arial,sans-serif;background:var(--navy);
+      color:var(--cream);margin:0;padding:22px 16px 60px;display:flex;justify-content:center}
+ .card{max-width:480px;width:100%}
+ h1{font-size:23px;margin:0 0 6px}
+ h1 .a{color:var(--red)}
+ p.deck{color:var(--steel);font-size:14px;margin:0 0 18px;line-height:1.45}
+ .pick{display:block;width:100%;background:var(--cream);color:var(--navy);border:none;
+      border-radius:12px;padding:16px;font-size:16px;font-weight:700;text-align:center;cursor:pointer}
+ .pick.more{background:transparent;color:var(--sky);border:2px dashed rgba(94,185,230,.5);
+      margin-top:12px;padding:13px}
+ #gallery{margin:14px 0 0;padding:0;list-style:none}
+ .item{display:flex;gap:12px;background:rgba(255,255,255,.05);border-radius:12px;
+      padding:10px;margin:0 0 12px;align-items:flex-start}
+ .item.gone{display:none}
+ .thumb{width:76px;height:76px;flex:0 0 76px;border-radius:9px;object-fit:cover;
+      background:#0c1730;display:flex;align-items:center;justify-content:center;
+      color:var(--sky);font-size:11px;font-weight:700;text-align:center;overflow:hidden}
+ .thumb video,.thumb img{width:100%;height:100%;object-fit:cover}
+ .meta{flex:1;min-width:0}
+ .fname{font-size:12px;color:var(--steel);margin:0 0 6px;white-space:nowrap;
+      overflow:hidden;text-overflow:ellipsis}
+ .cap{width:100%;background:var(--cream);color:var(--navy);border:none;border-radius:8px;
+      padding:9px 10px;font-size:14px}
+ .row2{display:flex;justify-content:space-between;align-items:center;margin-top:7px}
+ .state{font-size:12px;color:var(--steel)}
+ .state.ok{color:var(--sky);font-weight:700}
+ .state.err{color:#FFB4B4;font-weight:700}
+ .rm{background:none;border:none;color:#FFB4B4;font-size:13px;font-weight:700;
+      padding:2px 4px;cursor:pointer}
+ .note{width:100%;background:var(--cream);color:var(--navy);border:none;border-radius:10px;
+      padding:12px;font-size:15px;margin:16px 0 0;min-height:60px}
+ .send{width:100%;background:var(--red);color:#fff;border:none;border-radius:12px;
+      padding:16px;font-size:17px;font-weight:700;margin-top:18px}
+ .send:disabled{opacity:.45}
+ .empty{color:var(--steel);font-size:13px;text-align:center;padding:14px 0}
+ #banner{border-radius:10px;padding:12px 14px;font-size:14px;font-weight:600;margin:16px 0 0;display:none}
+ #banner.ok{display:block;background:rgba(94,185,230,.15);color:var(--sky)}
+ #banner.err{display:block;background:rgba(255,120,120,.15);color:#FFB4B4}
 </style></head><body><div class="card">
-<h1>Send us your content</h1>
-<p>Pick photos or videos from your gym and add one line about what is happening. We take it from there.</p>
-<form method="post" enctype="multipart/form-data">
- <input type="file" name="media" accept="image/*,video/mp4,video/quicktime" multiple required>
- <textarea name="note" maxlength="500" placeholder="One sentence about these (optional)"></textarea>
- <button type="submit">Send</button>
-</form></div></body></html>"""
+<h1>Send us your <span class="a">content</span></h1>
+<p class="deck">Pick the photos and videos from your gym. Add one quick line next to
+each so we know what is happening in it. All of it optional. We take it from there.</p>
 
+<label class="pick" for="filepick">Choose photos or videos</label>
+<input id="filepick" type="file" accept="image/*,video/mp4,video/quicktime" multiple hidden>
+<ul id="gallery"><li class="empty" id="emptymsg">Nothing picked yet.</li></ul>
+<label class="pick more" for="filepick" id="addmore" style="display:none">Add more</label>
+
+<textarea class="note" id="note" maxlength="500"
+  placeholder="Anything about the whole batch? (optional)"></textarea>
+<div id="banner"></div>
+<button class="send" id="send" disabled>Send it to LASSO</button>
+</div>
+<script>
+(function(){
+ var picked=[];            // {file, id, caption, sent}
+ var seq=0;
+ var input=document.getElementById('filepick');
+ var gallery=document.getElementById('gallery');
+ var emptymsg=document.getElementById('emptymsg');
+ var addmore=document.getElementById('addmore');
+ var sendBtn=document.getElementById('send');
+ var banner=document.getElementById('banner');
+ var note=document.getElementById('note');
+
+ function isVideo(f){return (f.type||'').indexOf('video')===0
+    || /\\.(mp4|mov|m4v|qt)$/i.test(f.name||'');}
+
+ function render(){
+   var live=picked.filter(function(p){return !p.removed;});
+   emptymsg.style.display = live.length ? 'none':'block';
+   addmore.style.display = live.length ? 'block':'none';
+   sendBtn.disabled = live.length===0;
+   sendBtn.textContent = live.length>1
+     ? ('Send '+live.length+' items to LASSO') : 'Send it to LASSO';
+ }
+
+ function addFiles(files){
+   for(var i=0;i<files.length;i++){(function(f){
+     var id='it'+(seq++);
+     var rec={file:f,id:id,caption:'',removed:false,sent:false};
+     picked.push(rec);
+     var li=document.createElement('li');
+     li.className='item'; li.id=id;
+     var thumb=document.createElement('div'); thumb.className='thumb';
+     if(isVideo(f)){thumb.textContent='VIDEO';}
+     else{var img=document.createElement('img');
+          img.src=URL.createObjectURL(f);
+          img.onload=function(){URL.revokeObjectURL(img.src);};
+          thumb.textContent=''; thumb.appendChild(img);}
+     var meta=document.createElement('div'); meta.className='meta';
+     var fname=document.createElement('div'); fname.className='fname';
+     fname.textContent=f.name||'file';
+     var cap=document.createElement('input'); cap.className='cap'; cap.type='text';
+     cap.maxLength=200; cap.placeholder='What is happening in this one? (optional)';
+     cap.addEventListener('input',function(){rec.caption=cap.value;});
+     var row2=document.createElement('div'); row2.className='row2';
+     var state=document.createElement('span'); state.className='state'; state.textContent='ready';
+     var rm=document.createElement('button'); rm.className='rm'; rm.type='button';
+     rm.textContent='Remove';
+     rm.addEventListener('click',function(){
+       rec.removed=true; li.className='item gone'; render();});
+     rec._state=state;
+     row2.appendChild(state); row2.appendChild(rm);
+     meta.appendChild(fname); meta.appendChild(cap); meta.appendChild(row2);
+     li.appendChild(thumb); li.appendChild(meta);
+     gallery.appendChild(li);
+   })(files[i]);}
+   input.value='';
+   render();
+ }
+
+ input.addEventListener('change',function(e){if(e.target.files&&e.target.files.length)addFiles(e.target.files);});
+
+ sendBtn.addEventListener('click',function(){
+   var live=picked.filter(function(p){return !p.removed;});
+   if(!live.length) return;
+   sendBtn.disabled=true; banner.className=''; banner.textContent='';
+   var fd=new FormData();
+   live.forEach(function(p){
+     fd.append('media',p.file,p.file.name||'upload');
+     fd.append('caption',p.caption||'');
+     p._state.textContent='sending'; p._state.className='state';
+   });
+   fd.append('note',note.value||'');
+   fetch(window.location.pathname,{method:'POST',body:fd}).then(function(r){
+     if(r.ok){
+       live.forEach(function(p){p.sent=true;p._state.textContent='sent';p._state.className='state ok';});
+       banner.className='ok';
+       banner.textContent='Got it. '+live.length+(live.length>1?' items are':' item is')+
+         ' in. We will take it from here.';
+       sendBtn.textContent='Sent'; sendBtn.disabled=true;
+     } else {
+       live.forEach(function(p){p._state.textContent='not sent';p._state.className='state err';});
+       banner.className='err';
+       banner.textContent = r.status===413
+         ? 'That batch was too large. Remove a few and try again.'
+         : (r.status===400 ? 'One of those files was not a photo or video.'
+                           : 'Something went wrong. Please try again.');
+       sendBtn.disabled=false;
+     }
+   }).catch(function(){
+     banner.className='err'; banner.textContent='Network hiccup. Please try again.';
+     sendBtn.disabled=false;
+     live.forEach(function(p){p._state.textContent='not sent';p._state.className='state err';});
+   });
+ });
+
+ render();
+})();
+</script>
+</body></html>"""
+
+# Kept for the no-JS fallback POST and any legacy client: a full-page success view.
 DONE = ("<!doctype html><html><body style='font-family:sans-serif;background:#121E3C;"
         "color:#FAF6F0;padding:40px;text-align:center'><h1>Got it.</h1>"
         "<p>Your content is in. We will take it from here.</p></body></html>")
@@ -1029,14 +1216,13 @@ def build_server(port=None):
 
     class Handler(BaseHTTPRequestHandler):
         def _token(self):
-            # Charset includes '.' for signed tokens (b64url.b64url); anchored,
-            # no slashes, so no path traversal.
-            m = re.match(r"^/u/([A-Za-z0-9_.-]{8,})$", self.path.split("?")[0])
-            return m.group(1) if m else None
+            # The signed-token upload page. See token_from_path for why the raw
+            # path is URL-decoded and trimmed before matching (a texted link
+            # commonly arrives with the '.' percent-encoded or a trailing slash).
+            return token_from_path(self.path, "u")
 
         def _form_token(self):
-            m = re.match(r"^/intake/([A-Za-z0-9_.-]{8,})$", self.path.split("?")[0])
-            return m.group(1) if m else None
+            return token_from_path(self.path, "intake")
 
         def _send_html(self, body_str, status=200):
             body = body_str.encode()
@@ -1514,16 +1700,30 @@ def build_server(port=None):
             msg = BytesParser(policy=email_default).parsebytes(
                 b"Content-Type: " + (self.headers.get("Content-Type") or "").encode()
                 + b"\r\n\r\n" + raw)
-            files, note = [], ""
+            # Parse the gallery submission. The page appends one 'media' file part
+            # immediately followed by its 'caption' part, per item, in order. We
+            # pair a caption to the media that PRECEDES it, so captions[i] is the
+            # caption for files[i] regardless of how many items were sent. A plain
+            # single 'note' (batch-wide) still works with no captions at all.
+            files, note, captions = [], "", []
             for part in msg.iter_parts() if msg.is_multipart() else []:
                 name = part.get_param("name", header="content-disposition")
                 if name == "note":
-                    note = part.get_content().strip() if isinstance(part.get_content(), str) else ""
+                    content = part.get_content()
+                    note = content.strip() if isinstance(content, str) else ""
                 elif name == "media":
                     payload = part.get_payload(decode=True) or b""
                     files.append((part.get_filename() or "upload",
                                   part.get_content_type(), payload))
-            status, _body = handle_upload(token, files, note=note)
+                    # keep captions index-aligned to files: pad this slot now,
+                    # a following 'caption' part fills it (else it stays blank).
+                    captions.append("")
+                elif name == "caption":
+                    content = part.get_content()
+                    cap = content.strip() if isinstance(content, str) else ""
+                    if files:                 # attach to the most recent media
+                        captions[len(files) - 1] = cap
+            status, _body = handle_upload(token, files, note=note, captions=captions)
             if status == 200:
                 body = DONE.encode()
                 self.send_response(200)
