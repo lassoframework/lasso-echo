@@ -1040,7 +1040,100 @@ def _bold_sponsor_strip(d, x, y, w, h, sponsors):
     d.text((x + 30, ny), text, font=nf, fill=BOLD_INK)
 
 
-def _summit_bold_feed(concept, out_path, sponsors=()):
+# ---- bold PHOTO background + legibility scrim -------------------------------
+# Blake ruling: each bold summit card should sit OVER a real event-scene photo
+# (gym owners at a summit in athleisure), not the flat dark base. The photo is
+# cover-cropped to the exact card size (reusing the house _cover primitive), then
+# a two-band BOLD_BG scrim is composited so the oversized ANTON headline, the
+# numeric callouts, the URL, the dash-free event lockup, and the sponsor strip all
+# stay legible over ANY photo. The whole bold overlay is still PIL-drawn ON TOP,
+# so text is never model-rendered (garble-proof) and the accent side rail stays.
+# When no background is provided the flat BOLD_BG behavior is UNCHANGED.
+
+# Configurable background library. The operator drops jpg/png into feed/ and
+# story/ subdirs; this code only consumes them. Missing/empty -> flat dark.
+SUMMIT_BG_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "content_library", "summit_bg")
+_BG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _bold_base_with_bg(bg_path, w, h):
+    """A (w, h) canvas from a real event photo, cover-cropped to the EXACT card
+    size (reusing the house _cover primitive so a portrait is never squished), then
+    darkened by a vertical BOLD_BG scrim: high opacity in the TOP band (behind the
+    headline + callouts) and the BOTTOM band (behind the URL, event lockup, and
+    sponsor strip), easing to ~35-45% through the middle so the crowd photo shows
+    through. A slight overall darken sits under all of it. Tuned so cream/white text
+    and the electric accent stay legible over any photo. Returns an RGB image.
+
+    Never crashes the card: the caller falls back to the flat dark base if opening
+    or cropping the photo raises (a bad/corrupt file must not sink the sprint)."""
+    src = _cover(Image.open(bg_path), w, h)   # exact size, cover-cropped, no squish
+    scrim = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(scrim)
+    br, bg_, bb = BOLD_BG
+    # The top band holds a STRONG near-opaque scrim across the whole headline +
+    # callouts zone (down to top_hold), then eases to the mid so the crowd photo
+    # shows through the middle; the bottom band ramps strong again behind the URL,
+    # the dash-free event lockup, and the sponsor strip. Tuned so cream/white text
+    # and the electric accent stay legible over ANY photo.
+    top_hold = h * 0.30        # headline zone: hold the strong scrim through here
+    top_band = h * 0.46        # ease strong -> mid finishes here
+    bot_band = h * 0.66        # URL + event lockup + sponsor strip below here
+    a_top, a_mid, a_bot = 236, 108, 238       # ~93% top, ~42% middle, ~93% bottom
+    for y in range(h):
+        if y <= top_hold:
+            a = a_top                                                # strong, flat
+        elif y <= top_band:
+            a = int(a_top - (a_top - a_mid) * ((y - top_hold) / (top_band - top_hold)))
+        elif y <= bot_band:
+            a = a_mid                                                # steady mid
+        else:
+            a = int(a_mid + (a_bot - a_mid) * ((y - bot_band) / (h - bot_band)))
+        sd.line([(0, y), (w, y)], fill=(br, bg_, bb, a))
+    base = Image.alpha_composite(src.convert("RGBA"), scrim).convert("RGB")
+    return base
+
+
+def _bold_canvas(w, h, bg_path):
+    """The base canvas for a bold card: the scrimmed event photo when bg_path is a
+    real, openable image; otherwise the flat BOLD_BG field (unchanged behavior).
+    NEVER crashes on a missing/corrupt/failed background: any error falls back to
+    the flat dark base so the card always renders."""
+    if bg_path:
+        try:
+            return _bold_base_with_bg(bg_path, w, h)
+        except Exception as exc:            # corrupt/unreadable photo -> flat dark
+            print(f"  bold bg failed ({os.path.basename(str(bg_path))}: {exc}); "
+                  "flat dark fallback")
+    return Image.new("RGB", (w, h), BOLD_BG)
+
+
+def _pick_summit_bg(concept_id, background_dir, subdir):
+    """Deterministically pick ONE background for a concept from
+    `background_dir`/`subdir` (feed/ or story/). Rotates by a STABLE hash of the
+    concept id so cards vary across concepts but a given concept always resolves to
+    the same photo (stable, reproducible sprints). Returns an absolute path or None.
+
+    None (flat dark fallback) when: no dir given, the subdir is missing, or it holds
+    no jpg/png. The images themselves are added by the operator; this only consumes
+    a sorted list of them, so the mapping is stable regardless of filesystem order."""
+    if not background_dir:
+        return None
+    sub = os.path.join(background_dir, subdir)
+    if not os.path.isdir(sub):
+        return None
+    files = sorted(f for f in os.listdir(sub)
+                   if os.path.splitext(f)[1].lower() in _BG_EXTS)
+    if not files:
+        return None
+    # stable hash (not Python's salted hash()): same id -> same index every run
+    import hashlib
+    idx = int(hashlib.sha1(str(concept_id).encode("utf-8")).hexdigest(), 16) % len(files)
+    return os.path.join(sub, files[idx])
+
+
+def _summit_bold_feed(concept, out_path, sponsors=(), background_path=None):
     """Render ONE bold summit sprint FEED card (1080x1080), PIL-composited.
 
     Layout (color-blocked bands, top to bottom):
@@ -1051,8 +1144,10 @@ def _summit_bold_feed(concept, out_path, sponsors=()):
       - a bottom sponsor strip (PRESENTED WITH), injectable + never fabricated
 
     Distinct from the daily house card by construction: dark base, electric accent,
-    color blocks, oversized type. Returns out_path."""
-    img = Image.new("RGB", (SIZE, SIZE), BOLD_BG)
+    color blocks, oversized type. When `background_path` is a real event photo it is
+    cover-cropped + scrimmed underneath and the bold overlay composites on top; when
+    None the flat BOLD_BG behavior is unchanged. Returns out_path."""
+    img = _bold_canvas(SIZE, SIZE, background_path)
     d = ImageDraw.Draw(img)
     x = MARGIN
     w = SIZE - 2 * MARGIN
@@ -1093,13 +1188,16 @@ def _summit_bold_feed(concept, out_path, sponsors=()):
     return out_path
 
 
-def _summit_bold_story(concept, out_path, sponsors=()):
+def _summit_bold_story(concept, out_path, sponsors=(), background_path=None):
     """Render ONE bold summit sprint STORY card (1080x1920), PIL-composited.
 
     Same bold identity as the feed, laid out for the 9:16 frame with top/bottom safe
     bands so nothing lands under IG chrome. Event lockup on the card; sponsor strip at
-    the bottom (injectable, never fabricated). Returns out_path."""
-    img = Image.new("RGB", (STORY_W, STORY_H), BOLD_BG)
+    the bottom (injectable, never fabricated). When `background_path` is a real event
+    photo it is cover-cropped to the tall frame + scrimmed underneath and the bold
+    overlay composites on top; when None the flat BOLD_BG behavior is unchanged.
+    Returns out_path."""
+    img = _bold_canvas(STORY_W, STORY_H, background_path)
     d = ImageDraw.Draw(img)
     x = STORY_MARGIN
     w = STORY_W - 2 * STORY_MARGIN
@@ -1142,14 +1240,32 @@ def _summit_bold_story(concept, out_path, sponsors=()):
     return out_path
 
 
-def render_bold_feed(concept, treatment, out_path, sponsors=()):
+def render_bold_feed(concept, treatment, out_path, sponsors=(),
+                     background_path=None, background_dir=None):
     """Sprint-path entry for a bold FEED card. `treatment` is accepted for a drop-in
     signature match with the studio feed path (both a/b share the concept's bold
-    identity; the treatment no longer forks the LOOK, only the caption arc does)."""
-    return _summit_bold_feed(concept, out_path, sponsors=sponsors)
+    identity; the treatment no longer forks the LOOK, only the caption arc does).
+
+    Background: pass `background_path` for an explicit photo, or `background_dir` to
+    have a background deterministically selected from its feed/ subdir by a stable
+    hash of the concept id (cards vary; a given concept is stable). An explicit path
+    wins. When neither resolves to a photo the flat BOLD_BG behavior is unchanged."""
+    bgp = background_path
+    if bgp is None and background_dir:
+        bgp = _pick_summit_bg(concept["id"], background_dir, "feed")
+    return _summit_bold_feed(concept, out_path, sponsors=sponsors, background_path=bgp)
 
 
-def render_bold_story(concept, treatment, out_path, sponsors=(), bg_path=None):
+def render_bold_story(concept, treatment, out_path, sponsors=(),
+                      background_path=None, background_dir=None, bg_path=None):
     """Sprint-path entry for a bold STORY card. Signature matches render_card_story
-    (bg_path accepted and ignored: the bold look is PIL-composited, not photo-scrimmed)."""
-    return _summit_bold_story(concept, out_path, sponsors=sponsors)
+    (`bg_path` is the legacy studio-story alias, accepted for compatibility).
+
+    Background: pass `background_path`/`bg_path` for an explicit photo, or
+    `background_dir` to have one deterministically selected from its story/ subdir by
+    a stable hash of the concept id. An explicit path wins. When neither resolves to a
+    photo the flat BOLD_BG behavior is unchanged."""
+    bgp = background_path or bg_path
+    if bgp is None and background_dir:
+        bgp = _pick_summit_bg(concept["id"], background_dir, "story")
+    return _summit_bold_story(concept, out_path, sponsors=sponsors, background_path=bgp)

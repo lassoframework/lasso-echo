@@ -351,6 +351,7 @@ def _concept_by_treatment():
 def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
                         story_renderer=None, agenda_renderer=None,
                         panel_renderer=None, host=None, sponsors=(),
+                        background_dir=None,
                         load_manifest=None, save_manifest=None):
     """Render every non-deferred sprint asset, host it, and write filename -> URL
     into summit_queue's manifest so sprint_assets()/sprint_builders() serve them.
@@ -367,6 +368,13 @@ def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
     `sponsors` is an injectable list of sponsor names threaded onto every bold card's
     PRESENTED WITH strip. Default empty -> a safe "Presented with our partners"
     placeholder is drawn; names are NEVER fabricated.
+
+    `background_dir` is the summit background library (default summit_render.SUMMIT_BG_DIR).
+    When it holds photos, each bold card composites over a real event-scene photo
+    (feed cards from its feed/ subdir, story cards from its story/ subdir), selected
+    deterministically per concept so cards vary and each concept is stable. When the
+    dir (or the relevant subdir) is empty or missing, cards fall back to the flat dark
+    base and NEVER crash. The photos themselves are added by the operator.
 
     Gated: AGENT_SUMMIT_CAMPAIGN_ENABLED must be armed AND hosting enabled; otherwise
     this is a no-op that reports and returns an empty summary. Idempotent: a filename
@@ -388,6 +396,9 @@ def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
     host = host or media_host.host_media
     load_manifest = load_manifest or summit_queue._load_manifest
     save_manifest = save_manifest or summit_queue._save_manifest
+    # default background library; an empty/missing dir simply falls back to flat dark
+    if background_dir is None:
+        background_dir = summit_render.SUMMIT_BG_DIR
 
     summary = {"rendered": [], "hosted": [], "skipped_hosted": [],
                "skipped_story": [], "deferred": list(DEFERRED_SCARCITY),
@@ -445,8 +456,11 @@ def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
                 summary["none_facts"].append(feed_name)
                 print(f"  no facts (no fabrication): {feed_name}")
             else:
-                # BOLD PIL feed (never Gemini): the loud, high-contrast summit card.
-                feed_renderer(concept, treatment, feed_path, sponsors=sponsors)
+                # BOLD PIL feed (never Gemini): the loud, high-contrast summit card,
+                # composited over a real event photo from the feed/ bg subdir when the
+                # library has one (else flat dark; never crashes on a missing bg).
+                feed_renderer(concept, treatment, feed_path, sponsors=sponsors,
+                              background_dir=background_dir)
                 summary["rendered"].append(feed_name)
                 _host_and_record(feed_name, feed_path, "FEED", FEED_SIZE)
 
@@ -459,7 +473,10 @@ def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
             summary["skipped_story"].append(story_name)
         else:
             story_path = os.path.join(images_dir, story_name)
-            story_renderer(concept, treatment, story_path, sponsors=sponsors)
+            # bold story composited over a real event photo from the story/ bg subdir
+            # when the library has one (else flat dark; never crashes on a missing bg).
+            story_renderer(concept, treatment, story_path, sponsors=sponsors,
+                           background_dir=background_dir)
             summary["rendered"].append(story_name)
             _host_and_record(story_name, story_path, "STORY", STORY_SIZE)
 
