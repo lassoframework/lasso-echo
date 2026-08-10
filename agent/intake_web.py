@@ -338,29 +338,41 @@ def handle_upload(token, files, note="", captions=None, r2=None, now=None):
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     stored = []
     caption_map = {}
-    for idx, (filename, ctype, data) in enumerate(files):
-        key = f"intake/{client}/incoming/{stamp}_{_safe_name(filename)}"
-        r2.put_bytes(key, data, content_type=ctype)
-        base = os.path.basename(key)
-        stored.append(base)
-        cap = ""
-        if idx < len(captions):
-            cap = (captions[idx] or "").strip()[:200]
-        if cap:
-            caption_map[base] = cap
-    sidecar = {
-        "note": (note or "").strip()[:500],
-        "client": client,
-        # never the raw token: a fingerprint is enough to trace which link was used
-        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
-        "timestamp": stamp,
-        "filenames": stored,
-        # per-file caption map (STORED basename -> the gym's one line about it);
-        # backward compatible: absent/empty when the client sent only a batch note.
-        "captions": caption_map,
-    }
-    r2.put_bytes(f"intake/{client}/incoming/{stamp}_upload.json",
-                 json.dumps(sidecar).encode("utf-8"), content_type="application/json")
+    # Every R2 write is wrapped: a storage failure MID-upload (creds accepted at
+    # construction but rejected by R2, a transient network fault, a bad bucket)
+    # must never bubble out of the HTTP handler as an unhandled 500/503 with a
+    # misleading "not found" body. We return an honest 503 the UI can show. The
+    # exception is logged (scrubbed) so a live misconfig is diagnosable.
+    try:
+        for idx, (filename, ctype, data) in enumerate(files):
+            key = f"intake/{client}/incoming/{stamp}_{_safe_name(filename)}"
+            r2.put_bytes(key, data, content_type=ctype)
+            base = os.path.basename(key)
+            stored.append(base)
+            cap = ""
+            if idx < len(captions):
+                cap = (captions[idx] or "").strip()[:200]
+            if cap:
+                caption_map[base] = cap
+        sidecar = {
+            "note": (note or "").strip()[:500],
+            "client": client,
+            # never the raw token: a fingerprint traces which link was used
+            "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            "timestamp": stamp,
+            "filenames": stored,
+            # per-file caption map (STORED basename -> the gym's one line about it);
+            # backward compatible: absent/empty when only a batch note was sent.
+            "captions": caption_map,
+        }
+        r2.put_bytes(f"intake/{client}/incoming/{stamp}_upload.json",
+                     json.dumps(sidecar).encode("utf-8"),
+                     content_type="application/json")
+    except Exception as e:
+        from . import ops_alerts as _oa
+        print(f"[intake-web] upload write failed for {client}: "
+              f"{type(e).__name__}: {_oa.scrub(str(e))}")
+        return 503, {"error": "storage unavailable"}
     return 200, {"ok": True, "stored": len(stored)}
 
 
@@ -871,22 +883,48 @@ class _R2:
                 return total
 
 
+def _looks_like_placeholder(value):
+    """True when a value is an unfilled setup-runbook placeholder (angle brackets),
+    e.g. '<from R2 dashboard>' or 'https://<your-account>.r2.cloudflarestorage.com'.
+    Those are NOT real credentials; boto3 rejects them and the upload cannot land."""
+    v = (value or "").strip()
+    return "<" in v and ">" in v
+
+
 def _default_r2():
     key_id = os.environ.get(config.S3_ACCESS_KEY_ID_ENV)
     secret = os.environ.get(config.S3_SECRET_ACCESS_KEY_ENV)
     if not key_id or not secret or not config.S3_BUCKET:
+        print("[intake-web] R2 not configured: one of "
+              f"{config.S3_ACCESS_KEY_ID_ENV}/{config.S3_SECRET_ACCESS_KEY_ENV}/"
+              "AGENT_S3_BUCKET is unset. Uploads will 503 until real R2 "
+              "credentials are set on this service.")
         return None
-    # Placeholder values from the setup runbook (e.g. "<your-account>.r2...") are
-    # invalid boto3 endpoints and raise ValueError at client construction time.
-    # Treat any construction failure as "not configured" so intake still accepts
-    # submissions without R2 (upload link is omitted until R2 is wired up).
+    # Placeholder values from the setup runbook (e.g. "<your-account>.r2...",
+    # "<from R2 dashboard>") are invalid boto3 endpoints/creds and raise at client
+    # construction time. Detect them explicitly and say so LOUDLY in the logs: a
+    # silent None here is exactly what made the live 503 look like a code bug when
+    # it was an unfilled env var. Uploads still 503 (storage genuinely unavailable),
+    # but the reason is now diagnosable.
+    for name, val in (("AGENT_S3_ENDPOINT", config.S3_ENDPOINT),
+                      (config.S3_ACCESS_KEY_ID_ENV, key_id),
+                      (config.S3_SECRET_ACCESS_KEY_ENV, secret),
+                      ("AGENT_S3_BUCKET", config.S3_BUCKET)):
+        if _looks_like_placeholder(val):
+            print(f"[intake-web] R2 not configured: {name} is still the setup "
+                  "placeholder (contains '<...>'). Set the real Cloudflare R2 "
+                  "value on the echo-intake-web service. Uploads will 503 until then.")
+            return None
     try:
         import boto3  # lazy
         s3 = boto3.client("s3", endpoint_url=config.S3_ENDPOINT or None,
                           region_name=config.S3_REGION or None,
                           aws_access_key_id=key_id, aws_secret_access_key=secret)
         return _R2(s3, config.S3_BUCKET)
-    except Exception:
+    except Exception as e:
+        from . import ops_alerts as _oa
+        print(f"[intake-web] R2 client construction failed: "
+              f"{type(e).__name__}: {_oa.scrub(str(e))}. Uploads will 503.")
         return None
 
 
@@ -1035,7 +1073,8 @@ each so we know what is happening in it. All of it optional. We take it from the
        banner.textContent = r.status===413
          ? 'That batch was too large. Remove a few and try again.'
          : (r.status===400 ? 'One of those files was not a photo or video.'
-                           : 'Something went wrong. Please try again.');
+         : (r.status===503 ? 'Our upload storage is briefly unavailable. Please try again in a few minutes.'
+                           : 'Something went wrong. Please try again.'));
        sendBtn.disabled=false;
      }
    }).catch(function(){
@@ -1731,8 +1770,17 @@ def build_server(port=None):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif status == 400:
+                self._deny(400, "upload rejected")
+            elif status == 413:
+                self._deny(413, "upload too large")
+            elif status == 503:
+                # HONEST error: storage is unavailable (R2 not configured or a write
+                # failed). Never "not found" — that misled the whole first diagnosis
+                # and gives the UI nothing true to show.
+                self._deny(503, "storage unavailable")
             else:
-                self._deny(status, "upload rejected" if status == 400 else "not found")
+                self._deny(status, "not found")
 
         def log_message(self, fmt, *args):
             # Never log the path: it carries the token. Method + status only.

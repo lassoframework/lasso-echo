@@ -263,6 +263,123 @@ def test_multipart_post_pairs_captions_to_files(server, monkeypatch):
     assert sc["captions"][names[2]] == "kettlebell class"
 
 
+# =============== BUG 3: the live 503 "not found" on a real upload POST ===========
+# The gallery GET renders but the upload POST 503'd with a "not found" body live,
+# while every test above stayed green. Reason: those tests swap _default_r2 for a
+# FakeR2 (whose put_bytes never touches boto3), so they never exercised the REAL
+# _R2 wrapper NOR the branch where R2 is unconfigured/placeholder. The true live
+# cause was unfilled R2 env (placeholder '<...>' values) -> _default_r2() None ->
+# handle_upload 503 -> _deny(503, "not found"). These tests drive the FULL do_POST
+# HTTP path through the real _R2 wrapper and the unconfigured branch, so this class
+# of failure can never pass tests again.
+
+
+class FakeS3:
+    """A boto3-s3-shaped stub so the REAL agent.intake_web._R2 wrapper (put_object)
+    is exercised end to end, not the FakeR2 shortcut. Optionally fails on a chosen
+    key to simulate a mid-upload storage fault."""
+
+    def __init__(self, fail_on=None):
+        self.objects = {}
+        self._fail_on = fail_on
+
+    def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+        if self._fail_on and self._fail_on in (Key or ""):
+            raise RuntimeError("R2 rejected the write (simulated)")
+        self.objects[f"{Bucket}/{Key}"] = Body
+
+    def list_objects_v2(self, **kw):
+        return {"Contents": []}   # quota unmeasured -> never blocks
+
+
+def test_full_post_through_real_r2_wrapper_persists_captions(server, monkeypatch):
+    """The regression that WOULD have caught the live 503: a real multipart POST
+    driven through do_POST and the real _R2 wrapper returns 200 and lands a sidecar
+    whose captions map is populated. FakeR2 bypassed put_object; this does not."""
+    s3 = FakeS3()
+    real_r2 = intake_web._R2(s3, "echo-bucket")
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: real_r2)
+    parts = [
+        ("media", "one.jpg", "image/jpeg", JPG),
+        ("field", "caption", "front desk"),
+        ("media", "two.mp4", "video/mp4", MP4),
+        ("field", "caption", ""),
+        ("field", "note", "saturday batch"),
+    ]
+    status, body = _post_multipart(server, f"/u/{TOKEN}", parts)
+    assert status == 200, f"expected 200, got {status}: {body}"
+    sc_key = [k for k in s3.objects if k.endswith("_upload.json")][0]
+    sc = json.loads(s3.objects[sc_key])
+    assert sc["client"] == "dalesuslick"
+    assert sc["note"] == "saturday batch"
+    names = sc["filenames"]
+    assert len(names) == 2
+    assert sc["captions"][names[0]] == "front desk"     # caption persisted
+    assert names[1] not in sc["captions"]               # blank omitted
+    # the actual media bytes landed too, not just the sidecar
+    assert any(k.endswith("_one.jpg") for k in s3.objects)
+    assert any(k.endswith("_two.mp4") for k in s3.objects)
+
+
+def test_post_when_storage_unconfigured_is_honest_503_not_not_found(server, monkeypatch):
+    """The exact live symptom: R2 unconfigured -> the POST must 503 with an HONEST
+    body ('storage unavailable'), never a misleading 'not found'."""
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: None)
+    status, body = _post_multipart(
+        server, f"/u/{TOKEN}", [("media", "a.jpg", "image/jpeg", JPG),
+                                ("field", "caption", "x")])
+    assert status == 503
+    assert "not found" not in body.lower()
+    assert "storage" in body.lower()
+
+
+def test_post_survives_midupload_storage_failure_with_honest_503(server, monkeypatch):
+    """A storage fault MID-upload (creds ok at construction, R2 rejects the write)
+    must return an honest 503, never crash the handler into a 500/connection reset."""
+    s3 = FakeS3(fail_on="_one.jpg")
+    monkeypatch.setattr(intake_web, "_default_r2",
+                        lambda: intake_web._R2(s3, "echo-bucket"))
+    status, body = _post_multipart(
+        server, f"/u/{TOKEN}", [("media", "one.jpg", "image/jpeg", JPG),
+                                ("field", "caption", "x")])
+    assert status == 503
+    assert "storage" in body.lower()
+
+
+def test_handle_upload_wraps_storage_write_error():
+    """Unit: a raising put_bytes yields a clean (503, storage unavailable), not a
+    bubbling exception."""
+    class Boom:
+        def put_bytes(self, *a, **k):
+            raise RuntimeError("kaboom")
+        def total_bytes(self, prefix):
+            return 0
+    status, body = handle_upload(TOKEN, [("a.jpg", "image/jpeg", JPG)],
+                                 captions=["x"], r2=Boom())
+    assert status == 503 and "storage" in body["error"]
+
+
+def test_default_r2_none_on_placeholder_env(monkeypatch):
+    """The live root cause reproduced: unfilled setup placeholders ('<...>') mean
+    _default_r2() returns None (so uploads 503) rather than building a broken client."""
+    monkeypatch.setenv("AGENT_S3_ACCESS_KEY_ID", "<from R2 dashboard>")
+    monkeypatch.setenv("AGENT_S3_SECRET_ACCESS_KEY", "<from R2 dashboard>")
+    monkeypatch.setattr(config, "S3_BUCKET", "<your-bucket-name>")
+    monkeypatch.setattr(config, "S3_ENDPOINT",
+                        "https://<your-account>.r2.cloudflarestorage.com")
+    assert intake_web._default_r2() is None
+
+
+def test_looks_like_placeholder():
+    assert intake_web._looks_like_placeholder("<from R2 dashboard>")
+    assert intake_web._looks_like_placeholder(
+        "https://<your-account>.r2.cloudflarestorage.com")
+    assert not intake_web._looks_like_placeholder(
+        "https://abc123.r2.cloudflarestorage.com")
+    assert not intake_web._looks_like_placeholder("realbucket")
+    assert not intake_web._looks_like_placeholder("")
+
+
 # --------------------------- guardrails still enforced ---------------------------
 
 def test_bad_type_rejected():
