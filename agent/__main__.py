@@ -2456,19 +2456,26 @@ def main(argv=None):
             i += 1
         _sq_run(images_dir=_images_dir, from_manifest=_from_manifest, sprint=_sprint)
     elif cmd == "summit-rebuild":
-        # Render + host the SUMMIT SPRINT concept cards (feed via the studio, paired
-        # 9:16 stories, agenda/panel feed-only) into summit_queue's manifest so the
-        # laid-out sprint can serve them. Gated on AGENT_SUMMIT_CAMPAIGN_ENABLED +
-        # hosting; idempotent (already-hosted files skipped); no fabrication.
+        # Render + host the SUMMIT SPRINT concept cards (BOLD PIL feed + paired 9:16
+        # BOLD story, agenda/panel feed-only) into summit_queue's manifest so the
+        # laid-out sprint can serve them. The bold summit look is PIL-composited (never
+        # Gemini) so it stays visually distinct from the daily house card. Gated on
+        # AGENT_SUMMIT_CAMPAIGN_ENABLED + hosting; idempotent (already-hosted files
+        # skipped); no fabrication. Optional --sponsors "A,B,C" threads sponsor names
+        # onto every bold card's PRESENTED WITH strip (never fabricated).
         from .summit_rebuild import render_and_host_all as _sr_render
         _images_dir = os.path.join(config.LIBRARY_PATH, "summit_sprint")
+        _sponsors = ()
         _sr_args = argv[1:]
         i = 0
         while i < len(_sr_args):
             if _sr_args[i] == "--images-dir" and i + 1 < len(_sr_args):
                 _images_dir = _sr_args[i + 1]; i += 2; continue
+            if _sr_args[i] == "--sponsors" and i + 1 < len(_sr_args):
+                _sponsors = tuple(s.strip() for s in _sr_args[i + 1].split(",")
+                                  if s.strip()); i += 2; continue
             i += 1
-        _sr_render(_images_dir)
+        _sr_render(_images_dir, sponsors=_sponsors)
     elif cmd == "book-queue":
         from .book_queue import run as _bq_run
         _images_dir = None

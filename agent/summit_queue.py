@@ -488,11 +488,80 @@ _SPRINT_EXTRA_CAPTIONS = {
 }
 
 
-def sprint_assets():
+# ---- detailed, sponsor-taggable sprint captions ----------------------------
+# Blake ruling: the sprint captions must be more DETAILED than the terse legacy
+# copy, with room to TAG SPONSORS. sprint_caption() builds a full caption from a
+# concept's own approved spec (hook + deck + optional support) plus the verified
+# summit facts (100 seats, 10 leaders, 2 days, November 7 and 8, Virgin Hotel
+# Nashville) and the registration CTA, then appends a sponsors line. Sponsors are
+# injectable and NEVER fabricated: with names supplied they appear; without, a
+# placeholder line ready for tagging is used. Dash-free, no "vendor", verified
+# facts only.
+
+# The known summit facts the caption may state (no fabrication beyond these).
+SUMMIT_DATES = "November 7 and 8"
+SUMMIT_VENUE = "Virgin Hotel Nashville"
+SUMMIT_URL = "lassoframework.com/summit"
+
+
+def _sponsor_line(sponsors=()):
+    """The final caption line for sponsor tagging. Names are NEVER fabricated: with
+    names supplied they are listed; without, a placeholder ready for tagging is used.
+    Dash-free by construction."""
+    names = [str(s).strip() for s in (sponsors or []) if str(s).strip()]
+    if not names:
+        return "Presented with our sponsors."
+    if len(names) == 1:
+        joined = names[0]
+    elif len(names) == 2:
+        joined = f"{names[0]} and {names[1]}"
+    else:
+        joined = ", ".join(names[:-1]) + f", and {names[-1]}"
+    return f"Presented with our sponsors: {joined}"
+
+
+def sprint_caption(concept, sponsors=()):
+    """Build a DETAILED, sponsor-taggable sprint caption for one concept card.
+
+    Structure:
+      - the concept hook (its headline, as a spoken line)
+      - the value line ("You walk out with your 2027 growth plan, not a notebook.")
+      - the concept's own deck (what they get / the substance)
+      - an optional support line from the concept spec
+      - dates + location (November 7 and 8, Virgin Hotel Nashville)
+      - scarcity (100 seats)
+      - a clear CTA (Claim your seat, lassoframework.com/summit)
+      - a final sponsors line for tagging (never fabricated)
+
+    Verified facts only; dash-free; no "vendor". Returns the caption string."""
+    hook = str(concept.get("headline", "")).strip()
+    hook = hook[0].upper() + hook[1:].lower() if hook else ""
+    deck = str(concept.get("deck", "")).strip()
+    support = str(concept.get("support", "")).strip()
+
+    lines = []
+    if hook:
+        lines.append(hook + ".")
+    lines.append("You walk out with your 2027 growth plan, not a notebook.")
+    if deck:
+        lines.append(deck)
+    if support:
+        lines.append(support)
+    lines.append(f"{SUMMIT_DATES}. {SUMMIT_VENUE}. 100 seats.")
+    lines.append("Claim your seat.\n" + SUMMIT_URL)
+    lines.append(_sponsor_line(sponsors))
+    return "\n\n".join(lines)
+
+
+def sprint_assets(sponsors=()):
     """Ordered (filename, caption) for the sprint FEED cards, arc-ordered. Both
-    treatments of each concept share that concept's approved caption; the agenda and
-    panel cards use the verified-facts captions above. Story files are paired 1:1 to
-    their feed card by name (<file>_story.png) and inherit the same caption."""
+    treatments of each concept share that concept's DETAILED sprint caption (built by
+    sprint_caption, sponsor-taggable); the agenda and panel cards use the
+    verified-facts captions above. Story files are paired 1:1 to their feed card by
+    name (<file>_story.png) and inherit the same caption.
+
+    `sponsors` threads sponsor names into every concept caption's final line (never
+    fabricated; default empty -> a placeholder line ready for tagging)."""
     from .summit_rebuild import SUMMIT_CONCEPTS, ARC_ORDER
     by_id = {c["id"]: c for c in SUMMIT_CONCEPTS}
     out = []
@@ -500,8 +569,9 @@ def sprint_assets():
         c = by_id.get(cid)
         if not c:
             continue
+        cap = sprint_caption(c, sponsors=sponsors)
         for t in ("a", "b"):
-            out.append((f"{cid}_{t}.png", c["caption"]))
+            out.append((f"{cid}_{t}.png", cap))
     # agenda + panel ride the sprint too
     for fname in ("08_agenda_day1.png", "09_agenda_day2.png", "22_panel_future.png"):
         out.append((fname, _SPRINT_EXTRA_CAPTIONS[fname]))

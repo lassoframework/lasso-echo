@@ -288,11 +288,14 @@ def test_noop_when_hosting_off(tmp_path, monkeypatch):
     assert man.data == {}
 
 
-# ---- studio call carries approved input + square target --------------------
-def test_studio_called_with_square_target_and_concept_headline(tmp_path):
-    _summary, studio, _host, _man = _run(tmp_path)
-    first = next(c for c in studio.calls)
-    assert first["headline"]  # a real concept headline, not empty
-    assert first["kw"].get("pixels") == "1080x1080"
-    assert first["kw"].get("aspect") == "1:1"
-    assert first["facts"], "facts must be the concept's approved lines, never empty"
+# ---- bold PIL feed, NOT the Gemini studio ----------------------------------
+def test_sprint_feed_is_bold_pil_not_studio(tmp_path):
+    """The sprint feed no longer routes through the Gemini studio (Blake: the bold
+    summit look is PIL-composited so it never resembles the daily house card). The
+    injected FakeStudio must therefore be called ZERO times, and the feed still lands
+    hosted at the exact 1080 canvas."""
+    _summary, studio, _host, man = _run(tmp_path)
+    assert studio.calls == [], "sprint feed must not call the Gemini studio anymore"
+    feed = Image.open(tmp_path / "01_invitation_a.png")
+    assert feed.size == (1080, 1080)
+    assert "01_invitation_a.png" in man.data

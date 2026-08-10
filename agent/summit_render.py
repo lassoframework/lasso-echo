@@ -41,6 +41,39 @@ MONT_B = os.path.join(_FD, "Montserrat-Bold.ttf")
 
 DEFAULT_FACTS = ["NOV 7 + 8", "VIRGIN HOTEL NASHVILLE", "100 SEATS"]
 
+# ---- BOLD SUMMIT identity (sprint concept cards ONLY) -----------------------
+# Blake ruling: the sprint/summit cards must NOT look like the daily house
+# infographic (soft cream + navy). This is a deliberately LOUD, high-contrast
+# identity: a deep near-black base, ONE electric accent, big color-blocked bands,
+# oversized condensed type, an event lockup on every card, and a sponsor strip.
+# It is PIL-composited (never Gemini) so the bold palette is fully controlled.
+# The DAILY house look (creative_studio + the cream/navy renderers above) is
+# UNTOUCHED; only the sprint feed/story path uses these helpers.
+BOLD_BG = (14, 18, 32)          # ~#0E1220 deep midnight, nothing like the cream card
+BOLD_BG_2 = (20, 26, 46)        # a hair lighter, for the color-blocked lower band
+BOLD_ACCENT = (255, 74, 28)     # ~#FF4A1C amplified LASSO red/orange, the ONE accent
+BOLD_INK = (247, 244, 238)      # warm white/cream type
+BOLD_MUTE = (150, 162, 190)     # muted cool grey for labels
+
+# Dash-free event lockup shown on EVERY bold card.
+EVENT_LOCKUP = ("LASSO GROWTH SUMMIT", "NOVEMBER 7 and 8", "VIRGIN HOTEL NASHVILLE")
+
+# Per-concept bold callouts: the data point(s) that must read big, not buried.
+# Sourced only from the receipted spine (no fabrication). (value, label) pairs.
+BOLD_CALLOUTS = {
+    "01_invitation": [("100", "SEATS"), ("10", "LEADERS"), ("2", "DAYS")],
+    "02_deliverable": [("2027", "GROWTH PLAN"), ("1", "BROKEN LEG FIXED")],
+    "03_agenda": [("10", "SESSIONS"), ("10", "LEADERS"), ("1", "PLAN")],
+    "04_funnel": [("40", "LEADS TO BOOK"), ("50", "BOOK TO SHOW"),
+                  ("70", "SHOW TO CLOSE")],
+    "05_math": [("2027", "TARGET"), ("1", "NUMBER NOT A WISH")],
+    "06_room": [("100", "OPERATORS"), ("2", "DAYS"), ("0", "STAGE PITCHES")],
+    "07_numbers": [("100", "OWNERS"), ("10", "LEADERS"), ("2", "DAYS"), ("1", "PLAN")],
+    "13_audience": [("100", "SERIOUS OPERATORS"), ("2027", "BUILT HERE")],
+    "11_stakes": [("70", "PERCENT CLOSE OR BETTER"), ("1", "SYSTEM AWAY")],
+    "12_outcome": [("2027", "GROWTH PLAN"), ("90", "DAY ACTION PLAN")],
+}
+
 
 def _f(path, size):
     return ImageFont.truetype(path, size)
@@ -905,3 +938,218 @@ def render_all_stories(out_dir, bg_dir=None):
             render_card_story(c, t, p, bg_path=bg)
             paths.append(p)
     return paths
+
+
+# ============================================================================
+# BOLD SUMMIT CARDS (sprint concept feed + story)
+# ============================================================================
+# A dedicated, loud, high-contrast look for the summit sprint, VISUALLY DISTINCT
+# from the daily cream/navy house card. PIL-composited end to end (never Gemini)
+# so the bold palette is fully controlled. Every card carries: the event lockup
+# band (LASSO GROWTH SUMMIT / NOVEMBER 7 and 8 / VIRGIN HOTEL NASHVILLE), the
+# oversized condensed headline with the ONE accent word, big numeric callouts,
+# and a bottom sponsor strip ("PRESENTED WITH"). Sponsors are injectable and
+# NEVER fabricated: an empty list renders a safe partner placeholder.
+
+
+def _bold_accent_lockup(d, x, y):
+    """A small accent-block event tag drawn top-left of a bold card: a solid accent
+    chip, then the summit name, so the brand reads instantly and loud."""
+    chip = 22
+    d.rectangle([x, y + 4, x + chip, y + 4 + chip], fill=BOLD_ACCENT)
+    ex = _tracked(d, (x + chip + 16, y), EVENT_LOCKUP[0], _f(OSWALD_B, 30), BOLD_INK, 4)
+    return ex
+
+
+def _bold_callouts_row(d, x, y, callouts, w, big=True, max_h=None):
+    """Big numeric callouts laid across a row, each value in oversized Anton with a
+    small label beneath. The ONE accent lives on the FIRST value (never a second
+    accent block). Data is rendered LOUD, never buried. Returns the y just past the
+    tallest label so the caller can flow content below without a collision.
+
+    `max_h` (optional) caps the vertical space: the value font auto-shrinks so the
+    number + its label fit within it, so a tall 3-line headline never squeezes the
+    callouts into the footer."""
+    n = max(1, len(callouts))
+    gap = 28
+    cellw = (w - gap * (n - 1)) // n
+    vsize = 112 if big else 88
+    lsize = 24 if big else 20
+    if max_h:
+        # value + ~1.5 label lines must fit max_h; shrink the value font to suit.
+        while vsize > 48 and vsize + 10 + int(lsize * 1.6) > max_h:
+            vsize -= 6
+    vf = _f(ANTON, vsize)
+    lf = _f(OSWALD_B, lsize)
+    bottom = y
+    for i, (val, label) in enumerate(callouts):
+        cx = x + i * (cellw + gap)
+        # shrink an over-wide value (e.g. "2027") so it never spills the cell
+        s = vf.size
+        f = vf
+        while _tw(d, val, f) > cellw and s > 44:
+            s -= 6
+            f = _f(ANTON, s)
+        col = BOLD_ACCENT if i == 0 else BOLD_INK
+        d.text((cx, y), val, font=f, fill=col)
+        # place the label below the REAL glyph bottom (textbbox), not the nominal
+        # font size, so the label never overlaps the tall Anton numerals.
+        gb = d.textbbox((cx, y), val, font=f)
+        ly = gb[3] + 10
+        wrapped = _wrap(d, label, lf, cellw)[:2]
+        for j, ln in enumerate(wrapped):
+            d.text((cx, ly + j * (lf.size + 4)), ln, font=lf, fill=BOLD_MUTE)
+        bottom = max(bottom, ly + len(wrapped) * (lf.size + 4))
+    return bottom
+
+
+def _bold_event_band(d, x, y, w, ink=None, mute=None):
+    """The event lockup band present on EVERY bold card: dates + venue in one loud
+    line, dash-free. Kept distinct from the accent so it never competes with it."""
+    ink = ink or BOLD_INK
+    mute = mute or BOLD_MUTE
+    df = _f(OSWALD_B, 32)
+    d.text((x, y), EVENT_LOCKUP[1], font=df, fill=ink)          # NOVEMBER 7 and 8
+    vy = y + df.size + 8
+    d.text((x, vy), EVENT_LOCKUP[2], font=_f(OSWALD, 28), fill=mute)  # VIRGIN HOTEL...
+    return vy + 34
+
+
+def _bold_sponsor_strip(d, x, y, w, h, sponsors):
+    """Bottom band labeled PRESENTED WITH with slots for sponsor names/logos.
+    `sponsors` is injectable and NEVER fabricated: an empty list renders a subtle
+    'Presented with our partners' placeholder, ready for tagging; supplied names are
+    laid across the strip. Uppercased for the loud identity; dash-free by contract."""
+    d.rectangle([x, y, x + w, y + h], fill=BOLD_BG_2)
+    d.rectangle([x, y, x + 10, y + h], fill=BOLD_ACCENT)  # accent tab, the strip is not dead
+    lf = _f(OSWALD_B, 24)
+    _tracked(d, (x + 30, y + 20), "PRESENTED WITH", lf, BOLD_MUTE, 4)
+    names = [str(s).strip().upper() for s in (sponsors or []) if str(s).strip()]
+    ny = y + 54
+    if not names:
+        d.text((x + 30, ny), "Presented with our partners", font=_f(MONT_SB, 28),
+               fill=BOLD_INK)
+        return
+    text = "     ".join(names)
+    nf = _f(OSWALD_B, 30)
+    # shrink if the joined names overrun the strip width
+    s = nf.size
+    while _tw(d, text, nf) > w - 60 and s > 18:
+        s -= 2
+        nf = _f(OSWALD_B, s)
+    d.text((x + 30, ny), text, font=nf, fill=BOLD_INK)
+
+
+def _summit_bold_feed(concept, out_path, sponsors=()):
+    """Render ONE bold summit sprint FEED card (1080x1080), PIL-composited.
+
+    Layout (color-blocked bands, top to bottom):
+      - deep midnight base with a big accent side rail (the loud identity)
+      - accent event tag + oversized condensed headline (ONE accent word)
+      - big numeric callouts for the concept's data point(s)
+      - the event lockup band (dates + venue), dash-free, on every card
+      - a bottom sponsor strip (PRESENTED WITH), injectable + never fabricated
+
+    Distinct from the daily house card by construction: dark base, electric accent,
+    color blocks, oversized type. Returns out_path."""
+    img = Image.new("RGB", (SIZE, SIZE), BOLD_BG)
+    d = ImageDraw.Draw(img)
+    x = MARGIN
+    w = SIZE - 2 * MARGIN
+
+    # loud accent side rail down the left edge (color-blocked, not the soft house card)
+    d.rectangle([0, 0, 18, SIZE], fill=BOLD_ACCENT)
+
+    y = MARGIN
+    _bold_accent_lockup(d, x, y)
+    y += 60
+
+    # eyebrow, then the oversized condensed headline with the ONE accent word
+    _tracked(d, (x, y), concept["eyebrow"].upper(), _f(OSWALD_B, 28), BOLD_MUTE, 5)
+    y += 58
+    red_tokens = set(w0.strip(".,").upper() for w0 in concept["red_word"].split())
+    # cap the headline so even a 3-line block leaves room for the callouts below
+    hf, lines = _fit(d, concept["headline"].upper(), w, 3, 116)
+    hy = _headline(d, x, y, lines, hf, red_tokens, BOLD_INK)
+
+    # bottom bands are pinned; the URL, event band, and sponsor strip live here.
+    strip_h = 132
+    strip_y = SIZE - strip_h
+    band_y = strip_y - 96          # NOVEMBER ... / VIRGIN HOTEL ...
+    url_y = band_y - 58            # LASSOFRAMEWORK.COM/SUMMIT
+
+    # big numeric callouts (data read loud, not buried) flow in the gap BETWEEN the
+    # headline bottom and the URL line, so a tall headline never collides with them.
+    callouts = BOLD_CALLOUTS.get(concept["id"], [("100", "SEATS"), ("2", "DAYS")])
+    co_y = hy + 40
+    _bold_callouts_row(d, x, co_y, callouts, w, big=True, max_h=url_y - 24 - co_y)
+
+    _tracked(d, (x, url_y), "LASSOFRAMEWORK.COM/SUMMIT",
+             _f(OSWALD_B, 26), BOLD_ACCENT, 3)
+    _bold_event_band(d, x, band_y, w)
+    _bold_sponsor_strip(d, 0, strip_y, SIZE, strip_h, sponsors)
+
+    img.save(out_path)
+    return out_path
+
+
+def _summit_bold_story(concept, out_path, sponsors=()):
+    """Render ONE bold summit sprint STORY card (1080x1920), PIL-composited.
+
+    Same bold identity as the feed, laid out for the 9:16 frame with top/bottom safe
+    bands so nothing lands under IG chrome. Event lockup on the card; sponsor strip at
+    the bottom (injectable, never fabricated). Returns out_path."""
+    img = Image.new("RGB", (STORY_W, STORY_H), BOLD_BG)
+    d = ImageDraw.Draw(img)
+    x = STORY_MARGIN
+    w = STORY_W - 2 * STORY_MARGIN
+
+    d.rectangle([0, 0, 20, STORY_H], fill=BOLD_ACCENT)  # loud accent rail
+
+    y = STORY_SAFE_TOP
+    _bold_accent_lockup(d, x, y)
+    y += 74
+
+    _tracked(d, (x, y), concept["eyebrow"].upper(), _f(OSWALD_B, 32), BOLD_MUTE, 5)
+    y += 74
+    red_tokens = set(w0.strip(".,").upper() for w0 in concept["red_word"].split())
+    s = 150
+    while s >= 72:
+        fo = _f(ANTON, s)
+        ls = _wrap(d, concept["headline"].upper(), fo, w)
+        if len(ls) <= 4:
+            break
+        s -= 4
+    hy = _headline(d, x, y, ls, fo, red_tokens, BOLD_INK)
+
+    # pinned bottom bands (URL, event band, sponsor strip)
+    strip_h = 150
+    strip_y = STORY_H - STORY_SAFE_BOT
+    band_y = strip_y - 110
+    url_y = band_y - 66
+
+    # callouts flow in the gap between headline and URL, auto-fit to the space
+    callouts = BOLD_CALLOUTS.get(concept["id"], [("100", "SEATS"), ("2", "DAYS")])
+    co_y = hy + 56
+    _bold_callouts_row(d, x, co_y, callouts, w, big=True, max_h=url_y - 30 - co_y)
+
+    _tracked(d, (x, url_y), "LASSOFRAMEWORK.COM/SUMMIT",
+             _f(OSWALD_B, 30), BOLD_ACCENT, 3)
+    _bold_event_band(d, x, band_y, w)
+    _bold_sponsor_strip(d, 0, strip_y, STORY_W, strip_h, sponsors)
+
+    img.save(out_path)
+    return out_path
+
+
+def render_bold_feed(concept, treatment, out_path, sponsors=()):
+    """Sprint-path entry for a bold FEED card. `treatment` is accepted for a drop-in
+    signature match with the studio feed path (both a/b share the concept's bold
+    identity; the treatment no longer forks the LOOK, only the caption arc does)."""
+    return _summit_bold_feed(concept, out_path, sponsors=sponsors)
+
+
+def render_bold_story(concept, treatment, out_path, sponsors=(), bg_path=None):
+    """Sprint-path entry for a bold STORY card. Signature matches render_card_story
+    (bg_path accepted and ignored: the bold look is PIL-composited, not photo-scrimmed)."""
+    return _summit_bold_story(concept, out_path, sponsors=sponsors)

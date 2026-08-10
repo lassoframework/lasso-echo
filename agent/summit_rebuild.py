@@ -348,33 +348,41 @@ def _concept_by_treatment():
     return out
 
 
-def render_and_host_all(images_dir, *, studio=None, story_renderer=None,
-                        agenda_renderer=None, panel_renderer=None, host=None,
+def render_and_host_all(images_dir, *, studio=None, feed_renderer=None,
+                        story_renderer=None, agenda_renderer=None,
+                        panel_renderer=None, host=None, sponsors=(),
                         load_manifest=None, save_manifest=None):
     """Render every non-deferred sprint asset, host it, and write filename -> URL
     into summit_queue's manifest so sprint_assets()/sprint_builders() serve them.
 
-    For each non-deferred concept x treatment (a, b): render the 1080x1080 FEED card
-    via the studio (creative_studio.generate; headline + facts from that concept's
-    spec), render the paired 1080x1920 STORY via the summit stories renderer, host
-    BOTH, and record both filenames. The three agenda/panel FEED cards are rendered
-    by summit_render's own PIL renderers and hosted feed-only (no paired story:
-    honestly skipped). The scarcity concepts (08/09/10 half full / moving fast /
-    last seats) are DEFERRED and never rendered here.
+    For each non-deferred concept x treatment (a, b): render the 1080x1080 BOLD FEED
+    card and the paired 1080x1920 BOLD STORY with summit_render's dedicated bold
+    summit renderers (PIL-composited, NEVER Gemini, so the loud high-contrast summit
+    identity is fully controlled and never looks like the daily cream/navy house
+    card), host BOTH, and record both filenames. The three agenda/panel FEED cards are
+    rendered by summit_render's own PIL renderers and hosted feed-only (no paired
+    story: honestly skipped). The scarcity concepts (08/09/10 half full / moving fast
+    / last seats) are DEFERRED and never rendered here.
+
+    `sponsors` is an injectable list of sponsor names threaded onto every bold card's
+    PRESENTED WITH strip. Default empty -> a safe "Presented with our partners"
+    placeholder is drawn; names are NEVER fabricated.
 
     Gated: AGENT_SUMMIT_CAMPAIGN_ENABLED must be armed AND hosting enabled; otherwise
     this is a no-op that reports and returns an empty summary. Idempotent: a filename
     already in the manifest is skipped (no re-render, no re-host). No fabrication: a
-    concept whose facts resolve empty renders nothing (studio None) and is left out.
+    concept whose facts resolve empty renders nothing and is left out.
 
     Every render/host/manifest hook is injectable so tests run fully offline with no
-    live Gemini and no live R2.
+    live Gemini and no live R2. `studio` is retained for signature compatibility but
+    the bold sprint feed no longer routes through it.
     """
     from . import config
     from . import creative_studio, media_host, summit_render, summit_queue
 
     studio = studio or creative_studio
-    story_renderer = story_renderer or summit_render.render_card_story
+    feed_renderer = feed_renderer or summit_render.render_bold_feed
+    story_renderer = story_renderer or summit_render.render_bold_story
     agenda_renderer = agenda_renderer or summit_render.render_agenda
     panel_renderer = panel_renderer or summit_render.render_panel
     host = host or media_host.host_media
@@ -429,17 +437,16 @@ def render_and_host_all(images_dir, *, studio=None, story_renderer=None,
             summary["skipped_hosted"].append(feed_name)
             print(f"  already hosted: {feed_name}")
         else:
+            # No-fabrication gate FIRST: a concept whose facts resolve empty renders
+            # NOTHING (never a faked card). The bold card carries verified facts only.
             facts = _concept_facts(concept)
             feed_path = os.path.join(images_dir, feed_name)
-            result = studio.generate(
-                concept["headline"], facts, out_path=feed_path,
-                aspect="1:1", pixels="1080x1080",
-                surface="summit feed post", account_key=None)
-            if not result:
-                # empty facts / flag off / no client: render NOTHING, never faked.
+            if not facts:
                 summary["none_facts"].append(feed_name)
-                print(f"  studio returned None (no fabrication): {feed_name}")
+                print(f"  no facts (no fabrication): {feed_name}")
             else:
+                # BOLD PIL feed (never Gemini): the loud, high-contrast summit card.
+                feed_renderer(concept, treatment, feed_path, sponsors=sponsors)
                 summary["rendered"].append(feed_name)
                 _host_and_record(feed_name, feed_path, "FEED", FEED_SIZE)
 
@@ -452,7 +459,7 @@ def render_and_host_all(images_dir, *, studio=None, story_renderer=None,
             summary["skipped_story"].append(story_name)
         else:
             story_path = os.path.join(images_dir, story_name)
-            story_renderer(concept, treatment, story_path)
+            story_renderer(concept, treatment, story_path, sponsors=sponsors)
             summary["rendered"].append(story_name)
             _host_and_record(story_name, story_path, "STORY", STORY_SIZE)
 
