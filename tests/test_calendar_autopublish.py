@@ -34,6 +34,12 @@ from agent.meta_publisher import PublishResult
 
 RUN_DATE = "2026-08-10"
 
+# A local "now" past the last SPRINT_SLOT_TIME (18:30) so every assigned slot is
+# due. Tests that assert publishing pass this so the time-of-day spacing gate
+# (FIX 1) never withholds a row; the spacing behavior itself is covered in its
+# own section below with earlier `now` values.
+LATE_NOW = "2026-08-10T23:59:00-04:00"
+
 
 # ---- fakes -----------------------------------------------------------------
 
@@ -147,7 +153,7 @@ def test_publishes_todays_rows_once(armed):
     note = _FakeNotifier()
 
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, notifier=note,
-                              now="2026-08-10T18:30:00+00:00")
+                              now=LATE_NOW)
 
     assert summary["ok"] is True
     assert set(summary["published"]) == {"a", "b", "c"}
@@ -158,7 +164,7 @@ def test_publishes_todays_rows_once(armed):
     assert {rid for rid, _, _ in store.published_calls} == {"a", "b", "c"}
     for _rid, media_id, published_at in store.published_calls:
         assert media_id == "M"
-        assert published_at == "2026-08-10T18:30:00+00:00"
+        assert published_at == LATE_NOW
 
 
 # ---- EXACTLY-ONCE / dup guard ----------------------------------------------
@@ -171,7 +177,7 @@ def test_already_published_row_is_skipped(armed):
         _row("fresh"),
     ])
     pub = _FakePublisher()
-    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
 
     assert summary["published"] == ["fresh"]
     assert "done" not in store.publishing_calls          # never claimed
@@ -182,7 +188,7 @@ def test_lost_claim_is_not_published(armed):
     # mark_publishing returns False (another worker won the claim) -> SKIP, no publish.
     store = _FakeStore([_row("x"), _row("y")], claim_returns={"x": False, "y": True})
     pub = _FakePublisher()
-    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
 
     assert summary["published"] == ["y"]
     assert "x" in summary["skipped"]
@@ -193,12 +199,12 @@ def test_rerun_after_success_publishes_nothing(armed):
     store = _FakeStore([_row("a"), _row("b")])
     pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
 
-    first = cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    first = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert set(first["published"]) == {"a", "b"}
 
     # Same store, a second run: rows are now published, so due_rows returns none.
     pub2 = _FakePublisher()
-    second = cap.publish_due(RUN_DATE, store=store, publisher=pub2)
+    second = cap.publish_due(RUN_DATE, store=store, publisher=pub2, now=LATE_NOW)
     assert second["published"] == []
     assert pub2.calls == []                              # NEVER double-posts to live
 
@@ -212,7 +218,7 @@ def test_only_run_date_yesterday_and_tomorrow_excluded(armed):
         _row("tomo", post_date="2026-08-11"),
     ])
     pub = _FakePublisher()
-    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
 
     assert summary["published"] == ["today"]
     assert [d.draft_id for d, _ in pub.calls] == ["today"]  # no backfill, no future
@@ -252,7 +258,7 @@ def test_would_publish_reverts_claim_and_is_retryable(armed):
     store = _FakeStore([_row("a")])
     pub = _FakePublisher(PublishResult(ok=True, mode="would_publish",
                                        detail="stories flag OFF"))
-    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
 
     assert summary["published"] == []
     assert summary["failed"] == ["a"]
@@ -270,7 +276,7 @@ def test_account_and_story_mapping(armed):
         _row("ig_story", account="instagram", fmt="story"),
     ])
     pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
-    cap.publish_due(RUN_DATE, store=store, publisher=pub)
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
 
     by_id = {d.draft_id: (d, a) for d, a in pub.calls}
     assert by_id["ig_feed"][1].key == "lasso_ig"
@@ -301,7 +307,7 @@ def test_publish_failure_reverts_and_others_still_publish(armed):
             raise _Boom("meta 500")
         return PublishResult(ok=True, mode="published", media_id="M")
 
-    summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher)
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=publisher, now=LATE_NOW)
 
     assert summary["published"] == ["good"]
     assert summary["failed"] == ["bad"]
@@ -317,7 +323,7 @@ def test_slack_notice_sent_once_with_summary(armed):
                         _row("b", account="facebook")])
     pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
     note = _FakeNotifier()
-    cap.publish_due(RUN_DATE, store=store, publisher=pub, notifier=note)
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, notifier=note, now=LATE_NOW)
 
     assert len(note.notices) == 1
     msg = note.notices[0]
@@ -332,8 +338,135 @@ def test_no_notice_when_nothing_published(armed):
     store = _FakeStore([_row("a")])
     pub = _FakePublisher(PublishResult(ok=True, mode="would_publish"))
     note = _FakeNotifier()
-    cap.publish_due(RUN_DATE, store=store, publisher=pub, notifier=note)
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, notifier=note, now=LATE_NOW)
     assert note.notices == []
+
+
+# ---- FIX 1: time-of-day spacing --------------------------------------------
+# Slots come from summit_queue.SPRINT_SLOT_TIMES = 07:30, 12:30, 18:30 in
+# POSTING_TIMEZONE (America/New_York by default). A row publishes only once its
+# assigned slot time is <= the current local `now` (injected). `now` values below
+# are given in EDT (-04:00) so the mapping to local time is explicit.
+
+
+def _edt(hhmm):
+    return f"2026-08-10T{hhmm}:00-04:00"
+
+
+def test_assign_slots_orders_feed_before_story_then_by_id():
+    # Deterministic ordering: feed(0) before story(1), then stable by id.
+    rows = [_row("z_story", fmt="story"), _row("a_feed", fmt="feed"),
+            _row("m_feed", fmt="feed")]
+    pairs = cap.assign_slots(rows)
+    assert [r["id"] for r, _ in pairs] == ["a_feed", "m_feed", "z_story"]
+    assert [slot for _, slot in pairs] == ["07:30", "12:30", "18:30"]
+
+
+def test_assign_slots_wraps_when_more_rows_than_slots():
+    rows = [_row(f"r{i}", fmt="feed") for i in range(4)]
+    pairs = cap.assign_slots(rows)
+    assert [slot for _, slot in pairs] == ["07:30", "12:30", "18:30", "07:30"]
+
+
+def test_is_due_predicate_before_and_after_slot():
+    assert cap.is_due("12:30", now=_edt("12:30")) is True    # exactly at slot
+    assert cap.is_due("12:30", now=_edt("12:29")) is False   # one minute early
+    assert cap.is_due("12:30", now=_edt("18:31")) is True    # well past
+
+
+def test_nothing_publishes_before_first_slot(armed):
+    # now (07:00 EDT) is before slot 1 (07:30) -> zero publishes, nothing claimed.
+    store = _FakeStore([_row("a"), _row("b"), _row("c")])
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("07:00"))
+
+    assert summary["published"] == []
+    assert set(summary["waiting"]) == {"a", "b", "c"}
+    assert pub.calls == []
+    assert store.publishing_calls == []                 # never claimed early
+
+
+def test_only_first_slot_row_publishes_after_slot_one(armed):
+    # now (08:00 EDT) is past slot 1 (07:30) but before slot 2 (12:30).
+    store = _FakeStore([_row("a"), _row("b"), _row("c")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("08:00"))
+
+    # Ordered a,b,c -> slots 07:30,12:30,18:30. Only 'a' is due.
+    assert summary["published"] == ["a"]
+    assert set(summary["waiting"]) == {"b", "c"}
+    assert [d.draft_id for d, _ in pub.calls] == ["a"]
+
+
+def test_all_rows_publish_after_last_slot(armed):
+    store = _FakeStore([_row("a"), _row("b"), _row("c")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("19:00"))
+
+    assert set(summary["published"]) == {"a", "b", "c"}
+    assert summary["waiting"] == []
+
+
+def test_story_publishes_after_its_paired_feed(armed):
+    # Within one account a feed takes slot 1 and its story slot 2, so at 08:00 EDT
+    # only the feed is due; the story waits for the later slot.
+    store = _FakeStore([
+        _row("feed1", account="instagram", fmt="feed"),
+        _row("story1", account="instagram", fmt="story"),
+    ])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub,
+                              now=_edt("08:00"))
+
+    assert summary["published"] == ["feed1"]            # feed first
+    assert summary["waiting"] == ["story1"]             # story not yet due
+
+    # A later run past slot 2 drips the story out; the feed is NOT re-published.
+    pub2 = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M2"))
+    summary2 = cap.publish_due(RUN_DATE, store=store, publisher=pub2,
+                               now=_edt("13:00"))
+    assert summary2["published"] == ["story1"]
+    assert [d.draft_id for d, _ in pub2.calls] == ["story1"]
+
+
+def test_drip_across_runs_is_exactly_once(armed):
+    # Runs across the day drip the rows out slot by slot; no row ever republishes
+    # and no row publishes before its slot on the run that publishes it. (As each
+    # earlier row publishes it leaves the due set, so the remaining rows re-rank
+    # onto the earlier, already-passed slots on the next run.)
+    store = _FakeStore([_row("a"), _row("b"), _row("c")])
+
+    p1 = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    s1 = cap.publish_due(RUN_DATE, store=store, publisher=p1, now=_edt("08:00"))
+    assert s1["published"] == ["a"]                     # only slot-1 row is due
+    assert set(s1["waiting"]) == {"b", "c"}
+
+    # A later run past slot 2 (13:00): 'a' is gone; b,c re-rank to slots 1 and 2,
+    # both now passed -> both publish. 'a' is never re-touched.
+    p2 = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    s2 = cap.publish_due(RUN_DATE, store=store, publisher=p2, now=_edt("13:00"))
+    assert set(s2["published"]) == {"b", "c"}
+    assert "a" not in [d.draft_id for d, _ in p2.calls]  # 'a' never re-touched
+
+    # Every row published exactly once across the runs.
+    assert sorted(rid for rid, _, _ in store.published_calls) == ["a", "b", "c"]
+
+
+def test_published_row_never_republishes_on_a_later_slot_run(armed):
+    # Belt-and-braces exactly-once under spacing: after 'a' is published in run 1,
+    # a later-slot run for the same store never claims or re-publishes it.
+    store = _FakeStore([_row("a"), _row("b")])
+    p1 = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=p1, now=_edt("08:00"))
+    assert store.rows["a"]["status"] == "published"
+
+    p2 = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    s2 = cap.publish_due(RUN_DATE, store=store, publisher=p2, now=_edt("19:00"))
+    assert "a" not in s2["published"]
+    assert "a" not in [d.draft_id for d, _ in p2.calls]
 
 
 # ---- store REST params (unit test the filter/claim/update SQL) --------------

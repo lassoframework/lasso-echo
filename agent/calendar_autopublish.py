@@ -25,18 +25,84 @@ Exactly-once design (the claim):
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 
 from . import config
 from . import meta_publisher
 from .accounts import get_account
 from .drafter import Draft, DraftStatus
+from .summit_queue import SPRINT_SLOT_TIMES
 
 
 def _now_iso(now=None):
     if now is not None:
         return now
     return datetime.now(timezone.utc).isoformat()
+
+
+def _order_key(row):
+    """
+    Deterministic ordering of a day+account's rows so slot assignment is stable
+    across re-runs (no schema change, no time-of-day column). Order:
+      1. feed before its paired story (a story shares the day; feed goes first),
+      2. then stable by id (string compare).
+    Returns a sort tuple; ties never occur because ids are unique.
+    """
+    fmt = (row.get("format") or "feed").strip().lower()
+    is_story = 1 if fmt == "story" else 0        # feed(0) sorts before story(1)
+    return (is_story, str(row.get("id") or ""))
+
+
+def assign_slots(rows):
+    """
+    Given ONE day+account's content_calendar rows, return [(row, slot_time)]
+    deterministically ordered, each row assigned an ordinal slot time.
+
+    Ordinals map onto summit_queue.SPRINT_SLOT_TIMES ("07:30","12:30","18:30")
+    in config.POSTING_TIMEZONE. If a day carries more rows than there are slot
+    times, the mapping WRAPS (ordinal % len) so every row still gets a concrete
+    time and none is starved. slot_time is an "HH:MM" string.
+    """
+    ordered = sorted(rows, key=_order_key)
+    n = len(SPRINT_SLOT_TIMES)
+    out = []
+    for i, row in enumerate(ordered):
+        slot_time = SPRINT_SLOT_TIMES[i % n] if n else "00:00"
+        out.append((row, slot_time))
+    return out
+
+
+def _local_now(now=None):
+    """
+    Current wall-clock time in config.POSTING_TIMEZONE as a timezone-aware
+    datetime. `now` is injectable for tests: pass an ISO string or a datetime.
+    Never uses Date.now-style nondeterminism when `now` is supplied.
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(config.POSTING_TIMEZONE)
+    if now is None:
+        return datetime.now(tz)
+    if isinstance(now, datetime):
+        dt = now
+    else:
+        dt = datetime.fromisoformat(str(now))
+    # Compare in the posting timezone. A naive `now` is read AS local time; an
+    # aware `now` is converted into it.
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def is_due(slot_time, now=None):
+    """
+    True when a row's assigned "HH:MM" slot_time (in POSTING_TIMEZONE) is <= the
+    current local time. A row is NEVER published before its slot; a row whose slot
+    has passed is NEVER skipped. `now` is injectable (see _local_now).
+    """
+    local = _local_now(now)
+    hh, mm = str(slot_time).split(":")
+    slot = time(int(hh), int(mm))
+    return local.timetz().replace(tzinfo=None) >= slot
 
 
 def _account_for(row):
@@ -68,11 +134,34 @@ def _draft_for(row):
     )
 
 
+def _slot_by_row_id(rows):
+    """
+    Assign each row a slot time, grouped by account so a feed and its paired story
+    within an ACCOUNT get spaced ordinals (feed first). Returns {row_id: "HH:MM"}.
+    """
+    by_account = {}
+    for row in rows:
+        acct = (row.get("account") or "").strip().lower()
+        by_account.setdefault(acct, []).append(row)
+    slots = {}
+    for acct_rows in by_account.values():
+        for row, slot_time in assign_slots(acct_rows):
+            slots[row.get("id")] = slot_time
+    return slots
+
+
 def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 notifier=None, now=None):
     """
     Read gym_id's content_calendar rows dated run_date and publish each unpublished
     one to live IG/FB, EXACTLY ONCE. Returns a summary dict.
+
+    TIME-OF-DAY SPACING: a day's rows are not fired all at once. Within a day+account
+    each row is assigned a deterministic ordinal slot time (SPRINT_SLOT_TIMES in
+    POSTING_TIMEZONE); a row only publishes once its slot time is <= the current local
+    time (`now`, injectable). Rows whose slot has not arrived are left pending and
+    publish on a later run the same day (the runner already calls this on a cycle).
+    Exactly-once is unchanged: a row still publishes at most once.
 
     Both gates must be armed (AGENT_CALENDAR_AUTOPUBLISH and AGENT_PUBLISH_ENABLED)
     or this is a no-op. `store`, `publisher`, and `notifier` are injectable so every
@@ -92,9 +181,13 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     rows = store.due_rows(gym_id, run_date) or []
 
+    # TIME-OF-DAY SPACING: assign each row a deterministic slot time up front.
+    slot_by_id = _slot_by_row_id(rows)
+
     published = []
     skipped = []
     failed = []
+    waiting = []            # slot not arrived yet: left pending for a later run
     published_accounts = set()
 
     for row in rows:
@@ -103,6 +196,14 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # already excludes these, but a live race could still surface one).
         if row.get("published_at") or row.get("late_post_id"):
             skipped.append(row_id)
+            continue
+
+        # SLOT GATE: publish nothing before its assigned slot time. A row whose slot
+        # has not arrived is left UNTOUCHED (never claimed) so a later run this same
+        # day drips it out. A row whose slot has passed is never skipped for timing.
+        slot_time = slot_by_id.get(row_id)
+        if slot_time is not None and not is_due(slot_time, now):
+            waiting.append(row_id)
             continue
 
         account = _account_for(row)
@@ -179,4 +280,4 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                   f"{type(e).__name__}: {e}")
 
     return {"ok": True, "published": published, "skipped": skipped,
-            "failed": failed, "date": run_date}
+            "failed": failed, "waiting": waiting, "date": run_date}

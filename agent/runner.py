@@ -479,6 +479,18 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 from .demo_calendar_queue import build_demo_calendar_draft as _dc_draft
                 draft = _dc_draft(account, day_key)
 
+            # QUIET the legacy LASSO daily card when autopublish is on (FIX 2).
+            # When AGENT_CALENDAR_AUTOPUBLISH is armed, content_calendar is the source
+            # of truth for LASSO and its rows are published directly at the end of the
+            # cycle, so the legacy daily rotation/infographic/fallback draft would be a
+            # redundant, divergent approval card. Skip building/carding it FOR LASSO
+            # ACCOUNTS ONLY. The book queue, welcome drip, and demo calendar above are
+            # untouched (they already ran); client-gym drafting below is untouched.
+            _skip_legacy_lasso_daily = (
+                config.calendar_autopublish_enabled()
+                and account.key.startswith("lasso")
+                and draft is None)
+
             # Category frequency + consecutive caps (category_cap.py, both OFF by
             # default). Campaign builders are gated; the fallback never blocks.
             from .category_cap import is_allowed as _cap_allowed, record_win as _record_cap
@@ -490,7 +502,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # only the builder whose category matches today's scheduled slot fires.
             # Campaign builders (book, podcast, summit) never pre-empt the schedule.
             # platform / b2b / doctrine days fall through to the creative layer below.
-            if config.category_rotation_enabled() and account.key.startswith("lasso"):
+            if (config.category_rotation_enabled() and account.key.startswith("lasso")
+                    and not _skip_legacy_lasso_daily):
                 from .content_categories import schedule_for_day as _sched_for_day
                 _day_sched = _sched_for_day(day_key)
                 if _day_sched is not None:
@@ -513,9 +526,10 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                                                        voice=acct_voice)
                     # _cat in ("platform", "b2b", "doctrine"): draft stays None;
                     # the creative rotation / infographic / fallback below fills.
-            else:
+            elif not _skip_legacy_lasso_daily:
                 # LEGACY PRIORITY CHAIN (rotation OFF; behavior byte-for-byte identical
-                # to what shipped before AGENT_CATEGORY_ROTATION existed).
+                # to what shipped before AGENT_CATEGORY_ROTATION existed). Skipped for
+                # LASSO accounts when autopublish is on (content_calendar is authority).
                 if account.key.startswith("lasso"):
                     # BOOK CAMPAIGN (AGENT_BOOK_CAMPAIGN_ENABLED, OFF): participates in
                     # rotation via frequency cap and consecutive cap (both default off).
@@ -541,13 +555,17 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # Creative rotation + variety guard: dormant unless AGENT_ROTATION_ENABLED.
             # Armed, it picks WHICH approved creative today's draft proposes (window,
             # pillar alternation, gate-clean only); None -> the paths below run as today.
-            if draft is None and account.key.startswith("lasso"):
+            # Skipped for LASSO accounts when autopublish is on (quiet the legacy card).
+            if (draft is None and account.key.startswith("lasso")
+                    and not _skip_legacy_lasso_daily):
                 from .rotation import build_rotated_draft
                 draft = build_rotated_draft(account, day_key, acct_voice, acct_lib, poster=poster)
             # For a LASSO account, try the fully-automated infographic path next. It is
             # dormant unless all three flags are armed; None -> fall back to the library
             # path unchanged. (A BLOCKED draft is still a draft: it surfaces, not falls back.)
-            if draft is None and account.key.startswith("lasso"):
+            # Skipped for LASSO accounts when autopublish is on (quiet the legacy card).
+            if (draft is None and account.key.startswith("lasso")
+                    and not _skip_legacy_lasso_daily):
                 draft = build_daily_infographic_draft(account, day_key)
             # CLIENT SOURCES (AGENT_CLIENT_SOURCES, OFF by default). A client
             # (non-LASSO) account drafts the day from its OWN approved sources +
@@ -559,7 +577,10 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 from .client_content import build_client_draft
                 draft = build_client_draft(account, day_key, acct_voice, acct_lib,
                                            poster=poster)
-            if draft is None:
+            # Library fallback: the last leg of the legacy LASSO daily draft. Skipped
+            # for LASSO accounts when autopublish is on so no redundant card is built;
+            # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
+            if draft is None and not _skip_legacy_lasso_daily:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
                 if creative is not None:
                     from .library_audit import check_creative as _check_creative
