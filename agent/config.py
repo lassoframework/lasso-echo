@@ -305,6 +305,24 @@ def real_calendar_mirror_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_REAL_CALENDAR_MIRROR", "false"))
 
 
+def calendar_autopublish_enabled() -> bool:
+    """
+    Scheduled calendar AUTO-PUBLISHER switch. OFF by default = zero behavior change:
+    the daily cycle never reads content_calendar for publishing and nothing goes to
+    live social from the calendar (byte-for-byte today's behavior; the manual approval
+    path is untouched). When ON, each daily cycle reads THAT day's content_calendar rows
+    for gym_id='lasso' (only the run date, never a past or future date) and publishes
+    each unpublished row to the real IG/FB surface through meta_publisher.publish. This
+    is a REAL publish path, so it ALSO requires AGENT_PUBLISH_ENABLED (the global publish
+    kill switch); with the publish flag OFF, publish() returns would_publish and the row
+    is left unpublished for a later run. EXACTLY-ONCE is enforced by an atomic claim on
+    each row (status pending -> publishing) before the network call, so a re-run or a
+    second worker never double-posts. Arm by hand in Railway env. Needs the Supabase
+    portal creds (the content_calendar data plane). No existing gate is weakened.
+    """
+    return _truthy(os.environ.get("AGENT_CALENDAR_AUTOPUBLISH", "false"))
+
+
 def real_month_plan_enabled() -> bool:
     """
     REAL month planner switch. OFF by default = zero behavior change: the planner is

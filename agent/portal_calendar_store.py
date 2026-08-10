@@ -154,6 +154,119 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    # ---- auto-publisher: read + exactly-once claim/update -------------------
+    # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
+    # They never publish; they only read the day's rows and flip status atomically
+    # so a row is published EXACTLY ONCE across re-runs / concurrent workers.
+    def due_rows(self, gym_id, run_date):
+        """
+        content_calendar rows that are DUE to publish on `run_date` for `gym_id`:
+          - gym_id == gym_id
+          - post_date == run_date  (ONLY the run date: never a past or future date)
+          - status NOT in ('published','denied','killed')
+          - published_at IS NULL   (never re-publish a row already sent)
+          - image_url present      (a row with no creative is skipped upstream too)
+        `run_date` is 'YYYY-MM-DD' (validated by the caller). Returns a list of dicts.
+        Gym scoped by the gym_id=eq filter so another gym's row is never returned.
+        """
+        params = {
+            "gym_id": f"eq.{gym_id}",
+            "post_date": f"eq.{run_date}",
+            "status": "not.in.(published,denied,killed)",
+            "published_at": "is.null",
+            "image_url": "not.is.null",
+            "order": "created_at",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
+    def mark_publishing(self, row_id):
+        """
+        ATOMIC CLAIM (the exactly-once guard). Conditionally flip status
+        'pending' -> 'publishing' for this row ONLY IF it is still unclaimed and
+        unpublished: the PATCH carries a filter of id=eq.<row_id> AND status=eq.pending
+        AND published_at=is.null, so PostgREST updates the row server-side only when
+        the pre-conditions still hold. Returns True only when THIS call won the claim
+        (exactly one row came back); False when the row was already publishing /
+        published / denied / killed (zero rows updated) so the caller SKIPS it. Two
+        concurrent runs can both call this; at most one gets True.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+            "status": "eq.pending",
+            "published_at": "is.null",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "publishing"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return len(rows) == 1
+
+    def mark_published(self, row_id, media_id, published_at):
+        """
+        Record a successful publish: status='published', published_at=<now iso>,
+        late_post_id=<media_id>. Filtered by id only (the row was already claimed by
+        mark_publishing, so no other worker can be here). Returns the updated row or None.
+        """
+        params = {"id": f"eq.{row_id}"}
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={
+                "status": "published",
+                "published_at": published_at,
+                "late_post_id": media_id,
+            },
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def mark_publish_failed(self, row_id):
+        """
+        REVERT a claim after a publish failure (or a would_publish result): status
+        back to 'pending' so the row is retried on the next run. Records NOTHING else
+        (no media id, no published_at), so a failed attempt never looks published.
+        Filtered by id only. Returns the updated row or None.
+        """
+        params = {"id": f"eq.{row_id}"}
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "pending"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
     # ---- mirror writes (real-drafts calendar mirror) ------------------------
     # These write calendar rows only. NOTHING here publishes to any social account.
     def insert_rows(self, account_key, rows):

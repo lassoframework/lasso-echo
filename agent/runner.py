@@ -704,4 +704,25 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 ops_alerts.alert(f"real-calendar mirror failed for {account.key}: "
                                  f"{type(e).__name__}: {e}. The draft run is unaffected.")
 
+    # CALENDAR AUTO-PUBLISHER (AGENT_CALENDAR_AUTOPUBLISH, OFF by default; ALSO needs
+    # AGENT_PUBLISH_ENABLED). publish_due() self-guards on BOTH flags, so an unguarded
+    # call is a safe no-op when off. Armed, it reads THIS day's content_calendar rows for
+    # gym_id='lasso' and publishes each unpublished one to live IG/FB EXACTLY ONCE (an
+    # atomic status claim per row). Isolated from drafting/approval; a failure here never
+    # takes the draft run down. The manual approval path is untouched.
+    if config.calendar_autopublish_enabled():
+        try:
+            from . import calendar_autopublish
+            summary = calendar_autopublish.publish_due(day_key, notifier=poster)
+            if summary.get("ok") and summary.get("published"):
+                print(f"[calendar-autopublish] published {len(summary['published'])} "
+                      f"row(s) for {day_key}; skipped {len(summary.get('skipped', []))}, "
+                      f"failed {len(summary.get('failed', []))}")
+            elif not summary.get("ok"):
+                print(f"[calendar-autopublish] no-op: {summary.get('reason')}")
+        except Exception as e:
+            print(f"[calendar-autopublish] cycle failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"calendar auto-publisher failed for {day_key}: "
+                             f"{type(e).__name__}: {e}. The draft run is unaffected.")
+
     return {"status": "drafted", "drafts": results}
