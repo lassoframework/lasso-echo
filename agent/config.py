@@ -1147,6 +1147,49 @@ def client_media_sync_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CLIENT_MEDIA_SYNC", "false"))
 
 
+def client_media_sync_minutes() -> int:
+    """How often the LISTENER'S frequent client-media lane may run, in minutes
+    (env AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5). The lane scans onboarded
+    client gyms' R2 uploads and auto-builds newly-ready calendars PROMPTLY (within
+    minutes of an upload) instead of waiting up to 24h for the once/day run_daily
+    pass. Throttled to this interval so it is not hammering R2 on every ~60s loop
+    tick; a scan with nothing new is a cheap no-op regardless. Floor 1 minute."""
+    try:
+        return max(1, int(os.environ.get("AGENT_CLIENT_MEDIA_SYNC_MINUTES", "5")))
+    except ValueError:
+        return 5
+
+
+def data_dir() -> str:
+    """The PERSISTENT data volume directory. This is the SAME dir the SQLite store
+    resolves to (db.db_path), the one place on the deployed worker that survives a
+    redeploy / restart. Resolution mirrors db.db_path exactly:
+
+      * AGENT_DATA_DIR when set (Railway volume mount), else "/data";
+      * that dir is only used when it actually EXISTS; otherwise fall back to "."
+        (local dev / tests have no /data volume, and the repo cwd persists there).
+
+    CLIENT-generated brand bibles live UNDER here (see client_voice_dir) so a gym's
+    onboarded voice doc is not wiped with the /app container image on every deploy.
+    LASSO's OWN bibles stay committed in the repo (brand_voice/) and are unaffected.
+    """
+    d = os.environ.get("AGENT_DATA_DIR", "/data")
+    return d if os.path.isdir(d) else "."
+
+
+def client_voice_dir() -> str:
+    """The DURABLE root for CLIENT (per-gym) brand bibles: <DATA_DIR>/brand_voice.
+    A client's bible lands at <DATA_DIR>/brand_voice/<base>/lasso_voice.md so it
+    survives worker restarts (unlike the ephemeral repo-relative brand_voice/<base>/
+    under /app, wiped on every deploy). Override with AGENT_CLIENT_VOICE_DIR for a
+    custom mount / tests. LASSO's committed brand_voice/ is a SEPARATE, repo-relative
+    tree and is never redirected here."""
+    override = os.environ.get("AGENT_CLIENT_VOICE_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(data_dir(), "brand_voice")
+
+
 def review_window_days() -> int:
     """
     The review cycle length in days (env AGENT_REVIEW_WINDOW_DAYS, default 14).

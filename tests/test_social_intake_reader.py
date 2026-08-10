@@ -19,6 +19,10 @@ from agent import client_sources as cs, social_intake_reader as sir  # noqa: E40
 @pytest.fixture(autouse=True)
 def _tmp(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # Pin the DURABLE client-voice dir to the tmp cwd so onboard's bible lands under
+    # tmp/brand_voice/<base> deterministically (independent of whether a real /data
+    # volume exists on the test host); onboard now writes to config.client_voice_dir().
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "brand_voice"))
     monkeypatch.chdir(tmp_path)          # brand_voice/ docs land under tmp
     yield
 

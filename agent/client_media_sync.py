@@ -367,11 +367,35 @@ def _has_approved_sources(account_key):
     return bool(client_sources.approved_sources(account_key))
 
 
+def _resolve_client_voice_path(base_key, repo_path):
+    """Resolve a CLIENT gym's brand-bible path, DURABLE FIRST then repo fallback.
+
+    A client bible is drafted at onboard into the persistent data volume
+    (config.client_voice_dir()/<base>/lasso_voice.md) so it survives a worker
+    restart. The Account still carries a repo-relative voice_doc; a wiped /app makes
+    that repo path disappear, so we look at the durable path FIRST and fall back to
+    the account's repo_path only when the durable file is absent. That fallback keeps
+    LASSO's OWN committed bibles (which ship in the repo, never onboarded) working
+    untouched: their durable path does not exist, so their repo path is used.
+
+    Returns the FIRST existing path, else the durable path (so a caller's
+    'missing voice' branch reports a stable, meaningful location). base_key is the
+    tenant base ('gritx'); repo_path is the account's configured voice_doc."""
+    durable = os.path.join(config.client_voice_dir(), base_key, "lasso_voice.md")
+    if os.path.exists(durable):
+        return durable
+    if repo_path and os.path.exists(repo_path):
+        return repo_path
+    return durable
+
+
 def _banned_words_for(base_key):
     """The gym's never-use words, read from its drafted bible (the intake writes the
-    words verbatim into brand_voice/<base>/lasso_voice.md). Empty when the bible is
-    missing or carries none. Never raises."""
-    path = os.path.join("brand_voice", base_key, "lasso_voice.md")
+    words verbatim into the durable <DATA_DIR>/brand_voice/<base>/lasso_voice.md,
+    falling back to the repo path for LASSO's committed bibles). Empty when the bible
+    is missing or carries none. Never raises."""
+    path = _resolve_client_voice_path(
+        base_key, os.path.join("brand_voice", base_key, "lasso_voice.md"))
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -542,7 +566,14 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # builder's _apply does a gym-scoped delete-then-insert (client calendars
             # are cheap real-photo cards, no Gemini), so the calendar EXTENDS cleanly.
 
-            voice = load_voice(account.voice_doc_path())
+            # Durable-first voice resolution: the client bible lives on the
+            # persistent data volume (survives restart); fall back to the account's
+            # repo-relative voice_doc only when the durable file is absent (LASSO's
+            # committed bibles). BUG 1: on the deployed worker the repo path is under
+            # /app and is WIPED every deploy, so an onboarded gym's generated bible
+            # was gone and this branch used to starve the build.
+            voice = load_voice(
+                _resolve_client_voice_path(base, account.voice_doc_path()))
             if voice is None:
                 results.append({"base": base, "status": "no_voice",
                                 "synced": sync.get("synced", 0)})

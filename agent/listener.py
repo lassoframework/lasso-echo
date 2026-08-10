@@ -137,6 +137,48 @@ def _fire_daily(store, today, run=run_daily):
     return out
 
 
+def _client_media_scan_due(now_mono, last_mono, interval_secs):
+    """PURE throttle predicate for the frequent client-media lane: True when at least
+    interval_secs have elapsed since the last scan (last_mono is 0.0 on first tick, so
+    the very first eligible tick always runs). Kept pure + tiny so a test can assert
+    the throttle without touching the loop or R2."""
+    return (now_mono - last_mono) >= interval_secs
+
+
+def run_client_media_lane(*, now_mono, last_mono, interval_secs, scan=None):
+    """The listener's FREQUENT client-media lane: PROMPTLY sync each onboarded client
+    gym's R2 uploads and auto-build its DRAFT calendar the moment it uploads, instead
+    of waiting up to 24h for the once/day run_daily pass (BUG 2). Returns the new
+    'last run' monotonic marker: unchanged when self-guarded off / throttled, else
+    now_mono after a run.
+
+    Self-guarded on AGENT_CLIENT_MEDIA_SYNC (scan_and_generate also re-checks the flag
+    and no-ops when off, belt and suspenders). Throttled to interval_secs so a ~60s
+    loop does not hammer R2; a scan with nothing new is a cheap no-op either way
+    (scan_and_generate skips gyms whose media count == existing feed count). Fully
+    isolated in try/except: a scan failure never kills the scheduler loop, exactly
+    like every other lane. DRAFTS ONLY: nothing here publishes (scan_and_generate has
+    no publish path)."""
+    if not config.client_media_sync_enabled():
+        return last_mono
+    if not _client_media_scan_due(now_mono, last_mono, interval_secs):
+        return last_mono
+    scan = scan or _default_client_media_scan
+    try:
+        scan()
+    except Exception as e:
+        print(f"[client-media-sync] frequent lane failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"client media frequent lane failed: {type(e).__name__}: {e}."
+                         " The draft run is unaffected.")
+    return now_mono
+
+
+def _default_client_media_scan():
+    """Run the real client-media scan (lazy import so flag-off never imports it)."""
+    from .client_media_sync import scan_and_generate
+    scan_and_generate()
+
+
 # Scheduler process heartbeat (no flag, honest observability): one kv row the
 # loop refreshes each cycle so `status` can prove the listen process is alive
 # and show when the next daily draw fires. Distinct from heartbeat.py (which
@@ -217,6 +259,8 @@ def _print_scheduled_lanes():
     armed the moment the scheduler starts."""
     lanes = [
         ("intake ingest", config.intake_enabled(), "AGENT_INTAKE_ENABLED"),
+        ("client media sync (frequent)", config.client_media_sync_enabled(),
+         "AGENT_CLIENT_MEDIA_SYNC"),
         ("opus poll", config.opus_enabled() and config.opus_poll_enabled(),
          "AGENT_OPUS_ENABLED + AGENT_OPUS_POLL_ENABLED"),
         ("podcast feed", config.podcast_enabled(), "AGENT_PODCAST_ENABLED"),
@@ -250,12 +294,14 @@ def _daily_scheduler(store):
     opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
     podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
     inbox_every = config.episode_inbox_poll_minutes() * 60
+    cms_every = config.client_media_sync_minutes() * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
     last_opus = 0.0
     last_podcast = 0.0
     last_inbox = 0.0
+    last_cms = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -309,6 +355,14 @@ def _daily_scheduler(store):
                 intake_ingest.process_all()
             except Exception as e:
                 print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
+        # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
+        # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
+        # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
+        # calendar, instead of waiting up to 24h for the once/day run_daily pass
+        # (which still runs, belt and suspenders). Cheap no-op when nothing changed;
+        # self-guarded, throttled, and fully isolated inside run_client_media_lane.
+        last_cms = run_client_media_lane(
+            now_mono=time.monotonic(), last_mono=last_cms, interval_secs=cms_every)
         # Opus Clip poll: FULLY INERT unless BOTH AGENT_OPUS_ENABLED and
         # AGENT_OPUS_POLL_ENABLED are armed. Errors alert (inside pull), never crash.
         if (config.opus_enabled() and config.opus_poll_enabled()

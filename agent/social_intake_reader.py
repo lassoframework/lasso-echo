@@ -31,7 +31,7 @@ every test runs fully offline (no Gemini / Supabase call in the build or test pa
 
 import os
 
-from . import bible_drafter, client_sources
+from . import bible_drafter, client_sources, config
 
 
 def _clean(value):
@@ -268,9 +268,13 @@ def _write_doc(path, text):
 def onboard_from_social(account_key, answers, *, approve=True):
     """Onboard a client from its submitted social intake.
 
-    * Writes brand_voice/<base>/lasso_voice.md and social_proof.md from the drafted
-      bible/proof: but NEVER clobbers an existing file (idempotent; a reviewed doc is
-      safe across re-runs).
+    * Writes the DURABLE client bible + social_proof (under config.client_voice_dir(),
+      i.e. <DATA_DIR>/brand_voice/<base>/) from the drafted bible/proof, but NEVER
+      clobbers an existing file (idempotent; a reviewed doc is safe across re-runs).
+      The durable location is the persistent data volume, so the generated bible is
+      NOT wiped when the /app container image is replaced on every deploy/restart
+      (BUG 1: a repo-relative brand_voice/<base>/ vanished on restart, starving the
+      client month builder of the voice doc it needs).
     * Lands the mapped bundle as client_sources for account_key, deduped against
       everything already stored (mirrors intake_onboard._step_sources), status
       "approved" when approve is True else "pending".
@@ -282,7 +286,7 @@ def onboard_from_social(account_key, answers, *, approve=True):
     mapped = map_answers(answers)
     base = _base_from_account(account_key)
 
-    voice_dir = os.path.join("brand_voice", base)
+    voice_dir = os.path.join(config.client_voice_dir(), base)
     bible_path = os.path.join(voice_dir, "lasso_voice.md")
     proof_path = os.path.join(voice_dir, "social_proof.md")
     wrote_bible = _write_doc(bible_path, mapped["bible_text"])

@@ -470,6 +470,94 @@ def test_one_gym_failing_never_blocks_others():
     assert statuses["topfuel"] in ("no_sources", "awaiting_media", "error")
 
 
+# ---- FIX 1: durable client bibles (survive a wiped /app on restart) --------------
+
+def _durable_bible(base, durable_root, never_line="(none provided in the intake)"):
+    """Write a client bible into the DURABLE voice dir (the persistent data volume),
+    NOT the repo-relative brand_voice/<base>/. Mirrors _bible's content."""
+    d = os.path.join(durable_root, base)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "lasso_voice.md"), "w", encoding="utf-8") as fh:
+        fh.write("We help members win.\n#GetFit\nSave this post.\n"
+                 f"Words to NEVER use: {never_line}\n")
+
+
+def test_onboard_writes_bible_to_durable_path_not_repo(monkeypatch, tmp_path):
+    """social_intake_reader.onboard_from_social lands the drafted bible on the DURABLE
+    data volume (config.client_voice_dir()), never the ephemeral repo-relative
+    brand_voice/<base>/ that a deploy wipes."""
+    durable = str(tmp_path / "data" / "brand_voice")
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", durable)
+    from agent import social_intake_reader as sir
+    answers = {"base_key": "gritx", "gym": {"name": "GritX"},
+               "voice": {"vibe": "warm", "words_to_never_use": "shredded, beast"}}
+    out = sir.onboard_from_social("gritx_ig", answers, approve=True)
+    assert out["base"] == "gritx"
+    # the bible + proof are on the durable volume...
+    assert os.path.exists(os.path.join(durable, "gritx", "lasso_voice.md"))
+    assert os.path.exists(os.path.join(durable, "gritx", "social_proof.md"))
+    # ...and NOT in the ephemeral repo-relative tree
+    assert not os.path.exists(os.path.join("brand_voice", "gritx", "lasso_voice.md"))
+    # the banned words rode into the bible verbatim (reviewer + guard both see them)
+    assert set(out["banned_words"]) == {"shredded", "beast"}
+
+
+def test_onboard_never_clobbers_a_reviewed_durable_bible(monkeypatch, tmp_path):
+    """A re-run of onboard leaves an existing (human-reviewed) durable bible intact."""
+    durable = str(tmp_path / "data" / "brand_voice")
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", durable)
+    d = os.path.join(durable, "gritx")
+    os.makedirs(d, exist_ok=True)
+    reviewed = "REVIEWED BY A HUMAN\nWords to NEVER use: keep\n"
+    with open(os.path.join(d, "lasso_voice.md"), "w", encoding="utf-8") as fh:
+        fh.write(reviewed)
+    from agent import social_intake_reader as sir
+    sir.onboard_from_social("gritx_ig", {"base_key": "gritx", "gym": {"name": "GritX"},
+                            "voice": {"words_to_never_use": "beast"}}, approve=True)
+    assert open(os.path.join(d, "lasso_voice.md")).read() == reviewed
+
+
+def test_restart_survival_durable_bible_loads_and_gym_builds(monkeypatch, tmp_path):
+    """The BUG-1 fix, end to end: a WIPED /app (repo brand_voice/<base> ABSENT) but the
+    durable bible PRESENT on the data volume -> the client voice still loads and the
+    gym's DRAFT calendar is built from its real media (no 'voice doc missing')."""
+    durable = str(tmp_path / "data" / "brand_voice")
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", durable)
+    _stock_sources("gritx_ig")
+    _durable_bible("gritx", durable, never_line="beast")
+    # prove the repo-relative bible does NOT exist (simulating a wiped /app image)
+    assert not os.path.exists(os.path.join("brand_voice", "gritx", "lasso_voice.md"))
+
+    r2 = _r2_with_uploads("gritx", n=3)
+    store = FakeStore()
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2)
+    assert out["ok"] is True
+    assert out["generated"] == 1, "durable bible must let the build proceed post-restart"
+    assert store.inserted, "expected DRAFT calendar rows built from the durable voice"
+    # the durable-parsed banned word reached the build's guard (banned words resolved
+    # from the durable bible, not the missing repo path)
+    assert cms._banned_words_for("gritx") == ("beast",)
+
+
+def test_lasso_committed_repo_bible_still_loads(monkeypatch, tmp_path):
+    """LASSO's OWN committed bible (repo-relative, never onboarded) is untouched: with
+    NO durable file present, the resolver falls back to the account's repo voice_doc."""
+    durable = str(tmp_path / "data" / "brand_voice")
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", durable)
+    _stock_sources("gritx_ig")
+    _bible("gritx")   # repo-relative brand_voice/gritx/lasso_voice.md, no durable file
+    assert not os.path.exists(os.path.join(durable, "gritx", "lasso_voice.md"))
+
+    r2 = _r2_with_uploads("gritx", n=2)
+    store = FakeStore()
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2)
+    assert out["ok"] is True and out["generated"] == 1
+    # the resolver returned the repo path (durable absent), and banned words parsed
+    resolved = cms._resolve_client_voice_path(
+        "gritx", os.path.join("brand_voice", "gritx", "lasso_voice.md"))
+    assert resolved == os.path.join("brand_voice", "gritx", "lasso_voice.md")
+
+
 def test_no_meta_publisher_in_path():
     """Guard: the sync/generate path never imports or calls the live publisher. Check
     the compiled code (constants + names), so a module docstring mentioning the
