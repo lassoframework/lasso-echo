@@ -7,6 +7,11 @@ Asserts:
   sync_uploads
     * lists + downloads NEW media into content_library/<base>, writes a public_url
       sidecar, and carries the gym's caption into the sidecar
+    * media that INGEST staged to pending_caption/ IS synced (with its per-file
+      caption), never skipped
+    * media spread across pending_caption/ + incoming/ + originals/ all sync;
+      idempotent; the SAME basename in two prefixes downloads once
+    * thumbs/, *.json sidecars, and manifest.json are NEVER synced as media
     * IDEMPOTENT: a file already present is skipped, never re-downloaded
     * non-media exts (and the _upload.json/_intake.json sidecars) are ignored
     * empty R2 -> 0 synced
@@ -131,12 +136,18 @@ def test_sync_downloads_new_media_with_public_url_and_caption():
     assert imgs == ["20260810T120000Z_photo_00.jpg",
                     "20260810T120000Z_photo_01.jpg",
                     "20260810T120000Z_photo_02.jpg"]
-    # sidecar carries the R2 public url + the gym's own caption (never fabricated)
+    # sidecar carries the R2 public url + the gym's own caption (never fabricated).
+    # The caption lives under "note" (the EXACT key library._load_sidecar reads into
+    # Creative.client_note); writing "client_note" here would be silently dropped.
     side = json.load(open(os.path.join(lib, "20260810T120000Z_photo_00.json")))
     assert side["public_url"] == (
         "https://cdn.example.com/intake/gritx/incoming/"
         "20260810T120000Z_photo_00.jpg")
-    assert side["client_note"] == "day 0 at the gym"
+    assert side["note"] == "day 0 at the gym"
+    # and it round-trips through the library the drafter reads
+    from agent import library as _lib
+    creatives = {os.path.basename(c.path): c for c in _lib.list_creatives(lib)}
+    assert creatives["20260810T120000Z_photo_00.jpg"].client_note == "day 0 at the gym"
 
 
 def test_sync_is_idempotent_no_redownload():
@@ -166,6 +177,115 @@ def test_sync_ignores_non_media_and_sidecars():
     assert not any(f.endswith((".txt", ".pdf")) for f in got)
 
 
+def test_sync_never_syncs_thumbs_json_or_manifest():
+    """Thumbnails (a real image extension), every *.json sidecar, and manifest.json
+    are NEVER downloaded as media, even though thumbs share a .jpg extension."""
+    objs = {
+        # one real staged photo the gym uploaded
+        "intake/gritx/pending_caption/20260810T120000Z_photo_00.jpg": b"\xff\xd8\xffJ",
+        "intake/gritx/pending_caption/20260810T120000Z_photo_00.json":
+            json.dumps({"status": "needs_caption",
+                        "original_key": "intake/gritx/incoming/x"}).encode("utf-8"),
+        # a thumbnail (real .jpg extension) must be excluded
+        "intake/gritx/thumbs/20260810T120000Z_photo_00_thumb.jpg": b"\xff\xd8\xffT",
+        # the processed manifest (JSON) must be excluded
+        "intake/gritx/manifest.json": json.dumps({"processed": []}).encode("utf-8"),
+    }
+    r2 = FakeR2(objs)
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out["synced"] == 1   # only the one real photo
+    lib = os.path.join("content_library", "gritx")
+    got = sorted(os.listdir(lib))
+    # exactly the one photo + its written library sidecar; no thumb, no manifest
+    assert "20260810T120000Z_photo_00.jpg" in got
+    assert not any("_thumb" in f for f in got)
+    assert "manifest.json" not in got
+    # the thumbnail bytes were never even fetched
+    assert not any(k.endswith("_thumb.jpg") for k in r2.got)
+
+
+def test_sync_pulls_pending_caption_with_per_file_caption():
+    """The real bug: a gym's uploaded photo that ingest STAGED to pending_caption/
+    (nothing left in incoming/) IS synced, and a per-file <stem>.json caption on it
+    is carried into the library sidecar. Previously sync listed only incoming/ and
+    found 0."""
+    objs = {
+        "intake/eng/pending_caption/20260810T120000Z_squat.jpg": b"\xff\xd8\xffENG",
+        "intake/eng/pending_caption/20260810T120000Z_squat.json":
+            json.dumps({"caption": "6am small group",
+                        "status": "needs_caption"}).encode("utf-8"),
+    }
+    r2 = FakeR2(objs)
+    out = cms.sync_uploads("eng", r2=r2)
+    assert out == {"synced": 1, "skipped": 0}
+    lib = os.path.join("content_library", "eng")
+    assert os.path.exists(os.path.join(lib, "20260810T120000Z_squat.jpg"))
+    side = json.load(open(os.path.join(lib, "20260810T120000Z_squat.json")))
+    assert side["note"] == "6am small group"
+    assert side["public_url"] == (
+        "https://cdn.example.com/intake/eng/pending_caption/"
+        "20260810T120000Z_squat.jpg")
+
+
+def test_sync_across_all_prefixes_idempotent_and_deduped():
+    """Media spread across pending_caption/ + incoming/ + originals/ all sync; the
+    batch _upload.json caption applies to the incoming/ photo; the SAME basename in
+    two prefixes downloads ONCE (processed form wins over the raw originals/ copy);
+    a re-sync re-downloads nothing."""
+    objs = {
+        # staged (uncaptioned) in pending_caption/
+        "intake/eng/pending_caption/20260810T120000Z_a.jpg": b"\xff\xd8\xffA",
+        # fresh + captioned via the batch sidecar in incoming/
+        "intake/eng/incoming/20260810T120000Z_b.jpg": b"\xff\xd8\xffB",
+        "intake/eng/incoming/20260810T120000Z_upload.json":
+            json.dumps({"note": "batch",
+                        "captions": {"20260810T120000Z_b.jpg": "coach Dave"}}
+                       ).encode("utf-8"),
+        # a raw MOV source archived to originals/ (its own basename)
+        "intake/eng/originals/20260810T120000Z_c.mov": b"\x00MOV",
+        # the SAME basename living in BOTH originals/ and pending_caption/: must
+        # download once, from the processed (pending_caption) copy.
+        "intake/eng/pending_caption/20260810T120000Z_d.jpg": b"\xff\xd8\xffDP",
+        "intake/eng/originals/20260810T120000Z_d.jpg": b"\xff\xd8\xffDO",
+    }
+    r2 = FakeR2(objs)
+    out = cms.sync_uploads("eng", r2=r2)
+    assert out == {"synced": 4, "skipped": 0}   # a, b, c, d (once)
+
+    lib = os.path.join("content_library", "eng")
+    imgs = sorted(f for f in os.listdir(lib) if f.endswith((".jpg", ".mov")))
+    assert imgs == ["20260810T120000Z_a.jpg", "20260810T120000Z_b.jpg",
+                    "20260810T120000Z_c.mov", "20260810T120000Z_d.jpg"]
+    # dedup: the processed pending_caption bytes won for the shared basename 'd'
+    with open(os.path.join(lib, "20260810T120000Z_d.jpg"), "rb") as fh:
+        assert fh.read() == b"\xff\xd8\xffDP"
+    # batch caption reached the incoming photo's sidecar
+    side_b = json.load(open(os.path.join(lib, "20260810T120000Z_b.json")))
+    assert side_b["note"] == "coach Dave"
+
+    # IDEMPOTENT: nothing re-downloads on a second pass.
+    r2.got.clear()
+    out2 = cms.sync_uploads("eng", r2=r2)
+    assert out2 == {"synced": 0, "skipped": 4}
+    assert [k for k in r2.got if _is_media_get(k)] == []
+
+
+def test_sync_non_media_exts_ignored_across_prefixes():
+    """Non-media extensions anywhere are ignored; an empty gym -> 0 synced."""
+    objs = {
+        "intake/eng/pending_caption/20260810T120000Z_readme.txt": b"hi",
+        "intake/eng/originals/20260810T120000Z_scan.pdf": b"%PDF",
+    }
+    r2 = FakeR2(objs)
+    out = cms.sync_uploads("eng", r2=r2)
+    assert out == {"synced": 0, "skipped": 0}
+    assert not os.path.isdir(os.path.join("content_library", "eng"))
+
+
+def _is_media_get(key):
+    return key.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"))
+
+
 def test_sync_empty_r2_zero_synced():
     r2 = FakeR2({})
     out = cms.sync_uploads("gritx", r2=r2)
@@ -173,6 +293,16 @@ def test_sync_empty_r2_zero_synced():
 
 
 # ---- scan_and_generate -----------------------------------------------------------
+
+def _feed_ig_rows(rows):
+    """The instagram FEED rows (one per photo placed): skips the FB mirror + stories."""
+    return [r for r in rows if r.get("format") == "feed"
+            and str(r.get("account", "")).lower() in ("instagram", "ig", "")]
+
+
+def _story_rows(rows):
+    return [r for r in rows if r.get("format") == "story"]
+
 
 def test_generate_when_media_and_sources_and_no_calendar():
     _stock_sources("gritx_ig")
@@ -190,6 +320,14 @@ def test_generate_when_media_and_sources_and_no_calendar():
         assert row["gym_id"] == "gritx"
         assert row["status"] == "pending"
         assert "id" not in row
+
+    # MEDIA-CAPPED, ONE PHOTO PER FEED, NO REUSE: 5 photos -> EXACTLY 5 ig feeds,
+    # each a DISTINCT image_url, plus 5 paired stories (never padded to 30).
+    ig_feeds = _feed_ig_rows(store.inserted)
+    assert len(ig_feeds) == 5
+    feed_imgs = [r["image_url"] for r in ig_feeds]
+    assert len(set(feed_imgs)) == 5, "every feed must use a distinct photo (no reuse)"
+    assert len(_story_rows(store.inserted)) == 5, "one paired story per feed"
 
 
 def test_no_media_awaits_generator_not_called():
@@ -220,12 +358,37 @@ def test_no_media_awaits_generator_not_called():
     assert store.inserted == [] and store.deleted == []
 
 
-def test_existing_calendar_not_regenerated():
+def _existing_feed_calendar(base, month, n):
+    """n instagram FEED rows (one per already-placed photo) in the given month, the
+    shape real_calendar_mirror writes and _existing_feed_count reads."""
+    return [{"gym_id": base, "account": "instagram", "format": "feed",
+             "post_date": f"{month}-{(i % 28) + 1:02d}", "status": "pending",
+             "image_url": f"u{i}"} for i in range(n)]
+
+
+def test_only_two_photos_builds_two_feeds_not_thirty():
+    """Blake's cap: 2 photos -> 2 feed posts (+ 2 stories), never padded to 30."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=2)
+    store = FakeStore()
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2, days=30)
+    assert out["ok"] is True and out["generated"] == 1
+    ig_feeds = _feed_ig_rows(store.inserted)
+    assert len(ig_feeds) == 2, "2 photos -> exactly 2 feeds, never 30"
+    assert len({r["image_url"] for r in ig_feeds}) == 2  # distinct photos
+    assert len(_story_rows(store.inserted)) == 2          # 2 paired stories
+
+
+def test_equal_media_and_feeds_is_idempotent_skip():
+    """media_count == existing feed rows -> SKIP, no rebuild (idempotent)."""
     _stock_sources("gritx_ig")
     _bible("gritx")
     r2 = _r2_with_uploads("gritx", n=4)
-    # gym already has rows in the start month -> never regenerate
-    store = FakeStore(existing={("gritx", "2026-08"): [{"id": "x"}]})
+    # already 4 feed rows placed for 4 photos -> nothing to grow.
+    store = FakeStore(existing={("gritx", "2026-08"): _existing_feed_calendar(
+        "gritx", "2026-08", 4)})
 
     from datetime import date
     out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
@@ -233,8 +396,40 @@ def test_existing_calendar_not_regenerated():
     assert out["ok"] is True
     assert out["skipped_existing"] == 1
     assert out["generated"] == 0
-    # media still synced, but NO calendar write
+    # media still synced, but NO calendar write (no delete, no insert)
     assert store.inserted == [] and store.deleted == []
+
+
+def test_uploading_more_extends_calendar_up_to_new_count():
+    """media_count > existing feed rows -> (re)build up to the new count; never past it."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=5)         # 5 photos now on hand
+    # only 2 feeds were built before (2 photos at the time) -> extend to 5.
+    store = FakeStore(existing={("gritx", "2026-08"): _existing_feed_calendar(
+        "gritx", "2026-08", 2)})
+
+    from datetime import date
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 8, 10), days=30)
+    assert out["ok"] is True
+    assert out["generated"] == 1
+    # extended (delete-then-insert) to exactly 5 distinct-photo feeds, never past 5.
+    ig_feeds = _feed_ig_rows(store.inserted)
+    assert len(ig_feeds) == 5
+    assert len({r["image_url"] for r in ig_feeds}) == 5
+    assert store.deleted, "extend does a gym-scoped delete-then-insert"
+
+
+def test_never_builds_past_media_count_even_with_large_days():
+    """days is only an UPPER bound: 3 photos + days=30 -> exactly 3 feeds."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=3)
+    store = FakeStore()
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2, days=30)
+    assert out["ok"] is True and out["generated"] == 1
+    assert len(_feed_ig_rows(store.inserted)) == 3
 
 
 def test_flag_off_is_noop(monkeypatch):

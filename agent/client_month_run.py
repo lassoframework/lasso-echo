@@ -184,8 +184,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     builder returns {ok:False, awaiting_media:True, ...} and writes NOTHING (no render,
     no host, no delete, no insert). A client NEVER gets an infographic-only calendar.
 
-    Returns {ok, upserted, days, skipped_banned, months}: or {ok:False, reason} when a
-    flag is off, an input is missing, or the gym is awaiting media (nothing touched)."""
+    MEDIA-CAPPED (Blake, 2026-08): the calendar is at most as long as the gym's media
+    supports. ONE PHOTO PER FEED, NO REUSE: a gym with N usable media items gets AT
+    MOST N feed posts (each a DISTINCT photo) plus their paired stories. `days` is an
+    UPPER bound, not a target: the real number of feed-days = min(days, unique media
+    count). We never pad to `days` and never reuse a photo across feeds; once the
+    library is exhausted the calendar simply ends.
+
+    Returns {ok, upserted, days, skipped_banned, media_count, months}: or {ok:False,
+    reason} when a flag is off, an input is missing, or the gym is awaiting media
+    (nothing touched)."""
     log = logger or (lambda m: print(f"[client-month] {m}"))
     if not config.client_month_enabled():
         return {"ok": False, "reason": "AGENT_CLIENT_MONTH off", "upserted": 0,
@@ -202,12 +210,19 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 
     # MEDIA-REQUIRED GUARD: a client with no uploaded media gets no calendar. WAIT and
     # write nothing (no render, no host, no delete, no insert). Never an infographic.
-    if _client_media_count(library_path) <= 0:
+    media_count = _client_media_count(library_path)
+    if media_count <= 0:
         log(f"{base_key}: waiting for client media (no photos/videos uploaded yet); "
             "nothing rendered, nothing written")
         return {"ok": False,
                 "reason": "waiting for client media (no photos/videos uploaded yet)",
-                "awaiting_media": True, "upserted": 0, "days": 0, "skipped_banned": 0}
+                "awaiting_media": True, "upserted": 0, "days": 0, "skipped_banned": 0,
+                "media_count": 0}
+
+    # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
+    # bound; the real number of feed-days is at most media_count (one distinct photo
+    # per feed, no reuse). A 2-photo gym gets 2 feeds, never 30.
+    max_feed_days = min(days, media_count)
 
     from datetime import date, timedelta
     start = start_date if isinstance(start_date, date) \
@@ -217,8 +232,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     skipped_banned = 0
     built_days = 0
     banned_words = tuple(banned_words or ())
-    for i in range(days):
+    # ONE PHOTO PER FEED, NO REUSE: track the creative each feed consumed so no photo
+    # is used by two feeds. A feed that would reuse an already-used photo is skipped
+    # for the day (pick_image rotates, so the next day usually lands a fresh one); the
+    # cap guarantees we stop once every unique photo has been placed.
+    used_paths = set()
+    # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
+    # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
+    # feed + its paired story are the same asset), so stories do not consume the cap.
+    i = 0
+    while i < days and built_days < max_feed_days:
         day_key = (start + timedelta(days=i)).isoformat()
+        i += 1
 
         feed, feed_drop = _clean_draft_for_day(
             account, day_key, voice, library_path, banned_words, log)
@@ -234,22 +259,23 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         if not _has_real_creative(feed):
             log(f"held: no client photo for the day {day_key} feed")
             continue
+        # NO REUSE: a photo already placed on an earlier feed is never reused. Skip
+        # the day; a later day's rotated pick fills a still-unused photo.
+        feed_path = (getattr(feed, "creative_path", "") or "").strip()
+        if feed_path and feed_path in used_paths:
+            log(f"skip {day_key} feed: photo already used by an earlier feed (no reuse)")
+            continue
+        if feed_path:
+            used_paths.add(feed_path)
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
 
-        story, story_drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, banned_words, log)
-        if story is None:
-            if story_drop:
-                skipped_banned += 1
-                log(f"drop {day_key} story: {story_drop}")
-            else:
-                log(f"skip {day_key} story: no approved source could build the day")
-            continue
-        if not _has_real_creative(story):
-            log(f"held: no client photo for the day {day_key} story")
-            continue
+        # PAIRED STORY on the SAME photo: the story mirrors the feed's real creative
+        # rather than re-picking (which would consume a SECOND photo and break the
+        # one-photo-per-feed cap). It carries the feed's caption + creative, marked as
+        # a story. No extra media is consumed, so N photos -> N feeds + N stories.
+        story = _story_from_feed(feed)
         _mark_story(story)
         drafts.append(story)
 
@@ -257,6 +283,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     result = _apply(base_key, rows, start, days, store, log)
     result["days"] = built_days
     result["skipped_banned"] = skipped_banned
+    result["media_count"] = media_count
     return result
 
 
@@ -269,6 +296,18 @@ def _mark_feed(draft):
 def _mark_story(draft):
     draft.is_story = True
     draft.draft_type = "story"
+
+
+def _story_from_feed(feed):
+    """A paired STORY draft on the SAME real photo as the feed. Cloned from the feed
+    (same caption, creative, day, source), NOT re-picked, so a feed and its story share
+    one photo and no second media item is consumed. A distinct draft_id keeps the two
+    from colliding in the DB. Reuses the feed's own creative on purpose (a feed + its
+    story are one asset), which is NOT the cross-feed reuse the cap forbids."""
+    import dataclasses
+    story = dataclasses.replace(feed)
+    story.draft_id = f"{feed.draft_id}_story"
+    return story
 
 
 def _to_rows(base_key, drafts):
