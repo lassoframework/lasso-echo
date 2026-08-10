@@ -196,6 +196,28 @@ ACCOUNTS = [
         library_prefix="content_library/topfuel",
         active=False,
     ),
+    Account(
+        key="eng_ig",
+        display_name="CrossFit and HYROX ENG IG",
+        platform=Platform.INSTAGRAM,
+        token_env="AGENT_ENG_IG_TOKEN",
+        target_id_env="AGENT_ENG_IG_ID",
+        voice_doc="brand_voice/eng/lasso_voice.md",
+        social_proof_doc="brand_voice/eng/social_proof.md",
+        library_prefix="content_library/eng",
+        active=False,
+    ),
+    Account(
+        key="eng_fb",
+        display_name="CrossFit and HYROX ENG Facebook Page",
+        platform=Platform.FACEBOOK_PAGE,
+        token_env="AGENT_ENG_FB_TOKEN",
+        target_id_env="AGENT_ENG_FB_PAGE_ID",
+        voice_doc="brand_voice/eng/lasso_voice.md",
+        social_proof_doc="brand_voice/eng/social_proof.md",
+        library_prefix="content_library/eng",
+        active=False,
+    ),
     # Kept as an INACTIVE record for history. Meta ended personal-profile publishing
     # in 2018 (Graph API cannot post to a personal profile), so this account can never
     # publish and must not generate daily draft cards. active=False excludes it from
