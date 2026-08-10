@@ -217,21 +217,22 @@ def account_state(acct, now=None):
     if acct.get("isActive") is False or acct.get("enabled") is False:
         return "expired"
     md = acct.get("metadata") or {}
-    # Require a POSITIVE connection signal — never optimistically claim "connected" on a bare or
-    # malformed payload. A real connected account carries at least one of these.
-    has_signal = (
-        acct.get("isActive") is True
-        or bool(acct.get("connectedAt"))
-        or bool(md.get("profileData"))
-    )
-    if not has_signal:
-        return "not_connected"
+    # Token expiry is a NEGATIVE and takes precedence: connectedAt + expires_in in the past -> expired.
     exp = md.get("expires_in")
     connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
     if isinstance(exp, (int, float)) and connected_at is not None:
         now = now or datetime.now(timezone.utc)
         if (now - connected_at).total_seconds() > float(exp):
             return "expired"
+    # A real account ROW present in Zernio's list IS the connection: the OAuth callback wrote it, and
+    # an intentional disconnect / inactive flag / token expiry (all handled above) are the only things
+    # that make it not connected. We do NOT require a positive signal like profileData/connectedAt/
+    # isActive: Zernio's list momentarily omits those fields, which used to flap a live connection
+    # (especially Instagram) to "not_connected" and force a reconnect every session. This matches the
+    # bar facebook_account_id() uses (platform + _id). The only guard is a bare or malformed payload
+    # with no account id, which is never optimistically called connected.
+    if not acct.get("_id"):
+        return "not_connected"
     return "connected"
 
 

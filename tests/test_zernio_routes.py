@@ -283,3 +283,25 @@ def test_page_select_persists_and_requires_id(db_env):
     status, body = zr.handle_facebook_page_select("gymA", "p1")
     assert status == 200 and body == {"ok": True}
     assert (_db.gym_get("gymA") or {}).get("zernio_default_fb_page_id") == "p1"
+
+
+def test_account_state_present_row_no_positive_signal_is_connected():
+    # A real Zernio account ROW (has _id) with NO isActive/connectedAt/profileData must be CONNECTED,
+    # not flapped to not_connected. This is the Instagram reconnect-every-session bug: Zernio's list
+    # momentarily omits the signal fields on a live connection.
+    import agent.zernio as z
+    acct = {"_id": "abc123", "platform": "instagram"}
+    assert z.account_state(acct) == "connected"
+
+
+def test_account_state_bare_payload_is_not_connected():
+    # A bare/malformed payload with no account id is never optimistically connected.
+    import agent.zernio as z
+    assert z.account_state({}) == "not_connected"
+    assert z.account_state({"platform": "instagram"}) == "not_connected"
+
+
+def test_account_state_explicit_negatives_still_win_over_present_row():
+    import agent.zernio as z
+    assert z.account_state({"_id": "x", "platform": "facebook", "intentionalDisconnectAt": "2026-01-01T00:00:00Z"}) == "expired"
+    assert z.account_state({"_id": "x", "platform": "facebook", "isActive": False}) == "expired"
