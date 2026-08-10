@@ -759,7 +759,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     if config.calendar_autopublish_enabled():
         try:
             from . import calendar_autopublish
-            summary = calendar_autopublish.publish_due(day_key, notifier=poster)
+            # catch_all=True: this is the ONCE/DAY draw, so it must be a safety net
+            # that publishes EVERY remaining due row regardless of slot (NO ORPHANS).
+            # Time-of-day spacing is driven by the listener's run_slot_ticks lane;
+            # this call guarantees nothing is ever left unpublished for the day even
+            # if the listener/slot ticks were missed or the scheduler fired only once.
+            summary = calendar_autopublish.publish_due(day_key, notifier=poster,
+                                                       catch_all=True)
             if summary.get("ok") and summary.get("published"):
                 print(f"[calendar-autopublish] published {len(summary['published'])} "
                       f"row(s) for {day_key}; skipped {len(summary.get('skipped', []))}, "

@@ -40,35 +40,57 @@ def _now_iso(now=None):
     return datetime.now(timezone.utc).isoformat()
 
 
-def _order_key(row):
+def _stable_hash(s):
+    """A deterministic non-negative int from a string, stable across processes
+    (Python's built-in hash() is salted per process, so it is NOT used here)."""
+    import hashlib
+    return int(hashlib.sha1(str(s).encode("utf-8")).hexdigest(), 16)
+
+
+def slot_index_for_row(row, n=None):
     """
-    Deterministic ordering of a day+account's rows so slot assignment is stable
-    across re-runs (no schema change, no time-of-day column). Order:
-      1. feed before its paired story (a story shares the day; feed goes first),
-      2. then stable by id (string compare).
-    Returns a sort tuple; ties never occur because ids are unique.
+    The STABLE slot ordinal for ONE row, a deterministic function of the ROW
+    ITSELF (its format + id) and NEVER of its position within the day's due set.
+    So when an earlier row publishes and leaves due_rows, a remaining row's slot
+    does NOT move earlier.
+
+    Mapping (n = number of slot times, default len(SPRINT_SLOT_TIMES) = 3):
+      - a STORY -> the middle slot (midday), so it lands after its paired feed.
+      - a FEED  -> a non-middle slot chosen by a stable hash of its id, spread
+        across the remaining (earlier + later) slots. With n=3 that is AM or PM.
+    A single-slot config (n=1) collapses everyone onto slot 0.
     """
+    if n is None:
+        n = len(SPRINT_SLOT_TIMES)
+    if n <= 1:
+        return 0
+    mid = n // 2
     fmt = (row.get("format") or "feed").strip().lower()
-    is_story = 1 if fmt == "story" else 0        # feed(0) sorts before story(1)
-    return (is_story, str(row.get("id") or ""))
+    if fmt == "story":
+        return mid
+    # Feed: pick from the non-middle slots by a stable hash so multiple feeds on
+    # one day spread out (and never all land on the story's midday slot).
+    non_mid = [i for i in range(n) if i != mid]
+    return non_mid[_stable_hash(row.get("id")) % len(non_mid)]
+
+
+def slot_time_for_row(row, n=None):
+    """The STABLE "HH:MM" slot time for one row (see slot_index_for_row)."""
+    if n is None:
+        n = len(SPRINT_SLOT_TIMES)
+    if not SPRINT_SLOT_TIMES:
+        return "00:00"
+    return SPRINT_SLOT_TIMES[slot_index_for_row(row, n) % len(SPRINT_SLOT_TIMES)]
 
 
 def assign_slots(rows):
     """
-    Given ONE day+account's content_calendar rows, return [(row, slot_time)]
-    deterministically ordered, each row assigned an ordinal slot time.
-
-    Ordinals map onto summit_queue.SPRINT_SLOT_TIMES ("07:30","12:30","18:30")
-    in config.POSTING_TIMEZONE. If a day carries more rows than there are slot
-    times, the mapping WRAPS (ordinal % len) so every row still gets a concrete
-    time and none is starved. slot_time is an "HH:MM" string.
+    Given a day+account's content_calendar rows, return [(row, slot_time)] where
+    each row's slot is its OWN stable slot (slot_time_for_row), independent of the
+    other rows present. Order the result by slot then id for a stable read.
     """
-    ordered = sorted(rows, key=_order_key)
-    n = len(SPRINT_SLOT_TIMES)
-    out = []
-    for i, row in enumerate(ordered):
-        slot_time = SPRINT_SLOT_TIMES[i % n] if n else "00:00"
-        out.append((row, slot_time))
+    out = [(row, slot_time_for_row(row)) for row in rows]
+    out.sort(key=lambda pair: (pair[1], str(pair[0].get("id") or "")))
     return out
 
 
@@ -93,16 +115,22 @@ def _local_now(now=None):
     return dt.astimezone(tz)
 
 
-def is_due(slot_time, now=None):
-    """
-    True when a row's assigned "HH:MM" slot_time (in POSTING_TIMEZONE) is <= the
-    current local time. A row is NEVER published before its slot; a row whose slot
-    has passed is NEVER skipped. `now` is injectable (see _local_now).
-    """
+def _slot_reached(slot_time, now=None):
+    """True when the wall-clock "HH:MM" slot_time (in POSTING_TIMEZONE) is <= the
+    current local time. `now` is injectable (see _local_now)."""
     local = _local_now(now)
     hh, mm = str(slot_time).split(":")
     slot = time(int(hh), int(mm))
     return local.timetz().replace(tzinfo=None) >= slot
+
+
+def is_due(row, now=None):
+    """
+    True when a ROW's OWN stable slot time (slot_time_for_row) is <= the current
+    local time. Compares the row's own slot, so a row is NEVER published before its
+    slot and its slot never moves when a sibling publishes. `now` is injectable.
+    """
+    return _slot_reached(slot_time_for_row(row), now)
 
 
 def _account_for(row):
@@ -134,34 +162,26 @@ def _draft_for(row):
     )
 
 
-def _slot_by_row_id(rows):
-    """
-    Assign each row a slot time, grouped by account so a feed and its paired story
-    within an ACCOUNT get spaced ordinals (feed first). Returns {row_id: "HH:MM"}.
-    """
-    by_account = {}
-    for row in rows:
-        acct = (row.get("account") or "").strip().lower()
-        by_account.setdefault(acct, []).append(row)
-    slots = {}
-    for acct_rows in by_account.values():
-        for row, slot_time in assign_slots(acct_rows):
-            slots[row.get("id")] = slot_time
-    return slots
-
-
 def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
-                notifier=None, now=None):
+                notifier=None, now=None, catch_all=False):
     """
     Read gym_id's content_calendar rows dated run_date and publish each unpublished
     one to live IG/FB, EXACTLY ONCE. Returns a summary dict.
 
-    TIME-OF-DAY SPACING: a day's rows are not fired all at once. Within a day+account
-    each row is assigned a deterministic ordinal slot time (SPRINT_SLOT_TIMES in
-    POSTING_TIMEZONE); a row only publishes once its slot time is <= the current local
-    time (`now`, injectable). Rows whose slot has not arrived are left pending and
-    publish on a later run the same day (the runner already calls this on a cycle).
-    Exactly-once is unchanged: a row still publishes at most once.
+    TIME-OF-DAY SPACING: a day's rows are not fired all at once. Each row has a
+    STABLE slot time derived from the row itself (slot_time_for_row), NOT from its
+    position in the shrinking due set, so a row's slot never moves when a sibling
+    publishes. A row publishes only once its own slot time is <= the current local
+    time (`now`, injectable). Rows whose slot has not arrived are left pending
+    (never claimed) for a later tick the same day.
+
+    NO ORPHANS: pass catch_all=True to publish ALL remaining unpublished due rows
+    for the day regardless of slot. The listener calls this at the LAST slot and the
+    once/day run_daily draw also calls it, so every due row is published that day
+    even if a mid-day tick was missed or the scheduler only fired once.
+
+    Exactly-once is unchanged: a row publishes at most once across every slot tick
+    and the catch-all (the atomic mark_publishing claim guards it).
 
     Both gates must be armed (AGENT_CALENDAR_AUTOPUBLISH and AGENT_PUBLISH_ENABLED)
     or this is a no-op. `store`, `publisher`, and `notifier` are injectable so every
@@ -181,9 +201,6 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     rows = store.due_rows(gym_id, run_date) or []
 
-    # TIME-OF-DAY SPACING: assign each row a deterministic slot time up front.
-    slot_by_id = _slot_by_row_id(rows)
-
     published = []
     skipped = []
     failed = []
@@ -198,11 +215,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             skipped.append(row_id)
             continue
 
-        # SLOT GATE: publish nothing before its assigned slot time. A row whose slot
-        # has not arrived is left UNTOUCHED (never claimed) so a later run this same
-        # day drips it out. A row whose slot has passed is never skipped for timing.
-        slot_time = slot_by_id.get(row_id)
-        if slot_time is not None and not is_due(slot_time, now):
+        # SLOT GATE: publish nothing before the row's OWN stable slot time. A row
+        # whose slot has not arrived is left UNTOUCHED (never claimed) so a later
+        # tick this same day drips it out. catch_all bypasses the gate so the last
+        # slot / the once-a-day draw sweeps every straggler (NO ORPHANS). A row whose
+        # slot has passed is never skipped for timing.
+        if not catch_all and not is_due(row, now):
             waiting.append(row_id)
             continue
 
@@ -281,3 +299,73 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     return {"ok": True, "published": published, "skipped": skipped,
             "failed": failed, "waiting": waiting, "date": run_date}
+
+
+# ---- listener slot-fire lane -------------------------------------------------
+# The scheduler loop fires run_daily (the DRAFT draw) once a day. That is far too
+# coarse for time-of-day spacing and would ORPHAN every later-slot row. So the
+# always-on listener loop also calls run_slot_ticks() on its ~1-min cadence: as
+# each SPRINT_SLOT_TIME is reached it publishes that slot's due rows, deduped per
+# (slot, day) via a kv marker so a slot fires at most once a day. The LAST slot
+# runs with catch_all=True so every straggler for the day is swept (NO ORPHANS).
+
+def _kv_default():
+    """The real kv (agent.db) as a tiny get/set object. Injectable for tests."""
+    from . import db
+
+    class _KV:
+        def get(self, key, default=""):
+            return db.kv_get(key, default)
+
+        def set(self, key, value):
+            db.kv_set(key, value)
+
+    return _KV()
+
+
+def _slot_fire_key(run_date, slot_time):
+    return f"calendar_slotfire_{run_date}_{slot_time}"
+
+
+def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
+                   notifier=None, now=None, kv=None):
+    """
+    Called on each listener loop tick. For every SPRINT_SLOT_TIME already reached
+    (in POSTING_TIMEZONE at `now`) that has NOT yet fired today, publish that slot's
+    due rows exactly once (kv-deduped per slot+day). The last slot fires with
+    catch_all=True so nothing is orphaned. Self-guards on both publish flags via
+    publish_due(). Returns a list of per-slot summaries (empty when nothing fired).
+
+    `now`, `store`, `publisher`, `notifier`, and `kv` are injectable for tests.
+    """
+    if not config.calendar_autopublish_enabled():
+        return []
+    if kv is None:
+        kv = _kv_default()
+
+    fired = []
+    slots = SPRINT_SLOT_TIMES or []
+    last_slot = slots[-1] if slots else None
+    for slot_time in slots:
+        if not _slot_reached(slot_time, now):
+            continue                              # this slot has not arrived yet
+        key = _slot_fire_key(run_date, slot_time)
+        try:
+            already = kv.get(key, "")
+        except Exception:
+            already = ""                          # a kv hiccup must not orphan a slot
+        if already == "done":
+            continue                              # this slot already fired today
+        summary = publish_due(run_date, gym_id=gym_id, store=store,
+                              publisher=publisher, notifier=notifier, now=now,
+                              catch_all=(slot_time == last_slot))
+        # Mark fired ONLY on an armed (ok) run so a flag-off no-op does not burn the
+        # slot; a later armed tick can then still fire it.
+        if summary.get("ok"):
+            try:
+                kv.set(key, "done")
+            except Exception as e:
+                print(f"[calendar-autopublish] slot-fire kv write failed "
+                      f"({slot_time}): {type(e).__name__}: {e}")
+        fired.append(summary)
+    return fired

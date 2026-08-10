@@ -280,6 +280,26 @@ def _daily_scheduler(store):
                     reporting_live.snapshot_all()
                 except Exception as e:
                     print(f"[reporting] snapshot pass failed: {type(e).__name__}: {e}")
+        # Calendar auto-publish SLOT-FIRE lane: dormant unless AGENT_CALENDAR_AUTOPUBLISH
+        # (also self-guards on AGENT_PUBLISH_ENABLED inside publish_due). The once/day
+        # run_daily draw is far too coarse for time-of-day spacing and would orphan
+        # later-slot rows, so this lane fires each SPRINT_SLOT_TIME (in POSTING_TIMEZONE)
+        # on the loop's ~1-min cadence, deduped per (slot, day) via kv; the last slot
+        # sweeps every straggler (catch_all). run_date is the LOCAL posting day (slots
+        # are local). Isolated in try/except; a failure never kills the loop.
+        if config.calendar_autopublish_enabled():
+            try:
+                from . import calendar_autopublish
+                from zoneinfo import ZoneInfo
+                _local_today = now.astimezone(
+                    ZoneInfo(config.POSTING_TIMEZONE)).date().isoformat()
+                calendar_autopublish.run_slot_ticks(
+                    _local_today, notifier=ops_alerts._default_poster())
+            except Exception as e:
+                print(f"[calendar-autopublish] slot-fire lane failed: "
+                      f"{type(e).__name__}: {e}")
+                ops_alerts.alert(f"calendar slot-fire lane failed: "
+                                 f"{type(e).__name__}: {e}. The draft run is unaffected.")
         # Intake ingest: dormant unless AGENT_INTAKE_ENABLED. Runs INSIDE this
         # listener (the one process with /data + R2); an error never kills the loop.
         if config.intake_enabled() and time.monotonic() - last_ingest >= ingest_every:
