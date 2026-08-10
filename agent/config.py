@@ -1126,6 +1126,27 @@ def client_month_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CLIENT_MONTH", "false"))
 
 
+def client_media_sync_enabled() -> bool:
+    """
+    Per-client MEDIA SYNC + auto-generate switch (AGENT_CLIENT_MEDIA_SYNC). OFF by
+    default = zero behavior change: client_media_sync.sync_uploads /
+    scan_and_generate touch nothing (no R2 read, no download, no calendar write).
+
+    When ON, each daily cycle Echo (a) LISTS each onboarded client gym's uploaded
+    media in R2 (intake/<base>/incoming/) and downloads the NEW files into that gym's
+    content_library/<base>/ (idempotent: never re-downloads a file already present),
+    then (b) for a gym that now HAS media AND approved sources AND NO calendar rows
+    yet, builds its DRAFT month from its REAL photos via client_month_run
+    .build_client_month (which requires AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES too).
+
+    Client calendars are DRAFTS (paused); NOTHING here publishes (client gyms have no
+    connected accounts and the calendar autopublisher is gym 'lasso' only). A gym with
+    no media is left awaiting; a gym that already has a calendar is never regenerated.
+    Secrets are never logged. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CLIENT_MEDIA_SYNC", "false"))
+
+
 def review_window_days() -> int:
     """
     The review cycle length in days (env AGENT_REVIEW_WINDOW_DAYS, default 14).

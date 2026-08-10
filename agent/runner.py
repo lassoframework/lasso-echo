@@ -383,6 +383,31 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"welcome-queue portal scan failed: {type(e).__name__}: {e}. "
                              "The drip continues from what is already queued.")
 
+    # CLIENT MEDIA SYNC + AUTO-GENERATE (AGENT_CLIENT_MEDIA_SYNC, OFF by default).
+    # Armed, once per cycle: for each onboarded client gym, pull its NEWLY uploaded
+    # photos/videos out of R2 into its content library, then, IF the gym now has media
+    # + approved sources + NO calendar yet, build its DRAFT month from its REAL media
+    # via build_client_month. This is the missing link that starts Echo working on a
+    # gym the moment it uploads. Client calendars are DRAFTS (paused); NOTHING here
+    # publishes. Self-guarded on the flag and fully isolated: a sync error never takes
+    # the draft run down, and one gym failing never blocks the others.
+    if config.client_media_sync_enabled():
+        try:
+            from .client_media_sync import scan_and_generate as _cms_scan
+            summary = _cms_scan()
+            if summary.get("ok"):
+                if summary.get("generated") or summary.get("synced"):
+                    print(f"[client-media-sync] synced {summary['synced']} media across "
+                          f"{summary['scanned']} gym(s); built {summary['generated']} "
+                          f"draft calendar(s), {summary.get('awaiting', 0)} awaiting, "
+                          f"{summary.get('skipped_existing', 0)} already built")
+            else:
+                print(f"[client-media-sync] skipped: {summary.get('reason')}")
+        except Exception as e:
+            print(f"[client-media-sync] scan failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"client media sync failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's
