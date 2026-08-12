@@ -265,6 +265,16 @@ def welcome_queue_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_WELCOME_QUEUE_ENABLED", "false"))
 
 
+def welcome_per_day() -> int:
+    """How many NEW-CLIENT welcomes to post per day (default 1). The daily run posts
+    the first; a listener lane posts (welcome_per_day - 1) more so the backlog catches
+    up faster. AGENT_WELCOME_PER_DAY. Clamped to at least 1."""
+    try:
+        return max(1, int(os.environ.get("AGENT_WELCOME_PER_DAY", "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
 def demo_calendar_enabled() -> bool:
     """
     The done-for-you demo calendar: 30 pre-made dated LASSO drafts that flow through

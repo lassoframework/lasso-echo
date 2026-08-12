@@ -317,6 +317,18 @@ def _daily_scheduler(store):
             print(f"[scheduler] late-draw check failed: {type(e).__name__}: {e}")
         if now.hour >= target_hour and last_run_date != today:
             _fire_daily(store, today)
+            # EXTRA welcomes for the day (catch-up): the daily draw posted welcome #1;
+            # post (AGENT_WELCOME_PER_DAY - 1) more so the backlog clears. No-op unless
+            # the queue is armed and per-day > 1. Fires once/day with the draw; an
+            # error never blocks the rest of the daily cycle.
+            try:
+                from . import welcome_queue as _wq
+                extra = _wq.publish_extra_welcomes(today, store=store)
+                if extra:
+                    print(f"[welcome-extra] posted {len(extra)} extra welcome(s): "
+                          + ", ".join(extra))
+            except Exception as e:
+                print(f"[welcome-extra] failed: {type(e).__name__}: {e}")
             last_run_date = today
             _write_last_run_date(today)
             # Daily metrics snapshot AFTER the daily draft: READ-ONLY Graph pulls
