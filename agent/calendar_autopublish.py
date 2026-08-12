@@ -239,6 +239,19 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     for row in rows:
         row_id = row.get("id")
+        # SHOW THE TIME: stamp the row's deterministic go-live time (scheduled_at) so
+        # the portal can display exactly when the post publishes — including rows still
+        # waiting on the client's approval. Display metadata only (never a status or
+        # publish write); best effort, never blocks the lane; idempotent (the slot is a
+        # pure function of the row).
+        if not row.get("scheduled_at"):
+            try:
+                stamper = getattr(store, "stamp_scheduled", None)
+                if stamper is not None:
+                    stamper(row_id, scheduled_iso_for_row(row, now))
+            except Exception as e:
+                print(f"[calendar-autopublish] scheduled_at stamp failed for "
+                      f"{row_id}: {type(e).__name__}: {e}")
         # Belt-and-braces: never touch a row already stamped published (the query
         # already excludes these, but a live race could still surface one).
         if row.get("published_at") or row.get("late_post_id"):
@@ -516,7 +529,8 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
     return alerted
 
 
-def publish_client_gyms(run_date, *, store=None, notifier=None, now=None):
+def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
+                        zernio_publish=None):
     """Publish every client gym's APPROVED, due calendar rows to the gym's OWN IG/FB
     via Zernio, scheduled at each row's slot time. Self-gating: publish_due checks
     AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED, and the zernio publisher checks
@@ -531,9 +545,30 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None):
     out = []
     for base in client_gym_bases():
         try:
+            # PER-GYM AUTONOMY (never portfolio-wide): the gym owner's own Autonomous
+            # toggle. TWO sources, either arms it for THIS gym only: the portal's
+            # Supabase echo_gym_settings row (the toggle in the client's calendar UI)
+            # or Echo's own kv flag (POST /portal/<token>/autonomy). Autonomous ON =>
+            # this gym's PENDING rows publish on their own at slot time (approved_only
+            # off); every other gym still requires the client's approval. Any read
+            # error defaults to NOT autonomous — approval required is the safe side.
+            autonomous = False
+            try:
+                from . import db as _db
+                autonomous = bool(_db.is_autonomous(base))
+                if not autonomous and store is not None:
+                    autonomous = bool(store.gym_autonomy(base))
+                elif not autonomous and store is None:
+                    from .portal_calendar_store import SupabaseCalendarStore
+                    autonomous = bool(SupabaseCalendarStore().gym_autonomy(base))
+            except Exception:
+                autonomous = False
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
-                                  now=now, catch_all=True, approved_only=True)
+                                  now=now, catch_all=True,
+                                  approved_only=not autonomous,
+                                  zernio_publish=zernio_publish)
             summary["gym"] = base
+            summary["autonomous"] = autonomous
             out.append(summary)
         except Exception as e:
             print(f"[client-autopublish] gym {base} failed: {type(e).__name__}: {e}")

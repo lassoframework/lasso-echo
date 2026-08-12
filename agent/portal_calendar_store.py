@@ -222,6 +222,91 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return len(rows) == 1
 
+    def stamp_scheduled(self, row_id, scheduled_at_iso):
+        """Record the row's planned go-live time (content_calendar.scheduled_at) so the
+        portal can SHOW the client when the post publishes. Display metadata only:
+        never touches status/published_at, never publishes. Idempotent by nature (the
+        slot is deterministic per row). Returns the updated row or None."""
+        if not scheduled_at_iso:
+            return None
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"scheduled_at": scheduled_at_iso},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def clear_social_connection(self, gym_slug, platform):
+        """Mark a gym's platform connection 'not_connected' (handle null) in the portal
+        snapshot (echo_social_connections), keyed by the gym's Supabase uuid resolved
+        from its slug. Used by the disconnect flow so the dashboard reflects the change
+        immediately. No-op when the gym/row is absent. Returns the updated row or None."""
+        g = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(), timeout=30,
+        )
+        if g.status_code >= 400:
+            raise PortalStoreError(g.status_code, _scrub((g.text or "")[:200]))
+        grows = g.json() or []
+        if not grows or not grows[0].get("id"):
+            return None
+        gym_uuid = grows[0]["id"]
+        r = self._client().patch(
+            self._rest("echo_social_connections"),
+            params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"state": "not_connected", "handle": None},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def gym_autonomy(self, gym_slug):
+        """The portal's per-gym Autonomous toggle for one gym, read from Supabase:
+        gyms.slug -> echo_gym_settings.autonomous. Returns True/False, or None when
+        the gym or its settings row is absent (caller treats None as NOT autonomous —
+        approval required is always the safe default). Read-only, gym-scoped."""
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None
+        gym_uuid = rows[0].get("id")
+        if not gym_uuid:
+            return None
+        r2 = self._client().get(
+            self._rest("echo_gym_settings"),
+            params={"gym_id": f"eq.{gym_uuid}", "select": "autonomous"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        srows = r2.json() or []
+        if not srows:
+            return None
+        return bool(srows[0].get("autonomous"))
+
     def publishing_rows(self):
         """Every row currently stuck in status='publishing' with no published_at,
         across all gyms (read-only; feeds the stale-claim ALERT sweep). A row lives

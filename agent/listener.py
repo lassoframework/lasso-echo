@@ -357,6 +357,16 @@ def _daily_scheduler(store):
                       f"{type(e).__name__}: {e}")
                 ops_alerts.alert(f"calendar slot-fire lane failed: "
                                  f"{type(e).__name__}: {e}. The draft run is unaffected.")
+        # New-client CATCH-UP report: one Slack message a day listing every gym signed
+        # up in the last 60 days and its calendar coverage, until everyone is caught up.
+        # INDEPENDENT of the autopublish flag (a report must never be silenced by a
+        # publish switch); self-deduped per day, flag-gated inside (AGENT_CATCHUP_REPORT),
+        # and an error never kills the loop.
+        try:
+            from . import catchup_report
+            catchup_report.run_daily()
+        except Exception as e:
+            print(f"[catchup] daily report failed: {type(e).__name__}: {e}")
         # Intake ingest: dormant unless AGENT_INTAKE_ENABLED. Runs INSIDE this
         # listener (the one process with /data + R2); an error never kills the loop.
         if config.intake_enabled() and time.monotonic() - last_ingest >= ingest_every:
