@@ -165,6 +165,11 @@ def _status():
     print(f"  ghl_intake     : {config.ghl_intake_enabled()}  (env AGENT_GHL_INTAKE_ENABLED)")
     print(f"  whatsapp_intake: {config.whatsapp_intake_enabled()}  (env AGENT_WHATSAPP_INTAKE_ENABLED)")
     print(f"  tenant_brain   : {config.tenant_brain_enabled()}  (env AGENT_TENANT_BRAIN_ENABLED)")
+    print(f"  sb7_captions   : {config.sb7_enabled()}  (env AGENT_SB7_ENABLED)")
+    print(f"  draft_on_upload: {config.draft_on_upload_enabled()}  (env AGENT_DRAFT_ON_UPLOAD)")
+    print(f"  intake_sync    : {config.social_intake_sync_enabled()}  (env AGENT_SOCIAL_INTAKE_SYNC)")
+    print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
+    print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  opus_factory   : {config.opus_factory_enabled()}  (env AGENT_OPUS_FACTORY_ENABLED)")
     print(f"  clipper        : {config.clipper_enabled()}  (env AGENT_CLIPPER_ENABLED)")
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")
@@ -748,6 +753,7 @@ _COMMANDS = {
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
+        ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -1633,6 +1639,32 @@ def main(argv=None):
             print("Pending human items:")
             for item in r["pending_human_items"]:
                 print(f"  {item}")
+    elif cmd == "social-intake-sync":
+        # Map un-routed social intakes (echo_social_intake) into Echo: voice/proof
+        # docs + approved client_sources, then mark the row routed. --all does every
+        # un-routed row; --base <slug> does one. Requires Supabase creds. Nothing
+        # publishes; a human still approves every draft. This is the durable fix for
+        # the CrossFit ENG miss (captured intake never forwarded).
+        from . import social_intake_reader as _sir
+        args_rest = argv[1:]
+        base = None
+        do_all = "--all" in args_rest
+        for i, a in enumerate(args_rest):
+            if a == "--base" and i + 1 < len(args_rest):
+                base = args_rest[i + 1]
+        if not base and not do_all:
+            print('usage: python -m agent social-intake-sync (--all | --base <slug>)')
+        else:
+            results = (_sir.sync_unrouted(lister=lambda: [base]) if base
+                       else _sir.sync_unrouted())
+            if not results:
+                print("No un-routed social intakes found (or Supabase creds not set).")
+            for r in results:
+                if r.get("ok"):
+                    print(f"  {r['base']}: mapped -> {r['account']}, "
+                          f"{r['sources_created']} source(s), routed={r['marked_routed']}")
+                else:
+                    print(f"  {r['base']}: SKIPPED ({r.get('reason')})")
     elif cmd == "onboard-client":
         # ONE-COMMAND Stage 3 onboarding from a completed intake. Missing fields
         # block with the list; touches no env, arms nothing.

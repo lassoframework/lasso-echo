@@ -114,6 +114,80 @@ def test_brain_entry_cannot_introduce_unverified_claim(monkeypatch, tmp_path):
     assert "80%" not in joined and "$5,000" not in joined
 
 
+# ---- edit_examples: the learning signal the drafter feeds back --------------------------------
+
+def test_edit_examples_returns_gate_clean_before_after_pairs(monkeypatch, tmp_path):
+    bdir = _arm(monkeypatch, tmp_path)
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="A long machine draft about the gym.",
+                              after="Short and human.", rule="style")
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="Another long one.",
+                              after="Punchy version.", rule="style")
+    pairs = tenant_brain.edit_examples("gym_a", base_dir=bdir)
+    assert pairs == [
+        ("A long machine draft about the gym.", "Short and human."),
+        ("Another long one.", "Punchy version."),
+    ]
+
+
+def test_edit_examples_skips_after_text_with_uncleared_claim(monkeypatch, tmp_path):
+    """An edit whose approved after-text carries an unverified stat is SKIPPED,
+    so an example can never smuggle a claim into a prompt."""
+    bdir = _arm(monkeypatch, tmp_path)
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="x", after="Members get 80% better results here.",
+                              rule="style")
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="y", after="Feel strong again.", rule="style")
+    pairs = tenant_brain.edit_examples("gym_a", base_dir=bdir)
+    assert pairs == [("y", "Feel strong again.")]
+    assert all("80%" not in a for _b, a in pairs)
+
+
+def test_edit_examples_skips_when_before_text_has_uncleared_claim(monkeypatch, tmp_path):
+    """Fabrication safety is symmetric: a legacy BEFORE draft carrying an
+    uncleared claim drops the whole pair, even when the after is clean."""
+    bdir = _arm(monkeypatch, tmp_path)
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="We save you $5,000 a year for sure.",
+                              after="Feel strong again.", rule="style")
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="clean before", after="clean after", rule="style")
+    pairs = tenant_brain.edit_examples("gym_a", base_dir=bdir)
+    assert pairs == [("clean before", "clean after")]
+    assert all("$5,000" not in b for b, _a in pairs)
+
+
+def test_edit_examples_caps_to_most_recent(monkeypatch, tmp_path):
+    bdir = _arm(monkeypatch, tmp_path)
+    for i in range(8):
+        tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                                  before=f"before {i}", after=f"after {i}",
+                                  rule="style")
+    pairs = tenant_brain.edit_examples("gym_a", base_dir=bdir, limit=3)
+    assert pairs == [("before 5", "after 5"), ("before 6", "after 6"),
+                     ("before 7", "after 7")]
+
+
+def test_edit_examples_never_leaks_across_tenants(monkeypatch, tmp_path):
+    bdir = _arm(monkeypatch, tmp_path)
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="a-before", after="a-after", rule="style")
+    tenant_brain.record_event("gym_b", "edit_diff", base_dir=bdir,
+                              before="b-before", after="b-after", rule="style")
+    assert tenant_brain.edit_examples("gym_a", base_dir=bdir) == [("a-before", "a-after")]
+    assert tenant_brain.edit_examples("gym_b", base_dir=bdir) == [("b-before", "b-after")]
+
+
+def test_edit_examples_empty_when_flag_off(monkeypatch, tmp_path):
+    bdir = _arm(monkeypatch, tmp_path)
+    tenant_brain.record_event("gym_a", "edit_diff", base_dir=bdir,
+                              before="x", after="y", rule="style")
+    monkeypatch.delenv("AGENT_TENANT_BRAIN_ENABLED", raising=False)
+    assert tenant_brain.edit_examples("gym_a", base_dir=bdir) == []
+
+
 # ---- flag off = inert ---------------------------------------------------------------------------
 
 def test_flag_off_records_and_filters_nothing(monkeypatch, tmp_path):

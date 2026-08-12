@@ -807,6 +807,17 @@ def zernio_enabled() -> bool:
     return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
 
 
+def zernio_publish_enabled() -> bool:
+    """
+    Zernio client-publish lane: when armed, an approved CLIENT-gym calendar row is
+    published (or scheduled) to the gym's OWN connected IG/FB via Zernio POST /v1/posts.
+    OFF by default. This is layered UNDER the global publish kill switch: BOTH
+    AGENT_ZERNIO_PUBLISH and AGENT_PUBLISH_ENABLED must be armed or nothing goes live
+    (the publisher returns would_publish). LASSO's own accounts stay on meta_direct.
+    """
+    return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
+
+
 def zernio_analytics_enabled() -> bool:
     """
     Zernio ANALYTICS pull switch (Part C dependency). OFF by default. When OFF, the
@@ -1723,6 +1734,56 @@ def intake_worker_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_INTAKE_WORKER", "false"))
 
 
+def draft_on_upload_enabled() -> bool:
+    """
+    Immediate draft-on-upload: the instant a gym's new media is INGESTED into its
+    library, draft ONE approval card per new asset for that gym instead of waiting
+    for the next daily draw. Applies to every organic-social gym (portal gyms +
+    LASSO house accounts). OFF by default; arm by hand with AGENT_DRAFT_ON_UPLOAD.
+
+    NEVER weakens a gate: the card goes through the SAME draft_post + _post_and_save
+    path as the daily run, so the approval gate, publish-off default, fabrication
+    gate, portal-vs-Slack routing, and per-gym autonomy are all identical. A gym
+    with no registry account or no voice doc is SKIPPED with one ops alert; nothing
+    is fabricated.
+    """
+    return _truthy(os.environ.get("AGENT_DRAFT_ON_UPLOAD", "false"))
+
+
+def dynamic_accounts_enabled() -> bool:
+    """
+    Dynamic, DB-backed client accounts: load client-gym Account records from a
+    persisted registry (JSON) IN ADDITION to the hardcoded ACCOUNTS, and let
+    onboarding auto-provision a new gym's Account record from its intake so scaling
+    to 100+ gyms never requires hand-editing accounts.py. OFF by default: when OFF,
+    only the hardcoded ACCOUNTS exist (byte-for-byte today's behavior). Auto-created
+    accounts are ALWAYS inactive; tokens stay by-hand (env); nothing publishes.
+    """
+    return _truthy(os.environ.get("AGENT_DYNAMIC_ACCOUNTS", "false"))
+
+
+def gym_registry_path() -> str:
+    """Where the dynamic client-account registry JSON lives. Defaults to the /data
+    volume (survives redeploys) with a local fallback for dev/tests."""
+    explicit = os.environ.get("AGENT_GYM_REGISTRY_PATH")
+    if explicit:
+        return explicit
+    if os.path.isdir("/data"):
+        return "/data/gym_accounts.json"
+    return "gym_accounts.json"
+
+
+def social_intake_sync_enabled() -> bool:
+    """
+    Automatic social-intake forward: map EVERY un-routed echo_social_intake row into
+    Echo (voice/proof docs + approved client_sources) and mark it routed, so no gym
+    is ever stranded the way CrossFit ENG was (captured but never forwarded). OFF by
+    default; arm by hand with AGENT_SOCIAL_INTAKE_SYNC. Requires Supabase creds. A
+    base with no registry Account is skipped with an alert; nothing publishes.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIAL_INTAKE_SYNC", "false"))
+
+
 def onboard_automint_enabled() -> bool:
     """
     Autonomous onboarding token mint switch. OFF by default.
@@ -1754,3 +1815,18 @@ SOCIALAPI_BASE_URL_DEFAULT = "https://api.social-api.ai/v1"
 # tokens. When unset: values are stored in plaintext in the kv table (dev mode).
 # Generate once: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 SOCIALAPI_ENC_KEY_ENV = "AGENT_SOCIALAPI_ENC_KEY"
+
+
+# ---- StoryBrand SB7 caption engine ------------------------------------------
+# When armed, the drafter uses an LLM to write captions using the SB7 framework
+# (problem-first, gym as guide, customer as hero) instead of the verbatim
+# TemplateGenerator. Requires ANTHROPIC_API_KEY. OFF by default.
+def sb7_enabled() -> bool:
+    """StoryBrand SB7 caption engine. OFF by default. Set AGENT_SB7_ENABLED=true to arm."""
+    return _truthy(os.environ.get("AGENT_SB7_ENABLED", "false"))
+
+
+def sb7_model() -> str:
+    """Claude model for SB7 caption generation (env AGENT_SB7_MODEL).
+    Defaults to Haiku 4.5 for speed and cost."""
+    return os.environ.get("AGENT_SB7_MODEL", "claude-haiku-4-5-20251001")

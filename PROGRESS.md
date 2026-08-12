@@ -1873,6 +1873,47 @@ BLAKE BY HAND to arm this pipeline:
       excluded from THAT tenant's rotation only; style rules + deny reasons
       fold into prompts THROUGH the fabrication gate (the brain never adds
       facts); AGENT_TENANT_BRAIN_ENABLED
+- [~] Immediate draft-on-upload (AGENT_DRAFT_ON_UPLOAD, default OFF): the instant a
+      gym's media is INGESTED (agent/intake_ingest._process_client), Echo drafts ONE
+      approval card per newly filed asset via runner.draft_for_new_upload — no waiting
+      for the once-daily draw. Reuses draft_post + _post_and_save so every gate is
+      identical (approval, publish-off, fabrication, portal-vs-Slack, per-gym autonomy).
+      Resolves the generation account (get_account(tenant) or <tenant>_ig); a gym with
+      no account or no voice doc is SKIPPED with one ops alert (no fabrication, media
+      preserved). Fixes Dale/CrossFit-ENG "nothing in the queue": before this, ingest
+      filed media but never drafted, and the daily draw only served active_accounts()
+      (LASSO only) — client/portal gyms (active=False or unregistered) were never drafted.
+      NOTE: a portal gym still needs a registry Account (<tenant>_ig) with a voice doc
+      before it can draft; the skip-alert names exactly what to add.
+- [~] Automatic social-intake forward (AGENT_SOCIAL_INTAKE_SYNC, default OFF):
+      agent/social_intake_reader.sync_unrouted() maps EVERY un-routed
+      echo_social_intake row into Echo (voice/proof docs via onboard_from_social +
+      approved client_sources) and marks the row routed. Per-gym error isolation
+      (one bad/no-account gym never blocks the batch); a base with no registry
+      Account is skipped with one ops alert. CLI: `python -m agent social-intake-sync
+      (--all | --base <slug>)`; listener polls every AGENT_SOCIAL_INTAKE_SYNC_MINUTES
+      (default 15) when armed. This is the durable fix for the CrossFit ENG miss
+      (intake captured 2026-08-09 with echo_forwarded=false / not_routed, never
+      forwarded). Tests: tests/test_social_intake_sync.py (incl. a 100-gym scale case).
+      KNOWN SCALE LIMIT: each gym still needs a registry Account (<base>_ig) in
+      accounts.py; the sync skips-with-alert until it exists (see next-step note).
+- [~] CrossFit and HYROX ENG onboarded to Echo (2026-08-12): eng_ig + eng_fb in
+      accounts.py (inactive, client-gym convention); brand_voice/eng/lasso_voice.md +
+      social_proof.md built from ENG's OWN verbatim intake (HYROX included per Blake);
+      4 SB7 posts generated and stored PENDING (ready to approve). Publish still needs
+      AGENT_ENG_IG_TOKEN/ID + AGENT_ENG_FB_TOKEN/PAGE_ID + AGENT_PUBLISH_ENABLED (by hand).
+- [~] StoryBrand SB7 caption engine + edit-learning feedback loop: the
+      StoryBrandGenerator (agent/drafter.py) writes SB7 captions via Claude
+      (AGENT_SB7_ENABLED, model AGENT_SB7_MODEL default Haiku 4.5) drawing ONLY
+      from the voice doc + client note. With the tenant brain armed it folds THIS
+      gym's learned preferences into the prompt: past before/after edits
+      (tenant_brain.edit_examples) + deny reasons (prompt_notes), so every edit
+      moves the next caption toward the approver's taste. BOTH sides of an edit
+      example pass the fabrication gate; per-tenant file keying = no cross-gym
+      leak; any LLM failure falls back to TemplateGenerator (a card always gets a
+      caption). Both flags default OFF = zero behavior change. Also: approving an
+      EXPIRED draft now publishes immediately (past scheduled_for ignored);
+      non-approve actions on expired drafts still no-op.
 - [x] July 16-31 replanned for both accounts (plan-month --from 2026-07-16,
       days 1-15 structurally untouched), 16 pending drafts per account held
       for approval in the LOCAL sandbox store. BLAKE BY HAND: run the same two

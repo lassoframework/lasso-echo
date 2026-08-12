@@ -10,10 +10,12 @@ Nothing publishes here. This job only drafts and surfaces. Publishing happens
 later, only on a human Approve, and only if the publish flag is armed.
 """
 
+import os
 from datetime import datetime, timezone
 
 from . import config, ops_alerts, schedule
 from .accounts import active_accounts
+from .library import VIDEO_EXTS
 from .daily_studio import build_daily_infographic_draft
 from .social_proof import build_social_proof_draft
 from .summit import build_summit_draft
@@ -296,6 +298,102 @@ def _post_and_save(draft, store, poster, idempotent):
     # Blocked drafts are stored too (terminal records): that is what lets the
     # blocked dedupe stop a retry storm from re-carding the same failure.
     store.put(draft)
+
+
+def _generation_account_for(tenant_key):
+    """The registry account that DRAFTS for this tenant. Tries the tenant key as
+    given (registry accounts like gritx_ig or lasso_ig), then <tenant>_ig (the
+    convention: intake files under the base key, the generation account is _ig).
+    Returns None when no registry account exists for the tenant."""
+    from .accounts import get_account
+    return get_account(tenant_key) or get_account(f"{tenant_key}_ig")
+
+
+def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
+                         voice_path=None, scheduled_for=None):
+    """
+    AGENT_DRAFT_ON_UPLOAD: draft ONE approval card per newly uploaded asset for a
+    tenant, the instant its media is ingested — no waiting for the daily draw.
+
+    Reuses draft_post + _post_and_save, so EVERY gate is identical to the daily
+    path: the approval gate, the publish-off default, the fabrication gate, the
+    portal-vs-Slack surface routing, and per-gym autonomy. This never publishes on
+    its own; it only makes the card appear immediately (a gym with autonomy armed
+    still publishes through the SAME gated approve path _post_and_save already uses).
+
+    filed_assets: list of (absolute_path, client_note) for the assets just filed.
+    Returns the list of Drafts produced (blocked markers included), or [] when the
+    flag is OFF or the tenant cannot be drafted.
+
+    A tenant with no registry account, or an account with no voice doc, is SKIPPED
+    with ONE ops alert naming exactly what to add. Nothing is fabricated; nothing
+    crashes the ingest loop.
+    """
+    if not config.draft_on_upload_enabled():
+        return []
+    if not filed_assets:
+        return []
+    if not config.master_enabled():
+        return []
+
+    account = _generation_account_for(tenant_key)
+    if account is None:
+        ops_alerts.alert(
+            f"draft-on-upload: {len(filed_assets)} new asset(s) filed for "
+            f"'{tenant_key}' but no registry account was found (looked for "
+            f"'{tenant_key}' and '{tenant_key}_ig'). Add the Account record so "
+            "Echo can draft for this gym. The media is safe in the library; "
+            "nothing was drafted.")
+        return []
+
+    voice = load_voice(account.voice_doc) if account.voice_doc else \
+        load_voice(voice_path or config.VOICE_DOC_PATH)
+    if voice is None:
+        ops_alerts.alert(
+            f"draft-on-upload: {account.key} uploaded media but its voice doc is "
+            "missing or empty. Nothing was drafted (no fabrication). Add the voice "
+            "doc, then re-file or wait for the daily draw.")
+        return []
+
+    from .library import Creative
+    poster = poster or SlackPoster()
+    if store is None:
+        from .store import PendingStore
+        store = PendingStore()
+    when = scheduled_for or datetime.now(timezone.utc).isoformat()
+    idempotent = config.idempotent_drafts_enabled()
+
+    # CLIENT gyms ALWAYS card (never portfolio auto-publish): the same
+    # force_approval=True gate build_gym_calendar_draft uses. Without it, an
+    # upload draft would be caught by the PORTFOLIO-WIDE AGENT_AUTO_APPROVE /
+    # trust-ladder auto-publish in _post_and_save and go out with no portal
+    # approval (and a Slack leak). LASSO's own accounts keep the default (False)
+    # so their existing portfolio auto-approve behavior is unchanged. Per-gym
+    # Autonomy still works: it lives inside the portal branch and deliberately
+    # overrides force_approval there.
+    force_card = not account.key.startswith("lasso")
+
+    produced = []
+    for path, note in filed_assets:
+        try:
+            note = (note or "").strip()
+            # A note-less asset would draft a CTA-only card (no client subject).
+            # Skip it: it is safely filed, and a later caption or the daily draw
+            # can pick it up. Never surface a content-free card, never fabricate.
+            if not note:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+            media_type = "video" if ext in VIDEO_EXTS else "image"
+            creative = Creative(path=path, media_type=media_type, client_note=note)
+            draft = draft_post(account, creative, when, voice=voice)
+            draft.force_approval = force_card
+            _post_and_save(draft, store, poster, idempotent)
+            produced.append(draft)
+        except Exception as e:
+            # One bad asset never blocks the rest, and never crashes ingest.
+            ops_alerts.alert(f"draft-on-upload: failed to draft {path} for "
+                             f"{account.key}: {type(e).__name__}: {e}")
+    return produced
 
 
 def _trust_startup_warning():

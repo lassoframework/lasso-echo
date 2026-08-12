@@ -111,7 +111,7 @@ def test_higgsfield_renderer_video_happy_path(monkeypatch, tmp_path):
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda req, timeout=30: _make_resp(fake_video_bytes, is_binary=True))
 
-    import higgsfield_client.http.client as _hfc
+    _hfc = pytest.importorskip("higgsfield_client.http.client")
     monkeypatch.setattr(_hfc, "SyncClient", _MockClient)
 
     beat = {"prompt": "A gym owner reviewing metrics on a whiteboard.", "duration": 5}
@@ -146,7 +146,7 @@ def test_higgsfield_renderer_image_happy_path(monkeypatch, tmp_path):
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda req, timeout=30: _make_resp(fake_img_bytes, is_binary=True))
 
-    import higgsfield_client.http.client as _hfc
+    _hfc = pytest.importorskip("higgsfield_client.http.client")
     monkeypatch.setattr(_hfc, "SyncClient", _MockClient)
 
     beat = {"prompt": "Close-up of a fitness tracker showing heart rate metrics.", "duration": 4}
@@ -184,7 +184,7 @@ def test_higgsfield_renderer_raises_on_missing_output_url(monkeypatch, tmp_path)
         def subscribe(self, application, arguments):
             return {}  # no video key
 
-    import higgsfield_client.http.client as _hfc
+    _hfc = pytest.importorskip("higgsfield_client.http.client")
     monkeypatch.setattr(_hfc, "SyncClient", _MockClient)
 
     with pytest.raises(RuntimeError, match="no output URL"):
@@ -202,7 +202,7 @@ def test_higgsfield_renderer_raises_on_sdk_error(monkeypatch, tmp_path):
         def subscribe(self, application, arguments):
             raise RuntimeError("Higgsfield 422 model not found")
 
-    import higgsfield_client.http.client as _hfc
+    _hfc = pytest.importorskip("higgsfield_client.http.client")
     monkeypatch.setattr(_hfc, "SyncClient", _MockClient)
 
     with pytest.raises(RuntimeError, match="Higgsfield 422"):

@@ -328,6 +328,9 @@ def _process_client(client, r2, poster, converter, phash, moderator):
         return payload.get("note", "")
 
     lib_dir = _library_dir_for(client)
+    # Draft-on-upload (AGENT_DRAFT_ON_UPLOAD): assets filed THIS pass, so we can
+    # draft one approval card per new upload the instant ingest finishes.
+    newly_filed = []
     for key in media_keys:
         if key in manifest["processed"]:
             stats["skipped"] += 1
@@ -487,6 +490,7 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 manifest["phash"].append(ph)
             r2.delete(key)
             stats["accepted"] += 1
+            newly_filed.append((os.path.join(lib_dir, name), note))
             # DAM auto-tag on the freshly filed asset (AGENT_AUTOTAG_ENABLED,
             # OFF by default; errors are contained inside autotag)
             try:
@@ -514,6 +518,25 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                              f"{type(e).__name__}: {e}")
 
     _save_manifest(r2, client, manifest)
+
+    # DRAFT-ON-UPLOAD (AGENT_DRAFT_ON_UPLOAD, OFF by default): draft one approval
+    # card per newly filed asset the instant ingest finishes, so a gym's upload
+    # lands in the queue immediately instead of waiting for the daily draw. The
+    # trigger reuses the daily draft+surface path (every gate intact) and is fully
+    # self-guarding: flag OFF or no new assets -> no-op; a draft failure never
+    # breaks ingest (this whole block is contained).
+    if config.draft_on_upload_enabled() and newly_filed:
+        try:
+            from . import runner
+            drafts = runner.draft_for_new_upload(client, newly_filed, poster=poster)
+            stats["drafted_on_upload"] = len(drafts)
+        except Exception as e:
+            print(f"[intake] draft-on-upload failed for {client}: "
+                  f"{type(e).__name__}: {e}")
+            ops_alerts.alert(f"draft-on-upload trigger errored for {client}: "
+                             f"{type(e).__name__}: {e}. Media is filed; the daily "
+                             "draw will still pick it up.")
+
     return stats
 
 

@@ -57,8 +57,10 @@ def _row(row_id, account="instagram", fmt="feed", post_date=RUN_DATE,
 class _FakeStore:
     """
     In-memory content_calendar. due_rows honors the run-date + unpublished filter;
-    mark_publishing is an ATOMIC claim (only status=='pending' AND no published_at
-    wins). A `claim_returns` override lets a test simulate a lost race.
+    mark_publishing is an ATOMIC claim mirroring the REAL store's precondition
+    (status in (pending, approved) AND no published_at wins — 'approved' became
+    claimable with the Zernio client lane). A `claim_returns` override lets a test
+    simulate a lost race.
     """
 
     def __init__(self, rows, claim_returns=None):
@@ -92,7 +94,8 @@ class _FakeStore:
                 self.rows[row_id]["status"] = "publishing"
             return won
         r = self.rows.get(row_id)
-        if not r or r.get("status") != "pending" or r.get("published_at"):
+        if not r or r.get("status") not in ("pending", "approved") \
+                or r.get("published_at"):
             return False
         r["status"] = "publishing"
         return True
@@ -106,7 +109,7 @@ class _FakeStore:
             r["late_post_id"] = media_id
         return r
 
-    def mark_publish_failed(self, row_id):
+    def mark_publish_failed(self, row_id, revert_status="pending"):
         self.failed_calls.append(row_id)
         r = self.rows.get(row_id)
         if r:
@@ -663,9 +666,12 @@ def test_mark_publishing_atomic_claim_params_and_true_on_one_row():
 
     assert won is True
     _, _url, params, _headers, body = http.calls[0]
-    # the conditional claim: pending + unpublished ONLY
+    # the conditional claim: unclaimed (pending OR client-approved) + unpublished ONLY.
+    # 'approved' became claimable with the Zernio client lane (a client approves BEFORE
+    # the publish lane picks the row up); exactly-once holds because a claimed row is
+    # 'publishing', which is not in the set.
     assert params["id"] == "eq.a"
-    assert params["status"] == "eq.pending"
+    assert params["status"] == "in.(pending,approved)"
     assert params["published_at"] == "is.null"
     assert body == {"status": "publishing"}
 

@@ -111,6 +111,23 @@ class ZernioClient:
         """GET /v1/accounts/{id}/facebook-page -> {pages:[{_id,name}]}."""
         return self._get(f"/v1/accounts/{account_id}/facebook-page")
 
+    def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
+                    page_id=None):
+        """POST /v1/posts: publish (or schedule) ONE post to one connected account.
+
+        Verified against docs.zernio.com: body=caption, media=[{url}], accountId,
+        scheduledFor=ISO8601 (OMIT to publish immediately), platformSpecificData.pageId
+        for a Facebook Page. Returns the created post JSON (carries the post id)."""
+        payload = {"accountId": str(account_id), "body": body or ""}
+        urls = [u for u in (media_urls or []) if u]
+        if urls:
+            payload["media"] = [{"url": u} for u in urls]
+        if scheduled_for:
+            payload["scheduledFor"] = scheduled_for
+        if page_id:
+            payload["platformSpecificData"] = {"pageId": str(page_id)}
+        return self._post("/v1/posts", payload)
+
     def analytics(self, profile_id, skip=0, limit=50):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
@@ -288,3 +305,36 @@ def facebook_account_id(accounts_json):
         if acct.get("platform") == "facebook" and acct.get("_id"):
             return str(acct["_id"])
     return None
+
+
+def instagram_account_id(accounts_json):
+    """The Zernio account _id of the connected Instagram account, or None."""
+    for acct in (accounts_json or {}).get("accounts") or []:
+        if acct.get("platform") == "instagram" and acct.get("_id"):
+            return str(acct["_id"])
+    return None
+
+
+def account_id_for(accounts_json, platform):
+    """The connected Zernio account _id for 'facebook' or 'instagram', or None. Only
+    a CONNECTED account (account_state) is returned, so an expired/disconnected
+    account never publishes."""
+    plat = (platform or "").strip().lower()
+    for acct in (accounts_json or {}).get("accounts") or []:
+        if acct.get("platform") == plat and acct.get("_id") \
+                and account_state(acct) == "connected":
+            return str(acct["_id"])
+    return None
+
+
+def post_id_of(post_json):
+    """The created post's id from a POST /v1/posts response, tolerant of shape
+    ({_id} | {id} | {post:{_id}} | {data:{_id}}). '' when none is present."""
+    if not isinstance(post_json, dict):
+        return ""
+    for holder in (post_json, post_json.get("post"), post_json.get("data")):
+        if isinstance(holder, dict):
+            pid = holder.get("_id") or holder.get("id")
+            if pid:
+                return str(pid)
+    return ""
