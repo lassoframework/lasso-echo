@@ -16,3 +16,5 @@ higgsfield-client>=0.1  # Higgsfield headless b-roll rendering; imported lazily 
 httpx>=0.21,<0.29  # Required by higgsfield-client SDK
 
 stripe>=9.0  # Welcome pipeline: read-only customers/subscriptions for new-client detection (imported lazily in welcome_posts.py)
+
+cairosvg>=2.7  # Welcome logo pipeline: rasterize SVG gym logos to PNG (system cairo present on Railway); imported lazily in website_scan.py
