@@ -48,6 +48,25 @@ forgets the stored page binding so a fresh page is picked on reconnect.
 is always the real one. The `echo_social_connections` snapshot is a display cache that
 Echo now keeps in sync on disconnect.
 
+### ⚠️ Portal-side BUG to fix (found live 2026-08-12, GritX)
+The portal's own status-sync job is writing `echo_social_connections` rows with
+**`state='connected'` and `handle=null`** when Zernio actually has **no account** for that
+platform. Repro: a gym disconnects its only IG (Zernio `list_accounts` returns []), Echo's
+`GET /portal/<token>/social-status` correctly returns `instagram.connected=false`, but the
+portal sync overwrites the snapshot back to `connected` a short time later, so the dashboard
+shows a phantom "Connected" with no handle and hides the Connect button — the owner is stuck.
+
+Two fixes on the portal side:
+1. **Trust `social-status`** as the source of truth (it reads Zernio live), or fix the sync
+   so a null/absent handle NEVER maps to `connected`. A row with no account id and no handle
+   is `not_connected`, full stop.
+2. Render the platform as **not connected** whenever `handle` is null, and always show the
+   **Connect** button in that state (even if a stale `state` says connected), so an owner is
+   never trapped by a phantom-connected display.
+
+Until this is fixed, a stuck gym can be reconnected with a direct Zernio connect link Echo
+mints via `GET /portal/<token>/social-connect?platform=instagram` (returns the OAuth URL).
+
 ---
 
 ## 2. Show clients WHEN each post goes live
