@@ -428,6 +428,99 @@ def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=Non
     )
 
 
+# ---- extra welcomes per day (catch-up lane) --------------------------------------------
+# The daily run posts ONE welcome. AGENT_WELCOME_PER_DAY > 1 posts more via this lane so
+# the backlog clears faster. Each extra welcome posts its feed to lasso_ig + lasso_fb and
+# its story to lasso_ig, through the SAME gated _post_and_save path, so it auto-publishes
+# exactly when AGENT_WELCOME_AUTOPUBLISH (or master auto-approve) is armed and cards
+# otherwise. Idempotent per day: it is invoked once with the daily draw and each served
+# gym is stamped, so a re-run never re-serves or double-posts.
+
+def serve_one_more(day_key):
+    """Pop the oldest still-QUEUED welcome, stamp it served for day_key, return it (or
+    None when the queue is empty). Distinct from next_for_day, which returns the day's
+    FIRST served item to every caller; this always advances to a NEW gym."""
+    with db._lock, _conn() as conn:
+        row = conn.execute("SELECT * FROM welcome_queue WHERE status='queued' "
+                           "ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE welcome_queue SET status='served', served_day=? WHERE id=?",
+                     (day_key, row["id"]))
+        conn.commit()
+        return dict(row)
+
+
+def _feed_draft_for(account, item, day_key):
+    return Draft(
+        draft_id=_draft_id(account.key, item["gym_key"], "feed"),
+        account_key=account.key,
+        platform=getattr(account, "platform", account.key),
+        caption=item["caption"], hashtags=[],
+        creative_path=f"welcome_{item['gym_key']}.png",
+        creative_public_url=item["feed_url"],
+        scheduled_for=schedule.scheduled_for(day_key),
+        status=DraftStatus.PENDING, day_key=day_key, draft_type="feed",
+        topic_type="WELCOME")
+
+
+def _story_draft_for(account, item, day_key):
+    if not item.get("story_url"):
+        return None
+    return Draft(
+        draft_id=_draft_id(account.key, item["gym_key"], "story"),
+        account_key=account.key,
+        platform=getattr(account, "platform", account.key),
+        caption=item["caption"], hashtags=[],
+        creative_path=f"welcome_{item['gym_key']}_story.png",
+        creative_public_url=item["story_url"],
+        scheduled_for=schedule.scheduled_for(day_key),
+        status=DraftStatus.PENDING, day_key=day_key, draft_type="story",
+        is_story=True, topic_type="WELCOME")
+
+
+def publish_extra_welcomes(day_key, poster=None, store=None, per_day=None,
+                           post_fn=None):
+    """Post (welcome_per_day - 1) EXTRA welcomes today beyond the one the daily run
+    already posts, so the backlog catches up. Each extra posts feed -> lasso_ig +
+    lasso_fb and story -> lasso_ig through _post_and_save (auto-publishes when
+    AGENT_WELCOME_AUTOPUBLISH is armed). Returns the gym names posted. No-op when the
+    queue is off/empty or welcome_per_day <= 1. All I/O injectable for tests."""
+    if not config.welcome_queue_enabled():
+        return []
+    per_day = per_day if per_day is not None else config.welcome_per_day()
+    extra = max(0, int(per_day) - 1)
+    if extra <= 0:
+        return []
+    from .accounts import get_account
+    if post_fn is None:
+        from .runner import _post_and_save
+        from .slack_surface import SlackPoster
+        from .store import PendingStore
+        poster = poster or SlackPoster()
+        store = store if store is not None else PendingStore()
+
+        def post_fn(draft):
+            _post_and_save(draft, store, poster, idempotent=False)
+
+    posted = []
+    for _ in range(extra):
+        item = serve_one_more(day_key)
+        if item is None:
+            break
+        for acct_key in ACCOUNTS:                       # feed on lasso_ig + lasso_fb
+            acct = get_account(acct_key)
+            if acct is not None:
+                post_fn(_feed_draft_for(acct, item, day_key))
+        for acct_key in STORY_ACCOUNTS:                 # story on lasso_ig
+            acct = get_account(acct_key)
+            sd = _story_draft_for(acct, item, day_key) if acct is not None else None
+            if sd is not None:
+                post_fn(sd)
+        posted.append(item.get("name") or item.get("gym_key"))
+    return posted
+
+
 # ---- the trigger: scan Stripe daily and enqueue ready welcomes -------------------------
 
 def scan_and_enqueue(reader=None, scraper=None, host_fn=None, window_days=45,
