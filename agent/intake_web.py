@@ -1313,7 +1313,8 @@ def build_server(port=None):
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/"
                 r"(calendar|library|report|approve|edit|deny|kill"
-                r"|social-connect|social-status|facebook-pages|facebook-page-select)$",
+                r"|social-connect|social-status|social-disconnect"
+                r"|facebook-pages|facebook-page-select)$",
                 self.path.split("?")[0],
             )
             if m:
@@ -1588,6 +1589,18 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 status, resp = _zr.handle_facebook_page_select(account_key, body.get("page_id", ""))
+                return self._send_json(resp, status)
+
+            # Zernio DISCONNECT: POST /portal/<token>/social-disconnect?platform=instagram|facebook.
+            # Lets a gym owner remove a wrongly-connected account (e.g. a personal or a
+            # spouse's IG) so they can reconnect the right one. Token->account; revoked = 404.
+            if pt_token is not None and pt_action == "social-disconnect":
+                account_key = client_for_token(pt_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                from urllib.parse import urlparse, parse_qs
+                platform = (parse_qs(urlparse(self.path).query).get("platform") or [""])[0]
+                status, resp = _zr.handle_social_disconnect(account_key, platform)
                 return self._send_json(resp, status)
 
             # Part B per-account autonomy toggle: POST /portal/<token>/autonomy.

@@ -818,6 +818,15 @@ def zernio_publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
 
 
+def catchup_report_enabled() -> bool:
+    """
+    Daily new-client CATCH-UP Slack report (Blake, 2026-08-12): one message a day
+    listing every gym signed up in the last 60 days with its calendar coverage, until
+    everyone is caught up (then one confirmation and quiet). Read-only; OFF by default.
+    """
+    return _truthy(os.environ.get("AGENT_CATCHUP_REPORT", "false"))
+
+
 def zernio_analytics_enabled() -> bool:
     """
     Zernio ANALYTICS pull switch (Part C dependency). OFF by default. When OFF, the

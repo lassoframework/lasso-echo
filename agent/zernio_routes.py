@@ -124,6 +124,81 @@ def handle_social_status(account_key, client=None):
     return 200, _z.map_status(accounts)
 
 
+def handle_social_disconnect(account_key, platform, client=None,
+                             snapshot_clear=None):
+    """POST /portal/<token>/social-disconnect?platform=instagram|facebook -> {ok, disconnected}.
+
+    For a gym owner who connected the WRONG account (e.g. a personal or a spouse's
+    Instagram): finds that platform's connected account under the gym's Zernio profile
+    and DELETES it (Zernio DELETE /v1/accounts/{id}), so they can reconnect the right
+    one. Also clears the portal's connection snapshot (echo_social_connections) for that
+    platform so the LASSO dashboard reflects the disconnect immediately, not the stale
+    account. FB additionally forgets the stored page binding (a new page must be picked
+    on reconnect). Idempotent: nothing connected for that platform -> {ok, disconnected:0}.
+    Token-scoped: account_key is validated upstream and every read/write is keyed to it."""
+    if not config.zernio_enabled():
+        return _disabled("social-disconnect")
+    if not account_key:
+        return 400, {"error": "missing account_key"}
+    if platform not in _z.PLATFORMS:
+        return 400, {"error": "platform must be instagram or facebook"}
+    pid = _resolve_profile_id(account_key) or _client(client).find_profile_id(account_key)
+    if not pid:
+        return 200, {"ok": True, "disconnected": 0, "detail": "nothing connected"}
+    c = _client(client)
+    try:
+        accounts = c.list_accounts(pid)
+        acct_id = _z.account_id_for(accounts, platform)
+        # account_id_for returns only a CONNECTED account; if none, also try any
+        # account row of that platform (a wrong/expired one still needs removing).
+        if not acct_id:
+            for a in (accounts or {}).get("accounts") or []:
+                if a.get("platform") == platform and a.get("_id"):
+                    acct_id = str(a["_id"])
+                    break
+        if not acct_id:
+            return 200, {"ok": True, "disconnected": 0, "detail": "nothing connected"}
+        c.disconnect_account(acct_id)
+    except _z.ZernioError as exc:
+        return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
+    except Exception as exc:
+        return 502, {"error": f"zernio call failed: {type(exc).__name__}"}
+    # forget the FB page binding so a reconnect picks a fresh page (best effort)
+    if platform == "facebook":
+        try:
+            existing = _db.gym_get(account_key) or {}
+            _db.gym_upsert(account_key, display_name=existing.get("display_name") or "",
+                           zernio_default_fb_page_id="")
+        except Exception:
+            pass
+    # clear the portal's snapshot so the dashboard updates now (best effort; the
+    # portal's own status poll would also correct it on the next read)
+    clearer = snapshot_clear or _default_snapshot_clear
+    try:
+        clearer(account_key, platform)
+    except Exception as exc:
+        print(f"[zernio] disconnect snapshot clear failed for {account_key}/"
+              f"{platform}: {type(exc).__name__}")
+    return 200, {"ok": True, "disconnected": 1, "platform": platform}
+
+
+def _default_snapshot_clear(account_key, platform):
+    """Set echo_social_connections.state='not_connected' (handle null) for this gym's
+    platform so the LASSO dashboard reflects a disconnect immediately. Keyed by the
+    gym's Supabase uuid resolved from its slug (the tenant base). No-op when creds are
+    absent or the gym/row is missing."""
+    from .portal_calendar_store import SupabaseCalendarStore
+    base = account_key
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    store = SupabaseCalendarStore()
+    if not getattr(store, "available", lambda: True)():
+        return
+    store.clear_social_connection(base, platform)
+
+
 def handle_facebook_pages(account_key, client=None):
     """GET /portal/<token>/facebook-pages -> {pages:[{id,name}]}."""
     if not config.zernio_enabled():

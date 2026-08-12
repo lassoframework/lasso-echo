@@ -207,14 +207,34 @@ def _before_after(all_posts, in_window, days, cutoff, now):
     era can't be bounded, so every 'before' leg is None.
     """
     months_window = _months_span(days)
+    # AFTER-ECHO leg is bounded at the Echo cutoff, NOT the raw window start. For a gym
+    # onboarded INSIDE the analysis window (exactly the recent-signup case), the window
+    # reaches back before Echo took over; counting those pre-Echo posts in the "after
+    # Echo" rate would blend the gym's own old performance into Echo's claimed results.
+    # We take the LATER of the window start and the cutoff, and normalize by that real
+    # span. When the cutoff is None (no known Echo start) the after leg is the full
+    # window (today's behavior).
+    after_lo = cutoff
+    if cutoff is not None and now is not None:
+        # window start = now - days; after era = [max(window_start, cutoff), now]
+        from datetime import timedelta as _td
+        window_start = now - _td(days=float(days)) if (isinstance(days, (int, float))
+                                                       and days > 0) else None
+        after_lo = cutoff if window_start is None else max(window_start, cutoff)
+    after_posts = ([p for p in in_window if _in_window(p, after_lo)]
+                   if after_lo is not None else in_window)
+    after_months = (_months_between(after_lo, now)
+                    if (after_lo is not None and now is not None) else months_window)
 
-    reach_after = _per_month(_sum_present(in_window, "reach"), months_window)
-    saves_after = _per_month(_sum_present(in_window, "saves"), months_window)
-    likes_after = _per_month(_sum_present(in_window, "likes"), months_window)
-    comments_after = _per_month(_sum_present(in_window, "comments"), months_window)
-    shares_after = _per_month(_sum_present(in_window, "shares"), months_window)
+    reach_after = _per_month(_sum_present(after_posts, "reach"), after_months)
+    follows_after = _per_month(_sum_present(after_posts, "follows"), after_months)
+    saves_after = _per_month(_sum_present(after_posts, "saves"), after_months)
+    likes_after = _per_month(_sum_present(after_posts, "likes"), after_months)
+    comments_after = _per_month(_sum_present(after_posts, "comments"), after_months)
+    shares_after = _per_month(_sum_present(after_posts, "shares"), after_months)
 
     reach_before = None
+    follows_before = None
     saves_before = None
     likes_before = None
     comments_before = None
@@ -230,6 +250,8 @@ def _before_after(all_posts, in_window, days, cutoff, now):
         before_months = _months_between(earliest, cutoff)
         reach_before = _per_month(
             _sum_present_range(all_posts, "reach", None, cutoff), before_months)
+        follows_before = _per_month(
+            _sum_present_range(all_posts, "follows", None, cutoff), before_months)
         saves_before = _per_month(
             _sum_present_range(all_posts, "saves", None, cutoff), before_months)
         likes_before = _per_month(
@@ -240,12 +262,11 @@ def _before_after(all_posts, in_window, days, cutoff, now):
             _sum_present_range(all_posts, "shares", None, cutoff), before_months)
 
     return {
-        # followers per month: Zernio's analytics snapshot carries a follower TOTAL,
-        # not a dated growth series, so a trustworthy per-month follower rate cannot be
-        # derived here. Both legs stay null (the portal shows "coming soon") rather than
-        # inventing a growth number. Wired null-not-zero, ready for a real follower time
-        # series when Zernio exposes one.
-        "followers_per_month": {"before": None, "after": None},
+        # followers per month: from per-post analytics.follows (new followers attributed
+        # to each post, verified live 2026-08-12) — a REAL windowed series, not a delta
+        # derived from the follower total. null-not-zero holds: a leg with no reported
+        # follows stays None.
+        "followers_per_month": {"before": follows_before, "after": follows_after},
         "reach_per_month": {"before": reach_before, "after": reach_after},
         "saves_per_month": {"before": saves_before, "after": saves_after},
         "likes_per_month": {"before": likes_before, "after": likes_after},
@@ -387,6 +408,9 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
     followers = _followers(aj.get("accounts") or [])
     reach = _sum_present(in_window, "reach")
     impressions = _sum_present(in_window, "impressions")
+    # NEW FOLLOWERS: Zernio posts carry analytics.follows (per-post new followers,
+    # verified live). Sum the window; null when absent everywhere (never 0).
+    new_follows = _sum_present(in_window, "follows")
 
     likes = _sum_present(in_window, "likes")
     comments = _sum_present(in_window, "comments")
@@ -444,11 +468,13 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
         },
         "audience": {
             # followers is a TOTAL (sum of accounts[].followersCount), NOT a 30-day
-            # delta. follower_delta is a genuine 30-day change; no trustworthy delta
-            # exists from a single analytics snapshot, so it stays null (the portal
-            # shows "coming soon"). We NEVER derive a delta from the total.
+            # delta. follower_delta is the sum of in-window posts[].analytics.follows:
+            # Zernio reports per-post FOLLOWS (new followers attributed to each post,
+            # verified live 2026-08-12), which IS a genuine windowed new-follower count.
+            # NULL-not-zero: when no post reports follows it stays null (the portal
+            # shows "coming soon"). We still NEVER derive a delta from the total.
             "followers": followers,
-            "follower_delta": None,
+            "follower_delta": new_follows,
             "reach": reach,
             "impressions": impressions,
         },

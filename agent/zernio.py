@@ -64,6 +64,27 @@ class ZernioClient:
             raise ZernioError(r.status_code, (r.text or "")[:200])
         return r.json()
 
+    def _delete(self, path):
+        r = self._client().delete(
+            self.base + path,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise ZernioError(r.status_code, (r.text or "")[:200])
+        # a 204/empty body is a valid success for a delete
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    def disconnect_account(self, account_id):
+        """DELETE /v1/accounts/{id}: disconnect AND remove a connected social account
+        from its profile (verified against docs.zernio.com — one call, full removal).
+        Lets a gym owner who connected the wrong account (e.g. a personal/other IG)
+        clear it and reconnect the right one."""
+        return self._delete(f"/v1/accounts/{account_id}")
+
     # ---- reads --------------------------------------------------------------
     def connect_url(self, profile_id, platform):
         """GET /v1/connect/{platform}?profileId=... -> {authUrl}."""
