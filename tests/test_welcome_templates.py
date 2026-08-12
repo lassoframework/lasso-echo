@@ -226,12 +226,16 @@ def _zone_bg_side_points(zone):
     these points are clear of any composed headline glyphs and read only the logo
     layer over the background. The old plate covered the ENTIRE zone, so if any of
     these still shows the background, the plate is gone."""
+    # Points in the zone MARGIN — the top/bottom edge strips and the extreme right
+    # edge — which a centered, aspect-preserved logo never covers even after the
+    # 2026-08-13 "logos were too small" fix enlarged the mark. The old dark plate
+    # covered the ENTIRE zone, so any of these showing the background proves it is gone.
     x, y, w, h = zone
     return [(x + int(w * 0.62), y + 8),
             (x + w - 8, y + 8),
             (x + int(w * 0.62), y + h - 8),
             (x + w - 8, y + h - 8),
-            (x + int(w * 0.85), y + h // 2)]
+            (x + w - 8, y + h // 2)]
 
 
 def test_real_logo_has_no_plate_fill_behind_it(tmp_path, cache):
