@@ -466,3 +466,40 @@ def test_story_background_prompt_is_vertical_and_calm_center():
     assert "CENTER" in p or "middle third" in p.lower()
     # still forbids all text/letters/logos
     assert "NO text" in p and "NO logos" in p
+
+
+# ---- contrast-aware logo placement (2026-08-13: white logos on any base) ----------
+
+def _mono_logo(rgb):
+    from PIL import Image
+    im = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+    for x in range(20, 100):
+        for y in range(20, 100):
+            im.putpixel((x, y), rgb + (255,))
+    return im
+
+
+def test_white_mono_logo_recolored_on_cream_base():
+    out = wt._ensure_contrast(_mono_logo((250, 250, 250)), "cream")
+    op = [p for p in out.getdata() if p[3] > 127][0]
+    assert op[:3] == (18, 30, 60)                    # navy ink so it reads on cream
+
+
+def test_white_mono_logo_kept_on_navy_base():
+    out = wt._ensure_contrast(_mono_logo((250, 250, 250)), "navy")
+    assert [p for p in out.getdata() if p[3] > 127][0][0] >= 240   # stays light
+
+
+def test_dark_mono_logo_recolored_on_navy_base():
+    out = wt._ensure_contrast(_mono_logo((10, 12, 20)), "navy")
+    assert [p for p in out.getdata() if p[3] > 127][0][0] >= 200    # lightened to read
+
+
+def test_multicolor_logo_is_never_recolored():
+    from PIL import Image
+    im = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+    for x in range(20, 100):
+        for y in range(20, 100):
+            im.putpixel((x, y), ((x * 3) % 255, (y * 5) % 255, 90, 255))
+    assert wt._is_monochrome(im) is False
+    assert wt._ensure_contrast(im, "cream") is im       # untouched

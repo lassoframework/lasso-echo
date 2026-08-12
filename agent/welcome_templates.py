@@ -773,13 +773,64 @@ def _draw_zone_hint(img, zone, base):
     _tracked(d, (x + (w - lw) // 2, y + h // 2 - 18), label, lf, ink + (120,), 5)
 
 
+def _is_monochrome(logo, sample_cap=4000):
+    """True when a logo's opaque pixels are essentially ONE color (low chroma spread),
+    e.g. an all-white or all-navy mark. Such a logo can be safely recolored to the
+    contrasting ink without destroying it; a multi-color logo is left alone."""
+    px = [p for p in logo.getdata() if p[3] > 127]
+    if not px:
+        return False
+    if len(px) > sample_cap:
+        step = len(px) // sample_cap
+        px = px[::step]
+    # spread of each channel across opaque pixels; low spread => single color
+    rs = [p[0] for p in px]; gs = [p[1] for p in px]; bs = [p[2] for p in px]
+    spread = max(max(rs) - min(rs), max(gs) - min(gs), max(bs) - min(bs))
+    return spread <= 60
+
+
+def _mean_luma(logo, sample_cap=4000):
+    px = [p for p in logo.getdata() if p[3] > 127]
+    if not px:
+        return 128
+    if len(px) > sample_cap:
+        px = px[::max(1, len(px) // sample_cap)]
+    return sum(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] for p in px) / len(px)
+
+
+def _recolor_through_alpha(logo, rgb):
+    """Recolor a logo to a solid `rgb`, preserving its alpha (shape). Same technique
+    the real LASSO wordmark uses for footer contrast."""
+    solid = Image.new("RGBA", logo.size, tuple(rgb) + (255,))
+    solid.putalpha(logo.split()[3])
+    return solid
+
+
+def _ensure_contrast(logo, base):
+    """Guarantee the logo reads on its template base. A MONOCHROME mark that is
+    low-contrast against the base (a light logo on cream, a dark logo on navy) is
+    recolored through its alpha to the base's ink color; a multi-color logo, or one
+    that already contrasts, is returned unchanged. This is what lets a white gym logo
+    (Sycamore) render on a cream card without a plate."""
+    if not _is_monochrome(logo):
+        return logo
+    luma = _mean_luma(logo)
+    light_base = base == "cream"
+    logo_is_light = luma >= 150
+    # low contrast when both are light or both are dark
+    if light_base == logo_is_light:
+        ink = (18, 30, 60) if light_base else (250, 246, 240)   # navy on cream, off-white on navy
+        return _recolor_through_alpha(logo, ink)
+    return logo
+
+
 def place_gym_logo(img, logo_path, zone, base):
     """Composite the gym's own logo directly into the safe zone, centered, over the
-    open background. Placed as-is (never recolored) so the gym's real mark is
-    preserved. Blake killed the logo plate everywhere (2026-08-06): there is NO cream
-    or navy box behind the logo now. With no logo (a blank review template) a subtle
-    dashed clear-space hint shows where the gym's mark will land, without a filled
-    plate that would read as part of the design."""
+    open background. Blake killed the logo plate everywhere (2026-08-06): there is NO
+    box behind the logo. A MONOCHROME logo that would be low-contrast on its base is
+    recolored through its alpha so it stays visible (a white logo on a cream card,
+    etc.); a multi-color logo is preserved as-is. With no logo (a blank review
+    template) a subtle dashed clear-space hint shows where the mark will land."""
     has_logo = bool(logo_path) and os.path.isfile(logo_path)
     if not has_logo:
         _draw_zone_hint(img, zone, base)
@@ -787,6 +838,7 @@ def place_gym_logo(img, logo_path, zone, base):
     x, y, w, h = zone
     logo = Image.open(logo_path).convert("RGBA")
     logo = _fit_into(logo, w, h)
+    logo = _ensure_contrast(logo, base)
     lx = x + (w - logo.size[0]) // 2
     ly = y + (h - logo.size[1]) // 2
     img.alpha_composite(logo, (lx, ly))

@@ -400,14 +400,11 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small after trim {img.size}"))
             continue
-        # Reject logos where most opaque pixels are white/near-white — invisible on the card plate
-        fin_px = list(img.getdata())
-        opaque_px = [px for px in fin_px if px[3] > 127]
-        if opaque_px:
-            white_count = sum(1 for px in opaque_px if px[0] > 200 and px[1] > 200 and px[2] > 200)
-            if white_count / len(opaque_px) > 0.40:
-                tried.append((why, f"white-on-plate logo ({white_count/len(opaque_px):.0%} white opaque)"))
-                continue
+        # NOTE (2026-08-13): the old "reject white/near-white logo" guard is GONE. It
+        # dated to the white logo PLATE (killed 2026-08-06) and was throwing away every
+        # white/monochrome brand mark (e.g. Sycamore's white SVG). The card compositor
+        # (welcome_templates.place_gym_logo) now makes a monochrome logo contrast with
+        # its template base instead, so a white logo is kept and rendered visibly.
         # A small-but-real logo is upscaled so it fills the card zone cleanly instead
         # of reading tiny (SVG already rendered large, so this is a no-op for it).
         img = _upscale_to(img)
