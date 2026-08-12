@@ -197,6 +197,30 @@ def test_llm_failure_falls_back_to_template(monkeypatch):
     assert creative.client_note in caption                 # template's verbatim note
 
 
+def test_hallucinated_number_falls_back_to_template(monkeypatch):
+    """OUTPUT fabrication gate: if the LLM emits a figure NOT in the approved
+    sources (note/voice), the caption is rejected and we fall back to the verbatim
+    template. No invented stat/price/count ever reaches a caption."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    # LLM invents "40% off" and "$99" that are nowhere in the note or voice doc
+    monkeypatch.setattr(drafter, "_call_llm_caption",
+                        lambda s, u: "Get 40% off your first month for just $99.")
+    creative = _creative(note="Our coaches meet you where you are.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert "40%" not in caption and "$99" not in caption
+    assert creative.client_note in caption          # fell back to the template
+
+
+def test_real_number_in_note_passes_the_output_gate(monkeypatch):
+    """A figure that IS in the client note passes (rephrasing is fine)."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    monkeypatch.setattr(drafter, "_call_llm_caption",
+                        lambda s, u: "579 five star reviews say it all. Come see why.")
+    creative = _creative(note="We have 579 five star reviews from real members.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert "579 five star reviews say it all" in caption   # SB7 output kept
+
+
 def test_empty_client_note_falls_back_to_template(monkeypatch):
     monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
     monkeypatch.setattr(drafter, "_call_llm_caption",

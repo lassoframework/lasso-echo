@@ -195,6 +195,26 @@ def _call_llm_caption(system, user):
     return "".join(getattr(p, "text", "") or "" for p in parts)
 
 
+import re as _re_claims
+# A figure the caption might carry: a standalone number, optionally with a decimal
+# or thousands separators (579, 6, 12,000, 4.5). Currency/percent/multiplier signs
+# around it don't change the digits, so matching the digit run is sufficient.
+_FIGURE_RE = _re_claims.compile(r"\d[\d,\.]*")
+
+
+def _output_claims_cleared(body, voice, client_note):
+    """True when every figure in `body` appears verbatim in an approved input (the
+    client note or the voice doc). No approved figure -> clean. This blocks an LLM
+    from smuggling an invented stat/price/count into a caption; a rephrased but real
+    number (its digits are in the sources) still passes."""
+    sources = f"{client_note}\n{getattr(voice, 'raw', '') or ''}"
+    for tok in _FIGURE_RE.findall(body or ""):
+        norm = tok.strip(".,")
+        if norm and norm not in sources:
+            return False
+    return True
+
+
 class StoryBrandGenerator:
     """
     LLM-powered caption generator using the StoryBrand SB7 framework.
@@ -292,6 +312,17 @@ class StoryBrandGenerator:
             body = (_call_llm_caption(self._SYSTEM, user) or "").strip()
             if not body:
                 raise ValueError("empty LLM response")
+            # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
+            # (stat, price, count) in the generated caption MUST trace to an approved
+            # input (the client note or the voice doc). A caption carrying a number
+            # the sources do not clear is a possible hallucination, so we REJECT it
+            # and fall back to the verbatim template rather than surface an invented
+            # stat. This restores the deterministic no-fabrication floor the template
+            # has; the prompt's HARD RULES are belt, this is suspenders.
+            if not _output_claims_cleared(body, voice, client_note):
+                print("[sb7] output carried a number not in the approved sources; "
+                      "falling back to template (no fabrication)")
+                return TemplateGenerator().build(voice, creative)
             fragments = [body]
             if cta and not _caption_has_cta(body, voice):
                 fragments.append(cta)
