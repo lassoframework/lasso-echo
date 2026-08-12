@@ -193,3 +193,32 @@ def test_upscale_never_downscales():
     from PIL import Image as _I
     big = _I.new("RGBA", (800, 600))
     assert ws._upscale_to(big).size == (800, 600)             # already large -> unchanged
+
+
+# ---- lazy-load + social-icon candidate fixes (2026-08-13: Sycamore wrong logo) -----
+
+def test_lazyload_uses_data_src_over_placeholder():
+    # Webflow: src is a data: placeholder, the REAL logo is in data-src
+    html = ('<img alt="Sycamore CrossFit" '
+            'src="data:image/svg+xml;base64,AAA" '
+            'data-src="https://cdn.site.com/Sycamore-CrossFit-Logo-Dark.webp">')
+    c = ws.logo_candidates(html, "https://sycamorecrossfit.com/")
+    assert any("Logo-Dark.webp" in u for u, _ in c), c
+    # the data: placeholder is never a candidate
+    assert not any(u.startswith("data:") for u, _ in c)
+
+
+def test_social_icon_logo_is_rejected():
+    html = ('<img class="logo" src="https://cdn.site.com/twitter-logo-x.svg">'
+            '<img alt="Sycamore CrossFit Logo" '
+            'src="https://cdn.site.com/brand-logo.webp">')
+    c = ws.logo_candidates(html, "https://x.com/")
+    assert not any("twitter-logo-x" in u for u, _ in c)     # social glyph rejected
+    assert any("brand-logo.webp" in u for u, _ in c)        # real brand kept
+
+
+def test_alt_logo_matched_even_without_logo_in_src():
+    html = ('<img alt="Peak Gym logo" '
+            'data-src="https://cdn.site.com/assets/brandmark.webp" src="data:x">')
+    c = ws.logo_candidates(html, "https://x.com/")
+    assert any("brandmark.webp" in u for u, _ in c)

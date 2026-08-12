@@ -58,13 +58,24 @@ _BLOCKED_LOGO_DOMAINS = frozenset([
 # Franchise / software brand keywords that flag a candidate as a partner badge, not the gym logo.
 # _FRANCHISE_BLOB_RE: word-boundary match for natural-language blobs (class/id/alt text).
 # _FRANCHISE_PATH_RE: no-boundary match for URL paths (handles camelCase filenames).
+# Franchise/vendor BADGES to skip — but NOT the words "crossfit"/"hyrox" on their own:
+# a gym is literally named "<Name> CrossFit", so its OWN logo file is
+# "<Name>-CrossFit-Logo.webp" and must never be rejected. We only skip the booking/
+# software vendor marks (a gym is never named "Wodify") and an explicit affiliate badge.
 _FRANCHISE_BLOB_RE = re.compile(
-    r"\b(?:crossfit|hyrox|wodify|mindbody|zingfit|glofox|pushpress|"
-    r"pikfit|trainerize|triib|sugarwod)\b",
+    r"\b(?:wodify|mindbody|zingfit|glofox|pushpress|pikfit|trainerize|triib|"
+    r"sugarwod|affiliate)\b",
     re.I
 )
 _FRANCHISE_PATH_RE = re.compile(
-    r"(?i)crossfit|hyrox|wodify|mindbody|zingfit|glofox|pushpress|pikfit|trainerize|sugarwod"
+    r"(?i)wodify|mindbody|zingfit|glofox|pushpress|pikfit|trainerize|sugarwod|"
+    r"crossfit[-_]?affiliate|affiliate[-_]?badge"
+)
+# Social-network icons masquerade as "logos" (e.g. twitter-logo-x.svg, a facebook/
+# instagram glyph). They are NEVER the gym's brand mark. Reject by URL path.
+_SOCIAL_ICON_RE = re.compile(
+    r"(?i)twitter-logo|x-logo|logo-x\b|facebook|instagram|tiktok|youtube|linkedin|"
+    r"pinterest|/social|social-icon|arrow-svg"
 )
 
 STATUS_OK = "OK"
@@ -151,6 +162,9 @@ def logo_candidates(html, base_url):
         absu = urljoin(base_url, u)
         if urlparse(absu).netloc in _BLOCKED_LOGO_DOMAINS:
             return
+        # Reject social-network icons (twitter/x/facebook glyphs tagged "logo")
+        if _SOCIAL_ICON_RE.search(absu):
+            return
         # Reject franchise/partner badges: blob match for header-img; path match for all
         if why == "header-img" and blob and _FRANCHISE_BLOB_RE.search(blob):
             return
@@ -159,15 +173,28 @@ def logo_candidates(html, base_url):
         if absu not in [c[0] for c in cands]:
             cands.append((absu, why))
 
+    def _real_src(tag):
+        """The image's REAL url, handling lazy-load: a src that is a data: URI / 1px
+        placeholder / empty is ignored in favor of data-src / data-lazy-src (Webflow,
+        Elementor, etc. put the true logo URL there)."""
+        src = _attr(tag, "src")
+        if (not src) or src.startswith("data:") or "base64" in src:
+            return (_attr(tag, "data-src") or _attr(tag, "data-lazy-src")
+                    or _attr(tag, "data-original") or src)
+        return src
+
     og_images = []
 
-    # 1. a header/nav <img> that looks like a logo (class/id/alt contains "logo"),
-    #    but skip partner/franchise badges (CrossFit affiliate, Hyrox, Wodify, etc.)
+    # 1. a header/nav <img> that looks like a logo (class/id/alt/src contains "logo",
+    #    or its alt reads like a brand mark), skipping partner/franchise/social badges.
     for tag in re.findall(r"<img\b[^>]*>", html, re.I):
-        blob = " ".join([_attr(tag, "src"), _attr(tag, "class"),
-                         _attr(tag, "id"), _attr(tag, "alt")]).lower()
-        if "logo" in blob:
-            add(_attr(tag, "src") or _attr(tag, "data-src"), "header-img", blob=blob)
+        real = _real_src(tag)
+        alt = _attr(tag, "alt")
+        blob = " ".join([real, _attr(tag, "src"), _attr(tag, "class"),
+                         _attr(tag, "id"), alt]).lower()
+        # "logo" anywhere in the resolved blob, OR an <img> whose alt says "logo"
+        if "logo" in blob or "logo" in alt.lower():
+            add(real, "header-img", blob=blob)
 
     # 2. apple-touch-icon
     for tag in re.findall(r"<link\b[^>]*>", html, re.I):
@@ -175,9 +202,9 @@ def logo_candidates(html, base_url):
         if "apple-touch-icon" in rel:
             add(_attr(tag, "href"), "apple-touch-icon")
 
-    # 3. anything whose URL path matches /logo/i
+    # 3. anything whose REAL url path matches /logo/i (lazy-load aware)
     for tag in re.findall(r"<(?:img|link)\b[^>]*>", html, re.I):
-        u = _attr(tag, "src") or _attr(tag, "href") or _attr(tag, "data-src")
+        u = _real_src(tag) or _attr(tag, "href")
         if u and re.search(r"logo", u, re.I):
             add(u, "logo-url")
 
