@@ -223,13 +223,36 @@ def _looks_svg(data, ext, ctype=""):
         or head[:4].lower() == b"<svg"
 
 
+_CAIRO_PRELOADED = False
+
+
+def _preload_cairo():
+    """cairocffi's find_library can't locate libcairo on the Railway (Nixpacks) image,
+    and the apt libcairo can't chain-load its deps against the Nix Python. The NIX
+    cairo in /nix/store has its whole dependency closure baked into its RPATH, so
+    loading THAT one RTLD_GLOBAL makes cairosvg import cleanly. Best effort, once."""
+    global _CAIRO_PRELOADED
+    if _CAIRO_PRELOADED:
+        return
+    import ctypes
+    import glob
+    for lib in (glob.glob("/nix/store/*cairo*/lib/libcairo.so")
+                + glob.glob("/nix/store/*cairo*/lib/libcairo.so.2")):
+        try:
+            ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            _CAIRO_PRELOADED = True
+            return
+        except Exception:
+            continue
+
+
 def _rasterize_svg(data, edge=SVG_RASTER_EDGE):
     """Rasterize SVG bytes to an RGBA PIL image at `edge` on the long side, crisp.
-    Uses cairosvg (system cairo is present on Railway); returns None if the lib is
-    absent or the SVG is unparseable, so the caller falls through to the next
-    candidate — never a crash."""
+    Uses cairosvg; returns None if cairo/cairosvg is unavailable or the SVG is
+    unparseable, so the caller falls through to the next candidate — never a crash."""
     try:
-        import cairosvg  # lazy; graceful if unavailable
+        _preload_cairo()
+        import cairosvg  # lazy
         png = cairosvg.svg2png(bytestring=data, output_width=edge, output_height=edge)
         return _load_raster(png)
     except Exception:
