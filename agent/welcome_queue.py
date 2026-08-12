@@ -363,6 +363,7 @@ def build_welcome_queue_draft(account, day_key):
         status=DraftStatus.PENDING,
         day_key=day_key,
         draft_type="feed",
+        topic_type="WELCOME",   # lets the runner auto-publish welcomes specifically
     )
 
 
@@ -423,6 +424,7 @@ def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=Non
         day_key=day_key,
         draft_type="story",
         is_story=True,
+        topic_type="WELCOME",
     )
 
 

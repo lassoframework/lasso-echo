@@ -708,6 +708,17 @@ def auto_approve_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_AUTO_APPROVE_ENABLED", "false"))
 
 
+def welcome_autopublish_enabled() -> bool:
+    """
+    Welcome-only auto-publish: NEW-CLIENT welcome posts (topic_type == "WELCOME")
+    publish at schedule time with no approval tap, WITHOUT enabling portfolio-wide
+    auto-approve. LASSO's other daily posts are unaffected. OFF by default; still
+    requires AGENT_PUBLISH_ENABLED to actually write to Meta (and AGENT_STORIES_ENABLED
+    for the story half). This is how the welcome backlog gets caught up hands-free.
+    """
+    return _truthy(os.environ.get("AGENT_WELCOME_AUTOPUBLISH", "false"))
+
+
 def trust_autopublish_enabled() -> bool:
     """
     Trust AUTOPUBLISH switch. OFF by default; a startup warning prints when
