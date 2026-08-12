@@ -31,7 +31,7 @@ every test runs fully offline (no Gemini / Supabase call in the build or test pa
 
 import os
 
-from . import bible_drafter, client_sources, config
+from . import bible_drafter, client_sources, config, ops_alerts
 
 
 def _clean(value):
@@ -317,3 +317,151 @@ def onboard_from_social(account_key, answers, *, approve=True):
         "approver": mapped["approver"],
         "base": base,
     }
+
+
+# ---- automatic forward: map EVERY un-routed intake into Echo -----------------------
+# This closes the gap that left CrossFit ENG stranded: an intake was CAPTURED in
+# echo_social_intake but never forwarded (echo_forwarded=false, not_routed). The
+# forward step existed (onboard_from_social) but nothing ran it automatically.
+# sync_unrouted() runs it for every un-routed row and marks the row routed, so no
+# gym is ever silently stranded again. Nothing publishes; a human still approves
+# every draft. Gated by AGENT_SOCIAL_INTAKE_SYNC (default OFF).
+
+def _default_lister():
+    """Live: the client_key of every echo_social_intake row not yet forwarded to
+    Echo, newest first. Reads creds lazily; NEVER logs the key. No creds -> []."""
+    from . import config
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key:
+        return []
+    import requests  # lazy, matches the repo pattern
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Accept": "application/json"}
+    # PAGINATED so a large un-routed backlog is never silently truncated (the exact
+    # "silent stranding" class this feature exists to kill). Walk Range windows until
+    # a short page; a full page that keeps coming is followed, not dropped.
+    page = 1000
+    seen, out, offset = set(), [], 0
+    while True:
+        params = {
+            "echo_forwarded": "is.false",
+            "select": "client_key,submitted_at",
+            "order": "submitted_at.desc",
+        }
+        hdr = dict(headers)
+        hdr["Range-Unit"] = "items"
+        hdr["Range"] = f"{offset}-{offset + page - 1}"
+        r = requests.get(f"{url}/rest/v1/echo_social_intake", params=params,
+                         headers=hdr, timeout=30)
+        if r.status_code >= 400:
+            break
+        rows = r.json() or []
+        for row in rows:
+            ck = _clean(row.get("client_key"))
+            if ck and ck not in seen:
+                seen.add(ck)
+                out.append(ck)
+        if len(rows) < page:
+            break
+        offset += page
+    return out
+
+
+def _default_marker(base_key, account_key):
+    """Live: mark every echo_social_intake row for base_key as forwarded to Echo.
+    Best effort; a failed mark never loses the (already landed) onboarding work.
+    Reads creds lazily; NEVER logs the key."""
+    from . import config
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key:
+        return False
+    import requests  # lazy
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Content-Type": "application/json", "Prefer": "return=minimal"}
+    body = {"echo_forwarded": True, "echo_status": "account_forwarded",
+            "echo_account_key": base_key}
+    r = requests.patch(f"{url}/rest/v1/echo_social_intake",
+                       params={"client_key": f"eq.{base_key}"},
+                       headers=headers, json=body, timeout=30)
+    return r.status_code < 400
+
+
+def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
+                  approve=False):
+    """Map EVERY un-routed social intake into Echo. Returns a per-base summary list.
+
+    For each un-routed base:
+      - resolve the generation account (<base>_ig); when AGENT_DYNAMIC_ACCOUNTS is
+        armed, a base with no account is AUTO-PROVISIONED (an inactive Account record
+        built from the intake's gym info) so onboarding is zero-touch and scales to
+        100+ gyms without hand-editing accounts.py. When dynamic accounts are OFF, a
+        base with no account is SKIPPED with one ops alert (never fabricate an account),
+      - run onboard_from_social (writes voice/proof docs if absent, lands client_sources),
+      - mark the row routed so it is never re-processed.
+
+    approve defaults FALSE: intake-derived client_sources land PENDING for one human
+    review, matching client_sources.submit_intake's own contract ("client input is
+    NEVER auto-trusted as fact"). Every downstream POST still cards for approval too.
+
+    All I/O is injectable so tests run fully offline. Gated by the caller; this
+    function itself always runs when called (the flag lives at the call sites)."""
+    from . import accounts as _accounts
+    from . import config as _config
+    lister = lister or _default_lister
+    reader = reader or _default_reader
+    marker = marker or _default_marker
+    onboard = onboard or onboard_from_social
+
+    results = []
+    for base in lister():
+        base = _clean(base)
+        if not base:
+            continue
+        account_key = f"{base}_ig"
+        answers = read_social_intake(base, reader=reader)
+        have_account = (_accounts.get_account(account_key) is not None
+                        or _accounts.get_account(base) is not None)
+
+        # AUTO-PROVISION (AGENT_DYNAMIC_ACCOUNTS): create the inactive Account record
+        # from the intake's gym info so no gym is stranded waiting on a hand-added
+        # accounts.py entry. Tokens stay by-hand (env); nothing publishes.
+        if not have_account and _config.dynamic_accounts_enabled():
+            gym = (answers or {}).get("gym") or {}
+            try:
+                _accounts.register_gym(
+                    base,
+                    name=_clean(gym.get("name")) or base,
+                    ig_handle=_clean(gym.get("ig_handle")),
+                    fb_page=_clean(gym.get("fb_page")))
+                have_account = _accounts.get_account(account_key) is not None
+            except Exception as e:
+                ops_alerts.alert(f"social-intake-sync: auto-provision of '{base}' "
+                                 f"failed: {type(e).__name__}: {e}. Left un-routed.")
+
+        if not have_account:
+            ops_alerts.alert(
+                f"social-intake-sync: '{base}' submitted a social intake but has no "
+                f"registry account ('{account_key}' / '{base}'). Add the Account "
+                "entry (or arm AGENT_DYNAMIC_ACCOUNTS), then re-run. The intake is "
+                "safe and left un-routed.")
+            results.append({"base": base, "ok": False, "reason": "no account"})
+            continue
+        gen_key = account_key if _accounts.get_account(account_key) is not None else base
+        if answers is None:
+            results.append({"base": base, "ok": False, "reason": "no answers"})
+            continue
+        try:
+            out = onboard(gen_key, answers, approve=approve)
+            marked = marker(base, base)
+            results.append({"base": base, "ok": True,
+                            "account": gen_key,
+                            "sources_created": out.get("sources_created", 0),
+                            "marked_routed": bool(marked)})
+        except Exception as e:
+            ops_alerts.alert(f"social-intake-sync: onboarding '{base}' failed: "
+                             f"{type(e).__name__}: {e}. Intake left un-routed.")
+            results.append({"base": base, "ok": False,
+                            "reason": f"{type(e).__name__}"})
+    return results

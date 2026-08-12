@@ -291,6 +291,7 @@ def _daily_scheduler(store):
     _print_scheduled_lanes()
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
+    intake_sync_every = max(1, int(os.environ.get("AGENT_SOCIAL_INTAKE_SYNC_MINUTES", "15"))) * 60
     opus_every = max(1, int(os.environ.get("AGENT_OPUS_POLL_MINUTES", "60"))) * 60
     podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
     inbox_every = config.episode_inbox_poll_minutes() * 60
@@ -298,6 +299,7 @@ def _daily_scheduler(store):
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
+    last_intake_sync = 0.0
     last_opus = 0.0
     last_podcast = 0.0
     last_inbox = 0.0
@@ -363,6 +365,23 @@ def _daily_scheduler(store):
         # self-guarded, throttled, and fully isolated inside run_client_media_lane.
         last_cms = run_client_media_lane(
             now_mono=time.monotonic(), last_mono=last_cms, interval_secs=cms_every)
+        # Social-intake forward: dormant unless AGENT_SOCIAL_INTAKE_SYNC. Maps every
+        # un-routed echo_social_intake row into Echo (voice/proof + client_sources)
+        # and marks it routed, so no gym is ever stranded the way ENG was. Nothing
+        # publishes; an error never kills the loop. Distinct from the client-media
+        # lane above: that syncs uploaded MEDIA; this maps submitted INTAKE FORMS.
+        if (config.social_intake_sync_enabled()
+                and time.monotonic() - last_intake_sync >= intake_sync_every):
+            last_intake_sync = time.monotonic()
+            try:
+                from . import social_intake_reader
+                synced = social_intake_reader.sync_unrouted()
+                mapped = [r for r in synced if r.get("ok")]
+                if mapped:
+                    print(f"[intake-sync] mapped {len(mapped)} gym(s) into Echo: "
+                          + ", ".join(r["base"] for r in mapped))
+            except Exception as e:
+                print(f"[intake-sync] pass failed: {type(e).__name__}: {e}")
         # Opus Clip poll: FULLY INERT unless BOTH AGENT_OPUS_ENABLED and
         # AGENT_OPUS_POLL_ENABLED are armed. Errors alert (inside pull), never crash.
         if (config.opus_enabled() and config.opus_poll_enabled()

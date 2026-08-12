@@ -4,8 +4,9 @@ real PendingStore on tmp files, no network. Asserts: the flag defaults OFF and
 OFF means exactly today's behavior (a re-run re-cards, no expiry sweep); ON, a
 same-content re-run returns the existing PENDING draft with no new card; changed
 content SUPERSEDES the old record and edits its card in place; a pending draft
-whose day has passed flips to EXPIRED with its card edited in place; and a stale
-approve on a superseded or expired draft is a friendly no-op that never publishes.
+whose day has passed flips to EXPIRED with its card edited in place; a stale
+approve on a SUPERSEDED draft is a friendly no-op; but an approve on an EXPIRED
+draft DOES publish immediately (post goes live, past schedule ignored).
 """
 
 import json
@@ -205,13 +206,28 @@ def test_stale_approve_on_superseded_is_friendly_noop():
     assert "newest card" in res.detail.lower()
 
 
-def test_stale_approve_on_expired_is_friendly_noop():
+def test_approve_on_expired_publishes_immediately():
+    """Approving an expired draft now publishes it (post goes live now, past
+    scheduled_for is ignored). The action succeeds with ok=True."""
+    class RecordingPublisher:
+        def __init__(self):
+            self.called = False
+
+        def publish(self, draft, account):
+            self.called = True
+
+            class Result:
+                mode = "published"
+                media_id = "fake_media_id"
+
+            return Result()
+
+    pub = RecordingPublisher()
     res = approvals.handle_action(
         "approve", _stale_draft(DraftStatus.EXPIRED), config.APPROVER_SLACK_ID,
-        publisher=ExplodingPublisher(), account=_acct())
-    assert res.ok is False
-    assert "expired" in res.detail.lower()
-    assert "today's card" in res.detail.lower()
+        publisher=pub, account=_acct())
+    assert res.ok is True, res.detail
+    assert pub.called, "publisher was never called for expired-draft approve"
 
 
 # ---- 7. the card edit itself: chat.update in place, buttons removed -----------
