@@ -197,8 +197,15 @@ def _post_and_save(draft, store, poster, idempotent):
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
     # entirely. Drafts publish at schedule time; a lightweight notice goes to Slack
     # so Blake can see what went out without needing to tap anything.
-    if (draft.status.value == "pending" and config.auto_approve_enabled()
-            and not getattr(draft, "force_approval", False)):
+    # WELCOME-ONLY auto-publish: AGENT_WELCOME_AUTOPUBLISH publishes new-client welcome
+    # posts (topic_type == "WELCOME") hands-free WITHOUT enabling portfolio-wide
+    # auto-approve, so the welcome backlog clears while every other LASSO post still
+    # cards for a tap. Same gated publish() path; AGENT_PUBLISH_ENABLED still applies.
+    _is_welcome = getattr(draft, "topic_type", "") == "WELCOME"
+    if (draft.status.value == "pending"
+            and not getattr(draft, "force_approval", False)
+            and (config.auto_approve_enabled()
+                 or (_is_welcome and config.welcome_autopublish_enabled()))):
         from . import db, postlog
         from .accounts import get_account
         from .meta_publisher import publish
