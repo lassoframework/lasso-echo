@@ -36,13 +36,16 @@ def test_flag_defaults_off(monkeypatch):
     assert wd.run_daily() is None
 
 
-def test_digest_shows_today_and_queued_with_template_and_image():
+def test_digest_shows_today_and_queued_with_template_feed_and_story():
     out = wd.build_digest("2026-08-12", _rows())
     assert out["served_today"] == 1 and out["queued"] == 1
     t = out["text"]
     assert "Bird Dog CrossFit" in t and "CrossFit Sunnyside" in t
     assert "Welcome to the LASSO family" in t          # the template caption
-    assert "https://r2/feed1.png" in t                 # hosted image link
+    assert "feed: https://r2/feed1.png" in t           # feed image
+    assert "story: https://r2/s1.png" in t             # story image alongside
+    # the served-today row has no story rendered -> named honestly, not hidden
+    assert "story: (not rendered yet)" in t
     assert "Old Gym" not in t                           # served on a past day, excluded
     assert "TODAY" in t and "QUEUED" in t
 

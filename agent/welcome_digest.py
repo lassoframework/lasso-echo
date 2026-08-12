@@ -45,9 +45,15 @@ def build_digest(today, rows):
         tier = f" [{r['tier']}]" if r.get("tier") else ""
         cap = (r.get("caption") or "").strip()
         cap_line = f"\n    “{cap[:200]}{'…' if len(cap) > 200 else ''}”" if cap else ""
-        img = f"\n    feed: {r['feed_url']}" if r.get("feed_url") else \
-            "\n    (image not rendered yet)"
-        return f"{tag} *{name}*{owner}{tier}{cap_line}{img}"
+        # BOTH the feed post AND its 9:16 story (the welcome_queue renders both). Show
+        # each hosted image so nothing is hidden; a missing one is named honestly.
+        media = []
+        media.append(f"feed: {r['feed_url']}" if r.get("feed_url")
+                     else "feed: (not rendered yet)")
+        media.append(f"story: {r['story_url']}" if r.get("story_url")
+                     else "story: (not rendered yet)")
+        media_line = "\n    " + "\n    ".join(media)
+        return f"{tag} *{name}*{owner}{tier}{cap_line}{media_line}"
 
     lines = [f"*New-client welcome posts* ({today}) — "
              f"{len(served_today)} going out today, {len(queued)} queued"]
