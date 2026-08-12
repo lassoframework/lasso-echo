@@ -133,13 +133,39 @@ def is_due(row, now=None):
     return _slot_reached(slot_time_for_row(row), now)
 
 
-def _account_for(row):
-    """Map a content_calendar row's account to an Echo account. 'facebook' -> the
-    LASSO FB page, everything else (incl. 'instagram') -> the LASSO IG account."""
-    acct = (row.get("account") or "").strip().lower()
-    if acct == "facebook":
-        return get_account("lasso_fb")
-    return get_account("lasso_ig")
+def _account_for(row, gym_id="lasso"):
+    """Map a content_calendar row to its Echo account. The row's `account` column is a
+    bare platform ('instagram'/'facebook'); the GYM comes from gym_id. LASSO keeps its
+    hardcoded accounts (byte-for-byte the original behavior). A CLIENT gym resolves to
+    ITS OWN account (<gym_id>_fb / <gym_id>_ig) so a client post never lands on LASSO's
+    pages. Returns None when no such account exists (the row is then skipped, never
+    misrouted)."""
+    plat = (row.get("account") or "").strip().lower()
+    base = (gym_id or "lasso").strip() or "lasso"
+    if base == "lasso":
+        return get_account("lasso_fb" if plat == "facebook" else "lasso_ig")
+    suffix = "_fb" if plat == "facebook" else "_ig"
+    return get_account(f"{base}{suffix}")
+
+
+def scheduled_iso_for_row(row, now=None):
+    """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
+    time (slot_time_for_row), in POSTING_TIMEZONE. This is what Echo hands Zernio as
+    `scheduledFor` so the client sees exactly when the post publishes. Returns '' when
+    the row has no post_date."""
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo
+    post_date = (row.get("post_date") or "").strip()
+    if not post_date:
+        return ""
+    slot = slot_time_for_row(row)
+    hh, mm = str(slot).split(":")
+    try:
+        y, m, d = (int(x) for x in post_date.split("-"))
+        tz = ZoneInfo(config.POSTING_TIMEZONE)
+        return datetime(y, m, d, int(hh), int(mm), tzinfo=tz).isoformat()
+    except (ValueError, TypeError):
+        return ""
 
 
 def _draft_for(row):
@@ -163,7 +189,8 @@ def _draft_for(row):
 
 
 def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
-                notifier=None, now=None, catch_all=False):
+                notifier=None, now=None, catch_all=False, approved_only=False,
+                zernio_publish=None):
     """
     Read gym_id's content_calendar rows dated run_date and publish each unpublished
     one to live IG/FB, EXACTLY ONCE. Returns a summary dict.
@@ -198,6 +225,9 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from .portal_calendar_store import SupabaseCalendarStore
         store = SupabaseCalendarStore()
     publisher = publisher or meta_publisher.publish
+    if zernio_publish is None:
+        from . import zernio_publisher
+        zernio_publish = zernio_publisher.publish
 
     rows = store.due_rows(gym_id, run_date) or []
 
@@ -215,6 +245,13 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             skipped.append(row_id)
             continue
 
+        # CLIENT approval gate: when approved_only (client gyms), a row that the client
+        # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO
+        # (approved_only=False) is unchanged: it auto-publishes pending rows at slot time.
+        if approved_only and (row.get("status") or "").strip().lower() != "approved":
+            waiting.append(row_id)
+            continue
+
         # SLOT GATE: publish nothing before the row's OWN stable slot time. A row
         # whose slot has not arrived is left UNTOUCHED (never claimed) so a later
         # tick this same day drips it out. catch_all bypasses the gate so the last
@@ -224,7 +261,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             waiting.append(row_id)
             continue
 
-        account = _account_for(row)
+        account = _account_for(row, gym_id)
         if account is None:
             # No mappable account: leave the row untouched (never claimed), skip it.
             skipped.append(row_id)
@@ -248,7 +285,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         draft.platform = account.platform
 
         try:
-            result = publisher(draft, account)
+            # ROUTE BY GYM: LASSO publishes via the Meta-direct lane (unchanged). A
+            # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio, scheduled at
+            # the row's own slot time so the go-live time is real and visible. The
+            # zernio publisher self-gates on AGENT_ZERNIO_PUBLISH + AGENT_PUBLISH_ENABLED
+            # (returns would_publish when off), so a client row is never sent live
+            # unless both are armed.
+            if account.key.startswith("lasso"):
+                result = publisher(draft, account)
+            else:
+                result = zernio_publish(
+                    draft, account, scheduled_for=scheduled_iso_for_row(row, now))
         except Exception as e:
             # A real publish error: revert the claim so it retries next run.
             try:
@@ -369,3 +416,54 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
                       f"({slot_time}): {type(e).__name__}: {e}")
         fired.append(summary)
     return fired
+
+
+# ---- client-gym publish lane (Zernio) ---------------------------------------
+# LASSO auto-publishes its own calendar via Meta-direct (above). A CLIENT gym's
+# path is different: the client APPROVES a post in the portal, and Echo then
+# publishes it to the gym's OWN connected IG/FB via Zernio, SCHEDULED at the row's
+# slot time. This function is the client counterpart to run_slot_ticks.
+
+def client_gym_bases():
+    """Distinct client-gym tenant bases (non-LASSO) from the account registry:
+    eng_ig / eng_fb -> 'eng'. LASSO is excluded (it has its own Meta-direct lane)."""
+    from .accounts import all_accounts
+    seen, bases = set(), []
+    for a in all_accounts():
+        k = a.key or ""
+        if k.startswith("lasso"):
+            continue
+        base = k
+        for suf in ("_ig", "_fb"):
+            if base.endswith(suf):
+                base = base[: -len(suf)]
+                break
+        if base and base not in seen:
+            seen.add(base)
+            bases.append(base)
+    return bases
+
+
+def publish_client_gyms(run_date, *, store=None, notifier=None, now=None):
+    """Publish every client gym's APPROVED, due calendar rows to the gym's OWN IG/FB
+    via Zernio, scheduled at each row's slot time. Self-gating: publish_due checks
+    AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED, and the zernio publisher checks
+    AGENT_ZERNIO_PUBLISH, so this is a no-op unless all three are armed. A client post
+    is due the moment it is approved (we hand Zernio the future slot time), so
+    catch_all=True; approved_only=True means an un-approved row is never published.
+    Per-gym isolation: one gym's failure never blocks another. Returns per-gym summaries."""
+    if not config.calendar_autopublish_enabled() or not config.publish_enabled():
+        return []
+    if not config.zernio_publish_enabled():
+        return []
+    out = []
+    for base in client_gym_bases():
+        try:
+            summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
+                                  now=now, catch_all=True, approved_only=True)
+            summary["gym"] = base
+            out.append(summary)
+        except Exception as e:
+            print(f"[client-autopublish] gym {base} failed: {type(e).__name__}: {e}")
+            out.append({"ok": False, "gym": base, "error": type(e).__name__})
+    return out

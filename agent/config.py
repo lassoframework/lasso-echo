@@ -807,6 +807,17 @@ def zernio_enabled() -> bool:
     return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
 
 
+def zernio_publish_enabled() -> bool:
+    """
+    Zernio client-publish lane: when armed, an approved CLIENT-gym calendar row is
+    published (or scheduled) to the gym's OWN connected IG/FB via Zernio POST /v1/posts.
+    OFF by default. This is layered UNDER the global publish kill switch: BOTH
+    AGENT_ZERNIO_PUBLISH and AGENT_PUBLISH_ENABLED must be armed or nothing goes live
+    (the publisher returns would_publish). LASSO's own accounts stay on meta_direct.
+    """
+    return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
+
+
 def zernio_analytics_enabled() -> bool:
     """
     Zernio ANALYTICS pull switch (Part C dependency). OFF by default. When OFF, the

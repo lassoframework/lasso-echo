@@ -343,6 +343,11 @@ def _daily_scheduler(store):
                     ZoneInfo(config.POSTING_TIMEZONE)).date().isoformat()
                 calendar_autopublish.run_slot_ticks(
                     _local_today, notifier=ops_alerts._default_poster())
+                # CLIENT gyms: publish each connected gym's APPROVED, due rows to its
+                # OWN IG/FB via Zernio, scheduled at the row's slot time. Self-gated by
+                # AGENT_ZERNIO_PUBLISH (a no-op unless armed); one gym never blocks another.
+                calendar_autopublish.publish_client_gyms(
+                    _local_today, notifier=ops_alerts._default_poster())
             except Exception as e:
                 print(f"[calendar-autopublish] slot-fire lane failed: "
                       f"{type(e).__name__}: {e}")
