@@ -712,7 +712,28 @@ def calm_zone_ok(img, zone, std_threshold=60.0):
     return (var ** 0.5) <= std_threshold
 
 
-def _fit_into(logo, box_w, box_h, pad_frac=0.14):
+def _trim_transparent(logo):
+    """Crop a logo to its non-transparent bounding box. Most gym logos ship with a
+    large transparent margin baked in; fitting the FULL image into the zone then
+    renders the actual mark tiny. Trimming to the real ink first makes the mark fill
+    its safe zone. Falls back to the original when there is no alpha or it is empty."""
+    try:
+        if logo.mode != "RGBA":
+            return logo
+        alpha = logo.split()[3]
+        bbox = alpha.getbbox()          # tight box of every non-zero-alpha pixel
+        if bbox and (bbox[2] - bbox[0]) > 0 and (bbox[3] - bbox[1]) > 0:
+            return logo.crop(bbox)
+    except Exception:
+        pass
+    return logo
+
+
+def _fit_into(logo, box_w, box_h, pad_frac=0.06):
+    # Trim the baked-in transparent margin FIRST so the real mark fills the zone,
+    # then scale to the safe zone with a small breathing pad (0.06, was 0.14 — the
+    # logos were reading tiny). Scales up small marks and down large ones alike.
+    logo = _trim_transparent(logo)
     pad_w, pad_h = int(box_w * pad_frac), int(box_h * pad_frac)
     avail_w, avail_h = box_w - 2 * pad_w, box_h - 2 * pad_h
     lw, lh = logo.size
