@@ -139,3 +139,57 @@ def test_site_fetch_failure_is_not_found(tmp_path):
     res = ws.fetch_logo("https://nope.gym", "acme_ig", out_dir=str(tmp_path),
                         fetch_html=boom)
     assert not res.ok and "fetch failed" in res.note
+
+
+# ---- SVG rasterization + small-logo upscaling (2026-08-13: pull every logo) -------
+
+def _svg_bytes(w=300, h=120):
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+            f'<rect width="{w}" height="{h}" fill="#0b1e3c"/>'
+            f'<circle cx="{w//2}" cy="{h//2}" r="{h//3}" fill="#e23b2e"/></svg>'
+            ).encode("utf-8")
+
+
+def test_looks_svg_detects_markup_and_ext():
+    assert ws._looks_svg(_svg_bytes(), ".svg") is True
+    assert ws._looks_svg(_svg_bytes(), "", "image/svg+xml") is True
+    assert ws._looks_svg(_svg_bytes(), "") is True            # sniffed from <svg
+    assert ws._looks_svg(_png_bytes(), ".png") is False
+
+
+def test_svg_logo_is_rasterized_and_accepted(tmp_path):
+    pytest.importorskip("cairosvg")
+    html = '<img src="/brand-logo.svg" class="logo">'
+    images = {"https://gym.com/brand-logo.svg": _svg_bytes()}
+    fh, fb = _fetchers(html, images)
+    # the fetcher returns image/svg+xml content-type
+    def fb_svg(url):
+        if url not in images:
+            raise RuntimeError("404")
+        return images[url], "image/svg+xml"
+    res = ws.fetch_logo("https://gym.com", "svgtest",
+                        out_dir=str(tmp_path), fetch_html=fh, fetch_bytes=fb_svg)
+    assert res.ok, res.note
+    assert "svg" in res.source                                # rasterized path
+    assert max(Image.open(res.path).size) >= ws.MIN_LONG_EDGE
+
+
+def test_small_raster_logo_is_accepted_and_upscaled(tmp_path):
+    # a real ~150px brand mark (fills its frame on a colored bg) used to be rejected as
+    # "too small"; now accepted + upscaled. Navy bg so knockout is a no-op and trim keeps it.
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (150, 110), (11, 30, 60, 255))
+    ImageDraw.Draw(img).ellipse([20, 15, 130, 95], fill=(226, 59, 46, 255))
+    buf = io.BytesIO(); img.save(buf, "PNG")
+    html = '<img src="/logo.png" class="logo">'
+    fh, fb = _fetchers(html, {"https://gym.com/logo.png": buf.getvalue()})
+    res = ws.fetch_logo("https://gym.com", "smalltest",
+                        out_dir=str(tmp_path), fetch_html=fh, fetch_bytes=fb)
+    assert res.ok, res.note
+    assert max(Image.open(res.path).size) >= ws.UPSCALE_TO    # upscaled to fill the zone
+
+
+def test_upscale_never_downscales():
+    from PIL import Image as _I
+    big = _I.new("RGBA", (800, 600))
+    assert ws._upscale_to(big).size == (800, 600)             # already large -> unchanged

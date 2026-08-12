@@ -36,9 +36,16 @@ from . import config
 
 # --- constants ---------------------------------------------------------------
 _UA = ("Mozilla/5.0 (compatible; LASSO-Echo/1.0; +https://lassoframework.com)")
-MIN_LONG_EDGE = 200          # anything smaller is a favicon / icon, rejected
+# A real on-page logo can be smaller than a hero image; favicons are excluded by URL
+# pattern (_is_favicon) regardless of size, so a low floor here admits small BRAND
+# logos (e.g. a 120px header mark) without admitting favicons. Anything accepted that
+# is under UPSCALE_TO is upscaled with LANCZOS so it fills the card zone cleanly.
+MIN_LONG_EDGE = 90
+UPSCALE_TO = 360             # upscale an accepted-but-small logo to at least this long edge
+SVG_RASTER_EDGE = 640        # SVG is vector: rasterize crisp at this size
 _FAVICON_HINT = re.compile(r"favicon|/icon[s]?/|apple-touch-icon-precomposed", re.I)
 _RASTER_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+_SVG_EXT = (".svg",)
 
 # Third-party domains that host affiliate badges / franchise marks — never the gym's own logo
 _BLOCKED_LOGO_DOMAINS = frozenset([
@@ -197,14 +204,48 @@ def _is_favicon(url):
     return False
 
 def _load_raster(data):
-    """Bytes -> RGBA PIL image, or None if it is not a raster image we handle
-    (e.g. an SVG, which we cannot rasterize without an extra dependency)."""
+    """Bytes -> RGBA PIL image, or None if it is not a raster image we handle."""
     try:
         img = Image.open(io.BytesIO(data))
         img.load()
         return img.convert("RGBA")
     except Exception:
         return None
+
+
+def _looks_svg(data, ext, ctype=""):
+    """True when the bytes are an SVG (by extension, content-type, or a leading
+    <svg / <?xml marker)."""
+    if ext in _SVG_EXT or "svg" in (ctype or "").lower():
+        return True
+    head = data[:256].lstrip() if isinstance(data, (bytes, bytearray)) else b""
+    return head[:5].lower() == b"<?xml" and b"<svg" in data[:2048].lower() \
+        or head[:4].lower() == b"<svg"
+
+
+def _rasterize_svg(data, edge=SVG_RASTER_EDGE):
+    """Rasterize SVG bytes to an RGBA PIL image at `edge` on the long side, crisp.
+    Uses cairosvg (system cairo is present on Railway); returns None if the lib is
+    absent or the SVG is unparseable, so the caller falls through to the next
+    candidate — never a crash."""
+    try:
+        import cairosvg  # lazy; graceful if unavailable
+        png = cairosvg.svg2png(bytestring=data, output_width=edge, output_height=edge)
+        return _load_raster(png)
+    except Exception:
+        return None
+
+
+def _upscale_to(img, target=UPSCALE_TO):
+    """Upscale a small logo so its long edge is at least `target` (LANCZOS). Never
+    downscales here (the fit step handles that); a logo already >= target is returned
+    unchanged."""
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge >= target or long_edge <= 0:
+        return img
+    scale = target / long_edge
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 
 def _knockout_bg(img, tol=12):
@@ -285,8 +326,8 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
         if _is_favicon(url):
             tried.append((why, "favicon-only, skipped"))
             continue
-        if ext and ext not in _RASTER_EXT and ext != "":
-            # e.g. .svg we cannot rasterize without a new dependency
+        is_svg_ext = ext in _SVG_EXT
+        if ext and ext not in _RASTER_EXT and not is_svg_ext:
             tried.append((why, f"unsupported {ext}"))
             continue
         try:
@@ -294,17 +335,25 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
         except Exception as e:
             tried.append((why, f"download failed: {e}"))
             continue
-        img = _load_raster(data)
-        if img is None:
-            tried.append((why, "not a raster image"))
-            continue
+        # SVG (vector) -> rasterize crisp; otherwise load the raster bytes.
+        if is_svg_ext or _looks_svg(data, ext, _ctype):
+            img = _rasterize_svg(data)
+            if img is None:
+                tried.append((why, "svg rasterize failed (cairosvg?)"))
+                continue
+            why = f"{why}(svg)"
+        else:
+            img = _load_raster(data)
+            if img is None:
+                tried.append((why, "not a raster image"))
+                continue
         if max(img.size) < MIN_LONG_EDGE:
             tried.append((why, f"too small {img.size}"))
             continue
         # og:image is typically a landscape hero photo — reject very wide OR very large images.
         # Rationale: fitness og:images are almost always athlete shots; logos are small and
         # square-ish. Anything > 1400px on the long edge is a banner or full-bleed photo.
-        if why == "og:image" and img.size[1] > 0:
+        if why.startswith("og:image") and img.size[1] > 0:
             ratio = img.size[0] / img.size[1]
             if ratio > 2.2 or max(img.size) > 1400:
                 tried.append((why, f"landscape photo rejected ({img.size[0]}×{img.size[1]})"))
@@ -336,6 +385,9 @@ def fetch_logo(website_url, account_key, override_path=None, out_dir=None,
             if white_count / len(opaque_px) > 0.40:
                 tried.append((why, f"white-on-plate logo ({white_count/len(opaque_px):.0%} white opaque)"))
                 continue
+        # A small-but-real logo is upscaled so it fills the card zone cleanly instead
+        # of reading tiny (SVG already rendered large, so this is a no-op for it).
+        img = _upscale_to(img)
         img.save(dest)
         return LogoResult(STATUS_OK, dest, why, img.size)
 
