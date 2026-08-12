@@ -1,0 +1,12 @@
+# System libraries the Python image needs beyond the auto-detected defaults.
+# cairo + pango + gdk-pixbuf back cairosvg (cairocffi), which rasterizes SVG gym
+# logos in the welcome pipeline (agent/website_scan.py). aptPkgs are ADDITIVE, so
+# this does not disturb the Nixpacks-detected Python toolchain.
+[phases.setup]
+aptPkgs = [
+  "libcairo2",
+  "libpango-1.0-0",
+  "libpangocairo-1.0-0",
+  "libgdk-pixbuf-2.0-0",
+  "libffi-dev",
+]
