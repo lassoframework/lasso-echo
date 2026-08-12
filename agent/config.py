@@ -818,6 +818,15 @@ def zernio_publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
 
 
+def welcome_digest_enabled() -> bool:
+    """
+    Daily NEW-CLIENT welcome digest to Slack: one message a day listing every new
+    client's welcome post (template caption + hosted feed image), today's served one
+    plus everything queued. Read-only visibility over welcome_queue; OFF by default.
+    """
+    return _truthy(os.environ.get("AGENT_WELCOME_DIGEST", "false"))
+
+
 def catchup_report_enabled() -> bool:
     """
     Daily new-client CATCH-UP Slack report (Blake, 2026-08-12): one message a day
