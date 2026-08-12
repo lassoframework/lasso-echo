@@ -171,6 +171,7 @@ def _status():
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  catchup_report : {config.catchup_report_enabled()}  (env AGENT_CATCHUP_REPORT)")
+    print(f"  welcome_digest : {config.welcome_digest_enabled()}  (env AGENT_WELCOME_DIGEST)")
     print(f"  opus_factory   : {config.opus_factory_enabled()}  (env AGENT_OPUS_FACTORY_ENABLED)")
     print(f"  clipper        : {config.clipper_enabled()}  (env AGENT_CLIPPER_ENABLED)")
     print(f"  clipper_render : {config.clipper_render_enabled()}  (env AGENT_CLIPPER_RENDER_ENABLED)")

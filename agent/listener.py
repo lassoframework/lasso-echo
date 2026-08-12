@@ -367,6 +367,14 @@ def _daily_scheduler(store):
             catchup_report.run_daily()
         except Exception as e:
             print(f"[catchup] daily report failed: {type(e).__name__}: {e}")
+        # New-client WELCOME digest: one Slack message a day showing every new client's
+        # welcome post (template caption + hosted image), today's + queued. Flag-gated
+        # inside, self-deduped per day, read-only; an error never kills the loop.
+        try:
+            from . import welcome_digest
+            welcome_digest.run_daily()
+        except Exception as e:
+            print(f"[welcome-digest] daily post failed: {type(e).__name__}: {e}")
         # Intake ingest: dormant unless AGENT_INTAKE_ENABLED. Runs INSIDE this
         # listener (the one process with /data + R2); an error never kills the loop.
         if config.intake_enabled() and time.monotonic() - last_ingest >= ingest_every:
