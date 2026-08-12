@@ -99,10 +99,13 @@ def handle_action(action, draft, actor_slack_id, note="",
                                    "Use the newest card instead.")
 
     if draft.status == DraftStatus.EXPIRED:
-        # An expired draft can never publish. Same friendly no-op as a supersede.
-        return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
-                            detail="This draft expired (its posting day has passed), "
-                                   "so nothing was published. Use today's card instead.")
+        if (action or "").lower() != "approve":
+            # Non-approve actions on expired drafts are no-ops.
+            return ActionResult(ok=False, action=action, draft_id=draft.draft_id,
+                                detail="This draft expired (its posting day has passed). "
+                                       "Use today's card instead.")
+        # approve on an expired draft: publish immediately (the post goes out now,
+        # the past scheduled_for date is ignored). Fall through to approve logic below.
 
     action = (action or "").lower()
 

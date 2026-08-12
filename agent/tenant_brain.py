@@ -109,6 +109,44 @@ def deny_reasons(tenant_key, base_dir=None):
             if e["kind"] == "deny_reason" and e.get("reason")]
 
 
+def edit_examples(tenant_key, base_dir=None, limit=5):
+    """
+    Recent (before, after) caption edit pairs this tenant's approver made, in
+    order, capped to the most recent `limit`. This is the CORE learning signal:
+    each pair shows how this gym likes a machine draft revised, so the drafter
+    can move its next caption toward the approver's taste and get better every
+    time an edit lands.
+
+    FABRICATION-SAFE, same contract as prompt_notes: the `after` text (what the
+    human approved) must pass the fabrication gate (rotation.is_gate_clean). A
+    pair whose after-text carries a claim no approved source clears is SKIPPED,
+    so an edit example can never smuggle an unverified number into a prompt.
+    Empty while the flag is OFF.
+    """
+    if not config.tenant_brain_enabled():
+        return []
+    from . import rotation
+    out = []
+    for e in read_events(tenant_key, base_dir):
+        if e["kind"] != "edit_diff":
+            continue
+        after = (e.get("after") or "").strip()
+        before = (e.get("before") or "").strip()
+        if not after:
+            continue
+        # BOTH sides must clear the fabrication gate: the after (human-approved
+        # text) AND the before (a prior draft that could carry a legacy claim).
+        # A pair where either side has an uncleared claim is dropped whole, so an
+        # edit example can never surface a %, $N, or Nx the sources don't clear.
+        if not rotation.is_gate_clean(after) or not rotation.is_gate_clean(before):
+            print(f"[brain] {tenant_key}: an edit example carries an uncleared "
+                  "claim and was SKIPPED from prompts (the gate stays the sole "
+                  "authority on claims).")
+            continue
+        out.append((before, after))
+    return out[-limit:] if limit else out
+
+
 def prompt_notes(tenant_key, base_dir=None):
     """
     The brain lines drafting folds into prompts: style rules + deny reasons.

@@ -176,6 +176,133 @@ def variant_hashtags(platform, hashtags):
     return tags[:TemplateGenerator.HASHTAG_LIMIT]
 
 
+def _call_llm_caption(system, user):
+    """Call Claude for SB7 caption generation. Raises on missing key or SDK."""
+    import os as _os
+    from . import config as _cfg
+    key = _os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    try:
+        import anthropic
+    except Exception:
+        raise RuntimeError("anthropic SDK not installed")
+    client = anthropic.Anthropic(api_key=key)
+    resp = client.messages.create(
+        model=_cfg.sb7_model(), max_tokens=400,
+        system=system, messages=[{"role": "user", "content": user}])
+    parts = getattr(resp, "content", []) or []
+    return "".join(getattr(p, "text", "") or "" for p in parts)
+
+
+class StoryBrandGenerator:
+    """
+    LLM-powered caption generator using the StoryBrand SB7 framework.
+
+    Applies the framework structure (customer as hero, problem-first, gym as guide,
+    one clear CTA) while drawing ONLY from the approved voice doc and the client's
+    note. No invented facts, stats, prices, or offers ever.
+
+    Falls back to TemplateGenerator silently on any LLM failure so the card
+    always gets a caption. Gated behind AGENT_SB7_ENABLED (OFF by default).
+    """
+
+    HASHTAG_LIMIT = 5
+
+    _SYSTEM = (
+        "You are a direct-response social media copywriter for a boutique gym or "
+        "fitness studio. Write captions using StoryBrand SB7 principles:\n"
+        "  Hero = the customer (busy professional, beginner, lifestyle seeker, 40+ reclaim)\n"
+        "  Problem = their real pain (time, energy, stuck, overwhelmed)\n"
+        "  Guide = the gym signals brief empathy then authority\n"
+        "  Plan = one implied simple step from the creative\n"
+        "  CTA = provided separately; do NOT include it in the body\n\n"
+        "HARD RULES:\n"
+        "- Draw ONLY from the brand voice doc and client note provided. No invented "
+        "facts, stats, prices, or offers.\n"
+        "- No em dashes, en dashes, or hyphens used as punctuation dashes.\n"
+        "- Lead with the customer's problem. Be punchy and direct.\n"
+        "- Body max 260 characters (hashtags and CTA appended separately).\n"
+        "- Output ONLY the caption body text. No CTA. No hashtags. No quotes.\n"
+        "- Never mention specific numbers, percentages, or prices unless they appear "
+        "verbatim in the client note."
+    )
+
+    @staticmethod
+    def _brain_guidance(account):
+        """Fold THIS gym's learned preferences into the prompt so every edit
+        makes the next caption better. Two signals, both fabrication-gated at the
+        source (tenant_brain), so nothing here can introduce an unverified claim:
+
+          - deny reasons + style notes  (tenant_brain.prompt_notes, deduped)
+          - past before/after edits      (tenant_brain.edit_examples)
+
+        Returns "" when there is no account, the brain flag is OFF, or nothing
+        has been learned yet, so a brand-new gym behaves exactly as before."""
+        if account is None:
+            return ""
+        key = getattr(account, "key", "") or ""
+        if not key:
+            return ""
+        try:
+            from . import tenant_brain
+            # dedupe prompt_notes preserving order (the edit path records a
+            # generic "style preference" rule, so raw notes repeat; collapse them)
+            seen, notes = set(), []
+            for n in tenant_brain.prompt_notes(key):
+                if n not in seen:
+                    seen.add(n)
+                    notes.append(n)
+            examples = tenant_brain.edit_examples(key)
+        except Exception as exc:
+            print(f"[sb7] brain guidance unavailable ({type(exc).__name__}: {exc})")
+            return ""
+        if not notes and not examples:
+            return ""
+        parts = ["THIS GYM'S LEARNED PREFERENCES (style guidance only, NEVER a "
+                 "source of facts):"]
+        for n in notes:
+            parts.append(f"- {n}")
+        if examples:
+            parts.append("Recent edits this gym's approver made. Learn the STYLE "
+                         "shift they prefer; do NOT copy any specific facts from them:")
+            for before, after in examples:
+                if before:
+                    parts.append(f"  BEFORE: {before}")
+                parts.append(f"  AFTER (preferred): {after}")
+        return "\n".join(parts) + "\n\n"
+
+    def build(self, voice, creative, account=None):
+        client_note = (creative.client_note or "").strip()
+        cta = _pick_cta(voice, creative)
+        hashtags = _select_hashtags(voice, creative)
+
+        if not client_note:
+            return TemplateGenerator().build(voice, creative)
+
+        guidance = self._brain_guidance(account)
+        user = (
+            f"BRAND VOICE DOC:\n{voice.raw}\n\n"
+            f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
+            f"{guidance}"
+            "Write a StoryBrand-structured caption body. Problem-first. "
+            "Gym as guide, not hero. Max 260 characters. Caption body only."
+        )
+        try:
+            body = (_call_llm_caption(self._SYSTEM, user) or "").strip()
+            if not body:
+                raise ValueError("empty LLM response")
+            fragments = [body]
+            if cta and not _caption_has_cta(body, voice):
+                fragments.append(cta)
+            caption = "\n\n".join(fragments).strip()
+            return caption, hashtags, fragments
+        except Exception as exc:
+            print(f"[sb7] LLM caption failed ({type(exc).__name__}: {exc}), "
+                  "falling back to template")
+            return TemplateGenerator().build(voice, creative)
+
+
 class TemplateGenerator:
     """
     Deterministic, zero-fabrication caption builder (the safe Stage 1 baseline).
@@ -190,7 +317,9 @@ class TemplateGenerator:
     HASHTAG_LIMIT = 5
     GROWTH_CTA_HINTS = ("save", "tag", "share", "dm", "send")
 
-    def build(self, voice, creative):
+    def build(self, voice, creative, account=None):
+        # account is accepted for a uniform generator interface but ignored: the
+        # deterministic template never leans on learned preferences.
         fragments = []
 
         # 1. Client note (the core body — verbatim, no fabrication)
@@ -276,7 +405,9 @@ def draft_post(account, creative, scheduled_for, voice=None,
             blocked_reason="Fabrication gate (pixels): " + gate_reason,
         )
 
-    gen = generator or TemplateGenerator()
+    if generator is None:
+        generator = StoryBrandGenerator() if config.sb7_enabled() else TemplateGenerator()
+    gen = generator
 
     cta_type = cta_url = ""
     topic_type = "STANDARD"
@@ -312,7 +443,9 @@ def draft_post(account, creative, scheduled_for, voice=None,
         plan_category = plan.get("category", "")
         plan_sub_topic = plan.get("sub_topic", "")
     else:
-        caption, hashtags, fragments = gen.build(voice, creative)
+        # Pass the account so the SB7 generator can fold in this gym's learned
+        # preferences (edits, deny reasons). TemplateGenerator ignores it.
+        caption, hashtags, fragments = gen.build(voice, creative, account=account)
 
     # Caption standard (section 9): a draft with no caption text cannot enter the
     # approval queue — the content brain or generator returned nothing usable.

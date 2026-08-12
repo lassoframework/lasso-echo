@@ -10,6 +10,7 @@ is kept as an INACTIVE record (personal-profile publishing ended in 2018). Edit
 ACCOUNTS or override the target ids via env. Tokens are set by Blake's own hand.
 """
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -143,6 +144,48 @@ ACCOUNTS = [
         active=False,                # arm after tokens + voice doc are filled
         # trust defaults to FULL_APPROVAL (level 0). Do not change here.
     ),
+    # CrossFit and HYROX ENG (Dale Suslick, Cape Coral FL). Onboarded on the ad-ops
+    # portal since 2026-06 AND filled out the DFY social intake 2026-08-09, but that
+    # intake was captured with echo_forwarded=false / echo_status=not_routed, so it
+    # never reached Echo (no account, no voice doc). These two entries close that gap.
+    # Voice doc + social proof are built from ENG's OWN verbatim intake. Still inactive:
+    # arm only after the IG/FB tokens + ids are set BY HAND in Railway env under the
+    # names below, and Dale confirms the voice doc. IG is the generation account; FB
+    # mirrors. base tenant key "eng" = the library prefix content_library/eng.
+    Account(
+        key="eng_ig",
+        display_name="CrossFit and HYROX ENG IG",
+        platform=Platform.INSTAGRAM,
+        token_env="AGENT_ENG_IG_TOKEN",
+        target_id_env="AGENT_ENG_IG_ID",
+        voice_doc="brand_voice/eng/lasso_voice.md",
+        social_proof_doc="brand_voice/eng/social_proof.md",
+        library_prefix="content_library/eng",
+        slack_channel="",            # the client's approval channel id, by hand
+        approvers=[],                # approver Slack ids, by hand
+        active=False,                # Client gyms stay active=False (like gritx/topfuel):
+                                     # they post via the CLIENT path (draft-on-upload +
+                                     # portal/client-month), NOT LASSO's daily run. ARMED
+                                     # for ENG 2026-08-12 via AGENT_DRAFT_ON_UPLOAD; publish
+                                     # needs AGENT_ENG_IG_TOKEN/ID + AGENT_PUBLISH_ENABLED.
+        # trust defaults to FULL_APPROVAL (level 0). Do not change here.
+    ),
+    Account(
+        key="eng_fb",
+        display_name="CrossFit and HYROX ENG Facebook Page",
+        platform=Platform.FACEBOOK_PAGE,
+        token_env="AGENT_ENG_FB_TOKEN",
+        target_id_env="AGENT_ENG_FB_PAGE_ID",
+        voice_doc="brand_voice/eng/lasso_voice.md",
+        social_proof_doc="brand_voice/eng/social_proof.md",
+        library_prefix="content_library/eng",
+        slack_channel="",            # the client's approval channel id, by hand
+        approvers=[],                # approver Slack ids, by hand
+        active=False,                # Client gym: posts via the client path, not LASSO's
+                                     # daily run. Publish needs AGENT_ENG_FB_TOKEN/PAGE_ID
+                                     # + AGENT_PUBLISH_ENABLED.
+        # trust defaults to FULL_APPROVAL (level 0). Do not change here.
+    ),
     # ---- CLIENT gyms (social-intake onboarded). These draft the month from their OWN
     # uploaded photos/videos paired with their OWN approved sources (client_month_run),
     # behind AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES. A gym with no uploaded media gets
@@ -211,13 +254,116 @@ ACCOUNTS = [
 ]
 
 
+# ---- Dynamic client-account registry (AGENT_DYNAMIC_ACCOUNTS, default OFF) ---------
+# Scales onboarding to 100+ gyms without hand-editing this file: client-gym Account
+# records are loaded from a persisted JSON registry and MERGED with the hardcoded
+# ACCOUNTS above. Flag OFF -> the registry is never read, so behavior is byte-for-byte
+# today's. Auto-created accounts are ALWAYS inactive (client gyms post via the client /
+# draft-on-upload path, not LASSO's daily run); tokens stay by-hand in env; nothing
+# publishes. Hardcoded ACCOUNTS always WIN on a key collision (never shadowed).
+_dynamic_cache = None  # list[Account] | None; None = not yet loaded this process
+
+
+def _account_from_registry_row(row):
+    """Build one INACTIVE client Account from a registry row. Standard conventions:
+    key <base>_ig / <base>_fb, token/id env names AGENT_<BASE>_IG_TOKEN etc., voice
+    doc + library under brand_voice/<base>/ and content_library/<base>."""
+    base = (row.get("base") or "").strip()
+    if not base:
+        return []
+    name = (row.get("name") or base).strip()
+    up = base.upper()
+    return [
+        Account(
+            key=f"{base}_ig", display_name=f"{name} IG",
+            platform=Platform.INSTAGRAM,
+            token_env=f"AGENT_{up}_IG_TOKEN", target_id_env=f"AGENT_{up}_IG_ID",
+            voice_doc=f"brand_voice/{base}/lasso_voice.md",
+            social_proof_doc=f"brand_voice/{base}/social_proof.md",
+            library_prefix=f"content_library/{base}",
+            active=False,
+        ),
+        Account(
+            key=f"{base}_fb", display_name=f"{name} Facebook Page",
+            platform=Platform.FACEBOOK_PAGE,
+            token_env=f"AGENT_{up}_FB_TOKEN", target_id_env=f"AGENT_{up}_FB_PAGE_ID",
+            voice_doc=f"brand_voice/{base}/lasso_voice.md",
+            social_proof_doc=f"brand_voice/{base}/social_proof.md",
+            library_prefix=f"content_library/{base}",
+            active=False,
+        ),
+    ]
+
+
+def _load_registry_rows():
+    from . import config
+    path = config.gym_registry_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _dynamic_accounts():
+    """Dynamic client accounts, cached per process. Empty when the flag is OFF.
+    The cache is keyed on the registry path so a runtime path change never serves
+    stale rows from a different registry (defense in depth; single-registry in prod)."""
+    global _dynamic_cache
+    from . import config
+    if not config.dynamic_accounts_enabled():
+        return []
+    path = config.gym_registry_path()
+    if _dynamic_cache is None or _dynamic_cache[0] != path:
+        hardcoded = {a.key for a in ACCOUNTS}
+        out = []
+        for row in _load_registry_rows():
+            for acct in _account_from_registry_row(row):
+                if acct.key not in hardcoded:   # hardcoded always wins
+                    out.append(acct)
+        _dynamic_cache = (path, out)
+    return _dynamic_cache[1]
+
+
+def all_accounts():
+    """Hardcoded ACCOUNTS + dynamic client accounts (when armed)."""
+    return list(ACCOUNTS) + _dynamic_accounts()
+
+
+def register_gym(base, *, name="", ig_handle="", fb_page=""):
+    """Persist one client gym to the dynamic registry so its Account records resolve
+    without hand-editing accounts.py. Idempotent (a re-register updates in place).
+    No-op returning [] when AGENT_DYNAMIC_ACCOUNTS is OFF. Returns the account keys
+    now resolvable for this gym. Tokens are NEVER written here (env, by hand)."""
+    global _dynamic_cache
+    from . import config
+    base = (base or "").strip()
+    if not base or not config.dynamic_accounts_enabled():
+        return []
+    path = config.gym_registry_path()
+    rows = _load_registry_rows()
+    row = {"base": base, "name": (name or base).strip(),
+           "ig_handle": (ig_handle or "").strip(), "fb_page": (fb_page or "").strip()}
+    rows = [r for r in rows if (r.get("base") or "").strip() != base]
+    rows.append(row)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=2)
+    _dynamic_cache = None   # invalidate so the new gym resolves immediately
+    return [f"{base}_ig", f"{base}_fb"]
+
+
 def active_accounts():
     """The accounts the daily runner drafts for: active only (inactive records skipped)."""
-    return [a for a in ACCOUNTS if a.active]
+    return [a for a in all_accounts() if a.active]
 
 
 def get_account(key):
-    for a in ACCOUNTS:
+    for a in all_accounts():
         if a.key == key:
             return a
     return None
