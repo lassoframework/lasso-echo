@@ -360,3 +360,59 @@ def test_publish_client_gyms_self_gates(monkeypatch):
     # all flags off -> no-op, no store touch
     monkeypatch.delenv("AGENT_ZERNIO_PUBLISH", raising=False)
     assert cap.publish_client_gyms("2026-08-13") == []
+
+
+# ---- stale-'publishing' watchdog (alert-only, never reverts) -------------------
+class _SweepStore:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def publishing_rows(self):
+        return list(self._rows)
+
+
+class _KV(dict):
+    def get(self, k, default=""):
+        return dict.get(self, k, default)
+
+    def set(self, k, v):
+        self[k] = v
+
+
+def test_sweep_first_sighting_records_never_alerts():
+    kv, alerts = _KV(), []
+    out = cap.sweep_stuck_publishing(
+        store=_SweepStore([{"id": "s1", "gym_id": "eng", "account": "instagram",
+                            "post_date": "2026-08-13"}]),
+        kv=kv, now="2026-08-13T10:00:00-04:00", alert=alerts.append)
+    assert out == [] and alerts == []
+    assert kv["stuck_publishing_s1"].startswith("2026-08-13T10:00")
+
+
+def test_sweep_alerts_once_past_threshold_and_never_reverts():
+    kv, alerts = _KV(), []
+    kv["stuck_publishing_s1"] = "2026-08-13T07:00:00-04:00"     # first seen 3h ago
+    store = _SweepStore([{"id": "s1", "gym_id": "eng", "account": "instagram",
+                          "post_date": "2026-08-13"}])
+    out = cap.sweep_stuck_publishing(store=store, kv=kv,
+                                     now="2026-08-13T10:00:00-04:00",
+                                     alert=alerts.append)
+    assert out == ["s1"] and len(alerts) == 1
+    assert "stuck in 'publishing'" in alerts[0]
+    assert "NOT auto-reverted" in alerts[0]                      # human decision only
+    assert kv["stuck_publishing_s1"] == "alerted"
+    # second pass: no re-alert
+    out2 = cap.sweep_stuck_publishing(store=store, kv=kv,
+                                      now="2026-08-13T11:00:00-04:00",
+                                      alert=alerts.append)
+    assert out2 == [] and len(alerts) == 1
+
+
+def test_sweep_under_threshold_stays_quiet():
+    kv, alerts = _KV(), []
+    kv["stuck_publishing_s2"] = "2026-08-13T09:30:00-04:00"      # 30 min ago
+    out = cap.sweep_stuck_publishing(
+        store=_SweepStore([{"id": "s2", "gym_id": "eng", "account": "facebook",
+                            "post_date": "2026-08-13"}]),
+        kv=kv, now="2026-08-13T10:00:00-04:00", alert=alerts.append)
+    assert out == [] and alerts == []

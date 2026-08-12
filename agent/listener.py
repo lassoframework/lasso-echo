@@ -348,6 +348,10 @@ def _daily_scheduler(store):
                 # AGENT_ZERNIO_PUBLISH (a no-op unless armed); one gym never blocks another.
                 calendar_autopublish.publish_client_gyms(
                     _local_today, notifier=ops_alerts._default_poster())
+                # Stale-'publishing' watchdog (alert-only, never reverts): a worker
+                # that died between the claim and the publish leaves a row stuck;
+                # this surfaces it to a human instead of silent forever-orphaning.
+                calendar_autopublish.sweep_stuck_publishing()
             except Exception as e:
                 print(f"[calendar-autopublish] slot-fire lane failed: "
                       f"{type(e).__name__}: {e}")

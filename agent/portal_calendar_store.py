@@ -222,6 +222,26 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return len(rows) == 1
 
+    def publishing_rows(self):
+        """Every row currently stuck in status='publishing' with no published_at,
+        across all gyms (read-only; feeds the stale-claim ALERT sweep). A row lives
+        in 'publishing' only for the seconds between the atomic claim and the
+        publish result, so anything seen here across sweeps is a crashed worker."""
+        params = {
+            "status": "eq.publishing",
+            "published_at": "is.null",
+            "select": "id,gym_id,account,post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def mark_published(self, row_id, media_id, published_at):
         """
         Record a successful publish: status='published', published_at=<now iso>,

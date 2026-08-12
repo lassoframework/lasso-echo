@@ -57,8 +57,10 @@ def _row(row_id, account="instagram", fmt="feed", post_date=RUN_DATE,
 class _FakeStore:
     """
     In-memory content_calendar. due_rows honors the run-date + unpublished filter;
-    mark_publishing is an ATOMIC claim (only status=='pending' AND no published_at
-    wins). A `claim_returns` override lets a test simulate a lost race.
+    mark_publishing is an ATOMIC claim mirroring the REAL store's precondition
+    (status in (pending, approved) AND no published_at wins — 'approved' became
+    claimable with the Zernio client lane). A `claim_returns` override lets a test
+    simulate a lost race.
     """
 
     def __init__(self, rows, claim_returns=None):
@@ -92,7 +94,8 @@ class _FakeStore:
                 self.rows[row_id]["status"] = "publishing"
             return won
         r = self.rows.get(row_id)
-        if not r or r.get("status") != "pending" or r.get("published_at"):
+        if not r or r.get("status") not in ("pending", "approved") \
+                or r.get("published_at"):
             return False
         r["status"] = "publishing"
         return True

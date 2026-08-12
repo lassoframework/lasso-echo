@@ -448,6 +448,74 @@ def client_gym_bases():
     return bases
 
 
+# Stale-'publishing' ALERT sweep (audit MEDIUM): a worker that dies between the
+# atomic claim and the publish result leaves its row in 'publishing' forever —
+# silent, unrecoverable, and invisible to the client. This sweep NEVER auto-reverts
+# (in the mark_published-write-failure case the post actually went out; a revert
+# would double-publish). It only ALERTS a human, once per row: first sighting
+# records the time in kv; a row still stuck past the threshold alerts and is
+# marked so it never re-alerts.
+
+STALE_PUBLISHING_SECONDS = 2 * 3600   # 2h: far beyond the seconds-wide claim window
+
+
+def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
+    """Alert (once per row) on any row stuck in 'publishing' past the threshold.
+    Read-only on the calendar; never reverts, never publishes. Returns the row ids
+    alerted this pass. All I/O injectable for tests."""
+    if store is None:
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+    if kv is None:
+        kv = _kv_default()
+    if alert is None:
+        from .ops_alerts import alert as _alert
+        alert = _alert
+    now_dt = _local_now(now)
+    alerted = []
+    try:
+        rows = store.publishing_rows() or []
+    except Exception as e:
+        print(f"[calendar-autopublish] stale-publishing sweep read failed: "
+              f"{type(e).__name__}: {e}")
+        return alerted
+    for row in rows:
+        rid = row.get("id")
+        if not rid:
+            continue
+        key = f"stuck_publishing_{rid}"
+        try:
+            seen = kv.get(key, "")
+        except Exception:
+            seen = ""
+        if seen == "alerted":
+            continue                              # already alerted, human owns it
+        if not seen:
+            try:
+                kv.set(key, now_dt.isoformat())   # first sighting: start the clock
+            except Exception:
+                pass
+            continue
+        try:
+            first = datetime.fromisoformat(seen)
+        except ValueError:
+            continue
+        if (now_dt - first).total_seconds() < STALE_PUBLISHING_SECONDS:
+            continue
+        alert(f"calendar row {rid} (gym {row.get('gym_id')}, {row.get('account')}, "
+              f"{row.get('post_date')}) has been stuck in 'publishing' for over "
+              f"{STALE_PUBLISHING_SECONDS // 3600}h — a worker likely died mid-"
+              "publish. NOT auto-reverted (the post may have gone out; a revert "
+              "could double-post). Check the account's feed: if the post is live, "
+              "mark the row published by hand; if not, flip it back to approved.")
+        try:
+            kv.set(key, "alerted")
+        except Exception:
+            pass
+        alerted.append(rid)
+    return alerted
+
+
 def publish_client_gyms(run_date, *, store=None, notifier=None, now=None):
     """Publish every client gym's APPROVED, due calendar rows to the gym's OWN IG/FB
     via Zernio, scheduled at each row's slot time. Self-gating: publish_due checks
