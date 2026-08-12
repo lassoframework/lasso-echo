@@ -297,9 +297,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 result = zernio_publish(
                     draft, account, scheduled_for=scheduled_iso_for_row(row, now))
         except Exception as e:
-            # A real publish error: revert the claim so it retries next run.
+            # A real publish error: revert the claim so it retries next run. A CLIENT
+            # row (approved_only) reverts to 'approved' so a transient failure never
+            # forces the client to re-approve; LASSO reverts to 'pending' (unchanged).
             try:
-                store.mark_publish_failed(row_id)
+                store.mark_publish_failed(
+                    row_id, revert_status="approved" if approved_only else "pending")
             except Exception as re:
                 print(f"[calendar-autopublish] revert failed for row {row_id}: "
                       f"{type(re).__name__}: {re}")
@@ -327,7 +330,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             published_accounts.add(account.key)
         else:
             try:
-                store.mark_publish_failed(row_id)
+                store.mark_publish_failed(
+                    row_id, revert_status="approved" if approved_only else "pending")
             except Exception as e:
                 print(f"[calendar-autopublish] revert failed for row {row_id}: "
                       f"{type(e).__name__}: {e}")

@@ -190,17 +190,21 @@ class SupabaseCalendarStore:
     def mark_publishing(self, row_id):
         """
         ATOMIC CLAIM (the exactly-once guard). Conditionally flip status
-        'pending' -> 'publishing' for this row ONLY IF it is still unclaimed and
-        unpublished: the PATCH carries a filter of id=eq.<row_id> AND status=eq.pending
-        AND published_at=is.null, so PostgREST updates the row server-side only when
-        the pre-conditions still hold. Returns True only when THIS call won the claim
-        (exactly one row came back); False when the row was already publishing /
-        published / denied / killed (zero rows updated) so the caller SKIPS it. Two
-        concurrent runs can both call this; at most one gets True.
+        'pending'|'approved' -> 'publishing' for this row ONLY IF it is still
+        unclaimed and unpublished: the PATCH carries a filter of id=eq.<row_id> AND
+        status=in.(pending,approved) AND published_at=is.null, so PostgREST updates
+        the row server-side only when the pre-conditions still hold. 'approved' is
+        claimable because a CLIENT-gym row is approved by the client BEFORE the
+        publish lane picks it up (the client publish lane only feeds approved rows);
+        exactly-once is unchanged: a claimed row is 'publishing', which is not in the
+        allowed set, so it can never be claimed twice. Returns True only when THIS
+        call won the claim (exactly one row came back); False when the row was
+        already publishing / published / denied / killed (zero rows updated) so the
+        caller SKIPS it. Two concurrent runs can both call this; at most one gets True.
         """
         params = {
             "id": f"eq.{row_id}",
-            "status": "eq.pending",
+            "status": "in.(pending,approved)",
             "published_at": "is.null",
         }
         r = self._client().patch(
@@ -244,13 +248,18 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return rows[0] if rows else None
 
-    def mark_publish_failed(self, row_id):
+    def mark_publish_failed(self, row_id, revert_status="pending"):
         """
         REVERT a claim after a publish failure (or a would_publish result): status
-        back to 'pending' so the row is retried on the next run. Records NOTHING else
-        (no media id, no published_at), so a failed attempt never looks published.
-        Filtered by id only. Returns the updated row or None.
+        back to `revert_status` so the row is retried on the next run. LASSO rows
+        revert to 'pending' (the default, unchanged). A CLIENT row that was APPROVED
+        before the claim reverts to 'approved' so a transient Zernio failure never
+        forces the client to re-approve. Records NOTHING else (no media id, no
+        published_at), so a failed attempt never looks published. Filtered by id
+        only. Returns the updated row or None.
         """
+        if revert_status not in ("pending", "approved"):
+            revert_status = "pending"
         params = {"id": f"eq.{row_id}"}
         r = self._client().patch(
             self._rest(_TABLE),
@@ -259,7 +268,7 @@ class SupabaseCalendarStore:
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             }),
-            json={"status": "pending"},
+            json={"status": revert_status},
             timeout=30,
         )
         if r.status_code >= 400:

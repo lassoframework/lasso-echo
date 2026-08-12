@@ -224,21 +224,38 @@ def test_scheduled_iso_for_row_builds_slot_timestamp():
 
 
 class FakeStore:
+    """STORE-FAITHFUL fake: mark_publishing enforces the REAL PostgREST claim
+    precondition (status in (pending, approved) AND published_at is null), mirroring
+    SupabaseCalendarStore. This is exactly the contract that masked the approved-row
+    claim bug when the fake blindly returned True — never weaken it."""
+
+    CLAIMABLE = ("pending", "approved")
+
     def __init__(self, rows):
-        self._rows = rows
+        self._rows = {r["id"]: dict(r) for r in rows}
         self.published = []
+        self.reverts = []
 
     def due_rows(self, gym_id, run_date):
-        return [r for r in self._rows if r.get("gym_id") == gym_id]
+        return [dict(r) for r in self._rows.values() if r.get("gym_id") == gym_id]
 
     def mark_publishing(self, row_id):
+        row = self._rows.get(row_id)
+        if not row or row.get("published_at") or \
+                (row.get("status") or "") not in self.CLAIMABLE:
+            return False
+        row["status"] = "publishing"
         return True
 
     def mark_published(self, row_id, media_id, published_at):
+        self._rows[row_id].update(status="published", published_at=published_at,
+                                  late_post_id=media_id)
         self.published.append((row_id, media_id, published_at))
         return {"id": row_id}
 
-    def mark_publish_failed(self, row_id):
+    def mark_publish_failed(self, row_id, revert_status="pending"):
+        self._rows[row_id]["status"] = revert_status
+        self.reverts.append((row_id, revert_status))
         return {"id": row_id}
 
 
@@ -274,6 +291,69 @@ def test_publish_due_skips_unapproved_client_row(monkeypatch):
                           zernio_publish=lambda *a, **k: called.append(1), catch_all=True)
     assert out["published"] == [] and called == []          # pending never published
     assert "r2" in out["waiting"]
+
+
+def test_approved_row_is_claimable_regression(monkeypatch):
+    """REGRESSION for the audit CRITICAL: the claim (mark_publishing) must accept an
+    APPROVED row, or every client approval dies in skipped forever. The store-faithful
+    fake enforces the real precondition, so this test fails if the claim filter ever
+    reverts to pending-only."""
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    rows = [{"id": "rA", "gym_id": "eng", "account": "instagram", "status": "approved",
+             "post_date": "2026-08-13", "format": "feed", "image_url": "https://r2/i.jpg",
+             "caption": "hi"}]
+    store = FakeStore(rows)
+
+    def fake_zernio(draft, account, scheduled_for=None):
+        from agent.zernio_publisher import PublishResult
+        return PublishResult(ok=True, mode="published", media_id="zpA")
+
+    out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
+                          zernio_publish=fake_zernio, catch_all=True)
+    assert out["published"] == ["rA"], f"approved row was not published: {out}"
+
+
+def test_failed_client_publish_reverts_to_approved(monkeypatch):
+    """A transient Zernio failure must revert the CLIENT row to 'approved' (not
+    'pending'), so the client never has to re-approve."""
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    rows = [{"id": "rB", "gym_id": "eng", "account": "instagram", "status": "approved",
+             "post_date": "2026-08-13", "format": "feed", "image_url": "https://r2/i.jpg"}]
+    store = FakeStore(rows)
+
+    def boom(draft, account, scheduled_for=None):
+        raise RuntimeError("zernio 500")
+
+    out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
+                          zernio_publish=boom, catch_all=True)
+    assert out["failed"] == ["rB"]
+    assert store.reverts == [("rB", "approved")]           # NOT pending
+    assert store._rows["rB"]["status"] == "approved"       # ready to retry, no re-approve
+
+
+def test_exactly_once_across_two_ticks(monkeypatch):
+    """A published row is never re-published on a second tick (published_at set +
+    status published => not claimable)."""
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    rows = [{"id": "rC", "gym_id": "eng", "account": "instagram", "status": "approved",
+             "post_date": "2026-08-13", "format": "feed", "image_url": "https://r2/i.jpg"}]
+    store = FakeStore(rows)
+    calls = []
+
+    def fake_zernio(draft, account, scheduled_for=None):
+        calls.append(1)
+        from agent.zernio_publisher import PublishResult
+        return PublishResult(ok=True, mode="published", media_id="zpC")
+
+    cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
+                    zernio_publish=fake_zernio, catch_all=True)
+    cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
+                    zernio_publish=fake_zernio, catch_all=True)   # second tick
+    assert calls == [1]                                    # exactly one network call
+    assert len(store.published) == 1
 
 
 def test_publish_client_gyms_self_gates(monkeypatch):

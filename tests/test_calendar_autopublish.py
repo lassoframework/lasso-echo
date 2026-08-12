@@ -106,7 +106,7 @@ class _FakeStore:
             r["late_post_id"] = media_id
         return r
 
-    def mark_publish_failed(self, row_id):
+    def mark_publish_failed(self, row_id, revert_status="pending"):
         self.failed_calls.append(row_id)
         r = self.rows.get(row_id)
         if r:
@@ -663,9 +663,12 @@ def test_mark_publishing_atomic_claim_params_and_true_on_one_row():
 
     assert won is True
     _, _url, params, _headers, body = http.calls[0]
-    # the conditional claim: pending + unpublished ONLY
+    # the conditional claim: unclaimed (pending OR client-approved) + unpublished ONLY.
+    # 'approved' became claimable with the Zernio client lane (a client approves BEFORE
+    # the publish lane picks the row up); exactly-once holds because a claimed row is
+    # 'publishing', which is not in the set.
     assert params["id"] == "eq.a"
-    assert params["status"] == "eq.pending"
+    assert params["status"] == "in.(pending,approved)"
     assert params["published_at"] == "is.null"
     assert body == {"status": "publishing"}
 
