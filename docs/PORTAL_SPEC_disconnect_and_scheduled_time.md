@@ -107,3 +107,32 @@ reads it **per gym**: when ON, that gym's approved-or-pending posts publish on t
 at slot time; when OFF, every post waits for the client's approval. No portal change
 needed — just confirm the toggle keeps writing `echo_gym_settings.autonomous` for the
 gym in view.
+
+---
+
+## 3. NON-NEGOTIABLE: never destroy or reword an approved post (portal side)
+
+**Problem it solves:** Dale (CrossFit ENG) approved posts, then on reload they (1) went
+back to "waiting on you", (2) came back with different caption wording, and (3) some
+approved posts disappeared. The Echo-side cause (a nightly rebuild deleting the whole
+gym-month) is **fixed and deployed** — Echo now leaves any human-owned row untouched. The
+portal must uphold the same invariant so it can never re-introduce the bug from its side.
+
+**Invariant:** once a `content_calendar` row has a human-owned status — anything NOT in
+`{pending, draft, queued, null}` (i.e. `approved`, `denied`, `killed`, `published`,
+`publishing`, `failed`) — the portal must **never DELETE it, never re-INSERT over it, and
+never change its `caption`**. The row is frozen at the moment the client acts.
+
+Portal rules:
+- **Approve / deny / kill** must be a `PATCH` that sends **only** `{ status: ... }` (plus
+  an optional note column). Never send `caption`, never delete-and-recreate the row to
+  change status. (Echo's own action endpoints already behave this way — match them.)
+- **Do NOT run any client-side "sync"/"reseed" that deletes or bulk-rewrites
+  `content_calendar` rows.** Only Echo writes the calendar (and it now preserves approvals).
+  If the portal has any such job, remove it or scope it to `status in (pending,draft)`.
+- **Editing a caption** is allowed only when the client themselves edits a *pending* draft.
+  A caption on an approved row is locked; if the client wants to change it, flip it back to
+  pending first (explicit action), then edit.
+
+Acceptance: approve a post → hard-reload → status still Approved, caption byte-identical.
+Wait past the next rebuild tick → still Approved, still same wording, still present.

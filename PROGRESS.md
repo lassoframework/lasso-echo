@@ -6,7 +6,33 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-06
+Last updated: 2026-08-13
+
+---
+
+## Client approvals now HOLD — rebuild never destroys/rewords an approved post (2026-08-13, SHA 5efd78d)
+
+Dale (CrossFit ENG) reported three symptoms of ONE root cause: after approving a post it
+(1) reverted to "waiting on you", (2) came back with different caption wording, and
+(3) approved posts disappeared. The nightly delete-then-insert calendar rebuild (client
+month / real month / demo->real mirror) wiped the whole gym-month — approved rows
+included — and re-inserted fresh `pending` rows with newly generated captions.
+
+### [x] Rebuild preserves human-owned rows (centralized at the store)
+- `portal_calendar_store.delete_month(preserve_human=True)` deletes ONLY wipeable rows
+  (status null/pending/draft/queued) via a PostgREST `or=` status guard.
+- `locked_slots()` + `preserve_and_prune()`: rebuild also SKIPS inserting a row that
+  collides with an already-approved `(post_date,account,format)` slot (no duplicate).
+- All three rebuild lanes route through `preserve_and_prune` before delete+insert.
+- Independent audit (code-analyzer): invariant UPHELD across every write path, no
+  CRITICAL/MAJOR. Guard test pins `_WIPEABLE_STATUSES`. Suite 2550 passed. DEPLOYED.
+- Live-verified ENG publish resolver: Zernio profile + IG + FB + FB page all resolve, so
+  an approved ENG post publishes to his own IG/FB at slot time.
+
+### [ ] Portal side (Vercel) — spec updated, needs Blake/portal team
+- `docs/PORTAL_SPEC_disconnect_and_scheduled_time.md` §3: portal approve/deny must PATCH
+  status only (never caption, never delete-recreate); no client-side calendar reseed.
+  DECISION NEEDED from Blake: assign the portal build to whoever owns the Vercel repo.
 
 ---
 
