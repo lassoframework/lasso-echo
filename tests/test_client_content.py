@@ -195,3 +195,60 @@ def test_run_daily_drafts_client_from_sources(tmp_path, monkeypatch):
     assert d.status == DraftStatus.PENDING
     assert d.category in cs.CLIENT_CATEGORIES     # a client-source draft, not blocked
     assert d.caption.strip()
+
+
+# ---- make_caption: SB7 real caption vs baseline (Dale's "HYROX" fix) ------------
+
+class _Src:
+    def __init__(self, text, cid="s1", citation="intake"):
+        self.text = text
+        self.id = cid
+        self.citation = citation
+
+
+def test_make_caption_uses_sb7_when_enabled(monkeypatch):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    from agent.drafter import StoryBrandGenerator
+    monkeypatch.setattr(
+        StoryBrandGenerator, "build",
+        lambda self, voice, creative, account=None: (
+            "You are busy and stuck. Our HYROX classes meet you where you are. "
+            "Show up prepared.", ["#eng"], ["body"]))
+    voice = VoiceDoc(raw="ENG voice.", hashtags=["#eng"], ctas=["Book now."])
+    acct = Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    cap, tags = client_content.make_caption(acct, _Src("HYROX"), voice, "k")
+    assert "HYROX" in cap and len(cap) > 40, "must be a real caption, not the raw word"
+    assert cap.strip().lower() != "hyrox"
+
+
+def test_make_caption_falls_back_when_sb7_off(monkeypatch):
+    monkeypatch.delenv("AGENT_SB7_ENABLED", raising=False)
+    voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Book now."])
+    acct = Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    cap, tags = client_content.make_caption(acct, _Src("HYROX class"), voice, "k")
+    # baseline: source text + CTA (never fabricated), still not blank
+    assert "HYROX class" in cap and "Book now." in cap
+
+
+def test_make_caption_falls_back_on_sb7_error(monkeypatch):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    from agent.drafter import StoryBrandGenerator
+
+    def boom(self, voice, creative, account=None):
+        raise RuntimeError("LLM down")
+    monkeypatch.setattr(StoryBrandGenerator, "build", boom)
+    voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Book now."])
+    cap, tags = client_content.make_caption(Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID"), _Src("HYROX"),
+                                            voice, "k")
+    assert "HYROX" in cap                       # baseline still produced a caption
+
+
+def test_make_caption_rejects_sb7_echoing_raw_source(monkeypatch):
+    # if SB7 just echoes the one-word source, treat it as no-improvement -> baseline
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    from agent.drafter import StoryBrandGenerator
+    monkeypatch.setattr(StoryBrandGenerator, "build",
+                        lambda self, v, c, account=None: ("HYROX", ["#x"], ["b"]))
+    voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Save this."])
+    cap, _ = client_content.make_caption(Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID"), _Src("HYROX"), voice, "k")
+    assert "Save this." in cap                  # fell back to baseline (which adds CTA)

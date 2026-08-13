@@ -94,6 +94,40 @@ def pick_image(account_key, day_key, library_path, exclude_keys=()):
     return pool[0]
 
 
+class _SourceCreative:
+    """Adapter so the SB7 caption generator (which keys off a creative's client_note +
+    stem) can run on a source-driven client draft: the day's approved fact IS the note
+    SB7 writes a real StoryBrand caption around, grounded in the gym's voice doc."""
+
+    def __init__(self, source, stem):
+        self.client_note = getattr(source, "text", "") or ""
+        self.stem = stem
+        self.path = stem
+
+
+def make_caption(account, source, voice, creative_key):
+    """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
+    caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
+    gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
+    raw one-line source. Any failure or a blank result falls back to compose_caption
+    (the deterministic source+CTA baseline), so a caption is always produced.
+
+    This is the fix for a client post whose caption was just the raw intake word (e.g.
+    'HYROX'): the same SB7 engine LASSO uses now writes every client caption too."""
+    if config.sb7_enabled():
+        try:
+            from .drafter import StoryBrandGenerator
+            cap, tags, _frags = StoryBrandGenerator().build(
+                voice, _SourceCreative(source, creative_key), account=account)
+            cap = (cap or "").strip()
+            if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
+                return filter_platform_copy(cap).strip(), tags
+        except Exception as exc:  # noqa: BLE001 - never block on the LLM
+            print(f"[client-caption] SB7 failed for {account.key} "
+                  f"({type(exc).__name__}); using the baseline")
+    return compose_caption(account, source, voice, creative_key)
+
+
 def compose_caption(account, source, voice, creative_key):
     """Caption from the approved fact (dash/vendor cleaned) + one CTA from the
     account's approved voice doc. Returns (caption, hashtags). The claim content
@@ -186,8 +220,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     image = pick_image(account.key, day_key, library_path,
                        exclude_keys=exclude_keys)
     if image is not None:
-        caption, hashtags = compose_caption(account, source, voice,
-                                            _image_key(image))
+        caption, hashtags = make_caption(account, source, voice,
+                                         _image_key(image))
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -210,8 +244,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         )
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
-    caption, hashtags = compose_caption(account, source, voice,
-                                        f"src_{source.id}")
+    caption, hashtags = make_caption(account, source, voice, f"src_{source.id}")
     # Option A: a source-backed template card, when a generator is wired + armed.
     template_url = template_fn(account, source, day_key) if template_fn else None
     if template_url:
