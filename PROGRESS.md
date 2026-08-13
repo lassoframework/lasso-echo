@@ -81,6 +81,30 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Story look + video previews + publish-now (Dale rounds 4-5, 2026-08-13)
+
+### [x] "I don't see the post to their main feed" (CRITICAL, status honesty)
+A manually-approved client post was handed to Zernio with a FUTURE slot (6:30pm) ->
+Zernio held it 'scheduled' while Echo marked the row 'published' -> green check, empty
+feed. Fix: manual approvals (approved_only) publish NOW; autonomous gyms keep the slot
+drip. Remediated live: deleted the 3 scheduled posts, republished now. Dale confirmed
+Thursday 13th is live.
+
+### [x] "make it story size + add a caption" -> agent/story_image.py (AGENT_STORY_FORMAT)
+Raw photo stories showed centered on black bars, no text. New formatter fills the 9:16
+frame (full photo on a blurred cover background) with the day's approved caption burned
+into a bottom card + gym-name brand line (stories publish empty-body, so text must be on
+the image). Pure Pillow, all local fonts, ENHANCE-only. Flag ARMED. 22 ENG stories
+reformatted live; verified render looks clean.
+
+### [x] "photo preview not present for 14th and future" -> video poster frames
+A video URL in an <img> is blank. action_reel.get_or_make_poster extracts a hosted
+poster; builder sets content_calendar.thumbnail_url; /social serves the poster as the
+display image for video rows (display-only; video still publishes). 21 ENG video rows
+backfilled live; portal confirmed serving posters. New column thumbnail_url.
+
+---
+
 ## Ghost stories + video previews (Dale round 3, 2026-08-13)
 
 ### [x] IG story said "published" but never appeared (CRITICAL, my own 409 mapping)
