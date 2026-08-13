@@ -247,6 +247,40 @@ def _content_key(path):
     return h.hexdigest()[:12]
 
 
+def poster_frame(video_path, out_path, at_sec=1.0, runner=None):
+    """Grab ONE representative frame as a JPG (a video's calendar preview). Tries
+    `at_sec` in, then 0.0 for very short clips. Raises ReelError on total failure."""
+    run = runner or _run
+    for ss in (at_sec, 0.0):
+        try:
+            run(["ffmpeg", "-hide_banner", "-y", "-ss", str(ss), "-i", str(video_path),
+                 "-frames:v", "1", "-q:v", "3", "-vf",
+                 "scale='min(1080,iw)':-2", str(out_path)], "poster")
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                return str(out_path)
+        except ReelError:
+            continue
+    raise ReelError("could not extract a poster frame")
+
+
+def get_or_make_poster(video_path, library_path, *, runner=None, logger=None):
+    """The hosted-ready poster JPG for a video (cached in <library>/reels/), or None
+    on failure. Pure ffmpeg, no flag gate: a video's calendar preview is always safe
+    to make. NEVER raises."""
+    log = logger or (lambda m: print(f"[video-poster] {m}"))
+    try:
+        cache_dir = os.path.join(str(library_path), _REEL_SUBDIR)
+        os.makedirs(cache_dir, exist_ok=True)
+        out = os.path.join(cache_dir, f"{_content_key(video_path)}__poster.jpg")
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+        return poster_frame(video_path, out, runner=runner)
+    except Exception as exc:  # noqa: BLE001 - a missing preview must never block a post
+        log(f"poster failed for {os.path.basename(str(video_path))}: "
+            f"{type(exc).__name__}")
+        return None
+
+
 def get_or_make_reel(video_path, caption, library_path, *, runner=None,
                      prober=None, profiler=None, assembler=None, logger=None):
     """The edited reel for this video (cached), or None when editing is off/failed.

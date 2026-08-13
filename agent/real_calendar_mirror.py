@@ -92,7 +92,7 @@ def _real_row(account_key, draft):
     row id fails with 22P02 and writes 0 rows. The write path is delete-then-insert, and
     /social + the approve/deny actions key off the DB-returned uuid, not the draft id.
     The draft's own id is exposed separately via _row_source_id for the demo-id guard."""
-    return {
+    row = {
         "gym_id": account_key,
         "account": getattr(draft, "platform", "") or "",
         "post_date": _post_date(draft),
@@ -102,6 +102,13 @@ def _real_row(account_key, draft):
         "image_url": getattr(draft, "creative_public_url", "") or "",
         "status": _draft_status(draft),
     }
+    # A video draft's hosted poster frame (display only; the video still publishes),
+    # so the portal calendar shows a real frame instead of a blank card. Omitted when
+    # absent so the column simply stays null.
+    thumb = getattr(draft, "thumbnail_url", "") or ""
+    if thumb:
+        row["thumbnail_url"] = thumb
+    return row
 
 
 def _row_source_id(draft):

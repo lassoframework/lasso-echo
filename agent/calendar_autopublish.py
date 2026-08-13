@@ -304,16 +304,23 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
         try:
             # ROUTE BY GYM: LASSO publishes via the Meta-direct lane (unchanged). A
-            # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio, scheduled at
-            # the row's own slot time so the go-live time is real and visible. The
-            # zernio publisher self-gates on AGENT_ZERNIO_PUBLISH + AGENT_PUBLISH_ENABLED
+            # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio. The zernio
+            # publisher self-gates on AGENT_ZERNIO_PUBLISH + AGENT_PUBLISH_ENABLED
             # (returns would_publish when off), so a client row is never sent live
             # unless both are armed.
+            #
+            # PUBLISH NOW ON MANUAL APPROVAL (approved_only): a client who taps Approve
+            # expects the post LIVE, not scheduled to a later slot the same day — and a
+            # row we hand Zernio with a FUTURE scheduledFor is 'scheduled', not on the
+            # feed yet, while Echo marked it 'published' (Dale: "I don't see the post to
+            # their main feed"). So a manually-approved post publishes immediately.
+            # An AUTONOMOUS gym (approved_only=False) keeps the slot time so its
+            # pending posts still DRIP across the day instead of firing all at once.
             if account.key.startswith("lasso"):
                 result = publisher(draft, account)
             else:
-                result = zernio_publish(
-                    draft, account, scheduled_for=scheduled_iso_for_row(row, now))
+                sched = None if approved_only else scheduled_iso_for_row(row, now)
+                result = zernio_publish(draft, account, scheduled_for=sched)
         except Exception as e:
             # A real publish error: revert the claim so it retries next run. A CLIENT
             # row (approved_only) reverts to 'approved' so a transient failure never

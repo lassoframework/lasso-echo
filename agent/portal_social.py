@@ -300,11 +300,19 @@ def _content_calendar_post(row):
         # IG + FB is two rows; without this the portal renders two identical cards
         # with no way to tag them.
         "platform": (row.get("account") or "").strip().lower(),
-        "image_public_url": row.get("image_url") or "",
-        # video|image, from the media URL's extension. A VIDEO in an <img> tag renders
-        # BLANK (Dale's "no photo preview"): the portal must render media_kind=='video'
-        # with a <video muted playsinline> tag instead.
+        # DISPLAY image: for a VIDEO row this is the hosted POSTER FRAME
+        # (content_calendar.thumbnail_url) so the calendar shows a real frame instead
+        # of a blank card — no portal change needed, because this field is display-only
+        # (the publisher reads the DB image_url column, the actual video, directly).
+        # An image row is unchanged.
+        "image_public_url": (row.get("thumbnail_url")
+                             or row.get("image_url") or ""),
+        # video|image, from the underlying media URL's extension. Lets the portal upgrade
+        # a video card to a real <video> player + play badge over the poster.
         "media_kind": _media_kind(row.get("image_url") or ""),
+        # the actual video URL (present only for video rows) for that <video> upgrade.
+        "video_url": (row.get("image_url") or "")
+                     if _media_kind(row.get("image_url") or "") == "video" else None,
         "caption": row.get("caption") or "",
         "scheduled_at": scheduled_at,
         # Publish record (display only): when it actually went out + the vendor post id.

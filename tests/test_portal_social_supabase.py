@@ -155,6 +155,32 @@ def test_social_post_media_kind_video_vs_image(monkeypatch):
     assert by_id["uuid-i"]["media_kind"] == "image"
 
 
+def test_video_row_displays_poster_frame_not_blank(monkeypatch):
+    # A video row with a hosted poster shows the FRAME (image_public_url = poster) so
+    # the calendar is never a blank card, while video_url carries the real video for a
+    # <video> upgrade. An image row is unchanged.
+    rows = [
+        _row("v1", post_date="2026-08-05", image_url="https://r2/w/clip.mp4"),
+        _row("v2", post_date="2026-08-06", image_url="https://r2/w/noposter.mp4"),
+        _row("i1", post_date="2026-08-07", image_url="https://r2/w/pic.jpg"),
+    ]
+    rows[0]["thumbnail_url"] = "https://r2/w/clip__poster.jpg"
+    store = _FakeStore(rows)
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    by_id = {p["id"]: p for p in body["posts"]}
+    # video WITH poster -> displays the frame, keeps the real video url
+    assert by_id["v1"]["image_public_url"] == "https://r2/w/clip__poster.jpg"
+    assert by_id["v1"]["video_url"] == "https://r2/w/clip.mp4"
+    assert by_id["v1"]["media_kind"] == "video"
+    # video WITHOUT a poster -> falls back to the video url (portal uses media_kind)
+    assert by_id["v2"]["image_public_url"] == "https://r2/w/noposter.mp4"
+    assert by_id["v2"]["video_url"] == "https://r2/w/noposter.mp4"
+    # image row unchanged: no video_url, display is the image
+    assert by_id["i1"]["image_public_url"] == "https://r2/w/pic.jpg"
+    assert by_id["i1"]["video_url"] is None
+
+
 def test_every_social_post_carries_a_stable_id(monkeypatch):
     store = _FakeStore([_row("id-a"), _row("id-b", post_date="2026-08-07")])
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)

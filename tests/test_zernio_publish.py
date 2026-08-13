@@ -375,8 +375,32 @@ def test_publish_due_routes_client_through_zernio(monkeypatch):
     out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=True,
                           zernio_publish=fake_zernio, catch_all=True)
     assert out["ok"] and out["published"] == ["r1"]
-    assert zcalls == [("eng_ig", "2026-08-13T07:30:00-04:00")] or zcalls[0][0] == "eng_ig"
+    # MANUAL APPROVAL PUBLISHES NOW: a client who tapped Approve expects the post live,
+    # not scheduled to a later slot (which reads 'published' while the feed is empty).
+    assert zcalls[0] == ("eng_ig", None)
     assert store.published and store.published[0][1] == "zp1"     # late_post_id recorded
+
+
+def test_publish_due_autonomous_keeps_slot_schedule(monkeypatch):
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    rows = [{"id": "r1", "gym_id": "eng", "account": "instagram", "status": "pending",
+             "post_date": "2026-08-13", "format": "feed", "image_url": "https://r2/i.jpg",
+             "caption": "hi"}]
+    store = FakeStore(rows)
+    zcalls = []
+
+    def fake_zernio(draft, account, scheduled_for=None):
+        zcalls.append((account.key, scheduled_for))
+        from agent.zernio_publisher import PublishResult
+        return PublishResult(ok=True, mode="published", media_id="zp1")
+
+    # autonomous gym (approved_only=False): pending posts DRIP at their slot time
+    out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=False,
+                          zernio_publish=fake_zernio, catch_all=True)
+    assert out["ok"] and out["published"] == ["r1"]
+    assert zcalls[0][0] == "eng_ig" and zcalls[0][1] and "2026-08-13T" in zcalls[0][1], \
+        "an autonomous gym keeps the slot schedule so posts spread across the day"
 
 
 def test_publish_due_skips_unapproved_client_row(monkeypatch):

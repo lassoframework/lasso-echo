@@ -238,6 +238,76 @@ def test_builder_keeps_raw_url_on_edit_failure(tmp_path, monkeypatch):
     assert feed.creative_public_url == "https://r2/raw/workout.mp4"
 
 
+def test_poster_frame_tries_fallback_ss(tmp_path):
+    calls = []
+
+    def runner(cmd, label=""):
+        calls.append(cmd)
+        # first attempt (ss=1.0) writes nothing; second (ss=0.0) succeeds
+        ss = cmd[cmd.index("-ss") + 1]
+        if ss == "0.0":
+            with open(cmd[-1], "wb") as fh:
+                fh.write(b"JPEGBYTES")
+
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        return R()
+
+    out = ar.poster_frame("v.mp4", str(tmp_path / "p.jpg"), runner=runner)
+    assert out and os.path.getsize(out) > 0
+    assert len(calls) == 2, "must retry at ss=0 for a very short clip"
+
+
+def test_get_or_make_poster_caches_and_never_raises(tmp_path, monkeypatch):
+    vid = _video(tmp_path)
+    calls = []
+
+    def runner(cmd, label=""):
+        calls.append("frame")
+        with open(cmd[-1], "wb") as fh:
+            fh.write(b"JPEGBYTES")
+
+        class R:
+            stdout, stderr, returncode = "", "", 0
+        return R()
+
+    p1 = ar.get_or_make_poster(vid, str(tmp_path), runner=runner, logger=lambda m: None)
+    assert p1 and p1.endswith("__poster.jpg")
+    p2 = ar.get_or_make_poster(vid, str(tmp_path), runner=runner, logger=lambda m: None)
+    assert p2 == p1 and calls == ["frame"], "poster is cached, no re-extract"
+
+    def boom(cmd, label=""):
+        raise ar.ReelError("ffmpeg gone")
+    # a fresh video whose extraction fails -> None, never raises
+    vid2 = _video(tmp_path, name="clip2.mp4", data=b"DIFFERENTBYTES")
+    assert ar.get_or_make_poster(vid2, str(tmp_path), runner=boom,
+                                 logger=lambda m: None) is None
+
+
+def test_builder_attaches_hosted_poster_to_video_draft(tmp_path, monkeypatch):
+    from agent import client_month_run as cmr
+
+    class Feed:
+        creative_path = str(tmp_path / "clip.mp4")
+        creative_public_url = "https://r2/raw/clip.mp4"
+        caption = "cap"
+
+    (tmp_path / "clip.mp4").write_bytes(b"RAW")
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+    from agent import action_reel as _ar, media_host as _mh
+    monkeypatch.setattr(_ar, "get_or_make_poster",
+                        lambda *a, **k: str(tmp_path / "p.jpg"))
+    monkeypatch.setattr(_mh, "host_media",
+                        lambda path, key: "https://r2/reels/clip__poster.jpg")
+
+    class Acct:
+        key = "eng_ig"
+
+    feed = Feed()
+    cmr._attach_video_poster(Acct(), feed, str(tmp_path), lambda m: None)
+    assert feed.thumbnail_url == "https://r2/reels/clip__poster.jpg"
+
+
 def test_builder_ignores_images_and_flag_off(tmp_path, monkeypatch):
     from agent import client_month_run as cmr
 

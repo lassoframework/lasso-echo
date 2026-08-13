@@ -350,6 +350,10 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # approved caption) and the draft's creative swaps to the hosted edit. Editing
         # only ENHANCES: any failure keeps the raw video; approval gate unchanged.
         _maybe_edit_video(account, feed, library_path, log)
+        # VIDEO PREVIEW: a video shows BLANK in the calendar's image slot. Generate +
+        # host a poster frame so the client SEES the video (a real frame) instead of a
+        # blank card. Display-only (the video still publishes); best effort.
+        _attach_video_poster(account, feed, library_path, log)
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
@@ -405,6 +409,24 @@ def _maybe_edit_video(account, feed, library_path, log):
             f"{type(exc).__name__}; posting the raw video")
 
 
+def _attach_video_poster(account, draft, library_path, log):
+    """For a VIDEO draft, generate + host a poster frame and stash its url on the draft
+    (-> content_calendar.thumbnail_url) so the portal shows a real frame, not a blank
+    card. Best effort: no poster just means the existing blank, never a blocked post."""
+    path = (getattr(draft, "creative_path", "") or "").strip()
+    if not path or not path.lower().endswith(_VIDEO_EXTS):
+        return
+    try:
+        from . import action_reel, media_host
+        poster = action_reel.get_or_make_poster(path, library_path, logger=log)
+        if poster and config.hosting_enabled():
+            hosted = media_host.host_media(poster, account.key)
+            if hosted:
+                draft.thumbnail_url = hosted
+    except Exception as exc:  # noqa: BLE001 - a preview must never block a post
+        log(f"poster lane failed for {os.path.basename(path)}: {type(exc).__name__}")
+
+
 def _mark_feed(draft):
     draft.is_story = False
     if not (getattr(draft, "draft_type", "") or "").strip():
@@ -425,6 +447,11 @@ def _story_from_feed(feed):
     import dataclasses
     story = dataclasses.replace(feed)
     story.draft_id = f"{feed.draft_id}_story"
+    # carry the dynamic poster attr (not a dataclass field, so replace() drops it) so
+    # a video story card shows the same frame preview as its feed.
+    thumb = getattr(feed, "thumbnail_url", "") or ""
+    if thumb:
+        story.thumbnail_url = thumb
     return story
 
 
