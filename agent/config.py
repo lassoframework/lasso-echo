@@ -1176,6 +1176,30 @@ def client_month_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CLIENT_MONTH", "false"))
 
 
+def client_video_edit_enabled() -> bool:
+    """
+    Action-cut Reel editing for CLIENT gym videos (AGENT_CLIENT_VIDEO_EDIT). OFF by
+    default = zero behavior change: an uploaded video posts as-is. When ON, the month
+    builder edits each video draft into an engaging Reel — pure ffmpeg, no AI spend:
+    the highest-motion moments fast-cut to ~AGENT_REEL_TARGET_SEC, cover-cropped to
+    9:16, with a text hook from the day's OWN approved caption (scrubbed by the
+    on-screen copy law: never a dash). Editing only ENHANCES: any failure falls back
+    to the raw video; nothing here publishes — the edited reel waits for the client's
+    approval like every post. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CLIENT_VIDEO_EDIT", "false"))
+
+
+def reel_target_sec() -> float:
+    """Target action-reel length in seconds (AGENT_REEL_TARGET_SEC, default 22).
+    Clamped to 10..60 (IG Reels sweet spot; never a mis-set 600s encode)."""
+    try:
+        val = float(os.environ.get("AGENT_REEL_TARGET_SEC", "22"))
+    except (TypeError, ValueError):
+        val = 22.0
+    return max(10.0, min(60.0, val))
+
+
 def client_media_sync_enabled() -> bool:
     """
     Per-client MEDIA SYNC + auto-generate switch (AGENT_CLIENT_MEDIA_SYNC). OFF by

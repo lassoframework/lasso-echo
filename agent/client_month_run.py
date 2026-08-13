@@ -345,6 +345,11 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         pub = (getattr(feed, "creative_public_url", "") or "").strip()
         if pub:
             used_keys.add(_url_basename(pub))
+        # ACTION-CUT REEL (AGENT_CLIENT_VIDEO_EDIT, OFF by default): a VIDEO draft is
+        # edited into an engaging fast-cut 9:16 reel (hook text from the day's own
+        # approved caption) and the draft's creative swaps to the hosted edit. Editing
+        # only ENHANCES: any failure keeps the raw video; approval gate unchanged.
+        _maybe_edit_video(account, feed, library_path, log)
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
@@ -364,6 +369,40 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     result["skipped_banned"] = skipped_banned
     result["media_count"] = media_count
     return result
+
+
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+
+
+def _maybe_edit_video(account, feed, library_path, log):
+    """Swap a VIDEO feed draft's creative for its action-cut reel (edited + HOSTED).
+    No-op unless AGENT_CLIENT_VIDEO_EDIT is armed, the creative is a video, and both
+    the edit and the hosting succeed — otherwise the raw video posts as-is (editing
+    may never block a post). Mutates feed.creative_public_url in place; the paired
+    story is cloned FROM the feed afterwards, so it inherits the same reel."""
+    if not config.client_video_edit_enabled():
+        return
+    path = (getattr(feed, "creative_path", "") or "").strip()
+    if not path or not path.lower().endswith(_VIDEO_EXTS):
+        return
+    try:
+        from . import action_reel, media_host
+        reel = action_reel.get_or_make_reel(
+            path, getattr(feed, "caption", "") or "", library_path, logger=log)
+        if not reel:
+            return
+        hosted = None
+        if config.hosting_enabled():
+            hosted = media_host.host_media(reel, account.key)
+        if hosted:
+            feed.creative_public_url = hosted
+            log(f"reel swapped in for {os.path.basename(path)}")
+        else:
+            log(f"reel edited but not hosted for {os.path.basename(path)}; "
+                "keeping the raw video url")
+    except Exception as exc:  # noqa: BLE001 - never block the day
+        log(f"reel edit lane failed for {os.path.basename(path)}: "
+            f"{type(exc).__name__}; posting the raw video")
 
 
 def _mark_feed(draft):

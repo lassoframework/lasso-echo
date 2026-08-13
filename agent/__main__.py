@@ -125,6 +125,7 @@ def _status():
           f"(env AGENT_CATEGORY_ROTATION)")
     print(f"  client_sources : {config.client_sources_enabled()}  (env AGENT_CLIENT_SOURCES)")
     print(f"  client_month   : {config.client_month_enabled()}  (env AGENT_CLIENT_MONTH)")
+    print(f"  client_video_edit: {config.client_video_edit_enabled()}  (env AGENT_CLIENT_VIDEO_EDIT; action-cut Reel editing for client videos — highest-motion fast cuts to ~{config.reel_target_sec():.0f}s (AGENT_REEL_TARGET_SEC), 9:16, hook text from the day's own approved caption; edits only ENHANCE, any failure posts the raw video; OFF => videos post as-is)")
     print(f"  client_media_sync: {config.client_media_sync_enabled()}  (env AGENT_CLIENT_MEDIA_SYNC; daily, pull each onboarded client gym's uploaded photos/videos out of R2 into its content library, then build its DRAFT month from its REAL media if it has media + approved sources + no calendar yet; client calendars are DRAFTS, never published; needs AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES too)")
     print(f"  summit         : {config.summit_campaign_enabled()}  (env AGENT_SUMMIT_CAMPAIGN_ENABLED)")
     print(f"  book_campaign  : {config.book_campaign_enabled()}  (env AGENT_BOOK_CAMPAIGN_ENABLED)")
