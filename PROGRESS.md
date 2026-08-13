@@ -81,6 +81,30 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Real StoryBrand client captions — no more raw intake word (Dale round 6, 2026-08-13)
+
+### [x] "why is the caption only HYROX?!" -> SB7 engine now writes client captions
+The client month builder dumped the raw one-line approved SOURCE as the caption
+(compose_caption = source.text + CTA), so a thin intake entry ("HYROX") was the whole
+caption, while the full SB7 StoryBrand generator (Claude, grounded ONLY in the gym's
+voice doc, figure-fabrication-gated) sat unused on the client path.
+- client_content.make_caption routes every client caption through SB7 when
+  AGENT_SB7_ENABLED (grounds on the day's source topic + the gym's OWN durable voice
+  doc), clean fallback to source+CTA on flag-off/LLM-error/no-improvement echo. Wired
+  into both the image and thin-library paths. GYM-AGNOSTIC.
+- Independent subagent audit: ALL 12 session fixes verified GYM-AGNOSTIC, no cross-gym
+  voice/CTA leak, SB7 output still clears banned-word + figure gates. 2621 tests collect.
+- Backfilled live: ENG's 87 rows -> 26 days got real captions (e.g. "You walked in
+  nervous... Coach Lester met you with patience. That's the difference between a gym and
+  a family."), 20 story cards re-rendered; 2 skipped by the fabrication gate (tried to
+  add unapproved numbers). GritX all-published (nothing to backfill); other gyms get it
+  automatically when their calendar builds.
+- Today's live ENG story replaced with the formatted card + real caption. NOTE:
+  Instagram does not support Zernio unpublish (FB/YT/LI/X only), so the old raw IG story
+  can't be deleted — it auto-expires in 24h while the new formatted one posts fresh.
+
+---
+
 ## Story look + video previews + publish-now (Dale rounds 4-5, 2026-08-13)
 
 ### [x] "I don't see the post to their main feed" (CRITICAL, status honesty)
