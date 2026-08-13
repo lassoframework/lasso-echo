@@ -61,6 +61,23 @@ def _row(gym_id="eng", post_date="2026-08-13", account="instagram",
             "format": fmt, "status": status}
 
 
+# ---- the invariant pin: what counts as WIPEABLE ---------------------------
+
+def test_human_owned_statuses_are_never_wipeable():
+    """GUARD: if any of these ever creep into _WIPEABLE_STATUSES, a rebuild would
+    silently delete a client's approved/published post again (Dale's original bug).
+    This test is the tripwire on that constant."""
+    human_owned = ("approved", "published", "publishing",
+                   "denied", "killed", "failed")
+    for s in human_owned:
+        assert s not in pcs._WIPEABLE_STATUSES, (
+            f"{s!r} must stay OUT of _WIPEABLE_STATUSES or approvals revert")
+
+
+def test_wipeable_set_is_exactly_the_machine_draft_statuses():
+    assert set(pcs._WIPEABLE_STATUSES) == {"pending", "draft", "queued"}
+
+
 # ---- delete_month status guard -------------------------------------------
 
 def test_delete_month_preserves_human_rows_by_default(monkeypatch):
