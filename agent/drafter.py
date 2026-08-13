@@ -176,6 +176,31 @@ def variant_hashtags(platform, hashtags):
     return tags[:TemplateGenerator.HASHTAG_LIMIT]
 
 
+import re as _re_scaffold
+
+# Lines the LLM sometimes prepends despite "output ONLY the caption body": a markdown
+# header (# Caption Body:), a bare label (Caption:, Body:, Post:), or a preamble
+# (Here's the caption:). Stripped so scaffolding never reaches a gym's feed.
+_SCAFFOLD_LINE = _re_scaffold.compile(
+    r"^\s*(#{1,6}\s*)?(caption( body| text)?|body|post|here'?s[^\n:]*)\s*:?\s*$",
+    _re_scaffold.IGNORECASE)
+
+
+def _strip_llm_scaffold(text):
+    """Remove leading markdown headers / 'Caption:'-style labels / wrapping quotes the
+    LLM may add around the caption body. Returns the clean caption text."""
+    lines = (text or "").strip().splitlines()
+    # drop leading scaffold/label/blank lines
+    while lines and (not lines[0].strip() or _SCAFFOLD_LINE.match(lines[0])
+                     or lines[0].lstrip().startswith("#")):
+        lines.pop(0)
+    out = "\n".join(lines).strip()
+    # unwrap surrounding quotes if the whole body is quoted
+    if len(out) >= 2 and out[0] in "\"'“”" and out[-1] in "\"'“”":
+        out = out[1:-1].strip()
+    return out
+
+
 def _call_llm_caption(system, user):
     """Call Claude for SB7 caption generation. Raises on missing key or SDK."""
     import os as _os
@@ -309,7 +334,7 @@ class StoryBrandGenerator:
             "Gym as guide, not hero. Max 260 characters. Caption body only."
         )
         try:
-            body = (_call_llm_caption(self._SYSTEM, user) or "").strip()
+            body = _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
             if not body:
                 raise ValueError("empty LLM response")
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure

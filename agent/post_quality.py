@@ -29,6 +29,11 @@ MIN_CONTENT_WORDS = 12
 # (surrounded by spaces, or a double hyphen). A hyphen inside a word (co-op) is fine.
 _DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
 
+# LLM scaffolding that must never reach a feed: a markdown header, or a bare
+# 'Caption:'/'Body:' label line (the model occasionally prepends these).
+_SCAFFOLD_RE = re.compile(
+    r"^\s*(#{1,6}\s|(caption( body| text)?|body|post)\s*:)", re.IGNORECASE)
+
 
 def _content_words(caption):
     """Every word of real caption copy: the whole caption MINUS hashtag-only lines.
@@ -54,6 +59,9 @@ def caption_issues(caption, banned_words=()):
                       "words) — likely the raw source, not a real caption")
     if _DASH_RE.search(cap):
         issues.append("caption contains a dash (violates the no-dash copy law)")
+    if _SCAFFOLD_RE.match(cap):
+        issues.append("caption starts with LLM scaffolding (a header or a "
+                      "'Caption:'/'Body:' label), not real copy")
     low = cap.lower()
     for w in banned_words or ():
         w = (w or "").strip().lower()

@@ -128,3 +128,20 @@ def test_builder_drops_thin_caption_when_sb7_on(monkeypatch, tmp_path):
     # every day's only source is the thin 'HYROX' -> all dropped -> nothing inserted
     assert store.inserted == [], "a thin caption must never reach the calendar"
     assert out["days"] == 0
+
+
+# ---- LLM scaffolding must never reach a feed --------------------------------
+
+def test_scaffold_header_rejected():
+    assert any("scaffold" in i for i in pq.caption_issues(
+        "# Caption Body:\n\nYou're tired of feeling stuck between work and life today."))
+    assert any("scaffold" in i for i in pq.caption_issues(
+        "Caption: You are strong and ready to train hard with the whole crew today now."))
+
+
+def test_strip_llm_scaffold():
+    from agent.drafter import _strip_llm_scaffold
+    assert _strip_llm_scaffold("# Caption Body:\n\nReal copy here.") == "Real copy here."
+    assert _strip_llm_scaffold("Caption:\nReal copy here.") == "Real copy here."
+    assert _strip_llm_scaffold('"Real quoted copy."') == "Real quoted copy."
+    assert _strip_llm_scaffold("Real copy, no scaffold.") == "Real copy, no scaffold."
