@@ -54,6 +54,20 @@ synthesized from the deterministic slot when unstamped (time visible pre-approva
 low_creative computed from RAW image_url before the fallback substitutes infographics;
 /calendar map_row returns the real scheduled_at; metrics ?days clamped to 365.
 
+### [x] Wave 2 (re-audit findings, SHA 9f1f762): locked-day siblings survive the
+rebuild delete (preserve_dates); denied/killed photos stay re-draftable; scheduledFor
+normalized to UTC; autonomy actor recorded. Independent re-audit verdict on wave 1:
+all 10 fixes FIXED, no gate weakened anywhere.
+
+### [x] LIVE-VERIFIED on ENG (first successful client publish ever, 2026-08-13 13:11 ET)
+- IG story published immediately (past slot -> publish-now path).
+- IG + FB feeds handed to Zernio with post ids, scheduled 2026-08-13T22:30Z (6:30 PM ET)
+  — probed Zernio directly: status 'scheduled', correct UTC time.
+- Calendar rebuilt: 30 feed days, 30 DISTINCT photos, 7 videos placed, locked day
+  skipped, published photo never re-picked.
+- /social payload live-probed: platform, published_at, synthesized scheduled_at all
+  present; low_creative honest.
+
 ### [ ] DECISIONS for Blake (not silently resolved)
 1. account_state: a bare Zernio row (no handle/connectedAt) still reads "connected"
    (94f29e7 anti-flap ruling) vs audit's phantom-connected finding. Which wins?
