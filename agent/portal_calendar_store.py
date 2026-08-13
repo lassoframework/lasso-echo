@@ -172,6 +172,33 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption(self, account_key, row_id, new_caption):
+        """PATCH the row's caption AND revert status to 'pending', filtered by BOTH id
+        and gym_id. Editing a caption resets the approval so the owner re-approves the
+        new wording — this prevents approving one text then silently posting another.
+        Returns the updated row dict, or None when zero rows matched (treated as 404)."""
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"caption": new_caption, "status": "pending"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        for row in rows:
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     # ---- auto-publisher: read + exactly-once claim/update -------------------
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically

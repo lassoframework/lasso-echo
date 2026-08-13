@@ -217,9 +217,15 @@ def _handle_action_supabase(action, account_key, draft_id, note):
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
 
         if action == "edit":
-            # Keep status pending; record the note without a schema change.
+            if not note:
+                return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
+                             "error": "note (new caption text) is required for edit"}
+            updated = sb.patch_caption(account_key, draft_id, note)
+            if updated is None:
+                return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
             return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
-                         "note": note or ""}
+                         "caption": updated.get("caption", ""),
+                         "status": updated.get("status", "pending")}
 
         new_status = _pcs.action_status(action)
         if new_status is None:

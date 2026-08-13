@@ -557,13 +557,19 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
                      "error": "fabrication gate: the note carries a claim with no "
                               "approved receipt. Cite an approved source or drop the "
                               "figure."}
+    if not note:
+        return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
+                     "error": "note (new caption text) is required for edit"}
     try:
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
-        # Keep status pending (do not alter the schema; just echo the note). No write.
+        updated = sb_store.patch_caption(account_key, draft_id, note)
+        if updated is None:
+            return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
         return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
-                     "note": note or ""}
+                     "caption": updated.get("caption", ""),
+                     "status": updated.get("status", "pending")}
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}

@@ -168,18 +168,36 @@ def test_action_patches_status_with_isolation_filter(monkeypatch, action, expect
     assert patch_call[4] == {"status": expected_status}
 
 
-def test_action_edit_keeps_pending_and_echoes_note(monkeypatch):
+def test_action_edit_writes_caption_and_reverts_to_pending(monkeypatch):
+    pre = _Resp(200, [_row("id-e", gym_id="lasso", status="approved")])
+    patched = _Resp(200, [_row("id-e", gym_id="lasso", status="pending",
+                               caption="shorter wording")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    status, body = portal_routes.handle_portal_action(
+        "edit", "lasso", "id-e", "actor-1", note="shorter wording")
+    assert status == 200
+    assert body["ok"] is True
+    assert body["caption"] == "shorter wording"
+    assert body["status"] == "pending"
+    # edit MUST issue a patch with caption + status
+    patches = [c for c in http.calls if c[0] == "patch"]
+    assert patches, "edit must write caption to the database"
+    payload = patches[0][4]  # json arg
+    assert payload.get("caption") == "shorter wording"
+    assert payload.get("status") == "pending"
+
+
+def test_action_edit_empty_note_returns_400(monkeypatch):
     pre = _Resp(200, [_row("id-e", gym_id="lasso", status="pending")])
     http = _FakeHTTP(get_resp=pre)
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
 
     status, body = portal_routes.handle_portal_action(
-        "edit", "lasso", "id-e", "actor-1", note="please shorten")
-    assert status == 200
-    assert body["ok"] is True
-    assert body["action"] == "edit"
-    assert body["note"] == "please shorten"
-    # edit issues NO write.
+        "edit", "lasso", "id-e", "actor-1", note="")
+    assert status == 400
+    assert "required" in body.get("error", "")
     assert not [c for c in http.calls if c[0] == "patch"]
 
 
@@ -219,7 +237,35 @@ def test_action_patch_wrong_gym_in_response_returns_404(monkeypatch):
     assert status == 404
 
 
-# ---- 5. report returns the null shape (no zeros) ------------------------------
+# ---- 5. patch_caption writes caption + resets status to pending ---------------
+
+def test_patch_caption_writes_caption_and_status(monkeypatch):
+    patched = _Resp(200, [_row("id-c", gym_id="lasso", status="pending",
+                                caption="new caption text")])
+    http = _FakeHTTP(patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_caption("lasso", "id-c", "new caption text")
+    assert result is not None
+    assert result["caption"] == "new caption text"
+    assert result["status"] == "pending"
+    method, url, params, headers, payload = http.calls[0]
+    assert method == "patch"
+    assert params["id"] == "eq.id-c"
+    assert params["gym_id"] == "eq.lasso"
+    assert payload == {"caption": "new caption text", "status": "pending"}
+
+
+def test_patch_caption_cross_gym_returns_none(monkeypatch):
+    # PATCH returns a row for a different gym — reject it.
+    patched = _Resp(200, [_row("id-c", gym_id="other", caption="new")])
+    http = _FakeHTTP(patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    result = pcs.SupabaseCalendarStore().patch_caption("lasso", "id-c", "new")
+    assert result is None
+
+
+# ---- 6. report returns the null shape (no zeros) ------------------------------
 
 def test_report_null_shape(monkeypatch):
     status, body = portal_routes.handle_portal_report("lasso", "14")
