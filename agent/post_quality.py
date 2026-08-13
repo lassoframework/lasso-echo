@@ -23,16 +23,21 @@ final "is this actually good enough to post" net.
 import re
 
 MIN_CAPTION_CHARS = 40
-MIN_BODY_WORDS = 8
+MIN_CONTENT_WORDS = 12
 
 # Any real dash: em/en/figure/horizontal-bar/minus, or a hyphen used AS a dash
 # (surrounded by spaces, or a double hyphen). A hyphen inside a word (co-op) is fine.
 _DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
 
 
-def _body(caption):
-    """The caption's body: everything before the first blank-line-separated CTA block."""
-    return (caption or "").split("\n\n", 1)[0].strip()
+def _content_words(caption):
+    """Every word of real caption copy: the whole caption MINUS hashtag-only lines.
+    Counts across a HOOK\\n\\nBODY\\n\\nCTA structure so a punchy short hook followed by
+    a real body still reads as substantial; only genuinely thin copy (the raw one-line
+    source, with or without a CTA) falls below the bar."""
+    lines = [ln for ln in (caption or "").splitlines()
+             if not ln.strip().startswith("#")]
+    return " ".join(lines).split()
 
 
 def caption_issues(caption, banned_words=()):
@@ -41,12 +46,12 @@ def caption_issues(caption, banned_words=()):
     cap = (caption or "").strip()
     if not cap:
         return ["empty caption"]
-    body = _body(cap)
+    words = _content_words(cap)
     if len(cap) < MIN_CAPTION_CHARS:
         issues.append(f"caption too short ({len(cap)} < {MIN_CAPTION_CHARS} chars)")
-    if len(body.split()) < MIN_BODY_WORDS:
-        issues.append(f"caption body too thin ({len(body.split())} < "
-                      f"{MIN_BODY_WORDS} words) — likely the raw source, not a caption")
+    if len(words) < MIN_CONTENT_WORDS:
+        issues.append(f"caption too thin ({len(words)} < {MIN_CONTENT_WORDS} content "
+                      "words) — likely the raw source, not a real caption")
     if _DASH_RE.search(cap):
         issues.append("caption contains a dash (violates the no-dash copy law)")
     low = cap.lower()

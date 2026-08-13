@@ -26,14 +26,27 @@ def test_raw_source_word_is_not_a_plus():
 
 
 def test_thin_body_with_cta_still_fails():
-    # the fallback baseline: raw word + CTA. Body is still one word -> not A+.
-    assert pq.caption_issues("HYROX\n\nSave this post. Come back when you stall.")
+    # the fallback baseline: raw word + CTA. Total content is still thin -> not A+.
+    assert pq.caption_issues("HYROX\n\nSave this post.")
 
 
 def test_real_storybrand_caption_passes():
     cap = ("You walked in nervous, unsure if you belonged. Coach Lester met you with "
            "patience and a real smile. That is the difference between a gym and a family.")
     assert pq.caption_issues(cap) == []
+
+
+def test_punchy_hook_then_body_passes():
+    # a short HOOK followed by a real BODY must NOT be flagged thin (was a false
+    # positive when only the first paragraph's words were counted).
+    cap = ("Your coach notices you. Really notices.\n\nThat's rare. Most gyms let you "
+           "blend into the crowd. Here you are seen from day one.\n\nBook a free intro.")
+    assert pq.caption_issues(cap) == []
+
+
+def test_hashtags_do_not_count_as_content():
+    # hashtag lines are not caption copy; a thin caption padded with tags still fails.
+    assert pq.caption_issues("HYROX\n\n#eng #hyrox #crossfit #fitness #gym #train #win")
 
 
 def test_dash_is_rejected():
