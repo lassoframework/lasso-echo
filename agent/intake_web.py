@@ -1572,7 +1572,8 @@ def build_server(port=None):
                 actor_id = body.get("actor_id", "")
                 note = body.get("note", "")
                 status, resp = _pr.handle_portal_action(
-                    pt_action, account_key, draft_id, actor_id, note=note
+                    pt_action, account_key, draft_id, actor_id, note=note,
+                    confirm=bool(body.get("confirm", False)),
                 )
                 return self._send_json(resp, status)
 

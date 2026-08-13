@@ -154,7 +154,8 @@ def test_action_patches_status_with_isolation_filter(monkeypatch, action, expect
     http = _FakeHTTP(get_resp=pre, patch_resp=patched)
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
 
-    status, body = portal_routes.handle_portal_action(action, "lasso", "id-9", "actor-1")
+    status, body = portal_routes.handle_portal_action(action, "lasso", "id-9",
+                                                      "actor-1", confirm=True)
     assert status == 200
     assert body == {"ok": True, "action": action, "draft_id": "id-9"}
 

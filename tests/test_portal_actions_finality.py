@@ -65,7 +65,7 @@ def test_legacy_actions_on_published_row_409_no_write(monkeypatch, action):
     store = _Store([_row("r1", "published")])
     _patch_store(monkeypatch, store)
     status, body = portal_routes.handle_portal_action(
-        action, "eng", "r1", "actor", note="new words")
+        action, "eng", "r1", "actor", note="new words", confirm=True)
     assert status == 409
     assert store.writes == []
 
@@ -75,7 +75,7 @@ def test_legacy_actions_on_publishing_row_409_no_write(monkeypatch, action):
     store = _Store([_row("r1", "publishing")])
     _patch_store(monkeypatch, store)
     status, body = portal_routes.handle_portal_action(
-        action, "eng", "r1", "actor", note="new words")
+        action, "eng", "r1", "actor", note="new words", confirm=True)
     assert status == 409, "an action mid-claim must never flip status (double-post)"
     assert store.writes == []
 
@@ -112,3 +112,33 @@ def test_partb_approve_on_published_is_idempotent_200(monkeypatch):
     status, body = ps._handle_approve_supabase("eng", "r1", "actor", None, store)
     assert status == 200 and body.get("idempotent") is True
     assert store.writes == []
+
+
+# ---- Blake ruling 2026-08-13: NO route family offers an unconfirmed kill ----
+
+def test_legacy_kill_without_confirm_is_400_no_write(monkeypatch):
+    store = _Store([_row("r1", "pending")])
+    _patch_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action(
+        "kill", "eng", "r1", "actor")                    # no confirm
+    assert status == 400
+    assert "confirm" in body["error"]
+    assert store.writes == [], "an unconfirmed kill must never write"
+
+
+def test_legacy_kill_with_confirm_kills(monkeypatch):
+    store = _Store([_row("r1", "pending")])
+    _patch_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action(
+        "kill", "eng", "r1", "actor", confirm=True)
+    assert status == 200
+    assert ("status", "r1", "killed") in store.writes
+
+
+def test_legacy_kill_confirm_gate_fires_before_any_lookup(monkeypatch):
+    # the gate is route-level: even a nonexistent row 400s (never a probe-able 404)
+    store = _Store([])
+    _patch_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action(
+        "kill", "eng", "ghost", "actor")
+    assert status == 400 and "confirm" in body["error"]

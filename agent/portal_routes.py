@@ -121,16 +121,21 @@ def handle_portal_library(account_key):
     }
 
 
-def handle_portal_action(action, account_key, draft_id, actor_id, note="", store=None):
+def handle_portal_action(action, account_key, draft_id, actor_id, note="",
+                         store=None, confirm=False):
     """
     POST /portal/<token>/{approve|edit|deny|kill}
 
-    Body: {draft_id, actor_id, note?}
+    Body: {draft_id, actor_id, note?, confirm?}
 
     Delegates to portal_approvals, which owns per-gym scoping +
     actor authorization + approvals.handle_action (same path as Slack).
 
     action must be one of: approve, edit, deny, kill.
+
+    KILL REQUIRES confirm=true (Blake ruling 2026-08-13): kill is permanent, so a
+    one-click kill is refused with 400 on BOTH data planes — matching the Part-B
+    /posts/<id>/kill contract, so no route family offers an unconfirmed kill.
     """
     if not config.portal_approvals_enabled():
         return _flag_off(action)
@@ -142,6 +147,10 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="", store
         return 400, {"error": "draft_id required"}
     if not actor_id:
         return 400, {"error": "actor_id required"}
+
+    if action == "kill" and not confirm:
+        return 400, {"ok": False, "action": "kill", "draft_id": draft_id,
+                     "error": "kill is permanent and requires confirm=true"}
 
     # Shared Supabase data plane wins when creds are present (the live portal
     # path). No creds -> the existing portal_approvals/SQLite path, unchanged.

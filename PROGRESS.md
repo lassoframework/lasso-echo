@@ -68,13 +68,16 @@ all 10 fixes FIXED, no gate weakened anywhere.
 - /social payload live-probed: platform, published_at, synthesized scheduled_at all
   present; low_creative honest.
 
-### [ ] DECISIONS for Blake (not silently resolved)
-1. account_state: a bare Zernio row (no handle/connectedAt) still reads "connected"
-   (94f29e7 anti-flap ruling) vs audit's phantom-connected finding. Which wins?
-2. Client calendars now place VIDEOS (per "posting videos/pictures" directive) — feed
-   videos publish as Reels via Zernio default. Confirm or images-only.
-3. Legacy kill route still one-click (no confirm=true param in its contract); Part-B
-   route requires confirm. Retire legacy route in the portal UI?
+### [x] DECISIONS — Blake ruled 2026-08-13 ("do all your recommendations")
+1. account_state anti-flap rule KEPT: a present Zernio account row = connected (the
+   94f29e7 ruling stands; the repeat-failure alert lane covers dead connections).
+   Pinned by test_account_state_present_row_no_positive_signal_is_connected.
+2. VIDEOS in client calendars KEPT ON (feed videos publish as Reels). Pinned by
+   test_videos_are_placed.
+3. Unconfirmed kill RETIRED: the legacy /portal/<token>/kill route now requires
+   confirm=true (400 otherwise), matching Part-B — no route family offers a
+   one-click permanent kill anymore. Portal spec updated; the UI must send
+   {confirm: true} on kill. Pinned by tests/test_portal_actions_finality.py.
 
 ---
 

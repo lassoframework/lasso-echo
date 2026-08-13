@@ -103,6 +103,12 @@ scheduled_at  timestamptz   -- the post's planned go-live time (ISO 8601, tz-awa
   and `killed` — render `publishing` like Approved with a spinner, `killed` however
   denied/removed content is shown. Any action on a `published` or `publishing` post
   returns **409** — disable the buttons for those states.
+- **KILL now requires confirmation on EVERY route** (Blake ruling 2026-08-13): both
+  `POST /portal/<token>/kill` and `POST /portal/<token>/posts/<id>/kill` refuse with
+  **400** unless the JSON body carries `"confirm": true`. Show a "This permanently
+  removes the post — are you sure?" dialog and send `confirm: true` only on yes. If
+  the portal's kill button currently sends no confirm field, it will start getting
+  400s — update it.
 
 ### Copy suggestion
 On the calendar header or a tooltip: "Posts publish at 7:30 AM, 12:30 PM, or 6:30 PM ET
