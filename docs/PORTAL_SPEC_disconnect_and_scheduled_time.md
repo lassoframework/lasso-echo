@@ -91,9 +91,18 @@ scheduled_at  timestamptz   -- the post's planned go-live time (ISO 8601, tz-awa
 - Wherever a calendar cell / list row shows the date, also show the time from
   `scheduled_at`, formatted in the gym's local timezone (or ET with a "ET" label):
   e.g. **"Aug 13 · 7:30 AM"**.
-- Read it straight from the existing `/portal/<token>/social` calendar payload if it
-  surfaces `scheduled_at` (add it to the select if not), or query the column directly.
-- When `scheduled_at` is null, fall back to the date only (don't show a fabricated time).
+- The `/portal/<token>/social` payload now ALWAYS carries `scheduled_at` per post —
+  when the DB stamp is absent Echo synthesizes it from the post's own deterministic
+  slot, so the UI never needs a fallback for missing times.
+- Each post in that payload also now carries:
+  - `platform` — `"instagram"` or `"facebook"` (a feed cross-posted to both is two
+    rows; use this for the IG/FB badge instead of guessing)
+  - `published_at` — when it actually went live (null until published)
+  - `late_post_id` — the vendor post id once published
+- Status chips: the `status` field can also be `publishing` (in flight, seconds-long)
+  and `killed` — render `publishing` like Approved with a spinner, `killed` however
+  denied/removed content is shown. Any action on a `published` or `publishing` post
+  returns **409** — disable the buttons for those states.
 
 ### Copy suggestion
 On the calendar header or a tooltip: "Posts publish at 7:30 AM, 12:30 PM, or 6:30 PM ET

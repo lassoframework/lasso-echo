@@ -203,20 +203,33 @@ class SupabaseCalendarStore:
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
     # so a row is published EXACTLY ONCE across re-runs / concurrent workers.
-    def due_rows(self, gym_id, run_date):
+    def due_rows(self, gym_id, run_date, catchup_days=0):
         """
         content_calendar rows that are DUE to publish on `run_date` for `gym_id`:
           - gym_id == gym_id
-          - post_date == run_date  (ONLY the run date: never a past or future date)
+          - post_date == run_date  (or, with catchup_days=N, any date in the last N
+            days through run_date — never a future date)
           - status NOT in ('published','denied','killed')
           - published_at IS NULL   (never re-publish a row already sent)
           - image_url present      (a row with no creative is skipped upstream too)
         `run_date` is 'YYYY-MM-DD' (validated by the caller). Returns a list of dicts.
         Gym scoped by the gym_id=eq filter so another gym's row is never returned.
-        """
+
+        catchup_days exists for the CLIENT lane: a gym owner who approves yesterday's
+        post this morning used to strand it forever (post_date=eq.<today> could never
+        see it again). With a small catch-up window the approved row is picked up and
+        published immediately (approved_only still guards: a pending past row is never
+        touched)."""
+        if catchup_days and int(catchup_days) > 0:
+            from datetime import date as _date, timedelta as _td
+            start = (_date.fromisoformat(run_date)
+                     - _td(days=int(catchup_days))).isoformat()
+            post_date_filter = [f"gte.{start}", f"lte.{run_date}"]
+        else:
+            post_date_filter = f"eq.{run_date}"
         params = {
             "gym_id": f"eq.{gym_id}",
-            "post_date": f"eq.{run_date}",
+            "post_date": post_date_filter,
             "status": "not.in.(published,denied,killed)",
             "published_at": "is.null",
             "image_url": "not.is.null",
@@ -351,6 +364,39 @@ class SupabaseCalendarStore:
         if not srows:
             return None
         return bool(srows[0].get("autonomous"))
+
+    def set_gym_autonomy(self, gym_slug, autonomous, actor=""):
+        """UPSERT the portal's per-gym Autonomous toggle: gyms.slug ->
+        echo_gym_settings.autonomous. This is the SHARED persistence plane the publish
+        lane reads (gym_autonomy) — the local SQLite kv alone is ephemeral and invisible
+        across services, so the toggle must land here to actually change publishing.
+        Returns True on write, False when the gym slug is unknown (caller surfaces it)."""
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        gym_uuid = (rows[0].get("id") if rows else None)
+        if not gym_uuid:
+            return False
+        r2 = self._client().post(
+            self._rest("echo_gym_settings"),
+            params={"on_conflict": "gym_id"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            }),
+            json=[{"gym_id": gym_uuid, "autonomous": bool(autonomous),
+                   "autonomy_updated_by": (actor or "")[:120]}],
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        return True
 
     def publishing_rows(self):
         """Every row currently stuck in status='publishing' with no published_at,
@@ -566,7 +612,7 @@ def map_row(row):
         "platform": row.get("account"),
         "caption": row.get("caption") or None,
         "creative_public_url": row.get("image_url") or None,
-        "scheduled_for": None,
+        "scheduled_for": row.get("scheduled_at"),
         "blocked_reason": None,
         "pillar": row.get("pillar") or None,
     }

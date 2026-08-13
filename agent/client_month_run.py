@@ -107,6 +107,47 @@ def _has_banned_word(text, banned_words):
     return False
 
 
+def _url_basename(url):
+    """The filename a public media URL points at (query string stripped). Hosted client
+    media keeps its library basename, so this is the join key between a calendar row's
+    image_url and the library creative it came from."""
+    return (url or "").split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def _locked_calendar_state(base_key, start, days, store, log):
+    """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
+    across the planned span. locked_feed_days: post_dates whose feed a human already
+    owns (approved/published/denied/killed — anything not machine-wipeable). used_keys:
+    the media basenames those human-owned rows carry (any format), so their photos are
+    never re-picked. Read-only; a read failure returns empty state (the store-level
+    preserve_and_prune backstop still guards the write)."""
+    from datetime import timedelta
+    from .portal_calendar_store import _WIPEABLE_STATUSES
+    locked_days, used = set(), set()
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return locked_days, used
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - never block the build on a read
+            log(f"locked-state read failed for {month}: {type(exc).__name__}")
+            continue
+        for row in rows:
+            status = str((row or {}).get("status") or "").lower()
+            if not status or status in _WIPEABLE_STATUSES:
+                continue
+            if str(row.get("format") or "").lower() == "feed":
+                locked_days.add(str(row.get("post_date") or "")[:10])
+            key = _url_basename(row.get("image_url") or "")
+            if key:
+                used.add(key)
+    locked_days.discard("")
+    return locked_days, used
+
+
 def _has_real_creative(draft):
     """True when the draft carries a REAL uploaded creative: a hosted/public url AND it
     is NOT a needs-media (no-image) draft. This is what makes a day emit a row; a day
@@ -118,7 +159,8 @@ def _has_real_creative(draft):
     return bool((getattr(draft, "creative_public_url", "") or "").strip())
 
 
-def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log):
+def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
+                         exclude_keys=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -133,7 +175,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
 
     Returns (draft, dropped_reason). draft is None when no clean draft could be built."""
     # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
-    draft = client_content.build_client_draft(account, day_key, voice, library_path)
+    draft = client_content.build_client_draft(account, day_key, voice, library_path,
+                                              exclude_keys=exclude_keys)
     if draft is None:
         return None, None
     if not _has_banned_word(draft.caption, banned_words):
@@ -146,7 +189,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     base = date.fromisoformat(str(day_key)[:10])
     for step in range(1, 8):
         alt_key = (base + timedelta(days=step)).isoformat()
-        alt = client_content.build_client_draft(account, alt_key, voice, library_path)
+        alt = client_content.build_client_draft(account, alt_key, voice, library_path,
+                                                exclude_keys=exclude_keys)
         if alt is None:
             continue
         if not _has_banned_word(alt.caption, banned_words):
@@ -219,23 +263,36 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 "awaiting_media": True, "upserted": 0, "days": 0, "skipped_banned": 0,
                 "media_count": 0}
 
-    # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
-    # bound; the real number of feed-days is at most media_count (one distinct photo
-    # per feed, no reuse). A 2-photo gym gets 2 feeds, never 30.
-    max_feed_days = min(days, media_count)
-
     from datetime import date, timedelta
     start = start_date if isinstance(start_date, date) \
         else date.fromisoformat(str(start_date)[:10])
+
+    # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
+    # published / denied / killed — anything a rebuild must preserve) across the span
+    # BEFORE planning, so the rebuild composes with them instead of fighting them:
+    #   * locked_feed_days: a day whose feed a human already owns is SKIPPED outright
+    #     (no replacement feed, no orphan story/FB-mirror alongside the approved post);
+    #   * used_keys: the photos those rows carry are EXCLUDED from every pick, so an
+    #     already-approved photo is never re-placed on another day (no double-post).
+    # Without this the builder re-picked approved photos (double-place) and photos
+    # consumed by pruned colliding rows were lost forever (under-build).
+    locked_feed_days, used_keys = _locked_calendar_state(
+        base_key, start, days, store, log)
+
+    # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
+    # bound; the real number of NEW feed-days is at most the media not already locked
+    # to an approved row (one distinct creative per feed, no reuse). A 2-photo gym
+    # gets 2 feeds, never 30.
+    max_feed_days = min(days, max(0, media_count - len(used_keys)))
 
     drafts = []
     skipped_banned = 0
     built_days = 0
     banned_words = tuple(banned_words or ())
     # ONE PHOTO PER FEED, NO REUSE: track the creative each feed consumed so no photo
-    # is used by two feeds. A feed that would reuse an already-used photo is skipped
-    # for the day (pick_image rotates, so the next day usually lands a fresh one); the
-    # cap guarantees we stop once every unique photo has been placed.
+    # is used by two feeds. used_keys (locked photos + this build's picks) is passed
+    # INTO the pick so every day draws a genuinely fresh creative; used_paths stays as
+    # the local-path backstop.
     used_paths = set()
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
@@ -245,8 +302,15 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         day_key = (start + timedelta(days=i)).isoformat()
         i += 1
 
+        # A day whose feed a human already owns keeps its approved content; the
+        # rebuild never plans a competing feed/story for it.
+        if day_key in locked_feed_days:
+            log(f"locked {day_key}: day already has approved/published content")
+            continue
+
         feed, feed_drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, banned_words, log)
+            account, day_key, voice, library_path, banned_words, log,
+            exclude_keys=used_keys)
         if feed is None:
             if feed_drop:
                 skipped_banned += 1
@@ -267,6 +331,10 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             continue
         if feed_path:
             used_paths.add(feed_path)
+            used_keys.add(os.path.basename(feed_path))
+        pub = (getattr(feed, "creative_public_url", "") or "").strip()
+        if pub:
+            used_keys.add(_url_basename(pub))
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1

@@ -61,13 +61,26 @@ def _image_key(creative):
     return os.path.basename(creative.path)
 
 
-def pick_image(account_key, day_key, library_path):
-    """An image from the account's uploaded library, preferring one not served
-    inside the no-repeat window; falls back to the least-recently-served image so
-    a stocked library always yields something. None when there are no images."""
-    imgs = [c for c in list_creatives(library_path) if c.media_type == "image"]
+def pick_image(account_key, day_key, library_path, exclude_keys=()):
+    """A creative (image OR video) from the account's uploaded library, preferring one
+    not served inside the no-repeat window; falls back to the least-recently-served so
+    a stocked library always yields something. None when the library is empty or every
+    candidate is excluded.
+
+    exclude_keys: creative basenames that must NOT be picked — the month builder passes
+    the photos already sitting on the gym's approved/published calendar rows plus the
+    ones this build already placed. Without this, a served-ledger polluted by repeated
+    plan-then-delete rebuild passes made the least-recently-served sort return the SAME
+    photo for every day (its own re-record kept it the minimum), collapsing a 34-photo
+    gym's month to a single feed day. Videos are picked like images (a gym that uploads
+    videos gets them posted; the publisher maps video media by extension)."""
+    imgs = [c for c in list_creatives(library_path)
+            if c.media_type in ("image", "video")]
     excl = rotation.style_exclusions(library_path)
     imgs = [c for c in imgs if _image_key(c) not in excl]
+    if exclude_keys:
+        skip = {str(k) for k in exclude_keys}
+        imgs = [c for c in imgs if _image_key(c) not in skip]
     if not imgs:
         return None
     served = rotation.load_served().get(account_key, [])
@@ -133,7 +146,7 @@ def classify(draft):
 
 
 def build_client_draft(account, day_key, voice, library_path, poster=None,
-                       s3_client=None, template_fn=None):
+                       s3_client=None, template_fn=None, exclude_keys=()):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -170,7 +183,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     scheduled_for = schedule.scheduled_for(day_key)
     fragments = [source.text, f"cite:{source.citation}"]
 
-    image = pick_image(account.key, day_key, library_path)
+    image = pick_image(account.key, day_key, library_path,
+                       exclude_keys=exclude_keys)
     if image is not None:
         caption, hashtags = compose_caption(account, source, voice,
                                             _image_key(image))

@@ -10,6 +10,60 @@ Last updated: 2026-08-13
 
 ---
 
+## Portal organic DEEP DIVE: publish payload, builder collapse, edit gate, finality (2026-08-13)
+
+Four independent audit agents swept every portal-organic surface (read model, actions,
+connections, upload->publish pipeline). Root causes found live and fixed:
+
+### [x] CRITICAL: Zernio create_post payload was WRONG — nothing client-side ever published
+Every client publish 400'd ("Missing required field: platforms") and retried every
+minute forever. Rebuilt to the OpenAPI-verified shape: content + platforms[] +
+mediaItems (typed image/video/gif) + publishNow when immediate (omitting scheduledFor
+used to silently create a DRAFT). Stories now publish as STORIES
+(platformSpecificData.contentType) instead of duplicate feed posts. x-request-id
+idempotency per call; Zernio's 24h duplicate 409 maps to already-posted (no retry loop).
+Past-slot approvals publish NOW instead of handing Zernio a past timestamp.
+
+### [x] CRITICAL: month builder collapse (Dale's empty Fri/Sat) + locked-slot awareness
+A served-ledger polluted by daily plan-then-delete passes made pick_image return the
+SAME photo every day -> a 34-photo gym collapsed to ONE feed day. Fixed by threading an
+exclude-keys set through the pick. Builder now also reads existing HUMAN-OWNED rows
+first: locked feed days are skipped outright (no competing drafts, no orphan pairs),
+locked photos are never re-picked (no double-posts), and the cap accounts for them.
+VIDEOS are now placeable (a gym uploading videos gets them posted). originals/ (raw
+archives of converted videos) no longer sync -> no double-count/spurious rebuilds.
+
+### [x] CRITICAL: legacy edit route had NO fabrication gate + finality guards
+/portal/<token>/edit wrote captions with no is_gate_clean check (a fabricated stat
+could enter an autonomous gym's caption and publish). Gate added. Both route families
+now refuse ALL actions on published (409) and mid-claim 'publishing' (409) rows —
+closing the portal-action double-post race. Deny is idempotent (no double budget burn).
+Revoked-token checks added to legacy actions + page-select + calendar/library/report.
+
+### [x] HIGH: stranded approvals + silent retry loops + autonomy split-brain
+- due_rows catch-up window (7d, client lane): approving yesterday's post publishes it.
+- Repeat publish failures alert a human once at 5 consecutive fails (was silent print).
+- Autonomy toggle now DUAL-WRITES echo_gym_settings (the plane the publisher reads);
+  local-kv-only writes were invisible across services. Response carries shared_persisted.
+- facebook-page-select validates ownership against the gym's own connected FB account.
+- Disconnect double-click 404 = already-disconnected success, not a 502.
+
+### [x] MEDIUM: /social read surface honest + complete
+Posts now carry platform (IG/FB badge), published_at, late_post_id; scheduled_at is
+synthesized from the deterministic slot when unstamped (time visible pre-approval);
+low_creative computed from RAW image_url before the fallback substitutes infographics;
+/calendar map_row returns the real scheduled_at; metrics ?days clamped to 365.
+
+### [ ] DECISIONS for Blake (not silently resolved)
+1. account_state: a bare Zernio row (no handle/connectedAt) still reads "connected"
+   (94f29e7 anti-flap ruling) vs audit's phantom-connected finding. Which wins?
+2. Client calendars now place VIDEOS (per "posting videos/pictures" directive) — feed
+   videos publish as Reels via Zernio default. Confirm or images-only.
+3. Legacy kill route still one-click (no confirm=true param in its contract); Part-B
+   route requires confirm. Retire legacy route in the portal UI?
+
+---
+
 ## Client approvals now HOLD — rebuild never destroys/rewords an approved post (2026-08-13, SHA 5efd78d)
 
 Dale (CrossFit ENG) reported three symptoms of ONE root cause: after approving a post it

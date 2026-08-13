@@ -130,9 +130,41 @@ def publish(draft, account, client=None, scheduled_for=None,
     if url:
         media_urls.append(url)
 
-    resp = client.create_post(account_id, getattr(draft, "caption", "") or "",
-                              media_urls=media_urls, scheduled_for=scheduled_for,
-                              page_id=page_id)
+    # STORY: the draft's own type decides the Zernio contentType (IG/FB Story vs feed).
+    story = bool(getattr(draft, "is_story", False)) or (
+        (getattr(draft, "draft_type", "") or "").strip().lower() == "story")
+
+    # PAST SLOT -> publish NOW: Zernio treats a missing scheduledFor + publishNow=true
+    # as immediate. Handing it a past timestamp risks a 400/undefined behavior, and a
+    # row approved after its slot passed should just go out (catch_all semantics).
+    if scheduled_for and _is_past(scheduled_for):
+        scheduled_for = None
+
+    try:
+        resp = client.create_post(account_id, getattr(draft, "caption", "") or "",
+                                  media_urls=media_urls, scheduled_for=scheduled_for,
+                                  page_id=page_id, platform=platform, story=story)
+    except zernio.ZernioError as exc:
+        # 409 = Zernio's 24h content-hash dedup: this exact content already posted to
+        # this account. That IS success for our exactly-once goal — mark it published
+        # instead of reverting to approved and retrying the same duplicate forever.
+        if getattr(exc, "status", None) == 409:
+            return PublishResult(ok=True, mode="published", media_id="",
+                                 detail="zernio dedup: identical post already exists")
+        raise
     post_id = zernio.post_id_of(resp)
     return PublishResult(ok=True, mode="published", media_id=post_id,
                          detail="scheduled" if scheduled_for else "published now")
+
+
+def _is_past(iso_ts):
+    """True when the ISO8601 timestamp is at/before now. A naive timestamp is assumed
+    UTC. Unparseable -> False (keep the schedule; Zernio will validate)."""
+    from datetime import datetime, timezone
+    try:
+        ts = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts <= datetime.now(timezone.utc)

@@ -843,6 +843,17 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         for account in (accounts or active_accounts()):
             if account.key.startswith("lasso") or account.key == _demo_gym:
                 continue
+            # A gym on the CLIENT-MONTH lane (has approved client sources) gets its
+            # calendar from build_client_month under its BASE gym_id; mirroring its
+            # PendingStore drafts here too would write a SECOND, off-plane copy
+            # (gym_id='eng_ig') the portal/publisher never read — junk at best, a
+            # double-publish surface at worst.
+            try:
+                from . import client_sources as _cs
+                if _cs.categories_present(account.key):
+                    continue
+            except Exception:
+                pass
             try:
                 summary = mirror_to_supabase(account.key, store, _sb)
                 if not summary.get("ok"):

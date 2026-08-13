@@ -216,10 +216,33 @@ def _handle_action_supabase(action, account_key, draft_id, note):
         if row is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
 
+        # PUBLISHED IS FINAL: the creative is already live on the gym's page. No
+        # portal action may rewrite it — an edit here would show a pending draft the
+        # client believes changed the live post (it never will), and approve/deny/kill
+        # would corrupt the publish record. 'publishing' is mid-claim: an action now
+        # would flip the row back to claimable and DOUBLE-POST.
+        _status_now = str(row.get("status") or "").lower()
+        if _status_now == "published":
+            return 409, {"ok": False, "action": action, "draft_id": draft_id,
+                         "error": "this post is already published; it can no longer "
+                                  "be edited, denied, or killed from the portal"}
+        if _status_now == "publishing":
+            return 409, {"ok": False, "action": action, "draft_id": draft_id,
+                         "error": "this post is publishing right now; try again in "
+                                  "a minute once it lands"}
+
         if action == "edit":
             if not note:
                 return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
                              "error": "note (new caption text) is required for edit"}
+            # FABRICATION GATE (same gate as the Part-B route): a note that introduces
+            # a stat/percentage/price with no approved receipt NEVER enters the caption.
+            from . import rotation as _rotation
+            if not _rotation.is_gate_clean(note):
+                return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                             "error": "fabrication gate: the note carries a claim "
+                                      "with no approved receipt. Cite an approved "
+                                      "source or drop the figure."}
             updated = sb.patch_caption(account_key, draft_id, note)
             if updated is None:
                 return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}

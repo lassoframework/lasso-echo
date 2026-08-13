@@ -190,7 +190,7 @@ def _draft_for(row):
 
 def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 notifier=None, now=None, catch_all=False, approved_only=False,
-                zernio_publish=None):
+                zernio_publish=None, catchup_days=0):
     """
     Read gym_id's content_calendar rows dated run_date and publish each unpublished
     one to live IG/FB, EXACTLY ONCE. Returns a summary dict.
@@ -229,7 +229,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
 
-    rows = store.due_rows(gym_id, run_date) or []
+    # catchup_days (client lane): also pick up recent-past rows the client approved
+    # AFTER their day passed, so a late approval publishes instead of stranding.
+    try:
+        rows = store.due_rows(gym_id, run_date, catchup_days=catchup_days) or []
+    except TypeError:
+        rows = store.due_rows(gym_id, run_date) or []      # older store/test fakes
 
     published = []
     skipped = []
@@ -322,6 +327,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             print(f"[calendar-autopublish] publish failed for row {row_id}: "
                   f"{type(e).__name__}: {e}")
+            _note_repeat_failure(row_id, gym_id, e)
             continue
 
         ok = getattr(result, "ok", False)
@@ -363,6 +369,34 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     return {"ok": True, "published": published, "skipped": skipped,
             "failed": failed, "waiting": waiting, "date": run_date}
+
+
+REPEAT_FAILURE_ALERT_AT = 5     # consecutive failures before a human is alerted
+
+# CLIENT catch-up window: a gym owner who approves a post AFTER its day passed still
+# gets it published (up to this many days late) instead of stranding it forever.
+CLIENT_CATCHUP_DAYS = 7
+
+
+def _note_repeat_failure(row_id, gym_id, exc):
+    """Count consecutive publish failures per row (kv) and ALERT a human ONCE when a
+    row keeps failing — the lane retries every ~1 min, so without this a broken row
+    (bad payload, missing page, dead account) fails silently forever behind a print.
+    Best effort: never raises, never blocks the lane. The counter is cleared lazily
+    (a published row simply stops being counted)."""
+    try:
+        from . import db, ops_alerts
+        key = f"pubfail_{row_id}"
+        n = int(db.kv_get(key) or 0) + 1
+        db.kv_set(key, str(n))
+        if n == REPEAT_FAILURE_ALERT_AT:
+            ops_alerts.alert(
+                f"calendar row {row_id} (gym {gym_id}) has failed to publish "
+                f"{n} times in a row: {type(exc).__name__}: {str(exc)[:160]}. "
+                "It will keep retrying, but a human should look — this is usually "
+                "a payload/connection problem, not a blip.")
+    except Exception:
+        pass
 
 
 # ---- listener slot-fire lane -------------------------------------------------
@@ -566,7 +600,8 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
                                   now=now, catch_all=True,
                                   approved_only=not autonomous,
-                                  zernio_publish=zernio_publish)
+                                  zernio_publish=zernio_publish,
+                                  catchup_days=CLIENT_CATCHUP_DAYS)
             summary["gym"] = base
             summary["autonomous"] = autonomous
             out.append(summary)

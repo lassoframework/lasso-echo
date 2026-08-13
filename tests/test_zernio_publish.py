@@ -39,13 +39,10 @@ class FakeZernioClient:
         return self._accounts
 
     def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
-                    page_id=None):
-        # delegate to the REAL payload builder so we test the true shape
-        payload = zernio.ZernioClient.create_post.__wrapped__ if hasattr(
-            zernio.ZernioClient.create_post, "__wrapped__") else None
+                    page_id=None, platform=None, story=False):
         self.created.append({"account_id": account_id, "body": body,
                              "media_urls": media_urls, "scheduled_for": scheduled_for,
-                             "page_id": page_id})
+                             "page_id": page_id, "platform": platform, "story": story})
         return {"_id": self.post_id}
 
 
@@ -90,11 +87,19 @@ def test_create_post_payload_publish_now():
             return R()
 
     c = zernio.ZernioClient(api_key="k", base="https://api.zernio.com", http=Http())
-    c.create_post("acct1", "Hello", media_urls=["https://r2/a.jpg"])
+    c.create_post("acct1", "Hello", media_urls=["https://r2/a.jpg"],
+                  platform="instagram")
     assert posted["url"].endswith("/v1/posts")
-    assert posted["json"] == {"accountId": "acct1", "body": "Hello",
-                              "media": [{"url": "https://r2/a.jpg"}]}
-    assert "scheduledFor" not in posted["json"]           # publish-now omits it
+    body = posted["json"]
+    # OpenAPI-verified shape: content + platforms[] + mediaItems (typed)
+    assert body["content"] == "Hello"
+    assert body["platforms"] == [{"platform": "instagram", "accountId": "acct1"}]
+    assert body["mediaItems"] == [{"type": "image", "url": "https://r2/a.jpg"}]
+    # no scheduledFor -> MUST be publishNow (else Zernio saves a DRAFT, not a post)
+    assert body["publishNow"] is True
+    assert "scheduledFor" not in body
+    # legacy keys of the broken payload must be gone
+    assert "accountId" not in body and "body" not in body and "media" not in body
 
 
 def test_create_post_payload_scheduled_and_fb_page():
@@ -112,10 +117,44 @@ def test_create_post_payload_scheduled_and_fb_page():
             return R()
 
     c = zernio.ZernioClient(api_key="k", http=Http())
-    c.create_post("fb1", "Hi", media_urls=["u"], scheduled_for="2026-08-13T07:30:00-04:00",
-                  page_id="PAGE99")
-    assert posted["json"]["scheduledFor"] == "2026-08-13T07:30:00-04:00"
-    assert posted["json"]["platformSpecificData"] == {"pageId": "PAGE99"}
+    c.create_post("fb1", "Hi", media_urls=["u"],
+                  scheduled_for="2026-08-13T07:30:00-04:00",
+                  page_id="PAGE99", platform="facebook")
+    body = posted["json"]
+    assert body["scheduledFor"] == "2026-08-13T07:30:00-04:00"
+    assert body["timezone"] == "UTC"
+    assert "publishNow" not in body                       # scheduled, not immediate
+    entry = body["platforms"][0]
+    assert entry["platform"] == "facebook" and entry["accountId"] == "fb1"
+    # pageId rides INSIDE the platform entry, not at the top level
+    assert entry["platformSpecificData"] == {"pageId": "PAGE99"}
+    assert "platformSpecificData" not in body
+
+
+def test_create_post_story_and_video_media_type():
+    posted = {}
+
+    class Http:
+        def post(self, url, json=None, headers=None, timeout=None):
+            posted["json"] = json
+            posted["headers"] = headers
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"_id": "z3"}
+            return R()
+
+    c = zernio.ZernioClient(api_key="k", http=Http())
+    c.create_post("ig1", "Story time", media_urls=["https://r2/clip.mp4"],
+                  platform="instagram", story=True)
+    body = posted["json"]
+    entry = body["platforms"][0]
+    assert entry["platformSpecificData"] == {"contentType": "story"}
+    assert body["mediaItems"] == [{"type": "video", "url": "https://r2/clip.mp4"}]
+    # idempotency header always present
+    assert posted["headers"].get("x-request-id")
 
 
 # ---- account id resolution ---------------------------------------------------
@@ -162,7 +201,7 @@ def test_publish_ig_resolves_and_posts(monkeypatch):
     client = FakeZernioClient(post_id="zpost_IG")
     res = zernio_publisher.publish(
         _draft(caption="Train today", url="https://r2/x.jpg"), _ig_account(),
-        client=client, scheduled_for="2026-08-13T07:30:00-04:00",
+        client=client, scheduled_for="2027-06-01T07:30:00-04:00",
         profile_resolver=lambda k: "prof_eng")
     assert res.ok and res.mode == "published" and res.media_id == "zpost_IG"
     assert len(client.created) == 1
@@ -170,8 +209,49 @@ def test_publish_ig_resolves_and_posts(monkeypatch):
     assert call["account_id"] == "ig_acct_1"              # the gym's own IG account
     assert call["body"] == "Train today"
     assert call["media_urls"] == ["https://r2/x.jpg"]
-    assert call["scheduled_for"] == "2026-08-13T07:30:00-04:00"
+    assert call["scheduled_for"] == "2027-06-01T07:30:00-04:00"
     assert call["page_id"] is None                        # IG has no page
+    assert call["platform"] == "instagram"                # platforms[] entry
+    assert call["story"] is False                         # feed, not story
+
+
+def test_publish_story_flows_content_type(monkeypatch):
+    _arm(monkeypatch)
+    client = FakeZernioClient()
+    d = _draft(caption="Story!", url="https://r2/s.jpg")
+    d.is_story = True
+    d.draft_type = "story"
+    res = zernio_publisher.publish(d, _ig_account(), client=client,
+                                   scheduled_for="2027-06-01T12:30:00-04:00",
+                                   profile_resolver=lambda k: "prof_eng")
+    assert res.ok
+    assert client.created[0]["story"] is True, \
+        "an approved STORY must publish as a story, never as a second feed post"
+
+
+def test_publish_past_slot_flips_to_publish_now(monkeypatch):
+    _arm(monkeypatch)
+    client = FakeZernioClient()
+    res = zernio_publisher.publish(
+        _draft(), _ig_account(), client=client,
+        scheduled_for="2020-01-01T07:30:00-05:00",         # long past
+        profile_resolver=lambda k: "prof_eng")
+    assert res.ok
+    assert client.created[0]["scheduled_for"] is None, \
+        "a past slot must publish NOW, not hand Zernio a past scheduledFor"
+
+
+def test_publish_409_dedup_is_success_not_retry_loop(monkeypatch):
+    _arm(monkeypatch)
+
+    class DupClient(FakeZernioClient):
+        def create_post(self, *a, **k):
+            raise zernio.ZernioError(409, '{"error":"duplicate post"}')
+
+    res = zernio_publisher.publish(_draft(), _ig_account(), client=DupClient(),
+                                   profile_resolver=lambda k: "prof_eng")
+    assert res.ok and res.mode == "published"
+    assert "dedup" in res.detail
 
 
 def test_publish_fb_requires_and_sends_page(monkeypatch):

@@ -279,18 +279,33 @@ def _content_calendar_post(row):
     fmt = (row.get("format") or "").strip().lower()
     if fmt not in ("feed", "story"):
         fmt = "feed"
+    # Go-live time: the stored stamp when present; else SYNTHESIZED from the row's own
+    # deterministic slot (the same pure function the publisher stamps from), so a
+    # pending/future post shows its real publish time before its day arrives. Never
+    # fabricated: it is exactly the time the row will go out.
+    scheduled_at = row.get("scheduled_at")
+    if not scheduled_at:
+        try:
+            from .calendar_autopublish import scheduled_iso_for_row
+            scheduled_at = scheduled_iso_for_row(row) or None
+        except Exception:
+            scheduled_at = None
     post = {
         "id": row.get("id"),
         "day_key": row.get("post_date"),
         "status": row.get("status") or "",
         "pillar": row.get("pillar") or "",
         "format": fmt,
+        # WHICH page this row posts to (instagram|facebook) — a feed cross-posted to
+        # IG + FB is two rows; without this the portal renders two identical cards
+        # with no way to tag them.
+        "platform": (row.get("account") or "").strip().lower(),
         "image_public_url": row.get("image_url") or "",
         "caption": row.get("caption") or "",
-        # Go-live time (content_calendar.scheduled_at, ISO tz-aware) so the portal can show clients
-        # WHEN a post publishes. Display metadata only; None on old/unstamped rows -> portal falls
-        # back to the date. Never invented: passed through exactly as stored, or None.
-        "scheduled_at": row.get("scheduled_at"),
+        "scheduled_at": scheduled_at,
+        # Publish record (display only): when it actually went out + the vendor post id.
+        "published_at": row.get("published_at"),
+        "late_post_id": row.get("late_post_id"),
     }
     # gym_id scopes the hosted fallback card (media_host tenant isolation); the portal
     # post shape itself is unchanged (no new keys).
@@ -374,7 +389,10 @@ def _handle_social_supabase(account_key, month, now=None):
     except Exception as exc:
         return 500, {"error": f"store error: {type(exc).__name__}"}
 
-    low_creative = not any((p.get("image_public_url") or "") for p in posts)
+    # HONEST low_creative: computed from the RAW rows' image_url, BEFORE the
+    # no-creative fallback substitutes hosted infographics into the display field —
+    # else a month running on fallback cards never triggers the "upload media" nudge.
+    low_creative = not any((r.get("image_url") or "").strip() for r in rows)
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
     awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
@@ -524,6 +542,24 @@ def _sb_load_owned_row(account_key, draft_id, sb_store):
     return row, None
 
 
+def _published_is_final(row, action, draft_id):
+    """A published row's creative is already live on the gym's page; no portal action
+    may rewrite it. A row in 'publishing' is mid-claim (the publisher owns it for the
+    seconds between the atomic claim and the result) — an action flipping it back to
+    pending/approved would make it claimable AGAIN and double-post. Returns the 409
+    response for either state, else None."""
+    status = str((row or {}).get("status") or "").lower()
+    if status == "published":
+        return 409, {"ok": False, "action": action, "draft_id": draft_id,
+                     "error": "this post is already published; it can no longer be "
+                              "edited, denied, or killed from the portal"}
+    if status == "publishing":
+        return 409, {"ok": False, "action": action, "draft_id": draft_id,
+                     "error": "this post is publishing right now; try again in a "
+                              "minute once it lands"}
+    return None
+
+
 def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -532,10 +568,15 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
-        # idempotent: an already approved row is a clean no-op (never a re-publish).
+        # idempotent: an already approved row is a clean no-op (never a re-publish);
+        # an already PUBLISHED row is also a clean no-op (the approval already ran its
+        # course), never a status rewrite back to 'approved'.
         if (row.get("status") or "") == _pcs.action_status("approve"):
             return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
                          "detail": "Already approved.", "idempotent": True}
+        if str(row.get("status") or "").lower() == "published":
+            return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
+                         "detail": "Already published.", "idempotent": True}
         updated = sb_store.set_status(account_key, draft_id,
                                       _pcs.action_status("approve"))
         if updated is None:
@@ -564,6 +605,9 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
+        final = _published_is_final(row, "edit", draft_id)
+        if final is not None:
+            return final
         updated = sb_store.patch_caption(account_key, draft_id, note)
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
@@ -587,6 +631,14 @@ def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
+        final = _published_is_final(row, "deny", draft_id)
+        if final is not None:
+            return final
+        # idempotent: re-denying an already denied row never burns a second unit.
+        if (row.get("status") or "") == _pcs.action_status("deny"):
+            return 200, {"ok": True, "action": "deny", "draft_id": draft_id,
+                         "detail": "Already denied.", "idempotent": True,
+                         "recreate_budget": _budget_state(account_key)}
         updated = sb_store.set_status(account_key, draft_id,
                                       _pcs.action_status("deny"))
         if updated is None:
@@ -611,6 +663,9 @@ def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_s
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
+        final = _published_is_final(row, "kill", draft_id)
+        if final is not None:
+            return final
         updated = sb_store.set_status(account_key, draft_id,
                                       _pcs.action_status("kill"))
         if updated is None:
@@ -801,11 +856,31 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
         return 500, {"ok": False,
                      "error": f"could not persist autonomy: {type(exc).__name__}",
                      "account_key": account_key}
+    # DUAL-WRITE the SHARED plane: the publish lane (a different Railway service with
+    # its own empty SQLite) reads echo_gym_settings.autonomous via gym_autonomy. The
+    # local kv write above alone would return {ok:true} while the publisher never sees
+    # the flag. Best effort here — the kv is still the local record; a Supabase outage
+    # must not 500 the toggle — but a miss is REPORTED in the response, never silent.
+    shared_persisted = False
+    try:
+        if config.portal_calendar_supabase_enabled():
+            from .portal_calendar_store import SupabaseCalendarStore
+            base = account_key
+            for suf in ("_ig", "_fb"):
+                if base.endswith(suf):
+                    base = base[: -len(suf)]
+                    break
+            shared_persisted = bool(SupabaseCalendarStore().set_gym_autonomy(
+                base, want_on, actor=actor_id or ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[portal-social] autonomy shared-plane write failed for "
+              f"{account_key}: {type(exc).__name__}")
 
     if not want_on:
         # Manual restored: clear only. Never un-approve anything already published.
         return 200, {"ok": True, "autonomous": False, "approved_count": 0,
-                     "account_key": account_key}
+                     "account_key": account_key,
+                     "shared_persisted": shared_persisted}
 
     # ON: auto-approve every currently-pending post for THIS account via the same
     # gated approve path a manual approve uses. Never fabricates a publish.
@@ -821,7 +896,7 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
             # auto-approve and the flag stays ON for future posts.
             continue
     return 200, {"ok": True, "autonomous": True, "approved_count": approved,
-                 "account_key": account_key}
+                 "account_key": account_key, "shared_persisted": shared_persisted}
 
 
 # ==========================================================================
@@ -962,6 +1037,7 @@ def handle_metrics(account_key, days=30, reader=None, zclient=None):
         days = 30
     if days <= 0:
         days = 30
+    days = min(days, 365)     # clamp: an unbounded ?days= flows into the Zernio pager
     if not is_social_active(account_key, reader=reader):
         return 402, {"account_key": account_key, "active": False,
                      "window_days": days, "posts": [], "totals": {}, "audience": {},

@@ -227,11 +227,12 @@ def test_sync_pulls_pending_caption_with_per_file_caption():
         "20260810T120000Z_squat.jpg")
 
 
-def test_sync_across_all_prefixes_idempotent_and_deduped():
-    """Media spread across pending_caption/ + incoming/ + originals/ all sync; the
-    batch _upload.json caption applies to the incoming/ photo; the SAME basename in
-    two prefixes downloads ONCE (processed form wins over the raw originals/ copy);
-    a re-sync re-downloads nothing."""
+def test_sync_across_prefixes_skips_originals_idempotent_and_deduped():
+    """Media in pending_caption/ + incoming/ sync; originals/ (the RAW archive of an
+    already-converted upload) is deliberately NOT synced — pulling it double-counted
+    the same video (raw .mov + converted .mp4, different basenames), inflating the
+    media count and double-placing the video on two feed days. The batch _upload.json
+    caption applies to the incoming/ photo; a re-sync re-downloads nothing."""
     objs = {
         # staged (uncaptioned) in pending_caption/
         "intake/eng/pending_caption/20260810T120000Z_a.jpg": b"\xff\xd8\xffA",
@@ -241,21 +242,21 @@ def test_sync_across_all_prefixes_idempotent_and_deduped():
             json.dumps({"note": "batch",
                         "captions": {"20260810T120000Z_b.jpg": "coach Dave"}}
                        ).encode("utf-8"),
-        # a raw MOV source archived to originals/ (its own basename)
+        # a raw MOV archived to originals/: MUST NOT sync (its converted .mp4 is the
+        # library copy; the raw would double-count the same video)
         "intake/eng/originals/20260810T120000Z_c.mov": b"\x00MOV",
-        # the SAME basename living in BOTH originals/ and pending_caption/: must
-        # download once, from the processed (pending_caption) copy.
+        # the same basename in originals/ never shadows the processed copy
         "intake/eng/pending_caption/20260810T120000Z_d.jpg": b"\xff\xd8\xffDP",
         "intake/eng/originals/20260810T120000Z_d.jpg": b"\xff\xd8\xffDO",
     }
     r2 = FakeR2(objs)
     out = cms.sync_uploads("eng", r2=r2)
-    assert out == {"synced": 4, "skipped": 0}   # a, b, c, d (once)
+    assert out == {"synced": 3, "skipped": 0}   # a, b, d — never the raw archive
 
     lib = os.path.join("content_library", "eng")
     imgs = sorted(f for f in os.listdir(lib) if f.endswith((".jpg", ".mov")))
     assert imgs == ["20260810T120000Z_a.jpg", "20260810T120000Z_b.jpg",
-                    "20260810T120000Z_c.mov", "20260810T120000Z_d.jpg"]
+                    "20260810T120000Z_d.jpg"]
     # dedup: the processed pending_caption bytes won for the shared basename 'd'
     with open(os.path.join(lib, "20260810T120000Z_d.jpg"), "rb") as fh:
         assert fh.read() == b"\xff\xd8\xffDP"
@@ -266,7 +267,7 @@ def test_sync_across_all_prefixes_idempotent_and_deduped():
     # IDEMPOTENT: nothing re-downloads on a second pass.
     r2.got.clear()
     out2 = cms.sync_uploads("eng", r2=r2)
-    assert out2 == {"synced": 0, "skipped": 4}
+    assert out2 == {"synced": 0, "skipped": 3}
     assert [k for k in r2.got if _is_media_get(k)] == []
 
 

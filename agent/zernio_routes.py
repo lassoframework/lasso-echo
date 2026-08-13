@@ -158,7 +158,13 @@ def handle_social_disconnect(account_key, platform, client=None,
                     break
         if not acct_id:
             return 200, {"ok": True, "disconnected": 0, "detail": "nothing connected"}
-        c.disconnect_account(acct_id)
+        try:
+            c.disconnect_account(acct_id)
+        except _z.ZernioError as exc:
+            # 404 = already gone (double-click race: the first click removed it).
+            # That IS the desired end state — fall through to the clears, not a 502.
+            if exc.status != 404:
+                raise
     except _z.ZernioError as exc:
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
     except Exception as exc:
@@ -227,6 +233,11 @@ def handle_facebook_page_select(account_key, page_id, client=None):
 
     Echo owns the Page binding: it persists the gym's chosen page id and injects it per post
     (Zernio's platformSpecificData.pageId). The portal stores nothing.
+
+    OWNERSHIP VALIDATED: the page id must be one of the pages the gym's OWN connected
+    Facebook account actually manages (list_facebook_pages). A typo'd/stale/foreign id
+    is refused with 400 at selection time instead of surfacing days later as a silent
+    publish failure (or a post landing on the wrong page).
     """
     if not config.zernio_enabled():
         return _disabled("facebook-page-select")
@@ -234,12 +245,29 @@ def handle_facebook_page_select(account_key, page_id, client=None):
         return 400, {"error": "missing account_key"}
     if not page_id or not str(page_id).strip():
         return 400, {"error": "page_id required"}
+    page_id = str(page_id).strip()
+    c = _client(client)
+    try:
+        pid = _resolve_profile_id(account_key)
+        if not pid:
+            return 400, {"error": "no social profile yet; connect Facebook first"}
+        fb_id = _z.facebook_account_id(c.list_accounts(pid))
+        if not fb_id:
+            return 400, {"error": "no Facebook account connected; connect it first"}
+        owned = {p["id"] for p in _z.map_pages(c.list_facebook_pages(fb_id))["pages"]}
+        if page_id not in owned:
+            return 400, {"error": "page_id does not belong to this gym's connected "
+                                  "Facebook account"}
+    except _z.ZernioError as exc:
+        return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
+    except Exception as exc:
+        return 502, {"error": f"zernio call failed: {type(exc).__name__}"}
     try:
         existing = _db.gym_get(account_key) or {}
         _db.gym_upsert(
             account_key,
             display_name=existing.get("display_name") or "",
-            zernio_default_fb_page_id=str(page_id).strip(),
+            zernio_default_fb_page_id=page_id,
         )
     except Exception as exc:
         return 500, {"error": f"db error: {type(exc).__name__}"}

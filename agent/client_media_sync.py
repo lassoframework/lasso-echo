@@ -77,7 +77,11 @@ _MANIFEST_BASENAME = "manifest.json"
 # order we prefer them when the SAME photo lives in more than one (e.g. a converted
 # JPG in pending_caption/ plus its raw HEIC source in originals/): the processed,
 # usable form wins over the raw source archive.
-_MEDIA_PREFIXES = ("pending_caption/", "incoming/", "originals/")
+# NOTE: originals/ is deliberately NOT synced — it archives the RAW upload after
+# ingest converts it (e.g. .mov -> .mp4 filed to the library). Syncing it too made
+# the same video count twice (raw + converted, different basenames), inflating the
+# media count, firing spurious grow-on-more rebuilds, and double-placing the video.
+_MEDIA_PREFIXES = ("pending_caption/", "incoming/")
 
 # Prefixes under intake/<base>/ we must NEVER sync as media (thumbnails, review /
 # deadletter quarantines, the archived intake forms). Listed for clarity even though

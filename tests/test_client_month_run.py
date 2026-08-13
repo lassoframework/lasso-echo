@@ -270,3 +270,91 @@ def test_banned_word_boundary():
     assert cmr._has_banned_word("we compete weekly", ["compete"])
     assert not cmr._has_banned_word("we are competent coaches", ["compete"])
     assert not cmr._has_banned_word("clean caption", [])
+
+
+# ---- 9. polluted served-ledger collapse regression (Dale's 1-feed month) ---------
+def test_polluted_ledger_still_places_distinct_photos(tmp_path, monkeypatch):
+    """Repeated plan-then-delete rebuild passes leave EVERY photo 'served' with a
+    future date. The old pick then returned the SAME photo for every day (its own
+    re-record kept it the least-recently-served minimum) and the month collapsed to
+    ONE feed day. The exclude_keys threading must keep every feed on a distinct photo."""
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    # pollute: all 5 photos served, dates spread across the FUTURE month
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    urls = [r["image_url"] for r in feed_ig]
+    assert len(urls) == 5, f"collapsed to {len(urls)} feed day(s)"
+    assert len(set(urls)) == 5, "a photo was reused across feeds"
+
+
+# ---- 10. locked (approved) days are skipped; their photos never re-picked --------
+class _LockedStore(_FakeStore):
+    """FakeStore that also reports existing rows, like the live list_month."""
+
+    def __init__(self, existing):
+        super().__init__()
+        self._existing = list(existing)
+
+    def list_month(self, base_key, month):
+        return [dict(r) for r in self._existing
+                if str(r.get("post_date", "")).startswith(month)]
+
+
+def test_locked_day_skipped_and_photo_never_repicked(tmp_path):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    locked = [
+        {"gym_id": "gritx", "post_date": "2026-08-02", "account": "instagram",
+         "format": "feed", "status": "approved",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+        {"gym_id": "gritx", "post_date": "2026-08-02", "account": "instagram",
+         "format": "story", "status": "approved",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+    ]
+    store = _LockedStore(locked)
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=6, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    # no new row lands on the locked day
+    assert not [r for r in store.inserted if r["post_date"] == "2026-08-02"], \
+        "planned a competing row on an approved day"
+    # the approved photo is never re-placed on another day
+    assert not [r for r in store.inserted
+                if r["image_url"].endswith("photo_01.jpg")], \
+        "re-picked a photo already locked to an approved post"
+    # cap: 6 media minus 1 locked photo -> at most 5 new feed days
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert 1 <= len(feed_ig) <= 5
+
+
+# ---- 11. uploaded VIDEOS are placeable (not silently skipped forever) ------------
+def test_videos_are_placed(tmp_path):
+    import json as _json
+    _stock_clean("gritx_ig")
+    lib = tmp_path / "vids"
+    lib.mkdir()
+    for i in range(2):
+        (lib / f"clip_{i}.mp4").write_bytes(b"\x00\x00FAKEMP4")
+        (lib / f"clip_{i}.json").write_text(
+            _json.dumps({"public_url": f"https://gritx.media/clip_{i}.mp4"}))
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=4, voice=_voice(),
+        library_path=str(lib), store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert feed_ig, "videos were never placed"
+    assert all(r["image_url"].endswith(".mp4") for r in feed_ig)

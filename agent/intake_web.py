@@ -1391,7 +1391,7 @@ def build_server(port=None):
             pt_token, pt_sub = self._portal_token_route()
             if pt_token is not None and pt_sub in ("calendar", "library", "report"):
                 account_key = client_for_token(pt_token)
-                if account_key is None:
+                if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 if pt_sub == "calendar":
                     from urllib.parse import urlparse, parse_qs
@@ -1559,7 +1559,7 @@ def build_server(port=None):
             pt_token, pt_action = self._portal_token_route()
             if pt_token is not None and pt_action in ("approve", "edit", "deny", "kill"):
                 account_key = client_for_token(pt_token)
-                if account_key is None:
+                if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > 64 * 1024:
@@ -1579,7 +1579,7 @@ def build_server(port=None):
             # Zernio Facebook Page select: POST /portal/<token>/facebook-page-select {page_id}.
             if pt_token is not None and pt_action == "facebook-page-select":
                 account_key = client_for_token(pt_token)
-                if account_key is None:
+                if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > 64 * 1024:

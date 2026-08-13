@@ -14,11 +14,24 @@ Field renames Echo owns (portal contract never changes): Zernio `authUrl`->`oaut
 """
 
 import os
+import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 
 from . import config
 
 PLATFORMS = ("instagram", "facebook")
+
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
+
+
+def _media_type(url):
+    """The Zernio MediaItem `type` for a media URL: video/gif by extension, else image."""
+    path = (url or "").split("?", 1)[0].lower()
+    if path.endswith(_VIDEO_EXTS):
+        return "video"
+    if path.endswith(".gif"):
+        return "gif"
+    return "image"
 
 
 class ZernioError(Exception):
@@ -53,11 +66,14 @@ class ZernioClient:
             raise ZernioError(r.status_code, (r.text or "")[:200])
         return r.json()
 
-    def _post(self, path, payload):
+    def _post(self, path, payload, headers=None):
+        hdrs = {"Authorization": f"Bearer {self.api_key}"}
+        if headers:
+            hdrs.update(headers)
         r = self._client().post(
             self.base + path,
             json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers=hdrs,
             timeout=30,
         )
         if r.status_code >= 400:
@@ -133,21 +149,45 @@ class ZernioClient:
         return self._get(f"/v1/accounts/{account_id}/facebook-page")
 
     def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
-                    page_id=None):
+                    page_id=None, platform=None, story=False):
         """POST /v1/posts: publish (or schedule) ONE post to one connected account.
 
-        Verified against docs.zernio.com: body=caption, media=[{url}], accountId,
-        scheduledFor=ISO8601 (OMIT to publish immediately), platformSpecificData.pageId
-        for a Facebook Page. Returns the created post JSON (carries the post id)."""
-        payload = {"accountId": str(account_id), "body": body or ""}
+        Payload verified against the Zernio OpenAPI spec (docs.zernio.com/api/openapi,
+        createPost). The 2026-08-13 shape:
+          * content            the caption (NOT `body`)
+          * platforms          REQUIRED for non-draft posts: [{platform, accountId,
+                               platformSpecificData?}] (a top-level accountId is ignored
+                               and the API 400s "Missing required field: platforms")
+          * mediaItems         [{type: image|video|gif, url}] (NOT `media`)
+          * scheduledFor       ISO8601 to schedule; when ABSENT the post becomes a DRAFT
+                               unless publishNow=true — so immediate sends set publishNow
+          * platformSpecificData.contentType='story' publishes an IG/FB Story;
+            platformSpecificData.pageId targets a specific Facebook Page.
+        Idempotency: every call carries a fresh x-request-id (UUID4) so a same-request
+        retry returns the original post instead of double-posting; Zernio additionally
+        409s exact duplicates within 24h (the caller maps that to already-posted).
+        Returns the created post JSON (carries the post id)."""
+        entry = {"accountId": str(account_id)}
+        if platform:
+            entry["platform"] = str(platform)
+        psd = {}
+        if story:
+            psd["contentType"] = "story"
+        if page_id:
+            psd["pageId"] = str(page_id)
+        if psd:
+            entry["platformSpecificData"] = psd
+        payload = {"content": body or "", "platforms": [entry]}
         urls = [u for u in (media_urls or []) if u]
         if urls:
-            payload["media"] = [{"url": u} for u in urls]
+            payload["mediaItems"] = [{"type": _media_type(u), "url": u} for u in urls]
         if scheduled_for:
             payload["scheduledFor"] = scheduled_for
-        if page_id:
-            payload["platformSpecificData"] = {"pageId": str(page_id)}
-        return self._post("/v1/posts", payload)
+            payload["timezone"] = "UTC"
+        else:
+            payload["publishNow"] = True
+        headers = {"x-request-id": str(_uuid.uuid4())}
+        return self._post("/v1/posts", payload, headers=headers)
 
     def analytics(self, profile_id, skip=0, limit=50):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).

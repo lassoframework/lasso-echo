@@ -278,11 +278,43 @@ def test_facebook_pages_maps_ids(db_env):
     assert body == {"pages": [{"id": "p1", "name": "Reverb Gym"}]}
 
 
-def test_page_select_persists_and_requires_id(db_env):
-    assert zr.handle_facebook_page_select("gymA", "")[0] == 400
-    status, body = zr.handle_facebook_page_select("gymA", "p1")
+def _fb_fake_with_pages():
+    return _FakeClient(
+        accounts={"accounts": [{"_id": "fb1", "platform": "facebook",
+                                "isActive": True,
+                                "connectedAt": "2026-07-29T13:14:04Z",
+                                "metadata": {"expires_in": 999999}}]},
+        pages={"pages": [{"_id": "p1", "name": "Reverb Gym"}]},
+    )
+
+
+def test_page_select_persists_owned_page(db_env):
+    _db.gym_upsert("gymA", zernio_profile_id="P1")
+    assert zr.handle_facebook_page_select("gymA", "",
+                                          client=_fb_fake_with_pages())[0] == 400
+    status, body = zr.handle_facebook_page_select("gymA", "p1",
+                                                  client=_fb_fake_with_pages())
     assert status == 200 and body == {"ok": True}
     assert (_db.gym_get("gymA") or {}).get("zernio_default_fb_page_id") == "p1"
+
+
+def test_page_select_refuses_foreign_page(db_env):
+    # OWNERSHIP: a page id the gym's own FB account does not manage is refused and
+    # never persisted (was the silent wrong-page/publish-failure trap).
+    _db.gym_upsert("gymA", zernio_profile_id="P1")
+    status, body = zr.handle_facebook_page_select("gymA", "someone_elses_page",
+                                                  client=_fb_fake_with_pages())
+    assert status == 400
+    assert "does not belong" in body["error"]
+    assert not (_db.gym_get("gymA") or {}).get("zernio_default_fb_page_id")
+
+
+def test_page_select_requires_connected_facebook(db_env):
+    _db.gym_upsert("gymB", zernio_profile_id="P2")
+    fake = _FakeClient(accounts={"accounts": [CONNECTED_IG]})   # IG only, no FB
+    status, body = zr.handle_facebook_page_select("gymB", "p1", client=fake)
+    assert status == 400
+    assert "no Facebook account" in body["error"]
 
 
 def test_account_state_present_row_no_positive_signal_is_connected():

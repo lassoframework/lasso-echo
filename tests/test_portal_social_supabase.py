@@ -121,8 +121,10 @@ def test_social_reads_content_calendar(monkeypatch):
 
 
 def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):
-    # The portal shows clients WHEN a post publishes; the payload must pass scheduled_at through
-    # exactly as stored, and leave it None (never fabricated) when the row is unstamped.
+    # The portal shows clients WHEN a post publishes: a stored stamp passes through
+    # verbatim; an UNSTAMPED row gets its go-live time SYNTHESIZED from the row's own
+    # deterministic slot (the exact time the publisher will use) — so a pending/future
+    # post shows its time before its day arrives instead of a blank.
     store = _FakeStore([
         _row("uuid-1", post_date="2026-08-05", scheduled_at="2026-08-05T07:30:00-04:00"),
         _row("uuid-2", post_date="2026-08-06", scheduled_at=None),
@@ -131,7 +133,12 @@ def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):
     _, body = ps.handle_social("lasso", "2026-08")
     by_id = {p["id"]: p for p in body["posts"]}
     assert by_id["uuid-1"]["scheduled_at"] == "2026-08-05T07:30:00-04:00"
-    assert by_id["uuid-2"]["scheduled_at"] is None
+    # synthesized: the row's own slot on its own day, never null, never a random time
+    from agent.calendar_autopublish import scheduled_iso_for_row
+    expected = scheduled_iso_for_row(
+        {"id": "uuid-2", "post_date": "2026-08-06", "format": "feed"})
+    assert by_id["uuid-2"]["scheduled_at"] == expected
+    assert by_id["uuid-2"]["scheduled_at"].startswith("2026-08-06T")
 
 
 def test_every_social_post_carries_a_stable_id(monkeypatch):
