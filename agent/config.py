@@ -1190,6 +1190,17 @@ def client_video_edit_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CLIENT_VIDEO_EDIT", "false"))
 
 
+def story_format_enabled() -> bool:
+    """Format a client PHOTO story into a proper 1080x1920 card (AGENT_STORY_FORMAT).
+    OFF by default = the raw photo posts to the story (centered on black bars, no text).
+    ON = the story creative becomes a filled 9:16 card: the full photo on a blurred
+    cover background with the day's OWN approved caption burned in (stories publish with
+    an empty body, so the text must be on the image). Formatting only ENHANCES: any
+    failure posts the raw photo. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_STORY_FORMAT", "false"))
+
+
 def reel_target_sec() -> float:
     """Target action-reel length in seconds (AGENT_REEL_TARGET_SEC, default 22).
     Clamped to 10..60 (IG Reels sweet spot; never a mis-set 600s encode)."""

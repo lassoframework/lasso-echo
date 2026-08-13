@@ -364,6 +364,10 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # a story. No extra media is consumed, so N photos -> N feeds + N stories.
         story = _story_from_feed(feed)
         _mark_story(story)
+        # STORY FORMATTING (AGENT_STORY_FORMAT, OFF by default): a PHOTO story's
+        # creative becomes a filled 1080x1920 card with the caption burned in, so it
+        # is story-size (no black bars) and readable. Video stories are left as-is.
+        _maybe_format_story(account, story, feed, library_path, log)
         drafts.append(story)
 
     rows = _to_rows(base_key, drafts)
@@ -425,6 +429,44 @@ def _attach_video_poster(account, draft, library_path, log):
                 draft.thumbnail_url = hosted
     except Exception as exc:  # noqa: BLE001 - a preview must never block a post
         log(f"poster lane failed for {os.path.basename(path)}: {type(exc).__name__}")
+
+
+def _maybe_format_story(account, story, feed, library_path, log):
+    """Swap a PHOTO story's creative for a formatted 1080x1920 story card (photo on a
+    blurred cover fill + the day's caption burned in), HOSTED. No-op unless
+    AGENT_STORY_FORMAT is armed and the creative is an image (video stories are left
+    alone). Best effort: any failure keeps the raw photo. Mutates story in place."""
+    path = (getattr(feed, "creative_path", "") or "").strip()
+    if not path or path.lower().endswith(_VIDEO_EXTS):
+        return
+    try:
+        from . import story_image, media_host
+        gym_name = _display_name_for(account)
+        card = story_image.get_or_make_story_image(
+            path, getattr(feed, "caption", "") or "", gym_name, library_path, logger=log)
+        if not card:
+            return
+        if config.hosting_enabled():
+            hosted = media_host.host_media(card, account.key)
+            if hosted:
+                story.creative_public_url = hosted
+                # the formatted card IS the story's image; it needs no separate poster
+                if getattr(story, "thumbnail_url", ""):
+                    story.thumbnail_url = ""
+                log(f"story formatted for {os.path.basename(path)}")
+    except Exception as exc:  # noqa: BLE001 - never block the day
+        log(f"story format lane failed for {os.path.basename(path)}: "
+            f"{type(exc).__name__}")
+
+
+def _display_name_for(account):
+    """A clean gym name for on-image branding: the account's display name minus a
+    trailing IG/FB tag, or '' when it would be noise."""
+    name = (getattr(account, "display_name", "") or "").strip()
+    for suf in (" IG", " FB", " Instagram", " Facebook"):
+        if name.endswith(suf):
+            name = name[: -len(suf)].strip()
+    return name
 
 
 def _mark_feed(draft):
