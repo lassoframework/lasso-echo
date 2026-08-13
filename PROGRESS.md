@@ -81,6 +81,30 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## A+ quality gate — every post checked, no sub-par caption reaches a calendar (2026-08-13)
+
+Blake standing bar: "whenever you make a post (ig, story, reel, anything) to calendar
+for a gym it needs to be A+ with captions and everything checked."
+
+### [x] agent/post_quality.py — the A+ gate, enforced at BUILD time
+A client draft is written ONLY when its caption is a REAL caption (>=12 content words,
+>=40 chars, counts across HOOK/BODY/CTA not just the first paragraph), carries NO dash
+(copy law), NO banned word, NO LLM scaffolding, and has real media. A sub-par draft is
+DROPPED (walk neighbour days for a better source, else hold) — never published. Active
+whenever SB7 (the real-caption engine) is on; SB7-off keeps the documented baseline.
+
+### [x] LLM scaffold leak fixed (GritX story "# Caption Body:")
+SB7 occasionally prepended a markdown header / 'Caption:' label. drafter._strip_llm_
+scaffold removes it before use; post_quality rejects any caption still starting with it.
+GritX's live story reformatted with a clean real caption ("You're juggling too much.
+Energy is shot.") + the 9:16 branded card.
+
+### [x] Verified: 0 captions fail A+ across ALL gyms (ENG + GritX, every month/status).
+Gym-agnostic (subagent-audited earlier). Every future gym inherits the gate + SB7 + the
+story/poster/reel lanes automatically. Suite 2627 green.
+
+---
+
 ## Real StoryBrand client captions — no more raw intake word (Dale round 6, 2026-08-13)
 
 ### [x] "why is the caption only HYROX?!" -> SB7 engine now writes client captions
