@@ -183,34 +183,52 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     attempts, re-homing the clean draft onto the real day. Any draft whose caption still
     carries a banned word is DROPPED (never emitted).
 
-    Returns (draft, dropped_reason). draft is None when no clean draft could be built."""
+    Returns (draft, dropped_reason). draft is None when no clean draft could be built.
+
+    A+ GATE: a draft is accepted only when it passes post_quality.is_a_plus (a REAL
+    caption + real media + no dash + no banned word), NOT merely the banned-word check.
+    A thin caption (e.g. the raw 'HYROX' source when SB7 could not write a real one) is
+    treated like a banned draft: we walk neighbouring days for a better source, and drop
+    the day if none qualifies. No gym ever gets a sub-par post on its calendar."""
+    from . import post_quality
+
+    def _accept(d):
+        if d is None:
+            return False
+        # A+ caption gate is enforced whenever the real-caption engine (SB7) is on —
+        # the production posture. With SB7 OFF the system is in its documented
+        # deterministic baseline mode (source + CTA), where only the banned-word bar
+        # applies, so a thin source is not dropped and the baseline stays usable.
+        if config.sb7_enabled():
+            return post_quality.is_a_plus(d, banned_words)
+        return not _has_banned_word(d.caption, banned_words)
+
     # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
     draft = client_content.build_client_draft(account, day_key, voice, library_path,
                                               exclude_keys=exclude_keys)
     if draft is None:
         return None, None
-    if not _has_banned_word(draft.caption, banned_words):
+    if _accept(draft):
         return draft, None
+    first_issues = post_quality.post_issues(draft, banned_words)
 
-    # The day's rotated source hit a banned word. Try alternative approved sources by
-    # walking neighbouring day keys so a DIFFERENT real approved source fills the day
-    # before we drop it. Bounded, no I/O beyond the same builder call, never fabricated.
+    # The day's draft is not A+ (banned word OR a thin/low-quality caption). Try
+    # alternative approved sources by walking neighbouring day keys so a DIFFERENT real
+    # approved source fills the day before we drop it. Bounded; never fabricated.
     from datetime import date, timedelta
     base = date.fromisoformat(str(day_key)[:10])
     for step in range(1, 8):
         alt_key = (base + timedelta(days=step)).isoformat()
         alt = client_content.build_client_draft(account, alt_key, voice, library_path,
                                                 exclude_keys=exclude_keys)
-        if alt is None:
-            continue
-        if not _has_banned_word(alt.caption, banned_words):
+        if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
             # on day_key (only the day is re-pointed; the caption/source/photo are the
             # real approved ones the builder produced).
             alt.day_key = day_key
             alt.scheduled_for = draft.scheduled_for
             return alt, None
-    return None, "banned-word: every candidate source for the day carried a banned word"
+    return None, f"not A+: {'; '.join(first_issues)}"
 
 
 def _row_from_draft(base_key, draft):
