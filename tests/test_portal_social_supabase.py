@@ -49,13 +49,14 @@ def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
 
 class _FakeStore:
     """Stands in for SupabaseCalendarStore. Enforces the same gym_id isolation the
-    real PostgREST filters do, and RECORDS every set_status so tests can assert that
-    NO write was issued on a cross-gym or missing row."""
+    real PostgREST filters do, and RECORDS every set_status/patch_caption so tests
+    can assert that NO write was issued on a cross-gym or missing row."""
 
     def __init__(self, rows=None):
         # rows keyed by id, each a content_calendar dict (carries its own gym_id)
         self._rows = {r["id"]: dict(r) for r in (rows or [])}
         self.patches = []  # (row_id, new_status) for every set_status attempt
+        self.caption_patches = []  # (row_id, caption) for every patch_caption attempt
 
     def list_month(self, account_key, month):
         prefix = month + "-"
@@ -75,6 +76,15 @@ class _FakeStore:
         if r is None or r.get("gym_id") != account_key:
             return None  # id+gym_id filter matched zero rows
         r["status"] = new_status
+        return dict(r)
+
+    def patch_caption(self, account_key, row_id, new_caption):
+        self.caption_patches.append((row_id, new_caption))
+        r = self._rows.get(row_id)
+        if r is None or r.get("gym_id") != account_key:
+            return None
+        r["caption"] = new_caption
+        r["status"] = "pending"
         return dict(r)
 
 
@@ -240,14 +250,25 @@ def test_kill_requires_confirm_no_write(monkeypatch):
     assert store.patches == []
 
 
-def test_edit_clean_note_keeps_pending_no_write(monkeypatch):
-    store = _FakeStore([_row("id-1", status="pending")])
+def test_edit_clean_note_writes_caption_and_reverts_to_pending(monkeypatch):
+    store = _FakeStore([_row("id-1", status="approved")])
     status, body = ps.handle_edit("lasso", "id-1", "U_owner",
                                   note="Please make the tone warmer.", sb_store=store)
     assert status == 200
     assert body["ok"] is True and body["action"] == "edit"
-    assert body["note"] == "Please make the tone warmer."
-    assert store.patches == [], "edit issues NO status write"
+    assert body["caption"] == "Please make the tone warmer."
+    assert body["status"] == "pending"
+    # edit writes caption via patch_caption, not via set_status
+    assert store.caption_patches == [("id-1", "Please make the tone warmer.")]
+    assert store.patches == [], "edit must use patch_caption, not set_status"
+
+
+def test_edit_empty_note_returns_400(monkeypatch):
+    store = _FakeStore([_row("id-1", status="pending")])
+    status, body = ps.handle_edit("lasso", "id-1", "U_owner",
+                                  note="", sb_store=store)
+    assert status == 400
+    assert store.caption_patches == [], "empty note must not write"
 
 
 def test_edit_with_stat_no_receipt_is_422_no_write(monkeypatch):
@@ -278,6 +299,7 @@ def test_cross_gym_action_is_404_and_no_write(db_tmp, call):
     assert body["ok"] is False
     assert body["error"] == "draft not found"
     assert store.patches == [], "CRITICAL: no PATCH may be issued on a cross gym row"
+    assert store.caption_patches == [], "CRITICAL: no caption write on a cross gym row"
 
 
 def test_cross_gym_deny_does_not_charge_budget(db_tmp):
