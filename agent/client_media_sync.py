@@ -239,8 +239,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
 
     # Collect media keys across every prefix that can hold the gym's real media. The
     # FIRST prefix to claim a basename wins (_MEDIA_PREFIXES order: pending_caption/
-    # then incoming/ then originals/), so a converted photo is not also re-filed from
-    # its raw source archive.
+    # then incoming/). originals/ is never listed at all — see _MEDIA_PREFIXES.
     chosen = {}          # basename -> R2 key
     listed_any = False
     for prefix in prefixes:

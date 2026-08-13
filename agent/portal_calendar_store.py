@@ -507,7 +507,8 @@ class SupabaseCalendarStore:
         out = r.json() or []
         return [x for x in out if str(x.get("gym_id")) == str(account_key)]
 
-    def delete_month(self, account_key, month, *, preserve_human=True):
+    def delete_month(self, account_key, month, *, preserve_human=True,
+                     preserve_dates=()):
         """DELETE content_calendar rows for account_key whose post_date falls inside the
         calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
         gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
@@ -519,15 +520,25 @@ class SupabaseCalendarStore:
         pending / draft / queued / NULL status) are deleted. Any row a human or the
         publisher has touched (approved, denied, killed, published, publishing, failed)
         is LEFT IN PLACE, so a nightly rebuild can never revert a client's approval. Pass
-        preserve_human=False only for a deliberate full wipe of a gym's month."""
+        preserve_human=False only for a deliberate full wipe of a gym's month.
+
+        preserve_dates: post_dates whose rows are NOT deleted at all (even wipeable
+        ones). The client builder passes its LOCKED days here: a day whose feed the
+        client approved keeps its still-pending siblings (the FB mirror + paired story
+        built from the same photo/caption) — the builder skips planning locked days, so
+        deleting their siblings would orphan the approved post's cross-post forever."""
         year = int(month[:4])
         mon = int(month[5:7])
         last_day = _calendar.monthrange(year, mon)[1]
         first = f"{month}-01"
         last = f"{month}-{last_day:02d}"
+        post_date_filter = [f"gte.{first}", f"lte.{last}"]
+        keep = sorted({str(d)[:10] for d in (preserve_dates or ()) if d})
+        if keep:
+            post_date_filter.append(f"not.in.({','.join(keep)})")
         params = {
             "gym_id": f"eq.{account_key}",
-            "post_date": [f"gte.{first}", f"lte.{last}"],
+            "post_date": post_date_filter,
         }
         if preserve_human:
             # delete only the never-touched drafts: status IS NULL OR status IN wipeable.

@@ -1622,8 +1622,10 @@ def build_server(port=None):
                     return self._send_json({"error": "invalid JSON"}, 400)
                 autonomous = bool(body.get("autonomous", False))
                 from .store import PendingStore
-                status, resp = _ps.handle_autonomy(account_key, autonomous,
-                                                   store=PendingStore())
+                status, resp = _ps.handle_autonomy(
+                    account_key, autonomous,
+                    actor_id=str(body.get("actor_id", "") or ""),
+                    store=PendingStore())
                 return self._send_json(resp, status)
 
             # Part B client-social ACTION routes: POST /portal/<token>/posts/<id>/{approve

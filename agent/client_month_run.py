@@ -114,13 +114,22 @@ def _url_basename(url):
     return (url or "").split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
 
 
+# Statuses whose PHOTO is genuinely consumed: the post is (or is about to be) live on
+# the gym's page, so re-placing its photo on another day would double-post. A DENIED or
+# KILLED row's photo is NOT consumed — the client rejected that caption, not the photo,
+# and excluding it forever would silently shrink the gym's usable library.
+_PHOTO_CONSUMING_STATUSES = ("approved", "published", "publishing")
+
+
 def _locked_calendar_state(base_key, start, days, store, log):
     """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
     across the planned span. locked_feed_days: post_dates whose feed a human already
-    owns (approved/published/denied/killed — anything not machine-wipeable). used_keys:
-    the media basenames those human-owned rows carry (any format), so their photos are
-    never re-picked. Read-only; a read failure returns empty state (the store-level
-    preserve_and_prune backstop still guards the write)."""
+    owns (approved/published/denied/killed — anything not machine-wipeable), so the
+    rebuild never plans a competing feed there. used_keys: the media basenames carried
+    by rows whose photo is truly consumed (approved/published/publishing, any format),
+    so a live photo is never re-picked; a denied/killed photo stays available.
+    Read-only; a read failure returns empty state (the store-level preserve_and_prune
+    backstop still guards the write)."""
     from datetime import timedelta
     from .portal_calendar_store import _WIPEABLE_STATUSES
     locked_days, used = set(), set()
@@ -141,9 +150,10 @@ def _locked_calendar_state(base_key, start, days, store, log):
                 continue
             if str(row.get("format") or "").lower() == "feed":
                 locked_days.add(str(row.get("post_date") or "")[:10])
-            key = _url_basename(row.get("image_url") or "")
-            if key:
-                used.add(key)
+            if status in _PHOTO_CONSUMING_STATUSES:
+                key = _url_basename(row.get("image_url") or "")
+                if key:
+                    used.add(key)
     locked_days.discard("")
     return locked_days, used
 
@@ -348,7 +358,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         drafts.append(story)
 
     rows = _to_rows(base_key, drafts)
-    result = _apply(base_key, rows, start, days, store, log)
+    result = _apply(base_key, rows, start, days, store, log,
+                    locked_days=locked_feed_days)
     result["days"] = built_days
     result["skipped_banned"] = skipped_banned
     result["media_count"] = media_count
@@ -397,10 +408,15 @@ def _to_rows(base_key, drafts):
     return rows
 
 
-def _apply(base_key, rows, start, days, store, log):
+def _apply(base_key, rows, start, days, store, log, locked_days=()):
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
-    apply_month_plan. Refuses the demo gym id. Never raises out."""
+    apply_month_plan. Refuses the demo gym id. Never raises out.
+
+    locked_days: post_dates the builder SKIPPED because a human owns their feed. Those
+    days' still-pending sibling rows (FB mirror + story on the approved feed's photo)
+    are preserved from the delete — the builder emits no replacement for them, so
+    wiping them would orphan the approved post's cross-post and story forever."""
     if base_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
@@ -423,7 +439,11 @@ def _apply(base_key, rows, start, days, store, log):
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:
-                deleted += delete_month(base_key, month) or 0
+                try:
+                    deleted += delete_month(base_key, month,
+                                            preserve_dates=locked_days) or 0
+                except TypeError:      # older store/test fakes without the kwarg
+                    deleted += delete_month(base_key, month) or 0
         insert_rows = getattr(store, "insert_rows", None)
         if insert_rows is not None and clean_rows:
             inserted += len(insert_rows(base_key, clean_rows) or [])

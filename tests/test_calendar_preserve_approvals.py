@@ -200,3 +200,47 @@ def test_client_apply_skips_locked_slot_and_still_deletes():
     inserted_slots = {pcs._slot_key(r) for r in store.inserted}
     assert ("2026-08-13", "instagram", "feed") not in inserted_slots
     assert out["upserted"] == 2
+
+
+# ---- wave 2: locked-day SIBLINGS survive the rebuild delete -----------------
+
+def test_delete_month_preserve_dates_excludes_locked_days(monkeypatch):
+    """A locked day's still-pending siblings (FB mirror + story of an approved feed)
+    must survive the rebuild delete: the builder emits no replacement for a locked
+    day, so wiping them would orphan the approved post's cross-post forever."""
+    http = _FakeHTTP(delete_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().delete_month(
+        "eng", "2026-08", preserve_dates=("2026-08-13", "2026-08-20"))
+    _, _, params, _, _ = http.calls[0]
+    assert params["post_date"] == [
+        "gte.2026-08-01", "lte.2026-08-31",
+        "not.in.(2026-08-13,2026-08-20)",
+    ]
+    # the human-status guard still applies on top
+    assert params["or"] == "(status.is.null,status.in.(pending,draft,queued))"
+
+
+def test_client_apply_passes_locked_days_to_delete():
+    from agent.client_month_run import _apply
+    from datetime import date
+
+    class _Rec:
+        def __init__(self):
+            self.calls = []
+
+        def locked_slots(self, *a):
+            return set()
+
+        def delete_month(self, base_key, month, *, preserve_human=True,
+                         preserve_dates=()):
+            self.calls.append((month, tuple(sorted(preserve_dates))))
+            return 0
+
+        def insert_rows(self, base_key, rows):
+            return rows
+
+    store = _Rec()
+    _apply("eng", [_row()], date(2026, 8, 13), 5, store, lambda m: None,
+           locked_days={"2026-08-13"})
+    assert store.calls and store.calls[0][1] == ("2026-08-13",)

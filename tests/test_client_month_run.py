@@ -358,3 +358,26 @@ def test_videos_are_placed(tmp_path):
                if r["format"] == "feed" and r["account"] == "instagram"]
     assert feed_ig, "videos were never placed"
     assert all(r["image_url"].endswith(".mp4") for r in feed_ig)
+
+
+# ---- 12. a DENIED photo stays available (only live photos are consumed) ----------
+def test_denied_photo_is_not_excluded(tmp_path):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=3)
+    locked = [
+        # denied feed on 08-02: its DAY stays locked, but its PHOTO is reusable
+        {"gym_id": "gritx", "post_date": "2026-08-02", "account": "instagram",
+         "format": "feed", "status": "denied",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+    ]
+    store = _LockedStore(locked)
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=4, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    # the denied day itself is not re-planned
+    assert not [r for r in store.inserted if r["post_date"] == "2026-08-02"]
+    # but photo_01 IS placeable on another day (3 photos -> 3 feed days possible)
+    used = {r["image_url"] for r in store.inserted if r["format"] == "feed"
+            and r["account"] == "instagram"}
+    assert "https://gritx.media/photo_01.jpg" in used

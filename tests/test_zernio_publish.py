@@ -121,7 +121,8 @@ def test_create_post_payload_scheduled_and_fb_page():
                   scheduled_for="2026-08-13T07:30:00-04:00",
                   page_id="PAGE99", platform="facebook")
     body = posted["json"]
-    assert body["scheduledFor"] == "2026-08-13T07:30:00-04:00"
+    # scheduledFor is normalized to UTC so it can never disagree with `timezone`
+    assert body["scheduledFor"] == "2026-08-13T11:30:00Z"
     assert body["timezone"] == "UTC"
     assert "publishNow" not in body                       # scheduled, not immediate
     entry = body["platforms"][0]

@@ -34,6 +34,18 @@ def _media_type(url):
     return "image"
 
 
+def _to_utc_iso(iso_ts):
+    """The timestamp re-expressed in UTC ('...Z' suffix). A naive timestamp is assumed
+    UTC; an unparseable one is passed through untouched (Zernio validates)."""
+    try:
+        ts = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return iso_ts
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class ZernioError(Exception):
     def __init__(self, status, detail=""):
         self.status = status
@@ -182,7 +194,10 @@ class ZernioClient:
         if urls:
             payload["mediaItems"] = [{"type": _media_type(u), "url": u} for u in urls]
         if scheduled_for:
-            payload["scheduledFor"] = scheduled_for
+            # Normalize to UTC so the ISO offset and the `timezone` field can never
+            # disagree (probed live: Zernio parses the offset correctly, but sending
+            # both consistent removes the ambiguity entirely).
+            payload["scheduledFor"] = _to_utc_iso(scheduled_for)
             payload["timezone"] = "UTC"
         else:
             payload["publishNow"] = True
