@@ -216,7 +216,7 @@ def test_publish_ig_resolves_and_posts(monkeypatch):
     assert call["story"] is False                         # feed, not story
 
 
-def test_publish_story_flows_content_type(monkeypatch):
+def test_publish_story_flows_content_type_and_no_caption(monkeypatch):
     _arm(monkeypatch)
     client = FakeZernioClient()
     d = _draft(caption="Story!", url="https://r2/s.jpg")
@@ -228,6 +228,24 @@ def test_publish_story_flows_content_type(monkeypatch):
     assert res.ok
     assert client.created[0]["story"] is True, \
         "an approved STORY must publish as a story, never as a second feed post"
+    # STORIES CARRY NO CAPTION: platforms don't display it, and the paired feed's
+    # caption made the story byte-identical to the feed -> Zernio's 24h dedup 409'd
+    # and the story was NEVER created while Echo marked it published.
+    assert client.created[0]["body"] == "", \
+        "a story must publish with an empty body or dedup eats it"
+
+
+def test_publish_409_carries_existing_post_id(monkeypatch):
+    _arm(monkeypatch)
+
+    class DupClient(FakeZernioClient):
+        def create_post(self, *a, **k):
+            raise zernio.ZernioError(
+                409, '{"error":"duplicate","existingPostId":"zp_prior"}')
+
+    res = zernio_publisher.publish(_draft(), _ig_account(), client=DupClient(),
+                                   profile_resolver=lambda k: "prof_eng")
+    assert res.ok and res.media_id == "zp_prior"
 
 
 def test_publish_past_slot_flips_to_publish_now(monkeypatch):

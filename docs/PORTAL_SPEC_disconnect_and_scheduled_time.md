@@ -99,6 +99,10 @@ scheduled_at  timestamptz   -- the post's planned go-live time (ISO 8601, tz-awa
     rows; use this for the IG/FB badge instead of guessing)
   - `published_at` — when it actually went live (null until published)
   - `late_post_id` — the vendor post id once published
+  - `media_kind` — `"video"` or `"image"`. **A video URL inside an `<img>` tag renders
+    a BLANK card** (clients reported "no photo preview"). When `media_kind == "video"`,
+    render `<video src={image_public_url} muted playsinline preload="metadata">`
+    (optionally with `controls`) instead of an `<img>`.
 - Status chips: the `status` field can also be `publishing` (in flight, seconds-long)
   and `killed` — render `publishing` like Approved with a spinner, `killed` however
   denied/removed content is shown. Any action on a `published` or `publishing` post

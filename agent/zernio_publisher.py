@@ -134,6 +134,12 @@ def publish(draft, account, client=None, scheduled_for=None,
     story = bool(getattr(draft, "is_story", False)) or (
         (getattr(draft, "draft_type", "") or "").strip().lower() == "story")
 
+    # STORIES CARRY NO CAPTION: platforms do not display caption text on a story, and
+    # sending the paired feed's caption made the story byte-identical to the feed on
+    # the same account — Zernio's 24h content-hash dedup then 409'd and the story was
+    # NEVER created while Echo marked it published (Dale's missing IG story, 2026-08-13).
+    body = "" if story else (getattr(draft, "caption", "") or "")
+
     # PAST SLOT -> publish NOW: Zernio treats a missing scheduledFor + publishNow=true
     # as immediate. Handing it a past timestamp risks a 400/undefined behavior, and a
     # row approved after its slot passed should just go out (catch_all semantics).
@@ -141,20 +147,34 @@ def publish(draft, account, client=None, scheduled_for=None,
         scheduled_for = None
 
     try:
-        resp = client.create_post(account_id, getattr(draft, "caption", "") or "",
+        resp = client.create_post(account_id, body,
                                   media_urls=media_urls, scheduled_for=scheduled_for,
                                   page_id=page_id, platform=platform, story=story)
     except zernio.ZernioError as exc:
         # 409 = Zernio's 24h content-hash dedup: this exact content already posted to
         # this account. That IS success for our exactly-once goal — mark it published
-        # instead of reverting to approved and retrying the same duplicate forever.
+        # (carrying Zernio's existingPostId when it names one) instead of reverting
+        # to approved and retrying the same duplicate forever. Stories can no longer
+        # trip this against their paired feed (empty body above); a remaining 409 is
+        # a genuine same-content duplicate.
         if getattr(exc, "status", None) == 409:
-            return PublishResult(ok=True, mode="published", media_id="",
+            existing = _existing_post_id(getattr(exc, "detail", ""))
+            return PublishResult(ok=True, mode="published", media_id=existing,
                                  detail="zernio dedup: identical post already exists")
         raise
     post_id = zernio.post_id_of(resp)
     return PublishResult(ok=True, mode="published", media_id=post_id,
                          detail="scheduled" if scheduled_for else "published now")
+
+
+def _existing_post_id(detail):
+    """Zernio's existingPostId out of a 409 body (best effort; '' when absent)."""
+    import json as _json
+    try:
+        data = _json.loads(detail or "")
+        return str(data.get("existingPostId") or "")
+    except (ValueError, TypeError):
+        return ""
 
 
 def _is_past(iso_ts):

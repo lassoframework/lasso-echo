@@ -301,6 +301,10 @@ def _content_calendar_post(row):
         # with no way to tag them.
         "platform": (row.get("account") or "").strip().lower(),
         "image_public_url": row.get("image_url") or "",
+        # video|image, from the media URL's extension. A VIDEO in an <img> tag renders
+        # BLANK (Dale's "no photo preview"): the portal must render media_kind=='video'
+        # with a <video muted playsinline> tag instead.
+        "media_kind": _media_kind(row.get("image_url") or ""),
         "caption": row.get("caption") or "",
         "scheduled_at": scheduled_at,
         # Publish record (display only): when it actually went out + the vendor post id.
@@ -310,6 +314,15 @@ def _content_calendar_post(row):
     # gym_id scopes the hosted fallback card (media_host tenant isolation); the portal
     # post shape itself is unchanged (no new keys).
     return _with_display_image(post, tenant=row.get("gym_id"))
+
+
+_VIDEO_URL_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+
+
+def _media_kind(url):
+    """'video' or 'image' from the media URL's extension (query string ignored)."""
+    path = (url or "").split("?", 1)[0].lower()
+    return "video" if path.endswith(_VIDEO_URL_EXTS) else "image"
 
 
 def _with_display_image(post, tenant=None):

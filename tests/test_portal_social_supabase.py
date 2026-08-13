@@ -141,6 +141,20 @@ def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):
     assert by_id["uuid-2"]["scheduled_at"].startswith("2026-08-06T")
 
 
+def test_social_post_media_kind_video_vs_image(monkeypatch):
+    # A video in an <img> tag renders BLANK — the payload must tell the portal which
+    # tag to use (Dale's "no photo preview" on his video posts).
+    store = _FakeStore([
+        _row("uuid-v", post_date="2026-08-05", image_url="https://r2/w/clip.mp4"),
+        _row("uuid-i", post_date="2026-08-06", image_url="https://r2/w/pic.jpg"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    by_id = {p["id"]: p for p in body["posts"]}
+    assert by_id["uuid-v"]["media_kind"] == "video"
+    assert by_id["uuid-i"]["media_kind"] == "image"
+
+
 def test_every_social_post_carries_a_stable_id(monkeypatch):
     store = _FakeStore([_row("id-a"), _row("id-b", post_date="2026-08-07")])
     monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)

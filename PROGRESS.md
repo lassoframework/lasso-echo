@@ -81,6 +81,24 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Ghost stories + video previews (Dale round 3, 2026-08-13)
+
+### [x] IG story said "published" but never appeared (CRITICAL, my own 409 mapping)
+A story shares its paired feed's photo AND caption on the same IG account -> byte
+identical -> Zernio's 24h content-hash dedup 409'd -> Echo's 409-as-published mapping
+marked it done while Zernio created NOTHING (late_post_id=''). Both ENG and GritX
+stories were ghosts (LASSO's Meta-direct stories unaffected). Fix: stories publish
+with an EMPTY body (platforms don't display story captions anyway) so the pair can
+never collide; 409s now carry Zernio's existingPostId into media_id. Ghost rows
+flipped back to approved for a real re-publish.
+
+### [x] "No photo preview" on video posts
+A video URL in an <img> tag renders blank. /social posts now carry media_kind
+(video|image); spec instructs the portal to render <video muted playsinline> for
+videos. Videos are ~21 of ENG's 57 cards — exactly the blanks Dale saw.
+
+---
+
 ## Action-cut Reels: client videos edited into engaging Reels (2026-08-13, SHA 4a3913f)
 
 Blake: "yes but i want not for podcast but more video action to be engaging." New lane,
