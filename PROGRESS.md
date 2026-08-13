@@ -81,6 +81,28 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Action-cut Reels: client videos edited into engaging Reels (2026-08-13, SHA 4a3913f)
+
+Blake: "yes but i want not for podcast but more video action to be engaging." New lane,
+MOTION-based (not the transcript/podcast editor): AGENT_CLIENT_VIDEO_EDIT (default OFF)
++ AGENT_REEL_TARGET_SEC (default 22s).
+
+### [x] agent/action_reel.py — pure ffmpeg, zero AI spend, deterministic
+- Scene-score motion profile on a downscaled stream -> highest-action 2.0-3.5s windows
+  fast-cut chronologically to ~22s; short clips kept whole; static camera falls back to
+  even spacing. 9:16 cover crop 1080x1920@30, h264/aac faststart, source audio kept.
+- 3s TEXT HOOK from the day's OWN approved caption (first sentence, word-truncated,
+  scrub_onscreen: the no-dash on-screen law). Never invented copy.
+- Content-hash cache in <library>/reels/ (invisible to media count + pick pool).
+- Editing only ENHANCES: flag off / image / edit fail / hosting fail all post the raw
+  video. Approval gate unchanged. Verified with a REAL 60s encode -> 8 cuts, 22.1s,
+  1080x1920, audio + hook intact. 13 offline tests.
+
+### [x] Builder wiring: video feed drafts swap creative for the HOSTED reel; the paired
+story inherits it (_maybe_edit_video in client_month_run).
+
+---
+
 ## Client approvals now HOLD — rebuild never destroys/rewords an approved post (2026-08-13, SHA 5efd78d)
 
 Dale (CrossFit ENG) reported three symptoms of ONE root cause: after approving a post it
