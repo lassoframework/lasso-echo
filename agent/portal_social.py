@@ -287,6 +287,10 @@ def _content_calendar_post(row):
         "format": fmt,
         "image_public_url": row.get("image_url") or "",
         "caption": row.get("caption") or "",
+        # Go-live time (content_calendar.scheduled_at, ISO tz-aware) so the portal can show clients
+        # WHEN a post publishes. Display metadata only; None on old/unstamped rows -> portal falls
+        # back to the date. Never invented: passed through exactly as stored, or None.
+        "scheduled_at": row.get("scheduled_at"),
     }
     # gym_id scopes the hosted fallback card (media_host tenant isolation); the portal
     # post shape itself is unchanged (no new keys).

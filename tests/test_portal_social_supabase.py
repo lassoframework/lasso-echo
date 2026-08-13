@@ -39,11 +39,11 @@ def _env(monkeypatch):
 
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
          status="pending", caption="hello", image_url="https://cdn/x.jpg",
-         pillar="education", fmt="feed"):
+         pillar="education", fmt="feed", scheduled_at=None):
     return {
         "id": row_id, "gym_id": gym_id, "post_date": post_date, "account": account,
         "status": status, "caption": caption, "image_url": image_url,
-        "pillar": pillar, "format": fmt,
+        "pillar": pillar, "format": fmt, "scheduled_at": scheduled_at,
     }
 
 
@@ -108,6 +108,20 @@ def test_social_reads_content_calendar(monkeypatch):
     assert p1["caption"] == "cap one"
     # the story row keeps its REAL format (not derived from is_story)
     assert body["posts"][1]["format"] == "story"
+
+
+def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):
+    # The portal shows clients WHEN a post publishes; the payload must pass scheduled_at through
+    # exactly as stored, and leave it None (never fabricated) when the row is unstamped.
+    store = _FakeStore([
+        _row("uuid-1", post_date="2026-08-05", scheduled_at="2026-08-05T07:30:00-04:00"),
+        _row("uuid-2", post_date="2026-08-06", scheduled_at=None),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    by_id = {p["id"]: p for p in body["posts"]}
+    assert by_id["uuid-1"]["scheduled_at"] == "2026-08-05T07:30:00-04:00"
+    assert by_id["uuid-2"]["scheduled_at"] is None
 
 
 def test_every_social_post_carries_a_stable_id(monkeypatch):
