@@ -39,6 +39,24 @@ _ACTION_STATUS = {
     "kill": "killed",
 }
 
+# A row is WIPEABLE only while no human and no publisher has ever touched it: a fresh
+# machine draft. Every other status is HUMAN OWNED and a calendar rebuild (the daily
+# delete-then-insert) must NEVER destroy it. This is the fix for approvals not holding:
+# a nightly re-plan used to delete the whole month (including a client's approved posts)
+# and re-insert fresh 'pending' rows, silently reverting every approval. Now the rebuild
+# leaves anything approved / denied / killed / published / publishing / failed in place.
+_WIPEABLE_STATUSES = ("pending", "draft", "queued")
+
+
+def _slot_key(row):
+    """The (post_date, account, format) a row occupies, normalized. Two rows with the
+    same slot key are the same calendar cell (a rebuild must not create a second one)."""
+    return (
+        str((row or {}).get("post_date") or "")[:10],
+        str((row or {}).get("account") or "").lower(),
+        str((row or {}).get("format") or "").lower(),
+    )
+
 
 class PortalStoreError(Exception):
     """A Supabase call failed. Detail is scrubbed of any secret before raising."""
@@ -416,24 +434,35 @@ class SupabaseCalendarStore:
         out = r.json() or []
         return [x for x in out if str(x.get("gym_id")) == str(account_key)]
 
-    def delete_month(self, account_key, month):
-        """DELETE every content_calendar row for account_key whose post_date falls inside
-        the calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
+    def delete_month(self, account_key, month, *, preserve_human=True):
+        """DELETE content_calendar rows for account_key whose post_date falls inside the
+        calendar month `month` ('YYYY-MM'). Gym scoped: the filter carries BOTH
         gym_id=eq.<account_key> AND the month's date bounds, so a row belonging to another
         gym (or outside the month) is never touched. Used by the delete-then-insert apply
         so a re-run replaces the month cleanly and idempotently. Returns the number of the
-        gym's rows deleted."""
+        gym's rows deleted.
+
+        preserve_human (default True): only WIPEABLE rows (fresh machine drafts:
+        pending / draft / queued / NULL status) are deleted. Any row a human or the
+        publisher has touched (approved, denied, killed, published, publishing, failed)
+        is LEFT IN PLACE, so a nightly rebuild can never revert a client's approval. Pass
+        preserve_human=False only for a deliberate full wipe of a gym's month."""
         year = int(month[:4])
         mon = int(month[5:7])
         last_day = _calendar.monthrange(year, mon)[1]
         first = f"{month}-01"
         last = f"{month}-{last_day:02d}"
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "post_date": [f"gte.{first}", f"lte.{last}"],
+        }
+        if preserve_human:
+            # delete only the never-touched drafts: status IS NULL OR status IN wipeable.
+            in_list = ",".join(_WIPEABLE_STATUSES)
+            params["or"] = f"(status.is.null,status.in.({in_list}))"
         r = self._client().delete(
             self._rest(_TABLE),
-            params={
-                "gym_id": f"eq.{account_key}",
-                "post_date": [f"gte.{first}", f"lte.{last}"],
-            },
+            params=params,
             headers=self._headers({"Prefer": "return=representation"}),
             timeout=30,
         )
@@ -441,6 +470,18 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+    def locked_slots(self, account_key, month):
+        """The set of (post_date, account, format) slots in `month` already occupied by a
+        HUMAN OWNED row (any status not in wipeable). A rebuild must not insert a second
+        row into one of these cells, or the client would see a duplicate next to the post
+        they already approved. Returns a set of slot-key tuples (empty on a clean month)."""
+        locked = set()
+        for row in self.list_month(account_key, month) or []:
+            status = str((row or {}).get("status") or "").lower()
+            if status and status not in _WIPEABLE_STATUSES:
+                locked.add(_slot_key(row))
+        return locked
 
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
@@ -456,6 +497,30 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+
+def preserve_and_prune(store, account_key, months, rows):
+    """Shared guard for every delete-then-insert rebuild lane (client month, real month,
+    demo->real mirror). Reads the HUMAN OWNED slots the gym already has across `months`
+    and drops any incoming row that would land on one of them, so a rebuild that keeps a
+    client's approved post never also inserts a duplicate draft into the same cell.
+
+    Returns (kept_rows, locked_slot_count). Safe when the store lacks locked_slots (a test
+    fake): then nothing is locked and every row is kept. Never raises out (a read failure
+    falls back to keeping all rows, matching the old behavior)."""
+    getter = getattr(store, "locked_slots", None)
+    if getter is None:
+        return list(rows or []), 0
+    locked = set()
+    for month in months:
+        try:
+            locked |= getter(account_key, month) or set()
+        except Exception:  # noqa: BLE001 - a read failure must not block the rebuild
+            return list(rows or []), 0
+    if not locked:
+        return list(rows or []), 0
+    kept = [r for r in (rows or []) if _slot_key(r) not in locked]
+    return kept, len(locked)
 
 
 # ---------------------------------------------------------------------------

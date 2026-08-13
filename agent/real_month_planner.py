@@ -724,6 +724,9 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     deleted = 0
     inserted = 0
     try:
+        # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
+        from .portal_calendar_store import preserve_and_prune
+        rows, _locked = preserve_and_prune(sb_store, account_key, months, rows)
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:

@@ -347,6 +347,11 @@ def _apply(base_key, rows, start, days, store, log):
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
     deleted = inserted = 0
     try:
+        # PRESERVE APPROVALS: drop any incoming row that would collide with a slot the
+        # gym has already approved/published, and let delete_month keep those rows in
+        # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
+        from .portal_calendar_store import preserve_and_prune
+        clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:

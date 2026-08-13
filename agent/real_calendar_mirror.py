@@ -210,6 +210,9 @@ def mirror_to_supabase(account_key, store, sb_store):
     deleted = 0
     inserted = 0
     try:
+        # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
+        from .portal_calendar_store import preserve_and_prune
+        real_rows, _locked = preserve_and_prune(sb_store, account_key, months, real_rows)
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:
