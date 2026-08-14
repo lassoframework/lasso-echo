@@ -81,6 +81,32 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Echo LEARNS from portal caption edits (Dale round 7, 2026-08-14)
+
+Dale edited tomorrow's captions with detailed reasons (a youth-fitness video had an
+adult-parent caption) and wants Echo to learn so future captions match.
+
+### [x] Portal edits now feed the learning loop (tenant_brain edit_diff)
+The loop existed (edit_diff -> edit_examples -> drafter._brain_guidance -> SB7 prompt)
+but the portal edit path never recorded to it. Both edit routes now call
+portal_social._learn_from_edit(before, after), keyed to the GENERATION account
+({base}_ig — the exact key _brain_guidance reads, NOT the bare base). AGENT_TENANT_BRAIN
+_ENABLED armed. Best effort, never breaks an edit.
+- Recorded Dale's real youth edit into eng_ig's brain; verified it reaches the prompt.
+- VERIFIED end-to-end: a fresh ENG youth caption now reads "Your kid's confidence is
+  built in the gym, not on a screen. We coach young athletes to move well, build real
+  strength..." (youth-development framing) instead of the old adult-parent angle.
+- Added "Step Up for Students Provider" as an approved ENG source so youth captions can
+  truthfully cite the credential (Dale's guidance).
+
+### [x] Edit persistence confirmed working; portal UI issues documented
+Dale's edits DID persist (tomorrow's posts carry his wording, approved). "Not sticking"
+= the portal UI not re-fetching after save; "kicked out twice" = a portal session issue.
+Both documented for the Vercel team in PORTAL_SPEC §4 (the edit response already returns
+{caption, status} for an in-place update).
+
+---
+
 ## A+ quality gate — every post checked, no sub-par caption reaches a calendar (2026-08-13)
 
 Blake standing bar: "whenever you make a post (ig, story, reel, anything) to calendar
