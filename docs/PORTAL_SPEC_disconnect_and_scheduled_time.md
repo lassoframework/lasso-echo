@@ -155,3 +155,24 @@ Portal rules:
 
 Acceptance: approve a post → hard-reload → status still Approved, caption byte-identical.
 Wait past the next rebuild tick → still Approved, still same wording, still present.
+
+---
+
+## 4. Edit UX: reflect the save WITHOUT a manual refresh (portal side)
+
+**Problem (Dale, CrossFit ENG, 2026-08-14):** "The edit is not sticking... you DO have to
+refresh the screen to see the edits stick. And twice the system kicked me out." Verified
+Echo-side: **the edit DOES persist** — `POST /portal/<token>/posts/<id>/edit` writes the
+new caption and returns it. The card just doesn't update until a full page reload.
+
+Portal fixes:
+- The edit endpoint returns `{ ok, caption, status }`. **Use that response to update the
+  card in place** (optimistic update / re-render from the returned `caption` + `status`),
+  so the new wording shows immediately — no manual refresh. Editing also flips the row to
+  `pending` (returned in `status`); reflect that chip change too.
+- **The "kicked out" logouts:** investigate the portal session/token lifetime on the edit
+  POST. The Echo token is long-lived; a mid-edit logout is a portal session-expiry or an
+  auth round-trip on submit. Repro: open a post, edit, submit — the user should stay in.
+- Note: Echo now also **learns** from every edit (records the before→after into the gym's
+  brain so future captions match the approver's taste). No portal change needed for that;
+  just keep sending the new caption as the edit `note`.
