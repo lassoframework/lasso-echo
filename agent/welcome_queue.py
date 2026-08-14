@@ -646,10 +646,14 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
                 continue
 
             template = welcome_posts.pick_template(gym_key)
-            posts = welcome_posts.generate_posts(template, name, "", logo.path,
+            # Owner name the client typed at onboarding (from onboarding_intake via
+            # portal_gyms); title-cased. Blank when none was captured -> card omits the
+            # owner line, never a broken one.
+            owner = welcome_posts.normalize_owner(g.get("owner_name") or "")
+            posts = welcome_posts.generate_posts(template, name, owner, logo.path,
                                                  out_dir, bg_client=bg_client,
                                                  cache_dir=cache_dir)
-            entry = {"gym_key": gym_key, "name": name, "owner": "",
+            entry = {"gym_key": gym_key, "name": name, "owner": owner,
                      "template": template, "tier_label": "", "posts": posts}
             if enqueue(entry, host_fn=host_fn):
                 enqueued += 1

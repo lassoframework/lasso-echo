@@ -85,6 +85,34 @@ class PortalGymsReader:
     def _rest(self, path):
         return f"{self._url}/rest/v1/{path}"
 
+    def owner_names(self, gym_ids):
+        """{gym_id: owner_name} from the onboarding_intake table for the given gyms.
+        The gyms table has NO owner column (only owner_client_id, often null for a
+        portal onboard), so the owner a client typed lives in onboarding_intake. Empty
+        dict on any error / no creds / no rows — a missing owner never blocks a welcome,
+        the card just renders without the owner line."""
+        ids = [str(g) for g in gym_ids if g]
+        if not ids or not self.available():
+            return {}
+        try:
+            r = self._client().get(
+                self._rest("onboarding_intake"),
+                params={"select": "gym_id,owner_name",
+                        "gym_id": f"in.({','.join(ids)})"},
+                headers=self._headers(),
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                return {}
+            out = {}
+            for row in (r.json() or []):
+                name = (row.get("owner_name") or "").strip()
+                if row.get("gym_id") and name:
+                    out[str(row["gym_id"])] = name
+            return out
+        except Exception:
+            return {}
+
     def real_columns(self):
         """The ACTUAL columns on the live `gyms` table, discovered by a single
         select=*&limit=1 probe (PostgREST returns every column key even on a one-row
@@ -161,6 +189,12 @@ class PortalGymsReader:
                 "domain": domain,
                 "slug": (row.get("slug") or "").strip(),
             })
+        # Enrich with the owner name the client typed at onboarding (from
+        # onboarding_intake — the gyms table has none). Best effort: a lookup failure
+        # just leaves owner_name "".
+        owners = self.owner_names([o["gym_id"] for o in out])
+        for o in out:
+            o["owner_name"] = owners.get(str(o["gym_id"]), "")
         return out
 
 

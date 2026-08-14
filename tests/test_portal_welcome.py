@@ -138,6 +138,44 @@ def test_reader_selects_only_real_columns(creds):
     assert not ({"domain", "website", "site", "url"} & selected)
 
 
+def test_reader_enriches_owner_name_from_onboarding_intake(creds):
+    # the gyms table has no owner column; the owner the client typed lives in
+    # onboarding_intake. list_recent must join it so a welcome card gets the owner.
+    gym_row = {"id": "g1", "name": "Project Evolve Personal Training",
+               "created_at": "2026-08-05T00:00:00+00:00"}
+
+    class _HTTP:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "params": params or {}})
+            if (params or {}).get("select") == "*":
+                return _Resp([_sample()])
+            if "onboarding_intake" in url:
+                return _Resp([{"gym_id": "g1", "owner_name": "JAKE RALEIGH"}])
+            return _Resp([gym_row])
+
+    out = portal_gyms.PortalGymsReader(http=_HTTP()).list_recent_portal_gyms(days=45)
+    assert len(out) == 1
+    assert out[0]["owner_name"] == "JAKE RALEIGH"
+
+
+def test_reader_owner_missing_stays_blank(creds):
+    gym_row = {"id": "g2", "name": "No Owner Gym", "created_at": "2026-08-05"}
+
+    class _HTTP:
+        def get(self, url, params=None, headers=None, timeout=None):
+            if (params or {}).get("select") == "*":
+                return _Resp([_sample()])
+            if "onboarding_intake" in url:
+                return _Resp([])              # no intake row -> no owner
+            return _Resp([gym_row])
+
+    out = portal_gyms.PortalGymsReader(http=_HTTP()).list_recent_portal_gyms(days=45)
+    assert out[0]["owner_name"] == ""         # blank, never a crash
+
+
 def test_reader_excludes_demo_and_test_gyms(creds):
     rows = [
         {"id": "real", "name": "Project Evolve", "created_at": "2026-08-05"},
