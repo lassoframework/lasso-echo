@@ -81,6 +81,33 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## Welcome post: no owner name + no story (Project Evolve, 2026-08-14)
+
+### [x] Owner name missing on portal welcomes -> pull from onboarding_intake
+scan_portal_and_enqueue hard-coded owner="" for portal gyms; the gyms table has no
+owner column (owner_client_id null on a portal onboard). The owner the client typed
+lives in onboarding_intake.owner_name. portal_gyms.owner_names() now reads it and
+list_recent_portal_gyms enriches each gym; the card + queue get the title-cased owner.
+Verified: Project Evolve owner = "Jake Raleigh". Every future portal welcome gets it.
+
+### [x] Story not posted -> re-posted live; publish path verified working
+The story asset was a genuine 1080x1920 9:16 (hosted, passed every guard) but the
+original day's run silently skipped publishing it. Re-posted live (media_id
+1808427114247699); mode=published. Both build lanes + the publish path work, so it was
+a one-off flow miss, not a broken path.
+
+### [ ] Logo reads small -> design constraint, flagged for Blake
+_fit_into correctly fills the logo_zone, but a WIDE logo ("[PROJECT EVOLVE] PERSONAL
+TRAINING") is width-limited so it looks short/small in a squareish zone. Not a clear
+bug; enlarging risks layout overlap. DECISION for Blake: widen the logo zone / allow
+wide logos to scale bigger, or leave as-is.
+
+NOTE: the already-LIVE Project Evolve feed + the re-posted story used the pre-fix
+assets (no owner, small logo). Instagram forbids editing/deleting a live post, so
+those specific posts can't be corrected; the fix applies to all future welcomes.
+
+---
+
 ## GritX stuck at 1 day despite 179 uploads — batch-insert key mismatch (2026-08-14)
 
 Ryan (GritX) uploaded ~179 media (171 photos + 8 videos) but Echo only ever built 1 day.
