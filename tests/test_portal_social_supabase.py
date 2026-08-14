@@ -464,3 +464,40 @@ def test_lasso_framework_llc_key_never_flagged(monkeypatch, _upload_env):
     assert status == 200
     assert body["awaiting_media"] is False
     assert body["upload_url"] == ""
+
+
+# ---- edit feeds the learning loop (tenant_brain edit_diff) ------------------
+
+def test_edit_records_edit_diff_for_learning(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_ENABLED", "true")
+    from agent import tenant_brain, portal_social as ps
+    monkeypatch.setattr(tenant_brain, "brains_dir", lambda base=None: str(tmp_path))
+    monkeypatch.setattr(tenant_brain, "brain_path",
+                        lambda k, base=None: str(tmp_path / f"{k}.md"))
+    store = _FakeStore([_row("id-1", gym_id="eng", status="pending",
+                             caption="You're running on fumes. Work, kids.")])
+    ps._handle_edit_supabase("eng", "id-1", "U_owner",
+                             "Youth, parents, and fitness make for a strong family. "
+                             "We coach young athletes to build real strength.",
+                             None, store)
+    events = tenant_brain.read_events("eng_ig", str(tmp_path))
+    diffs = [e for e in events if e["kind"] == "edit_diff"]
+    assert diffs, "a portal edit must record an edit_diff for the gym's brain"
+    assert diffs[-1]["before"].startswith("You're running on fumes")
+    assert "Youth, parents" in diffs[-1]["after"]
+
+
+def test_edit_learning_keyed_to_generation_account(monkeypatch, tmp_path):
+    # recorded under {base}_ig — the key drafter._brain_guidance reads — not the base
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_ENABLED", "true")
+    from agent import tenant_brain, portal_social as ps
+    monkeypatch.setattr(tenant_brain, "brains_dir", lambda base=None: str(tmp_path))
+    monkeypatch.setattr(tenant_brain, "brain_path",
+                        lambda k, base=None: str(tmp_path / f"{k}.md"))
+    store = _FakeStore([_row("id-2", gym_id="eng", status="pending",
+                             caption="old caption text here for the gym")])
+    ps._handle_edit_supabase("eng", "id-2", "U_owner",
+                             "A brand new and much better caption for the whole crew.",
+                             None, store)
+    assert tenant_brain.read_events("eng_ig", str(tmp_path))   # keyed eng_ig
+    assert not tenant_brain.read_events("eng", str(tmp_path))  # NOT the bare base

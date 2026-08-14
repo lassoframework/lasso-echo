@@ -252,9 +252,16 @@ def _handle_action_supabase(action, account_key, draft_id, note):
                              "error": "fabrication gate: the note carries a claim "
                                       "with no approved receipt. Cite an approved "
                                       "source or drop the figure."}
+            before = row.get("caption") or ""
             updated = sb.patch_caption(account_key, draft_id, note)
             if updated is None:
                 return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+            # LEARN from the edit so future captions match the approver's taste.
+            try:
+                from .portal_social import _learn_from_edit
+                _learn_from_edit(account_key, before, note)
+            except Exception:
+                pass
             return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                          "caption": updated.get("caption", ""),
                          "status": updated.get("status", "pending")}

@@ -608,6 +608,30 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
                      "draft_id": draft_id}
 
 
+def _learn_from_edit(account_key, before, after):
+    """Record a client's caption edit into THIS gym's brain (tenant_brain edit_diff) so
+    the drafter's NEXT caption for the gym moves toward the approver's taste. Keyed by
+    the gym's GENERATION account ({base}_ig) — the same key drafter._brain_guidance
+    reads — so a portal edit actually teaches the SB7 prompt. Best effort, never raises,
+    no-op while AGENT_TENANT_BRAIN_ENABLED is off."""
+    before = (before or "").strip()
+    after = (after or "").strip()
+    if not after or after == before:
+        return
+    try:
+        from . import tenant_brain
+        base = str(account_key or "")
+        for suf in ("_ig", "_fb"):
+            if base.endswith(suf):
+                base = base[: -len(suf)]
+                break
+        tenant_brain.record_event(f"{base}_ig", "edit_diff",
+                                  before=before, after=after)
+    except Exception as exc:  # noqa: BLE001 - learning must never break an edit
+        print(f"[portal-social] brain edit_diff record failed for "
+              f"{account_key}: {type(exc).__name__}")
+
+
 def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -629,9 +653,13 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         final = _published_is_final(row, "edit", draft_id)
         if final is not None:
             return final
+        before = row.get("caption") or ""
         updated = sb_store.patch_caption(account_key, draft_id, note)
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        # LEARN: feed the (before -> after) edit into the gym's brain so future
+        # captions move toward the approver's taste (Dale's youth-content guidance).
+        _learn_from_edit(account_key, before, note)
         return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                      "caption": updated.get("caption", ""),
                      "status": updated.get("status", "pending")}
