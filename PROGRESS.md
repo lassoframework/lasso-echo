@@ -81,6 +81,24 @@ all 10 fixes FIXED, no gate weakened anywhere.
 
 ---
 
+## GritX stuck at 1 day despite 179 uploads — batch-insert key mismatch (2026-08-14)
+
+Ryan (GritX) uploaded ~179 media (171 photos + 8 videos) but Echo only ever built 1 day.
+
+### [x] Root cause: PostgREST PGRST102 "All object keys must match"
+insert_rows sent a HETEROGENEOUS batch — video rows carry thumbnail_url, photo rows
+don't — and PostgREST 400s a mixed-key batch, failing the ENTIRE month insert (0 rows
+written). The build generated all days fine; only the WRITE failed, silently, every
+rebuild. GritX was the first gym to rebuild after thumbnail_url joined the row shape.
+Affects ANY gym with both photo and video posts.
+
+### [x] Fix: insert_rows normalizes every batch to the UNION of keys (missing -> None).
+Rebuilt GritX live: **90 rows / 30 days**, 24 video rows placed, 52 distinct media, 0
+suspect captions (all A+). The 3 published Aug-13 posts were PRESERVED (rebuild composed
+with them, not over them). 2 new store tests. Suite 2630 green.
+
+---
+
 ## Echo LEARNS from portal caption edits (Dale round 7, 2026-08-14)
 
 Dale edited tomorrow's captions with detailed reasons (a youth-fitness video had an
