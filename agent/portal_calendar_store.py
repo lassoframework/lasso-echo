@@ -485,7 +485,14 @@ class SupabaseCalendarStore:
         Every row's gym_id is FORCED to account_key (a caller can never write another
         gym's row through this store) and any stray `id` key is STRIPPED before the POST.
         No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
-        and idempotent. Returns the list of inserted row dicts (each with its new uuid)."""
+        and idempotent. Returns the list of inserted row dicts (each with its new uuid).
+
+        KEY NORMALIZATION: PostgREST rejects a heterogeneous batch with PGRST102 "All
+        object keys must match". Our rows are NOT uniform — a video row carries
+        thumbnail_url, a photo row doesn't — so a mixed batch (any gym with both photo
+        and video posts) used to 400 the ENTIRE insert and write 0 rows (GritX rebuild
+        stuck at 1 day). We normalize every row to the UNION of keys across the batch,
+        filling missing keys with None, so the batch is always uniform."""
         payload = []
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
@@ -493,6 +500,10 @@ class SupabaseCalendarStore:
             payload.append(clean)
         if not payload:
             return []
+        all_keys = set()
+        for r in payload:
+            all_keys.update(r.keys())
+        payload = [{k: r.get(k) for k in all_keys} for r in payload]
         r = self._client().post(
             self._rest(_TABLE),
             headers=self._headers({

@@ -392,6 +392,29 @@ def test_insert_rows_empty_is_noop(monkeypatch):
     assert not [c for c in http.calls if c[0] == "post"], "no POST for empty rows"
 
 
+def test_insert_rows_normalizes_heterogeneous_keys(monkeypatch):
+    # PostgREST PGRST102: every object in a batch must have the SAME keys. A video row
+    # carries thumbnail_url, a photo row doesn't -> the mixed batch used to 400 the whole
+    # insert (GritX rebuild stuck). Every object must go out with the union of keys.
+    http = _FakeHTTP(post_resp=_Resp(201, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc-key-secret", http=http)
+    rows = [
+        {"post_date": "2026-08-14", "format": "feed", "caption": "video post",
+         "image_url": "u.mp4", "thumbnail_url": "poster.jpg"},   # has thumbnail
+        {"post_date": "2026-08-15", "format": "feed", "caption": "photo post",
+         "image_url": "p.jpg"},                                   # NO thumbnail
+    ]
+    store.insert_rows("gritx", rows)
+    sent = [c for c in http.calls if c[0] == "post"][0][4]
+    keysets = [frozenset(o.keys()) for o in sent]
+    assert len(set(keysets)) == 1, "all objects in the batch must have identical keys"
+    assert "thumbnail_url" in keysets[0]
+    # the photo row's missing thumbnail is present as None (not absent)
+    photo = next(o for o in sent if o["caption"] == "photo post")
+    assert photo["thumbnail_url"] is None
+
+
 def test_delete_month_scoped_by_gym_and_month(monkeypatch):
     deleted = [{"id": "u1", "gym_id": "lasso", "post_date": "2026-08-10"}]
     http = _FakeHTTP(delete_resp=_Resp(200, deleted))
