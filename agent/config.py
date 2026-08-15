@@ -839,6 +839,16 @@ def zernio_publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
 
 
+def gbp_publish_enabled() -> bool:
+    """GBP publish + reconcile lanes (Phase 5). OFF by default. When armed, the listener
+    runs publish_due_gbp (approved googlebusiness rows -> Zernio) and reconcile_gbp
+    (hourly-for-48h poll). Layered UNDER the global publish kill switch AND draft mode:
+    the autonomous build keeps this OFF and every send isDraft, so nothing goes live.
+    Live GBP publishing requires arming this AND AGENT_PUBLISH_ENABLED by hand.
+    """
+    return _truthy(os.environ.get("AGENT_GBP_PUBLISH", "false"))
+
+
 def welcome_digest_enabled() -> bool:
     """
     Daily NEW-CLIENT welcome digest to Slack: one message a day listing every new

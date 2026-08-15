@@ -364,6 +364,26 @@ def _daily_scheduler(store):
                 # that died between the claim and the publish leaves a row stuck;
                 # this surfaces it to a human instead of silent forever-orphaning.
                 calendar_autopublish.sweep_stuck_publishing()
+                # GBP lane (AGENT_GBP_PUBLISH, OFF by default): publish approved
+                # googlebusiness rows via Zernio and run the §7.2 reconcile poll. A
+                # no-op unless armed; the autonomous build keeps this OFF so nothing
+                # goes live. One gym never blocks another.
+                if config.gbp_publish_enabled():
+                    try:
+                        from . import gbp_worker, gbp_store
+                        from .zernio import ZernioClient
+                        _gs, _gc = gbp_store.GbpStore(), ZernioClient()
+                        if _gs.available():
+                            # armed-live requires the global publish switch too; else draft
+                            _draft = not config.publish_enabled()
+                            gbp_worker.publish_due_gbp(
+                                _gs, _gc, run_date=_local_today, draft=_draft,
+                                alert=ops_alerts.alert)
+                            gbp_worker.reconcile_gbp(_gs, _gc, alert=ops_alerts.alert)
+                    except Exception as e:
+                        print(f"[gbp] lane failed: {type(e).__name__}: {e}")
+                        ops_alerts.alert(f"GBP lane failed: {type(e).__name__}: {e}. "
+                                         "The draft run is unaffected.")
             except Exception as e:
                 print(f"[calendar-autopublish] slot-fire lane failed: "
                       f"{type(e).__name__}: {e}")

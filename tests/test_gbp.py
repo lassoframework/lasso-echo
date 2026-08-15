@@ -35,6 +35,13 @@ def test_phone_number_rejected():
         city="Carmel"))
     # a bare year or small number is not a phone number
     assert not gbp.has_phone("Coaching since 2015 for 12 week blocks in Carmel today.")
+    # bare 7-digit local numbers ARE caught (audit finding #2)
+    assert gbp.has_phone("Reach 555-0198 to join our Carmel program this week.")
+    assert gbp.has_phone("Text 555 0198 to book your first Carmel session today.")
+    assert gbp.has_phone("Call 555.0198 to start training in Carmel this month now.")
+    # but a 4-3 / 3-3 shape or image dims are NOT phone numbers
+    assert not gbp.has_phone("Crop to 1200 900 for the Carmel gym floor photo today.")
+    assert not gbp.has_phone("Open 2015 2020 hours across the Carmel gym each week now.")
 
 
 def test_dash_rejected():

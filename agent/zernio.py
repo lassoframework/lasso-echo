@@ -227,6 +227,16 @@ class ZernioClient:
         the GBP reconcile poll (§7.2) reads this hourly for 48h after publish."""
         return self._get(f"/v1/posts/{post_id}")
 
+    def create_gmb_media(self, account_id, image_url):
+        """POST /v1/accounts/{accountId}/gmb-media — add a photo to a GBP location's
+        gallery (§6.4 photo drop). SYNCHRONOUS: no webhook, no draft mode; a 2xx means
+        the photo is live. The GBP worker only calls this in ARMED live mode; in the
+        draft build the worker simulates it and never touches this endpoint."""
+        payload = {"mediaFormat": "PHOTO", "sourceUrl": image_url}
+        headers = {"x-request-id": str(_uuid.uuid4())}
+        return self._post(f"/v1/accounts/{account_id}/gmb-media", payload,
+                          headers=headers)
+
     def analytics(self, profile_id, skip=0, limit=50):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 

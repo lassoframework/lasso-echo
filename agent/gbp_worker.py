@@ -152,11 +152,38 @@ def resolve_connection(connections, gbp_location_id=None):
                        f"(location={gbp_location_id or 'any'})")
 
 
+def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
+    """§6.4 photo drop: add the image to the GBP gallery via Zernio gmb-media. This
+    endpoint is SYNCHRONOUS with NO webhook and no caption — 2xx -> published now,
+    error -> failed + reason + alert. No caption gate (a gallery photo has no text). In
+    the DRAFT build we do NOT call gmb-media (it would upload live); we simulate a
+    published result so the dogfood shows the photo card without touching Google."""
+    if not (row.get("image_url") or "").strip():
+        return {"ok": False, "status": "failed", "late_post_id": "",
+                "reject_reason": "photo drop has no image", "mode": ""}
+    if draft:
+        return {"ok": True, "status": "published", "late_post_id": "",
+                "reject_reason": "", "mode": "draft"}
+    try:
+        resp = client.create_gmb_media(connection["zernio_account_id"],
+                                       row["image_url"])
+    except Exception as e:  # noqa: BLE001 - synchronous: an error IS the outcome
+        if alert:
+            alert(f"GBP photo drop failed for {row.get('gym_id')} "
+                  f"row {row.get('id')}: {type(e).__name__}")
+        return {"ok": False, "status": "failed", "late_post_id": "",
+                "reject_reason": f"photo upload: {type(e).__name__}", "mode": ""}
+    from .zernio import post_id_of
+    return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
+            "reject_reason": "", "mode": "live"}
+
+
 def publish_one(row, connections, *, client, draft=True, alert=None):
     """Publish one approved GBP row: connection precheck (§7.1) + routing + send. Returns
     the status transition dict {status, late_post_id, reject_reason}. A needs_reconnect
     gym HOLDS silently (status stays 'approved'); a routing failure or rail violation
-    goes to 'failed' with a reason (+ alert), never a silent hold."""
+    goes to 'failed' with a reason (+ alert), never a silent hold. A photo-drop row
+    (format='photo') routes to the gmb-media path (§6.4), not the posts API."""
     # §7.1.1 hold silently if the only/target connection is needs_reconnect
     live = [c for c in (connections or []) if c.get("status") == "connected"]
     if not live and (connections or []):
@@ -170,12 +197,109 @@ def publish_one(row, connections, *, client, draft=True, alert=None):
                   f"row {row.get('id')}: {e}")
         return {"status": "failed", "late_post_id": "",
                 "reject_reason": "connection routing"}
-    res = publish_gbp_row(row, conn, client=client, draft=draft)
-    if not res["ok"] and alert:
+    is_photo = str(row.get("format") or "").lower() == "photo"
+    res = (publish_photo_drop(row, conn, client=client, draft=draft, alert=alert)
+           if is_photo
+           else publish_gbp_row(row, conn, client=client, draft=draft))
+    if not res["ok"] and alert and not is_photo:
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
     return {"status": res["status"], "late_post_id": res["late_post_id"],
             "reject_reason": res["reject_reason"]}
+
+
+def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None):
+    """Publish lane: send every APPROVED, due googlebusiness row (draft in this run).
+    Groups by gym, reads its connections once, routes + sends each row, and writes the
+    status back (published / failed+reason; needs_reconnect holds silently). Returns a
+    summary. A per-row failure never blocks the others."""
+    from .zernio import _to_utc_iso  # reuse the tz normalizer for published_at
+    rows = store.approved_gbp_rows(run_date) or []
+    by_gym = {}
+    for r in rows:
+        by_gym.setdefault(r.get("gym_id"), []).append(r)
+    published = failed = held = 0
+    for gym, gym_rows in by_gym.items():
+        try:
+            conns = store.connections_for(gym) or []
+        except Exception as e:  # noqa: BLE001
+            if alert:
+                alert(f"GBP publish: could not read connections for {gym}: "
+                      f"{type(e).__name__}")
+            continue
+        for row in gym_rows:
+            try:
+                res = publish_one(row, conns, client=client, draft=draft, alert=alert)
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                store.mark_failed(row.get("id"), f"worker error: {type(e).__name__}")
+                continue
+            if res.get("held"):
+                held += 1
+                continue
+            if res["status"] == "published":
+                published += 1
+                stamp = _to_utc_iso((now or _utcnow()).isoformat())
+                store.mark_published(row.get("id"), res["late_post_id"], stamp)
+            elif res["status"] == "failed":
+                failed += 1
+                store.mark_failed(row.get("id"), res["reject_reason"])
+    return {"published": published, "failed": failed, "held": held,
+            "gyms": len(by_gym)}
+
+
+def reconcile_gbp(store, client, *, now=None, alert=None):
+    """§7.2 reconcile: for each recently-PUBLISHED GBP row still inside the 48h window,
+    poll GET /v1/posts/{id} and apply the classification. published/pending -> leave;
+    policy rejection -> failed+reason+alert; transient -> one retry (then failed);
+    deleted -> deleted. Never auto-requeues. Returns a summary."""
+    now = now or _utcnow()
+    since = _iso(now - timedelta(hours=RECONCILE_HOURS))
+    rows = store.recent_published_gbp(since) or []
+    demoted = retried = 0
+    for row in rows:
+        if not in_reconcile_window(row.get("published_at"), now=now):
+            continue
+        pid = row.get("late_post_id")
+        if not pid:
+            continue
+        try:
+            state, reason = classify_reconcile(client.get_post(pid))
+        except Exception:  # noqa: BLE001 - a poll error just waits for the next tick
+            continue
+        if state in ("published", "pending"):
+            continue
+        if state == "retry":
+            retried += 1
+            ok = False
+            try:
+                ok = bool(getattr(client, "retry_post", lambda _pid: None)(pid))
+            except Exception:  # noqa: BLE001
+                ok = False
+            if not ok:
+                store.mark_failed(row.get("id"),
+                                  "Google could not publish this post after a retry.")
+                if alert:
+                    alert(f"GBP post {pid} for {row.get('gym_id')} failed after retry.")
+                demoted += 1
+        elif state == "deleted":
+            store.mark_status(row.get("id"), "deleted")
+            demoted += 1
+        else:  # failed (policy or unknown)
+            store.mark_failed(row.get("id"), reason)
+            if alert:
+                alert(f"GBP post {pid} for {row.get('gym_id')} rejected: {reason}")
+            demoted += 1
+    return {"checked": len(rows), "demoted": demoted, "retried": retried}
+
+
+def _utcnow():
+    from datetime import datetime as _dt
+    return _dt.now(timezone.utc)
+
+
+def _iso(dt):
+    return dt.isoformat()
 
 
 def in_reconcile_window(published_at, now=None):

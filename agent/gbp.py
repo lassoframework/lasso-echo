@@ -30,9 +30,12 @@ MIN_CONTENT_WORDS = 12                # reuse the A+ floor: a real caption, not 
 # no em/en/figure-dash/minus, and no hyphen used AS a dash (spaced or doubled)
 _DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
 _HASHTAG_RE = re.compile(r"(?:^|\s)#\w")
-# a phone number: 7+ digits with common separators, or a (xxx) xxx-xxxx shape
+# a phone number: a 10-digit US number in any common shape, OR a bare 7-digit local
+# number (555-0198 / 555 0198 / 555.0198). The 3-then-4 local shape is specific enough
+# not to catch "1200 900" (4-3) or a year range.
 _PHONE_RE = re.compile(
-    r"(?:\+?\d[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}\b")
+    r"(?:\+?\d[\s.\-]?)?(?:\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}\b"
+    r"|\b\d{3}[\s.\-]\d{4}\b")
 _SCAFFOLD_RE = re.compile(
     r"^\s*(#{1,6}\s|(caption( body| text)?|body|post)\s*:)", re.IGNORECASE)
 
