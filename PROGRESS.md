@@ -6,7 +6,44 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-13
+Last updated: 2026-08-15
+
+---
+
+## GBP rail (Google Business) — Phase 0 preflight CLOSED, holding at Phase 2 gate (2026-08-15)
+
+Approved spec: `GBP_BUILD_SPEC.md` (v2). My scope: Phase 0 (preflight), Phase 3 (planner
+GBP lane), Phase 5 (publish worker), Phase 6 (reviews, later). Portal owns Phase 1
+(connection UI), Phase 2 (migrations), Phase 4 (approval card). Phase 7 (reporting) not mine.
+
+### [x] Phase 0 preflight — all four answered
+- **P0.1 analytics add-on: YES.** Read-only probe of `/v1/analytics/googlebusiness/performance`
+  and `/search-keywords` with our live key returned HTTP 400 "Invalid accountId format" — past
+  auth + entitlement to param validation (an unentitled add-on 402/403s first). No entitlement
+  wall. Definitive confirmation lands with a real connected GBP account at dogfood.
+- **P0.2 gmb-media (photo drops): YES.** Probe of `/v1/accounts/{id}/gmb-media` also returned
+  400 invalid-accountId (reachable), AND Blake confirmed live from billing. Photo drops STAY in v1.
+  (Spec said `gmbmedia`; real endpoint is `gmb-media` under `/accounts/{accountId}/`.)
+- **P0.3 per-location cost: ~$0.30/month per connected location** (Blake, from live billing). No
+  multi-location cap needed for v1.
+- **P0.4 profile_id per DFY gym:** existing DFY gyms have one (ENG, GritX verified). Founding-five
+  GBP-only gaps close through `zernio_routes._ensure_profile_id` on connect.
+
+### [x] §7.2 status model DECISION (Blake): option (b) sync + reconcile, NOT webhook
+There is NO existing Zernio webhook receiver (code-audited; FB/IG marks status synchronously). v1:
+`create_post` returns → mark published (provisional) → **reconcile polls `GET /v1/posts/{id}` HOURLY
+for the first 48h after publish, then stops.** A demotion applies the full §7.2 classification
+(transient→one retry; policy rejection→`failed` + plain-English `reject_reason` + staff alert;
+deleted→`deleted`); NEVER auto-requeues. Webhook receiver is a v2 upgrade (noted in spec §7.2).
+
+### [!] Legacy: `agent/gbp_publisher.py` is SUPERSEDED — do NOT extend
+It publishes direct to mybusiness.googleapis.com/v4 with a hand-set token (imported by
+approvals.py, config.py). Per Blake's portal-session ruling, ALL GBP publishing routes through
+`zernio_publisher.py` per the spec. Leave the legacy file untouched.
+
+### [ ] HOLDING at the Phase 2 migration gate
+Phase 3 planner code does not start until the portal's Phase 2 migration (content_calendar GBP
+columns) lands. Mapping approved by Blake; build against `GBP_BUILD_SPEC.md`.
 
 ---
 

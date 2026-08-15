@@ -204,6 +204,39 @@ class ZernioClient:
         headers = {"x-request-id": str(_uuid.uuid4())}
         return self._post("/v1/posts", payload, headers=headers)
 
+    def create_post_raw(self, payload, *, draft=False, publish_now=True):
+        """POST /v1/posts with a FULLY-BUILT body (content + mediaItems + platforms),
+        for platforms whose platformSpecificData the caller assembles itself (GBP). The
+        GBP payload builder (agent/gbp.build_post_payload) produces `payload`; this only
+        adds send-mode + a fresh idempotency id, never reshapes the platforms entry.
+
+        draft=True forces isDraft (Zernio saves it, publishes NOTHING) — used by the
+        autonomous build + validation so no live post is ever created. draft=False +
+        publish_now sends immediately (the real armed worker path, human-tap gated
+        upstream). Returns the created post JSON (carries the post id)."""
+        body = dict(payload or {})
+        if draft:
+            body["isDraft"] = True
+        elif publish_now:
+            body["publishNow"] = True
+        headers = {"x-request-id": str(_uuid.uuid4())}
+        return self._post("/v1/posts", body, headers=headers)
+
+    def get_post(self, post_id):
+        """GET /v1/posts/{id} -> the post JSON (status + per-platform state). Read-only;
+        the GBP reconcile poll (§7.2) reads this hourly for 48h after publish."""
+        return self._get(f"/v1/posts/{post_id}")
+
+    def create_gmb_media(self, account_id, image_url):
+        """POST /v1/accounts/{accountId}/gmb-media — add a photo to a GBP location's
+        gallery (§6.4 photo drop). SYNCHRONOUS: no webhook, no draft mode; a 2xx means
+        the photo is live. The GBP worker only calls this in ARMED live mode; in the
+        draft build the worker simulates it and never touches this endpoint."""
+        payload = {"mediaFormat": "PHOTO", "sourceUrl": image_url}
+        headers = {"x-request-id": str(_uuid.uuid4())}
+        return self._post(f"/v1/accounts/{account_id}/gmb-media", payload,
+                          headers=headers)
+
     def analytics(self, profile_id, skip=0, limit=50):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
