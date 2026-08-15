@@ -68,6 +68,26 @@ def test_resolve_offer_skips_without_url_or_name():
     assert gp.resolve_offer(None, None) == (None, None)
 
 
+def test_resolve_offer_dict_element_uses_name_not_stringified_dict():
+    # a jsonb offer element that is an object must yield its name, never "{'name': ...}"
+    name, d = gp.resolve_offer([{"name": "Free Trial", "id": 7}], "https://ghl/join")
+    assert name == "Free Trial" and d == {"redeemOnlineUrl": "https://ghl/join"}
+    # an object with no name-ish field -> skip (never fabricate a name from the dict repr)
+    assert gp.resolve_offer([{"id": 7}], "https://ghl/join") == (None, None)
+
+
+def test_plan_reports_failure_when_store_cannot_persist():
+    _seed()
+
+    class _NoPersist:
+        pass  # no insert_rows
+
+    out = gp.plan_gbp_month("lasso", "lasso_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=_NoPersist(), start=date(2026, 9, 1),
+                            offer=None, events=[], caption_fn=_cap, image_fn=_img)
+    assert out["ok"] is False and out["planned"] == 0   # never a phantom success
+
+
 # ---- cadence + row shape ---------------------------------------------------
 
 def test_full_cadence_with_offer_and_event():

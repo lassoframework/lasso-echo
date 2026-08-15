@@ -10,7 +10,7 @@ Last updated: 2026-08-15
 
 ---
 
-## GBP rail (Google Business) — Phase 0 preflight CLOSED, holding at Phase 2 gate (2026-08-15)
+## GBP rail (Google Business) — Phase 3 + Phase 5 BUILT, draft-only, dogfood PROVEN (2026-08-15)
 
 Approved spec: `GBP_BUILD_SPEC.md` (v2). My scope: Phase 0 (preflight), Phase 3 (planner
 GBP lane), Phase 5 (publish worker), Phase 6 (reviews, later). Portal owns Phase 1
@@ -41,9 +41,77 @@ It publishes direct to mybusiness.googleapis.com/v4 with a hand-set token (impor
 approvals.py, config.py). Per Blake's portal-session ruling, ALL GBP publishing routes through
 `zernio_publisher.py` per the spec. Leave the legacy file untouched.
 
-### [ ] HOLDING at the Phase 2 migration gate
-Phase 3 planner code does not start until the portal's Phase 2 migration (content_calendar GBP
-columns) lands. Mapping approved by Blake; build against `GBP_BUILD_SPEC.md`.
+### [x] Phase 2 migration LANDED (confirmed 2026-08-15)
+`information_schema` on the portal project (ooqcvmcjspeltuuhcvlh) shows all six GBP columns on
+`content_calendar`: `gbp_topic_type`, `gbp_cta_type`, `gbp_cta_url`, `gbp_event` (jsonb),
+`gbp_offer` (jsonb), `gbp_location_id`. Planner writes against these live.
+
+### [x] Offer/CTA source DISCOVERED — real columns, gaps flagged
+Live front-end offer NAME → `onboarding_intake.offers` (jsonb array). Redeem/CTA URL →
+`onboarding_intake.ghl_link` (the GHL funnel). **No CTA-type override column** and **no coupon /
+offer-window / terms source** exist. Rulings applied: CTA defaults to `LEARN_MORE`; offer window is
+a planner default (10d, validator cap 30); coupon/terms are OMITTED, never invented. `resolve_offer`
+requires BOTH a real name AND a redeem URL, else the OFFER slot is skipped (never a dead offer).
+GAP for Blake (backlog, not a blocker): if you want per-gym CTA-type overrides or real coupon
+codes/terms in GBP OFFER posts, a source column must be added; today those fields are absent by
+design, not fabricated.
+
+### [x] Phase 3 planner lane — BUILT (`agent/gbp_planner.py`, draft-only)
+Cadence §5.1: 8 STANDARD + 1 OFFER (only when a real offer resolves) + 0–2 EVENT (real only) +
+4 photo drops. Every STANDARD/EVENT caption clears `gbp.caption_issues` (A+) or its slot is
+SKIPPED — A+ or nothing. GBP copy rules enforced (80-char hook, 150–300 chars / 1500 hard cap, no
+hashtags, no phone, city named once, no dashes, CTA carries the ask, UTM `?utm_source=google&
+utm_medium=organic_gbp&utm_campaign=echo_{pillar_slug}`, OFFER omits callToAction, CALL exempt from
+UTM). Image cropped to 1200×900 (4:3) at PLAN time (the exact pixels the owner approves). Rows land
+`status='pending'`, `account='googlebusiness'`.
+
+### [x] Phase 5 publish worker + §7.2 reconcile — BUILT (`agent/gbp_worker.py`, draft-only)
+`publish_due_gbp` (approved+due rows → Zernio `create_post_raw(draft=True)` this run), photo drops
+via `create_gmb_media` (§6.4; draft simulates, live uploads), and `reconcile_gbp` (option (b): poll
+`GET /v1/posts/{id}` hourly for 48h then stop; policy→failed no-retry, transient→one retry,
+deleted→deleted, never auto-requeue). Routing: 0/2+ connections → failed + alert; `needs_reconnect`
+→ silent hold. Listener lane (`agent/listener.py`) runs both only when `gbp_publish_enabled()` and
+is a no-op otherwise; draft unless BOTH `AGENT_GBP_PUBLISH` and `AGENT_PUBLISH_ENABLED` are armed.
+
+### [x] Independent audit — two findings CLOSED, re-audit clean
+Round 1 (planner+worker): **#1 MAJOR** photo-drop rows (format=photo, empty caption) were
+un-sendable → added `zernio.create_gmb_media` + `gbp_worker.publish_photo_drop` + photo routing in
+`publish_one`. **#2 MODERATE** phone regex missed bare 7-digit locals (555-0198) → `_PHONE_RE`
+fixed (image dims `1200 900` and year ranges `2015 2020` still pass; regression asserts added).
+Round 2 (dogfood entrypoint + listener lane + store): 6 findings → all CLOSED, re-audit clean,
+0 material remaining. **2 CRITICAL:** swallowed idempotency read error re-inserted a duplicate
+month (now aborts without write); dead offer resolver called `_get` on the wrong object (now reads
+via `GbpStore.onboarding_intake`). **1 MAJOR:** `GbpStore.available()` was always True so the
+creds-less no-op could never fire (now checks `_url`/`_key`). **3 MODERATE/MINOR:** stale terminal
+row blocked re-plan forever (now excludes failed/denied/deleted); planner reported phantom success
+without `insert_rows` (now returns ok:False); `resolve_offer` stringified a dict element (now reads
+name/title/label). +7 regression tests. Hard limits (zero live publishes, pending-only, no
+fabrication, legacy dead, OFFER omits CTA) verified intact through both rounds.
+
+Full suite: **2726 passed, 11 skipped** on main (GBP rail + Dale's FB/IG fixes merged).
+
+### [x/!] Dogfood for `portal_gym_key='lasso'` — PROVEN on real material; WRITE runs on the worker
+`agent/gbp_dogfood.py` (idempotent, gym-agnostic core, flag/CLI: `python3 -m agent.gbp_dogfood
+lasso Carmel`) resolves the gym's REAL voice + library + offer + connection and calls the planner.
+Proven end-to-end on 100% real LASSO material (no fabrication):
+- **7/8 real facts** from `brand_voice/lasso_now.md` produced A+ GBP captions (each names Carmel,
+  no hashtags, in-range). The 8th was correctly **skipped by the figure-fabrication gate** — the
+  anti-invention guard firing as designed.
+- **5/5 real library images** cropped to exactly 1200×900; `content_library/` holds **14 real
+  lasso images** ≥ the 12 needed (8 STANDARD + 4 photo). LASSO has no `onboarding_intake` offer
+  row, so the OFFER slot is skipped by design; no real events → 0 EVENT.
+- **[!] The pending-row WRITE requires R2 image hosting** (turns each crop into a public URL Zernio
+  can fetch). R2 is a hand-set secret on the deployed worker and is NOT configured in a local
+  session — I did not touch it (secrets are yours; never touch client R2 setup). So the real rows
+  are written by running the entrypoint **on the deployed worker** where R2 + the ingested
+  approved-sources DB live. No fabrication was used to paper over this. **Your action:** deploy,
+  then run `python3 -m agent.gbp_dogfood lasso Carmel` on the worker once (or arm the lane); then
+  click Connect on LASSO's GBP listing and approve the pending posts.
+
+### [!] Legacy `agent/gbp_publisher.py` — untouched and dead (verified)
+The new rail uses `account='googlebusiness'` rows + the GBP worker lane. `approvals.py` still routes
+its legacy `Platform.GOOGLE_BUSINESS` path to `gbp_publisher`; that path is not used by the new
+rail and the legacy file was not modified.
 
 ---
 

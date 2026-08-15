@@ -79,9 +79,17 @@ def resolve_offer(offers_json, ghl_link):
     slot. offer_dict is the content_calendar.gbp_offer payload (redeemOnlineUrl only —
     coupon/terms have no source and are omitted, never invented). Requires BOTH a real
     offer name AND a redeem URL; either missing -> skip (never a dead offer)."""
+    def _name_of(item):
+        # a jsonb offer element may be a plain string or an object; pull a real name
+        # field from an object, never stringify the dict into the caption.
+        if isinstance(item, dict):
+            return str(item.get("name") or item.get("title") or item.get("label")
+                       or "").strip()
+        return str(item or "").strip()
+
     name = ""
     if isinstance(offers_json, list) and offers_json:
-        name = str(offers_json[0]).strip()
+        name = _name_of(offers_json[0])
     elif isinstance(offers_json, str):
         name = offers_json.strip()
     url = (ghl_link or "").strip()
@@ -254,7 +262,11 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
         return {"ok": False, "reason": "nothing planned (no A+ captions or media)",
                 "planned": 0, **counts}
 
-    inserted = store.insert_rows(portal_gym_key, rows) if hasattr(store, "insert_rows") else []
+    if not hasattr(store, "insert_rows"):
+        # never report a phantom success: a store that cannot persist means 0 rows landed
+        return {"ok": False, "reason": "store cannot persist rows (no insert_rows)",
+                "planned": 0, **counts}
+    inserted = store.insert_rows(portal_gym_key, rows)
     log(f"{portal_gym_key}: planned {len(rows)} GBP rows "
         f"(std {counts['standard']}, offer {counts['offer']}, event {counts['event']}, "
         f"photo {counts['photo']}, skipped {counts['skipped']})")

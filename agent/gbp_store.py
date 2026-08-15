@@ -22,7 +22,14 @@ class GbpStore:
         self._s = base or SupabaseCalendarStore()
 
     def available(self):
-        return getattr(self._s, "available", lambda: True)()
+        """True only when the wrapped store has real portal creds. The base
+        SupabaseCalendarStore has no available(), so we check its _url/_key directly —
+        otherwise a creds-less run would sail past the guard and crash on the first HTTP
+        call instead of no-opping cleanly."""
+        base_avail = getattr(self._s, "available", None)
+        if callable(base_avail):
+            return base_avail()
+        return bool(getattr(self._s, "_url", "") and getattr(self._s, "_key", ""))
 
     # ---- reads --------------------------------------------------------------
     def approved_gbp_rows(self, run_date):
@@ -60,6 +67,37 @@ class GbpStore:
         """Every connection row (for the nightly token-health sweep, Phase 1 §3.3, which
         the portal owns — exposed here read-only for staff tooling)."""
         return self._get(_CONN, {"order": "portal_gym_key"})
+
+    def future_gbp_rows(self, portal_gym_key, on_or_after):
+        """ACTIVE googlebusiness rows for a gym dated on/after `on_or_after`. The
+        dogfood/planner idempotency guard: a gym that already has a future GBP month in
+        flight is left untouched (never a duplicate plan). TERMINAL rows (failed / denied /
+        deleted) are EXCLUDED so a single stale cleanup row can never block a fresh plan
+        forever — only a real in-flight month (pending/approved/scheduled/published)
+        counts."""
+        return self._get(_CAL, {"account": f"eq.{PLATFORM}",
+                                "gym_id": f"eq.{portal_gym_key}",
+                                "post_date": f"gte.{on_or_after}",
+                                "status": "not.in.(failed,denied,deleted)",
+                                "order": "post_date"})
+
+    def onboarding_intake(self, portal_gym_key):
+        """The gym's onboarding_intake offer fields ({business_name, offers, ghl_link}) or
+        None. LASSO's own record is keyed by business_name; client gyms match the base key.
+        Offers/ghl_link ONLY — the planner never invents an offer. Reads through this
+        store's own _get (the base SupabaseCalendarStore has none)."""
+        base = portal_gym_key.rsplit("_", 1)[0] if portal_gym_key.endswith(("_ig", "_fb")) \
+            else portal_gym_key
+        rows = self._get("onboarding_intake",
+                         {"select": "business_name,offers,ghl_link",
+                          "business_name": f"ilike.*{base}*", "limit": "1"})
+        return rows[0] if rows else None
+
+    # ---- writes -------------------------------------------------------------
+    def insert_rows(self, portal_gym_key, rows):
+        """Passthrough to the calendar store's insert path so the planner can write its
+        PENDING rows through one GBP store object. Rows are already gym-scoped dicts."""
+        return self._s.insert_rows(portal_gym_key, rows)
 
     # ---- writes (content_calendar status only; never an approval) -----------
     def mark_published(self, row_id, late_post_id, published_at):
