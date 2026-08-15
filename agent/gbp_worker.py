@@ -1,0 +1,195 @@
+"""
+GBP publish worker (Phase 5) — send logic + the §7.2 reconcile classifier.
+
+This is NOT the legacy agent/gbp_publisher.py (dead, direct-v4, do-not-extend). All GBP
+publishing routes through Zernio here, reusing agent/gbp.py for the payload and rails.
+
+Split so the pure decisions are unit-testable without the DB or network:
+  * build_gbp_payload_for_row  — content_calendar row + connection -> Zernio body
+  * publish_gbp_row            — re-validate rails at send, then Zernio create_post_raw
+                                 (draft=True in the autonomous build; nothing goes live)
+  * classify_reconcile         — a GET /v1/posts/{id} response -> next status (§7.2)
+  * in_reconcile_window        — hourly-for-48h poll gate
+
+The DB lanes (select approved GBP rows, resolve the connection row, write status back)
+attach once the Phase 2 migration lands (gbp_* columns + gym_gbp_connections). They are
+thin wrappers over these pure functions.
+"""
+
+from datetime import datetime, timedelta, timezone
+
+from . import gbp
+
+RECONCILE_HOURS = 48          # §7.2: poll hourly for the first 48h after publish
+
+
+# --- row -> payload --------------------------------------------------------
+
+def build_gbp_payload_for_row(row, connection):
+    """Assemble the Zernio POST body for an approved GBP `content_calendar` row using
+    its connection. Raises gbp.GbpPayloadError on any structural violation (bad topic,
+    OFFER with a CTA, missing image), so a malformed post can never be sent.
+
+    row keys: caption, image_url, gbp_topic_type, gbp_cta_type, gbp_cta_url, gbp_event,
+              gbp_offer, pillar. connection: zernio_account_id, gbp_location_id."""
+    pd = gbp.build_platform_data(
+        account_id=connection["zernio_account_id"],
+        topic_type=row.get("gbp_topic_type") or "STANDARD",
+        location_id=connection["gbp_location_id"],
+        pillar=row.get("pillar") or "",
+        cta_type=row.get("gbp_cta_type") or gbp.DEFAULT_CTA,
+        cta_url=row.get("gbp_cta_url") or "",
+        event=row.get("gbp_event"),
+        offer=row.get("gbp_offer"),
+    )
+    return gbp.build_post_payload(
+        caption=row.get("caption") or "",
+        image_url=row.get("image_url") or "",
+        platform_data=pd,
+    )
+
+
+def publish_gbp_row(row, connection, *, client, draft=True):
+    """Send one approved GBP row through Zernio. Re-validates the hard rails at send
+    time (belt-and-suspenders over the planner) and refuses to ship a violation.
+
+    Returns a dict: {ok, status, late_post_id, reject_reason, mode}.
+      * rail violation / bad payload -> {ok False, status 'failed', reject_reason ...}
+        (the caller writes 'failed' + alerts; NEVER a silent hold)
+      * sent -> {ok True, status 'published', late_post_id, mode 'draft'|'live'}
+
+    draft=True (autonomous build + validation) sends isDraft — Zernio stores it and
+    publishes NOTHING. The armed worker passes draft=False, human-tap gated upstream."""
+    caption = row.get("caption") or ""
+    # §7.1 re-validate the hard rails (no dash/hashtag/phone, image present, length).
+    # city is a planner-time signal; at send we enforce the platform hard rules only.
+    issues = gbp.caption_issues(caption)
+    if not (row.get("image_url") or "").strip():
+        issues.append("no image on the row")
+    if issues:
+        return {"ok": False, "status": "failed", "late_post_id": "",
+                "reject_reason": "rail check: " + "; ".join(issues), "mode": ""}
+    try:
+        payload = build_gbp_payload_for_row(row, connection)
+    except gbp.GbpPayloadError as e:
+        return {"ok": False, "status": "failed", "late_post_id": "",
+                "reject_reason": f"payload: {e}", "mode": ""}
+    resp = client.create_post_raw(payload, draft=draft)
+    from .zernio import post_id_of
+    return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
+            "reject_reason": "", "mode": "draft" if draft else "live"}
+
+
+# --- §7.2 reconcile classifier --------------------------------------------
+
+_POLICY_WORDS = ("policy", "phone", "image", "gimmick", "disallow", "rejected",
+                 "not allowed", "violation", "prohibited", "url mismatch",
+                 "invalid content", "spam")
+_TRANSPORT_WORDS = ("timeout", "timed out", "temporar", "rate limit", "rate-limit",
+                    "unavailable", "network", "5xx", "500", "502", "503", "504",
+                    "try again", "internal error")
+
+
+def _platform_state(post_json):
+    """(status, error_text) for the googlebusiness platform in a Zernio post response.
+    Falls back to the top-level status when there is no per-platform breakdown."""
+    post = (post_json or {}).get("post") or post_json or {}
+    for p in (post.get("platforms") or []):
+        if str(p.get("platform")) == gbp.PLATFORM:
+            return (str(p.get("status") or "").lower(),
+                    str(p.get("error") or p.get("errorMessage") or ""))
+    return str(post.get("status") or "").lower(), str(post.get("error") or "")
+
+
+def classify_reconcile(post_json):
+    """Map a GET /v1/posts/{id} response to the next status per §7.2. Returns
+    (state, reject_reason) where state is one of:
+      'published' | 'pending' | 'retry' | 'failed' | 'deleted'
+    'pending' means keep polling (still in flight). 'retry' means one posts_retry; a
+    second failure the caller escalates to 'failed'. A policy rejection is 'failed'
+    with a plain-English reason and is NEVER retried."""
+    status, err = _platform_state(post_json)
+    low = (err or "").lower()
+    if status in ("published", "live", "success", "succeeded", "posted"):
+        return "published", ""
+    if status in ("deleted", "cancelled", "canceled"):
+        return "deleted", ""
+    if status in ("failed", "error", "rejected"):
+        if any(w in low for w in _POLICY_WORDS):
+            return "failed", _plain_reason(err)
+        if any(w in low for w in _TRANSPORT_WORDS):
+            return "retry", ""
+        # unknown failure: treat as policy (do NOT auto-retry into a loop); surface it
+        return "failed", _plain_reason(err) or "Google rejected this post."
+    # scheduled / processing / pending / queued / '' -> still settling
+    return "pending", ""
+
+
+def _plain_reason(err):
+    """A short, client-safe reason from a raw platform error (scrubbed of ids/urls)."""
+    import re
+    txt = re.sub(r"https?://\S+", "", err or "").strip()
+    txt = re.sub(r"\s+", " ", txt)
+    return txt[:200]
+
+
+class RoutingError(Exception):
+    """A GBP row resolved to 0 or 2+ connections. §7.1: never a silent hold — the row
+    goes to 'failed' with reject_reason='connection routing' + a staff alert."""
+
+
+def resolve_connection(connections, gbp_location_id=None):
+    """Exactly ONE connection for a GBP row, or RoutingError. `connections` are the
+    connected (status='connected') rows for the row's portal_gym_key. When the row
+    carries a gbp_location_id (multi-location gym), match on it; otherwise there must be
+    exactly one connection. 0 or 2+ -> RoutingError (§7.1)."""
+    conns = list(connections or [])
+    if gbp_location_id:
+        conns = [c for c in conns if c.get("gbp_location_id") == gbp_location_id]
+    if len(conns) == 1:
+        return conns[0]
+    raise RoutingError(f"resolved {len(conns)} connections "
+                       f"(location={gbp_location_id or 'any'})")
+
+
+def publish_one(row, connections, *, client, draft=True, alert=None):
+    """Publish one approved GBP row: connection precheck (§7.1) + routing + send. Returns
+    the status transition dict {status, late_post_id, reject_reason}. A needs_reconnect
+    gym HOLDS silently (status stays 'approved'); a routing failure or rail violation
+    goes to 'failed' with a reason (+ alert), never a silent hold."""
+    # §7.1.1 hold silently if the only/target connection is needs_reconnect
+    live = [c for c in (connections or []) if c.get("status") == "connected"]
+    if not live and (connections or []):
+        return {"status": "approved", "late_post_id": "", "reject_reason": "",
+                "held": "needs_reconnect"}
+    try:
+        conn = resolve_connection(live, row.get("gbp_location_id"))
+    except RoutingError as e:
+        if alert:
+            alert(f"GBP routing failure for {row.get('gym_id')} "
+                  f"row {row.get('id')}: {e}")
+        return {"status": "failed", "late_post_id": "",
+                "reject_reason": "connection routing"}
+    res = publish_gbp_row(row, conn, client=client, draft=draft)
+    if not res["ok"] and alert:
+        alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
+              f"{res['reject_reason']}")
+    return {"status": res["status"], "late_post_id": res["late_post_id"],
+            "reject_reason": res["reject_reason"]}
+
+
+def in_reconcile_window(published_at, now=None):
+    """True while a post is inside the 48h post-publish poll window (§7.2). After 48h
+    the post is settled and the hourly reconcile stops."""
+    if not published_at:
+        return False
+    now = now or datetime.now(timezone.utc)
+    pub = published_at
+    if isinstance(pub, str):
+        try:
+            pub = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if pub.tzinfo is None:
+        pub = pub.replace(tzinfo=timezone.utc)
+    return now - pub <= timedelta(hours=RECONCILE_HOURS)
