@@ -1275,6 +1275,25 @@ def client_voice_dir() -> str:
     return os.path.join(data_dir(), "brand_voice")
 
 
+def tenant_brain_dir() -> str:
+    """The DURABLE root for per-gym tenant brains: <DATA_DIR>/brains.
+
+    WHY: tenant_brain.brains_dir() historically defaulted to the repo-relative "brains"
+    dir, which on the deployed worker resolves to /app/brains — inside the container
+    IMAGE, wiped on every redeploy. So a client's caption edits (edit_diff), deny
+    reasons, and kills were recorded to an EPHEMERAL dir and lost on the next deploy: the
+    learning loop looked armed but nothing survived (Dale, 2026-08-15: 'not sure Echo
+    captured my reasoning'). Rooting the brain under the persistent /data volume (the same
+    place client voice bibles and echo.db live) makes learning actually stick across
+    deploys. Override with AGENT_TENANT_BRAIN_DIR for a custom mount / tests. When /data
+    does not exist (local dev / tests) data_dir() falls back to '.', so the brain stays
+    at the repo-relative 'brains' exactly as before — no test churn."""
+    override = os.environ.get("AGENT_TENANT_BRAIN_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(data_dir(), "brains")
+
+
 def review_window_days() -> int:
     """
     The review cycle length in days (env AGENT_REVIEW_WINDOW_DAYS, default 14).

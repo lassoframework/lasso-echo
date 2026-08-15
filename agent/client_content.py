@@ -94,18 +94,92 @@ def pick_image(account_key, day_key, library_path, exclude_keys=()):
     return pool[0]
 
 
+def _humanize_stem(stem):
+    """A human-readable phrase from a media filename stem, used as a photo-grounding
+    HINT only (never a source of facts). Strips the intake timestamp prefix
+    (20260812T181128Z_), splits on separators, drops pure-noise tokens (hex hashes,
+    IMG_1234, bare numbers, extensions), and returns the descriptive words a client
+    put in the filename ('Dale_Peace_Run' -> 'Dale Peace Run', 'Youth_Wall_Sit_w_
+    smiles' -> 'Youth Wall Sit w smiles'). Returns '' when nothing descriptive remains
+    (e.g. a UUID/hash-named upload), so a meaningless filename adds no noise."""
+    import re
+    s = os.path.splitext(str(stem or ""))[0]
+    # drop the intake timestamp prefix: 20260812T181128Z_
+    s = re.sub(r"^\d{8}T\d{6}Z_", "", s)
+    words = []
+    for tok in re.split(r"[\s._\-]+", s):
+        tok = tok.strip()
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in ("img", "image", "photo", "video", "vid", "final", "original",
+                   "edit", "copy"):
+            continue
+        if tok.isdigit():                       # bare counter like 1946
+            continue
+        if re.fullmatch(r"[0-9a-f]{8,}", low):  # hex hash / uuid chunk
+            continue
+        if re.fullmatch(r"[A-Za-z0-9]{16,}", tok) and any(ch.isdigit() for ch in tok):
+            continue                            # long mixed alnum id
+        words.append(tok)
+    return " ".join(words).strip()
+
+
+def photo_grounding(creative):
+    """Real, client-provided signals about WHAT THIS PHOTO/VIDEO SHOWS, so the caption
+    can reference the actual shot instead of talking past it (Dale: 'the copy isn't
+    quite matching the actual photo or video'). Two signals, both already present, both
+    non-fabricated:
+
+      * the picked creative's OWN sidecar note (<file>.json "note" / <file>.txt), the
+        client's own words about the shot ('Youth fitness fun with smiles');
+      * a humanized filename hint ('Dale_Peace_Run' -> 'Dale Peace Run').
+
+    Returns '' when neither signal is descriptive (a hash-named upload with no note), so
+    a photo with no real signal changes nothing. This is a HINT for grounding only: the
+    figure-fabrication gate, banned-word gate, and no-dash law still run on the output,
+    and the caption's CLAIMS still come only from the approved source."""
+    if creative is None:
+        return ""
+    note = (getattr(creative, "client_note", "") or "").strip()
+    stem = getattr(creative, "stem", None)
+    if stem is None:
+        stem = os.path.basename(getattr(creative, "path", "") or "")
+    hint = _humanize_stem(stem)
+    parts = []
+    if note:
+        parts.append(note)
+    # only add the filename hint when it adds something the note doesn't already say
+    if hint and hint.lower() not in " ".join(parts).lower():
+        parts.append(hint)
+    return "; ".join(p for p in parts if p).strip()
+
+
 class _SourceCreative:
     """Adapter so the SB7 caption generator (which keys off a creative's client_note +
     stem) can run on a source-driven client draft: the day's approved fact IS the note
-    SB7 writes a real StoryBrand caption around, grounded in the gym's voice doc."""
+    SB7 writes a real StoryBrand caption around, grounded in the gym's voice doc.
 
-    def __init__(self, source, stem):
-        self.client_note = getattr(source, "text", "") or ""
+    photo_hint (optional): real client-provided signals about what the PICKED photo/video
+    actually shows (its sidecar note + humanized filename). When present it is appended
+    to the note SB7 sees, tagged as a scene hint, so the copy references the shot instead
+    of talking about an unrelated topic. It NEVER carries claims (the figure gate still
+    runs on the output); it only steers the caption toward the visible subject."""
+
+    def __init__(self, source, stem, photo_hint=""):
+        note = getattr(source, "text", "") or ""
+        photo_hint = (photo_hint or "").strip()
+        if photo_hint:
+            note = (note.rstrip()
+                    + "\n\nWHAT THIS POST'S PHOTO/VIDEO SHOWS (reference this so the "
+                      "caption matches the image; it is a scene hint, NOT a source of "
+                      "facts, numbers, offers, or names to state): " + photo_hint)
+        self.client_note = note
         self.stem = stem
         self.path = stem
 
 
-def make_caption(account, source, voice, creative_key):
+def make_caption(account, source, voice, creative_key, creative=None):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -113,12 +187,21 @@ def make_caption(account, source, voice, creative_key):
     (the deterministic source+CTA baseline), so a caption is always produced.
 
     This is the fix for a client post whose caption was just the raw intake word (e.g.
-    'HYROX'): the same SB7 engine LASSO uses now writes every client caption too."""
+    'HYROX'): the same SB7 engine LASSO uses now writes every client caption too.
+
+    ALIGNMENT (Dale, 2026-08-15): `creative` is the actual picked photo/video. Its own
+    sidecar note + filename hint are passed to SB7 as a SCENE HINT so the copy references
+    what is actually in the shot (a youth photo gets a youth-shaped caption), instead of
+    the caption talking about a rotated source topic unrelated to the image. Grounding
+    only, never fabrication: the figure gate, banned-word gate, and no-dash law all still
+    run on the output, and the caption's CLAIMS still come only from the approved source."""
     if config.sb7_enabled():
         try:
             from .drafter import StoryBrandGenerator
+            hint = photo_grounding(creative)
             cap, tags, _frags = StoryBrandGenerator().build(
-                voice, _SourceCreative(source, creative_key), account=account)
+                voice, _SourceCreative(source, creative_key, photo_hint=hint),
+                account=account)
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
                 return filter_platform_copy(cap).strip(), tags
@@ -220,8 +303,10 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     image = pick_image(account.key, day_key, library_path,
                        exclude_keys=exclude_keys)
     if image is not None:
+        # Pass the ACTUAL picked creative so the caption is grounded in what the photo/
+        # video shows (its sidecar note + filename), not just the rotated source topic.
         caption, hashtags = make_caption(account, source, voice,
-                                         _image_key(image))
+                                         _image_key(image), creative=image)
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)

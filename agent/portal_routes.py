@@ -122,7 +122,7 @@ def handle_portal_library(account_key):
 
 
 def handle_portal_action(action, account_key, draft_id, actor_id, note="",
-                         store=None, confirm=False):
+                         store=None, confirm=False, reason=""):
     """
     POST /portal/<token>/{approve|edit|deny|kill}
 
@@ -155,7 +155,8 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
     # Shared Supabase data plane wins when creds are present (the live portal
     # path). No creds -> the existing portal_approvals/SQLite path, unchanged.
     if store is None and config.portal_calendar_supabase_enabled():
-        return _handle_action_supabase(action, account_key, draft_id, note)
+        return _handle_action_supabase(action, account_key, draft_id, note,
+                                       reason=reason)
 
     fn = getattr(_pa, action)
     if action in ("edit", "deny", "kill"):
@@ -209,7 +210,7 @@ def handle_portal_report(account_key, days):
 
 # ---- helpers -------------------------------------------------------------------
 
-def _handle_action_supabase(action, account_key, draft_id, note):
+def _handle_action_supabase(action, account_key, draft_id, note, reason=""):
     """
     Supabase content_calendar action path. approve/deny/kill flip status; edit
     keeps status pending and echoes the note (no schema change, never fails on a
@@ -217,6 +218,9 @@ def _handle_action_supabase(action, account_key, draft_id, note):
     scoped to gym_id, plus the gym_id filter on the PATCH itself. A row whose
     gym_id != account_key (or a missing row) is a 404 that never reveals it
     exists and never issues a write. NOTHING here publishes.
+
+    reason (optional): the approver's explicit 'reason why', distinct from the new
+    caption; recorded into the gym's brain as the edit's style rule (Dale, 2026-08-15).
     """
     try:
         sb = _pcs.SupabaseCalendarStore()
@@ -256,15 +260,18 @@ def _handle_action_supabase(action, account_key, draft_id, note):
             updated = sb.patch_caption(account_key, draft_id, note)
             if updated is None:
                 return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-            # LEARN from the edit so future captions match the approver's taste.
+            # LEARN from the edit so future captions match the approver's taste. The
+            # approver's explicit reason (when sent) is captured as the edit's rule so
+            # the stated intent is not dropped (Dale, 2026-08-15).
             try:
                 from .portal_social import _learn_from_edit
-                _learn_from_edit(account_key, before, note)
+                _learn_from_edit(account_key, before, note, reason=reason)
             except Exception:
                 pass
             return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                          "caption": updated.get("caption", ""),
-                         "status": updated.get("status", "pending")}
+                         "status": updated.get("status", "pending"),
+                         "reason_captured": bool((reason or "").strip())}
 
         new_status = _pcs.action_status(action)
         if new_status is None:

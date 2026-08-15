@@ -1571,9 +1571,14 @@ def build_server(port=None):
                 draft_id = body.get("draft_id", "")
                 actor_id = body.get("actor_id", "")
                 note = body.get("note", "")
+                # The approver's explicit "reason why" note, distinct from the new
+                # caption (Dale, 2026-08-15). Accept a couple of likely field names so
+                # a portal sending "reason" or "why" is captured either way.
+                reason = (body.get("reason", "") or body.get("why", "")
+                          or body.get("reason_why", ""))
                 status, resp = _pr.handle_portal_action(
                     pt_action, account_key, draft_id, actor_id, note=note,
-                    confirm=bool(body.get("confirm", False)),
+                    confirm=bool(body.get("confirm", False)), reason=reason,
                 )
                 return self._send_json(resp, status)
 
@@ -1648,6 +1653,9 @@ def build_server(port=None):
                     return self._send_json({"error": "invalid JSON"}, 400)
                 actor_id = body.get("actor_id", "")
                 note = body.get("note", "")
+                # The approver's explicit "reason why", distinct from the new caption.
+                reason = (body.get("reason", "") or body.get("why", "")
+                          or body.get("reason_why", ""))
                 confirm = bool(body.get("confirm", False))
                 from .store import PendingStore
                 store = PendingStore()
@@ -1656,7 +1664,7 @@ def build_server(port=None):
                                                       store=store)
                 elif ps_action == "edit":
                     status, resp = _ps.handle_edit(account_key, ps_post_id, actor_id,
-                                                   note=note, store=store)
+                                                   note=note, store=store, reason=reason)
                 elif ps_action == "deny":
                     status, resp = _ps.handle_deny(account_key, ps_post_id, actor_id,
                                                    note=note, store=store)

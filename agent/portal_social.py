@@ -608,15 +608,26 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
                      "draft_id": draft_id}
 
 
-def _learn_from_edit(account_key, before, after):
+def _learn_from_edit(account_key, before, after, reason=""):
     """Record a client's caption edit into THIS gym's brain (tenant_brain edit_diff) so
     the drafter's NEXT caption for the gym moves toward the approver's taste. Keyed by
     the gym's GENERATION account ({base}_ig) — the same key drafter._brain_guidance
     reads — so a portal edit actually teaches the SB7 prompt. Best effort, never raises,
-    no-op while AGENT_TENANT_BRAIN_ENABLED is off."""
+    no-op while AGENT_TENANT_BRAIN_ENABLED is off.
+
+    reason (optional, Dale 2026-08-15): the approver's EXPLICIT "reason why" note — WHY
+    they changed the caption — sent as a field distinct from the new caption. When
+    present it is recorded as the edit's `rule` (the schema's style-rule slot), so the
+    approver's stated intent teaches the prompt directly instead of being only INFERRED
+    from the before/after diff. Fabrication-safe: the rule text still passes the gate in
+    prompt_notes before it can reach a prompt, so a reason carrying an uncleared figure
+    is skipped from prompts (it is still recorded for the human audit trail)."""
     before = (before or "").strip()
     after = (after or "").strip()
-    if not after or after == before:
+    reason = (reason or "").strip()
+    # Record when the caption actually changed, OR when there is an explicit reason to
+    # capture (a reason with no text change still teaches the gym's style preference).
+    if (not after or after == before) and not reason:
         return
     try:
         from . import tenant_brain
@@ -625,14 +636,17 @@ def _learn_from_edit(account_key, before, after):
             if base.endswith(suf):
                 base = base[: -len(suf)]
                 break
-        tenant_brain.record_event(f"{base}_ig", "edit_diff",
-                                  before=before, after=after)
+        fields = {"before": before, "after": after}
+        if reason:
+            fields["rule"] = reason
+        tenant_brain.record_event(f"{base}_ig", "edit_diff", **fields)
     except Exception as exc:  # noqa: BLE001 - learning must never break an edit
         print(f"[portal-social] brain edit_diff record failed for "
               f"{account_key}: {type(exc).__name__}")
 
 
-def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store):
+def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store,
+                          reason=""):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
         return short
@@ -657,12 +671,15 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         updated = sb_store.patch_caption(account_key, draft_id, note)
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-        # LEARN: feed the (before -> after) edit into the gym's brain so future
-        # captions move toward the approver's taste (Dale's youth-content guidance).
-        _learn_from_edit(account_key, before, note)
+        # LEARN: feed the (before -> after) edit AND the approver's explicit reason
+        # into the gym's brain so future captions move toward the approver's taste
+        # (Dale's youth-content guidance). The reason, when sent, is captured as the
+        # edit's rule so the stated intent is not dropped.
+        _learn_from_edit(account_key, before, note, reason=reason)
         return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                      "caption": updated.get("caption", ""),
-                     "status": updated.get("status", "pending")}
+                     "status": updated.get("status", "pending"),
+                     "reason_captured": bool((reason or "").strip())}
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
@@ -752,16 +769,23 @@ def handle_approve(account_key, draft_id, actor_id, store=None, reader=None, sb_
 # POST /portal/<token>/posts/<id>/edit  (note; re-runs the fabrication gate -> 422)
 # ==========================================================================
 
-def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=None, sb_store=None):
+def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                sb_store=None, reason=""):
     """Request a revision with a note. The note is re-run through the fabrication gate
     (rotation.is_gate_clean): a note that introduces a stat, percentage, or price with
     no approved receipt is REFUSED with 422 so an unsupported claim can never enter the
     caption. With Supabase creds present, a clean note keeps the shared row 'pending'
     and echoes the note (no schema change, no publish). Otherwise delegates to
-    portal_approvals.edit."""
+    portal_approvals.edit.
+
+    reason (optional): the approver's explicit 'reason why' note, distinct from the new
+    caption. It is recorded into the gym's brain as the edit's style rule so the stated
+    intent teaches the next caption (Dale, 2026-08-15). Persisted only through the
+    Supabase learning path; the legacy path keeps its existing contract."""
     if config.portal_calendar_supabase_enabled():
         return _handle_edit_supabase(account_key, draft_id, actor_id, note, reader,
-                                     sb_store or _pcs.SupabaseCalendarStore())
+                                     sb_store or _pcs.SupabaseCalendarStore(),
+                                     reason=reason)
     draft, short = _action_preamble(account_key, draft_id, actor_id, store, reader)
     if short is not None:
         return short

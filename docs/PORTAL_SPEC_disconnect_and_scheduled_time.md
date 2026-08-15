@@ -176,3 +176,42 @@ Portal fixes:
 - Note: Echo now also **learns** from every edit (records the before→after into the gym's
   brain so future captions match the approver's taste). No portal change needed for that;
   just keep sending the new caption as the edit `note`.
+
+### 4b. The "reason why" field (Dale, CrossFit ENG, 2026-08-15)
+
+**Problem:** "Took a fair amount of editing, approving, and refreshing to save the revised
+copy... after refreshing the reason why feedback field disappeared, not sure Echo captured
+my reasoning (may have had to double-enter)."
+
+Two sides:
+
+- **Portal side (Vercel) — the field disappearing on refresh:** the "reason why" textarea is
+  losing its value on the re-render/refresh. This is the same class of issue as §4: the
+  portal must (a) keep the reason field's value in component state so a re-render does not
+  clear it, and (b) send it on submit and clear it only AFTER a `200`. The "double-enter"
+  and the disappearing field are portal state/refresh bugs, not an Echo persistence bug.
+
+- **Echo side — now CAPTURES the reason (fix 2026-08-15):** the edit endpoints
+  (`POST /portal/<token>/posts/<id>/edit` and `POST /portal/<token>/edit`) now accept an
+  OPTIONAL **`reason`** field in the JSON body (aliases `why` / `reason_why` also accepted),
+  distinct from the new caption `note`. When present, Echo records it into the gym's brain as
+  the edit's **style rule** (`tenant_brain` `edit_diff.rule`), so the approver's stated
+  intent teaches the next caption directly — not only inferred from the before/after diff.
+  The edit response now echoes **`reason_captured: true|false`** so the portal can confirm
+  Echo received it (show a small "reasoning saved" tick). If the portal sends only `note`
+  (no reason), behavior is unchanged; the reason is purely additive.
+  - **Portal action:** send the reason-why textarea value as `reason` in the edit POST body,
+    and use `reason_captured` in the response to confirm capture to the user (removing the
+    "not sure Echo captured my reasoning" doubt). Fabrication rule still applies to the
+    caption `note` (422 on an uncleared figure); the `reason` is style guidance and is
+    fabrication-gated only when it is later folded into a prompt.
+
+### 4c. Learning durability (Echo side, fix 2026-08-15)
+
+The tenant brain (edit diffs, reasons, deny reasons, kills) previously wrote to a
+repo-relative `brains/` dir which, on the deployed worker, resolved to `/app/brains` —
+inside the container image and **wiped on every redeploy**. So a gym's accumulated edit
+learning silently reset each deploy. Echo now roots the brain under the persistent `/data`
+volume (`AGENT_TENANT_BRAIN_DIR`, default `<DATA_DIR>/brains`), so edits and reasons survive
+deploys and the loop actually compounds. No portal change; noted so ops sets the volume path
+if a custom mount is used.

@@ -382,11 +382,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # a story. No extra media is consumed, so N photos -> N feeds + N stories.
         story = _story_from_feed(feed)
         _mark_story(story)
-        # STORY FORMATTING (AGENT_STORY_FORMAT, OFF by default): a PHOTO story's
-        # creative becomes a filled 1080x1920 card with the caption burned in, so it
-        # is story-size (no black bars) and readable. Video stories are left as-is.
-        _maybe_format_story(account, story, feed, library_path, log)
-        drafts.append(story)
+        # STORY FORMATTING (AGENT_STORY_FORMAT): a PHOTO story's creative becomes a
+        # filled 1080x1920 card with the caption burned in; a VIDEO story's creative
+        # becomes a 9:16 story video with the caption burned in. A story publishes with
+        # an EMPTY body, so the caption MUST be on the media. If neither can be produced
+        # (flag off, or the render fails) the story would go out CAPTIONLESS (Dale, 2026
+        # -08-15) -> we DROP it instead of shipping a story with no caption. The feed
+        # still posts; only the un-captionable story is held.
+        if _maybe_format_story(account, story, feed, library_path, log):
+            drafts.append(story)
+        else:
+            log(f"drop {day_key} story: cannot carry its caption (a story publishes "
+                "empty-body; refusing to ship a captionless story)")
 
     rows = _to_rows(base_key, drafts)
     result = _apply(base_key, rows, start, days, store, log,
@@ -450,31 +457,64 @@ def _attach_video_poster(account, draft, library_path, log):
 
 
 def _maybe_format_story(account, story, feed, library_path, log):
-    """Swap a PHOTO story's creative for a formatted 1080x1920 story card (photo on a
-    blurred cover fill + the day's caption burned in), HOSTED. No-op unless
-    AGENT_STORY_FORMAT is armed and the creative is an image (video stories are left
-    alone). Best effort: any failure keeps the raw photo. Mutates story in place."""
+    """Give a story its CAPTION on the media (a story publishes empty-body, so the words
+    must be burned in), and report whether the story may ship:
+
+      * PHOTO story  -> a filled 1080x1920 card (photo on a blurred cover fill + caption).
+      * VIDEO story  -> a 9:16 story video with the caption burned in.
+
+    Returns True when the story carries its caption (keep it) and False when it CANNOT
+    (drop it, never ship a captionless story). Mutates story.creative_public_url in place
+    on success.
+
+    CAPTIONLESS GUARD (Dale, 2026-08-15): when AGENT_STORY_FORMAT is ON (the production
+    posture), a story that cannot get its caption onto the media is DROPPED (return False)
+    rather than published captionless. A raw video story was the exact bug: video stories
+    were 'left alone', so they went out with no caption at all.
+
+    BASELINE UNCHANGED: with AGENT_STORY_FORMAT OFF (the documented deterministic
+    baseline / tests), stories keep their raw media exactly as before and are always kept
+    (return True) — this guard does not change flag-off behavior."""
+    if not config.story_format_enabled():
+        return True                              # baseline: unchanged, always keep
     path = (getattr(feed, "creative_path", "") or "").strip()
-    if not path or path.lower().endswith(_VIDEO_EXTS):
-        return
+    is_video = bool(path) and path.lower().endswith(_VIDEO_EXTS)
+    caption = getattr(feed, "caption", "") or ""
     try:
         from . import story_image, media_host
         gym_name = _display_name_for(account)
-        card = story_image.get_or_make_story_image(
-            path, getattr(feed, "caption", "") or "", gym_name, library_path, logger=log)
-        if not card:
-            return
-        if config.hosting_enabled():
-            hosted = media_host.host_media(card, account.key)
-            if hosted:
-                story.creative_public_url = hosted
-                # the formatted card IS the story's image; it needs no separate poster
-                if getattr(story, "thumbnail_url", ""):
-                    story.thumbnail_url = ""
-                log(f"story formatted for {os.path.basename(path)}")
-    except Exception as exc:  # noqa: BLE001 - never block the day
+        if is_video:
+            asset = story_image.get_or_make_story_video(
+                path, caption, gym_name, library_path, logger=log)
+        else:
+            asset = story_image.get_or_make_story_image(
+                path, caption, gym_name, library_path, logger=log)
+        if not asset:
+            # Could not put the caption on the media -> the story would be captionless.
+            return False
+        # The captioned asset must be HOSTED to publish. If hosting is off/failed we
+        # cannot ship the captioned story, so we drop it rather than fall back to the
+        # raw (captionless) media.
+        if not config.hosting_enabled():
+            log(f"story caption built but hosting is off for {os.path.basename(path)}; "
+                "dropping the story (a story must not go out captionless)")
+            return False
+        hosted = media_host.host_media(asset, account.key)
+        if not hosted:
+            log(f"story caption built but hosting failed for {os.path.basename(path)}; "
+                "dropping the story (a story must not go out captionless)")
+            return False
+        story.creative_public_url = hosted
+        # the captioned asset IS the story's media; it needs no separate poster
+        if getattr(story, "thumbnail_url", ""):
+            story.thumbnail_url = ""
+        log(f"story {'video ' if is_video else ''}captioned for "
+            f"{os.path.basename(path)}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - never crash the build
         log(f"story format lane failed for {os.path.basename(path)}: "
-            f"{type(exc).__name__}")
+            f"{type(exc).__name__}; dropping the story to avoid a captionless post")
+        return False
 
 
 def _display_name_for(account):

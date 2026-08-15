@@ -39,7 +39,18 @@ _ENTRY_RE = re.compile(r"^## (\S+) (\w+) (\{.*\})$")
 
 
 def brains_dir(base_dir=None):
-    return base_dir or "brains"
+    """Where tenant brain files live. An explicit base_dir always wins (tests pass a
+    tmp dir). Otherwise the DURABLE per-gym brain root (config.tenant_brain_dir() ->
+    <DATA_DIR>/brains on the deployed worker, so edits survive a redeploy; '.'/brains
+    in local dev / tests where /data does not exist). Historically this returned the
+    repo-relative 'brains', which on the worker was the ephemeral /app/brains and was
+    wiped every deploy — the learning loop recorded to a dir that never persisted."""
+    if base_dir:
+        return base_dir
+    try:
+        return config.tenant_brain_dir()
+    except Exception:  # noqa: BLE001 - config must never break a brain read/write
+        return "brains"
 
 
 def brain_path(tenant_key, base_dir=None):

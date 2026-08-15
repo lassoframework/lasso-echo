@@ -148,6 +148,85 @@ def build_story_image(photo_path, out_path, caption="", gym_name=""):
     return out_path
 
 
+def _story_video_drawtext(caption, gym_name):
+    """The ffmpeg -vf filter that burns the day's caption into a bottom card on a 9:16
+    story VIDEO, so a video story is never captionless (stories publish empty-body, so
+    the text must live on the media). Reuses story_caption (scrubbed, no dashes, short)
+    and wraps it to a fixed column. Text stays up for the WHOLE clip (a story is short).
+    Returns '' when there is no usable caption text (caller then treats the video story
+    as un-captionable)."""
+    text = story_caption(caption)
+    if not text:
+        return ""
+    lines = textwrap.wrap(text, width=34) or [text]
+    name = scrub_onscreen((gym_name or "").strip()).upper()
+
+    def esc(s):
+        # ffmpeg drawtext escaping: backslash, quote, colon, percent.
+        return (s.replace("\\", "").replace("'", "’")
+                 .replace(":", "\\:").replace("%", "\\%"))
+
+    # A translucent bottom band behind the text for legibility, then each line.
+    filters = ["drawbox=x=0:y=h*0.62:w=w:h=h*0.38:color=black@0.55:t=fill"]
+    y = "h*0.66"
+    if name:
+        filters.append(
+            f"drawtext=text='{esc(name)}':fontsize=46:fontcolor=0x78DC82:"
+            f"x=(w-text_w)/2:y={y}")
+        y = "h*0.72"
+    for i, ln in enumerate(lines[:5]):
+        yy = f"({y})+{i}*70"
+        filters.append(
+            f"drawtext=text='{esc(ln)}':fontsize=52:fontcolor=white:"
+            f"box=0:x=(w-text_w)/2:y={yy}")
+    return ",".join(filters)
+
+
+def get_or_make_story_video(video_path, caption, gym_name, library_path, *,
+                            runner=None, logger=None):
+    """A 9:16 story VIDEO with the day's caption BURNED IN (cover-cropped to 1080x1920),
+    cached in <library>/reels/, or None when the flag is off / there is no caption text /
+    the render fails. This is the video counterpart of get_or_make_story_image: because
+    IG/FB stories publish with an EMPTY body, a raw video story carries NO caption at all
+    (Dale's captionless story, 2026-08-15). Burning the caption onto the story video is
+    the only way a video story shows its words. NEVER raises: any failure returns None so
+    the caller can decide (it drops the story rather than ship it captionless)."""
+    log = logger or (lambda m: print(f"[story-video] {m}"))
+    if not config.story_format_enabled():
+        return None
+    try:
+        import hashlib
+        from . import action_reel
+        run = runner or action_reel._run
+        vf = _story_video_drawtext(caption, gym_name)
+        if not vf:
+            log(f"no caption text for {os.path.basename(str(video_path))}; "
+                "cannot caption the video story")
+            return None
+        cache_dir = os.path.join(str(library_path), "reels")
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(video_path, "rb") as fh:
+            vid_key = hashlib.sha256(fh.read()).hexdigest()[:12]
+        cap_key = hashlib.sha256((caption or "").encode("utf-8")).hexdigest()[:6]
+        out = os.path.join(cache_dir, f"{vid_key}_{cap_key}__storyvid.mp4")
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+        vf_full = ("scale=1080:1920:force_original_aspect_ratio=increase,"
+                   "crop=1080:1920,fps=30,format=yuv420p," + vf)
+        cmd = ["ffmpeg", "-hide_banner", "-y", "-i", str(video_path),
+               "-vf", vf_full, "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", "23", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", str(out)]
+        run(cmd, "story-video")
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+        return None
+    except Exception as exc:  # noqa: BLE001 - a story format may never crash the build
+        log(f"story video failed for {os.path.basename(str(video_path))}: "
+            f"{type(exc).__name__}")
+        return None
+
+
 def get_or_make_story_image(photo_path, caption, gym_name, library_path, *,
                             logger=None):
     """Hosted-ready 9:16 story card for a photo (cached in <library>/reels/), or None
