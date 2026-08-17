@@ -100,13 +100,20 @@ Proven end-to-end on 100% real LASSO material (no fabrication):
 - **5/5 real library images** cropped to exactly 1200×900; `content_library/` holds **14 real
   lasso images** ≥ the 12 needed (8 STANDARD + 4 photo). LASSO has no `onboarding_intake` offer
   row, so the OFFER slot is skipped by design; no real events → 0 EVENT.
-- **[!] The pending-row WRITE requires R2 image hosting** (turns each crop into a public URL Zernio
-  can fetch). R2 is a hand-set secret on the deployed worker and is NOT configured in a local
-  session — I did not touch it (secrets are yours; never touch client R2 setup). So the real rows
-  are written by running the entrypoint **on the deployed worker** where R2 + the ingested
-  approved-sources DB live. No fabrication was used to paper over this. **Your action:** deploy,
-  then run `python3 -m agent.gbp_dogfood lasso Carmel` on the worker once (or arm the lane); then
-  click Connect on LASSO's GBP listing and approve the pending posts.
+- **[x] Pending rows LANDED (2026-08-17).** Ran `agent.gbp_dogfood lasso Carmel` on the deployed
+  worker (where R2 + material live): **12 pending googlebusiness rows for gym_id='lasso'** — 8
+  STANDARD (real captions from lasso_now.md, each names Carmel, LEARN_MORE → lassoframework.com,
+  real R2-hosted 1200×900 crops) + 4 photo drops (image only). 0 skipped. Verified in
+  content_calendar.
+- **Bespoke-material fix (Blake ruling 2026-08-17):** the live dogfood exposed that LASSO's content
+  is NOT in the client_sources pipeline (0 approved sources for lasso_ig; cards flat in
+  content_library/lasso_*). The planner correctly BLOCKED rather than fabricate. Fix: injectable
+  `facts` source in plan_gbp_month (LASSO's facts parsed from lasso_now.md copy bank) + a flat-card
+  image picker. 100% real approved material; every A+/figure/no-dash gate still runs. No FB/IG lane
+  change.
+- **Rows plan with no gbp_location_id (LASSO not connected yet); this is correct** — the worker's
+  `resolve_connection` binds LASSO's single connection at publish time. **Your only actions:** click
+  Connect on LASSO's GBP listing, then approve the pending posts.
 
 ### [!] Legacy `agent/gbp_publisher.py` — untouched and dead (verified)
 The new rail uses `account='googlebusiness'` rows + the GBP worker lane. `approvals.py` still routes
