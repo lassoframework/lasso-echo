@@ -108,6 +108,12 @@ def _real_row(account_key, draft):
     thumb = getattr(draft, "thumbnail_url", "") or ""
     if thumb:
         row["thumbnail_url"] = thumb
+    # Task #28 (§5c): a story's RAW source url for immediate caption re-burn. Set ONLY when
+    # the flag armed it (the column exists), so pre-migration inserts never carry an unknown
+    # column. Omitted otherwise (column stays null / absent from the payload).
+    src_media = getattr(draft, "source_media_url", "") or ""
+    if src_media:
+        row["source_media_url"] = src_media
     return row
 
 

@@ -297,6 +297,7 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
                                  "error": f"invalid gbp cta type: {ct}"}
             before = row.get("caption") or ""
             updated = None
+            reburned = None
             if note:
                 # FABRICATION GATE (same gate as the Part-B route): a note that introduces
                 # a stat/percentage/price with no approved receipt NEVER enters the caption.
@@ -319,6 +320,13 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
                     _learn_from_edit(account_key, before, note, reason=reason)
                 except Exception:
                     pass
+                # Task #28 (§5c): a STORY caption edit re-burns onto fresh media at once
+                # (gated + best-effort; the caption is already saved).
+                try:
+                    from .portal_social import maybe_reburn_story
+                    reburned = maybe_reburn_story(account_key, row, note, sb)
+                except Exception:
+                    reburned = None
             if gbp_fields:
                 updated = sb.patch_gbp_fields(account_key, draft_id, gbp_fields)
                 if updated is None:
@@ -327,7 +335,12 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
             return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                          "caption": (updated.get("caption", "") if updated else ""),
                          "status": (updated.get("status", "pending") if updated else "pending"),
+                         "day_key": (updated.get("post_date", "") if updated else ""),
+                         # Task #28: echo the reason so the portal repopulates the "Why"
+                         # field and shows it separately (never appended to the caption).
+                         "reason": (reason or ""),
                          "reason_captured": bool((reason or "").strip()),
+                         "story_reburned": bool(reburned),
                          "gbp_updated": sorted(gbp_fields.keys())}
 
         if action == "requeue":
@@ -372,7 +385,12 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
         if updated is None:
             # Zero rows matched the id+gym_id filter -> treat as not found.
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-        return 200, {"ok": True, "action": action, "draft_id": draft_id}
+        # Task #28 (false-approval fix): return the AUTHORITATIVE status + day_key of the
+        # row actually written, so the portal updates ONLY that card from server truth and
+        # never carries the badge onto the next post.
+        return 200, {"ok": True, "action": action, "draft_id": draft_id,
+                     "status": updated.get("status", ""),
+                     "day_key": updated.get("post_date", "")}
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}

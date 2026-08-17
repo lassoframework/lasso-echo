@@ -585,6 +585,13 @@ def _maybe_format_story(account, story, feed, library_path, log):
     # equals the feed caption (the paired story is cloned from the feed). This is what
     # lets a saved story caption actually get BURNED onto the media on re-render.
     caption = (getattr(story, "caption", "") or getattr(feed, "caption", "") or "")
+    # Task #28 (§5c): keep the RAW (un-captioned) source url so an edited story caption can
+    # re-burn IMMEDIATELY instead of only on the next monthly rebuild. Gated: written to
+    # content_calendar.source_media_url only when AGENT_STORY_SOURCE_MEDIA is on (the column
+    # exists). feed.creative_public_url is the raw feed media before the story burn swaps
+    # story.creative_public_url to the captioned asset.
+    if config.story_source_media_enabled():
+        story.source_media_url = (getattr(feed, "creative_public_url", "") or "")
     try:
         from . import story_image, media_host
         gym_name = _display_name_for(account)

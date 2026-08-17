@@ -613,10 +613,56 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
                                       _pcs.action_status("approve"))
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-        return 200, {"ok": True, "action": "approve", "draft_id": draft_id}
+        return 200, _action_result("approve", draft_id, updated)
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
+
+
+def _gym_display_name(account_key):
+    """Best-effort gym display name for the story caption card, from the registry account;
+    falls back to the title-cased base key. Never raises."""
+    try:
+        from .accounts import get_account
+        acct = get_account(f"{account_key}_ig") or get_account(account_key)
+        name = getattr(acct, "display_name", "") if acct else ""
+        return name or account_key.replace("_", " ").title()
+    except Exception:  # noqa: BLE001
+        return account_key.replace("_", " ").title()
+
+
+def maybe_reburn_story(account_key, row, new_caption, sb_store, *, logger=None):
+    """Task #28 (§5c): after a STORY caption edit, re-burn the new caption onto fresh media
+    from the row's raw source_media_url and swap image_url — so a saved story caption shows
+    immediately, not only on the monthly rebuild. Fully gated + best-effort: a no-op unless
+    story_reburn.should_reburn(row), and any failure leaves the saved caption edit intact
+    (the rebuild is the backstop). Returns the new image_url or None."""
+    log = logger or (lambda m: print(f"[portal-social] {m}"))
+    try:
+        from . import story_reburn
+        if not story_reburn.should_reburn(row):
+            return None
+        new_url = story_reburn.reburn(
+            row.get("source_media_url"), new_caption, _gym_display_name(account_key),
+            account_key, logger=log)
+        if not new_url:
+            return None
+        sb_store.patch_image_url(account_key, row.get("id"), new_url)
+        return new_url
+    except Exception as exc:  # noqa: BLE001 - a re-burn must NEVER fail the saved edit
+        log(f"story re-burn skipped ({type(exc).__name__})")
+        return None
+
+
+def _action_result(action, draft_id, updated_row):
+    """Task #28 (false-approval fix): return the AUTHORITATIVE per-row status + day_key from
+    the just-written row so the portal binds THAT card's badge to server truth — instead of
+    optimistically carrying the new status onto the next card. The UI updates only the row
+    whose id it submitted; every other card keeps its own /social status."""
+    row = updated_row or {}
+    return {"ok": True, "action": action, "draft_id": draft_id,
+            "status": row.get("status") or "",
+            "day_key": row.get("post_date") or ""}
 
 
 def _learn_from_edit(account_key, before, after, reason=""):
@@ -702,9 +748,19 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
     except Exception as exc:  # noqa: BLE001 - learning may never fail a saved edit
         print(f"[portal-social] learn-from-edit failed post-save for "
               f"{account_key}: {type(exc).__name__}")
+    # Task #28 (§5c): a STORY caption edit re-burns onto fresh media immediately (gated,
+    # best-effort — the caption is already saved). `row` is the pre-edit row (carries
+    # format + source_media_url); `note` is the new caption.
+    reburned = maybe_reburn_story(account_key, row, note, sb_store)
     return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
                  "caption": updated.get("caption", ""),
+                 "story_reburned": bool(reburned),
                  "status": updated.get("status", "pending"),
+                 "day_key": updated.get("post_date", ""),
+                 # Task #28: echo the reason text back (not just a captured bool) so the
+                 # portal repopulates the "Why" field after save and shows it as a separate
+                 # "Why: …" line — never appended to the caption.
+                 "reason": (reason or ""),
                  "reason_captured": bool((reason or "").strip())}
 
 
@@ -737,7 +793,7 @@ def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
                      "draft_id": draft_id}
     # Charge the budget only after a successful deny (never on a 404 or store error).
     spend_recreate(account_key)
-    return 200, {"ok": True, "action": "deny", "draft_id": draft_id,
+    return 200, {**_action_result("deny", draft_id, updated),
                  "recreate_budget": _budget_state(account_key)}
 
 
@@ -759,7 +815,7 @@ def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_s
                                       _pcs.action_status("kill"))
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-        return 200, {"ok": True, "action": "kill", "draft_id": draft_id}
+        return 200, _action_result("kill", draft_id, updated)
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}

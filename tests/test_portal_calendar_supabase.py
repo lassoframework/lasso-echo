@@ -157,7 +157,9 @@ def test_action_patches_status_with_isolation_filter(monkeypatch, action, expect
     status, body = portal_routes.handle_portal_action(action, "lasso", "id-9",
                                                       "actor-1", confirm=True)
     assert status == 200
-    assert body == {"ok": True, "action": action, "draft_id": "id-9"}
+    assert body["ok"] is True and body["action"] == action and body["draft_id"] == "id-9"
+    # Task #28: the response carries the AUTHORITATIVE written status + day_key
+    assert body["status"] == expected_status and body["day_key"] == "2026-08-06"
 
     # One GET (pre-check) then one PATCH; both scoped by gym_id.
     get_call = [c for c in http.calls if c[0] == "get"][0]

@@ -199,6 +199,23 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_image_url(self, account_key, row_id, new_image_url):
+        """Task #28 (§5c): swap a story row's image_url to freshly re-burned media after a
+        caption edit. STATUS-preserving (the edit already reset it to 'pending'); this only
+        updates the media. id+gym_id isolation. Returns the updated row or None."""
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"image_url": new_image_url}, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def patch_gbp_fields(self, account_key, row_id, fields):
         """G1: persist edited GBP structured columns (already normalized to gbp_* names)
         and revert status to 'pending' — an edit to CTA/event/offer/location resets the

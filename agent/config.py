@@ -870,6 +870,18 @@ def gbp_coach_screen_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
 
 
+def story_source_media_enabled() -> bool:
+    """Task #28 (Dale §5c): store each story's RAW source media url at plan time
+    (content_calendar.source_media_url) so an edited story caption RE-BURNS immediately
+    instead of only on the monthly rebuild. Default OFF because the column does not exist
+    until the DRAFT migration is applied — writing it before then would 400 the insert.
+    SEQUENCE: apply migrations/DRAFT_content_calendar_source_media_url.sql, THEN set
+    AGENT_STORY_SOURCE_MEDIA=true on the echo + echo-intake-web services. Rides under
+    AGENT_STORY_FORMAT (the burn itself); OFF => no source stored, edits re-burn on the
+    next rebuild exactly as today."""
+    return _truthy(os.environ.get("AGENT_STORY_SOURCE_MEDIA", "false"))
+
+
 def gbp_publish_window_enabled() -> bool:
     """§7.3 / G5: gate GBP publishing to weekday mornings 8-10am in the CONNECTION row's
     timezone. Default ON. Set AGENT_GBP_PUBLISH_WINDOW=false to publish a due GBP post

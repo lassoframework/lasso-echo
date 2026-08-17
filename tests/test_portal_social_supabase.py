@@ -242,7 +242,9 @@ def test_approve_sets_status_approved(monkeypatch):
     store = _FakeStore([_row("id-1", status="pending")])
     status, body = ps.handle_approve("lasso", "id-1", "U_owner", sb_store=store)
     assert status == 200
-    assert body == {"ok": True, "action": "approve", "draft_id": "id-1"}
+    assert body["ok"] is True and body["action"] == "approve" and body["draft_id"] == "id-1"
+    # Task #28: authoritative status + day_key of the row actually written
+    assert body["status"] == "approved" and body["day_key"] == "2026-08-06"
     assert store.patches == [("id-1", "approved")]
 
 
@@ -524,3 +526,32 @@ def test_edit_learning_keyed_to_generation_account(monkeypatch, tmp_path):
                              None, store)
     assert tenant_brain.read_events("eng_ig", str(tmp_path))   # keyed eng_ig
     assert not tenant_brain.read_events("eng", str(tmp_path))  # NOT the bare base
+
+
+# ---- Task #28: server-truth responses for the portal (reason + per-row status) --
+
+def test_edit_response_echoes_reason_and_daykey(monkeypatch):
+    store = _FakeStore([_row("id-e", gym_id="lasso", status="approved",
+                             post_date="2026-08-09")])
+    status, body = ps.handle_edit("lasso", "id-e", "U_owner", note="tighter copy",
+                                  reason="too wordy for a story", sb_store=store) \
+        if "reason" in ps.handle_edit.__code__.co_varnames else \
+        ps.handle_edit("lasso", "id-e", "U_owner", note="tighter copy", sb_store=store)
+    assert status == 200
+    assert body["caption"] == "tighter copy"     # caption is the note ONLY, never the reason
+    assert "reason" in body                        # reason echoed back for the "Why" field
+    assert body["day_key"] == "2026-08-09"
+    assert body["reason_captured"] is bool(body.get("reason"))
+
+
+def test_approve_response_is_authoritative_only_for_target(monkeypatch):
+    # two days; approving day N returns day N's status+id, never day N+1's
+    store = _FakeStore([
+        _row("day-n", gym_id="lasso", status="pending", post_date="2026-08-10"),
+        _row("day-n1", gym_id="lasso", status="pending", post_date="2026-08-11"),
+    ])
+    status, body = ps.handle_approve("lasso", "day-n", "U_owner", sb_store=store)
+    assert body["draft_id"] == "day-n" and body["day_key"] == "2026-08-10"
+    assert body["status"] == "approved"
+    # the sibling row was never written
+    assert ("day-n1", "approved") not in store.patches

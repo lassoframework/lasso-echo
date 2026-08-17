@@ -291,10 +291,74 @@ updates `content_calendar.caption` but the already-hosted `image_url` still carr
     (`client_month_run._edited_story_captions` + `_maybe_format_story`).
   - Tests: `tests/test_story_caption_saved_shows.py`.
 
-**Portal note (optional polish):** after a story-caption edit, the portal may show "your
-story caption is saved and will render on the next build" so the client is not surprised the
-change is not instantly visible on the media thumbnail (the media re-renders on the rebuild).
-There is a residual schema limitation: `content_calendar` does not retain the story's RAW
-source media URL, so Echo cannot re-burn instantly at edit time — it re-burns on the rebuild.
-If instant re-render is wanted, add a `source_media_url` column to `content_calendar` (portal
-migration) and Echo can re-burn synchronously; logged as a backlog decision, not a blocker.
+**Instant re-render — NOW BUILT (Echo side, 2026-08-17), gated on one migration.** Echo can
+re-burn a story caption synchronously at edit time. Sequence:
+  1. Apply `migrations/DRAFT_content_calendar_source_media_url.sql` (adds a nullable
+     `content_calendar.source_media_url text`; additive, no backfill, changes nothing alone).
+  2. Set `AGENT_STORY_SOURCE_MEDIA=true` on the `echo` + `echo-intake-web` services.
+  Then: the planner stores each story's raw source url; a story-caption edit re-burns the new
+  caption onto fresh media immediately and swaps `image_url`; the edit response carries
+  `story_reburned: true`. Best-effort — the caption edit persists regardless, and the monthly
+  rebuild remains the backstop. Until the flag is armed, behavior is exactly as today.
+
+---
+
+## 6. Task #28 — Echo backend delivered; the exact frontend diff to apply
+
+Echo now returns SERVER-TRUTH on every action so the portal can stop guessing. The two
+symptoms below are frontend optimistic-state bugs; the backend was already correct and is now
+also easier to bind to. **Apply this diff, then run the normal build/audit/fix loop on it.**
+
+### What Echo returns now (contract — no portal request changes needed to READ these)
+- `GET /portal/<token>/social` — each post already carries authoritative `id`, `day_key`,
+  `status`. Bind each card's badge to ITS OWN `post.status`.
+- Every action `POST` response now includes the **written row's** `status` + `day_key`:
+  - `approve`/`deny`/`kill`/`requeue` → `{ok, action, draft_id, status, day_key, ...}`
+  - `edit` → `{ok, action, draft_id, caption, status, day_key, reason, reason_captured,
+    story_reburned, gbp_updated}`. `caption` is the clean post copy (NEVER the reason);
+    `reason` echoes the "Why" text; `reason_captured` is a saved-tick boolean.
+
+### 6a. Fix 5a — the "Why" reason must never touch the caption
+```diff
+  // edit submit
+- body: JSON.stringify({ draft_id, actor_id, note: captionText + "\n" + whyText })   // BUG: reason concatenated
++ body: JSON.stringify({ draft_id, actor_id, note: captionText, reason: whyText })    // reason is its OWN field
+  // on response:
+- setCaption(prev => prev + "\n" + whyText)          // BUG: re-appends the reason locally
++ setCaption(res.caption)                             // render the clean caption from the server ONLY
++ setWhy(res.reason)                                  // keep the "Why" field populated (no more disappearing)
++ setReasonSaved(res.reason_captured)                 // show a small "reasoning saved ✓" tick
+  // render the reason as a SEPARATE muted line under the card, e.g. <p className="why">Why: {why}</p>
+```
+
+### 6b. Fix 5b — approving one card must not mark the next card approved
+```diff
+  async function onApprove(id) {
+    const res = await postAction(`${id}/approve`)
+-   advanceToNextCard()
+-   setCards(cs => cs.map(c => c.selected ? { ...c, status: "approved" } : c))  // BUG: paints the NOW-selected (next) card
++   // update ONLY the row the server actually wrote, keyed by the returned draft_id:
++   setCards(cs => cs.map(c => c.id === res.draft_id ? { ...c, status: res.status } : c))
++   advanceToNextCard()                                // advancing the VIEW is fine; carrying the badge is the bug
+  }
+  // Each card badge is driven by its own status (from /social or the per-id action response),
+  // never copied from the previously-approved card. On refresh nothing changes because the
+  // server was always the source of truth.
+```
+
+### 6c. Fix 5c — show the re-burned story image after an edit (once the migration is live)
+```diff
+  const res = await postAction(`${id}/edit`, { note, reason })
+  setCaption(res.caption)
++ if (res.story_reburned) {
++   // Echo re-burned the caption onto fresh media; refresh this card's image from the server
++   refetchPost(id)            // or: setCard(c => ({ ...c, image_public_url: undefined })) then re-GET /social
++ }
+```
+Until `AGENT_STORY_SOURCE_MEDIA` is armed, `story_reburned` is always `false` and the story
+re-renders on the monthly rebuild (unchanged) — so this branch is safe to ship immediately.
+
+**Backend tests proving the contract (all green here):** `tests/test_portal_social_supabase.py`
+(reason echo + per-target authoritative status), `tests/test_portal_calendar_supabase.py`
+(action responses carry status+day_key; edit reason echoed), `tests/test_story_reburn.py`
+(gated re-burn, best-effort, pre-migration safety).
