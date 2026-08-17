@@ -207,7 +207,7 @@ def get_or_make_story_video(video_path, caption, gym_name, library_path, *,
         os.makedirs(cache_dir, exist_ok=True)
         with open(video_path, "rb") as fh:
             vid_key = hashlib.sha256(fh.read()).hexdigest()[:12]
-        cap_key = hashlib.sha256((caption or "").encode("utf-8")).hexdigest()[:6]
+        cap_key = _caption_key(caption)
         out = os.path.join(cache_dir, f"{vid_key}_{cap_key}__storyvid.mp4")
         if os.path.isfile(out) and os.path.getsize(out) > 0:
             return out
@@ -227,6 +227,49 @@ def get_or_make_story_video(video_path, caption, gym_name, library_path, *,
         return None
 
 
+def _caption_key(caption):
+    """The 6-char content key this module burns into a story media FILENAME
+    (get_or_make_story_image / _story_video use it as `cap_key`). Two callers deriving
+    it from the SAME caption text get the SAME key, so a story's rendered media can be
+    checked against a later (possibly edited) caption WITHOUT re-rendering or storing
+    the raw source. Empty caption -> the key of ''."""
+    import hashlib
+    return hashlib.sha256((caption or "").encode("utf-8")).hexdigest()[:6]
+
+
+# A rendered story asset filename carries `..._<cap_key>__story.jpg` (photo) or
+# `..._<cap_key>__storyvid.mp4` (video). These markers let the publisher tell (a) that
+# a story's media was caption-burned by this module, and (b) which caption it burned.
+_STORY_MEDIA_MARKERS = ("__story.jpg", "__story.jpeg", "__storyvid.mp4")
+
+
+def story_media_carries_caption(image_url, caption):
+    """Does this story's rendered media (image_url) carry THIS caption?
+
+    Returns:
+      * True  when the media filename is a caption-burned story asset AND its embedded
+        cap_key matches _caption_key(caption) — the media shows the current caption;
+      * False when it is a caption-burned story asset but the cap_key does NOT match —
+        the caption was edited AFTER the media was rendered, so the media is STALE
+        (would publish the OLD/blank caption). The caller HOLDS the story;
+      * True  when the media is NOT a caption-burned story asset at all (e.g. a raw URL
+        from a flag-off baseline build, or a non-story) — this guard makes no claim
+        about media it did not produce, so it never blocks the existing baseline.
+
+    Pure + deterministic + schema-free: it reads only the filename this module wrote,
+    so it works across services (the publisher runs on a different box than the portal
+    edit) with no new column and no raw source retention."""
+    url = (image_url or "").split("?", 1)[0]
+    name = url.rsplit("/", 1)[-1]
+    marker = next((m for m in _STORY_MEDIA_MARKERS if name.endswith(m)), None)
+    if marker is None:
+        return True  # not our burned asset: do not judge it
+    stem = name[: -len(marker)]
+    # filename shape: <vid_key>_<cap_key>  -> the last underscore-separated chunk.
+    burned_cap_key = stem.rsplit("_", 1)[-1] if "_" in stem else stem
+    return burned_cap_key == _caption_key(caption)
+
+
 def get_or_make_story_image(photo_path, caption, gym_name, library_path, *,
                             logger=None):
     """Hosted-ready 9:16 story card for a photo (cached in <library>/reels/), or None
@@ -241,7 +284,7 @@ def get_or_make_story_image(photo_path, caption, gym_name, library_path, *,
         os.makedirs(cache_dir, exist_ok=True)
         with open(photo_path, "rb") as fh:
             vid_key = hashlib.sha256(fh.read()).hexdigest()[:12]
-        cap_key = hashlib.sha256((caption or "").encode("utf-8")).hexdigest()[:6]
+        cap_key = _caption_key(caption)
         out = os.path.join(cache_dir, f"{vid_key}_{cap_key}__story.jpg")
         if os.path.isfile(out) and os.path.getsize(out) > 0:
             return out
