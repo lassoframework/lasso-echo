@@ -127,6 +127,24 @@ def test_full_cadence_with_offer_and_event():
     assert len(photos) == 4 and all(r["caption"] == "" for r in photos)
 
 
+def test_injected_facts_drive_standard_without_client_sources():
+    # a tenant with NO client_sources (present==[]) still plans a full STANDARD run from an
+    # injected real fact list (e.g. LASSO's lasso_now.md copy bank). Gates still apply.
+    store = _Store()
+    facts = [("All in one offer", "Ads, nurture, site, social, reporting in one place."),
+             ("Sales are now", "The job is closing members, not building funnels."),
+             ("Proof", "71.9% booked vs an 18.5% industry average.")]
+    out = gp.plan_gbp_month(
+        "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), offer=None, events=[],
+        facts=facts, caption_fn=_cap, image_fn=_img)
+    assert out["ok"] and out["standard"] == 8      # cycled facts fill all 8 slots
+    # the injected pillar names ride onto the rows
+    pillars = {r["pillar"] for r in store.rows if r["gbp_topic_type"] == "STANDARD"
+               and r["format"] == "update"}
+    assert pillars <= {"All in one offer", "Sales are now", "Proof"}
+
+
 def test_no_offer_skips_offer_slot():
     _seed()
     store = _Store()

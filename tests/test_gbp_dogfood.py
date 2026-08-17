@@ -160,3 +160,35 @@ def test_base_of_strips_platform_suffix():
     assert gd._base_of("lasso_ig") == "lasso"
     assert gd._base_of("gritx_fb") == "gritx"
     assert gd._base_of("lasso") == "lasso"
+
+
+def test_lasso_facts_parsed_from_real_now_doc():
+    # parse the committed brand_voice/lasso_now.md — real approved copy bank
+    facts = gd._lasso_facts()
+    assert len(facts) >= 5                      # 5 pillars + proof receipts
+    pillars = {p for p, _ in facts}
+    assert "Sales are now" in pillars and "Proof" in pillars
+    # every fact carries real text, none empty
+    assert all(isinstance(t, str) and len(t) > 20 for _, t in facts)
+
+
+def test_lasso_facts_empty_when_doc_missing(tmp_path):
+    assert gd._lasso_facts(str(tmp_path / "nope.md")) == []
+
+
+def test_lasso_image_fn_globs_prefixed_cards(tmp_path, monkeypatch):
+    from PIL import Image
+    # two lasso_ cards + one foreign image; the fn must pick only lasso_ ones
+    for name in ("lasso_a.png", "lasso_b.png", "other_gym.png"):
+        Image.new("RGB", (1200, 1200), (30, 40, 60)).save(tmp_path / name)
+    # stub the crop-and-host to a deterministic url keyed by basename (no R2 in tests)
+    monkeypatch.setattr(gd.gbp_planner, "_cropped_image_url",
+                        lambda acct, img, day: f"https://r2/{os.path.basename(img.path)}")
+    fn = gd._make_lasso_image_fn(str(tmp_path), "lasso_ig")
+    used = set()
+    u1 = fn("2026-09-01", used)
+    u2 = fn("2026-09-04", used)
+    assert u1 != u2 and all("lasso_" in u for u in (u1, u2))   # only lasso_ cards, no reuse
+    assert "other_gym" not in (u1 + u2)
+    # pool of 2 exhausts -> None (no reuse, never a foreign image)
+    assert fn("2026-09-07", used) is None

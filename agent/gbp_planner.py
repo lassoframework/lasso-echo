@@ -157,7 +157,7 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
 def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city,
                    store, start=None, days=30, offer=None, events=(),
                    gbp_location_id=None, cta_url="", caption_fn=None, image_fn=None,
-                   logger=None):
+                   facts=None, logger=None):
     """Plan one GBP month for a gym and WRITE it as PENDING rows (Echo write path).
 
     Cadence (§5.1): 8 STANDARD + 1 OFFER (if a real offer resolves) + up to 2 EVENT
@@ -169,13 +169,21 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     offer: (name, offer_dict) from resolve_offer, or None. events: list of
     {title, schedule, fact} dicts (real, from the gym record). caption_fn/image_fn are
     injectable for tests; production uses generate_gbp_caption + client_content.pick_image
-    + crop-and-host."""
+    + crop-and-host.
+
+    facts: OPTIONAL list of (pillar, fact_text) tuples — a bespoke, already-approved fact
+    source (e.g. LASSO's own lasso_now.md copy bank) for a tenant whose content does NOT
+    live in the client_sources pipeline. When given, the STANDARD loop draws its facts
+    from this list (cycled) instead of client_sources, and satisfies the presence guard.
+    It is REAL approved material only; every A+ / figure / no-dash gate still runs on the
+    generated caption, so no gate is weakened and nothing is fabricated."""
     log = logger or (lambda m: print(f"[gbp-planner] {m}"))
     start = start or date.today()
     caption_fn = caption_fn or (lambda fact: generate_gbp_caption(fact, voice, city))
+    facts = list(facts or [])
     present = client_sources.categories_present(account_gen_key)
-    if not present and not offer and not events:
-        return {"ok": False, "reason": "no approved sources / offer / events",
+    if not present and not facts and not offer and not events:
+        return {"ok": False, "reason": "no approved sources / facts / offer / events",
                 "planned": 0}
 
     used = set()
@@ -197,17 +205,23 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
 
     # ---- 8 STANDARD (2/week ~ every 3-4 days) ----
     day = start
+    fact_i = 0
     while counts["standard"] < CADENCE["STANDARD"] and (day - start).days < days:
-        cat = client_content.category_for_day(account_gen_key, day.isoformat(), present) \
-            if present else None
-        src = client_content._source_for_day(account_gen_key, day.isoformat(), cat,
-                                              present) if cat else None
-        fact = getattr(src, "text", "") if src else ""
+        if facts:
+            pillar, fact = facts[fact_i % len(facts)]
+            fact_i += 1
+        else:
+            cat = client_content.category_for_day(account_gen_key, day.isoformat(),
+                                                  present) if present else None
+            src = client_content._source_for_day(account_gen_key, day.isoformat(), cat,
+                                                  present) if cat else None
+            fact = getattr(src, "text", "") if src else ""
+            pillar = cat or "update"
         img_url = _image_url(day.isoformat()) if fact else None
         cap = caption_fn(fact) if (fact and img_url) else None
         if cap and img_url:
             rows.append(_row(portal_gym_key, account_gen_key, day.isoformat(), cap,
-                             img_url, topic_type="STANDARD", pillar=(cat or "update"),
+                             img_url, topic_type="STANDARD", pillar=pillar,
                              cta_type=gbp.DEFAULT_CTA, cta_url=cta_url,
                              gbp_location_id=gbp_location_id, fmt="update"))
             counts["standard"] += 1
