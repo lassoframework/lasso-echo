@@ -37,15 +37,19 @@ SAFETY_FLAGS = ("minor_prominent", "third_party_brand", "unsanitary", "injury_vi
 # for review + strips the offending descriptive text from caption eligibility. text_in_image
 # is NEVER scanned here (ruling 6) — it must capture name tags verbatim; a person-name there
 # is caught by the model's contains_person_name flag instead.
-_GENDER = (r"\bman\b", r"\bmen\b", r"\bwoman\b", r"\bwomen\b", r"\bmale\b", r"\bfemale\b",
-           r"\bguy\b", r"\bguys\b", r"\bgirl\b", r"\bgirls\b", r"\blady\b", r"\bladies\b",
-           r"\bgentleman\b", r"\bgentlemen\b", r"\bboy\b", r"\bboys\b", r"\bdude\b",
-           r"\bhe\b", r"\bshe\b", r"\bhim\b", r"\bher\b", r"\bhis\b")
-_AGE = (r"\byoung\b", r"\bold\b", r"\belderly\b", r"\bteenage\b", r"\bteen\b", r"\bsenior\b",
-        r"\bmiddle.aged\b")
+_GENDER = (r"\bman\b", r"\bmen\b", r"\bwoman\b", r"\bwomen\b", r"\bmales?\b", r"\bfemales?\b",
+           r"\bguys?\b", r"\bgirls?\b", r"\blady\b", r"\bladies\b", r"\bgentlem[ae]n\b",
+           r"\bboys?\b", r"\bdudes?\b", r"\bhe\b", r"\bshe\b", r"\bhim\b", r"\bher\b",
+           r"\bhis\b", r"\bhers\b")
+# age terms are person-descriptors; kept conservative (over-blocking an "old rack" image is
+# the SAFE failure per §10 — it routes to coach hand-pick, never a mismatch).
+_AGE = (r"\byoung\b", r"\bold\b", r"\belderly\b", r"\bteenage[dr]?\b", r"\bteens?\b",
+        r"\bseniors?\b", r"\bmiddle.aged\b", r"\bkids?\b")
 _APPEARANCE = (r"\bmuscular\b", r"\bripped\b", r"\bjacked\b", r"\boverweight\b", r"\bobese\b",
                r"\bskinny\b", r"\bslim\b", r"\bheavyset\b", r"\bchubby\b", r"\bplus.size\b",
-               r"\btoned\b", r"\bshredded\b", r"\bbuff\b")
+               r"\btoned\b", r"\bshredded\b", r"\bbuff\b", r"\bfat\b", r"\bpetite\b",
+               r"\bcurvy\b", r"\bstocky\b", r"\bbald\b", r"\bblonde?\b", r"\bbrunette\b",
+               r"\bbearded\b", r"\bthin\b")
 _HEALTH = (r"\binjured\b", r"\bunhealthy\b", r"\bdiabetic\b", r"\bpregnant\b", r"\bdisabled\b",
            r"\bobese\b")
 _IDENTITY_RE = re.compile("|".join(_GENDER + _AGE + _APPEARANCE + _HEALTH), re.IGNORECASE)
@@ -74,6 +78,15 @@ def dct_phash(data):
     except Exception:
         return None
     px = list(img.getdata())
+    # LOW-VARIANCE GUARD (audit item 4): a near-uniform image (blank wall, empty frame) has
+    # ~0 DCT AC energy, so the median-threshold sign bits are rounding noise and unrelated
+    # flats false-cluster. Encode the quantized MEAN brightness deterministically instead, so
+    # same-brightness flats match and different-brightness flats separate.
+    mean = sum(px) / len(px)
+    var = sum((p - mean) ** 2 for p in px) / len(px)
+    if var < 16:            # std < 4 grey levels: effectively flat
+        bucket = min(255, max(0, int(mean)))
+        return f"{(bucket << 8 | bucket) & 0xFFFFFFFFFFFFFFFF:016x}"
     grid = [px[r * _DCT_N:(r + 1) * _DCT_N] for r in range(_DCT_N)]
     # 2D DCT-II, keep only the top-left 8x8 low-frequency coefficients
     rows = [[sum(grid[r][x] * _COS[u][x] for x in range(_DCT_N)) for u in range(_DCT_LOW)]
@@ -178,7 +191,7 @@ def coerce_analysis(raw, *, phash=None):
         "reject_reason": (str(q.get("reject_reason")).strip() or None)
         if q.get("reject_reason") else None,
     }
-    safety = [f for f in (body.get("safety_flags") or [])
+    safety = [str(f).strip().lower() for f in (body.get("safety_flags") or [])
               if str(f).strip().lower() in SAFETY_FLAGS]
 
     try:
@@ -210,18 +223,43 @@ def coerce_analysis(raw, *, phash=None):
     }
 
 
-_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
-_COMMON_CAPS = {"the", "gym", "monday", "tuesday", "wednesday", "thursday", "friday",
-                "saturday", "sunday", "crossfit", "hyrox", "wod", "amrap", "emom", "rx",
-                "open", "week", "day", "class", "coach", "welcome", "team"}
+# gym/equipment/exercise/time vocabulary that legitimately appears Titlecase on SIGNAGE and
+# must NOT be mistaken for a member name (fixes the signage over-exclusion, audit item 3).
+_GYM_VOCAB = {
+    "the", "and", "for", "gym", "fitness", "studio", "club", "box", "team", "crew", "class",
+    "open", "week", "day", "days", "hours", "welcome", "coach", "coaches", "member",
+    "members", "front", "desk", "area", "zone", "room", "floor", "wall", "rack", "racks",
+    "squat", "bench", "press", "deadlift", "clean", "jerk", "snatch", "row", "rowing",
+    "rower", "rowers", "barbell", "dumbbell", "kettlebell", "kettlebells", "cardio",
+    "strength", "conditioning", "mobility", "yoga", "spin", "cycle", "hyrox", "crossfit",
+    "wod", "amrap", "emom", "rx", "pr", "workout", "warmup", "cooldown", "reps", "sets",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "morning", "evening", "noon", "session", "sessions",
+    "results", "goals", "flow", "lift", "lifting", "run", "running", "sprint",
+}
+_NAME_CUE = re.compile(
+    r"\b(coach|member|welcome|congrats|congratulations|great job|great work|way to go|"
+    r"nice work|shout ?out|thanks?|thank you|meet|by|from|for)\s+([A-Z][a-zA-Z]{1,})",
+    re.IGNORECASE)
+_FULL_NAME = re.compile(r"\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b")   # Firstname Lastname
 
 
 def _looks_like_person_name(text):
-    """Heuristic: a capitalized word that is not a common gym/day word suggests a member
-    name in the image (name tag / whiteboard). Conservative — a match routes to coach
-    hand-pick, it never fabricates a caption."""
-    for m in _NAME_RE.finditer(text or ""):
-        if m.group(0).lower() not in _COMMON_CAPS:
+    """Heuristic backstop for a member name in the image text (name tag / whiteboard) when
+    the model does not set contains_person_name itself. PRECISE by design — it fires only on
+    a clear name signal (a name CUE followed by a Titlecase word, or a Firstname Lastname
+    pair) whose tokens are NOT gym vocabulary — so Titlecase signage like 'Deadlift Area' or
+    'Barbell Club' is not mistaken for a name (audit item 3). A hit routes to coach
+    hand-pick; the model's own contains_person_name / pii_visible remain the primary
+    defense."""
+    t = text or ""
+    for m in _NAME_CUE.finditer(t):
+        if m.group(2).lower() not in _GYM_VOCAB:
+            return True
+    for m in _FULL_NAME.finditer(t):
+        a, b = m.group(0).split()[:2]
+        if a.lower() not in _GYM_VOCAB and b.lower() not in _GYM_VOCAB:
             return True
     return False
 

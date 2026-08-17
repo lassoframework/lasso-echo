@@ -10,6 +10,33 @@ Last updated: 2026-08-17
 
 ---
 
+## Echo Vision — image understanding + grounded captions (ECHO_VISION_SPEC.md, 2026-08-17)
+
+Autonomous build, phase loop (build → independent audit → fix → re-audit to zero → this log).
+KEY FINDING at spec-map time: this is a v2 EXTENSION of the existing DAM v1 (`agent/dam.py`:
+autotag/near-dupe/consent), not greenfield. Rulings (Blake): analysis lives on the DAM
+SIDECAR (no DB table; `sync_uploads` preserves it across re-syncs); reuse the Gemini path +
+spend cap (+ per-slot/per-gym-monthly on top in P4); DCT-pHash; crop-verify checks what
+SHIPS (GBP 1200×900 crop, IG/FB the original); `intake_web` owns the upload UI;
+`text_in_image` firewalled from the drafter. Per-gym flag `AGENT_VISION_GYMS` (default none);
+flips only at next `build_client_month` with pending/approved frozen; LASSO dogfood diff to
+Blake before any client gym; adversarial set must route 100% before any default-on.
+
+- **[x] P0 — adversarial harness** (`tests/test_vision_adversarial.py`): §9.3 set routes 100%
+  through the real coerce+routing (name tag, whiteboard-PII, before/after collage, athlete
+  comp, minor-prominent, blurry burst, empty-gym, gender-leak, third-party-brand). Standing
+  acceptance bar.
+- **[x/audit] P1 — analysis v2** (`agent/vision.py`): v2 `media_analysis` schema; identity
+  firewall on one_line/subjects/details (never text_in_image); DCT-pHash + Hamming;
+  `caption_eligible_details` (≥0.85); `auto_plannable` (excludes safety/person-name/athlete/
+  identity-leak/unusable/missing-failed); `analyze_and_store` on the sidecar (idempotent =
+  preserve-on-re-sync; 3-attempt fail → `analysis_failed`+alert); `analyze_library` backfill;
+  ingest hook in `client_media_sync` (per-gym, best-effort). +31 tests. Independent audit in
+  flight.
+- [ ] P2 hygiene · [ ] P3 pick scoring · [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
+
+---
+
 ## Dale round 2 beta feedback (Aug 18 post, 2026-08-17) — 5 items, gym-agnostic
 
 Independent trace confirmed each root cause in live code before the fix. Suite 2730 -> 2750

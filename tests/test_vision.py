@@ -205,3 +205,50 @@ def test_analyze_library_skips_analyzed_and_videos(tmp_path, monkeypatch):
     assert out["analyzed"] == 2                # both images, not the video
     out2 = vision.analyze_library(str(tmp_path), reader=lambda b: _GOOD_JSON, day="2026-09-01")
     assert out2["skipped"] == 2 and out2["analyzed"] == 0    # idempotent second pass
+
+
+# ---- audit fixes: firewall plurals/appearance, precise name heuristic, flat pHash --------
+
+def test_firewall_catches_plurals_and_more_appearance():
+    assert "males" in vision.identity_issues("two males on the bench")
+    assert "females" in vision.identity_issues("a row of females")
+    assert vision.identity_issues("a fat member")          # appearance
+    assert vision.identity_issues("a petite person")
+    assert vision.identity_issues("a bald coach")
+    assert vision.identity_issues("a thin build")
+
+
+def test_firewall_leak_excludes_via_coerce():
+    a = vision.coerce_analysis({"one_line": "Two males spotting on the bench",
+                                "quality": {"usable": True}, "avatar_fit": "genpop"})
+    assert a["identity_flag"] is True
+    assert vision.auto_plannable(a)[0] is False
+
+
+def test_name_heuristic_precise_ignores_signage():
+    # signage must NOT be read as a member name
+    for sign in ("Deadlift Area", "Barbell Club", "Rowing Zone", "January Challenge",
+                 "Strength And Conditioning", "Squat Rack"):
+        assert vision._looks_like_person_name(sign) is False, sign
+    # clear name signals DO fire
+    assert vision._looks_like_person_name("Great work Marcus") is True
+    assert vision._looks_like_person_name("John Smith crushed it") is True
+    assert vision._looks_like_person_name("coach Sarah") is True
+
+
+def test_flat_images_do_not_falsely_cluster():
+    from PIL import Image
+    import io as _io
+
+    def _solid(v):
+        b = _io.BytesIO()
+        Image.new("L", (64, 64), v).save(b, format="PNG")
+        return vision.dct_phash(b.getvalue())
+    dark, light, dark2 = _solid(10), _solid(245), _solid(10)
+    assert vision.hamming(dark, dark2) == 0            # identical flats cluster
+    assert vision.hamming(dark, light) > 6             # dark vs light do NOT (was a collision)
+
+
+def test_safety_flag_stored_stripped():
+    a = vision.coerce_analysis({"one_line": "x", "safety_flags": [" pii_visible ", "UNSANITARY"]})
+    assert a["safety_flags"] == ["pii_visible", "unsanitary"]   # normalized, no stray space
