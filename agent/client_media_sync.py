@@ -289,6 +289,18 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
 
     if synced or skipped:
         log(f"{base_key}: synced {synced} new media, skipped {skipped} already present")
+
+    # ECHO VISION ingest hook (§2.1): analyze newly-synced images once, on the gym's DAM
+    # sidecar, so content-scoring + grounding have data before planning. Idempotent (an
+    # already-analyzed image is skipped -> analysis is PRESERVED across re-syncs, ruling 1).
+    # Gated per-gym (AGENT_VISION_GYMS) and best-effort — a vision failure never fails sync.
+    if synced and config.vision_enabled_for(base_key):
+        try:
+            from . import vision, ops_alerts
+            vision.analyze_library(lib_dir, alert=ops_alerts.alert, logger=log)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{base_key}: vision sweep failed: {type(exc).__name__}")
+
     return {"synced": synced, "skipped": skipped}
 
 

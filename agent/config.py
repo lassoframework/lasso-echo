@@ -999,6 +999,27 @@ def autotag_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_AUTOTAG_ENABLED", "false"))
 
 
+def vision_gyms() -> set:
+    """Echo Vision (ECHO_VISION_SPEC) per-gym enablement. The set of BASE gym keys where
+    image understanding + grounded captions are ON. Default EMPTY — vision is off for every
+    gym until a gym is added by hand (and only after its library backfills clean + the
+    adversarial test set routes 100%). Set AGENT_VISION_GYMS as a comma list of base keys
+    (e.g. 'lasso,gritx'). Per §9: a gym flips ONLY at its next build_client_month, with
+    pending/approved rows frozen; new-gym default-on is a later rollout step, not this flag."""
+    raw = os.environ.get("AGENT_VISION_GYMS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def vision_enabled_for(gym_key) -> bool:
+    """True when Echo Vision is armed for this gym (base key or an _ig/_fb suffix)."""
+    base = (gym_key or "").strip().lower()
+    for suffix in ("_ig", "_fb"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base in vision_gyms()
+
+
 def ocr_check_enabled() -> bool:
     """
     Headline OCR check switch. OFF by default. ON, a rendered card's headline is

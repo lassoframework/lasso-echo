@@ -1,0 +1,401 @@
+"""
+Echo Vision (ECHO_VISION_SPEC) — Phase 1: image understanding at ingest.
+
+Extends DAM v1 (agent/dam.py autotag) to the v2 `media_analysis` schema: analyze once at
+ingest, store as data on the DAM SIDECAR (ruling 1 — no new DB table), every consumer reads
+the stored analysis. The analysis is treated as UNTRUSTED input: per-detail confidence, an
+identity firewall on the descriptive fields, and safety routing so a wrong or unscreened
+analysis can never auto-plan.
+
+Provider: the existing Gemini vision path (ruling 2), reused from dam._default_reader; the
+per-slot / per-gym-monthly accounting rides on top of the global daily cap in P4.
+
+Nothing here publishes, picks, or captions — it only produces + validates the analysis and
+answers "may this image auto-plan?" / "which details are caption-eligible?".
+"""
+
+import io
+import json
+import math
+import re
+
+VISION_VERSION = 2
+CAPTION_CONFIDENCE = 0.85          # §2.2: only details >= this are caption-eligible
+_REVIEW_CONFIDENCE = 0.7           # low overall confidence -> human review
+
+SETTINGS = ("gym_floor", "front_desk", "exterior", "outdoor", "studio", "event", "other")
+ACTIVITIES = ("strength", "cardio", "class", "coaching", "community", "facility", "food",
+              "none")
+PEOPLE_BUCKETS = ("none", "solo", "pair", "small_group", "crowd")
+AVATAR_FITS = ("genpop", "athlete_leaning", "athlete", "unclear")
+SAFETY_FLAGS = ("minor_prominent", "third_party_brand", "unsanitary", "injury_visible",
+                "pii_visible")
+
+# ---- identity firewall (§2.2, guardrail 11) --------------------------------------------
+# Descriptive fields (one_line/subjects/visible_details) must carry NEUTRAL person terms
+# only. These wordlists are the backstop behind the neutral prompt: a hit flags the analysis
+# for review + strips the offending descriptive text from caption eligibility. text_in_image
+# is NEVER scanned here (ruling 6) — it must capture name tags verbatim; a person-name there
+# is caught by the model's contains_person_name flag instead.
+_GENDER = (r"\bman\b", r"\bmen\b", r"\bwoman\b", r"\bwomen\b", r"\bmale\b", r"\bfemale\b",
+           r"\bguy\b", r"\bguys\b", r"\bgirl\b", r"\bgirls\b", r"\blady\b", r"\bladies\b",
+           r"\bgentleman\b", r"\bgentlemen\b", r"\bboy\b", r"\bboys\b", r"\bdude\b",
+           r"\bhe\b", r"\bshe\b", r"\bhim\b", r"\bher\b", r"\bhis\b")
+_AGE = (r"\byoung\b", r"\bold\b", r"\belderly\b", r"\bteenage\b", r"\bteen\b", r"\bsenior\b",
+        r"\bmiddle.aged\b")
+_APPEARANCE = (r"\bmuscular\b", r"\bripped\b", r"\bjacked\b", r"\boverweight\b", r"\bobese\b",
+               r"\bskinny\b", r"\bslim\b", r"\bheavyset\b", r"\bchubby\b", r"\bplus.size\b",
+               r"\btoned\b", r"\bshredded\b", r"\bbuff\b")
+_HEALTH = (r"\binjured\b", r"\bunhealthy\b", r"\bdiabetic\b", r"\bpregnant\b", r"\bdisabled\b",
+           r"\bobese\b")
+_IDENTITY_RE = re.compile("|".join(_GENDER + _AGE + _APPEARANCE + _HEALTH), re.IGNORECASE)
+
+
+def identity_issues(text):
+    """Return the identity/appearance terms found in a descriptive string (empty when
+    clean). The backstop behind the neutral prompt AND the caption gate (Phase 5)."""
+    return sorted({m.group(0).lower() for m in _IDENTITY_RE.finditer(text or "")})
+
+
+# ---- DCT perceptual hash (ruling 3) ----------------------------------------------------
+_DCT_N = 32                        # downscale grid
+_DCT_LOW = 8                       # low-frequency block kept for the hash
+_COS = [[math.cos((2 * x + 1) * u * math.pi / (2 * _DCT_N)) for x in range(_DCT_N)]
+        for u in range(_DCT_LOW)]  # precomputed cosine table (8 x 32)
+
+
+def dct_phash(data):
+    """A 64-bit DCT perceptual hash (pHash) as a 16-char hex string, or None when the bytes
+    are not a readable image. More robust to scale/compression than the v1 average hash, so
+    burst near-dupes cluster reliably (§3). Pure-Python DCT (no numpy)."""
+    try:
+        from PIL import Image  # lazy
+        img = Image.open(io.BytesIO(data)).convert("L").resize((_DCT_N, _DCT_N))
+    except Exception:
+        return None
+    px = list(img.getdata())
+    grid = [px[r * _DCT_N:(r + 1) * _DCT_N] for r in range(_DCT_N)]
+    # 2D DCT-II, keep only the top-left 8x8 low-frequency coefficients
+    rows = [[sum(grid[r][x] * _COS[u][x] for x in range(_DCT_N)) for u in range(_DCT_LOW)]
+            for r in range(_DCT_N)]
+    coeffs = [[sum(rows[r][u] * _COS[v][r] for r in range(_DCT_N)) for u in range(_DCT_LOW)]
+              for v in range(_DCT_LOW)]
+    flat = [coeffs[v][u] for v in range(_DCT_LOW) for u in range(_DCT_LOW)]
+    med = sorted(flat[1:])[len(flat[1:]) // 2]     # median excluding the DC term
+    bits = "".join("1" if c > med else "0" for c in flat)
+    return f"{int(bits, 2):016x}"
+
+
+def hamming(a, b):
+    """Hamming distance between two 16-char hex pHashes (§3, cluster at <=6). Large when
+    either is missing/malformed so a bad hash never falsely clusters."""
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except (TypeError, ValueError):
+        return 999
+
+
+# ---- analysis normalization + firewall -------------------------------------------------
+_VISION_PROMPT = (
+    "You are a careful visual describer for a gym's social media. Look ONLY at what is "
+    "visibly in this image and reply with ONLY a JSON object, no other text:\n"
+    '{"one_line": "one neutral sentence; use NEUTRAL person terms only (a person, three '
+    'people, a member, a coach); NEVER a name, gender, age, body, appearance, or health",\n'
+    ' "setting": one of gym_floor|front_desk|exterior|outdoor|studio|event|other,\n'
+    ' "subjects": [up to 5 short lowercase nouns for what is shown],\n'
+    ' "people_bucket": one of none|solo|pair|small_group|crowd (estimate the grouping, not '
+    'an exact count),\n'
+    ' "includes_children": true or false,\n'
+    ' "activity": one of strength|cardio|class|coaching|community|facility|food|none,\n'
+    ' "visible_details": [{"detail": short phrase, "confidence": 0.0-1.0} up to 6],\n'
+    ' "text_in_image": any legible text VERBATIM (signs, whiteboards, name tags) or null,\n'
+    ' "activity_confidence": 0.0-1.0,\n'
+    ' "quality": {"sharp": bool, "well_lit": bool, "usable": bool, "reject_reason": string '
+    'or null},\n'
+    ' "avatar_fit": one of genpop|athlete_leaning|athlete|unclear (athlete = competitive/'
+    'physique/heavy-barbell; genpop = everyday people),\n'
+    ' "safety_flags": [any of minor_prominent|third_party_brand|unsanitary|injury_visible|'
+    'pii_visible]}\n'
+    "Rules: describe ONLY the visible; invent nothing; no names/gender/age/body/health in "
+    "any field EXCEPT text_in_image (verbatim). If a whiteboard or screen shows member "
+    "names, phone numbers, or payment info, add pii_visible."
+)
+
+
+def _one_of(val, allowed, default):
+    v = str(val or "").strip().lower()
+    return v if v in allowed else default
+
+
+def coerce_analysis(raw, *, phash=None):
+    """Normalize a raw Gemini JSON string/dict into the v2 media_analysis schema, applying
+    the identity firewall to the descriptive fields. Returns the analysis dict, or None when
+    the payload cannot be parsed (caller treats None as a failed analysis)."""
+    try:
+        body = raw if isinstance(raw, dict) else json.loads(
+            raw[raw.index("{"): raw.rindex("}") + 1])
+    except Exception:
+        return None
+
+    one_line = str(body.get("one_line") or body.get("description") or "").strip()[:300]
+    subjects = [str(s).strip().lower() for s in (body.get("subjects") or [])][:5]
+    details_in = body.get("visible_details") or []
+    details = []
+    for d in details_in[:6]:
+        if isinstance(d, dict) and d.get("detail"):
+            try:
+                conf = max(0.0, min(1.0, float(d.get("confidence", 0))))
+            except (TypeError, ValueError):
+                conf = 0.0
+            details.append({"detail": str(d["detail"]).strip()[:80], "confidence": conf})
+
+    # IDENTITY FIREWALL (ruling 6): scan one_line/subjects/details ONLY, never text_in_image.
+    leak_terms = set(identity_issues(one_line))
+    for s in subjects:
+        leak_terms.update(identity_issues(s))
+    clean_details = []
+    for d in details:
+        hit = identity_issues(d["detail"])
+        if hit:
+            leak_terms.update(hit)          # a leaking detail is dropped from eligibility
+            continue
+        clean_details.append(d)
+    identity_flag = bool(leak_terms)
+
+    text_in_image = body.get("text_in_image")
+    text_in_image = (str(text_in_image).strip() or None) if text_in_image else None
+    contains_person_name = bool(body.get("contains_person_name", False))
+    # a person-name in the image text routes like a safety flag (§2.2); the model may set it,
+    # else we conservatively treat a name-tag-ish text as a name when it looks like one.
+    if text_in_image and _looks_like_person_name(text_in_image):
+        contains_person_name = True
+
+    q = body.get("quality") or {}
+    quality = {
+        "sharp": bool(q.get("sharp", True)),
+        "well_lit": bool(q.get("well_lit", True)),
+        "usable": bool(q.get("usable", True)),
+        "reject_reason": (str(q.get("reject_reason")).strip() or None)
+        if q.get("reject_reason") else None,
+    }
+    safety = [f for f in (body.get("safety_flags") or [])
+              if str(f).strip().lower() in SAFETY_FLAGS]
+
+    try:
+        activity_conf = max(0.0, min(1.0, float(body.get("activity_confidence", 0.8))))
+    except (TypeError, ValueError):
+        activity_conf = 0.8
+
+    return {
+        "version": VISION_VERSION,
+        "one_line": one_line,
+        "setting": _one_of(body.get("setting"), SETTINGS, "other"),
+        "subjects": subjects,
+        "people": {"bucket": _one_of((body.get("people") or {}).get("bucket")
+                                     if isinstance(body.get("people"), dict)
+                                     else body.get("people_bucket"),
+                                     PEOPLE_BUCKETS, "none"),
+                   "includes_children": bool(body.get("includes_children", False))},
+        "activity": _one_of(body.get("activity"), ACTIVITIES, "none"),
+        "visible_details": clean_details,
+        "text_in_image": text_in_image,
+        "contains_person_name": contains_person_name,
+        "quality": quality,
+        "avatar_fit": _one_of(body.get("avatar_fit"), AVATAR_FITS, "unclear"),
+        "safety_flags": sorted(set(str(f).lower() for f in safety)),
+        "activity_confidence": activity_conf,
+        "identity_flag": identity_flag,
+        "identity_terms": sorted(leak_terms),
+        "phash": phash,
+    }
+
+
+_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+_COMMON_CAPS = {"the", "gym", "monday", "tuesday", "wednesday", "thursday", "friday",
+                "saturday", "sunday", "crossfit", "hyrox", "wod", "amrap", "emom", "rx",
+                "open", "week", "day", "class", "coach", "welcome", "team"}
+
+
+def _looks_like_person_name(text):
+    """Heuristic: a capitalized word that is not a common gym/day word suggests a member
+    name in the image (name tag / whiteboard). Conservative — a match routes to coach
+    hand-pick, it never fabricates a caption."""
+    for m in _NAME_RE.finditer(text or ""):
+        if m.group(0).lower() not in _COMMON_CAPS:
+            return True
+    return False
+
+
+# ---- routing (§2.2, §4, guardrails 13/14) ----------------------------------------------
+def caption_eligible_details(analysis):
+    """Details a caption may lean on: confidence >= 0.85 AND already identity-clean. Below
+    threshold, details exist for search/debug only."""
+    if not analysis:
+        return []
+    return [d["detail"] for d in analysis.get("visible_details", [])
+            if d.get("confidence", 0) >= CAPTION_CONFIDENCE]
+
+
+def auto_plannable(analysis):
+    """(ok, reasons): may this image be AUTO-picked by the planner? False (with reasons)
+    for a missing/failed analysis, any safety flag, a person-name in the image, an athlete
+    shot, an identity leak, or unusable quality (§2.2, guardrails 13/14). athlete_leaning
+    and unclear are still plannable but RESTRICTED to Behind-the-scenes (handled in the pick
+    scorer, §4), so they are not excluded here."""
+    reasons = []
+    if not analysis or analysis.get("analysis_failed"):
+        return False, ["no analysis"]
+    if analysis.get("version") != VISION_VERSION:
+        return False, ["stale analysis version"]
+    if analysis.get("safety_flags"):
+        reasons += [f"safety:{f}" for f in analysis["safety_flags"]]
+    if analysis.get("contains_person_name"):
+        reasons.append("person_name_in_image")
+    if analysis.get("avatar_fit") == "athlete":
+        reasons.append("athlete")
+    if analysis.get("identity_flag"):
+        reasons.append("identity_leak")
+    if not (analysis.get("quality") or {}).get("usable", False):
+        reasons.append("unusable")
+    return (not reasons), reasons
+
+
+def bts_restricted(analysis):
+    """§2.2/§4: avatar_fit athlete_leaning or unclear may ONLY fill a Behind-the-scenes
+    slot (conservative default for unclear). The pick scorer enforces this."""
+    return (analysis or {}).get("avatar_fit") in ("athlete_leaning", "unclear")
+
+
+# ---- store / read on the DAM sidecar (ruling 1: sidecar, no DB) ------------------------
+MAX_ATTEMPTS = 3                   # §2.1: nightly retry sweep, then analysis_failed + alert
+_SIDE_KEY = "media_analysis"
+_ATTEMPT_KEY = "media_analysis_attempts"
+
+
+def stored_analysis(creative_path):
+    """The v2 analysis stored on the sidecar, or None. Returns the analysis dict even when
+    it is the {analysis_failed:true} marker (so callers can tell 'failed' from 'missing')."""
+    from . import dam
+    return dam.read_sidecar(creative_path).get(_SIDE_KEY)
+
+
+def analysis_state(creative_path):
+    """'ok' | 'failed' | 'missing' for one asset — the planner's screen (§2.1)."""
+    a = stored_analysis(creative_path)
+    if not a:
+        return "missing"
+    if a.get("analysis_failed") or a.get("version") != VISION_VERSION:
+        return "failed" if a.get("analysis_failed") else "missing"
+    return "ok"
+
+
+def _vision_reader():
+    """Gemini vision reader with the v2 prompt (mirrors dam._default_reader wiring). None
+    when the studio is unarmed / keyless."""
+    from . import config
+    import os as _os
+    if not config.creative_studio_enabled():
+        return None
+    key = _os.environ.get(config.NANO_API_KEY_ENV)
+    if not key:
+        return None
+    from google import genai  # lazy
+    from google.genai import types as gtypes
+    client = genai.Client(api_key=key)
+
+    def _read(image_bytes):
+        resp = client.models.generate_content(
+            model=config.OCR_MODEL,
+            contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                      _VISION_PROMPT])
+        return getattr(resp, "text", "") or ""
+
+    return _read
+
+
+def analyze_and_store(creative_path, *, reader=None, day=None, alert=None, force=False):
+    """Analyze ONE image once and store the v2 analysis on its DAM sidecar. Idempotent:
+    a sidecar already carrying a current-version analysis is SKIPPED (preserve-on-re-sync,
+    ruling 1) unless force=True. Returns the analysis dict, the existing one on skip, or
+    None when it could not run (unarmed / keyless / past the daily cap).
+
+    Failure handling (§2.1): a parse/read failure bumps an attempt counter; on the 3rd
+    failed attempt the sidecar is marked {analysis_failed:true} and staff is alerted. A
+    failed/absent analysis EXCLUDES the image from auto-planning (auto_plannable)."""
+    from . import dam, config
+    from datetime import date
+
+    existing = dam.read_sidecar(creative_path).get(_SIDE_KEY)
+    if existing and existing.get("version") == VISION_VERSION and not force:
+        return existing
+
+    reader = reader or _vision_reader()
+    if reader is None:
+        return None
+    day = day or date.today().isoformat()
+    from .creative_studio import spend_allowed
+    if not spend_allowed(account_key=None, day=day):
+        return None
+
+    try:
+        with open(creative_path, "rb") as fh:
+            raw_bytes = fh.read()
+    except OSError:
+        return None
+    phash = dct_phash(raw_bytes)
+    try:
+        analysis = coerce_analysis(reader(raw_bytes), phash=phash)
+    except Exception as exc:  # noqa: BLE001 - never raise out of ingest
+        print(f"[vision] analyze failed for {creative_path}: {type(exc).__name__}")
+        analysis = None
+
+    if analysis is not None:
+        dam.write_sidecar(creative_path, {_SIDE_KEY: analysis, _ATTEMPT_KEY: 0,
+                                          "media_analysis_version": VISION_VERSION})
+        if analysis.get("identity_flag") and alert:
+            alert(f"vision: identity terms in analysis for "
+                  f"{creative_path} ({analysis.get('identity_terms')}); routed to review")
+        return analysis
+
+    # failure path: bump attempts; escalate on the 3rd.
+    attempts = int(dam.read_sidecar(creative_path).get(_ATTEMPT_KEY, 0)) + 1
+    if attempts >= MAX_ATTEMPTS:
+        failed = {"version": VISION_VERSION, "analysis_failed": True,
+                  "phash": phash, "attempts": attempts}
+        dam.write_sidecar(creative_path, {_SIDE_KEY: failed, _ATTEMPT_KEY: attempts})
+        if alert:
+            alert(f"vision: analysis FAILED after {attempts} attempts for {creative_path}; "
+                  "excluded from auto-planning (coach hand-pick only)")
+        return failed
+    dam.write_sidecar(creative_path, {_ATTEMPT_KEY: attempts})
+    return None
+
+
+def analyze_library(library_path, *, reader=None, day=None, alert=None, force=False,
+                    logger=None):
+    """Backfill/ingest sweep: analyze every not-yet-analyzed image in a gym's library
+    (idempotent, throttled by the daily spend cap). Videos are skipped (§2.1, out of scope
+    for v1). Returns {analyzed, skipped, failed}."""
+    import os as _os
+    log = logger or (lambda m: print(f"[vision] {m}"))
+    counts = {"analyzed": 0, "skipped": 0, "failed": 0}
+    if not _os.path.isdir(library_path):
+        return counts
+    for name in sorted(_os.listdir(library_path)):
+        if _os.path.splitext(name)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+            continue
+        path = _os.path.join(library_path, name)
+        state = analysis_state(path)
+        if state in ("ok", "failed") and not force:
+            counts["skipped"] += 1
+            continue
+        res = analyze_and_store(path, reader=reader, day=day, alert=alert, force=force)
+        if res is None:
+            counts["failed"] += 1        # could not run (cap/keyless) — retried next sweep
+        elif res.get("analysis_failed"):
+            counts["failed"] += 1
+        else:
+            counts["analyzed"] += 1
+    log(f"{library_path}: analyzed {counts['analyzed']}, skipped {counts['skipped']}, "
+        f"failed {counts['failed']}")
+    return counts
