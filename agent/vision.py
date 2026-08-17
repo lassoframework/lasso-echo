@@ -309,6 +309,85 @@ def bts_restricted(analysis):
     return (analysis or {}).get("avatar_fit") in ("athlete_leaning", "unclear")
 
 
+# ---- Phase 2: near-duplicate clustering (Hamming <= 6) ---------------------------------
+CLUSTER_HAMMING = 6                 # §3: cluster near-dupes within this pHash distance
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _phash_for(creative_path):
+    """The image's DCT pHash: the one already stored on the sidecar at ingest (free), else
+    computed now. None when unreadable."""
+    a = stored_analysis(creative_path)
+    if a and a.get("phash"):
+        return a["phash"]
+    try:
+        with open(creative_path, "rb") as fh:
+            return dct_phash(fh.read())
+    except OSError:
+        return None
+
+
+def cluster_library(library_path):
+    """§3 near-duplicate collapse: greedily group a gym's images whose DCT pHashes are within
+    CLUSTER_HAMMING, writing a shared `dupe_group` (the leader's basename) into every member's
+    sidecar so rotation.rotation_key treats a burst of near-identical shots as ONE creative.
+    Reads the pHash stored at ingest (no re-hash). Returns {leader: [members]} (multi-member
+    groups only). Singletons keep their own filename key (no dupe_group written)."""
+    import os as _os
+    from . import dam
+    if not _os.path.isdir(library_path):
+        return {}
+    hashed = []          # (name, phash) for readable images
+    for name in sorted(_os.listdir(library_path)):
+        if _os.path.splitext(name)[1].lower() not in _IMG_EXTS:
+            continue
+        h = _phash_for(_os.path.join(library_path, name))
+        if h:
+            hashed.append((name, h))
+    leaders = []         # (leader_name, leader_hash)
+    members = {}         # leader_name -> [names]
+    for name, h in hashed:
+        placed = False
+        for lname, lh in leaders:
+            if hamming(h, lh) <= CLUSTER_HAMMING:
+                members[lname].append(name)
+                placed = True
+                break
+        if not placed:
+            leaders.append((name, h))
+            members[name] = [name]
+    groups = {}
+    for lname, names in members.items():
+        if len(names) < 2:
+            continue
+        groups[lname] = names
+        for m in names:
+            dam.write_sidecar(_os.path.join(library_path, m), {"dupe_group": lname})
+    return groups
+
+
+def cluster_count(library_path):
+    """§3 starvation guard input: the number of DISTINCT near-dupe CLUSTERS in the library
+    (each multi-shot burst counts once), plus every singleton. This — not the raw image
+    count — is how many genuinely different photos the month can draw on."""
+    import os as _os
+    from . import dam
+    if not _os.path.isdir(library_path):
+        return 0
+    seen_groups = set()
+    count = 0
+    for name in sorted(_os.listdir(library_path)):
+        if _os.path.splitext(name)[1].lower() not in _IMG_EXTS:
+            continue
+        group = dam.read_sidecar(_os.path.join(library_path, name)).get("dupe_group")
+        if group:
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
+        count += 1
+    return count
+
+
 # ---- store / read on the DAM sidecar (ruling 1: sidecar, no DB) ------------------------
 MAX_ATTEMPTS = 3                   # §2.1: nightly retry sweep, then analysis_failed + alert
 _SIDE_KEY = "media_analysis"

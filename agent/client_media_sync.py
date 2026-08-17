@@ -298,6 +298,9 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         try:
             from . import vision, ops_alerts
             vision.analyze_library(lib_dir, alert=ops_alerts.alert, logger=log)
+            # §3: collapse near-dupes into clusters so rotation + the starvation guard treat
+            # a burst as one creative.
+            vision.cluster_library(lib_dir)
         except Exception as exc:  # noqa: BLE001
             log(f"{base_key}: vision sweep failed: {type(exc).__name__}")
 
@@ -544,6 +547,22 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # path and the builder agree on what counts as usable media.
             from .client_month_run import _client_media_count
             media_count = _client_media_count(lib_dir)
+            # §3 STARVATION GUARD (vision on): count distinct near-dupe CLUSTERS, not raw
+            # images, so a burst of the same shot cannot inflate the month into forced
+            # near-dupe reuse. Cap the calendar at the cluster count and fire a gap alert to
+            # the coach BEFORE a thin month plans.
+            if config.vision_enabled_for(base):
+                from . import vision, ops_alerts
+                clusters = vision.cluster_count(lib_dir)
+                if 0 < clusters < media_count:
+                    log(f"{base}: {clusters} photo clusters < {media_count} media "
+                        "(near-dupes collapsed) — capping the month at clusters")
+                    media_count = clusters
+                if 0 < clusters < days:
+                    ops_alerts.alert(
+                        f"{base}: only {clusters} distinct photo clusters for a {days}-day "
+                        "month (starvation gap) — ask the gym for fresh material before the "
+                        "next build; the month is capped at what the library really supports")
             if media_count <= 0:
                 awaiting += 1
                 results.append({"base": base, "status": "awaiting_media",

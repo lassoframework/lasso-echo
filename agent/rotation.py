@@ -104,8 +104,11 @@ def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
                 "INSERT INTO served (account_key, key, pillar, date, archetype, "
                 "set_name) VALUES (?,?,?,?,?,?)",
                 (account_key, key, pillar, day_key, archetype, set_name))
-            # prune far beyond the window so the table never grows unbounded
-            cutoff = _days_ago(day_key, config.ROTATION_WINDOW_DAYS * 3)
+            # prune far beyond the window so the table never grows unbounded. Keep AT LEAST
+            # the vision per-platform reuse horizon (IG 60d) so a 60d reuse check never loses
+            # rows it needs (§3).
+            cutoff = _days_ago(day_key, max(config.ROTATION_WINDOW_DAYS * 3,
+                                            IG_REUSE_DAYS + 5))
             conn.execute("DELETE FROM served WHERE account_key=? AND date < ?",
                          (account_key, cutoff))
             conn.commit()
@@ -116,6 +119,57 @@ def record_served(account_key, key, pillar, day_key, archetype="", set_name=""):
 def _days_ago(day_key, n):
     from datetime import timedelta
     return (date.fromisoformat(day_key) - timedelta(days=n)).isoformat()
+
+
+# ---- §3 per-platform reuse windows -----------------------------------------------------
+IG_REUSE_DAYS = 60                  # IG never reuses a cluster within 60 days
+GBP_AFTER_IG_DAYS = 14             # GBP may reuse an IG-published image after 14 days
+GBP_SAME_MONTH_DAYS = 30          # GBP never reuses the same cluster twice in ~a month
+
+
+def _platform_of(account_key):
+    """'ig' | 'fb' | 'gbp' | 'other' for a served/target account key."""
+    k = (account_key or "").strip().lower()
+    if k.endswith("_ig") or k in ("instagram", "ig"):
+        return "ig"
+    if k.endswith("_fb") or k in ("facebook", "fb"):
+        return "fb"
+    if k in ("googlebusiness", "gbp") or k.endswith("_gbp"):
+        return "gbp"
+    return "other"
+
+
+def reuse_blocked(cluster_key, target_account_key, day_key, served=None):
+    """§3: True when serving this near-dupe CLUSTER on the target platform/day would violate
+    a reuse window. IG (and its FB mirror): not within IG_REUSE_DAYS. GBP: not within
+    GBP_SAME_MONTH_DAYS on GBP itself, and not within GBP_AFTER_IG_DAYS of an IG serve
+    (cross-surface). The same cluster never appears twice in one month on one platform. A
+    read failure returns False (never blocks planning on a flaky ledger; the no-repeat pick
+    window is the backstop)."""
+    if not cluster_key:
+        return False
+    served = load_served() if served is None else served
+    target = _platform_of(target_account_key)
+    # gather (platform, date) for every past serve of this exact cluster
+    hits = []
+    for acct, entries in (served or {}).items():
+        p = _platform_of(acct)
+        for e in entries:
+            if e.get("key") == cluster_key:
+                hits.append((p, e.get("date", "")))
+    if not hits:
+        return False
+
+    def _within(platforms, days):
+        floor = _days_ago(day_key, days)
+        return any(p in platforms and d and d >= floor for p, d in hits)
+
+    if target in ("ig", "fb"):
+        return _within(("ig", "fb"), IG_REUSE_DAYS)
+    if target == "gbp":
+        return (_within(("gbp",), GBP_SAME_MONTH_DAYS)
+                or _within(("ig", "fb"), GBP_AFTER_IG_DAYS))
+    return _within((target,), config.ROTATION_WINDOW_DAYS)
 
 
 # ---- candidate metadata ---------------------------------------------------------
