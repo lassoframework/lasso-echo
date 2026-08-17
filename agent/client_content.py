@@ -61,19 +61,23 @@ def _image_key(creative):
     return os.path.basename(creative.path)
 
 
-def pick_image(account_key, day_key, library_path, exclude_keys=()):
-    """A creative (image OR video) from the account's uploaded library, preferring one
-    not served inside the no-repeat window; falls back to the least-recently-served so
-    a stocked library always yields something. None when the library is empty or every
-    candidate is excluded.
+def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None):
+    """A creative from the account's uploaded library.
 
-    exclude_keys: creative basenames that must NOT be picked — the month builder passes
-    the photos already sitting on the gym's approved/published calendar rows plus the
-    ones this build already placed. Without this, a served-ledger polluted by repeated
-    plan-then-delete rebuild passes made the least-recently-served sort return the SAME
-    photo for every day (its own re-record kept it the minimum), collapsing a 34-photo
-    gym's month to a single feed day. Videos are picked like images (a gym that uploads
-    videos gets them posted; the publisher maps video media by extension)."""
+    LEGACY (vision off): least-recently-served within the no-repeat window, cluster-keyed
+    (dam.rotation_key collapses a near-dupe burst to one key; it falls back to the basename
+    when the library is not clustered, so non-vision behavior is unchanged).
+
+    VISION (AGENT_VISION_GYMS + a pillar, §4): IMAGES only (videos are coach hand-pick under
+    vision); flagged/unanalyzed images are never auto-picked (guardrail 13); a cluster inside
+    a per-platform reuse window is skipped (§3); the rest are scored on slot-job fit
+    (vision.content_score) and the best is chosen deterministically. Below VISION_SCORE_FLOOR
+    the best available is still returned but flagged `weak_match` for the coach (never silent,
+    §4). None when nothing plannable remains.
+
+    exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
+    approved/published rows + this build's placements)."""
+    from . import dam
     imgs = [c for c in list_creatives(library_path)
             if c.media_type in ("image", "video")]
     excl = rotation.style_exclusions(library_path)
@@ -88,9 +92,41 @@ def pick_image(account_key, day_key, library_path, exclude_keys=()):
     for e in served:                       # oldest..newest, so newest date wins
         last_served[e["key"]] = e["date"]
     window_start = rotation._days_ago(day_key, config.ROTATION_WINDOW_DAYS)
-    fresh = [c for c in imgs if last_served.get(_image_key(c), "") < window_start]
+
+    def _rkey(c):
+        return dam.rotation_key(c.path)
+
+    if config.vision_enabled_for(account_key) and pillar:
+        from . import vision
+        cands = []
+        for c in imgs:
+            if c.media_type != "image":
+                continue                   # §2.1: videos are out of scope for vision auto-pick
+            analysis = vision.stored_analysis(c.path)
+            ok, _ = vision.auto_plannable(analysis)
+            if not ok:
+                continue                   # guardrail 13: flagged/unanalyzed never auto-planned
+            rk = _rkey(c)
+            if rotation.reuse_blocked(rk, account_key, day_key, served={account_key: served}):
+                continue                   # §3 per-platform reuse window
+            recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
+            score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
+            if ok_slot:
+                cands.append((score, rk, _image_key(c), c))
+        if not cands:
+            return None
+        cands.sort(key=lambda t: (-t[0], t[1], t[2]))   # high score, deterministic tie-break
+        best_score, _rk, _name, best = cands[0]
+        if best_score < vision.VISION_SCORE_FLOOR:
+            try:
+                best.weak_match = True     # planned but flagged for the coach (§4, never silent)
+            except Exception:
+                pass
+        return best
+
+    fresh = [c for c in imgs if last_served.get(_rkey(c), "") < window_start]
     pool = fresh if fresh else imgs
-    pool.sort(key=lambda c: (last_served.get(_image_key(c), ""), _image_key(c)))
+    pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
     return pool[0]
 
 
@@ -312,8 +348,11 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     scheduled_for = schedule.scheduled_for(day_key)
     fragments = [source.text, f"cite:{source.citation}"]
 
+    from . import dam
+    # §4: pass the day's pillar so vision content-scores the pick to the slot job (a no-op
+    # for non-vision gyms, which keep least-recently-served rotation).
     image = pick_image(account.key, day_key, library_path,
-                       exclude_keys=exclude_keys)
+                       exclude_keys=exclude_keys, pillar=category)
     if image is not None:
         # Pass the ACTUAL picked creative so the caption is grounded in what the photo/
         # video shows (its sidecar note + filename), not just the rotated source topic.
@@ -325,8 +364,10 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             hosted = media_host.host_media(image.path, account.key)
             if hosted:
                 public_url = hosted
-        rotation.record_served(account.key, _image_key(image), category, day_key)
-        return Draft(
+        # Record on the CLUSTER key (dam.rotation_key; basename when unclustered) so the
+        # per-platform reuse windows + no-repeat window see a near-dupe burst as one asset.
+        rotation.record_served(account.key, dam.rotation_key(image.path), category, day_key)
+        draft = Draft(
             draft_id=_make_id(account.key, image.path, scheduled_for),
             account_key=account.key,
             platform=account.platform,
@@ -340,6 +381,16 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             day_key=day_key,
             category=category,
         )
+        # §4 weak_match: no image cleared the score floor -> the best available was planned
+        # and flagged for the coach. Never silent: carry it on the draft + log it.
+        if getattr(image, "weak_match", False):
+            try:
+                draft.weak_match = True
+            except Exception:
+                pass
+            print(f"[vision] weak_match pick for {account.key} {day_key} "
+                  f"(pillar {category}) -> coach review")
+        return draft
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",

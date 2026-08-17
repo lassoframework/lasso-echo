@@ -201,11 +201,12 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     rows = []
     counts = {"standard": 0, "offer": 0, "event": 0, "photo": 0, "skipped": 0}
 
-    def _image_url(day_key):
+    def _image_url(day_key, pillar=None):
         if image_fn is not None:
             return image_fn(day_key, used)
+        # §4: pass the slot pillar so vision content-scores the pick (no-op for non-vision).
         img = client_content.pick_image(account_gen_key, day_key, library_path,
-                                        exclude_keys=used)
+                                        exclude_keys=used, pillar=pillar)
         if img is None:
             return None
         key = os.path.basename(img.path)
@@ -228,7 +229,7 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                                                   present) if cat else None
             fact = getattr(src, "text", "") if src else ""
             pillar = cat or "update"
-        img_url = _image_url(day.isoformat()) if fact else None
+        img_url = _image_url(day.isoformat(), pillar=pillar) if fact else None
         cap = caption_fn(fact) if (fact and img_url) else None
         if cap and img_url:
             rows.append(_row(portal_gym_key, account_gen_key, day.isoformat(), cap,
@@ -245,7 +246,7 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     if offer and offer[0] and offer[1] and offer_confirmed:
         oname, odict = offer
         od = day.isoformat()
-        img_url = _image_url(od)
+        img_url = _image_url(od, pillar="offer")
         cap = caption_fn(f"Our current offer: {oname}") if img_url else None
         if cap and img_url:
             rows.append(_row(portal_gym_key, account_gen_key, od, cap, img_url,
@@ -263,7 +264,7 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     # ---- 0-2 EVENT (real events only) ----
     for ev in list(events)[:CADENCE["EVENT_MAX"]]:
         ed = day.isoformat()
-        img_url = _image_url(ed)
+        img_url = _image_url(ed, pillar="event")
         cap = caption_fn(ev.get("fact") or ev.get("title") or "") if img_url else None
         if cap and img_url and ev.get("schedule"):
             rows.append(_row(portal_gym_key, account_gen_key, ed, cap, img_url,
@@ -280,7 +281,7 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     # ---- 4 PHOTO drops (gallery uploads; image only, no caption gate) ----
     pday = start + timedelta(days=1)
     while counts["photo"] < CADENCE["PHOTO"] and (pday - start).days < days:
-        img_url = _image_url(pday.isoformat())
+        img_url = _image_url(pday.isoformat(), pillar="photo")
         if img_url:
             rows.append(_row(portal_gym_key, account_gen_key, pday.isoformat(),
                              "", img_url, topic_type="STANDARD", pillar="photo",

@@ -382,6 +382,79 @@ def cluster_library(library_path):
     return groups
 
 
+# ---- Phase 3: content scoring (§4 — match the slot JOB to the picture) -----------------
+# Each pillar/slot-job maps to preferred image CONTENT. Keys are matched as substrings
+# against the (lowercased) pillar so client categories (offer/service/testimonial/faq/about/
+# promo) AND GBP pillar names ("local update", "photo", "proof", ...) both resolve.
+_SLOT_PREFS = {
+    "testimonial":  {"activity": ("coaching", "strength"), "people": ("solo", "pair"),
+                     "setting": ("gym_floor", "studio")},           # Transformation
+    "transform":    {"activity": ("coaching", "strength"), "people": ("solo", "pair"),
+                     "setting": ("gym_floor", "studio")},
+    "service":      {"activity": ("coaching", "class"), "people": ("solo", "pair", "small_group"),
+                     "setting": ("gym_floor", "studio")},           # Education
+    "faq":          {"activity": ("coaching", "facility"), "people": ("solo", "small_group"),
+                     "setting": ("gym_floor", "front_desk")},       # Education
+    "education":    {"activity": ("coaching", "class"), "people": ("solo", "small_group"),
+                     "setting": ("gym_floor",)},
+    "community":    {"activity": ("class", "community"), "people": ("small_group", "crowd"),
+                     "setting": ("gym_floor", "event")},            # Community
+    "about":        {"activity": ("community", "facility"), "people": ("small_group", "crowd"),
+                     "setting": ("gym_floor", "front_desk")},
+    "promo":        {"activity": ("class", "community"), "people": ("small_group", "crowd"),
+                     "setting": ("gym_floor",)},
+    "offer":        {"activity": ("facility", "community"), "people": ("small_group", "crowd",
+                     "none"), "setting": ("gym_floor", "exterior")},  # Offer: best-lit facility/group
+    "photo":        {"activity": ("facility", "community"), "people": ("none", "small_group",
+                     "crowd"), "setting": ("gym_floor", "exterior", "front_desk")},  # GBP photo drop
+    "local":        {"activity": ("facility", "community"), "people": ("small_group", "crowd",
+                     "none"), "setting": ("exterior", "front_desk", "gym_floor")},  # GBP local update
+    "behind":       {"activity": ("coaching", "facility"), "people": ("solo", "none"),
+                     "setting": ("gym_floor", "front_desk")},       # Behind the scenes
+    "proof":        {"activity": ("coaching", "strength", "community"), "people": ("solo",
+                     "pair", "small_group"), "setting": ("gym_floor",)},
+}
+_DEFAULT_PREFS = {"activity": ("class", "coaching", "community", "facility"),
+                  "people": ("solo", "pair", "small_group"), "setting": ("gym_floor",)}
+VISION_SCORE_FLOOR = 3.0            # below this, the best pick is flagged weak_match (§4)
+# a slot that WANTS a behind-the-scenes / facility feel — the only home for
+# athlete_leaning/unclear images (§2.2/§4).
+_BTS_SLOTS = ("behind", "faq", "about", "photo", "local", "offer")
+
+
+def _prefs_for(pillar):
+    p = (pillar or "").strip().lower()
+    for key, prefs in _SLOT_PREFS.items():
+        if key in p:
+            return prefs, key
+    return _DEFAULT_PREFS, ""
+
+
+def content_score(analysis, pillar, *, recency=0.0):
+    """(score, ok_for_slot): how well this image's CONTENT fits the slot job (§4). Higher is
+    better. ok_for_slot is False when the image must not fill THIS slot (an athlete_leaning/
+    unclear image outside a behind-the-scenes/facility slot). Score blends pillar affinity
+    (activity + people + setting matches) + quality + a caller-supplied recency bonus (0..1,
+    higher = fresher). Deterministic given the analysis + pillar + recency."""
+    if not analysis or analysis.get("analysis_failed"):
+        return -1.0, False
+    prefs, key = _prefs_for(pillar)
+    # BTS restriction (§2.2/§4): athlete_leaning/unclear only in a behind/facility slot.
+    if bts_restricted(analysis) and key not in _BTS_SLOTS:
+        return -1.0, False
+    score = 0.0
+    if analysis.get("activity") in prefs["activity"]:
+        score += 3.0
+    if (analysis.get("people") or {}).get("bucket") in prefs["people"]:
+        score += 2.0
+    if analysis.get("setting") in prefs["setting"]:
+        score += 1.5
+    q = analysis.get("quality") or {}
+    score += (0.5 if q.get("sharp") else 0.0) + (0.5 if q.get("well_lit") else 0.0)
+    score += max(0.0, min(1.0, recency))          # fresher (less recently served) ranks up
+    return score, True
+
+
 def cluster_count(library_path):
     """§3 starvation guard input: the number of DISTINCT near-dupe CLUSTERS in the library
     (each multi-shot burst counts once), plus every singleton. This — not the raw image
