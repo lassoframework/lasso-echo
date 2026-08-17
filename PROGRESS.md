@@ -92,6 +92,22 @@ It publishes direct to mybusiness.googleapis.com/v4 with a hand-set token (impor
 approvals.py, config.py). Per Blake's portal-session ruling, ALL GBP publishing routes through
 `zernio_publisher.py` per the spec. Leave the legacy file untouched.
 
+### [x] Task #28 (ruled to the Echo session, 2026-08-17) — CLOSED, 0 audit findings
+Echo-side backend support for the two portal (Vercel) optimistic-state bugs + the story
+instant re-burn; the exact Vercel frontend diff lives in
+`docs/PORTAL_SPEC_disconnect_and_scheduled_time.md §6` for the portal session to apply.
+- **5a reason field:** edit responses ECHO `reason` + `reason_captured` (both surfaces); caption
+  stays the note only (fabrication gate runs first; reason never enters the caption).
+- **5b false-approval:** approve/deny/kill/requeue + the generic action path return the WRITTEN
+  row's authoritative `status` + `day_key` (`_action_result`); `/social` already per-post
+  authoritative. UI binds each card to its own id — no carry-over.
+- **5c story re-burn:** DRAFT migration `migrations/DRAFT_content_calendar_source_media_url.sql`
+  (to Blake, NOT applied). Behind `AGENT_STORY_SOURCE_MEDIA` (default OFF, under
+  AGENT_STORY_FORMAT): planner stores each story's raw source url (omitted from the row when
+  unset → pre-migration inserts safe), a story-caption edit re-burns immediately + swaps
+  image_url; best-effort (never fails the saved edit). SEQUENCE: apply migration → arm flag.
+Independent audit: 6/6 CONFIRMED, 0 material defects. Suite 2811 passed.
+
 ### [x] Phase 2 migration LANDED (confirmed 2026-08-15)
 `information_schema` on the portal project (ooqcvmcjspeltuuhcvlh) shows all six GBP columns on
 `content_calendar`: `gbp_topic_type`, `gbp_cta_type`, `gbp_cta_url`, `gbp_event` (jsonb),
