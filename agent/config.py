@@ -870,6 +870,17 @@ def gbp_coach_screen_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
 
 
+def coach_screen_first_month_enabled() -> bool:
+    """GATE 2 for the FB/IG CLIENT month (Blake, 2026-08-17): coach screens every gym's
+    FIRST month on EVERY platform before the owner sees it — the coach SOP (walk the owner
+    through their first approvals) now enforced in software. When ON (the DEFAULT), a
+    CLIENT gym's first FB/IG month is written 'coach_review' (withheld) until released.
+    Gyms with a month already in flight are grandfathered (they already have owner-visible
+    rows, so they are not first-month). Set AGENT_COACH_SCREEN_FIRST_MONTH=false to bypass.
+    LASSO's own dogfood account is exempt (it is not a client gym)."""
+    return _truthy(os.environ.get("AGENT_COACH_SCREEN_FIRST_MONTH", "true"))
+
+
 def welcome_digest_enabled() -> bool:
     """
     Daily NEW-CLIENT welcome digest to Slack: one message a day listing every new

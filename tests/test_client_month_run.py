@@ -178,6 +178,65 @@ def test_builds_paused_real_photo_rows_with_fb_mirror(tmp_path):
     assert ("gritx", "2026-08") in store.deleted
 
 
+# ---- 3b. GATE 2 coach-screens-first-month (FB/IG client month) -------------------
+
+class _StoreWithHistory(_FakeStore):
+    """A store that reports whether the gym already has owner-visible rows (the real
+    Supabase signal), so the first-month gate can engage."""
+    def __init__(self, has_visible):
+        super().__init__()
+        self._has_visible = has_visible
+
+    def has_owner_visible_rows(self, base_key):
+        return self._has_visible
+
+
+def test_gate2_first_month_withheld_as_coach_review(tmp_path):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _StoreWithHistory(has_visible=False)   # brand-new gym, no prior rows
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True and store.inserted
+    assert all(r["status"] == "coach_review" for r in store.inserted), \
+        "a gym's first month must be withheld from the owner until a coach releases it"
+
+
+def test_gate2_established_gym_grandfathered_pending(tmp_path):
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _StoreWithHistory(has_visible=True)     # already has owner-visible rows
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True and store.inserted
+    assert all(r["status"] == "pending" for r in store.inserted), \
+        "an established gym is grandfathered, never re-withheld on a rebuild"
+
+
+def test_gate2_off_writes_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_COACH_SCREEN_FIRST_MONTH", "false")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _StoreWithHistory(has_visible=False)
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True and all(r["status"] == "pending" for r in store.inserted)
+
+
+def test_gate2_store_without_signal_defaults_pending(tmp_path):
+    # a store lacking has_owner_visible_rows (legacy/tests) never withholds by accident
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True and all(r["status"] == "pending" for r in store.inserted)
+
+
 # ---- 4. a day with no photo is SKIPPED, never infographic-filled ------------------
 def test_day_with_no_photo_is_skipped_never_infographic(tmp_path, monkeypatch):
     _stock_clean("gritx_ig")

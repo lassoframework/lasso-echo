@@ -180,10 +180,19 @@ Both live in the Echo planner (+ the Echo backend read), NOT the Vercel portal. 
   rejects them (409) — the owner cannot see or approve month-1 until a coach releases it. Release:
   `python3 -m agent.gbp_dogfood release <gym>` flips the gym's `coach_review` rows -> `pending`. First
   month = the gym has no prior googlebusiness rows (`GbpStore.any_gbp_rows`).
-- **LASSO's existing 12 dogfood rows are `pending`** (planned before these gates) and stay owner-visible
-  — Blake is LASSO's own coach/owner. New gyms get `coach_review` on their first month automatically.
-  OPEN: extend GATE 2 to the FB/IG client-month lane (`build_client_month`)? Not done (that lane is
-  owned by a parallel edit right now); flag for Blake.
+- **LASSO's 12 dogfood rows stay `pending`** — EXEMPT BY DESIGN (`gbp_dogfood.run` skips GATE 2 for
+  base `lasso`; `build_client_month` skips it too). Blake is LASSO's own owner+coach; approving the
+  raw month IS the client-experience test.
+- **GATE 2 EXTENDED to the FB/IG client month (Blake ruling 2026-08-17).** Coach screens every gym's
+  first month on EVERY platform before the owner sees it (the coach SOP, now enforced in software).
+  `build_client_month` writes a client gym's FIRST month `coach_review` when
+  `AGENT_COACH_SCREEN_FIRST_MONTH` (default ON) and the gym has no owner-visible rows yet
+  (`SupabaseCalendarStore.has_owner_visible_rows`). Gyms with a month already in flight are
+  GRANDFATHERED (they have owner-visible rows -> not first month -> never re-withheld). Safe default:
+  a store lacking the signal is treated as established (no withhold). The coach release is
+  gym-wide across all platforms: `python3 -m agent.gbp_dogfood release <gym>` flips every
+  `coach_review` row (GBP + FB/IG) -> `pending` in one shot. The owner `/social` read already hides
+  `coach_review` (platform-agnostic filter), so the FB/IG withhold needed no extra read change.
 
 ### [!] Legacy `agent/gbp_publisher.py` — untouched and dead (verified)
 The new rail uses `account='googlebusiness'` rows + the GBP worker lane. `approvals.py` still routes

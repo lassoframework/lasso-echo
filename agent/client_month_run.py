@@ -289,6 +289,22 @@ def _row_from_draft(base_key, draft):
     return _mirror._real_row(base_key, draft)
 
 
+def _is_first_month(base_key, store, log):
+    """GATE 2: True when this gym has NO owner-visible content_calendar row yet (its first,
+    not-yet-released month). A store without has_owner_visible_rows (test fakes, legacy) is
+    treated as ESTABLISHED (returns False) so the gate only ever engages against the real
+    Supabase store — nothing withheld by accident."""
+    checker = getattr(store, "has_owner_visible_rows", None)
+    if not callable(checker):
+        return False
+    try:
+        return not checker(base_key)
+    except Exception as exc:  # noqa: BLE001 - a check failure must never withhold blindly
+        log(f"{base_key}: first-month check failed ({type(exc).__name__}); treating as "
+            "established (not withheld)")
+        return False
+
+
 def build_client_month(account, base_key, start_date, days=30, *, voice,
                        library_path=None, store, banned_words=(), logger=None):
     """Assemble a month of PAUSED client calendar rows FROM THE GYM'S OWN UPLOADED
@@ -470,6 +486,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 "empty-body; refusing to ship a captionless story)")
 
     rows = _to_rows(base_key, drafts)
+    # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
+    # every platform is WITHHELD from the owner ('coach_review') until a coach screens and
+    # releases it — the coach SOP enforced in software. Established gyms (any owner-visible
+    # row already) are grandfathered, never re-withheld on a rebuild. LASSO's own account is
+    # exempt (not a client gym). Safe default: a store lacking the signal is treated as
+    # established (no withhold), so nothing changes for it.
+    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
+            and _is_first_month(base_key, store, log)):
+        for r in rows:
+            r["status"] = "coach_review"
+        log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
+            "until a coach releases it; GATE 2)")
     result = _apply(base_key, rows, start, days, store, log,
                     locked_days=locked_feed_days)
     result["days"] = built_days

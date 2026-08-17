@@ -436,3 +436,36 @@ def test_delete_month_ignores_foreign_gym_rows_in_response(monkeypatch):
     store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
                                       service_key="svc", http=http)
     assert store.delete_month("lasso", "2026-08") == 1
+
+
+# ---- GATE 2 store helpers: first-month signal + coach release -----------------
+
+def test_has_owner_visible_rows_true_when_non_coach_review_exists():
+    http = _FakeHTTP(get_resp=_Resp(200, [{"id": "x"}]))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    assert store.has_owner_visible_rows("gritx") is True
+    _, _, params, _ = http.calls[-1]
+    assert params["gym_id"] == "eq.gritx"
+    assert params["status"] == "neq.coach_review"   # coach_review rows don't count
+
+
+def test_has_owner_visible_rows_false_when_empty():
+    http = _FakeHTTP(get_resp=_Resp(200, []))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    assert store.has_owner_visible_rows("gritx") is False
+
+
+def test_release_coach_review_flips_all_platforms_to_pending():
+    released = [{"id": "1", "account": "instagram"}, {"id": "2", "account": "facebook"}]
+    http = _FakeHTTP(patch_resp=_Resp(200, released))
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc", http=http)
+    out = store.release_coach_review("gritx")
+    assert len(out) == 2
+    _, _, params, _, body = http.calls[-1]
+    assert params["gym_id"] == "eq.gritx"
+    assert params["status"] == "eq.coach_review"     # only withheld rows
+    assert "account" not in params                    # every platform, one shot
+    assert body == {"status": "pending"}

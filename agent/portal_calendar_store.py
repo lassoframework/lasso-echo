@@ -122,6 +122,33 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def has_owner_visible_rows(self, account_key):
+        """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
+        content_calendar row (any status EXCEPT 'coach_review', any account, any date). A
+        gym with none is in its FIRST, not-yet-released month; a gym with any is established
+        and grandfathered (never re-withheld on a rebuild)."""
+        params = {"gym_id": f"eq.{account_key}", "status": "neq.coach_review",
+                  "select": "id", "limit": "1"}
+        r = self._client().get(self._rest(_TABLE), params=params,
+                               headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return bool(r.json() or [])
+
+    def release_coach_review(self, account_key):
+        """GATE 2 coach release: flip ALL of this gym's withheld 'coach_review' rows (every
+        account/platform) to 'pending' in one PATCH, so the owner can see and approve their
+        first month after the coach walks them through it. Returns the released rows."""
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}", "status": "eq.coach_review"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "pending"}, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def get_row(self, account_key, row_id):
         """
         The single row with this id AND gym_id == account_key, or None.
