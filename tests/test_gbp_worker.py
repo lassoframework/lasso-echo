@@ -227,7 +227,7 @@ class _Store:
     def recent_published_gbp(self, since):
         return [dict(r) for r in self._rows if r.get("status") == "published"]
 
-    def mark_published(self, row_id, late, at):
+    def mark_published(self, row_id, late, at, gbp_location_id=None):
         self.published.append((row_id, late))
 
     def mark_failed(self, row_id, reason):
@@ -311,29 +311,131 @@ def test_reconcile_gbp_demotes_policy_rejection():
     assert store.failed and "phone" in store.failed[0][1]
 
 
-def test_g7_transient_retry_republishes_and_keeps_published():
+def _c_tz(tz="America/New_York"):
+    return {"zernio_account_id": "acc1", "gbp_location_id": "locations/1",
+            "status": "connected", "timezone": tz}
+
+
+def test_g5_in_publish_window():
     from datetime import datetime, timezone
-    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
-    rows = [dict(_row(), id="r1", gym_id="lasso", status="published", late_post_id="zpOld",
-                 published_at="2026-09-02T06:00:00+00:00")]
-    store = _Store(rows, {"lasso": [_c()]})   # a live connection so the retry can route
+    ny = "America/New_York"          # 2026-09-01 is a Tuesday; EDT = UTC-4
+    assert gw.in_publish_window(datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc), ny) is True   # 9am ET
+    assert gw.in_publish_window(datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc), ny) is False  # 12pm ET
+    assert gw.in_publish_window(datetime(2026, 9, 1, 11, 30, tzinfo=timezone.utc), ny) is False  # 7:30am ET (pre-window)
+    assert gw.in_publish_window(datetime(2026, 9, 5, 13, 0, tzinfo=timezone.utc), ny) is False   # Sat 9am ET (weekend)
+    assert gw.in_publish_window(datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc), "") is True     # no tz -> publish
+
+
+def test_g5_window_flag_off_publishes_anytime(monkeypatch):
+    from datetime import datetime, timezone
+    monkeypatch.setenv("AGENT_GBP_PUBLISH_WINDOW", "false")
+    assert gw.in_publish_window(datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
+                                "America/New_York") is True
+
+
+def test_g6_offer_window_lapsed_detection():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 15, 13, 0, tzinfo=timezone.utc)
+    offer_old = dict(_row(), gbp_topic_type="OFFER",
+                     gbp_event={"schedule": {"startDate": "2026-09-01",
+                                             "endDate": "2026-09-10"}})
+    offer_live = dict(_row(), gbp_topic_type="OFFER",
+                      gbp_event={"schedule": {"startDate": "2026-09-10",
+                                              "endDate": "2026-09-30"}})
+    assert gw.offer_window_lapsed(offer_old, now) is True     # ended 09-10, now 09-15
+    assert gw.offer_window_lapsed(offer_live, now) is False   # ends 09-30
+    assert gw.offer_window_lapsed(dict(_row()), now) is False  # a STANDARD row never lapses
+
+
+def test_g6_lapsed_offer_reverts_to_pending():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 15, 13, 0, tzinfo=timezone.utc)   # weekday 9am ET, in window
+    row = dict(_row(), id="o1", gym_id="lasso", gbp_topic_type="OFFER",
+               gbp_event={"schedule": {"startDate": "2026-09-01", "endDate": "2026-09-10"}})
+    store = _Store([row], {"lasso": [_c_tz()]})
+    alerts = []
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-15", draft=True,
+                             now=now, alert=alerts.append)
+    assert out["reverted"] == 1 and out["published"] == 0
+    assert store.status == [("o1", "pending")]               # back to the owner
+    assert store.published == [] and any("lapsed" in a for a in alerts)
+
+
+def test_g6_reslot_held_row_publishes_after_reconnect_in_window():
+    # a row held while needs_reconnect stays 'approved'; once connected AND in-window it
+    # publishes at the next window (the re-slot is emergent from hold + window gate).
+    from datetime import datetime, timezone
+    row = dict(_row(), id="r1", gym_id="eng")
+    # 1) needs_reconnect -> held, nothing sent
+    s1 = _Store([row], {"eng": [_c(status="needs_reconnect")]})
+    out1 = gw.publish_due_gbp(s1, _FakeClient(), run_date="2026-09-01", draft=True,
+                              now=datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc))
+    assert out1["held"] == 1 and s1.published == []
+    # 2) reconnected + in the 8-10am window -> publishes
+    s2 = _Store([row], {"eng": [_c_tz()]})
+    out2 = gw.publish_due_gbp(s2, _FakeClient(), run_date="2026-09-01", draft=True,
+                              now=datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc))
+    assert out2["published"] == 1 and s2.published
+
+
+def test_g5_publish_holds_outside_window():
+    from datetime import datetime, timezone
+    rows = [dict(_row(), id="r1", gym_id="lasso")]
+    store = _Store(rows, {"lasso": [_c_tz()]})
+    now = datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc)     # 12pm ET, outside 8-10am
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True,
+                             now=now, alert=lambda m: None)
+    assert out["held"] == 1 and out["published"] == 0
+    assert store.published == []                               # nothing sent off-window
+
+
+def test_g5_publish_inside_window_sends():
+    from datetime import datetime, timezone
+    rows = [dict(_row(), id="r1", gym_id="lasso")]
+    store = _Store(rows, {"lasso": [_c_tz()]})
+    now = datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc)     # 9am ET, in window
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True,
+                             now=now, alert=lambda m: None)
+    assert out["published"] == 1 and store.published
+
+
+def test_g7_send_time_transient_retry_succeeds():
+    # a transient error at SEND raises once, the ONE retry succeeds -> published.
+    calls = {"n": 0}
 
     class _C:
-        def get_post(self, pid):
-            return {"post": {"platforms": [{"platform": "googlebusiness",
-                                            "status": "failed",
-                                            "error": "temporarily unavailable, try again"}]}}
-        # the re-send succeeds with a fresh id
         def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("502 temporarily unavailable")
             return {"_id": "zpNew", "post": {"platforms": [
                 {"platform": "googlebusiness", "status": "published"}]}}
-    out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
-    assert out["retried"] == 1 and out["demoted"] == 0      # retry succeeded, no demote
-    assert store.published and store.published[-1][0] == "r1"   # re-published
-    assert store.failed == []
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["ok"] and res["status"] == "published" and calls["n"] == 2
 
 
-def test_g7_transient_retry_failure_demotes_to_failed():
+def test_g7_send_time_second_failure_is_failed():
+    class _C:
+        def create_post_raw(self, payload, **k):
+            raise RuntimeError("request timeout")     # both the send and the retry fail
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["ok"] is False and res["status"] == "failed"
+    assert "after a retry" in res["reject_reason"]
+
+
+def test_g7_policy_send_error_not_retried():
+    calls = {"n": 0}
+
+    class _C:
+        def create_post_raw(self, payload, **k):
+            calls["n"] += 1
+            raise RuntimeError("policy violation: phone number in post")
+    res = gw.publish_gbp_row(dict(_row(), id="r1"), _c(), client=_C(), draft=False)
+    assert res["ok"] is False and calls["n"] == 1     # a policy error is NOT retried
+
+
+def test_g7_reconcile_transient_keeps_polling_never_resends():
+    # a transient poll result must NOT re-send (double-post + draft-bypass risk); keep polling
     from datetime import datetime, timezone
     now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
     rows = [dict(_row(), id="r1", gym_id="lasso", status="published", late_post_id="zpOld",
@@ -344,12 +446,12 @@ def test_g7_transient_retry_failure_demotes_to_failed():
         def get_post(self, pid):
             return {"post": {"platforms": [{"platform": "googlebusiness",
                                             "status": "failed",
-                                            "error": "request timeout"}]}}
-        def create_post_raw(self, payload, **k):
-            raise RuntimeError("still failing")     # retry also fails
+                                            "error": "temporarily unavailable, try again"}]}}
+        def create_post_raw(self, *a, **k):
+            raise AssertionError("reconcile must NEVER re-send (double-post risk)")
     out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
-    assert out["retried"] == 1 and out["demoted"] == 1
-    assert store.failed and store.failed[0][0] == "r1"       # one retry, then failed
+    assert out["waiting"] == 1 and out["demoted"] == 0    # keeps polling, no demote
+    assert store.failed == [] and store.published == []   # untouched
 
 
 def test_g3_reconcile_ranks_top_post_by_clicks():

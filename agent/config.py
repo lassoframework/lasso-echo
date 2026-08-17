@@ -870,6 +870,14 @@ def gbp_coach_screen_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
 
 
+def gbp_publish_window_enabled() -> bool:
+    """§7.3 / G5: gate GBP publishing to weekday mornings 8-10am in the CONNECTION row's
+    timezone. Default ON. Set AGENT_GBP_PUBLISH_WINDOW=false to publish a due GBP post
+    whenever the lane runs (e.g. a manual catch-up). A row outside the window HOLDS
+    (status stays 'approved') and publishes on the next in-window tick."""
+    return _truthy(os.environ.get("AGENT_GBP_PUBLISH_WINDOW", "true"))
+
+
 def coach_screen_first_month_enabled() -> bool:
     """GATE 2 for the FB/IG CLIENT month (Blake, 2026-08-17): coach screens every gym's
     FIRST month on EVERY platform before the owner sees it — the coach SOP (walk the owner

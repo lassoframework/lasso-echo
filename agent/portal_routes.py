@@ -122,7 +122,7 @@ def handle_portal_library(account_key):
 
 
 def handle_portal_action(action, account_key, draft_id, actor_id, note="",
-                         store=None, confirm=False, reason=""):
+                         store=None, confirm=False, reason="", gbp=None):
     """
     POST /portal/<token>/{approve|edit|deny|kill}
 
@@ -156,7 +156,7 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
     # path). No creds -> the existing portal_approvals/SQLite path, unchanged.
     if store is None and config.portal_calendar_supabase_enabled():
         return _handle_action_supabase(action, account_key, draft_id, note,
-                                       reason=reason)
+                                       reason=reason, gbp=gbp)
 
     # requeue (G2) is a content_calendar-only action (failed GBP/FB/IG rows live there).
     # The legacy SQLite drafts plane has no failed-row recovery, so it is unsupported there.
@@ -216,7 +216,32 @@ def handle_portal_report(account_key, days):
 
 # ---- helpers -------------------------------------------------------------------
 
-def _handle_action_supabase(action, account_key, draft_id, note, reason=""):
+_GBP_FIELD_MAP = {
+    "topicType": "gbp_topic_type", "topic_type": "gbp_topic_type",
+    "gbp_topic_type": "gbp_topic_type",
+    "ctaType": "gbp_cta_type", "cta_type": "gbp_cta_type", "gbp_cta_type": "gbp_cta_type",
+    "ctaUrl": "gbp_cta_url", "cta_url": "gbp_cta_url", "gbp_cta_url": "gbp_cta_url",
+    "event": "gbp_event", "gbp_event": "gbp_event",
+    "offer": "gbp_offer", "gbp_offer": "gbp_offer",
+    "locationId": "gbp_location_id", "location_id": "gbp_location_id",
+    "gbp_location_id": "gbp_location_id",
+}
+
+
+def _normalize_gbp_fields(gbp):
+    """Map a portal `gbp` edit object (topicType/ctaType/... OR the column names) to
+    content_calendar columns. Unknown keys are ignored. Returns {} when nothing maps."""
+    if not isinstance(gbp, dict):
+        return {}
+    out = {}
+    for k, v in gbp.items():
+        col = _GBP_FIELD_MAP.get(k)
+        if col:
+            out[col] = v
+    return out
+
+
+def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=None):
     """
     Supabase content_calendar action path. approve/deny/kill flip status; edit
     keeps status pending and echoes the note (no schema change, never fails on a
@@ -251,35 +276,59 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason=""):
                                   "a minute once it lands"}
 
         if action == "edit":
-            if not note:
+            # G1: an edit may change the caption (note), the GBP structured fields (gbp),
+            # or both. At least one is required.
+            gbp_fields = _normalize_gbp_fields(gbp)
+            if not note and not gbp_fields:
                 return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
-                             "error": "note (new caption text) is required for edit"}
-            # FABRICATION GATE (same gate as the Part-B route): a note that introduces
-            # a stat/percentage/price with no approved receipt NEVER enters the caption.
-            from . import rotation as _rotation
-            if not _rotation.is_gate_clean(note):
-                return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
-                             "error": "fabrication gate: the note carries a claim "
-                                      "with no approved receipt. Cite an approved "
-                                      "source or drop the figure."}
+                             "error": "a new caption (note) or gbp fields is required "
+                                      "for edit"}
+            # Validate the GBP structured fields BEFORE any write (the worker re-validates
+            # the full payload at send, but reject an obviously bad topic/CTA here).
+            if gbp_fields:
+                from . import gbp as _gbp
+                tt = gbp_fields.get("gbp_topic_type")
+                if tt is not None and tt not in _gbp.TOPIC_TYPES:
+                    return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                                 "error": f"invalid gbp topic type: {tt}"}
+                ct = gbp_fields.get("gbp_cta_type")
+                if ct is not None and ct not in _gbp.CTA_TYPES:
+                    return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                                 "error": f"invalid gbp cta type: {ct}"}
             before = row.get("caption") or ""
-            updated = sb.patch_caption(account_key, draft_id, note)
-            if updated is None:
-                return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-            # DURABLE-FIRST (Dale, 2026-08-17): the caption is now saved. LEARN from the
-            # edit best-effort so future captions match the approver's taste; the reason
-            # (when sent) is captured as the edit's rule so the stated intent is not
-            # dropped. Learning is guarded so a slow/failing brain write can NEVER flip a
-            # persisted edit into an error the client keeps retrying.
-            try:
-                from .portal_social import _learn_from_edit
-                _learn_from_edit(account_key, before, note, reason=reason)
-            except Exception:
-                pass
+            updated = None
+            if note:
+                # FABRICATION GATE (same gate as the Part-B route): a note that introduces
+                # a stat/percentage/price with no approved receipt NEVER enters the caption.
+                from . import rotation as _rotation
+                if not _rotation.is_gate_clean(note):
+                    return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
+                                 "error": "fabrication gate: the note carries a claim "
+                                          "with no approved receipt. Cite an approved "
+                                          "source or drop the figure."}
+                updated = sb.patch_caption(account_key, draft_id, note)
+                if updated is None:
+                    return 404, {"ok": False, "error": "draft not found",
+                                 "draft_id": draft_id}
+                # DURABLE-FIRST (Dale, 2026-08-17): the caption is saved. LEARN best-effort
+                # so future captions match the approver's taste; the reason (when sent) is
+                # captured as the edit's rule. Guarded so a slow brain write can NEVER flip
+                # a persisted edit into an error the client keeps retrying.
+                try:
+                    from .portal_social import _learn_from_edit
+                    _learn_from_edit(account_key, before, note, reason=reason)
+                except Exception:
+                    pass
+            if gbp_fields:
+                updated = sb.patch_gbp_fields(account_key, draft_id, gbp_fields)
+                if updated is None:
+                    return 404, {"ok": False, "error": "draft not found",
+                                 "draft_id": draft_id}
             return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
-                         "caption": updated.get("caption", ""),
-                         "status": updated.get("status", "pending"),
-                         "reason_captured": bool((reason or "").strip())}
+                         "caption": (updated.get("caption", "") if updated else ""),
+                         "status": (updated.get("status", "pending") if updated else "pending"),
+                         "reason_captured": bool((reason or "").strip()),
+                         "gbp_updated": sorted(gbp_fields.keys())}
 
         if action == "requeue":
             # G2: a coach fixes a FAILED row and requeues. If the caption WORDS changed,

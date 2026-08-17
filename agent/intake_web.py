@@ -1557,7 +1557,8 @@ def build_server(port=None):
             # Gated by AGENT_PORTAL_APPROVALS. Token resolves to account_key.
             # Unknown/revoked token = 404. Body is JSON: {draft_id, actor_id, note?}.
             pt_token, pt_action = self._portal_token_route()
-            if pt_token is not None and pt_action in ("approve", "edit", "deny", "kill"):
+            if pt_token is not None and pt_action in ("approve", "edit", "deny", "kill",
+                                                      "requeue"):
                 account_key = client_for_token(pt_token)
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
@@ -1576,9 +1577,12 @@ def build_server(port=None):
                 # a portal sending "reason" or "why" is captured either way.
                 reason = (body.get("reason", "") or body.get("why", "")
                           or body.get("reason_why", ""))
+                # GBP structured fields forwarded on edit (G1): a `gbp` object carrying
+                # topic/cta/event/offer/location. Passed through so Echo persists them.
+                gbp = body.get("gbp") if isinstance(body.get("gbp"), dict) else None
                 status, resp = _pr.handle_portal_action(
                     pt_action, account_key, draft_id, actor_id, note=note,
-                    confirm=bool(body.get("confirm", False)), reason=reason,
+                    confirm=bool(body.get("confirm", False)), reason=reason, gbp=gbp,
                 )
                 return self._send_json(resp, status)
 

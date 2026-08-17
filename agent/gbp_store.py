@@ -125,10 +125,17 @@ class GbpStore:
         return self._s.insert_rows(portal_gym_key, rows)
 
     # ---- writes (content_calendar status only; never an approval) -----------
-    def mark_published(self, row_id, late_post_id, published_at):
-        return self._patch(row_id, {"status": "published",
-                                    "late_post_id": late_post_id or "",
-                                    "published_at": published_at})
+    def mark_published(self, row_id, late_post_id, published_at, gbp_location_id=None):
+        """Stamp the row published. gbp_location_id (the CONNECTION's location, bound at
+        publish) is written back onto the row when given, so a row planned before Connect
+        (null location) now carries the real location — this keeps the reconcile top-post
+        ranker keyed on the SAME (gym, location, month) as the publish-time posts_published
+        bump (G3)."""
+        fields = {"status": "published", "late_post_id": late_post_id or "",
+                  "published_at": published_at}
+        if gbp_location_id:
+            fields["gbp_location_id"] = gbp_location_id
+        return self._patch(row_id, fields)
 
     def mark_failed(self, row_id, reject_reason):
         """§7.1/§7.2: a failed GBP post -> status='failed' + plain-English reason. NEVER

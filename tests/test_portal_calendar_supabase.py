@@ -527,3 +527,41 @@ def test_requeue_refused_on_legacy_plane():
     status, body = portal_routes.handle_portal_action(
         "requeue", "lasso", "id", "a1", store=object())
     assert status == 400 and "content_calendar" in body["error"]
+
+
+# ---- G1 edit accepts + persists GBP structured fields ------------------------
+
+def test_edit_persists_gbp_structured_fields(monkeypatch):
+    pre = _Resp(200, [_row("id-g", gym_id="lasso", status="approved")])
+    patched = _Resp(200, [_row("id-g", gym_id="lasso", status="pending")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    gbp = {"topicType": "EVENT", "ctaType": "BOOK", "ctaUrl": "https://gym.com/e",
+           "event": {"schedule": {"startDate": "2026-10-01", "endDate": "2026-10-01"}}}
+    status, body = portal_routes.handle_portal_action(
+        "edit", "lasso", "id-g", "a1", gbp=gbp)
+    assert status == 200 and body["ok"] is True
+    assert set(body["gbp_updated"]) == {"gbp_topic_type", "gbp_cta_type", "gbp_cta_url",
+                                        "gbp_event"}
+    payload = [c for c in http.calls if c[0] == "patch"][-1][4]
+    assert payload["gbp_topic_type"] == "EVENT" and payload["gbp_cta_type"] == "BOOK"
+    assert payload["gbp_cta_url"] == "https://gym.com/e"
+    assert payload["status"] == "pending"      # a structured edit resets approval
+
+
+def test_edit_rejects_bad_gbp_topic_before_write(monkeypatch):
+    pre = _Resp(200, [_row("id-g", gym_id="lasso", status="approved")])
+    http = _FakeHTTP(get_resp=pre)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action(
+        "edit", "lasso", "id-g", "a1", gbp={"topicType": "REEL"})
+    assert status == 422 and "topic" in body["error"].lower()
+    assert [c for c in http.calls if c[0] == "patch"] == []    # rejected before any write
+
+
+def test_edit_requires_note_or_gbp(monkeypatch):
+    pre = _Resp(200, [_row("id-g", gym_id="lasso", status="approved")])
+    http = _FakeHTTP(get_resp=pre)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action("edit", "lasso", "id-g", "a1")
+    assert status == 400 and "caption" in body["error"].lower()

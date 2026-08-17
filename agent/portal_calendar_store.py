@@ -199,6 +199,28 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_gbp_fields(self, account_key, row_id, fields):
+        """G1: persist edited GBP structured columns (already normalized to gbp_* names)
+        and revert status to 'pending' — an edit to CTA/event/offer/location resets the
+        approval exactly like a caption edit, so the owner re-approves what actually ships.
+        id+gym_id isolation. Returns the updated row, or None when zero rows matched."""
+        payload = {k: v for k, v in (fields or {}).items()}
+        if not payload:
+            return None
+        payload["status"] = "pending"
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def requeue(self, account_key, row_id, *, new_status, new_caption=None):
         """G2 requeue: move a FAILED row back into the flow, CLEARING reject_reason.
         When new_caption is given (the coach changed the words) it is written and
