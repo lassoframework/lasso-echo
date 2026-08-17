@@ -158,6 +158,51 @@ def _locked_calendar_state(base_key, start, days, store, log):
     return locked_days, used
 
 
+def _edited_story_captions(base_key, start, days, store, log):
+    """{post_date -> caption} for STORY rows the client edited in the portal but which
+    have NOT been re-rendered yet. Editing a story caption (portal_calendar_store.
+    patch_caption) resets the row to 'pending' and updates content_calendar.caption, but
+    the burned media still carries the OLD caption. A rebuild would otherwise re-render
+    the story from the FRESH feed caption and silently discard the client's edit. We
+    read the client's edited story caption here so the rebuild RE-RENDERS the story with
+    the CLIENT'S text (Dale, 2026-08-17: 'I added a story caption and saved but it did
+    not show'). Only a story whose caption differs from its paired feed's caption is
+    treated as edited (an unedited paired story matches the feed by construction).
+    Read-only; a read failure returns {} (the rebuild falls back to the feed caption)."""
+    from datetime import timedelta
+    edited = {}
+    list_month = getattr(store, "list_month", None)
+    if list_month is None:
+        return edited
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - never block the build on a read
+            log(f"edited-story read failed for {month}: {type(exc).__name__}")
+            continue
+        feeds_by_date = {}
+        stories_by_date = {}
+        for row in rows:
+            fmt = str(row.get("format") or "").lower()
+            pd = str(row.get("post_date") or "")[:10]
+            if not pd:
+                continue
+            if fmt == "feed":
+                feeds_by_date.setdefault(pd, row.get("caption") or "")
+            elif fmt == "story":
+                stories_by_date[pd] = row.get("caption") or ""
+        for pd, story_cap in stories_by_date.items():
+            story_cap = (story_cap or "").strip()
+            feed_cap = (feeds_by_date.get(pd) or "").strip()
+            # An edited story caption is one that differs from the paired feed caption
+            # (an unedited paired story is cloned FROM the feed, so it matches).
+            if story_cap and story_cap != feed_cap:
+                edited[pd] = story_cap
+    return edited
+
+
 def _has_real_creative(draft):
     """True when the draft carries a REAL uploaded creative: a hosted/public url AND it
     is NOT a needs-media (no-image) draft. This is what makes a day emit a row; a day
@@ -306,6 +351,9 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # consumed by pruned colliding rows were lost forever (under-build).
     locked_feed_days, used_keys = _locked_calendar_state(
         base_key, start, days, store, log)
+    # Client-EDITED story captions per day: honor them on re-render so a saved story
+    # caption is not discarded by the rebuild (Dale, 2026-08-17).
+    edited_story_caps = _edited_story_captions(base_key, start, days, store, log)
 
     # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
     # bound; the real number of NEW feed-days is at most the media not already locked
@@ -382,6 +430,14 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # a story. No extra media is consumed, so N photos -> N feeds + N stories.
         story = _story_from_feed(feed)
         _mark_story(story)
+        # HONOR A CLIENT-EDITED STORY CAPTION: if the client edited this day's story
+        # caption in the portal, re-render the story with THEIR text (not the freshly
+        # generated feed caption), so a saved story caption is never discarded by the
+        # rebuild. Fabrication-safe: an edited caption already cleared the edit route's
+        # fabrication gate before it was stored. The FEED keeps its own caption.
+        story_caption_override = edited_story_caps.get(str(day_key)[:10])
+        if story_caption_override:
+            story.caption = story_caption_override
         # STORY FORMATTING (AGENT_STORY_FORMAT): a PHOTO story's creative becomes a
         # filled 1080x1920 card with the caption burned in; a VIDEO story's creative
         # becomes a 9:16 story video with the caption burned in. A story publishes with
@@ -479,7 +535,10 @@ def _maybe_format_story(account, story, feed, library_path, log):
         return True                              # baseline: unchanged, always keep
     path = (getattr(feed, "creative_path", "") or "").strip()
     is_video = bool(path) and path.lower().endswith(_VIDEO_EXTS)
-    caption = getattr(feed, "caption", "") or ""
+    # The STORY's own caption wins when it was overridden by a client edit; otherwise it
+    # equals the feed caption (the paired story is cloned from the feed). This is what
+    # lets a saved story caption actually get BURNED onto the media on re-render.
+    caption = (getattr(story, "caption", "") or getattr(feed, "caption", "") or "")
     try:
         from . import story_image, media_host
         gym_name = _display_name_for(account)

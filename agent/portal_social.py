@@ -660,6 +660,13 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
     if not note:
         return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
                      "error": "note (new caption text) is required for edit"}
+    # DURABLE WRITE FIRST, then LEARN (Dale, 2026-08-17: "saving took several attempts /
+    # timed out / booted me out"). The caption edit is the durable calendar write; the
+    # learning/brain write is best-effort and must NEVER be able to fail the save. So the
+    # store round-trips run inside this try (a real store error is a 500), but learning is
+    # deliberately OUTSIDE it: once patch_caption returns the updated row, the edit HAS
+    # persisted, and nothing after it may turn that success into an error the client
+    # retries against.
     try:
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
@@ -671,18 +678,23 @@ def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
         updated = sb_store.patch_caption(account_key, draft_id, note)
         if updated is None:
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-        # LEARN: feed the (before -> after) edit AND the approver's explicit reason
-        # into the gym's brain so future captions move toward the approver's taste
-        # (Dale's youth-content guidance). The reason, when sent, is captured as the
-        # edit's rule so the stated intent is not dropped.
-        _learn_from_edit(account_key, before, note, reason=reason)
-        return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
-                     "caption": updated.get("caption", ""),
-                     "status": updated.get("status", "pending"),
-                     "reason_captured": bool((reason or "").strip())}
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
+    # The caption is now durably saved. LEARN best-effort: feed the (before -> after)
+    # edit AND the approver's explicit reason into the gym's brain so future captions
+    # move toward the approver's taste (Dale's youth-content guidance). _learn_from_edit
+    # never raises, but we still guard here so even a catastrophic failure cannot flip a
+    # persisted edit into a 500 the client keeps retrying.
+    try:
+        _learn_from_edit(account_key, before, note, reason=reason)
+    except Exception as exc:  # noqa: BLE001 - learning may never fail a saved edit
+        print(f"[portal-social] learn-from-edit failed post-save for "
+              f"{account_key}: {type(exc).__name__}")
+    return 200, {"ok": True, "action": "edit", "draft_id": draft_id,
+                 "caption": updated.get("caption", ""),
+                 "status": updated.get("status", "pending"),
+                 "reason_captured": bool((reason or "").strip())}
 
 
 def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_store):

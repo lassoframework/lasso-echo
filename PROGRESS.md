@@ -6,7 +6,58 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-15
+Last updated: 2026-08-17
+
+---
+
+## Dale round 2 beta feedback (Aug 18 post, 2026-08-17) — 5 items, gym-agnostic
+
+Independent trace confirmed each root cause in live code before the fix. Suite 2730 -> 2750
+green (+20 tests). No gate weakened (nothing publishes without a human tap; no direct
+content_calendar approval; no fabrication).
+
+### [x] 1. Content mismatch on a youth VIDEO — round-1 grounding VERIFIED to cover video
+The round-1 scene-hint fix already covers VIDEO: `client_content.pick_image` returns image
+OR video and `build_client_draft` passes the ACTUAL picked creative into
+`make_caption(creative=...)`, which feeds `photo_grounding(creative)` (sidecar note +
+humanized filename) to SB7 as a scene hint. No code change needed. Regression test
+`tests/test_youth_video_grounding.py` pins a youth VIDEO end-to-end -> youth-matched
+grounding reaches the SB7 prompt (a hash-named video adds no false scene).
+
+### [x] 2. Edit/save glitches — durable-first, learning can never fail a saved edit
+`agent/portal_social.py::_handle_edit_supabase` restructured: the store round-trips (the
+DURABLE caption write) run in their own try; `_learn_from_edit` runs AFTER, guarded, so a
+slow/failing brain write can no longer flip a persisted edit into a 500 the client keeps
+retrying. Same durable-first note in `agent/portal_routes.py::_handle_action_supabase`.
+Test `tests/test_edit_save_resilient.py` (caption persists + returns 200 even when learning
+raises; patch precedes learn).
+
+### [x] 3. "Reason" text leaked into the caption — proven backend-clean, frontend specced
+Both edit routes write `content_calendar.caption` = EXACTLY the note (never the reason);
+the reason is recorded only as the edit's tenant_brain `rule` and echoed via
+`reason_captured`. The leak is a PORTAL concat bug. Test
+`tests/test_edit_reason_no_caption_leak.py` (caption == note byte-for-byte, reason absent,
+reason_captured true, on both routes). Frontend fix specced:
+`docs/PORTAL_SPEC_disconnect_and_scheduled_time.md` §5a.
+
+### [x] 4. False approval on the next day — proven backend-clean, frontend specced
+Approve flips ONLY `content_calendar.id == <id>` (+ gym_id) via `set_status`; the PATCH is
+filtered by id AND gym_id, one row, never a sibling / cursor advance. The false "Approved"
+on the next card is PORTAL optimistic state. Test
+`tests/test_approve_marks_only_target_row.py` (exactly one PATCH, target id only, sibling
+untouched). Frontend fix specced: §5b.
+
+### [x] 5. No caption on a story — publisher HOLDS stale/blank, rebuild honors the edit
+A story publishes empty-body, so the caption lives only on the burned media; editing a
+story caption updated content_calendar.caption but the hosted image_url still carried the
+old/absent caption. Schema-free fix: the burned story media filename embeds the caption key
+(`story_image.story_media_carries_caption`), so `calendar_autopublish._story_media_is_stale`
+HOLDS a story whose media does not carry its current caption (never ships stale/blank), and
+the calendar rebuild RE-RENDERS the story with the CLIENT'S edited caption
+(`client_month_run._edited_story_captions` + `_maybe_format_story` prefers the story's own
+caption). Test `tests/test_story_caption_saved_shows.py`. Residual: content_calendar keeps
+no RAW source URL, so instant edit-time re-burn needs a `source_media_url` column (portal
+migration) — logged in §5c as a backlog decision, not a blocker.
 
 ---
 

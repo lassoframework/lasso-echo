@@ -215,3 +215,86 @@ learning silently reset each deploy. Echo now roots the brain under the persiste
 volume (`AGENT_TENANT_BRAIN_DIR`, default `<DATA_DIR>/brains`), so edits and reasons survive
 deploys and the loop actually compounds. No portal change; noted so ops sets the volume path
 if a custom mount is used.
+
+## 5. Round 2 Dale (CrossFit ENG) beta feedback (reviewed Aug 18 post, 2026-08-17)
+
+### 5a. The "reason why" text leaked INTO the caption body (PORTAL BUG)
+
+**Symptom (Dale):** after refresh the edited caption stuck, BUT the text typed in the
+"Why" reason field was pasted directly BELOW the updated post copy — the reason leaked
+into the caption body.
+
+**Root cause: this is a PORTAL bug, proven backend-clean.** Echo's edit endpoints write
+the caption and the reason to two SEPARATE places and NEVER concatenate them:
+
+- `content_calendar.caption` is set to EXACTLY the `note` (new caption) via
+  `SupabaseCalendarStore.patch_caption` — `json={"caption": new_caption, ...}` with no
+  reason appended (`agent/portal_calendar_store.py`).
+- the `reason` is recorded only as the edit's teaching **rule** in the gym's tenant brain
+  (`_learn_from_edit` -> `tenant_brain.edit_diff.rule`), never returned in `caption`.
+- Regression tests pin this: `tests/test_edit_reason_no_caption_leak.py` asserts the
+  persisted `caption` equals the note byte-for-byte and does NOT contain the reason text,
+  on BOTH edit routes (`/posts/<id>/edit` and the legacy `/portal/<token>/edit`).
+
+**Portal action (REQUIRED):** the frontend is concatenating the reason into the caption it
+displays (or sends). Fix the edit form so:
+  - the "Why" textarea value is sent ONLY as the `reason` body field, NEVER appended to the
+    `note`/caption field;
+  - after save, render the caption from the response's `caption` field alone (do not
+    re-append the reason locally). Echo's response returns `{caption, status,
+    reason_captured}` — `caption` is the clean post copy; show the reason separately (e.g. a
+    muted "Why: …" line under the card) and use `reason_captured: true` to show a small
+    "reasoning saved" tick so there is a clear signal Echo received it.
+
+### 5b. Approving one day marks the NEXT day "Approved" too (PORTAL BUG)
+
+**Symptom (Dale):** approving one day's post auto-advances the UI to the next day and shows
+that next post as "Approved" even though it was never approved; a refresh reveals it is NOT
+approved.
+
+**Root cause: PORTAL optimistic-state bug, proven backend-clean.** Echo's approve endpoint
+marks EXACTLY the row whose id was submitted and never the next day's row:
+
+- `POST /portal/<token>/posts/<id>/approve` flips ONLY `content_calendar.id == <id>` (and
+  `gym_id == account_key`) to `approved` via `SupabaseCalendarStore.set_status`, whose PATCH
+  is filtered by `id=eq.<id>` AND `gym_id=eq.<account_key>` — a single row
+  (`agent/portal_calendar_store.py`). It never advances a cursor and never touches a sibling.
+- Regression test `tests/test_approve_marks_only_target_row.py` submits day N's id against a
+  two-day calendar and asserts (i) exactly one PATCH went out, (ii) it carried day N's id,
+  (iii) day N+1's row is untouched (still its prior status).
+
+**Portal action (REQUIRED):** the frontend is optimistically painting the NEXT card as
+"Approved" after an approve (a UI cursor advance + a status carry-over). Fix so:
+  - an approve updates ONLY the card whose id was approved; do NOT copy its new status onto
+    the next card when auto-advancing;
+  - drive each card's badge from the server response for THAT id (or a re-fetch), never from
+    the previously-approved card's state. Auto-advancing the view is fine; carrying the
+    "Approved" badge to the next post is the bug.
+
+### 5c. A saved STORY caption must show on the story (Echo side, FIXED 2026-08-17)
+
+**Symptom (Dale):** the Monday Aug 17 story showed no caption even though he added a story
+caption and saved.
+
+**Root cause (Echo side):** a story publishes with an EMPTY body, so its caption lives only
+on the burned MEDIA. When a client edits a story caption in the portal, `patch_caption`
+updates `content_calendar.caption` but the already-hosted `image_url` still carries the OLD
+(or no) caption, and the publisher shipped `image_url` verbatim.
+
+**Echo fix (no portal change needed):**
+  - the publisher now HOLDS a story whose rendered media does not carry its CURRENT caption
+    (detected schema-free: the burned story media filename embeds the caption key), so a
+    story is NEVER shipped stale/blank — it waits for a re-render (`calendar_autopublish
+    ._story_media_is_stale`).
+  - the calendar rebuild now RE-RENDERS the story with the client's EDITED caption (read from
+    the existing story row) instead of overwriting it with the freshly generated feed caption
+    (`client_month_run._edited_story_captions` + `_maybe_format_story`).
+  - Tests: `tests/test_story_caption_saved_shows.py`.
+
+**Portal note (optional polish):** after a story-caption edit, the portal may show "your
+story caption is saved and will render on the next build" so the client is not surprised the
+change is not instantly visible on the media thumbnail (the media re-renders on the rebuild).
+There is a residual schema limitation: `content_calendar` does not retain the story's RAW
+source media URL, so Echo cannot re-burn instantly at edit time — it re-burns on the rebuild.
+If instant re-render is wanted, add a `source_media_url` column to `content_calendar` (portal
+migration) and Echo can re-burn synchronously; logged as a backlog decision, not a blocker.

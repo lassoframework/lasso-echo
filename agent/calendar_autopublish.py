@@ -168,6 +168,40 @@ def scheduled_iso_for_row(row, now=None):
         return ""
 
 
+def _story_media_is_stale(row):
+    """True when this row is a STORY whose rendered media does NOT carry the row's
+    CURRENT caption (the caption was edited after the media was burned), so publishing
+    it would ship a stale/blank story. False for a feed row, a story with a matching
+    caption, or a story whose media was not caption-burned by story_image (raw baseline).
+    Never raises (a guard must never crash the lane)."""
+    if (row.get("format") or "feed").strip().lower() != "story":
+        return False
+    try:
+        from . import story_image
+        return not story_image.story_media_carries_caption(
+            row.get("image_url") or "", row.get("caption") or "")
+    except Exception:
+        return False  # fail OPEN to the existing behavior; never block on the guard
+
+
+def _alert_story_needs_render(row_id, gym_id):
+    """One ops alert per row when a story is HELD because its saved caption is not on
+    its media yet (needs a build re-render). Deduped in the shared kv so a repeated
+    tick never storms the channel."""
+    try:
+        from . import db, ops_alerts
+        key = f"story_stale_alerted_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: story {row_id} held — its saved caption is not on the media "
+            "yet. It publishes once the calendar rebuild re-renders the story with the "
+            "new caption (never shipped captionless).")
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
 def _draft_for(row):
     """Build a PENDING Draft from a content_calendar row for meta_publisher.publish."""
     fmt = (row.get("format") or "feed").strip().lower()
@@ -283,6 +317,21 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         if account is None:
             # No mappable account: leave the row untouched (never claimed), skip it.
             skipped.append(row_id)
+            continue
+
+        # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
+        # an EMPTY body, so its caption lives only on the rendered media. When a client
+        # EDITS a story caption in the portal, content_calendar.caption changes but the
+        # already-hosted image_url still carries the OLD (or no) caption. Publishing it
+        # now would ship a story whose words do not match the saved caption (Dale saw a
+        # captionless story). We HOLD such a row (never claimed, left for a build
+        # re-render) rather than ship a stale/blank story. Schema-free: the burned story
+        # media's filename embeds the caption key, so a mismatch is detectable from the
+        # row alone. A non-story row, or a story whose media was NOT caption-burned by
+        # us (raw baseline), is never affected.
+        if _story_media_is_stale(row):
+            waiting.append(row_id)
+            _alert_story_needs_render(row_id, gym_id)
             continue
 
         # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.

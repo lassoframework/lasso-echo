@@ -260,9 +260,11 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason=""):
             updated = sb.patch_caption(account_key, draft_id, note)
             if updated is None:
                 return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
-            # LEARN from the edit so future captions match the approver's taste. The
-            # approver's explicit reason (when sent) is captured as the edit's rule so
-            # the stated intent is not dropped (Dale, 2026-08-15).
+            # DURABLE-FIRST (Dale, 2026-08-17): the caption is now saved. LEARN from the
+            # edit best-effort so future captions match the approver's taste; the reason
+            # (when sent) is captured as the edit's rule so the stated intent is not
+            # dropped. Learning is guarded so a slow/failing brain write can NEVER flip a
+            # persisted edit into an error the client keeps retrying.
             try:
                 from .portal_social import _learn_from_edit
                 _learn_from_edit(account_key, before, note, reason=reason)
