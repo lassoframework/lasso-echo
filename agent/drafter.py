@@ -226,6 +226,64 @@ import re as _re_claims
 # around it don't change the digits, so matching the digit run is sufficient.
 _FIGURE_RE = _re_claims.compile(r"\d[\d,\.]*")
 
+# Cross-day OPENING-REPETITION guard (Ryan Parr, 2026-08-17). Each planned day's
+# caption is generated independently; with a small problem palette the model kept
+# opening several days in a row with the same hook ("You're juggling too much" x3,
+# then "You're swamped" x3). We normalize the first few words of each accepted
+# caption into an "opening signature" and feed the running set back into the next
+# day's prompt as a STYLE-only "do not open like these" instruction. Never a source
+# of facts; a caption is always still produced (this never blocks a post).
+_OPENING_WORDS = 7
+_OPENING_COLLIDE_WORDS = 4   # two openings collide if they share this many leading words
+# Apostrophes (straight or curly) are REMOVED so "You're" and "Youre" normalize the
+# same; all other punctuation becomes a token break.
+_OPENING_APOS = _re_claims.compile(r"['‘’]")
+_OPENING_STOP = _re_claims.compile(r"[^\w\s]")
+
+
+def _opening_tokens(caption):
+    """Normalized leading tokens of a caption's first real (non-hashtag) line:
+    lowercased, apostrophes removed (so "You're" and "Youre" both -> "youre"), other
+    punctuation split, whitespace collapsed. Returns [] for an empty caption."""
+    for line in (caption or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cleaned = _OPENING_STOP.sub(" ", _OPENING_APOS.sub("", line)).lower()
+        toks = cleaned.split()
+        if toks:
+            return toks
+    return []
+
+
+def opening_signature(caption, words=_OPENING_WORDS):
+    """A normalized signature of a caption's OPENING: the first `words` normalized
+    words of its first non-hashtag line. Two captions that lead with the same hook
+    (modulo punctuation/case) share a leading prefix, so the month builder can record
+    and avoid opener repetition. Returns "" for an empty caption."""
+    return " ".join(_opening_tokens(caption)[:words])
+
+
+def openings_collide(caption, avoid_openings, prefix=_OPENING_COLLIDE_WORDS):
+    """True when `caption` opens like any phrase in `avoid_openings`: they share the
+    same first `prefix` normalized words (or one opening is shorter and is a full
+    leading prefix of the other). This is the cross-day repetition Ryan flagged —
+    "You're juggling too much ..." on several days running — detected even when the
+    words AFTER the shared hook differ. STYLE signal only; it never blocks a post."""
+    cap_toks = _opening_tokens(caption)
+    if not cap_toks:
+        return False
+    cap_head = cap_toks[:prefix]
+    for other in avoid_openings or ():
+        other_toks = _opening_tokens(other) if isinstance(other, str) else []
+        if not other_toks:
+            continue
+        other_head = other_toks[:prefix]
+        n = min(len(cap_head), len(other_head))
+        if n and cap_head[:n] == other_head[:n]:
+            return True
+    return False
+
 
 def _output_claims_cleared(body, voice, client_note):
     """True when every figure in `body` appears verbatim in an approved input (the
@@ -258,7 +316,8 @@ class StoryBrandGenerator:
         "You are a direct-response social media copywriter for a boutique gym or "
         "fitness studio. Write captions using StoryBrand SB7 principles:\n"
         "  Hero = the customer (busy professional, beginner, lifestyle seeker, 40+ reclaim)\n"
-        "  Problem = their real pain (time, energy, stuck, overwhelmed)\n"
+        "  Problem = their real pain (time, energy, stuck, overwhelmed, intimidated, "
+        "no results, no accountability, tried everything, guilt, low confidence)\n"
         "  Guide = the gym signals brief empathy then authority\n"
         "  Plan = one implied simple step from the creative\n"
         "  CTA = provided separately; do NOT include it in the body\n\n"
@@ -266,12 +325,41 @@ class StoryBrandGenerator:
         "- Draw ONLY from the brand voice doc and client note provided. No invented "
         "facts, stats, prices, or offers.\n"
         "- No em dashes, en dashes, or hyphens used as punctuation dashes.\n"
-        "- Lead with the customer's problem. Be punchy and direct.\n"
+        "- Keep the customer's problem central, but VARY the ENTRY POINT. Do not open "
+        "every caption the same way. Rotate how you begin: sometimes the problem, "
+        "sometimes the outcome they want, sometimes a question, sometimes a scene or "
+        "member moment from the photo, sometimes a myth to bust. Even with limited "
+        "source material, make the OPENING WORDS feel fresh, not a repeat of a stock "
+        "hook. Be punchy and direct.\n"
         "- Body max 260 characters (hashtags and CTA appended separately).\n"
         "- Output ONLY the caption body text. No CTA. No hashtags. No quotes.\n"
         "- Never mention specific numbers, percentages, or prices unless they appear "
         "verbatim in the client note."
     )
+
+    @staticmethod
+    def _avoid_openings_block(avoid_openings):
+        """A HARD prompt instruction listing recent opening phrases this caption must
+        NOT begin with or closely paraphrase, so consecutive planned days stop leading
+        with the same hook (Ryan Parr, 2026-08-17). STYLE guidance only: it steers the
+        entry point, never a source of facts. Returns "" when there is nothing to
+        avoid (a brand-new gym / the first day behaves exactly as before)."""
+        seen, phrases = set(), []
+        for p in avoid_openings or ():
+            p = (p or "").strip()
+            low = p.lower()
+            if p and low not in seen:
+                seen.add(low)
+                phrases.append(p)
+        if not phrases:
+            return ""
+        lines = ["OPENINGS ALREADY USED ON RECENT DAYS. Do NOT begin this caption with "
+                 "any of these, and do NOT closely paraphrase them. Choose a DIFFERENT "
+                 "entry point (a different problem angle, an outcome, a question, a scene, "
+                 "or a member moment) so this day's opening words are clearly distinct:"]
+        for p in phrases:
+            lines.append(f"- {p}")
+        return "\n".join(lines) + "\n\n"
 
     @staticmethod
     def _brain_guidance(account):
@@ -317,7 +405,18 @@ class StoryBrandGenerator:
                 parts.append(f"  AFTER (preferred): {after}")
         return "\n".join(parts) + "\n\n"
 
-    def build(self, voice, creative, account=None):
+    def build(self, voice, creative, account=None, avoid_openings=()):
+        """Write one SB7 caption.
+
+        avoid_openings (optional): normalized opening phrases used on RECENT planned
+        days (see opening_signature). Folded into the prompt as a HARD "do not open
+        like these" instruction so consecutive days stop leading with the same hook
+        (Ryan Parr, 2026-08-17). STYLE-only: it never carries a fact. When a generated
+        caption's opening still collides with a recent one, we retry ONCE with a
+        stronger nudge and prefer the more varied result; we NEVER block the post over
+        it — a caption is always produced (template fallback + figure gate stay intact).
+        A brand-new gym / the first day passes avoid_openings empty and behaves exactly
+        as before."""
         client_note = (creative.client_note or "").strip()
         cta = _pick_cta(voice, creative)
         hashtags = _select_hashtags(voice, creative)
@@ -326,17 +425,35 @@ class StoryBrandGenerator:
             return TemplateGenerator().build(voice, creative)
 
         guidance = self._brain_guidance(account)
-        user = (
-            f"BRAND VOICE DOC:\n{voice.raw}\n\n"
-            f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
-            f"{guidance}"
-            "Write a StoryBrand-structured caption body. Problem-first. "
-            "Gym as guide, not hero. Max 260 characters. Caption body only."
-        )
+        avoid_block = self._avoid_openings_block(avoid_openings)
+        avoid_list = [p for p in (avoid_openings or ()) if (p or "").strip()]
+
+        def _compose(extra_nudge=""):
+            user = (
+                f"BRAND VOICE DOC:\n{voice.raw}\n\n"
+                f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
+                f"{guidance}"
+                f"{avoid_block}"
+                f"{extra_nudge}"
+                "Write a StoryBrand-structured caption body. Problem-first. "
+                "Gym as guide, not hero. Max 260 characters. Caption body only."
+            )
+            return _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+
         try:
-            body = _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
+            body = _compose()
             if not body:
                 raise ValueError("empty LLM response")
+            # CROSS-DAY OPENING VARIETY: if the opening still collides with a recent
+            # day's opening, retry ONCE with a stronger nudge and keep whichever result
+            # is distinct. This never blocks: the collided caption is still valid copy,
+            # so we only PREFER the varied one; a caption is always produced.
+            if avoid_list and openings_collide(body, avoid_list):
+                retry = _compose(
+                    "IMPORTANT: your opening MUST be clearly different from the recent "
+                    "openings listed above. Start from a different angle entirely.\n\n")
+                if retry and not openings_collide(retry, avoid_list):
+                    body = retry
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
             # (stat, price, count) in the generated caption MUST trace to an approved
             # input (the client note or the voice doc). A caption carrying a number

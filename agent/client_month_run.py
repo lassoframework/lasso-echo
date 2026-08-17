@@ -215,7 +215,7 @@ def _has_real_creative(draft):
 
 
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
-                         exclude_keys=()):
+                         exclude_keys=(), avoid_openings=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -234,7 +234,11 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     caption + real media + no dash + no banned word), NOT merely the banned-word check.
     A thin caption (e.g. the raw 'HYROX' source when SB7 could not write a real one) is
     treated like a banned draft: we walk neighbouring days for a better source, and drop
-    the day if none qualifies. No gym ever gets a sub-par post on its calendar."""
+    the day if none qualifies. No gym ever gets a sub-par post on its calendar.
+
+    avoid_openings (Ryan Parr, 2026-08-17): opening phrases already used on this build's
+    earlier accepted days, threaded to the caption generator so this day does not lead
+    with the same hook as its neighbours. STYLE-only guidance; never blocks a day."""
     from . import post_quality
 
     def _accept(d):
@@ -250,7 +254,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
 
     # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
     draft = client_content.build_client_draft(account, day_key, voice, library_path,
-                                              exclude_keys=exclude_keys)
+                                              exclude_keys=exclude_keys,
+                                              avoid_openings=avoid_openings)
     if draft is None:
         return None, None
     if _accept(draft):
@@ -265,7 +270,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     for step in range(1, 8):
         alt_key = (base + timedelta(days=step)).isoformat()
         alt = client_content.build_client_draft(account, alt_key, voice, library_path,
-                                                exclude_keys=exclude_keys)
+                                                exclude_keys=exclude_keys,
+                                                avoid_openings=avoid_openings)
         if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
             # on day_key (only the day is re-pointed; the caption/source/photo are the
@@ -370,6 +376,13 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # INTO the pick so every day draws a genuinely fresh creative; used_paths stays as
     # the local-path backstop.
     used_paths = set()
+    # OPENING-VARIETY (Ryan Parr, 2026-08-17): accumulate the OPENING of each accepted
+    # feed caption and feed the recent window into the NEXT day's generation so several
+    # days in a row do not lead with the same hook. STYLE-only, bounded, never a block;
+    # with SB7 off (deterministic baseline) the generator ignores it, so nothing changes.
+    from .drafter import opening_signature
+    recent_openings = []            # accepted opening signatures, oldest..newest
+    _OPENING_WINDOW = 6             # how many recent openings each new day must avoid
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -386,7 +399,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 
         feed, feed_drop = _clean_draft_for_day(
             account, day_key, voice, library_path, banned_words, log,
-            exclude_keys=used_keys)
+            exclude_keys=used_keys, avoid_openings=recent_openings[-_OPENING_WINDOW:])
         if feed is None:
             if feed_drop:
                 skipped_banned += 1
@@ -423,6 +436,11 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
+        # Record this accepted feed's opening so the NEXT day avoids leading the same
+        # way (the cross-day repetition Ryan flagged). Blank signatures are skipped.
+        sig = opening_signature(getattr(feed, "caption", "") or "")
+        if sig:
+            recent_openings.append(sig)
 
         # PAIRED STORY on the SAME photo: the story mirrors the feed's real creative
         # rather than re-picking (which would consume a SECOND photo and break the

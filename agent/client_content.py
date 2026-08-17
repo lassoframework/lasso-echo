@@ -179,7 +179,8 @@ class _SourceCreative:
         self.path = stem
 
 
-def make_caption(account, source, voice, creative_key, creative=None):
+def make_caption(account, source, voice, creative_key, creative=None,
+                 avoid_openings=()):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -194,14 +195,20 @@ def make_caption(account, source, voice, creative_key, creative=None):
     what is actually in the shot (a youth photo gets a youth-shaped caption), instead of
     the caption talking about a rotated source topic unrelated to the image. Grounding
     only, never fabrication: the figure gate, banned-word gate, and no-dash law all still
-    run on the output, and the caption's CLAIMS still come only from the approved source."""
+    run on the output, and the caption's CLAIMS still come only from the approved source.
+
+    OPENING VARIETY (Ryan Parr, 2026-08-17): `avoid_openings` is the set of opening
+    phrases used on recent planned days. It is passed to the SB7 generator as STYLE-only
+    guidance so consecutive days stop leading with the same hook. It never carries a
+    fact and never blocks a post; the baseline fallback ignores it (it only ever emits
+    the verbatim approved source, which the A+ / banned-word gates already govern)."""
     if config.sb7_enabled():
         try:
             from .drafter import StoryBrandGenerator
             hint = photo_grounding(creative)
             cap, tags, _frags = StoryBrandGenerator().build(
                 voice, _SourceCreative(source, creative_key, photo_hint=hint),
-                account=account)
+                account=account, avoid_openings=avoid_openings)
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
                 return filter_platform_copy(cap).strip(), tags
@@ -263,7 +270,8 @@ def classify(draft):
 
 
 def build_client_draft(account, day_key, voice, library_path, poster=None,
-                       s3_client=None, template_fn=None, exclude_keys=()):
+                       s3_client=None, template_fn=None, exclude_keys=(),
+                       avoid_openings=()):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -279,6 +287,10 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
 
     Never fabricates: the caption's fact comes verbatim from one approved source
     and is re-checked against the fabrication gate before it can ship.
+
+    avoid_openings (Ryan Parr, 2026-08-17): opening phrases used on recent planned
+    days, threaded to the caption generator so consecutive days do not lead with the
+    same hook. STYLE-only, never a fact, never a block.
     """
     if not config.client_sources_enabled():
         return None
@@ -306,7 +318,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # Pass the ACTUAL picked creative so the caption is grounded in what the photo/
         # video shows (its sidecar note + filename), not just the rotated source topic.
         caption, hashtags = make_caption(account, source, voice,
-                                         _image_key(image), creative=image)
+                                         _image_key(image), creative=image,
+                                         avoid_openings=avoid_openings)
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -329,7 +342,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         )
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
-    caption, hashtags = make_caption(account, source, voice, f"src_{source.id}")
+    caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
+                                     avoid_openings=avoid_openings)
     # Option A: a source-backed template card, when a generator is wired + armed.
     template_url = template_fn(account, source, day_key) if template_fn else None
     if template_url:

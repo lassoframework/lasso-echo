@@ -94,7 +94,7 @@ def test_builder_drops_thin_caption_when_sb7_on(monkeypatch, tmp_path):
     # make_caption rejects the echo, falls back to the raw source -> gate drops it.
     from agent.drafter import StoryBrandGenerator
     monkeypatch.setattr(StoryBrandGenerator, "build",
-                        lambda self, v, c, account=None: ("HYROX", ["#x"], ["b"]))
+                        lambda self, v, c, account=None, avoid_openings=(): ("HYROX", ["#x"], ["b"]))
     cs.add_source("q_ig", "service", "HYROX", "intake")
 
     lib = tmp_path / "lib"
