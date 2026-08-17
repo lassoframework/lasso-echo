@@ -328,41 +328,57 @@ def _phash_for(creative_path):
 
 
 def cluster_library(library_path):
-    """§3 near-duplicate collapse: greedily group a gym's images whose DCT pHashes are within
+    """§3 near-duplicate collapse: group a gym's images whose DCT pHashes are within
     CLUSTER_HAMMING, writing a shared `dupe_group` (the leader's basename) into every member's
     sidecar so rotation.rotation_key treats a burst of near-identical shots as ONE creative.
-    Reads the pHash stored at ingest (no re-hash). Returns {leader: [members]} (multi-member
-    groups only). Singletons keep their own filename key (no dupe_group written)."""
+
+    Uses UNION-FIND (transitive closure), NOT greedy leader matching: a burst a~b~c where the
+    end frames are >6 apart still forms one cluster, and the result is DETERMINISTIC —
+    independent of filename order (audit fix). The leader is the lexicographically smallest
+    member. Reads the pHash stored at ingest (no re-hash). Returns {leader: sorted[members]}
+    for multi-member groups only; singletons keep their own filename key (no dupe_group)."""
     import os as _os
     from . import dam
     if not _os.path.isdir(library_path):
         return {}
-    hashed = []          # (name, phash) for readable images
+    hashed = []          # (name, phash) for readable images, name-sorted
     for name in sorted(_os.listdir(library_path)):
         if _os.path.splitext(name)[1].lower() not in _IMG_EXTS:
             continue
         h = _phash_for(_os.path.join(library_path, name))
         if h:
             hashed.append((name, h))
-    leaders = []         # (leader_name, leader_hash)
-    members = {}         # leader_name -> [names]
-    for name, h in hashed:
-        placed = False
-        for lname, lh in leaders:
-            if hamming(h, lh) <= CLUSTER_HAMMING:
-                members[lname].append(name)
-                placed = True
-                break
-        if not placed:
-            leaders.append((name, h))
-            members[name] = [name]
+
+    n = len(hashed)
+    parent = list(range(n))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)   # lower index (earlier name) wins: stable
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if hamming(hashed[i][1], hashed[j][1]) <= CLUSTER_HAMMING:
+                _union(i, j)
+
+    comps = {}
+    for i in range(n):
+        comps.setdefault(_find(i), []).append(hashed[i][0])
     groups = {}
-    for lname, names in members.items():
-        if len(names) < 2:
+    for members in comps.values():
+        if len(members) < 2:
             continue
-        groups[lname] = names
-        for m in names:
-            dam.write_sidecar(_os.path.join(library_path, m), {"dupe_group": lname})
+        leader = min(members)           # deterministic leader, order-independent
+        groups[leader] = sorted(members)
+        for m in members:
+            dam.write_sidecar(_os.path.join(library_path, m), {"dupe_group": leader})
     return groups
 
 

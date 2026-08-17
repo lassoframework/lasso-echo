@@ -34,7 +34,16 @@ Blake before any client gym; adversarial set must route 100% before any default-
   ingest hook in `client_media_sync` (per-gym, best-effort). Independent audit → 3 findings
   (1 CRITICAL guardrail-11 leak, 1 MAJOR name over-block, 1 MINOR flat-pHash) FIXED; re-audit
   0 material remaining (one safe-direction over-block noted for the dogfood-diff revisit).
-- [ ] P2 hygiene · [ ] P3 pick scoring · [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
+- **[x] P2 — library hygiene** (`agent/vision.py` cluster_library/cluster_count;
+  `agent/rotation.py` reuse_blocked; `client_media_sync` starvation wiring): Hamming-≤6
+  near-dupe clustering on the ingest pHash (writes dupe_group; rotation collapses a burst to
+  one creative); cluster-count starvation guard caps the month at clusters + fires a coach
+  gap alert before a thin month; per-platform reuse windows (IG/FB 60d, GBP-after-IG 14d,
+  GBP-same-month 30d). Served prune bumped to ≥60d. Independent audit → 1 defect (greedy
+  clustering was order-dependent / non-transitive); FIXED with UNION-FIND (deterministic,
+  transitive-closure "burst=one cluster") + an order-independence test. Other 4 items
+  CONFIRMED (no false-merge, safe starvation floor, correct windows, no rotation regression).
+- [ ] P3 pick scoring · [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
 
 ---
 

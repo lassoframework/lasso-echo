@@ -91,3 +91,22 @@ def test_fb_mirror_shares_ig_window():
     s = _served(("gritx_fb", "clusterA", "2026-09-01"))
     # an IG target sees the FB serve within the 60d window (feed mirror = same asset)
     assert rotation.reuse_blocked("clusterA", "gritx_ig", "2026-09-15", served=s) is True
+
+
+def test_cluster_transitive_closure_and_deterministic(tmp_path):
+    # a~b (Hamming 6), b~c (6), a NOT~c (12): a chain/burst -> ONE cluster (transitive).
+    HA, HB, HC = "0000000000000000", "000000000000003f", "0000000000000fff"
+    # library 1: names sort a,b,c (hashes a,b,c)
+    l1 = tmp_path / "l1"; l1.mkdir()
+    _asset(str(l1), "a.png", HA); _asset(str(l1), "b.png", HB); _asset(str(l1), "c.png", HC)
+    g1 = vision.cluster_library(str(l1))
+    assert vision.cluster_count(str(l1)) == 1                 # all three collapse to one
+    assert len(next(iter(g1.values()))) == 3
+
+    # library 2: the SAME hash set but the "c" hash sits on the name that sorts FIRST — a
+    # greedy leader clusterer would give a different membership/count; union-find must not.
+    l2 = tmp_path / "l2"; l2.mkdir()
+    _asset(str(l2), "aaa.png", HC); _asset(str(l2), "bbb.png", HB); _asset(str(l2), "ccc.png", HA)
+    g2 = vision.cluster_library(str(l2))
+    assert vision.cluster_count(str(l2)) == 1                 # deterministic: still one cluster
+    assert len(next(iter(g2.values()))) == 3                 # same membership regardless of names
