@@ -61,7 +61,7 @@ migration) — logged in §5c as a backlog decision, not a blocker.
 
 ---
 
-## GBP rail (Google Business) — Phase 3 + Phase 5 BUILT, draft-only, dogfood PROVEN (2026-08-15)
+## GBP rail (Google Business) — §12 A+ bar MET, all 7 hand-off gaps CLOSED (2026-08-17)
 
 Approved spec: `GBP_BUILD_SPEC.md` (v2). My scope: Phase 0 (preflight), Phase 3 (planner
 GBP lane), Phase 5 (publish worker), Phase 6 (reviews, later). Portal owns Phase 1
@@ -194,37 +194,37 @@ Both live in the Echo planner (+ the Echo backend read), NOT the Vercel portal. 
   `coach_review` row (GBP + FB/IG) -> `pending` in one shot. The owner `/social` read already hides
   `coach_review` (platform-agnostic filter), so the FB/IG withhold needed no extra read change.
 
-### [ ] REMAINING to reach the §12 A+ bar (independent audit vs GBP_ECHO_HANDOFF.md, 2026-08-17)
-The P0 gates + P1 planner + most of the P1 worker are BUILT and verified live. An independent
-read-only audit against the hand-off's §12 acceptance found these Echo code gaps still open. The
-LASSO dogfood (STANDARD + photo, no offer, manual approve) works end to end WITHOUT them; they block
-a full multi-gym rollout with offers, failures, and reporting.
+### [x] §12 A+ bar — ALL 7 gaps CLOSED (build → audit → fix → re-audit, 2026-08-17)
+Every Echo code gap the hand-off reconciliation found is now built, tested, and cleared by
+independent audit to ZERO material findings. Two audit rounds; round 1 flagged 2 defects (G3 key
+split, G7 double-post/draft-bypass) which were fixed and re-audited clean.
 
-- **[ ] G1 — `edit` accepts GBP structured fields.** The portal now forwards a `gbp` object on edit
-  (topic/cta/event/offer/location); Echo's edit path (`portal_routes.handle_portal_action`,
-  `portal_social._handle_edit_supabase`, `portal_calendar_store.patch_caption`) only handles
-  caption+reason and DROPS the GBP fields. An owner/coach cannot edit CTA/event/offer/location.
-- **[ ] G2 — `requeue` action + words-changed routing.** No `requeue` handler exists
-  (`portal_routes.py` allows only approve/edit/deny/kill). A `failed` GBP row cannot be fixed and
-  requeued; if the caption words changed it must re-enter OWNER approval. This is the coach's
-  failed-row recovery loop — highest priority.
-- **[ ] G3 — worker writes `posts_published` + `top_post_id` to `gym_gbp_metrics`.** The portal cron
-  deliberately omits these two; the worker never touches gym_gbp_metrics, so today NO ONE writes them.
-  Breaks §12 reporting.
-- **[ ] G4 — planner pauses on `needs_reconnect`.** Only the worker holds at publish; the planner
-  plans regardless, so the queue can fill with unpublishable posts. Hand-off says the planner must pause.
-- **[ ] G5 — publish timing 8-10am in the connection row's timezone (§7.3).** The worker publishes any
-  approved+due row immediately; no time-of-day window, `connection.timezone` never read.
-- **[ ] G6 — needs_reconnect re-slot + lapsed-OFFER→pending.** Held posts stay `approved` with no
-  re-slot into the next 8-10am window; a lapsed OFFER window is not reverted to `pending`.
-- **[ ] G7 — transient retry is a no-op.** `reconcile_gbp` calls `client.retry_post` via
-  `getattr(..., lambda: None)` (`gbp_worker.py:276`) but `ZernioClient` has no `retry_post`, so a
-  transient/5xx demote falls straight to `failed` instead of the intended one retry.
+- **[x] G4 — planner pauses on `needs_reconnect`.** `gbp_dogfood._connection_status`; a
+  needs_reconnect-only gym plans nothing (connected/none still plan). Audit: CONFIRMED.
+- **[x] G2 — `requeue` action + words-changed routing.** `portal_routes` + `patch/requeue` store
+  method: failed-only (else 409); words changed → OWNER `pending` + fabrication gate + learn;
+  unchanged → `approved`; reject_reason cleared; legacy plane 400. Audit: CONFIRMED.
+- **[x] G3 — worker owns `posts_published` + `top_post_id`.** posts_published incremented at publish;
+  top_post_id seeded at publish + ranked BY CLICKS during reconcile from real per-post data (never
+  fabricated). Row stamped with the connection location at publish so publish/reconcile key on the
+  same (gym, location, month). Audit: CONFIRMED (round-1 key-split fixed).
+- **[x] G7 — transient retry.** One retry at SEND time (`publish_gbp_row`, transport-only, honors
+  draft, a failed send never went live → no double-post); reconcile NEVER re-sends (transient →
+  keep polling). Audit: CONFIRMED (round-1 reconcile-resend removed).
+- **[x] G5 — 8-10am publish window in the connection timezone (§7.3).** `in_publish_window` (weekday
+  8-10am local; missing tz → publish; `AGENT_GBP_PUBLISH_WINDOW` default ON); off-window rows HOLD as
+  `approved`, never dropped. Audit: CONFIRMED.
+- **[x] G6 — lapsed-OFFER→pending + reconnect re-slot.** `offer_window_lapsed` reverts a dead OFFER to
+  `pending` + staff alert (status write only, never publishes); held rows re-slot at the next
+  in-window tick. Audit: CONFIRMED.
+- **[x] G1 — `edit` accepts + persists GBP structured fields.** `gbp` object (camelCase or column
+  names) validated (topic/cta) BEFORE any write, persisted via `patch_gbp_fields`, reverts to
+  `pending`; requeue + gbp flow through the intake_web POST route; OFFER-omits-CTA still enforced at
+  build. Audit: CONFIRMED.
 
-BUILT + verified: GATE 1, GATE 2 (GBP+FB/IG), cadence, caption rails, 1200x900 pre-crop, Zernio
-routing, connection-status hold, payload per topicType (OFFER omits callToAction), late_post_id,
-policy→failed-never-auto-requeue, photo drops synchronous. DEVIATION to ratify: images host to R2,
-not Supabase storage (functionally fetchable; Zernio proxies a public URL). P2 reviews deferred.
+DEVIATION RATIFIED (Blake 2026-08-17): images host to R2 (`media_host`), not Supabase storage —
+functionally fetchable (Zernio proxies a public URL); spec + hand-off wording updated. P2 reviews
+(§8) remain deferred to Phase 6. Full suite green (2800 passed).
 
 ### [!] Legacy `agent/gbp_publisher.py` — untouched and dead (verified)
 The new rail uses `account='googlebusiness'` rows + the GBP worker lane. `approvals.py` still routes
