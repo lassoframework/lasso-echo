@@ -163,9 +163,9 @@ Same content library as FB/IG — same photos, different words.
 ### 5.3 Image rules — crop BEFORE approval
 
 - Exactly 1 image per post. JPEG or PNG (Zernio auto-converts WebP). Max 5MB. Min 400x300.
-- **The pipeline crops to 4:3 at 1200x900 at PLANNING time**, stores the processed file in Supabase storage, and puts THAT url on the plan row. The owner approves the exact pixels that publish. No post-approval image transformation, ever — otherwise the human tap approved a different image than the one that ships.
+- **The pipeline crops to 4:3 at 1200x900 at PLANNING time**, stores the processed file in **R2 (Echo's existing media host, `media_host.host_media`)** — ratified by Blake 2026-08-17 over the original Supabase-storage plan; R2 is where every other Echo creative already lives — and puts THAT public url on the plan row. The owner approves the exact pixels that publish. No post-approval image transformation, ever — otherwise the human tap approved a different image than the one that ships.
 - Prefer faces and the gym floor. No heavy text overlays (quality signal + rejection risk). Never stock photos.
-- Supabase storage URLs pass straight through (Zernio auto-proxies them).
+- The hosted public image URL passes straight through (Zernio auto-proxies any public url; R2 `pub-*.r2.dev` urls are public).
 
 ---
 

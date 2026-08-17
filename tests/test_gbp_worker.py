@@ -236,6 +236,40 @@ class _Store:
     def mark_status(self, row_id, status):
         self.status.append((row_id, status))
 
+    # G3 metrics capture (additive)
+    def bump_posts_published(self, gym, loc, month_iso, *, now_iso, seed_top_post_id=None):
+        self.__dict__.setdefault("bumps", []).append(
+            (gym, loc, month_iso, seed_top_post_id))
+
+    def top_post_by_clicks(self, gym, loc, month):
+        return {"id": "m1", "top_post_id": None}
+
+    def set_top_post(self, metrics_row_id, top_post_id, now_iso):
+        self.__dict__.setdefault("top_sets", []).append((metrics_row_id, top_post_id))
+
+
+def test_g3_publish_bumps_posts_published():
+    rows = [dict(_row(), id="r1", gym_id="lasso")]
+    store = _Store(rows, {"lasso": [_c()]})
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01",
+                             draft=True, alert=lambda m: None,
+                             now=__import__("datetime").datetime(
+                                 2026, 9, 1, 9, 0, tzinfo=__import__("datetime").timezone.utc))
+    assert out["published"] == 1
+    bumps = getattr(store, "bumps", [])
+    assert len(bumps) == 1
+    gym, loc, month_iso, seed = bumps[0]
+    assert gym == "lasso" and month_iso == "2026-09-01"      # first of the publish month
+    assert seed, "top_post_id must be seeded with the published post's late_post_id"
+
+
+def test_g3_post_clicks_extractor():
+    assert gw._post_clicks({"insights": {"clicks": 12}}) == 12
+    assert gw._post_clicks({"metrics": {"clicks": 3}}) == 3
+    assert gw._post_clicks({"clicks": 7}) == 7
+    assert gw._post_clicks({"status": "published"}) is None   # no click signal -> None
+    assert gw._post_clicks("nope") is None
+
 
 def test_publish_due_gbp_publishes_and_fails_correctly():
     rows = [
@@ -275,6 +309,69 @@ def test_reconcile_gbp_demotes_policy_rejection():
     out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
     assert out["demoted"] == 1
     assert store.failed and "phone" in store.failed[0][1]
+
+
+def test_g7_transient_retry_republishes_and_keeps_published():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    rows = [dict(_row(), id="r1", gym_id="lasso", status="published", late_post_id="zpOld",
+                 published_at="2026-09-02T06:00:00+00:00")]
+    store = _Store(rows, {"lasso": [_c()]})   # a live connection so the retry can route
+
+    class _C:
+        def get_post(self, pid):
+            return {"post": {"platforms": [{"platform": "googlebusiness",
+                                            "status": "failed",
+                                            "error": "temporarily unavailable, try again"}]}}
+        # the re-send succeeds with a fresh id
+        def create_post_raw(self, payload, **k):
+            return {"_id": "zpNew", "post": {"platforms": [
+                {"platform": "googlebusiness", "status": "published"}]}}
+    out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
+    assert out["retried"] == 1 and out["demoted"] == 0      # retry succeeded, no demote
+    assert store.published and store.published[-1][0] == "r1"   # re-published
+    assert store.failed == []
+
+
+def test_g7_transient_retry_failure_demotes_to_failed():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    rows = [dict(_row(), id="r1", gym_id="lasso", status="published", late_post_id="zpOld",
+                 published_at="2026-09-02T06:00:00+00:00")]
+    store = _Store(rows, {"lasso": [_c()]})
+
+    class _C:
+        def get_post(self, pid):
+            return {"post": {"platforms": [{"platform": "googlebusiness",
+                                            "status": "failed",
+                                            "error": "request timeout"}]}}
+        def create_post_raw(self, payload, **k):
+            raise RuntimeError("still failing")     # retry also fails
+    out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
+    assert out["retried"] == 1 and out["demoted"] == 1
+    assert store.failed and store.failed[0][0] == "r1"       # one retry, then failed
+
+
+def test_g3_reconcile_ranks_top_post_by_clicks():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    rows = [
+        dict(_row(), id="r1", gym_id="lasso", status="published", late_post_id="zpA",
+             gbp_location_id="locations/1", published_at="2026-09-02T06:00:00+00:00"),
+        dict(_row(), id="r2", gym_id="lasso", status="published", late_post_id="zpB",
+             gbp_location_id="locations/1", published_at="2026-09-02T06:30:00+00:00"),
+    ]
+    store = _Store(rows, {})
+
+    class _C:
+        def get_post(self, pid):
+            clicks = {"zpA": 4, "zpB": 19}[pid]      # zpB is the top by clicks
+            return {"post": {"platforms": [{"platform": "googlebusiness",
+                                            "status": "published"}]},
+                    "insights": {"clicks": clicks}}
+    out = gw.reconcile_gbp(store, _C(), now=now, alert=lambda m: None)
+    assert out["top_ranked"] == 1
+    assert getattr(store, "top_sets", []) == [("m1", "zpB")]   # the max-clicks post wins
 
 
 # ---- §6.4 photo drops ------------------------------------------------------

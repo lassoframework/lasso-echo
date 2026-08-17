@@ -140,7 +140,7 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
     if not config.portal_approvals_enabled():
         return _flag_off(action)
 
-    if action not in ("approve", "edit", "deny", "kill"):
+    if action not in ("approve", "edit", "deny", "kill", "requeue"):
         return 400, {"error": f"unknown action: {action}"}
 
     if not draft_id:
@@ -157,6 +157,12 @@ def handle_portal_action(action, account_key, draft_id, actor_id, note="",
     if store is None and config.portal_calendar_supabase_enabled():
         return _handle_action_supabase(action, account_key, draft_id, note,
                                        reason=reason)
+
+    # requeue (G2) is a content_calendar-only action (failed GBP/FB/IG rows live there).
+    # The legacy SQLite drafts plane has no failed-row recovery, so it is unsupported there.
+    if action == "requeue":
+        return 400, {"ok": False, "action": "requeue", "draft_id": draft_id,
+                     "error": "requeue requires the content_calendar data plane"}
 
     fn = getattr(_pa, action)
     if action in ("edit", "deny", "kill"):
@@ -274,6 +280,40 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason=""):
                          "caption": updated.get("caption", ""),
                          "status": updated.get("status", "pending"),
                          "reason_captured": bool((reason or "").strip())}
+
+        if action == "requeue":
+            # G2: a coach fixes a FAILED row and requeues. If the caption WORDS changed,
+            # it re-enters OWNER approval ('pending'); otherwise it goes straight back to
+            # the publish queue ('approved'). reject_reason is cleared either way. Only a
+            # failed row can be requeued.
+            if _status_now != "failed":
+                return 409, {"ok": False, "action": "requeue", "draft_id": draft_id,
+                             "error": "only a failed post can be requeued"}
+            before = row.get("caption") or ""
+            changed = bool((note or "").strip()) and note.strip() != before.strip()
+            if changed:
+                from . import rotation as _rotation
+                if not _rotation.is_gate_clean(note):
+                    return 422, {"ok": False, "action": "requeue", "draft_id": draft_id,
+                                 "error": "fabrication gate: the new caption carries a "
+                                          "claim with no approved receipt. Cite an "
+                                          "approved source or drop the figure."}
+                updated = sb.requeue(account_key, draft_id, new_status="pending",
+                                     new_caption=note)
+                if updated is not None:
+                    try:
+                        from .portal_social import _learn_from_edit
+                        _learn_from_edit(account_key, before, note, reason=reason)
+                    except Exception:
+                        pass
+            else:
+                updated = sb.requeue(account_key, draft_id, new_status="approved")
+            if updated is None:
+                return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+            return 200, {"ok": True, "action": "requeue", "draft_id": draft_id,
+                         "status": updated.get("status", ""),
+                         "words_changed": changed,
+                         "caption": updated.get("caption", "")}
 
         new_status = _pcs.action_status(action)
         if new_status is None:

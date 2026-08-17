@@ -63,17 +63,43 @@ def _resolve_connection_location(portal_gym_key, store):
     return None, ""
 
 
+def _connection_status(portal_gym_key, store):
+    """The gym's GBP connection posture (G4): 'connected' if ANY connection is connected,
+    else 'needs_reconnect' if any is needs_reconnect, else 'none' (never connected). A
+    'needs_reconnect'-only gym must NOT be planned — the queue would fill with posts that
+    cannot publish. 'none' still plans (by design: rows plan before Connect, the worker
+    binds the single connection at publish). Read failure -> 'none' (never blocks on a
+    flaky read; the worker holds needs_reconnect at publish as the backstop)."""
+    try:
+        conns = store.connections_for(portal_gym_key) or []
+    except Exception:  # noqa: BLE001
+        return "none"
+    statuses = {str(c.get("status", "")).lower() for c in conns}
+    if "connected" in statuses:
+        return "connected"
+    if "needs_reconnect" in statuses:
+        return "needs_reconnect"
+    return "none"
+
+
 def plan_gbp_dogfood(portal_gym_key, account_gen_key, *, voice, library_path, city,
                      store, offer=None, cta_url="", gbp_location_id=None, days=30,
                      start=None, events=(), caption_fn=None, image_fn=None,
                      facts=None, offer_confirmed=False, initial_status="pending",
-                     now=None, logger=None):
+                     connection_status="none", now=None, logger=None):
     """Idempotently plan + write one gym's PENDING GBP month. Skips (no-op) when the gym
     already has googlebusiness rows dated on/after `start` (never a duplicate month).
-    Blocks (does not fabricate) when voice is missing. Returns the planner result dict
-    (plus {'skipped_existing': True} on the idempotency no-op)."""
+    Blocks (does not fabricate) when voice is missing, and PAUSES (G4) when the gym's GBP
+    connection is 'needs_reconnect'. Returns the planner result dict (plus
+    {'skipped_existing': True} on the idempotency no-op)."""
     log = logger or (lambda m: print(f"[gbp-dogfood] {m}"))
     start = start or (now or date.today())
+    # G4: never plan for a gym whose connection needs reconnecting — the posts could not
+    # publish and the queue would fill with unpublishable rows.
+    if connection_status == "needs_reconnect":
+        log(f"{portal_gym_key}: GBP connection needs_reconnect -> planner PAUSED "
+            "(nothing written; reconnect, then re-run)")
+        return {"ok": False, "reason": "connection needs_reconnect", "planned": 0}
     if voice is None:
         log(f"{portal_gym_key}: voice doc missing -> BLOCK (no fabrication)")
         return {"ok": False, "reason": "voice doc missing", "planned": 0}
@@ -218,6 +244,7 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
     # the GbpStore itself is the offer reader (it has onboarding_intake + _get)
     offer = _resolve_offer_for(portal_gym_key, store)
     loc, offer_url = _resolve_connection_location(portal_gym_key, store)
+    conn_status = _connection_status(portal_gym_key, store)   # G4
 
     # GATE 1: OFFER only for a gym whose live offer a human has confirmed (default: none).
     offer_confirmed = base in config.gbp_offer_confirmed_gyms()
@@ -259,7 +286,8 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
         portal_gym_key, account_gen_key, voice=voice, library_path=library_path,
         city=city, store=store, offer=offer, cta_url=resolved_cta, gbp_location_id=loc,
         days=days, now=now, facts=facts, image_fn=image_fn,
-        offer_confirmed=offer_confirmed, initial_status=initial_status, logger=log)
+        offer_confirmed=offer_confirmed, initial_status=initial_status,
+        connection_status=conn_status, logger=log)
 
 
 def release(portal_gym_key, *, logger=None):

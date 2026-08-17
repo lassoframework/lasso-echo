@@ -199,6 +199,28 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def requeue(self, account_key, row_id, *, new_status, new_caption=None):
+        """G2 requeue: move a FAILED row back into the flow, CLEARING reject_reason.
+        When new_caption is given (the coach changed the words) it is written and
+        new_status should be 'pending' (owner re-approval); otherwise new_status is
+        'approved' (straight back to the publish queue). id+gym_id isolation. Returns the
+        updated row, or None when zero rows matched."""
+        fields = {"status": new_status, "reject_reason": ""}
+        if new_caption is not None:
+            fields["caption"] = new_caption
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=fields, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def patch_caption(self, account_key, row_id, new_caption):
         """PATCH the row's caption AND revert status to 'pending', filtered by BOTH id
         and gym_id. Editing a caption resets the approval so the owner re-approves the

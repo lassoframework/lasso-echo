@@ -469,3 +469,61 @@ def test_release_coach_review_flips_all_platforms_to_pending():
     assert params["status"] == "eq.coach_review"     # only withheld rows
     assert "account" not in params                    # every platform, one shot
     assert body == {"status": "pending"}
+
+
+# ---- G2 requeue: failed-row recovery + words-changed routing ------------------
+
+def test_requeue_failed_no_change_back_to_approved(monkeypatch):
+    pre = _Resp(200, [_row("id-f", gym_id="lasso", status="failed")])
+    patched = _Resp(200, [_row("id-f", gym_id="lasso", status="approved")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action("requeue", "lasso", "id-f", "a1")
+    assert status == 200 and body["ok"] is True
+    assert body["status"] == "approved" and body["words_changed"] is False
+    payload = [c for c in http.calls if c[0] == "patch"][0][4]
+    assert payload["status"] == "approved"        # straight back to the queue
+    assert payload["reject_reason"] == ""          # failure cleared
+    assert "caption" not in payload                # words unchanged -> no caption write
+
+
+def test_requeue_failed_with_word_change_reenters_owner_approval(monkeypatch):
+    pre = _Resp(200, [_row("id-f", gym_id="lasso", status="failed", caption="old words")])
+    patched = _Resp(200, [_row("id-f", gym_id="lasso", status="pending",
+                               caption="a calmer rewrite for the day")])
+    http = _FakeHTTP(get_resp=pre, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action(
+        "requeue", "lasso", "id-f", "a1", note="a calmer rewrite for the day")
+    assert status == 200 and body["words_changed"] is True
+    assert body["status"] == "pending"             # owner must re-approve changed words
+    payload = [c for c in http.calls if c[0] == "patch"][0][4]
+    assert payload["status"] == "pending"
+    assert payload["caption"] == "a calmer rewrite for the day"
+    assert payload["reject_reason"] == ""
+
+
+def test_requeue_rejects_non_failed_row(monkeypatch):
+    pre = _Resp(200, [_row("id-p", gym_id="lasso", status="pending")])
+    http = _FakeHTTP(get_resp=pre)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action("requeue", "lasso", "id-p", "a1")
+    assert status == 409 and "only a failed" in body["error"].lower()
+    assert [c for c in http.calls if c[0] == "patch"] == []   # never writes
+
+
+def test_requeue_word_change_hits_fabrication_gate(monkeypatch):
+    pre = _Resp(200, [_row("id-f", gym_id="lasso", status="failed", caption="old")])
+    http = _FakeHTTP(get_resp=pre)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    status, body = portal_routes.handle_portal_action(
+        "requeue", "lasso", "id-f", "a1", note="We grew this gym 300% last month")
+    assert status == 422 and "fabrication" in body["error"].lower()
+    assert [c for c in http.calls if c[0] == "patch"] == []   # blocked before any write
+
+
+def test_requeue_refused_on_legacy_plane():
+    # requeue only exists on the content_calendar plane; a passed store bypasses supabase
+    status, body = portal_routes.handle_portal_action(
+        "requeue", "lasso", "id", "a1", store=object())
+    assert status == 400 and "content_calendar" in body["error"]

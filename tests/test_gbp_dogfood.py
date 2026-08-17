@@ -179,6 +179,39 @@ def test_gate1_unconfirmed_offer_not_written():
     assert not any(r["gbp_topic_type"] == "OFFER" for r in store.rows)
 
 
+def test_g4_connection_status_posture():
+    def _s(conns):
+        return _Store(conns=conns)
+    assert gd._connection_status("g", _s([{"status": "connected"}])) == "connected"
+    assert gd._connection_status("g", _s([{"status": "needs_reconnect"}])) == "needs_reconnect"
+    # connected wins even if another row needs reconnect (multi-location)
+    assert gd._connection_status("g", _s([{"status": "needs_reconnect"},
+                                          {"status": "connected"}])) == "connected"
+    assert gd._connection_status("g", _s([])) == "none"      # never connected -> still plans
+
+
+def test_g4_planner_pauses_on_needs_reconnect():
+    _seed("gritx_ig")
+    store = _Store()
+    out = gd.plan_gbp_dogfood(
+        "gritx", "gritx_ig", voice=_voice(), library_path="/x", city="Fishers",
+        store=store, start=date(2026, 9, 1), connection_status="needs_reconnect",
+        caption_fn=_cap, image_fn=_img)
+    assert out["ok"] is False and out["reason"] == "connection needs_reconnect"
+    assert out["planned"] == 0 and store.rows == []      # nothing written
+
+
+def test_g4_none_and_connected_still_plan():
+    _seed("gritx_ig")
+    for st in ("none", "connected"):
+        store = _Store()
+        out = gd.plan_gbp_dogfood(
+            "gritx", "gritx_ig", voice=_voice(), library_path="/x", city="Fishers",
+            store=store, start=date(2026, 9, 1), connection_status=st,
+            caption_fn=_cap, image_fn=_img)
+        assert out["ok"] and out["standard"] == 8
+
+
 def test_base_of_strips_platform_suffix():
     assert gd._base_of("lasso_ig") == "lasso"
     assert gd._base_of("gritx_fb") == "gritx"

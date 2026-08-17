@@ -205,7 +205,8 @@ def publish_one(row, connections, *, client, draft=True, alert=None):
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
     return {"status": res["status"], "late_post_id": res["late_post_id"],
-            "reject_reason": res["reject_reason"]}
+            "reject_reason": res["reject_reason"],
+            "gbp_location_id": conn.get("gbp_location_id")}   # for the G3 metrics bump
 
 
 def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None):
@@ -239,8 +240,19 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 continue
             if res["status"] == "published":
                 published += 1
-                stamp = _to_utc_iso((now or _utcnow()).isoformat())
+                _pub_at = (now or _utcnow())
+                stamp = _to_utc_iso(_pub_at.isoformat())
                 store.mark_published(row.get("id"), res["late_post_id"], stamp)
+                # G3: the publish rail owns posts_published (the portal cron omits it).
+                # Best-effort: a metrics write must never fail or undo a publish.
+                try:
+                    month_iso = _pub_at.date().replace(day=1).isoformat()
+                    store.bump_posts_published(
+                        gym, res.get("gbp_location_id"), month_iso,
+                        now_iso=stamp, seed_top_post_id=res.get("late_post_id"))
+                except Exception as e:  # noqa: BLE001
+                    print(f"[gbp] posts_published bump failed for {gym}: "
+                          f"{type(e).__name__}")
             elif res["status"] == "failed":
                 failed += 1
                 store.mark_failed(row.get("id"), res["reject_reason"])
@@ -248,15 +260,62 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
             "gyms": len(by_gym)}
 
 
+def _post_clicks(post_json):
+    """G3: a per-post click count from a Zernio GET /v1/posts/{id} response, or None when
+    the response carries no click signal (top_post_id is NEVER ranked from a fabricated
+    number — only from real click data). Tolerant of a few likely shapes."""
+    if not isinstance(post_json, dict):
+        return None
+    for path in (("insights", "clicks"), ("metrics", "clicks"), ("analytics", "clicks"),
+                 ("insights", "websiteClicks"), ("clicks",), ("clickThroughs",)):
+        node = post_json
+        for k in path:
+            node = node.get(k) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, (int, float)):
+            return int(node)
+    return None
+
+
+def _retry_publish_row(store, client, row, now):
+    """G7: ONE genuine retry of a transiently-failed GBP post. Zernio has no retry
+    endpoint, so a real retry rebuilds from the row + its connection and RE-SENDS once
+    through the same rail-validated send path. Returns True on a fresh 2xx publish (the new
+    late_post_id is stored), False otherwise (caller -> failed). Never raises."""
+    from .zernio import _to_utc_iso
+    try:
+        conns = [c for c in (store.connections_for(row.get("gym_id")) or [])
+                 if c.get("status") == "connected"]
+        conn = resolve_connection(conns, row.get("gbp_location_id"))
+    except Exception:  # noqa: BLE001 - no live connection -> cannot retry
+        return False
+    is_photo = str(row.get("format") or "").lower() == "photo"
+    try:
+        res = (publish_photo_drop(row, conn, client=client, draft=False, alert=None)
+               if is_photo
+               else publish_gbp_row(row, conn, client=client, draft=False))
+    except Exception:  # noqa: BLE001
+        return False
+    if res.get("ok") and res.get("status") == "published":
+        store.mark_published(row.get("id"), res.get("late_post_id"),
+                             _to_utc_iso(now.isoformat()))
+        return True
+    return False
+
+
 def reconcile_gbp(store, client, *, now=None, alert=None):
     """§7.2 reconcile: for each recently-PUBLISHED GBP row still inside the 48h window,
     poll GET /v1/posts/{id} and apply the classification. published/pending -> leave;
     policy rejection -> failed+reason+alert; transient -> one retry (then failed);
-    deleted -> deleted. Never auto-requeues. Returns a summary."""
+    deleted -> deleted. Never auto-requeues. G3: while polling, rank the top post BY CLICKS
+    per (gym, location, month) from real per-post click data and set gym_gbp_metrics
+    .top_post_id — a no-op when the poll carries no clicks. Returns a summary."""
     now = now or _utcnow()
     since = _iso(now - timedelta(hours=RECONCILE_HOURS))
     rows = store.recent_published_gbp(since) or []
     demoted = retried = 0
+    best_by_key = {}   # (gym, loc, month) -> (clicks, late_post_id) : G3 top-by-clicks
     for row in rows:
         if not in_reconcile_window(row.get("published_at"), now=now):
             continue
@@ -264,19 +323,24 @@ def reconcile_gbp(store, client, *, now=None, alert=None):
         if not pid:
             continue
         try:
-            state, reason = classify_reconcile(client.get_post(pid))
+            post_json = client.get_post(pid)
+            state, reason = classify_reconcile(post_json)
         except Exception:  # noqa: BLE001 - a poll error just waits for the next tick
             continue
         if state in ("published", "pending"):
+            # G3: rank the top post by real clicks (no-op if the poll has no click data)
+            clicks = _post_clicks(post_json)
+            if clicks is not None:
+                key = (row.get("gym_id"), row.get("gbp_location_id") or "",
+                       str(row.get("published_at") or "")[:7] + "-01")
+                if clicks > best_by_key.get(key, (-1, None))[0]:
+                    best_by_key[key] = (clicks, pid)
             continue
         if state == "retry":
             retried += 1
-            ok = False
-            try:
-                ok = bool(getattr(client, "retry_post", lambda _pid: None)(pid))
-            except Exception:  # noqa: BLE001
-                ok = False
-            if not ok:
+            # G7: a REAL one-shot retry (rebuild + re-send), not a no-op. Success leaves
+            # the row published (with a fresh late_post_id); failure demotes to failed.
+            if not _retry_publish_row(store, client, row, now):
                 store.mark_failed(row.get("id"),
                                   "Google could not publish this post after a retry.")
                 if alert:
@@ -290,7 +354,19 @@ def reconcile_gbp(store, client, *, now=None, alert=None):
             if alert:
                 alert(f"GBP post {pid} for {row.get('gym_id')} rejected: {reason}")
             demoted += 1
-    return {"checked": len(rows), "demoted": demoted, "retried": retried}
+    # G3: write the top-by-clicks winner per (gym, location, month). Best-effort — a
+    # metrics write must never break the reconcile lane.
+    ranked = 0
+    for (gym, loc, month), (_clicks, top_pid) in best_by_key.items():
+        try:
+            mrow = store.top_post_by_clicks(gym, loc, month)
+            if mrow and mrow.get("top_post_id") != top_pid:
+                store.set_top_post(mrow["id"], top_pid, _iso(now))
+                ranked += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[gbp] top_post_id rank failed for {gym}: {type(e).__name__}")
+    return {"checked": len(rows), "demoted": demoted, "retried": retried,
+            "top_ranked": ranked}
 
 
 def _utcnow():

@@ -11,6 +11,7 @@ from .portal_calendar_store import SupabaseCalendarStore, PortalStoreError, _scr
 
 _CAL = "content_calendar"
 _CONN = "gym_gbp_connections"
+_METRICS = "gym_gbp_metrics"
 PLATFORM = "googlebusiness"
 
 
@@ -137,6 +138,70 @@ class GbpStore:
 
     def mark_status(self, row_id, status):
         return self._patch(row_id, {"status": status})
+
+    # ---- G3 metrics (posts_published at publish; top_post_id by clicks at reconcile) --
+    def bump_posts_published(self, portal_gym_key, gbp_location_id, month_iso, *,
+                             now_iso, seed_top_post_id=None):
+        """G3: increment gym_gbp_metrics.posts_published for (gym, location, month) on each
+        publish. The portal cron owns impressions/clicks but OMITS this count, so the
+        publish rail owns it. Read-modify-write (no RPC): a missing row is INSERTed with
+        posts_published=1; an existing row is PATCHed to current+1. seed_top_post_id (the
+        just-published post's late_post_id) seeds top_post_id ONLY when it is still null, so
+        the column is never blank once a gym has published; reconcile later refines it to
+        the top post BY CLICKS. Best-effort — a metrics write must never fail a publish."""
+        loc = gbp_location_id or ""
+        existing = self._get(_METRICS, {
+            "portal_gym_key": f"eq.{portal_gym_key}", "gbp_location_id": f"eq.{loc}",
+            "month": f"eq.{month_iso}", "select": "id,posts_published,top_post_id",
+            "limit": "1"})
+        if existing:
+            cur = existing[0].get("posts_published") or 0
+            fields = {"posts_published": cur + 1, "synced_at": now_iso}
+            if seed_top_post_id and not existing[0].get("top_post_id"):
+                fields["top_post_id"] = seed_top_post_id
+            self._patch_metrics(existing[0]["id"], fields)
+        else:
+            self._insert_metrics({
+                "portal_gym_key": portal_gym_key, "gbp_location_id": loc,
+                "month": month_iso, "posts_published": 1,
+                "top_post_id": seed_top_post_id or None, "synced_at": now_iso})
+
+    def top_post_by_clicks(self, portal_gym_key, gbp_location_id, month_iso):
+        """The current gym_gbp_metrics row's top_post_id for (gym, location, month), or
+        None. Used by the reconcile ranker to compare a post's clicks against the record."""
+        rows = self._get(_METRICS, {
+            "portal_gym_key": f"eq.{portal_gym_key}", "gbp_location_id": f"eq.{gbp_location_id or ''}",
+            "month": f"eq.{month_iso}", "select": "id,top_post_id", "limit": "1"})
+        return rows[0] if rows else None
+
+    def set_top_post(self, metrics_row_id, top_post_id, now_iso):
+        """G3: set gym_gbp_metrics.top_post_id (the top post BY CLICKS, ranked during
+        reconcile from per-post engagement — never fabricated; only set when real click
+        data ranked a post)."""
+        return self._patch_metrics(metrics_row_id,
+                                   {"top_post_id": top_post_id, "synced_at": now_iso})
+
+    def _patch_metrics(self, row_id, fields):
+        r = self._s._client().patch(
+            self._s._rest(_METRICS), params={"id": f"eq.{row_id}"},
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json=fields, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def _insert_metrics(self, fields):
+        r = self._s._client().post(
+            self._s._rest(_METRICS),
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json=fields, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
 
     # ---- plumbing -----------------------------------------------------------
     def _get(self, table, params):
