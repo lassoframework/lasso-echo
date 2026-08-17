@@ -234,3 +234,87 @@ def test_template_generator_accepts_account_kwarg():
     """Uniform interface: TemplateGenerator.build ignores account cleanly."""
     caption, _h, _f = TemplateGenerator().build(_voice(), _creative(), account=_acct())
     assert _creative().client_note in caption
+
+
+# ---- cross-day OPENING variety (Ryan Parr, 2026-08-17) ------------------------
+
+def test_opening_signature_normalizes_hook():
+    """The signature is the normalized leading words of the first real (non-hashtag)
+    line; a hashtag-only first line is skipped."""
+    a = drafter.opening_signature("You're juggling too much today.")
+    assert a == "youre juggling too much today"
+    assert drafter.opening_signature("") == ""
+    # a hashtag-only first line is skipped; the signature comes from the real body line
+    assert drafter.opening_signature(
+        "#gym\nYou're juggling too much today.") == a
+
+
+def test_openings_collide_detects_shared_hook():
+    """Two captions leading with the same hook COLLIDE even when the words after the
+    hook differ (Ryan's exact case); a different opener does not collide."""
+    avoid = ["you're juggling too much"]
+    assert drafter.openings_collide(
+        "You're juggling too much and it never stops.", avoid)
+    assert drafter.openings_collide(
+        "Youre juggling too much this week, we get it.", avoid)
+    assert not drafter.openings_collide(
+        "Ready to feel strong again? Start here.", avoid)
+    assert not drafter.openings_collide("anything", [])
+    assert not drafter.openings_collide("", avoid)
+
+
+def test_avoid_openings_reaches_the_prompt(monkeypatch):
+    """The recent openings are folded into the LLM prompt as a HARD 'do not open like
+    these' instruction (STYLE-only, never a fact)."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    fake = FakeLLM(body="Ready to feel strong again? We meet you where you are.")
+    monkeypatch.setattr(drafter, "_call_llm_caption", fake)
+    StoryBrandGenerator().build(
+        _voice(), _creative(),
+        avoid_openings=["you're juggling too much", "you're swamped"])
+    assert "OPENINGS ALREADY USED" in fake.user
+    assert "you're juggling too much" in fake.user
+    assert "you're swamped" in fake.user
+
+
+def test_no_avoid_openings_leaves_prompt_unchanged(monkeypatch):
+    """A brand-new gym / the first day passes no avoid list -> no avoid block, same
+    prompt as before."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    fake = FakeLLM()
+    monkeypatch.setattr(drafter, "_call_llm_caption", fake)
+    StoryBrandGenerator().build(_voice(), _creative())     # avoid_openings default ()
+    assert "OPENINGS ALREADY USED" not in fake.user
+
+
+def test_colliding_opening_retries_once_and_prefers_varied(monkeypatch):
+    """When the first generation still collides with a recent opening, the generator
+    retries ONCE and keeps the more varied result."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    calls = {"n": 0}
+
+    def _fake(system, user):
+        calls["n"] += 1
+        # first attempt collides with the avoid list; retry (stronger nudge) varies
+        return ("You're juggling too much and it never stops."
+                if calls["n"] == 1
+                else "Strength starts with one honest hour a week.")
+
+    monkeypatch.setattr(drafter, "_call_llm_caption", _fake)
+    caption, _h, _f = StoryBrandGenerator().build(
+        _voice(), _creative(), avoid_openings=["you're juggling too much"])
+    assert calls["n"] == 2                              # retried exactly once
+    assert "Strength starts with one honest hour" in caption
+    assert "juggling too much" not in caption.lower()
+
+
+def test_colliding_opening_never_blocks_the_post(monkeypatch):
+    """If even the retry still collides, a caption is STILL produced (the varied hook
+    is preferred but never required; a post is never blocked over opener repetition)."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    fake = FakeLLM(body="You're juggling too much, every single day.")
+    monkeypatch.setattr(drafter, "_call_llm_caption", fake)
+    caption, _h, _f = StoryBrandGenerator().build(
+        _voice(), _creative(), avoid_openings=["you're juggling too much"])
+    assert caption.strip()                              # a caption is always produced
+    assert "Book your intro session." in caption        # CTA still appended

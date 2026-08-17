@@ -84,7 +84,7 @@ def test_youth_video_yields_youth_grounding_to_sb7(tmp_path, monkeypatch):
     seen = {}
 
     class _FakeSB7:
-        def build(self, voice, creative, account=None):
+        def build(self, voice, creative, account=None, avoid_openings=()):
             seen["note"] = creative.client_note
             return ("Your kid's confidence is built in the gym, not on a screen.",
                     ["#Youth"], [])

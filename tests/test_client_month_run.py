@@ -381,3 +381,57 @@ def test_denied_photo_is_not_excluded(tmp_path):
     used = {r["image_url"] for r in store.inserted if r["format"] == "feed"
             and r["account"] == "instagram"}
     assert "https://gritx.media/photo_01.jpg" in used
+
+
+# ---- 13. cross-day OPENING variety with LOW source variety (Ryan Parr) -----------
+def test_low_variety_month_diversifies_openings(tmp_path, monkeypatch):
+    """Ryan Parr, 2026-08-17: with few facts and one photo shoot, several planned days
+    in a row led with the SAME opener ('You're juggling too much' x3, then 'You're
+    swamped' x3). The month builder must thread each accepted day's opening into the
+    NEXT day's generation so the openings diversify. This simulates a repetition-prone
+    model (SB7 armed, LLM stubbed): unguided it always opens the same way; once the
+    avoid list reaches the prompt it varies. Asserts (a) the accepted captions do NOT
+    all share one opening and (b) the avoid-openings signal reached the generator."""
+    from agent import drafter
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+
+    # LOW source variety: a couple of same-theme facts (like Ryan's account).
+    cs.add_source("gritx_ig", "service", "Busy schedule fitness for working parents",
+                  "client social intake")
+    cs.add_source("gritx_ig", "offer", "Swamped parent kickstart program",
+                  "client social intake")
+
+    seen_avoid_blocks = []
+
+    def _fake_llm(system, user):
+        # record whether the cross-day avoid block reached the prompt
+        seen_avoid_blocks.append("OPENINGS ALREADY USED" in user)
+        # A repetition-prone model: default to the SAME stock opener every time. When
+        # the prompt tells it which openings to avoid, it varies the entry point so the
+        # opening is genuinely different (12+ content words, no figures, no dashes).
+        if "OPENINGS ALREADY USED" in user:
+            return ("Ready to feel strong again and finally enjoy your workouts every "
+                    "single week with people who cheer you on")
+        return ("You are juggling too much and there is never enough time in your day "
+                "to take proper care of yourself")
+
+    monkeypatch.setattr(drafter, "_call_llm_caption", _fake_llm)
+
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=6, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(feed_ig) >= 3, "not enough feed days built to observe repetition"
+
+    # (a) the accepted feed captions do NOT all lead with the same opening
+    sigs = {drafter.opening_signature(r["caption"]) for r in feed_ig}
+    assert len(sigs) > 1, f"all feed openings collapsed to one hook: {sigs}"
+
+    # (b) the avoid-openings signal reached the generator on later days (day 1 has no
+    # prior opening, so it is absent then; it must be present on at least one later day)
+    assert any(seen_avoid_blocks), "the avoid-openings signal never reached the prompt"
