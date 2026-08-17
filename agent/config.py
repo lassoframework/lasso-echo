@@ -849,6 +849,27 @@ def gbp_publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_PUBLISH", "false"))
 
 
+def gbp_offer_confirmed_gyms() -> set:
+    """GATE 1 (OFFER-only-when-confirmed): the set of portal_gym_keys whose LIVE offer a
+    human has CONFIRMED. The planner generates a GBP OFFER post ONLY for a gym in this set
+    (and only when a real offer + redeem url also resolve). Default EMPTY => OFFER is OFF
+    for every gym until confirmed by hand — a wrong offer to Google is a failure we cannot
+    eat. Hand-set AGENT_GBP_OFFER_CONFIRMED as a comma list of base gym keys (e.g.
+    'gritx,eng'). This is the interim mechanism until a portal-driven confirmation column
+    exists; local updates, events, and photo drops are unaffected."""
+    raw = os.environ.get("AGENT_GBP_OFFER_CONFIRMED", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def gbp_coach_screen_enabled() -> bool:
+    """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
+    is written in the withheld 'coach_review' status so the OWNER never sees or approves it
+    until a coach screens and releases it. Set AGENT_GBP_COACH_SCREEN=false only to bypass
+    the screen (e.g. a gym a coach has already vetted). The owner /social read hides
+    coach_review rows; the release flips them to 'pending'."""
+    return _truthy(os.environ.get("AGENT_GBP_COACH_SCREEN", "true"))
+
+
 def welcome_digest_enabled() -> bool:
     """
     Daily NEW-CLIENT welcome digest to Slack: one message a day listing every new

@@ -97,6 +97,7 @@ def test_full_cadence_with_offer_and_event():
         "lasso", "lasso_ig", voice=_voice(), library_path="/nope", city="Carmel",
         store=store, start=date(2026, 9, 1), days=30, cta_url="https://gym.com/start",
         offer=("12 Week Strength", {"redeemOnlineUrl": "https://ghl/join"}),
+        offer_confirmed=True,     # GATE 1: OFFER only when the live offer is confirmed
         events=[{"title": "Open House", "fact": "Open house this month in Carmel",
                  "schedule": {"startDate": "2026-09-20", "endDate": "2026-09-20"}}],
         caption_fn=_cap, image_fn=_img)
@@ -143,6 +144,32 @@ def test_injected_facts_drive_standard_without_client_sources():
     pillars = {r["pillar"] for r in store.rows if r["gbp_topic_type"] == "STANDARD"
                and r["format"] == "update"}
     assert pillars <= {"All in one offer", "Sales are now", "Proof"}
+
+
+def test_gate1_offer_skipped_when_not_confirmed():
+    # a REAL offer resolves but is not confirmed -> OFFER slot skipped (never a wrong
+    # offer to Google). Local updates + photo drops unaffected.
+    _seed()
+    store = _Store()
+    out = gp.plan_gbp_month(
+        "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1),
+        offer=("12 Week Strength", {"redeemOnlineUrl": "https://ghl/join"}),
+        offer_confirmed=False, caption_fn=_cap, image_fn=_img)
+    assert out["ok"] and out["offer"] == 0 and out["standard"] == 8 and out["photo"] == 4
+    assert not any(r["gbp_topic_type"] == "OFFER" for r in store.rows)
+
+
+def test_gate2_initial_status_written_on_every_row():
+    # coach_review (withheld) status rides onto every planned row for a first month
+    _seed()
+    store = _Store()
+    out = gp.plan_gbp_month(
+        "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), offer=None, events=[],
+        initial_status="coach_review", caption_fn=_cap, image_fn=_img)
+    assert out["ok"] and store.rows
+    assert all(r["status"] == "coach_review" for r in store.rows)
 
 
 def test_no_offer_skips_offer_slot():

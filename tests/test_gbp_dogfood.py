@@ -156,6 +156,29 @@ def test_full_cadence_writes_pending_rows():
                for r in store.rows)
 
 
+def test_gate2_coach_review_status_threads_through():
+    _seed()
+    store = _Store()
+    out = gd.plan_gbp_dogfood(
+        "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1), initial_status="coach_review",
+        caption_fn=_cap, image_fn=_img)
+    assert out["ok"] and store.rows
+    assert all(r["status"] == "coach_review" for r in store.rows)
+
+
+def test_gate1_unconfirmed_offer_not_written():
+    _seed()
+    store = _Store()
+    out = gd.plan_gbp_dogfood(
+        "lasso", "lasso_ig", voice=_voice(), library_path="/x", city="Carmel",
+        store=store, start=date(2026, 9, 1),
+        offer=("Free Trial", {"redeemOnlineUrl": "https://ghl/x"}),
+        offer_confirmed=False, caption_fn=_cap, image_fn=_img)
+    assert out["ok"] and out["offer"] == 0
+    assert not any(r["gbp_topic_type"] == "OFFER" for r in store.rows)
+
+
 def test_base_of_strips_platform_suffix():
     assert gd._base_of("lasso_ig") == "lasso"
     assert gd._base_of("gritx_fb") == "gritx"

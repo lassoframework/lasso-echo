@@ -81,6 +81,30 @@ class GbpStore:
                                 "status": "not.in.(failed,denied,deleted)",
                                 "order": "post_date"})
 
+    def any_gbp_rows(self, portal_gym_key):
+        """True if the gym has ANY googlebusiness row ever (any date, any status). GATE 2
+        month-1 detection: no prior rows => this is the gym's first GBP month, so it is
+        written withheld ('coach_review')."""
+        rows = self._get(_CAL, {"account": f"eq.{PLATFORM}",
+                                "gym_id": f"eq.{portal_gym_key}",
+                                "select": "id", "limit": "1"})
+        return bool(rows)
+
+    def release_coach_review(self, portal_gym_key):
+        """GATE 2 coach release: flip this gym's withheld googlebusiness 'coach_review'
+        rows to 'pending' (owner-visible) in one PATCH. Returns the released rows. A coach
+        runs this after screening the gym's first month."""
+        r = self._s._client().patch(
+            self._s._rest(_CAL),
+            params={"account": f"eq.{PLATFORM}", "gym_id": f"eq.{portal_gym_key}",
+                    "status": "eq.coach_review"},
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json={"status": "pending"}, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def onboarding_intake(self, portal_gym_key):
         """The gym's onboarding_intake offer fields ({business_name, offers, ghl_link}) or
         None. LASSO's own record is keyed by business_name; client gyms match the base key.

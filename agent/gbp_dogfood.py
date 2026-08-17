@@ -66,7 +66,8 @@ def _resolve_connection_location(portal_gym_key, store):
 def plan_gbp_dogfood(portal_gym_key, account_gen_key, *, voice, library_path, city,
                      store, offer=None, cta_url="", gbp_location_id=None, days=30,
                      start=None, events=(), caption_fn=None, image_fn=None,
-                     facts=None, now=None, logger=None):
+                     facts=None, offer_confirmed=False, initial_status="pending",
+                     now=None, logger=None):
     """Idempotently plan + write one gym's PENDING GBP month. Skips (no-op) when the gym
     already has googlebusiness rows dated on/after `start` (never a duplicate month).
     Blocks (does not fabricate) when voice is missing. Returns the planner result dict
@@ -92,7 +93,8 @@ def plan_gbp_dogfood(portal_gym_key, account_gen_key, *, voice, library_path, ci
         portal_gym_key, account_gen_key, voice=voice, library_path=library_path,
         city=city, store=store, start=start, days=days, offer=offer, events=events,
         gbp_location_id=gbp_location_id, cta_url=cta_url, caption_fn=caption_fn,
-        image_fn=image_fn, facts=facts, logger=log)
+        image_fn=image_fn, facts=facts, offer_confirmed=offer_confirmed,
+        initial_status=initial_status, logger=log)
 
 
 # ---- LASSO bespoke material (its content is not in the client_sources pipeline) -----
@@ -217,6 +219,21 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
     offer = _resolve_offer_for(portal_gym_key, store)
     loc, offer_url = _resolve_connection_location(portal_gym_key, store)
 
+    # GATE 1: OFFER only for a gym whose live offer a human has confirmed (default: none).
+    offer_confirmed = base in config.gbp_offer_confirmed_gyms()
+    # GATE 2: a gym's FIRST GBP month is withheld in 'coach_review' until a coach releases
+    # it. First month == the gym has NO prior googlebusiness rows at all.
+    is_first_month = True
+    try:
+        is_first_month = not store.any_gbp_rows(portal_gym_key)
+    except Exception:  # noqa: BLE001
+        is_first_month = True
+    initial_status = "coach_review" if (config.gbp_coach_screen_enabled()
+                                        and is_first_month) else "pending"
+    if initial_status == "coach_review":
+        log(f"{portal_gym_key}: first GBP month -> written as 'coach_review' "
+            "(withheld from owner until a coach releases it; GATE 2)")
+
     facts = None
     if base == "lasso":
         # LASSO's content is bespoke: facts from lasso_now.md, cards flat in the repo
@@ -234,17 +251,40 @@ def run(portal_gym_key="lasso", *, city=None, cta_url=None, days=30, now=None,
     return plan_gbp_dogfood(
         portal_gym_key, account_gen_key, voice=voice, library_path=library_path,
         city=city, store=store, offer=offer, cta_url=resolved_cta, gbp_location_id=loc,
-        days=days, now=now, facts=facts, image_fn=image_fn, logger=log)
+        days=days, now=now, facts=facts, image_fn=image_fn,
+        offer_confirmed=offer_confirmed, initial_status=initial_status, logger=log)
+
+
+def release(portal_gym_key, *, logger=None):
+    """GATE 2 coach release: after a coach screens a gym's withheld first GBP month, flip
+    its 'coach_review' rows to 'pending' so the owner can see and approve them."""
+    log = logger or (lambda m: print(f"[gbp-dogfood] {m}"))
+    from .gbp_store import GbpStore
+    store = GbpStore()
+    if not store.available():
+        return {"ok": False, "reason": "portal store unavailable", "released": 0}
+    released = store.release_coach_review(portal_gym_key)
+    log(f"{portal_gym_key}: released {len(released)} coach_review rows -> pending")
+    return {"ok": True, "released": len(released)}
 
 
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
+    # coach release: `python3 -m agent.gbp_dogfood release <gym>`
+    if argv and argv[0] == "release":
+        if len(argv) < 2:
+            print("usage: python3 -m agent.gbp_dogfood release <portal_gym_key>")
+            return 2
+        res = release(argv[1])
+        print(f"[gbp-dogfood] result: {res}")
+        return 0 if res.get("ok") else 1
     gym = argv[0] if argv else "lasso"
     # city passed as 2nd arg (real); LASSO's is Carmel.
     city = argv[1] if len(argv) > 1 else ("Carmel" if gym == "lasso" else None)
     cta_url = argv[2] if len(argv) > 2 else None    # optional LEARN_MORE target override
     if not city:
         print("usage: python3 -m agent.gbp_dogfood <portal_gym_key> <city> [cta_url]")
+        print("       python3 -m agent.gbp_dogfood release <portal_gym_key>")
         return 2
     res = run(gym, city=city, cta_url=cta_url)
     print(f"[gbp-dogfood] result: {res}")

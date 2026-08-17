@@ -246,6 +246,29 @@ def test_approve_sets_status_approved(monkeypatch):
     assert store.patches == [("id-1", "approved")]
 
 
+def test_gate2_coach_review_rows_withheld_from_owner(monkeypatch):
+    # GATE 2: a first-month 'coach_review' post is invisible in the owner /social view
+    # until a coach releases it; a sibling 'pending' post shows normally.
+    store = _FakeStore([
+        _row("vis-1", post_date="2026-08-05", status="pending"),
+        _row("hidden-1", post_date="2026-08-08", status="coach_review"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    status, body = ps.handle_social("lasso", "2026-08")
+    assert status == 200
+    ids = {p["id"] for p in body["posts"]}
+    assert ids == {"vis-1"}, "coach_review rows must not reach the owner view"
+
+
+def test_gate2_approve_rejects_coach_review_row(monkeypatch):
+    # even if a withheld row's id leaks, the owner cannot approve it
+    store = _FakeStore([_row("id-1", status="coach_review")])
+    status, body = ps.handle_approve("lasso", "id-1", "U_owner", sb_store=store)
+    assert status == 409 and body["ok"] is False
+    assert "coach review" in body["error"].lower()
+    assert store.patches == [], "a coach_review row must never be flipped to approved"
+
+
 def test_approve_idempotent_on_already_approved(monkeypatch):
     store = _FakeStore([_row("id-1", status="approved")])
     status, body = ps.handle_approve("lasso", "id-1", "U_owner", sb_store=store)

@@ -406,6 +406,11 @@ def _handle_social_supabase(account_key, month, now=None):
     try:
         sb = _pcs.SupabaseCalendarStore()
         rows = sb.list_month(account_key, month)
+        # GATE 2 (coach-screens-first-month): rows a coach has NOT yet released are
+        # WITHHELD from the owner. 'coach_review' posts never appear in the owner /social
+        # view (nor feed low_creative/awaiting) until a coach flips them to 'pending'.
+        rows = [r for r in rows
+                if str((r or {}).get("status") or "").lower() != "coach_review"]
         posts = [_content_calendar_post(r) for r in rows]
     except Exception as exc:
         return 500, {"error": f"store error: {type(exc).__name__}"}
@@ -598,6 +603,12 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
         if str(row.get("status") or "").lower() == "published":
             return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
                          "detail": "Already published.", "idempotent": True}
+        # GATE 2: a withheld first-month row cannot be approved by the owner. It stays
+        # invisible in /social, but guard the action too in case an id leaks.
+        if str(row.get("status") or "").lower() == "coach_review":
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "this post is still in coach review and has not been "
+                                  "released yet"}
         updated = sb_store.set_status(account_key, draft_id,
                                       _pcs.action_status("approve"))
         if updated is None:

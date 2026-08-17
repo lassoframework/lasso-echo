@@ -166,6 +166,25 @@ Proven end-to-end on 100% real LASSO material (no fabrication):
   `resolve_connection` binds LASSO's single connection at publish time. **Your only actions:** click
   Connect on LASSO's GBP listing, then approve the pending posts.
 
+### [x] Two planner gates (Blake, 2026-08-17) — "a failure we can't eat"
+Both live in the Echo planner (+ the Echo backend read), NOT the Vercel portal. Defaults CLOSED.
+- **GATE 1 — OFFER-only-when-confirmed.** `plan_gbp_month(offer_confirmed=...)`: the OFFER slot is
+  planned ONLY when a real offer resolves AND the gym is confirmed. Source: `AGENT_GBP_OFFER_CONFIRMED`
+  (comma list of base gym keys; **default EMPTY => OFFER OFF for every gym**). A wrong offer to Google
+  is unrecoverable, so OFFER stays off per gym until a human confirms. Local updates, events, photo
+  drops are unaffected (day-one safe). Interim mechanism; a portal-driven confirmation column is the
+  upgrade path.
+- **GATE 2 — coach-screens-first-month.** A gym's FIRST GBP month is written in status `coach_review`
+  (withheld) instead of `pending`. `AGENT_GBP_COACH_SCREEN` **defaults ON**. The owner `/social` read
+  (`portal_social._handle_social_supabase`) filters out `coach_review` rows, and the approve action
+  rejects them (409) — the owner cannot see or approve month-1 until a coach releases it. Release:
+  `python3 -m agent.gbp_dogfood release <gym>` flips the gym's `coach_review` rows -> `pending`. First
+  month = the gym has no prior googlebusiness rows (`GbpStore.any_gbp_rows`).
+- **LASSO's existing 12 dogfood rows are `pending`** (planned before these gates) and stay owner-visible
+  — Blake is LASSO's own coach/owner. New gyms get `coach_review` on their first month automatically.
+  OPEN: extend GATE 2 to the FB/IG client-month lane (`build_client_month`)? Not done (that lane is
+  owned by a parallel edit right now); flag for Blake.
+
 ### [!] Legacy `agent/gbp_publisher.py` — untouched and dead (verified)
 The new rail uses `account='googlebusiness'` rows + the GBP worker lane. `approvals.py` still routes
 its legacy `Platform.GOOGLE_BUSINESS` path to `gbp_publisher`; that path is not used by the new

@@ -128,9 +128,12 @@ def _cropped_image_url(account_key, image, day_key):
 
 def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
          topic_type, pillar, cta_type=gbp.DEFAULT_CTA, cta_url="",
-         event=None, offer=None, gbp_location_id=None, fmt="update"):
-    """One PENDING content_calendar GBP row dict (no id; DB mints it). account is the
-    literal 'googlebusiness'; gym_id is the portal_gym_key canonical join."""
+         event=None, offer=None, gbp_location_id=None, fmt="update",
+         status="pending"):
+    """One content_calendar GBP row dict (no id; DB mints it). account is the literal
+    'googlebusiness'; gym_id is the portal_gym_key canonical join. status is 'pending'
+    (owner-visible) normally, or 'coach_review' (withheld from the owner) for a gym's
+    first month under GATE 2."""
     row = {
         "gym_id": portal_gym_key,
         "account": gbp.PLATFORM,             # 'googlebusiness'
@@ -139,7 +142,7 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
         "format": fmt,                        # update | event | offer | photo
         "caption": caption,
         "image_url": image_url,
-        "status": "pending",
+        "status": status,
         "gbp_topic_type": topic_type,
     }
     if topic_type != "OFFER":
@@ -157,7 +160,8 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
 def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city,
                    store, start=None, days=30, offer=None, events=(),
                    gbp_location_id=None, cta_url="", caption_fn=None, image_fn=None,
-                   facts=None, logger=None):
+                   facts=None, offer_confirmed=False, initial_status="pending",
+                   logger=None):
     """Plan one GBP month for a gym and WRITE it as PENDING rows (Echo write path).
 
     Cadence (§5.1): 8 STANDARD + 1 OFFER (if a real offer resolves) + up to 2 EVENT
@@ -176,7 +180,14 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     live in the client_sources pipeline. When given, the STANDARD loop draws its facts
     from this list (cycled) instead of client_sources, and satisfies the presence guard.
     It is REAL approved material only; every A+ / figure / no-dash gate still runs on the
-    generated caption, so no gate is weakened and nothing is fabricated."""
+    generated caption, so no gate is weakened and nothing is fabricated.
+
+    GATE 1 offer_confirmed: the OFFER slot is planned ONLY when this is True AND a real
+    offer resolves. A gym whose live offer is not confirmed gets NO OFFER post (a wrong
+    offer to Google is a failure we cannot eat). Local updates / events / photo drops are
+    unaffected. GATE 2 initial_status: the status every planned row is written with —
+    'pending' (owner-visible) normally, or 'coach_review' (withheld from the owner until a
+    coach screens and releases it) for a gym's first month."""
     log = logger or (lambda m: print(f"[gbp-planner] {m}"))
     start = start or date.today()
     caption_fn = caption_fn or (lambda fact: generate_gbp_caption(fact, voice, city))
@@ -223,14 +234,15 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             rows.append(_row(portal_gym_key, account_gen_key, day.isoformat(), cap,
                              img_url, topic_type="STANDARD", pillar=pillar,
                              cta_type=gbp.DEFAULT_CTA, cta_url=cta_url,
-                             gbp_location_id=gbp_location_id, fmt="update"))
+                             gbp_location_id=gbp_location_id, fmt="update",
+                             status=initial_status))
             counts["standard"] += 1
         else:
             counts["skipped"] += 1
         day += timedelta(days=3)
 
-    # ---- 1 OFFER (only when a real offer + redeem url resolved) ----
-    if offer and offer[0] and offer[1]:
+    # ---- 1 OFFER (GATE 1: only when a real offer + redeem url resolved AND confirmed) ----
+    if offer and offer[0] and offer[1] and offer_confirmed:
         oname, odict = offer
         od = day.isoformat()
         img_url = _image_url(od)
@@ -239,11 +251,14 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             rows.append(_row(portal_gym_key, account_gen_key, od, cap, img_url,
                              topic_type="OFFER", pillar="offer", offer=odict,
                              event=_offer_window(day), gbp_location_id=gbp_location_id,
-                             fmt="offer"))
+                             fmt="offer", status=initial_status))
             counts["offer"] += 1
         else:
             counts["skipped"] += 1
         day += timedelta(days=2)
+    elif offer and offer[0] and offer[1] and not offer_confirmed:
+        log(f"{portal_gym_key}: offer '{offer[0]}' resolved but NOT confirmed -> OFFER "
+            "slot skipped (GATE 1: offer-only-when-confirmed)")
 
     # ---- 0-2 EVENT (real events only) ----
     for ev in list(events)[:CADENCE["EVENT_MAX"]]:
@@ -255,7 +270,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                              topic_type="EVENT", pillar="event", cta_type=gbp.DEFAULT_CTA,
                              cta_url=cta_url,
                              event={"title": ev.get("title") or "", "schedule": ev["schedule"]},
-                             gbp_location_id=gbp_location_id, fmt="event"))
+                             gbp_location_id=gbp_location_id, fmt="event",
+                             status=initial_status))
             counts["event"] += 1
         else:
             counts["skipped"] += 1
@@ -268,7 +284,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
         if img_url:
             rows.append(_row(portal_gym_key, account_gen_key, pday.isoformat(),
                              "", img_url, topic_type="STANDARD", pillar="photo",
-                             gbp_location_id=gbp_location_id, fmt="photo"))
+                             gbp_location_id=gbp_location_id, fmt="photo",
+                             status=initial_status))
             counts["photo"] += 1
         pday += timedelta(days=7)
 

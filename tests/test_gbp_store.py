@@ -78,3 +78,49 @@ def test_onboarding_intake_queries_by_base_name():
 def test_onboarding_intake_none_when_empty():
     s = _CapturingStore(_FakeBase(url="u", key="k"), rows=[])
     assert s.onboarding_intake("lasso") is None
+
+
+def test_any_gbp_rows_queries_gym_scoped():
+    base = _FakeBase(url="u", key="k")
+    s = _CapturingStore(base, rows=[{"id": "x"}])
+    assert s.any_gbp_rows("lasso") is True
+    table, params = base.captured[-1]
+    assert table == "content_calendar"
+    assert params["account"] == "eq.googlebusiness" and params["gym_id"] == "eq.lasso"
+
+
+def test_any_gbp_rows_false_when_empty():
+    s = _CapturingStore(_FakeBase(url="u", key="k"), rows=[])
+    assert s.any_gbp_rows("lasso") is False
+
+
+def test_release_coach_review_patches_status():
+    # release flips coach_review -> pending via a filtered PATCH
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = "[]"
+        def json(self):
+            return [{"id": "1", "status": "pending"}, {"id": "2", "status": "pending"}]
+
+    class _Client:
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            captured["params"] = params
+            captured["json"] = json
+            return _Resp()
+
+    class _Base(_FakeBase):
+        def _client(self):
+            return _Client()
+        def _rest(self, path):
+            return f"https://x/rest/v1/{path}"
+        def _headers(self, extra=None):
+            return {}
+
+    s = GbpStore(base=_Base(url="u", key="k"))
+    released = s.release_coach_review("lasso")
+    assert len(released) == 2
+    assert captured["params"]["status"] == "eq.coach_review"
+    assert captured["params"]["gym_id"] == "eq.lasso"
+    assert captured["json"] == {"status": "pending"}
