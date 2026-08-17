@@ -45,11 +45,16 @@ _GENDER = (r"\bman\b", r"\bmen\b", r"\bwoman\b", r"\bwomen\b", r"\bmales?\b", r"
 # the SAFE failure per §10 — it routes to coach hand-pick, never a mismatch).
 _AGE = (r"\byoung\b", r"\bold\b", r"\belderly\b", r"\bteenage[dr]?\b", r"\bteens?\b",
         r"\bseniors?\b", r"\bmiddle.aged\b", r"\bkids?\b")
+# Body-appearance descriptors of a PERSON. `fat` excludes the common "fat-burning" compound
+# (a class descriptor, not a body). A few terms (thin/blonde) can still hit object/facility
+# descriptions ("thin mats", "blonde wood") — an accepted SAFE-direction over-block per §10
+# (routes to coach, never a mismatch); revisit with an object-context allowlist only if the
+# LASSO dogfood diff shows real exclusion at scale.
 _APPEARANCE = (r"\bmuscular\b", r"\bripped\b", r"\bjacked\b", r"\boverweight\b", r"\bobese\b",
                r"\bskinny\b", r"\bslim\b", r"\bheavyset\b", r"\bchubby\b", r"\bplus.size\b",
-               r"\btoned\b", r"\bshredded\b", r"\bbuff\b", r"\bfat\b", r"\bpetite\b",
-               r"\bcurvy\b", r"\bstocky\b", r"\bbald\b", r"\bblonde?\b", r"\bbrunette\b",
-               r"\bbearded\b", r"\bthin\b")
+               r"\btoned\b", r"\bshredded\b", r"\bbuff\b", r"\bfat\b(?!\s*[- ]?burn)",
+               r"\bpetite\b", r"\bcurvy\b", r"\bstocky\b", r"\bbald\b", r"\bblonde?\b",
+               r"\bbrunette\b", r"\bbearded\b", r"\bthin\b")
 _HEALTH = (r"\binjured\b", r"\bunhealthy\b", r"\bdiabetic\b", r"\bpregnant\b", r"\bdisabled\b",
            r"\bobese\b")
 _IDENTITY_RE = re.compile("|".join(_GENDER + _AGE + _APPEARANCE + _HEALTH), re.IGNORECASE)

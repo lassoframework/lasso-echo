@@ -26,13 +26,14 @@ Blake before any client gym; adversarial set must route 100% before any default-
   through the real coerce+routing (name tag, whiteboard-PII, before/after collage, athlete
   comp, minor-prominent, blurry burst, empty-gym, gender-leak, third-party-brand). Standing
   acceptance bar.
-- **[x/audit] P1 — analysis v2** (`agent/vision.py`): v2 `media_analysis` schema; identity
+- **[x] P1 — analysis v2** (`agent/vision.py`): v2 `media_analysis` schema; identity
   firewall on one_line/subjects/details (never text_in_image); DCT-pHash + Hamming;
   `caption_eligible_details` (≥0.85); `auto_plannable` (excludes safety/person-name/athlete/
   identity-leak/unusable/missing-failed); `analyze_and_store` on the sidecar (idempotent =
   preserve-on-re-sync; 3-attempt fail → `analysis_failed`+alert); `analyze_library` backfill;
-  ingest hook in `client_media_sync` (per-gym, best-effort). +31 tests. Independent audit in
-  flight.
+  ingest hook in `client_media_sync` (per-gym, best-effort). Independent audit → 3 findings
+  (1 CRITICAL guardrail-11 leak, 1 MAJOR name over-block, 1 MINOR flat-pHash) FIXED; re-audit
+  0 material remaining (one safe-direction over-block noted for the dogfood-diff revisit).
 - [ ] P2 hygiene · [ ] P3 pick scoring · [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
 
 ---
