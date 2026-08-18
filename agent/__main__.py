@@ -828,6 +828,7 @@ _COMMANDS = {
         ("audit / fleet-status", "cross-account state"),
         ("gbp-check", "Google Business Profile check"),
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
+        ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
     ],
     "trust & approvals": [
@@ -2619,6 +2620,31 @@ def main(argv=None):
                 print("The gym can now connect Google Business Profile / GBM in Zernio.")
             else:
                 print(f"provision FAILED for {account_key}: {info}")
+    elif cmd == "zernio-connect-url":
+        # Print a gym's OAuth CONNECT url for a platform so ops can hand the owner a direct
+        # link (e.g. Google Business). Run on the worker (ZERNIO_API_KEY lives there):
+        #   railway ssh --service echo /opt/venv/bin/python -m agent zernio-connect-url \
+        #     --account eng --platform googlebusiness
+        account_key, platform = "", "googlebusiness"
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] in ("--account", "--gym") and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--platform" and i + 1 < len(args_rest):
+                platform = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent zernio-connect-url --account <key> "
+                  "[--platform instagram|facebook|googlebusiness]")
+        else:
+            from .zernio_routes import connect_url_for
+            ok, info = connect_url_for(account_key, platform)
+            if ok:
+                print(f"{account_key} {platform} connect url:")
+                print(info)
+            else:
+                print(f"connect-url FAILED for {account_key} {platform}: {info}")
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:

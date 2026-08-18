@@ -105,14 +105,44 @@ def provision_gym(account_key, client=None):
     return True, str(pid)
 
 
+def connect_url_for(account_key, platform, client=None):
+    """OPS: the OAuth CONNECT url for a gym + platform (instagram|facebook|googlebusiness),
+    find-or-creating the Zernio profile first. This is the same URL the portal handler returns;
+    exposed for the CLI so ops can hand a gym owner a direct connect link (e.g. a Google
+    Business connect link) without a portal round-trip. Returns (ok, url_or_error). Requires
+    zernio_enabled() (ZERNIO_API_KEY) — run on the worker where the key lives."""
+    if not config.zernio_enabled():
+        return False, "zernio disabled (ZERNIO_API_KEY not set on this host)"
+    if not account_key:
+        return False, "missing account_key"
+    if platform not in _z.CONNECT_PLATFORMS:
+        return False, f"platform must be one of {', '.join(_z.CONNECT_PLATFORMS)}"
+    c = _client(client)
+    try:
+        pid = _ensure_profile_id(account_key, c)
+        if not pid:
+            return False, "could not resolve a Zernio profile for this gym"
+        data = c.connect_url(pid, platform)
+    except _z.ZernioError as exc:
+        return False, f"zernio {exc.status}: {exc.detail}"
+    except Exception as exc:  # noqa: BLE001 - report, never crash the ops command
+        return False, f"{type(exc).__name__}: {exc}"
+    auth_url = (data or {}).get("authUrl")
+    if not auth_url or not str(auth_url).startswith("http"):
+        return False, "zernio returned no authUrl"
+    return True, str(auth_url)
+
+
 def handle_social_connect(account_key, platform, client=None):
-    """GET /portal/<token>/social-connect?platform=instagram|facebook -> {oauth_url}."""
+    """GET /portal/<token>/social-connect?platform=instagram|facebook|googlebusiness
+    -> {oauth_url}. Google Business connects through the SAME find-or-create profile +
+    connect_url path as IG/FB (Zernio platform key 'googlebusiness')."""
     if not config.zernio_enabled():
         return _disabled("social-connect")
     if not account_key:
         return 400, {"error": "missing account_key"}
-    if platform not in _z.PLATFORMS:
-        return 400, {"error": "platform must be instagram or facebook"}
+    if platform not in _z.CONNECT_PLATFORMS:
+        return 400, {"error": "platform must be instagram, facebook, or googlebusiness"}
     c = _client(client)
     try:
         pid = _ensure_profile_id(account_key, c)

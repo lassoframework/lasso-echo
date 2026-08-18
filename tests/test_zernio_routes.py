@@ -198,6 +198,33 @@ def test_connect_validates_platform(db_env):
     assert "platform" in body["error"]
 
 
+def test_connect_allows_google_business(db_env):
+    # Google Business connects through the same profile + connect_url path (Dale/ENG).
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=1"})
+    status, body = zr.handle_social_connect("gymA", "googlebusiness", client=fake)
+    assert status == 200
+    assert body["oauth_url"].startswith("https://accounts.google.com/")
+    assert ("connect", "new_profile", "googlebusiness") in fake.calls
+
+
+def test_connect_url_for_google_business(db_env):
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=2"})
+    ok, url = zr.connect_url_for("gymA", "googlebusiness", client=fake)
+    assert ok is True and url.startswith("https://accounts.google.com/")
+
+
+def test_connect_url_for_rejects_bad_platform(db_env):
+    ok, err = zr.connect_url_for("gymA", "tiktok", client=_FakeClient())
+    assert ok is False and "platform must be" in err
+
+
+def test_connect_url_for_dark_without_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.delenv("ZERNIO_API_KEY", raising=False)
+    ok, info = zr.connect_url_for("gymA", "googlebusiness", client=_FakeClient())
+    assert ok is False and "disabled" in info
+
+
 def test_connect_creates_when_no_profile_exists(db_env):
     # No stored binding AND no existing Zernio profile of this name -> create one.
     fake = _FakeClient(connect={"authUrl": "https://www.facebook.com/v24.0/dialog/oauth?x=1"})

@@ -20,6 +20,11 @@ from datetime import datetime, timedelta, timezone
 from . import config
 
 PLATFORMS = ("instagram", "facebook")
+# Platforms a gym may CONNECT via the OAuth flow. Broader than PLATFORMS (which drives status
+# mapping + posting, IG/FB only): Google Business connects + publishes through Zernio but has no
+# IG/FB-style status row, so it lives here, not in PLATFORMS. Zernio's key is one word, lowercase
+# ('googlebusiness'), verified live against api.zernio.com 2026-08-18.
+CONNECT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
 
