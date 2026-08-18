@@ -118,6 +118,9 @@ def test_social_reads_content_calendar(monkeypatch):
     assert p1["caption"] == "cap one"
     # the story row keeps its REAL format (not derived from is_story)
     assert body["posts"][1]["format"] == "story"
+    # a STORY shows the IMAGE ONLY: its caption is burned onto the media, so the display
+    # caption is blanked (Blake 2026-08-18). The feed caption above is unaffected.
+    assert body["posts"][1]["caption"] == ""
 
 
 def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):

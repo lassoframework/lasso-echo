@@ -267,7 +267,11 @@ def _calendar_post(row):
         "pillar": row.get("pillar") or "",
         "format": "story" if row.get("is_story") else "feed",
         "image_public_url": row.get("feed_url") or row.get("story_url") or "",
-        "caption": row.get("caption") or "",
+        # A STORY carries its text burned onto the media itself, so the portal shows the
+        # image ONLY, no caption box (Blake 2026-08-18). The raw caption still lives on the
+        # row for the edit / re-burn / publish paths (which read the row directly, not this
+        # display shape), so nothing downstream loses the text.
+        "caption": "" if row.get("is_story") else (row.get("caption") or ""),
     }
 
 
@@ -313,7 +317,10 @@ def _content_calendar_post(row):
         # the actual video URL (present only for video rows) for that <video> upgrade.
         "video_url": (row.get("image_url") or "")
                      if _media_kind(row.get("image_url") or "") == "video" else None,
-        "caption": row.get("caption") or "",
+        # STORY = image only in the portal: its caption is burned onto the media, so the
+        # display caption is blanked (Blake 2026-08-18). The row's caption is untouched for
+        # the edit / re-burn / publish paths.
+        "caption": "" if fmt == "story" else (row.get("caption") or ""),
         "scheduled_at": scheduled_at,
         # Publish record (display only): when it actually went out + the vendor post id.
         "published_at": row.get("published_at"),
