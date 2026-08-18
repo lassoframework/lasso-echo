@@ -74,8 +74,9 @@ def test_auto_plannable_excludes_each_flag_class():
     base = {"one_line": "a class", "quality": {"usable": True}, "avatar_fit": "genpop"}
     assert vision.auto_plannable(vision.coerce_analysis(
         {**base, "safety_flags": ["injury_visible"]}))[0] is False
+    # athlete is NO LONGER a flag class (Blake 2026-08-18): a competitive shot is plannable
     assert vision.auto_plannable(vision.coerce_analysis(
-        {**base, "avatar_fit": "athlete"}))[0] is False
+        {**base, "avatar_fit": "athlete"}))[0] is True
     assert vision.auto_plannable(vision.coerce_analysis(
         {**base, "quality": {"usable": False}}))[0] is False
     assert vision.auto_plannable(None)[0] is False
@@ -83,8 +84,11 @@ def test_auto_plannable_excludes_each_flag_class():
 
 
 def test_bts_restricted():
+    # athlete / athlete_leaning are unrestricted now; only `unclear` stays BTS-only
     assert vision.bts_restricted(vision.coerce_analysis({"one_line": "x",
-                                 "avatar_fit": "athlete_leaning"})) is True
+                                 "avatar_fit": "athlete_leaning"})) is False
+    assert vision.bts_restricted(vision.coerce_analysis({"one_line": "x",
+                                 "avatar_fit": "athlete"})) is False
     assert vision.bts_restricted(vision.coerce_analysis({"one_line": "x",
                                  "avatar_fit": "unclear"})) is True
     assert vision.bts_restricted(vision.coerce_analysis({"one_line": "x",

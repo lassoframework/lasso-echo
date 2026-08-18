@@ -48,11 +48,15 @@ FIXTURES = [
     ("before_after_collage", _analysis(one_line="A side by side of a member in the gym",
                                        subjects=["collage"], activity="community"),
      True, None),
-    # 4. athlete competition shot -> avatar_fit athlete -> EXCLUDED
+    # 4. athlete / competition / HYROX shot -> PLANNABLE for every gym (Blake 2026-08-18: the
+    #    LASSO avatar rule no longer excludes competitive athletes). Still caption-safe: no
+    #    identity/body words leak. Only minors/PII/name/identity/unusable exclude.
     ("athlete_comp", _analysis(avatar_fit="athlete",
                                one_line="A person lifting a heavily loaded barbell on a "
-                                        "competition platform"),
-     False, "athlete"),
+                                        "competition platform",
+                               subjects=["barbell", "competition_platform"],
+                               activity="strength"),
+     True, None),
     # 5. minor prominent -> EXCLUDED
     ("minor_prominent", _analysis(includes_children=True,
                                   safety_flags=["minor_prominent"]),
@@ -87,6 +91,25 @@ def test_adversarial_set_routes_100_percent():
         elif reason_substr and not any(reason_substr in r for r in reasons):
             misroutes.append(f"{name}: expected reason ~'{reason_substr}', got {reasons}")
     assert not misroutes, "adversarial misroutes:\n" + "\n".join(misroutes)
+
+
+def test_athlete_hyrox_photo_is_plannable_and_caption_can_describe_it():
+    # Blake 2026-08-18: competitive athletes / HYROX are a valid audience for EVERY gym.
+    # The photo must be plannable, score a normal (non-BTS) slot, and its athletic details
+    # must survive as caption-eligible so the caption can TALK about the HYROX/competition.
+    a = vision.coerce_analysis(_analysis(
+        avatar_fit="athlete", activity="strength",
+        one_line="An athlete pushing a sled through a HYROX station",
+        subjects=["hyrox", "sled_push", "competition"],
+        visible_details=[{"detail": "HYROX sled", "confidence": 0.95},
+                         {"detail": "competition floor markings", "confidence": 0.9}]))
+    assert vision.auto_plannable(a)[0] is True                 # no longer excluded
+    assert vision.bts_restricted(a) is False                   # athlete is unrestricted now
+    score, ok_slot = vision.content_score(a, "service")        # a normal slot, not BTS
+    assert ok_slot is True
+    eligible = vision.caption_eligible_details(a)              # >=0.85 details flow to caption
+    assert any("hyrox" in d.lower() for d in eligible)
+    assert vision.identity_issues(a["one_line"]) == []         # 'athlete' is not a body word
 
 
 def test_before_after_collage_yields_no_identity_or_number_leak():

@@ -80,7 +80,7 @@ Field rules:
 - **Identity validation scope:** the name/identity validator runs on `one_line`, `subjects`, and `visible_details`. It does NOT run on `text_in_image` — that field must capture name tags and whiteboards verbatim to be useful. Instead, `text_in_image` is firewalled from the drafter entirely, and any person-name in it sets `contains_person_name: true`, which routes like a safety flag (no auto-planning; coach hand-pick only).
 - **`people.bucket`, not a count.** Vision models miscount past six; buckets are what captions actually need. "Packed house" requires `crowd`; "one on one" requires `solo|pair`.
 - **`visible_details` carry confidence.** Only details ≥0.85 are caption-eligible; below that they exist for search/debug only.
-- **`avatar_fit`:** `athlete` never auto-picked; `athlete_leaning` and `unclear` both restricted to Behind the scenes only (conservative default for `unclear`).
+- **`avatar_fit`:** (AMENDED 2026-08-18, Blake) `athlete` and `athlete_leaning` are now auto-pickable for EVERY gym and score like any other photo — the LASSO avatar rule no longer excludes competitive CrossFit / HYROX / athletes. Only `unclear` stays restricted to Behind the scenes (conservative default when the model cannot tell what the shot is). The identity/body-word firewall and all `safety_flags` are unchanged.
 - **`safety_flags` enum:** `minor_prominent`, `third_party_brand`, `unsanitary`, `injury_visible`, **`pii_visible`** (whiteboards/screens showing member names, phones, payment info — the most common real gym leak). Any flag = excluded from auto-planning; coach may hand-pick deliberately.
 - **No `mood` field.** Subjective, hallucination-prone, and the pick logic works on activity + grouping + quality. Cut.
 - `quality.usable=false` (blurry, dark, sliver, screenshot) = excluded from planning; listed in a **staff-facing** library view with reasons. Never shown raw to gym owners — the coach translates it into the monthly "fresh material" ask.
@@ -108,7 +108,7 @@ One vision call per image, structured output enforced, low temperature, prompt f
 | Transformation | solo/pair, coaching_moment or strength |
 | Education | coaching_moment, equipment detail, demonstration |
 | Community | small_group/crowd, class, candid |
-| Behind the scenes | coach solo, facility (also the only home for athlete_leaning/unclear) |
+| Behind the scenes | coach solo, facility (also the only home for an `unclear` shot) |
 | Offer | best-lit facility or group shot in the library |
 | GBP local update | exterior, facility, group — what a stranger checking the listing wants |
 | GBP photo drop | highest quality within reuse windows, rotating settings |
@@ -116,7 +116,7 @@ One vision call per image, structured output enforced, low temperature, prompt f
 Rules:
 
 - Score = pillar affinity + quality + recency + cluster-not-used-this-month. **Determinism is scoped:** identical picks given the same (gym, month, library snapshot, analysis_version). Rows past `pending` are FROZEN — a mid-month re-plan may only touch rows still in `draft/pending`, never re-pick or re-caption anything the owner has seen or approved.
-- Flagged images (safety, athlete, contains_person_name, analysis_failed, null) never auto-picked.
+- Flagged images (safety, contains_person_name, identity leak, analysis_failed, null) never auto-picked. (Athlete imagery is NO LONGER a flag class as of 2026-08-18.)
 - No image above the score floor → slot planned with best available AND flagged `weak_match` for the coach. Never silent.
 
 ---
@@ -170,7 +170,7 @@ Upload flow gains one optional free-text field per image plus one checkbox:
 
 1. **Flag flips at the next `build_client_month` run, never mid-month.** Pending and approved rows are frozen; vision only shapes months planned after the flip. No owner ever re-approves something that changed under them.
 2. **Dogfood first:** backfill LASSO's library, re-plan the next dogfood month vision-on, and produce the old-picks vs new-picks DIFF. The diff is the demo and the go/no-go evidence.
-3. **Adversarial photo test set** (build it before shipping): name tags legible, whiteboard with member names, before/after collage, athlete comp shot, minor prominent, blurry burst duplicates, empty-gym shot. Every one must route correctly (flag, exclude, or caption safely). This test set is the acceptance bar, not vibes.
+3. **Adversarial photo test set** (build it before shipping): name tags legible, whiteboard with member names, before/after collage, athlete/HYROX comp shot (now routes as plannable + caption-safe, not excluded — amended 2026-08-18), minor prominent, blurry burst duplicates, empty-gym shot. Every one must route correctly (flag, exclude, or caption safely). This test set is the acceptance bar, not vibes.
 4. **Shadow month = plumbing smoke test, not the metric.** Shadow means: analysis + scoring run and log; drafter and picks stay FULLY legacy. One month at n≈12 posts cannot power a FIX-rate comparison — run shadow for plumbing confidence, and make the ship decision on the dogfood diff + test set.
 5. Per-gym flag, default ON for new DFY gyms after the founding gyms convert cleanly.
 
@@ -180,7 +180,7 @@ Upload flow gains one optional free-text field per image plus one checkbox:
 
 11. **Never identify a person from a photo.** No names, gender, age, bodies, health. Role words only, unless `consent_confirmed` AND the client wrote it.
 12. **Never invent results from an image.** Photos prove presence, not outcomes. Numbers come from the gym record or consented context only.
-13. **Flagged and unanalyzed images never auto-plan.** Safety flags, athlete imagery, person-name text, failed analysis — coach hand-pick only. An error path is not a bypass path.
+13. **Flagged and unanalyzed images never auto-plan.** Safety flags, person-name text, identity leaks, failed analysis — coach hand-pick only. An error path is not a bypass path. (Athlete/competitive/HYROX imagery was removed from this exclusion on 2026-08-18 — it now auto-plans for every gym.)
 14. **Grounding means verified.** A caption detail must survive the confidence threshold AND the crop verify. Contradictions never ship; unverifiable specificity falls back to safe generality; the system swaps or asks a human, never ships the mismatch.
 
 Enforced twice, as always: generation prompts AND the post_quality gate.

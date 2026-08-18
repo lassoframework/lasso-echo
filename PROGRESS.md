@@ -89,6 +89,21 @@ Blake before any client gym; adversarial set must route 100% before any default-
 must route 100% before any per-gym flag defaults on; the LASSO dogfood diff goes to Blake before
 any client gym converts; `AGENT_VISION_GYMS` ships empty. Full suite green after P4-P6.
 
+**Shipped + turned ON (2026-08-18):** merged to main (PR #18); `AGENT_VISION_GYMS=district_h,
+eng,gritx,topfuel` set on the Railway `echo` worker (Blake turned vision on for ALL client gyms,
+consciously overriding the dogfood-first gate; approval gate + adversarial routing + identity
+firewall are the backstops). The GritX calendar-rebuild-churn fix shipped in the same merge for
+every gym.
+
+**Avatar rule amended (2026-08-18, Blake):** competitive CrossFit / HYROX / athletes are now a
+valid LASSO audience for EVERY gym. `auto_plannable` no longer excludes `avatar_fit == "athlete"`;
+`bts_restricted` now only restricts `unclear` (athlete/athlete_leaning score like any photo);
+the video b-roll prompt no longer excludes athletes; the adversarial `athlete_comp` fixture flips
+to plannable + caption-safe. Safety exclusions (minors, PII, third-party brand) and the identity/
+body-word firewall are unchanged — captions describe the athletic/HYROX ACTIVITY, never a person's
+body. The org-level avatar rule still needs a manual edit in organization settings to be
+authoritative across sessions.
+
 ---
 
 ## Dale round 2 beta feedback (Aug 18 post, 2026-08-17) — 5 items, gym-agnostic

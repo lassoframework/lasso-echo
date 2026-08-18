@@ -108,7 +108,8 @@ _HOUSE_STYLE_WRAP = (
     "Palette leans navy #121E3C and warm cream #FAF6F0 with one restrained red accent. "
     "No text, no words, no captions, no logos, no watermarks anywhere in frame. "
     "Not clip art, not an icon, not an infographic. "
-    "Busy professional gym owners and members, never competitive athletes. "
+    "Real gym owners, members, coaches, and athletes of every level, including "
+    "competitive CrossFit and HYROX. "
     "Scene: "
 )
 

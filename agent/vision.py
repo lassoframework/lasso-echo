@@ -281,10 +281,12 @@ def caption_eligible_details(analysis):
 
 def auto_plannable(analysis):
     """(ok, reasons): may this image be AUTO-picked by the planner? False (with reasons)
-    for a missing/failed analysis, any safety flag, a person-name in the image, an athlete
-    shot, an identity leak, or unusable quality (§2.2, guardrails 13/14). athlete_leaning
-    and unclear are still plannable but RESTRICTED to Behind-the-scenes (handled in the pick
-    scorer, §4), so they are not excluded here."""
+    for a missing/failed analysis, any safety flag, a person-name in the image, an identity
+    leak, or unusable quality. Athlete / competitive / HYROX shots ARE now plannable for
+    every gym (Blake 2026-08-18: the LASSO avatar rule no longer excludes competitive
+    athletes); only `unclear` stays soft-restricted to behind-the-scenes slots in the pick
+    scorer (§4). Safety exclusions (minors, PII, etc.) and the identity/body firewall are
+    unchanged."""
     reasons = []
     if not analysis or analysis.get("analysis_failed"):
         return False, ["no analysis"]
@@ -294,8 +296,6 @@ def auto_plannable(analysis):
         reasons += [f"safety:{f}" for f in analysis["safety_flags"]]
     if analysis.get("contains_person_name"):
         reasons.append("person_name_in_image")
-    if analysis.get("avatar_fit") == "athlete":
-        reasons.append("athlete")
     if analysis.get("identity_flag"):
         reasons.append("identity_leak")
     if not (analysis.get("quality") or {}).get("usable", False):
@@ -304,9 +304,11 @@ def auto_plannable(analysis):
 
 
 def bts_restricted(analysis):
-    """§2.2/§4: avatar_fit athlete_leaning or unclear may ONLY fill a Behind-the-scenes
-    slot (conservative default for unclear). The pick scorer enforces this."""
-    return (analysis or {}).get("avatar_fit") in ("athlete_leaning", "unclear")
+    """§4: an `unclear` avatar_fit may ONLY fill a Behind-the-scenes slot (conservative
+    default when the model could not tell what the shot is). athlete / athlete_leaning are NO
+    LONGER restricted (Blake 2026-08-18: competitive athletes are a valid audience) — they
+    score like any other photo. The pick scorer enforces the `unclear` restriction."""
+    return (analysis or {}).get("avatar_fit") in ("unclear",)
 
 
 # ---- Phase 2: near-duplicate clustering (Hamming <= 6) ---------------------------------
@@ -417,8 +419,8 @@ _SLOT_PREFS = {
 _DEFAULT_PREFS = {"activity": ("class", "coaching", "community", "facility"),
                   "people": ("solo", "pair", "small_group"), "setting": ("gym_floor",)}
 VISION_SCORE_FLOOR = 3.0            # below this, the best pick is flagged weak_match (§4)
-# a slot that WANTS a behind-the-scenes / facility feel — the only home for
-# athlete_leaning/unclear images (§2.2/§4).
+# a slot that WANTS a behind-the-scenes / facility feel — the only home for an
+# `unclear` image (§4).
 _BTS_SLOTS = ("behind", "faq", "about", "photo", "local", "offer")
 
 
@@ -439,14 +441,15 @@ def _prefs_for(pillar):
 
 def content_score(analysis, pillar, *, recency=0.0):
     """(score, ok_for_slot): how well this image's CONTENT fits the slot job (§4). Higher is
-    better. ok_for_slot is False when the image must not fill THIS slot (an athlete_leaning/
-    unclear image outside a behind-the-scenes/facility slot). Score blends pillar affinity
-    (activity + people + setting matches) + quality + a caller-supplied recency bonus (0..1,
-    higher = fresher). Deterministic given the analysis + pillar + recency."""
+    better. ok_for_slot is False when the image must not fill THIS slot (an `unclear` image
+    outside a behind-the-scenes/facility slot). Score blends pillar affinity (activity +
+    people + setting matches) + quality + a caller-supplied recency bonus (0..1, higher =
+    fresher). Deterministic given the analysis + pillar + recency."""
     if not analysis or analysis.get("analysis_failed"):
         return -1.0, False
     prefs, key = _prefs_for(pillar)
-    # BTS restriction (§2.2/§4): athlete_leaning/unclear only in a behind/facility slot.
+    # BTS restriction (§4): an `unclear` shot only in a behind/facility slot. Athlete /
+    # competitive / HYROX shots are unrestricted (Blake 2026-08-18).
     if bts_restricted(analysis) and key not in _BTS_SLOTS:
         return -1.0, False
     score = 0.0

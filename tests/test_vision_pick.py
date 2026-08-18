@@ -57,11 +57,13 @@ def test_content_score_affinity_matches_slot_job():
 
 
 def test_content_score_bts_restriction():
-    lean = _analysis(avatar_fit="athlete_leaning", activity="coaching")
-    # athlete_leaning cannot fill a Transformation slot...
-    assert vision.content_score(lean, "testimonial")[1] is False
-    # ...but may fill a behind-the-scenes slot
-    assert vision.content_score(lean, "behind")[1] is True
+    # only `unclear` is BTS-restricted now (athlete/athlete_leaning are unrestricted)
+    unclear = _analysis(avatar_fit="unclear", activity="coaching")
+    assert vision.content_score(unclear, "testimonial")[1] is False   # not a BTS slot
+    assert vision.content_score(unclear, "behind")[1] is True         # BTS slot ok
+    # an athlete shot now fills a normal slot like any other photo (Blake 2026-08-18)
+    athlete = _analysis(avatar_fit="athlete", activity="strength")
+    assert vision.content_score(athlete, "testimonial")[1] is True
 
 
 def test_content_score_failed_analysis():
@@ -101,7 +103,7 @@ def test_pick_image_weak_match_flag(tmp_path, monkeypatch):
 def test_pick_image_none_when_all_flagged(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_VISION_GYMS", "gritx")
     lib = str(tmp_path)
-    _asset(lib, "a.png", _analysis(avatar_fit="athlete"))          # excluded
+    _asset(lib, "a.png", _analysis(safety_flags=["pii_visible"]))       # excluded
     _asset(lib, "b.png", _analysis(safety_flags=["minor_prominent"]))   # excluded
     assert client_content.pick_image("gritx_ig", "2026-09-01", lib, pillar="testimonial") is None
 
