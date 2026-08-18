@@ -743,7 +743,35 @@ def _vision_reader():
     return _read
 
 
-def analyze_and_store(creative_path, *, reader=None, day=None, alert=None, force=False):
+def within_gym_budget(gym, day, *, alert=None):
+    """Ruling 2: a per-gym MONTHLY cap on vision calls, on top of the global daily cap.
+    Increments a (gym, month) counter in the kv store and returns False once the cap is hit
+    (alarming staff ONCE), so a runaway re-analysis loop cannot burn the budget. cap<=0 or no
+    gym disables the check. Best-effort: a kv error never blocks a call (returns True)."""
+    from . import config
+    cap = config.vision_gym_monthly_cap()
+    if cap <= 0 or not gym:
+        return True
+    try:
+        from . import db
+        month = str(day or "")[:7] or "unknown"
+        key = f"vision_spend_{gym}_{month}"
+        cur = int(db.kv_get(key, "0") or "0")
+        if cur >= cap:
+            akey = f"vision_budget_alarm_{gym}_{month}"
+            if alert and not db.kv_get(akey):
+                alert(f"vision: {gym} hit the monthly vision-call cap ({cap}) for {month} — "
+                      "pausing further analysis/verify (possible re-analysis loop?)")
+                db.kv_set(akey, "1")
+            return False
+        db.kv_set(key, str(cur + 1))
+        return True
+    except Exception:  # noqa: BLE001 - budget accounting must never block a call
+        return True
+
+
+def analyze_and_store(creative_path, *, reader=None, day=None, alert=None, force=False,
+                      gym=None):
     """Analyze ONE image once and store the v2 analysis on its DAM sidecar. Idempotent:
     a sidecar already carrying a current-version analysis is SKIPPED (preserve-on-re-sync,
     ruling 1) unless force=True. Returns the analysis dict, the existing one on skip, or
@@ -766,6 +794,8 @@ def analyze_and_store(creative_path, *, reader=None, day=None, alert=None, force
     from .creative_studio import spend_allowed
     if not spend_allowed(account_key=None, day=day):
         return None
+    if gym and not within_gym_budget(gym, day, alert=alert):
+        return None                       # ruling 2: per-gym monthly cap (runaway guard)
 
     try:
         with open(creative_path, "rb") as fh:
@@ -802,12 +832,17 @@ def analyze_and_store(creative_path, *, reader=None, day=None, alert=None, force
 
 
 def analyze_library(library_path, *, reader=None, day=None, alert=None, force=False,
-                    logger=None):
+                    logger=None, gym=None):
     """Backfill/ingest sweep: analyze every not-yet-analyzed image in a gym's library
     (idempotent, throttled by the daily spend cap). Videos are skipped (§2.1, out of scope
-    for v1). Returns {analyzed, skipped, failed}."""
+    for v1). Returns {analyzed, skipped, failed}.
+
+    gym: the canonical base key for the per-gym monthly cap (ruling 2). Defaults to the
+    library-folder basename so a standalone backfill still keys per-gym; callers with the
+    real base key (the ingest sweep) should pass it so the cap counter is canonical."""
     import os as _os
     log = logger or (lambda m: print(f"[vision] {m}"))
+    gym = gym or _os.path.basename(library_path.rstrip("/"))
     counts = {"analyzed": 0, "skipped": 0, "failed": 0}
     if not _os.path.isdir(library_path):
         return counts
@@ -819,7 +854,8 @@ def analyze_library(library_path, *, reader=None, day=None, alert=None, force=Fa
         if state in ("ok", "failed") and not force:
             counts["skipped"] += 1
             continue
-        res = analyze_and_store(path, reader=reader, day=day, alert=alert, force=force)
+        res = analyze_and_store(path, reader=reader, day=day, alert=alert, force=force,
+                                gym=gym)
         if res is None:
             counts["failed"] += 1        # could not run (cap/keyless) — retried next sweep
         elif res.get("analysis_failed"):

@@ -296,11 +296,14 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     # ECHO VISION ingest hook (§2.1): analyze newly-synced images once, on the gym's DAM
     # sidecar, so content-scoring + grounding have data before planning. Idempotent (an
     # already-analyzed image is skipped -> analysis is PRESERVED across re-syncs, ruling 1).
-    # Gated per-gym (AGENT_VISION_GYMS) and best-effort — a vision failure never fails sync.
-    if synced and config.vision_enabled_for(base_key):
+    # Gated per-gym (AGENT_VISION_GYMS, or §9.4 shadow) and best-effort — a vision failure
+    # never fails sync. Shadow gyms analyze/cluster too, so the shadow pick log has data;
+    # only the drafter/pick stays legacy for them (see client_content._shadow_log_pick).
+    if synced and (config.vision_enabled_for(base_key) or config.vision_shadow_for(base_key)):
         try:
             from . import vision, ops_alerts
-            vision.analyze_library(lib_dir, alert=ops_alerts.alert, logger=log)
+            vision.analyze_library(lib_dir, alert=ops_alerts.alert, logger=log,
+                                   gym=base_key)   # canonical key for the per-gym monthly cap
             # §3: collapse near-dupes into clusters so rotation + the starvation guard treat
             # a burst as one creative.
             vision.cluster_library(lib_dir)
@@ -351,22 +354,36 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
     consent guard. Consent is NEVER inferred from the presence of context text."""
     stem = os.path.splitext(media_name)[0]
     side_path = os.path.join(lib_dir, stem + ".json")
+    # MERGE, don't skip (audit B4): an existing sidecar's reviewed note/context is never
+    # clobbered, but a pre-existing sidecar must not swallow this upload's consent + context.
+    existing = {}
     if os.path.exists(side_path):
-        return
-    payload = {"public_url": _public_url_for_key(r2_key)}
-    if caption:
-        # library._load_sidecar reads data["note"] into Creative.client_note, so the
-        # gym's caption MUST live under "note" to reach the drafter (writing
-        # "client_note" here would be silently dropped by list_creatives).
+        try:
+            with open(side_path, encoding="utf-8") as fh:
+                existing = json.load(fh) or {}
+        except (OSError, ValueError):
+            existing = {}
+    payload = dict(existing)
+    payload.setdefault("public_url", _public_url_for_key(r2_key))
+    # library._load_sidecar reads data["note"] into Creative.client_note, so the gym's
+    # caption MUST live under "note" to reach the drafter (writing "client_note" here would
+    # be silently dropped). Never clobber a note already on the sidecar.
+    if caption and not payload.get("note"):
         payload["note"] = caption
-    if client_context:
+    if client_context and not payload.get("client_context"):
         payload["client_context"] = client_context
-    try:
-        with open(side_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-    except OSError as exc:
-        log(f"sidecar write failed: {type(exc).__name__}")
-    if consent:
+    # consent is the CHECKBOX only, recorded in the DAM consent log at most once (a marker on
+    # the sidecar dedups across re-syncs so we never append duplicate audit rows).
+    record_consent = consent and not payload.get("consent_recorded")
+    if record_consent:
+        payload["consent_recorded"] = True
+    if payload != existing:
+        try:
+            with open(side_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+        except OSError as exc:
+            log(f"sidecar write failed: {type(exc).__name__}")
+    if record_consent:
         try:
             from . import dam
             dam.set_consent(os.path.join(lib_dir, media_name), "granted",

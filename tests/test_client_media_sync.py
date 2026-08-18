@@ -705,3 +705,45 @@ def test_no_meta_publisher_in_path():
     for banned in ("meta_publisher", "publish_due", "publish", "autopublish",
                    "host_media"):
         assert not any(banned in n for n in names), f"unexpected reference: {banned}"
+
+
+# ---- audit B4: _write_sidecar MERGES into a pre-existing sidecar --------------------
+
+def test_write_sidecar_merges_context_and_consent_without_clobbering_note(tmp_path, monkeypatch):
+    """A pre-existing sidecar (a reviewed note) must NOT swallow this upload's context +
+    consent (audit B4 hardening). The note is preserved; context merges in; consent records."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import dam
+    lib = str(tmp_path)
+    media = "20260810T120000Z_p.jpg"
+    stem = os.path.splitext(media)[0]
+    open(os.path.join(lib, media), "wb").close()
+    # a sidecar already carries a reviewed note + public_url (no context/consent yet)
+    with open(os.path.join(lib, stem + ".json"), "w") as fh:
+        json.dump({"note": "reviewed note", "public_url": "https://r2/p.jpg"}, fh)
+
+    cms._write_sidecar(lib, media, "clients/x/p.jpg", "a different caption",
+                       lambda *_: None, client_context="busy professionals, 6am crew",
+                       consent=True)
+
+    with open(os.path.join(lib, stem + ".json")) as fh:
+        side = json.load(fh)
+    assert side["note"] == "reviewed note"                     # never clobbered
+    assert side["client_context"] == "busy professionals, 6am crew"  # merged in
+    # consent recorded in the DAM audit trail + sidecar
+    assert str(side.get("consent", "")).lower() == "granted"
+    assert dam.consent_log_entries(os.path.join(lib, media))    # an audit row exists
+
+
+def test_write_sidecar_records_consent_at_most_once(tmp_path, monkeypatch):
+    """The consent_recorded marker dedups: a second call with consent=True adds no new
+    audit row (a re-sync cannot duplicate the consent log)."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import dam
+    lib = str(tmp_path)
+    media = "20260810T120000Z_q.jpg"
+    open(os.path.join(lib, media), "wb").close()
+    for _ in range(3):
+        cms._write_sidecar(lib, media, "clients/x/q.jpg", "cap", lambda *_: None,
+                           client_context="ctx", consent=True)
+    assert len(dam.consent_log_entries(os.path.join(lib, media))) == 1

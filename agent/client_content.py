@@ -127,7 +127,47 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None)
     fresh = [c for c in imgs if last_served.get(_rkey(c), "") < window_start]
     pool = fresh if fresh else imgs
     pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
-    return pool[0]
+    legacy = pool[0]
+    # §9.4 SHADOW: for a shadow (not enabled) gym, compute what vision WOULD pick and log the
+    # diff, but SHIP the legacy pick unchanged. A plumbing smoke test, zero effect on posts.
+    if pillar and config.vision_shadow_for(account_key):
+        _shadow_log_pick(account_key, day_key, pillar, legacy, imgs,
+                         last_served, window_start, served)
+    return legacy
+
+
+def _shadow_log_pick(account_key, day_key, pillar, legacy, imgs,
+                     last_served, window_start, served):
+    """§9.4: print the vision-vs-legacy pick for a shadow gym (best-effort, never raises,
+    one line per account/day/pillar). Selection mirrors the vision branch above but its
+    result is DISCARDED — the caller already shipped the legacy pick."""
+    try:
+        from . import dam, vision, db
+        dkey = f"vision_shadow_logged_{account_key}_{day_key}_{pillar}"
+        if db.kv_get(dkey):
+            return
+        best, best_score = None, -99.0
+        for c in imgs:
+            if c.media_type != "image":
+                continue
+            a = vision.stored_analysis(c.path)
+            if not vision.auto_plannable(a)[0]:
+                continue
+            rk = dam.rotation_key(c.path)
+            if rotation.reuse_blocked(rk, account_key, day_key, served={account_key: served}):
+                continue
+            recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
+            score, ok_slot = vision.content_score(a, pillar, recency=recency)
+            if ok_slot and score > best_score:
+                best, best_score = c, score
+        v_name = os.path.basename(best.path) if best else None
+        l_name = os.path.basename(legacy.path) if legacy else None
+        print(f"[vision-shadow] {account_key} {day_key} {pillar}: "
+              f"legacy={l_name} vision_would={v_name} "
+              f"({'DIFFERENT' if v_name != l_name else 'same'}, score={best_score:.1f})")
+        db.kv_set(dkey, "1")
+    except Exception:  # noqa: BLE001 - shadow logging must never affect a build
+        pass
 
 
 def _humanize_stem(stem):

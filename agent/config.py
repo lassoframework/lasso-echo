@@ -1012,12 +1012,40 @@ def vision_gyms() -> set:
 
 def vision_enabled_for(gym_key) -> bool:
     """True when Echo Vision is armed for this gym (base key or an _ig/_fb suffix)."""
+    return _vision_base(gym_key) in vision_gyms()
+
+
+def _vision_base(gym_key) -> str:
     base = (gym_key or "").strip().lower()
     for suffix in ("_ig", "_fb"):
         if base.endswith(suffix):
-            base = base[: -len(suffix)]
-            break
-    return base in vision_gyms()
+            return base[: -len(suffix)]
+    return base
+
+
+def vision_shadow_gyms() -> set:
+    """§9.4 SHADOW gyms: analysis + content scoring RUN and log, but the picks + drafter stay
+    FULLY LEGACY (a plumbing smoke test, not the ship metric). A gym in shadow but NOT in
+    AGENT_VISION_GYMS gets analyzed/scored with zero effect on what it posts. Comma list of
+    base keys in AGENT_VISION_SHADOW; default empty."""
+    raw = os.environ.get("AGENT_VISION_SHADOW", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def vision_shadow_for(gym_key) -> bool:
+    return _vision_base(gym_key) in vision_shadow_gyms()
+
+
+def vision_gym_monthly_cap() -> int:
+    """Ruling 2: a per-gym MONTHLY cap on Gemini vision calls (analysis + crop-verify),
+    layered ON TOP of the global daily cap (creative_studio.spend_allowed). A gym's month is
+    ~12-15 posts * (1 analysis + 1 verify) + backfill, so the default is generous; it exists
+    to alarm on a runaway (a re-analysis loop), not to throttle normal use. 0 disables the
+    per-gym cap. Env AGENT_VISION_GYM_MONTHLY_CAP (default 400)."""
+    try:
+        return int(os.environ.get("AGENT_VISION_GYM_MONTHLY_CAP", "400"))
+    except ValueError:
+        return 400
 
 
 def ocr_check_enabled() -> bool:

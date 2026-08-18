@@ -115,6 +115,22 @@ def test_pick_image_vision_off_ignores_analysis(tmp_path, monkeypatch):
     assert pick is not None and os.path.basename(pick.path) == "only.png"  # legacy ignores flags
 
 
+def test_pick_image_shadow_ships_legacy_pick(tmp_path, monkeypatch, capsys):
+    # §9.4: a SHADOW (not enabled) gym logs the vision pick but SHIPS the legacy pick.
+    monkeypatch.delenv("AGENT_VISION_GYMS", raising=False)
+    monkeypatch.setenv("AGENT_VISION_SHADOW", "gritx")
+    lib = str(tmp_path)
+    # 'flagged.png' is an athlete shot (vision would EXCLUDE it); legacy least-recently-served
+    # sorts by basename, so 'a_flagged.png' is the legacy pick even though vision rejects it.
+    _asset(lib, "a_flagged.png", _analysis(avatar_fit="athlete"))
+    _asset(lib, "z_clean.png", _analysis(activity="coaching"))
+    pick = client_content.pick_image("gritx_ig", "2026-09-01", lib, pillar="testimonial")
+    # shadow does NOT change the ship: legacy still returns the name-first athlete photo
+    assert os.path.basename(pick.path) == "a_flagged.png"
+    out = capsys.readouterr().out
+    assert "[vision-shadow]" in out and "gritx_ig" in out
+
+
 def test_prefs_exact_match_first():
     # a single-token client pillar resolves by EXACT match (no substring ambiguity)
     prefs, key = vision._prefs_for("offer")
