@@ -80,6 +80,31 @@ def _ensure_profile_id(account_key, client):
     return pid
 
 
+def provision_gym(account_key, client=None):
+    """OPS: find-or-create this gym's Zernio PROFILE so it can connect Google Business Profile
+    / GBM (or any platform). Provisioning normally happens as a side effect of the FIRST IG/FB
+    connect (handle_social_connect -> _ensure_profile_id); this is the direct path for a
+    GBP-first gym whose owner goes straight to Google Business and hits "not provisioned in
+    Zernio yet". Find-first (reuses an existing profile by name; only creates when none exists),
+    so it is safe to re-run. Returns (ok, profile_id_or_error_string). Requires
+    zernio_enabled() (ZERNIO_API_KEY) — run on the worker where the key lives:
+        railway run /opt/venv/bin/python -m agent zernio-provision --account <key>
+    """
+    if not config.zernio_enabled():
+        return False, "zernio disabled (ZERNIO_API_KEY not set on this host)"
+    if not account_key:
+        return False, "missing account_key"
+    try:
+        pid = _ensure_profile_id(account_key, _client(client))
+    except _z.ZernioError as exc:
+        return False, f"zernio {exc.status}: {exc.detail}"
+    except Exception as exc:  # noqa: BLE001 - report, never crash the ops command
+        return False, f"{type(exc).__name__}: {exc}"
+    if not pid:
+        return False, "no profile id returned (check the gym name against Zernio)"
+    return True, str(pid)
+
+
 def handle_social_connect(account_key, platform, client=None):
     """GET /portal/<token>/social-connect?platform=instagram|facebook -> {oauth_url}."""
     if not config.zernio_enabled():

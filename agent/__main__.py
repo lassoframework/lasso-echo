@@ -826,6 +826,7 @@ _COMMANDS = {
         ("monthly-report / monthly-review / grade-card", "month-end artifacts"),
         ("audit / fleet-status", "cross-account state"),
         ("gbp-check", "Google Business Profile check"),
+        ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
     ],
     "trust & approvals": [
@@ -2596,6 +2597,27 @@ def main(argv=None):
         _welcome_queue(argv[1:])
     elif cmd == "podcast-quote-card":
         _podcast_quote_card(argv[1:])
+    elif cmd == "zernio-provision":
+        # Provision (find-or-create) a gym's Zernio PROFILE so it can connect Google Business
+        # Profile / GBM without first connecting IG/FB. Run on the worker (ZERNIO_API_KEY lives
+        # there): railway run /opt/venv/bin/python -m agent zernio-provision --account <key>
+        account_key = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] in ("--account", "--gym") and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            i += 1
+        if not account_key:
+            print("usage: python -m agent zernio-provision --account <key>")
+        else:
+            from .zernio_routes import provision_gym
+            ok, info = provision_gym(account_key)
+            if ok:
+                print(f"provisioned {account_key}: zernio_profile_id={info}")
+                print("The gym can now connect Google Business Profile / GBM in Zernio.")
+            else:
+                print(f"provision FAILED for {account_key}: {info}")
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:

@@ -337,3 +337,31 @@ def test_account_state_explicit_negatives_still_win_over_present_row():
     import agent.zernio as z
     assert z.account_state({"_id": "x", "platform": "facebook", "intentionalDisconnectAt": "2026-01-01T00:00:00Z"}) == "expired"
     assert z.account_state({"_id": "x", "platform": "facebook", "isActive": False}) == "expired"
+
+
+# ---- provision_gym: the GBP-first ops path (find-or-create the Zernio profile) --------
+
+def test_provision_gym_creates_when_no_profile(db_env):
+    # ENG-style GBP-first gym with no Zernio profile yet -> create one, persist the id.
+    fake = _FakeClient()
+    ok, pid = zr.provision_gym("eng", client=fake)
+    assert ok is True
+    assert pid == "new_profile"
+    assert ("create", "eng") in fake.calls
+    assert (_db.gym_get("eng") or {}).get("zernio_profile_id") == "new_profile"
+
+
+def test_provision_gym_reuses_existing_no_create(db_env):
+    # already provisioned in Zernio -> reuse by name, never create (a create would 409).
+    fake = _FakeClient(existing_profiles=[{"_id": "eng_pid", "name": "eng"}])
+    ok, pid = zr.provision_gym("eng", client=fake)
+    assert ok is True and pid == "eng_pid"
+    assert ("create", "eng") not in fake.calls
+
+
+def test_provision_gym_dark_without_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.delenv("ZERNIO_API_KEY", raising=False)
+    ok, info = zr.provision_gym("eng", client=_FakeClient())
+    assert ok is False
+    assert "disabled" in info
