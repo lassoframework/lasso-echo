@@ -25,6 +25,10 @@ PLATFORMS = ("instagram", "facebook")
 # IG/FB-style status row, so it lives here, not in PLATFORMS. Zernio's key is one word, lowercase
 # ('googlebusiness'), verified live against api.zernio.com 2026-08-18.
 CONNECT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
+# Platforms the portal reflects a CONNECTED/EXPIRED status for. Includes googlebusiness so the
+# self-serve connect page can show it connected on a return visit (Zernio's accounts[] carries
+# the googlebusiness account once linked). Posting still keys off PLATFORMS.
+STATUS_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
 
@@ -377,16 +381,16 @@ def _handle_of(acct):
 def map_status(accounts_json, now=None):
     """
     Fold Zernio's flat `accounts[]` into the portal's per-platform shape:
-      {platforms: {instagram: {connected, handle, expired}, facebook: {...}}}
+      {platforms: {instagram: {connected, handle, expired}, facebook: {...}, googlebusiness: {...}}}
     Missing platform -> not connected, no handle (never fabricated). When more than one account of a
     platform exists, a connected one wins over an expired one.
     """
-    out = {p: {"connected": False, "handle": None, "expired": False} for p in PLATFORMS}
+    out = {p: {"connected": False, "handle": None, "expired": False} for p in STATUS_PLATFORMS}
     for acct in (accounts_json or {}).get("accounts") or []:
         if not isinstance(acct, dict):
             continue
         plat = acct.get("platform")
-        if plat not in PLATFORMS:
+        if plat not in STATUS_PLATFORMS:
             continue
         state = account_state(acct, now)
         cur = out[plat]

@@ -68,8 +68,19 @@ def test_map_status_missing_platform_is_not_connected_no_handle():
 def test_map_status_defensive_on_garbage():
     for bad in (None, {}, {"accounts": None}, {"accounts": [42, "x"]}):
         out = z.map_status(bad)
-        assert set(out["platforms"]) == {"instagram", "facebook"}
+        assert set(out["platforms"]) == {"instagram", "facebook", "googlebusiness"}
         assert out["platforms"]["instagram"]["connected"] is False
+
+
+def test_map_status_google_business_connected():
+    # a connected googlebusiness account is reflected so the connect page shows it linked
+    gbp = {"_id": "acct_gbp", "platform": "googlebusiness", "isActive": True,
+           "enabled": True, "connectedAt": "2026-08-18T00:00:00.000Z",
+           "intentionalDisconnectAt": None,
+           "metadata": {"expires_in": 5183999}}
+    out = z.map_status({"accounts": [gbp]})
+    assert out["platforms"]["googlebusiness"]["connected"] is True
+    assert out["platforms"]["instagram"]["connected"] is False
 
 
 def test_bare_account_without_signal_is_not_connected():

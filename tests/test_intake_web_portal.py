@@ -239,3 +239,41 @@ def test_portal_token_route_accepts_signed_dotted_token():
     inst.path = f"/portal/{dotless}/social-status"
     tok, got = inst._portal_token_route()
     assert tok == dotless and got == "social-status"
+
+
+# ---- self-serve CONNECT page (IG / FB / Google Business) ------------------------
+
+def test_render_connect_page_has_all_three_platforms(monkeypatch):
+    monkeypatch.setattr("agent.db.gym_get",
+                        lambda k: {"display_name": "CrossFit and HYROX ENG"})
+    html = intake_web.render_connect_page("eng-tok-12345678", "eng")
+    # all three connect buttons, keyed by the platform the endpoint expects
+    assert 'data-p="instagram"' in html
+    assert 'data-p="facebook"' in html
+    assert 'data-p="googlebusiness"' in html          # the new Google Business button
+    # the token is injected so the buttons hit the right token-scoped endpoint
+    assert "eng-tok-12345678" in html
+    # gym name shown in the header
+    assert "CrossFit and HYROX ENG" in html
+    # NO secret in the page (no api key / bearer / oauth url baked in)
+    low = html.lower()
+    assert "authorization" not in low and "bearer" not in low
+    assert "accounts.google.com" not in low           # oauth url is fetched at click time
+    # copy law: no em/en/figure dash and no spaced hyphen in the copy (CSS custom
+    # properties like --navy are not copy and are allowed, per the FORM_PAGE convention)
+    import re as _re
+    assert not _re.search(r"[‐-―−]|(?:\s-\s)", html)
+
+
+def test_render_connect_page_escapes_gym_name(monkeypatch):
+    monkeypatch.setattr("agent.db.gym_get",
+                        lambda k: {"display_name": '<script>x</script>'})
+    html = intake_web.render_connect_page("tok-abcdefgh", "evil")
+    assert "<script>x</script>" not in html            # escaped, not injected raw
+    assert "&lt;script&gt;" in html
+
+
+def test_render_connect_page_generic_header_when_name_missing(monkeypatch):
+    monkeypatch.setattr("agent.db.gym_get", lambda k: None)
+    html = intake_web.render_connect_page("tok-abcdefgh", "nogym")
+    assert "your gym" in html                          # graceful fallback

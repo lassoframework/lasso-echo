@@ -1124,6 +1124,94 @@ DONE = ("<!doctype html><html><body style='font-family:sans-serif;background:#12
         "<p>Your content is in. We will take it from here.</p></body></html>")
 
 
+# ---- the LASSO self-serve CONNECT page (Zernio: IG, FB, Google Business) ----------
+# Client facing copy law: NO dash characters anywhere in the copy. The page holds NO
+# secret: each button fetches the OAuth url from the token-gated /social-connect endpoint
+# at click time and redirects the browser to Zernio. GBP connect uses the 'googlebusiness'
+# platform key. __TOKEN__ / __GYM__ are replaced server side (never via .format, which the
+# CSS/JS braces would break).
+CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect your accounts</title>
+<style>
+ :root{--navy:#121E3C;--red:#FF2A2A;--cream:#FAF6F0;--steel:#D8E3EE}
+ *{box-sizing:border-box}
+ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--navy);color:var(--cream);min-height:100vh;display:flex;
+  align-items:center;justify-content:center;padding:24px}
+ .card{width:100%;max-width:440px}
+ h1{font-size:26px;margin:0 0 6px}
+ p.sub{color:var(--steel);margin:0 0 24px;line-height:1.5}
+ .btn{display:flex;align-items:center;justify-content:space-between;width:100%;
+  border:0;border-radius:14px;padding:18px 20px;margin:12px 0;font-size:17px;
+  font-weight:700;cursor:pointer;background:var(--cream);color:var(--navy)}
+ .btn:disabled{opacity:.55;cursor:default}
+ .btn .state{font-size:13px;font-weight:700;color:#157A47}
+ .btn.busy{opacity:.6}
+ .note{color:var(--steel);font-size:13px;margin-top:20px;line-height:1.5}
+ .err{color:#FF9B9B;font-size:14px;margin-top:14px;min-height:18px}
+</style></head><body>
+<div class="card">
+ <h1>Connect your accounts</h1>
+ <p class="sub">Link the accounts for __GYM__ so we can publish for you. You will be sent to
+  the platform to approve, then brought right back.</p>
+ <button class="btn" data-p="instagram"><span>Connect Instagram</span><span class="state" id="s-instagram"></span></button>
+ <button class="btn" data-p="facebook"><span>Connect Facebook</span><span class="state" id="s-facebook"></span></button>
+ <button class="btn" data-p="googlebusiness"><span>Connect Google Business</span><span class="state" id="s-googlebusiness"></span></button>
+ <div class="err" id="err"></div>
+ <p class="note">Google Business needs a verified Google Business Profile. Nothing posts without
+  your approval on every post.</p>
+</div>
+<script>
+ var TOKEN = "__TOKEN__";
+ var base = "/portal/" + encodeURIComponent(TOKEN);
+ function setErr(m){ document.getElementById("err").textContent = m || ""; }
+ // Reflect current IG/FB connection state (status endpoint tracks IG/FB only).
+ fetch(base + "/social-status").then(function(r){return r.ok?r.json():null;}).then(function(j){
+   if(!j||!j.platforms) return;
+   ["instagram","facebook","googlebusiness"].forEach(function(p){
+     var st = j.platforms[p]||{}; var el = document.getElementById("s-"+p);
+     if(el && st.connected){ el.textContent = st.expired ? "Reconnect" : "Connected"; }
+   });
+ }).catch(function(){});
+ document.querySelectorAll(".btn").forEach(function(b){
+   b.addEventListener("click", function(){
+     if(b.classList.contains("busy")) return;
+     setErr(""); b.classList.add("busy");
+     fetch(base + "/social-connect?platform=" + encodeURIComponent(b.dataset.p))
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){
+        var url = res.j && res.j.oauth_url;
+        if(res.ok && url){ window.location.href = url; }
+        else { b.classList.remove("busy"); setErr((res.j && (res.j.detail||res.j.error)) || "Could not start the connection. Please try again."); }
+      })
+      .catch(function(){ b.classList.remove("busy"); setErr("Network error. Please try again."); });
+   });
+ });
+</script>
+</body></html>"""
+
+
+def _db_gym_name(account_key):
+    """A gym's display name for the connect page header, or '' when unknown. Never raises."""
+    try:
+        from . import db as _db
+        row = _db.gym_get(account_key) or {}
+        return (row.get("display_name") or row.get("gym_name") or "").strip()
+    except Exception:  # noqa: BLE001 - the page renders with a generic header on any miss
+        return ""
+
+
+def render_connect_page(token, account_key):
+    """The self-serve connect page HTML for a resolved token + account. Holds NO secret: each
+    button fetches the OAuth url from the token-gated /social-connect endpoint at click time.
+    The gym name is HTML-escaped; the token is path-safe ([A-Za-z0-9_.-]) so it is injected
+    verbatim into the JS string."""
+    from html import escape as _esc
+    gym = _db_gym_name(account_key) or "your gym"
+    return CONNECT_PAGE.replace("__TOKEN__", token).replace("__GYM__", _esc(gym))
+
+
 # ---- the LASSO social intake form (V3 palette, mobile first) --------------------
 # Client facing copy law: no dash characters, never the word vendor.
 FORM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -1297,6 +1385,11 @@ def build_server(port=None):
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            # Harden the client-facing pages (none are meant to be embedded): block MIME
+            # sniffing, framing/clickjacking, and referrer leakage to the OAuth redirect.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
@@ -1452,6 +1545,21 @@ def build_server(port=None):
                 else:
                     status, body = _zr.handle_facebook_pages(account_key)
                 return self._send_json(body, status)
+
+            # Self-serve CONNECT page: GET /portal/<token>/connect -> a branded HTML page
+            # with Instagram / Facebook / Google Business buttons. Each button fetches the
+            # OAuth url from the token-gated /social-connect endpoint and redirects to Zernio,
+            # so a gym owner connects everything (incl. GBP) without touching Zernio's dash.
+            # Holds NO secret; token->account; unknown/revoked/zernio-off = 404.
+            m_connect = re.match(r"^/portal/([A-Za-z0-9_.-]{8,})/connect$",
+                                 self.path.split("?")[0])
+            if m_connect:
+                tok = m_connect.group(1)
+                account_key = client_for_token(tok)
+                if (account_key is None or is_revoked(account_key)
+                        or not config.zernio_enabled()):
+                    return self._deny(404)
+                return self._send_html(render_connect_page(tok, account_key))
 
             # Part B client-social READ routes: /portal/<token>/social (month calendar)
             # and /portal/<token>/metrics (Part D report shape). Gated by
