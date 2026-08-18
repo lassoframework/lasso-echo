@@ -72,10 +72,25 @@ def caption_issues(caption, banned_words=()):
 
 
 def post_issues(draft, banned_words=()):
-    """Every reason this DRAFT is not A+ (caption issues + media). Empty == A+."""
+    """Every reason this DRAFT is not A+ (caption issues + media + grounding). Empty == A+."""
     issues = caption_issues(getattr(draft, "caption", "") or "", banned_words)
     if not (getattr(draft, "creative_public_url", "") or "").strip():
         issues.append("no media (empty creative url)")
+    # ECHO VISION §5/§7: a caption that CONTRADICTS the crop-verified image is not A+. The
+    # month builder treats not-A+ as "walk alternatives" (regen/swap); exhausted -> drop the
+    # day. Grounding is present only on vision drafts; contradiction-only (absence passes).
+    grounding = getattr(draft, "grounding", None)
+    if grounding:
+        try:
+            from . import vision
+            issues += ["grounding: " + c for c in vision.grounding_contradictions(
+                getattr(draft, "caption", "") or "", grounding.get("analysis"),
+                verified=grounding.get("verified"),
+                gym_claims=grounding.get("claims") or (),
+                consent=grounding.get("consent", False),
+                client_context=grounding.get("client_context", ""))]
+        except Exception:  # noqa: BLE001 - never let the gate itself raise
+            pass
     return issues
 
 

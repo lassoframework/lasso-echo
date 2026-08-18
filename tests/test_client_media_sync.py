@@ -433,6 +433,131 @@ def test_never_builds_past_media_count_even_with_large_days():
     assert len(_feed_ig_rows(store.inserted)) == 3
 
 
+def _feeds_over_span(base, start, days):
+    """`days` instagram FEED rows on `days` CONSECUTIVE, genuinely-distinct post_dates
+    from `start` (may cross a month boundary), keyed into the store by each row's own
+    month so _existing_feed_count reads them the way the live store returns rows. Unlike
+    _existing_feed_calendar (which wraps at 28 and collides), this yields exactly `days`
+    distinct feed dates — needed to model a gym built out to a full month cap."""
+    from collections import defaultdict
+    from datetime import timedelta
+    by_month = defaultdict(list)
+    for i in range(days):
+        d = (start + timedelta(days=i)).isoformat()
+        by_month[(base, d[:7])].append(
+            {"gym_id": base, "account": "instagram", "format": "feed",
+             "post_date": d, "status": "pending", "image_url": f"u{i}"})
+    return dict(by_month)
+
+
+# ---- CHURN FIX: a library LARGER than `days` must not rebuild every scan ----------
+# (Ryan Parr / GritX, 2026-08-18: "it's been recreating the post since yesterday".)
+# GritX had 179 usable media but a 30-day cap, so it placed ~30 feeds; the OLD compare
+# `existing_feeds >= media_count` (30 >= 179 -> False) rebuilt on EVERY scan forever.
+# The fix compares against build_target = min(days, media_count), so a full month is
+# idempotent. These tests FAIL on the old code and pass on the fix.
+
+def test_big_library_built_out_to_days_cap_is_idempotent_no_churn():
+    """179-media gym already built out to its 30-feed `days` cap -> SKIP, no rebuild.
+
+    Reproduces the GritX churn exactly: media_count (30 here, standing in for 179 >
+    days) FAR exceeds the feeds a 30-day month can hold. Once built out, a re-scan must
+    be idempotent (no delete-then-insert), or the calendar 'recreates the post' daily."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    # 40 photos on hand but a 30-day month: the build can only ever place 30 feeds.
+    r2 = _r2_with_uploads("gritx", n=40)
+    # the gym is ALREADY built out to the 30-feed cap across the planned span.
+    from datetime import date
+    start = date(2026, 8, 1)
+    store = FakeStore(existing=_feeds_over_span("gritx", start, 30))
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=start, days=30)
+    assert out["ok"] is True
+    # THE FIX: idempotent skip, NOT a rebuild. Old code: existing_feeds(30) >=
+    # media_count(40) is False -> it would rebuild (churn). New: >= build_target(30).
+    assert out["generated"] == 0, "a full month must not rebuild (this was the churn)"
+    assert out["skipped_existing"] == 1
+    assert store.inserted == [] and store.deleted == [], \
+        "no delete-then-insert: the calendar must not be recreated"
+    res = {r["base"]: r for r in out["results"]}["gritx"]
+    assert res["status"] == "has_calendar"
+    assert res["build_target"] == 30
+
+
+def test_big_library_extends_only_up_to_days_cap_then_stops():
+    """A gym with more media than `days` but a SHORT existing calendar still grows —
+    but only up to the `days` cap, and then never churns again on the next scan."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=40)      # plenty of media
+    from datetime import date
+    # only 5 feeds built so far -> should extend up to the 10-day cap (build_target=10).
+    store = FakeStore(existing={("gritx", "2026-08"): _existing_feed_calendar(
+        "gritx", "2026-08", 5)})
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 8, 1), days=10)
+    assert out["ok"] is True and out["generated"] == 1
+    assert len(_feed_ig_rows(store.inserted)) == 10, "extends up to the days cap"
+
+    # Now it is built out to the cap: a SECOND scan must be idempotent (no churn).
+    store2 = FakeStore(existing={("gritx", "2026-08"): _existing_feed_calendar(
+        "gritx", "2026-08", 10)})
+    out2 = cms.scan_and_generate(clients=["gritx"], store=store2, r2=r2,
+                                 now=date(2026, 8, 1), days=10)
+    assert out2["generated"] == 0 and out2["skipped_existing"] == 1
+    assert store2.inserted == [] and store2.deleted == []
+
+
+def test_thin_library_smaller_than_days_alerts_the_coach_once():
+    """Ryan's own hypothesis, surfaced: a gym with FEWER media than a full month gets a
+    clear 'out of fresh creative' alert (deduped per count), never a silent short
+    calendar. The build still proceeds; the alert is a signal, not a block."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=3)       # only 3 photos for a 30-day month
+    store = FakeStore()
+
+    alerts = []
+    import agent.ops_alerts as _oa
+    orig = _oa.alert
+    _oa.alert = lambda msg, *a, **k: alerts.append(msg)
+    try:
+        out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2, days=30)
+        # re-scan with the SAME count must NOT re-alert (deduped)
+        store2 = FakeStore(existing={("gritx", "2026-08"): _existing_feed_calendar(
+            "gritx", "2026-08", 3)})
+        from datetime import date
+        cms.scan_and_generate(clients=["gritx"], store=store2, r2=r2,
+                              now=date(2026, 8, 1), days=30)
+    finally:
+        _oa.alert = orig
+
+    assert out["generated"] == 1, "a thin library still builds what it can"
+    thin = [m for m in alerts if "out of fresh creative" in m]
+    assert len(thin) == 1, "exactly one thin-creative alert, deduped across scans"
+    assert "3 usable" in thin[0] and "gritx" in thin[0]
+
+
+def test_full_month_library_does_not_alert_thin():
+    """A library that fills the whole month (media >= days) fires NO thin alert."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=6)
+    store = FakeStore()
+    alerts = []
+    import agent.ops_alerts as _oa
+    orig = _oa.alert
+    _oa.alert = lambda msg, *a, **k: alerts.append(msg)
+    try:
+        # days=5, media=6 -> media >= days, no thin signal
+        cms.scan_and_generate(clients=["gritx"], store=store, r2=r2, days=5)
+    finally:
+        _oa.alert = orig
+    assert not [m for m in alerts if "out of fresh creative" in m]
+
+
 def test_flag_off_is_noop(monkeypatch):
     monkeypatch.setenv("AGENT_CLIENT_MEDIA_SYNC", "false")
     _stock_sources("gritx_ig")
@@ -580,3 +705,45 @@ def test_no_meta_publisher_in_path():
     for banned in ("meta_publisher", "publish_due", "publish", "autopublish",
                    "host_media"):
         assert not any(banned in n for n in names), f"unexpected reference: {banned}"
+
+
+# ---- audit B4: _write_sidecar MERGES into a pre-existing sidecar --------------------
+
+def test_write_sidecar_merges_context_and_consent_without_clobbering_note(tmp_path, monkeypatch):
+    """A pre-existing sidecar (a reviewed note) must NOT swallow this upload's context +
+    consent (audit B4 hardening). The note is preserved; context merges in; consent records."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import dam
+    lib = str(tmp_path)
+    media = "20260810T120000Z_p.jpg"
+    stem = os.path.splitext(media)[0]
+    open(os.path.join(lib, media), "wb").close()
+    # a sidecar already carries a reviewed note + public_url (no context/consent yet)
+    with open(os.path.join(lib, stem + ".json"), "w") as fh:
+        json.dump({"note": "reviewed note", "public_url": "https://r2/p.jpg"}, fh)
+
+    cms._write_sidecar(lib, media, "clients/x/p.jpg", "a different caption",
+                       lambda *_: None, client_context="busy professionals, 6am crew",
+                       consent=True)
+
+    with open(os.path.join(lib, stem + ".json")) as fh:
+        side = json.load(fh)
+    assert side["note"] == "reviewed note"                     # never clobbered
+    assert side["client_context"] == "busy professionals, 6am crew"  # merged in
+    # consent recorded in the DAM audit trail + sidecar
+    assert str(side.get("consent", "")).lower() == "granted"
+    assert dam.consent_log_entries(os.path.join(lib, media))    # an audit row exists
+
+
+def test_write_sidecar_records_consent_at_most_once(tmp_path, monkeypatch):
+    """The consent_recorded marker dedups: a second call with consent=True adds no new
+    audit row (a re-sync cannot duplicate the consent log)."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import dam
+    lib = str(tmp_path)
+    media = "20260810T120000Z_q.jpg"
+    open(os.path.join(lib, media), "wb").close()
+    for _ in range(3):
+        cms._write_sidecar(lib, media, "clients/x/q.jpg", "cap", lambda *_: None,
+                           client_context="ctx", consent=True)
+    assert len(dam.consent_log_entries(os.path.join(lib, media))) == 1

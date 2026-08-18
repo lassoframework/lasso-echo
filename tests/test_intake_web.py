@@ -116,3 +116,24 @@ def test_client_isolation_by_token(monkeypatch):
     intake_web.handle_upload("tok-gymb-87654321", [JPG], r2=r2)
     assert all(k.startswith("intake/gymb/incoming/") for k in r2.objects)
     assert not any("gyma" in k for k in r2.objects)   # never another client's prefix
+
+
+def test_upload_stores_context_and_consent_no_laundering(monkeypatch):
+    _arm(monkeypatch)
+    r2 = FakeR2()
+    a = ("a.jpg", "image/jpeg", b"jpgbytesaaaa")
+    b = ("b.jpg", "image/jpeg", b"jpgbytesbbbb")
+    status, body = intake_web.handle_upload(
+        "tok-gyma-12345678", [a, b],
+        client_contexts=["Sarah lost 40lbs on our program", "just the empty gym floor"],
+        consents=[True, False], r2=r2)          # a: checkbox ticked; b: text but NO checkbox
+    assert status == 200 and body["stored"] == 2
+    sidecar = json.loads(
+        r2.objects[[k for k in r2.objects if k.endswith("_upload.json")][0]][0])
+    a_base, b_base = sidecar["filenames"][0], sidecar["filenames"][1]
+    ctx, cons = sidecar["client_context"], sidecar["consent"]
+    assert ctx[a_base] == "Sarah lost 40lbs on our program"
+    assert ctx[b_base] == "just the empty gym floor"
+    # consent is the CHECKBOX only — file b has context TEXT but no checkbox -> NOT consented
+    assert cons.get(a_base) is True
+    assert b_base not in cons        # no consent laundering from text presence

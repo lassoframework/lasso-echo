@@ -10,6 +10,87 @@ Last updated: 2026-08-17
 
 ---
 
+## Echo Vision — image understanding + grounded captions (ECHO_VISION_SPEC.md, 2026-08-17)
+
+Autonomous build, phase loop (build → independent audit → fix → re-audit to zero → this log).
+KEY FINDING at spec-map time: this is a v2 EXTENSION of the existing DAM v1 (`agent/dam.py`:
+autotag/near-dupe/consent), not greenfield. Rulings (Blake): analysis lives on the DAM
+SIDECAR (no DB table; `sync_uploads` preserves it across re-syncs); reuse the Gemini path +
+spend cap (+ per-slot/per-gym-monthly on top in P4); DCT-pHash; crop-verify checks what
+SHIPS (GBP 1200×900 crop, IG/FB the original); `intake_web` owns the upload UI;
+`text_in_image` firewalled from the drafter. Per-gym flag `AGENT_VISION_GYMS` (default none);
+flips only at next `build_client_month` with pending/approved frozen; LASSO dogfood diff to
+Blake before any client gym; adversarial set must route 100% before any default-on.
+
+- **[x] P0 — adversarial harness** (`tests/test_vision_adversarial.py`): §9.3 set routes 100%
+  through the real coerce+routing (name tag, whiteboard-PII, before/after collage, athlete
+  comp, minor-prominent, blurry burst, empty-gym, gender-leak, third-party-brand). Standing
+  acceptance bar.
+- **[x] P1 — analysis v2** (`agent/vision.py`): v2 `media_analysis` schema; identity
+  firewall on one_line/subjects/details (never text_in_image); DCT-pHash + Hamming;
+  `caption_eligible_details` (≥0.85); `auto_plannable` (excludes safety/person-name/athlete/
+  identity-leak/unusable/missing-failed); `analyze_and_store` on the sidecar (idempotent =
+  preserve-on-re-sync; 3-attempt fail → `analysis_failed`+alert); `analyze_library` backfill;
+  ingest hook in `client_media_sync` (per-gym, best-effort). Independent audit → 3 findings
+  (1 CRITICAL guardrail-11 leak, 1 MAJOR name over-block, 1 MINOR flat-pHash) FIXED; re-audit
+  0 material remaining (one safe-direction over-block noted for the dogfood-diff revisit).
+- **[x] P2 — library hygiene** (`agent/vision.py` cluster_library/cluster_count;
+  `agent/rotation.py` reuse_blocked; `client_media_sync` starvation wiring): Hamming-≤6
+  near-dupe clustering on the ingest pHash (writes dupe_group; rotation collapses a burst to
+  one creative); cluster-count starvation guard caps the month at clusters + fires a coach
+  gap alert before a thin month; per-platform reuse windows (IG/FB 60d, GBP-after-IG 14d,
+  GBP-same-month 30d). Served prune bumped to ≥60d. Independent audit → 1 defect (greedy
+  clustering was order-dependent / non-transitive); FIXED with UNION-FIND (deterministic,
+  transitive-closure "burst=one cluster") + an order-independence test. Other 4 items
+  CONFIRMED (no false-merge, safe starvation floor, correct windows, no rotation regression).
+- **[x] P3 — planner content scoring** (`vision.content_score`/_SLOT_PREFS;
+  `client_content.pick_image` vision branch; `client_month_run` weak_match alert): pick_image
+  content-scores images to the slot job (activity+people+setting affinity + quality +
+  recency), excludes every flag class (guardrail 13), restricts athlete_leaning/unclear to
+  BTS slots, skips reuse-windowed clusters, below-floor → weak_match (per-build staff alert,
+  never silent). Deterministic tie-break. Legacy rotation unchanged for non-vision gyms
+  (recency now cluster-keyed via dam.rotation_key = basename fallback). Independent audit → 0
+  material findings.
+- **[x] P4 — caption chain** (`vision.crop_verify`/`grounding_contradictions`/`policy_screen`;
+  `client_content.build_client_draft` verify-then-draft; `post_quality.post_issues` grounding
+  gate): §3.5 crop-verify re-checks the SHIPPED pixels (ruling 4: GBP the 1200x900 crop, IG/FB
+  the original) and confirms the people bucket + each caption-eligible (≥0.85) detail; a caption
+  may lean ONLY on survivors. Closed 4-claim contradiction gate (people-quantity fails CLOSED
+  on an unconfirmed bucket, outdoor, crop-rejected objects by word-boundary, high-risk
+  identity+numbers) runs in the A+ gate — contradiction-only, absence passes; inert on non-vision
+  drafts. Independent audit → 1 CRITICAL (crop_verify fell back to the stale ingest bucket) +
+  1 MAJOR (false-positive solo/outdoor words + substring object check) + number-gating FIXED;
+  re-audit CONFIRMED both closed, 0 material.
+- **[x] P5 — consent + client_context** (`intake_web.handle_upload`; `client_media_sync`
+  `_read_context_consent`/`_write_sidecar`; `build_client_draft` context screen): per-file
+  `client_context` (raw material, never verbatim output — screened by `context_usable`:
+  health/review-bait/weight-promise + dash/hashtag/phone/banned, no shape checks) and consent
+  (CHECKBOX only — the laundering guard means consent is NEVER inferred from context text). A
+  consented term unlocks an identity/number claim ONLY when it also appears in the context.
+  Independent audit → 0 material defects (laundering, stale-bucket, index-alignment, non-vision
+  regression all CONFIRMED closed); one latent-fragility note (B4) hardened below.
+- **[x] P6 — rollout** (`agent/config.py` flags; `vision.within_gym_budget`;
+  `client_content._shadow_log_pick`; `agent/vision_dogfood.py`): per-gym `AGENT_VISION_GYMS`
+  (default EMPTY — off for every gym); a gym flips only at its next `build_client_month` with
+  pending/approved frozen. Ruling 2: `within_gym_budget` per-(gym,month) Gemini-call cap
+  (`AGENT_VISION_GYM_MONTHLY_CAP`, default 400) layered on the global daily cap, alarm-once
+  runaway guard. §9.4 SHADOW (`AGENT_VISION_SHADOW`): analysis + scoring run and LOG the
+  would-be pick, but the ship stays FULLY legacy. **LASSO dogfood diff** (`agent.vision_dogfood`,
+  `python3 -m agent.vision_dogfood lasso`): per-pillar old-pick (vision off) vs new-pick (vision
+  on) + reason — the go/no-go deliverable to Blake BEFORE any client gym converts. Audit B4
+  hardening: `_write_sidecar` now MERGES into a pre-existing sidecar (never clobbers a reviewed
+  note) so a stale sidecar can't swallow this upload's consent+context; consent recorded at most
+  once via a marker. Independent audit → 0 material defects (all 6 probes BUILT: default-off,
+  budget layered-not-replacing, shadow ships legacy, B4 no-clobber/no-laundering, dogfood
+  read-only, no rail regression); one cosmetic note (monthly-cap key derived from folder
+  basename) hardened by threading the canonical `base_key` through `analyze_library(gym=)`.
+
+**Rollout gate (hard limits, unchanged):** the adversarial set (`test_vision_adversarial.py`)
+must route 100% before any per-gym flag defaults on; the LASSO dogfood diff goes to Blake before
+any client gym converts; `AGENT_VISION_GYMS` ships empty. Full suite green after P4-P6.
+
+---
+
 ## Dale round 2 beta feedback (Aug 18 post, 2026-08-17) — 5 items, gym-agnostic
 
 Independent trace confirmed each root cause in live code before the fix. Suite 2730 -> 2750

@@ -485,6 +485,20 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             log(f"drop {day_key} story: cannot carry its caption (a story publishes "
                 "empty-body; refusing to ship a captionless story)")
 
+    # §4 weak_match: no image cleared the content-score floor for these slots — the best
+    # available was planned and must reach the coach (never silent). One summary staff alert
+    # per build, not per day.
+    weak = sum(1 for d in drafts if getattr(d, "weak_match", False))
+    if weak:
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(f"{base_key}: {weak} post(s) this month are a WEAK photo match "
+                             "(no strong image for the slot) — review or ask the gym for "
+                             "fresher material for those pillars")
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"{base_key}: {weak} weak_match pick(s) flagged for the coach")
+
     rows = _to_rows(base_key, drafts)
     # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
     # every platform is WITHHELD from the owner ('coach_review') until a coach screens and

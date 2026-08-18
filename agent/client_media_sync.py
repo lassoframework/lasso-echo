@@ -261,6 +261,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     lib_dir = _library_dir(base_key, out_dir)
     os.makedirs(lib_dir, exist_ok=True)
     captions = _read_captions(r2, prefixes, log)
+    contexts, consents = _read_context_consent(r2, prefixes, log)   # §8 per-file context + consent
 
     synced = 0
     skipped = 0
@@ -284,35 +285,111 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         except OSError as exc:
             log(f"{base_key}: write failed for one object: {type(exc).__name__}")
             continue
-        _write_sidecar(lib_dir, name, key, captions.get(name, ""), log)
+        _write_sidecar(lib_dir, name, key, captions.get(name, ""), log,
+                       client_context=contexts.get(name, ""),
+                       consent=bool(consents.get(name)))
         synced += 1
 
     if synced or skipped:
         log(f"{base_key}: synced {synced} new media, skipped {skipped} already present")
+
+    # ECHO VISION ingest hook (§2.1): analyze newly-synced images once, on the gym's DAM
+    # sidecar, so content-scoring + grounding have data before planning. Idempotent (an
+    # already-analyzed image is skipped -> analysis is PRESERVED across re-syncs, ruling 1).
+    # Gated per-gym (AGENT_VISION_GYMS, or §9.4 shadow) and best-effort — a vision failure
+    # never fails sync. Shadow gyms analyze/cluster too, so the shadow pick log has data;
+    # only the drafter/pick stays legacy for them (see client_content._shadow_log_pick).
+    if synced and (config.vision_enabled_for(base_key) or config.vision_shadow_for(base_key)):
+        try:
+            from . import vision, ops_alerts
+            vision.analyze_library(lib_dir, alert=ops_alerts.alert, logger=log,
+                                   gym=base_key)   # canonical key for the per-gym monthly cap
+            # §3: collapse near-dupes into clusters so rotation + the starvation guard treat
+            # a burst as one creative.
+            vision.cluster_library(lib_dir)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{base_key}: vision sweep failed: {type(exc).__name__}")
+
     return {"synced": synced, "skipped": skipped}
 
 
-def _write_sidecar(lib_dir, media_name, r2_key, caption, log):
+def _read_context_consent(r2, prefixes, log):
+    """({basename: client_context}, {basename: consent_bool}) from the batch upload
+    sidecars (§8). Mirrors the batch read in _read_captions; malformed sidecars are
+    skipped, never raise."""
+    contexts, consents, seen = {}, {}, set()
+    for prefix in prefixes:
+        try:
+            keys = list(r2.list_keys(prefix) or [])
+        except Exception:  # noqa: BLE001
+            continue
+        for key in keys:
+            if key in seen or not key.endswith(_UPLOAD_SIDECAR_SUFFIX):
+                continue
+            seen.add(key)
+            data = _load_json(r2, key)
+            if not isinstance(data, dict):
+                continue
+            for name, ctx in (data.get("client_context") or {}).items():
+                if name and ctx:
+                    contexts.setdefault(str(name), str(ctx))
+            for name, ok in (data.get("consent") or {}).items():
+                if name and ok:
+                    consents.setdefault(str(name), True)
+    return contexts, consents
+
+
+def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
+                   consent=False):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
     client_note, never fabricated). Idempotent: an existing sidecar (a reviewed note)
-    is never clobbered."""
+    is never clobbered.
+
+    §8: client_context (the gym's free-text about this photo) is stored as RAW MATERIAL
+    under "client_context" (never verbatim output — the caption gate + policy screen govern
+    its use). consent is the CHECKBOX only; when set it is recorded in the DAM consent log
+    (audit trail) as 'granted', which is what lets a people photo be selected under the
+    consent guard. Consent is NEVER inferred from the presence of context text."""
     stem = os.path.splitext(media_name)[0]
     side_path = os.path.join(lib_dir, stem + ".json")
+    # MERGE, don't skip (audit B4): an existing sidecar's reviewed note/context is never
+    # clobbered, but a pre-existing sidecar must not swallow this upload's consent + context.
+    existing = {}
     if os.path.exists(side_path):
-        return
-    payload = {"public_url": _public_url_for_key(r2_key)}
-    if caption:
-        # library._load_sidecar reads data["note"] into Creative.client_note, so the
-        # gym's caption MUST live under "note" to reach the drafter (writing
-        # "client_note" here would be silently dropped by list_creatives).
+        try:
+            with open(side_path, encoding="utf-8") as fh:
+                existing = json.load(fh) or {}
+        except (OSError, ValueError):
+            existing = {}
+    payload = dict(existing)
+    payload.setdefault("public_url", _public_url_for_key(r2_key))
+    # library._load_sidecar reads data["note"] into Creative.client_note, so the gym's
+    # caption MUST live under "note" to reach the drafter (writing "client_note" here would
+    # be silently dropped). Never clobber a note already on the sidecar.
+    if caption and not payload.get("note"):
         payload["note"] = caption
-    try:
-        with open(side_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-    except OSError as exc:
-        log(f"sidecar write failed: {type(exc).__name__}")
+    if client_context and not payload.get("client_context"):
+        payload["client_context"] = client_context
+    # consent is the CHECKBOX only, recorded in the DAM consent log at most once (a marker on
+    # the sidecar dedups across re-syncs so we never append duplicate audit rows).
+    record_consent = consent and not payload.get("consent_recorded")
+    if record_consent:
+        payload["consent_recorded"] = True
+    if payload != existing:
+        try:
+            with open(side_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+        except OSError as exc:
+            log(f"sidecar write failed: {type(exc).__name__}")
+    if record_consent:
+        try:
+            from . import dam
+            dam.set_consent(os.path.join(lib_dir, media_name), "granted",
+                            granted_by="client_upload_checkbox")
+        except Exception as exc:  # noqa: BLE001 - consent audit must never fail the sync
+            log(f"consent record failed: {type(exc).__name__}")
 
 
 # ---- scan + generate: sync media, then draft the month for gyms newly ready --------
@@ -461,6 +538,33 @@ def _existing_feed_count(store, base_key, start, days):
     return len(feed_dates), True
 
 
+def _alert_thin_creative(base_key, media_count, days, log):
+    """Surface to the coach that a gym is OUT OF FRESH CREATIVE: it has fewer usable
+    media than a full `days` month, so its calendar is short and Echo is recycling the
+    N photos it has. This is the DEFINITIVE answer to a coach asking 'is this just not
+    enough creative?' (Ryan Parr / GritX, 2026-08-18) — never a silent short calendar.
+
+    Deduped per gym + media_count via the kv store so the FREQUENT scan lane (which
+    re-runs every interval) fires at most one alert per distinct count; it re-fires only
+    when the count changes (a new upload). Best-effort: an alert/kv failure never blocks
+    the build. Emits nothing when the library already fills the month (media >= days)."""
+    if not (0 < media_count < days):
+        return
+    try:
+        from . import db, ops_alerts
+        key = f"thin_creative_alerted_{base_key}_{media_count}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{base_key} is out of fresh creative: only {media_count} usable "
+            f"photo(s)/video(s) for a {days}-day month, so the calendar is capped at "
+            f"{media_count} post(s) and recycles them. Ask the gym for more material "
+            "to fill the month. Not blocked; the current calendar stands.")
+    except Exception as exc:  # noqa: BLE001 - a signal must never block the build
+        log(f"{base_key}: thin-creative alert failed: {type(exc).__name__}")
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -532,6 +636,20 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # path and the builder agree on what counts as usable media.
             from .client_month_run import _client_media_count
             media_count = _client_media_count(lib_dir)
+            # §3 STARVATION GUARD (vision on): count distinct near-dupe CLUSTERS, not raw
+            # images, so a burst of the same shot cannot inflate the month into forced
+            # near-dupe reuse. Cap the calendar at the cluster count and fire a gap alert to
+            # the coach BEFORE a thin month plans.
+            if config.vision_enabled_for(base):
+                from . import vision
+                clusters = vision.cluster_count(lib_dir)
+                if 0 < clusters < media_count:
+                    log(f"{base}: {clusters} photo clusters < {media_count} media "
+                        "(near-dupes collapsed) — capping the month at clusters")
+                    media_count = clusters
+                # The starvation ALERT is fired once, deduped, by _alert_thin_creative below
+                # against this (cluster-capped) media_count — so a vision gym whose distinct
+                # clusters < days is caught there without spamming every scan.
             if media_count <= 0:
                 awaiting += 1
                 results.append({"base": base, "status": "awaiting_media",
@@ -545,10 +663,27 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 log(f"{base}: media ready but no calendar store configured; not built")
                 continue
 
-            # GROW-ON-MORE, NEVER PAST MEDIA: compare the gym's current unique media
-            # count against the FEED rows already placed. Only (re)build when the gym
-            # has MORE media than placed feeds; an equal count is idempotent (skip, no
-            # rebuild). We never build past media_count (the builder caps that too).
+            # GROW-ON-MORE, NEVER PAST MEDIA: compare the FEED rows already placed
+            # against the number of feeds the build would ACTUALLY produce, not the raw
+            # media_count. The builder caps a month at min(days, media_count) feeds (one
+            # distinct photo per feed, `days` an UPPER bound) — see build_client_month's
+            # max_feed_days. So the true "am I built out?" target is that SAME cap:
+            #
+            #     build_target = min(days, media_count)
+            #
+            # THE CHURN BUG THIS FIXES (Ryan Parr / GritX, 2026-08-18, "it's been
+            # recreating the post since yesterday"): comparing existing_feeds against the
+            # RAW media_count made a gym with MORE media than `days` rebuild on EVERY
+            # scan forever. existing_feeds is structurally capped near `days` (the build
+            # can never place more than `days` feeds), so `existing_feeds >= media_count`
+            # was never true for a large library (GritX: 34 placed vs 179 media). Each
+            # frequent-lane scan then delete-then-inserted, re-picking photos and
+            # "recreating the post" daily, and polluting the served ledger (which
+            # degrades rotation so the same photos keep coming back). Comparing against
+            # the real build_target instead makes an UNCHANGED library idempotent: once a
+            # 179-photo gym is built out to its 30-feed cap, existing_feeds (30) >=
+            # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
+            # cap still grows; a library already at/over the cap never churns again.
             existing_feeds, read_ok = _existing_feed_count(store, base, start, days)
             if not read_ok:
                 # Could not read reliably: do NOT risk a duplicate/rebuild this pass.
@@ -557,15 +692,26 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: calendar read failed; left as-is (no rebuild)")
                 continue
-            if existing_feeds >= media_count:
-                # Already built out to (or beyond) the media the gym has: idempotent.
+            build_target = min(days, media_count)
+            # THIN-CREATIVE SURFACE (Ryan's own hypothesis, made definitive): when the
+            # gym has FEWER usable media than a full `days` month, the calendar is
+            # necessarily short and Echo is recycling what little it has. Say so, once,
+            # to the coach — so the answer to "is this just not enough creative?" is a
+            # clear signal, never a silent short calendar. Deduped per gym+count so a
+            # frequent scan never storms the channel; re-fires only if the count moves.
+            if 0 < media_count < days:
+                _alert_thin_creative(base, media_count, days, log)
+            if existing_feeds >= build_target:
+                # Already built out to the media the gym supports (capped at `days`):
+                # idempotent. An unchanged library never rebuilds again.
                 skipped_existing += 1
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
-                                "existing_feeds": existing_feeds})
+                                "existing_feeds": existing_feeds,
+                                "build_target": build_target})
                 continue
-            # else: media_count > existing_feeds -> (re)build up to the new count. The
+            # else: build_target > existing_feeds -> (re)build up to the cap. The
             # builder's _apply does a gym-scoped delete-then-insert (client calendars
             # are cheap real-photo cards, no Gemini), so the calendar EXTENDS cleanly.
 
