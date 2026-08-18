@@ -476,6 +476,33 @@ def _existing_feed_count(store, base_key, start, days):
     return len(feed_dates), True
 
 
+def _alert_thin_creative(base_key, media_count, days, log):
+    """Surface to the coach that a gym is OUT OF FRESH CREATIVE: it has fewer usable
+    media than a full `days` month, so its calendar is short and Echo is recycling the
+    N photos it has. This is the DEFINITIVE answer to a coach asking 'is this just not
+    enough creative?' (Ryan Parr / GritX, 2026-08-18) — never a silent short calendar.
+
+    Deduped per gym + media_count via the kv store so the FREQUENT scan lane (which
+    re-runs every interval) fires at most one alert per distinct count; it re-fires only
+    when the count changes (a new upload). Best-effort: an alert/kv failure never blocks
+    the build. Emits nothing when the library already fills the month (media >= days)."""
+    if not (0 < media_count < days):
+        return
+    try:
+        from . import db, ops_alerts
+        key = f"thin_creative_alerted_{base_key}_{media_count}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{base_key} is out of fresh creative: only {media_count} usable "
+            f"photo(s)/video(s) for a {days}-day month, so the calendar is capped at "
+            f"{media_count} post(s) and recycles them. Ask the gym for more material "
+            "to fill the month. Not blocked; the current calendar stands.")
+    except Exception as exc:  # noqa: BLE001 - a signal must never block the build
+        log(f"{base_key}: thin-creative alert failed: {type(exc).__name__}")
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -576,10 +603,27 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 log(f"{base}: media ready but no calendar store configured; not built")
                 continue
 
-            # GROW-ON-MORE, NEVER PAST MEDIA: compare the gym's current unique media
-            # count against the FEED rows already placed. Only (re)build when the gym
-            # has MORE media than placed feeds; an equal count is idempotent (skip, no
-            # rebuild). We never build past media_count (the builder caps that too).
+            # GROW-ON-MORE, NEVER PAST MEDIA: compare the FEED rows already placed
+            # against the number of feeds the build would ACTUALLY produce, not the raw
+            # media_count. The builder caps a month at min(days, media_count) feeds (one
+            # distinct photo per feed, `days` an UPPER bound) — see build_client_month's
+            # max_feed_days. So the true "am I built out?" target is that SAME cap:
+            #
+            #     build_target = min(days, media_count)
+            #
+            # THE CHURN BUG THIS FIXES (Ryan Parr / GritX, 2026-08-18, "it's been
+            # recreating the post since yesterday"): comparing existing_feeds against the
+            # RAW media_count made a gym with MORE media than `days` rebuild on EVERY
+            # scan forever. existing_feeds is structurally capped near `days` (the build
+            # can never place more than `days` feeds), so `existing_feeds >= media_count`
+            # was never true for a large library (GritX: 34 placed vs 179 media). Each
+            # frequent-lane scan then delete-then-inserted, re-picking photos and
+            # "recreating the post" daily, and polluting the served ledger (which
+            # degrades rotation so the same photos keep coming back). Comparing against
+            # the real build_target instead makes an UNCHANGED library idempotent: once a
+            # 179-photo gym is built out to its 30-feed cap, existing_feeds (30) >=
+            # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
+            # cap still grows; a library already at/over the cap never churns again.
             existing_feeds, read_ok = _existing_feed_count(store, base, start, days)
             if not read_ok:
                 # Could not read reliably: do NOT risk a duplicate/rebuild this pass.
@@ -588,15 +632,26 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: calendar read failed; left as-is (no rebuild)")
                 continue
-            if existing_feeds >= media_count:
-                # Already built out to (or beyond) the media the gym has: idempotent.
+            build_target = min(days, media_count)
+            # THIN-CREATIVE SURFACE (Ryan's own hypothesis, made definitive): when the
+            # gym has FEWER usable media than a full `days` month, the calendar is
+            # necessarily short and Echo is recycling what little it has. Say so, once,
+            # to the coach — so the answer to "is this just not enough creative?" is a
+            # clear signal, never a silent short calendar. Deduped per gym+count so a
+            # frequent scan never storms the channel; re-fires only if the count moves.
+            if 0 < media_count < days:
+                _alert_thin_creative(base, media_count, days, log)
+            if existing_feeds >= build_target:
+                # Already built out to the media the gym supports (capped at `days`):
+                # idempotent. An unchanged library never rebuilds again.
                 skipped_existing += 1
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
-                                "existing_feeds": existing_feeds})
+                                "existing_feeds": existing_feeds,
+                                "build_target": build_target})
                 continue
-            # else: media_count > existing_feeds -> (re)build up to the new count. The
+            # else: build_target > existing_feeds -> (re)build up to the cap. The
             # builder's _apply does a gym-scoped delete-then-insert (client calendars
             # are cheap real-photo cards, no Gemini), so the calendar EXTENDS cleanly.
 
