@@ -118,9 +118,28 @@ def test_social_reads_content_calendar(monkeypatch):
     assert p1["caption"] == "cap one"
     # the story row keeps its REAL format (not derived from is_story)
     assert body["posts"][1]["format"] == "story"
-    # a STORY shows the IMAGE ONLY: its caption is burned onto the media, so the display
-    # caption is blanked (Blake 2026-08-18). The feed caption above is unaffected.
+    # LASSO's OWN story shows the image only: its caption is burned onto the media, so the
+    # display caption is blanked (Blake 2026-08-18). The feed caption above is unaffected.
     assert body["posts"][1]["caption"] == ""
+
+
+def test_client_gym_keeps_story_caption(monkeypatch):
+    # Blake 2026-08-18: story captions show for CLIENT gyms (only LASSO is blanked). A gym
+    # owner (Dale/ENG) must see the story caption to read + approve it — blanking it made the
+    # portal show an "Echo is writing" placeholder.
+    store = _FakeStore([
+        _row("uuid-1", gym_id="eng", post_date="2026-08-05", caption="feed cap",
+             image_url="https://cdn/1.jpg", pillar="proof", fmt="feed"),
+        _row("uuid-2", gym_id="eng", post_date="2026-08-20", caption="story cap",
+             image_url="https://cdn/2.jpg", pillar="offer", fmt="story"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+
+    status, body = ps.handle_social("eng", "2026-08")
+    assert status == 200
+    assert body["posts"][0]["caption"] == "feed cap"
+    assert body["posts"][1]["format"] == "story"
+    assert body["posts"][1]["caption"] == "story cap"   # CLIENT story caption PRESERVED
 
 
 def test_social_post_surfaces_scheduled_at_go_live_time(monkeypatch):
