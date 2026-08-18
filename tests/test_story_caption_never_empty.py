@@ -150,3 +150,49 @@ def test_maybe_format_story_drops_photo_story_when_hosting_off(monkeypatch, tmp_
     story = _Draft("You are busy. We help.", str(tmp_path / "photo.jpg"))
     assert client_month_run._maybe_format_story(_Acct(), story, feed, tmp_path,
                                                 lambda m: None) is False
+
+
+# ---- _maybe_format_feed: reframe an out-of-spec feed photo, ENHANCE-only (never drop) ----
+
+def test_maybe_format_feed_flag_off_keeps_raw(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_month_run.config, "feed_autofit_enabled", lambda: False)
+    feed = _Draft("cap", str(tmp_path / "p.jpg"))
+    client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
+    assert feed.creative_public_url == "raw-url"          # untouched
+
+
+def test_maybe_format_feed_in_spec_keeps_raw(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_month_run.config, "feed_autofit_enabled", lambda: True)
+    monkeypatch.setattr(client_month_run.config, "hosting_enabled", lambda: True)
+    from agent import feed_image
+    monkeypatch.setattr(feed_image, "get_or_make_feed_image",
+                        lambda p, lib, logger=None: None)   # in-spec -> None
+    feed = _Draft("cap", str(tmp_path / "square.jpg"))
+    client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
+    assert feed.creative_public_url == "raw-url"          # posts the raw photo unchanged
+
+
+def test_maybe_format_feed_swaps_when_reframed(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_month_run.config, "feed_autofit_enabled", lambda: True)
+    monkeypatch.setattr(client_month_run.config, "hosting_enabled", lambda: True)
+    from agent import feed_image
+    import agent.media_host as media_host
+    monkeypatch.setattr(feed_image, "get_or_make_feed_image",
+                        lambda p, lib, logger=None: str(tmp_path / "reframed__feed.jpg"))
+    monkeypatch.setattr(media_host, "host_media", lambda p, k: "https://cdn/x__feed.jpg")
+    feed = _Draft("cap", str(tmp_path / "tall.jpg"))
+    client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
+    assert feed.creative_public_url == "https://cdn/x__feed.jpg"   # swapped to the reframe
+
+
+def test_maybe_format_feed_never_drops_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_month_run.config, "feed_autofit_enabled", lambda: True)
+    monkeypatch.setattr(client_month_run.config, "hosting_enabled", lambda: True)
+    from agent import feed_image
+    def _boom(*a, **k):
+        raise RuntimeError("render blew up")
+    monkeypatch.setattr(feed_image, "get_or_make_feed_image", _boom)
+    feed = _Draft("cap", str(tmp_path / "tall.jpg"))
+    # must NOT raise and must keep the raw media (feed autofit never drops a post)
+    client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
+    assert feed.creative_public_url == "raw-url"

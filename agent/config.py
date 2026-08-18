@@ -1312,6 +1312,17 @@ def story_format_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_STORY_FORMAT", "false"))
 
 
+def feed_autofit_enabled() -> bool:
+    """Auto-fit a client's FEED photo into an in-spec 1080x1080 card (AGENT_FEED_AUTOFIT).
+    OFF by default = the raw photo posts as uploaded. ON = a photo whose aspect ratio is
+    OUTSIDE Instagram/Facebook's accepted feed range (0.8 to 1.91) is re-framed: the whole
+    photo contained on a blurred cover fill of itself, so the platform never hard-crops the
+    subject. In-spec photos are left untouched. Only ENHANCES: any failure posts the raw
+    photo. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_FEED_AUTOFIT", "false"))
+
+
 def reel_target_sec() -> float:
     """Target action-reel length in seconds (AGENT_REEL_TARGET_SEC, default 22).
     Clamped to 10..60 (IG Reels sweet spot; never a mis-set 600s encode)."""

@@ -449,6 +449,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # host a poster frame so the client SEES the video (a real frame) instead of a
         # blank card. Display-only (the video still publishes); best effort.
         _attach_video_poster(account, feed, library_path, log)
+        # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec (odd-crop /
+        # panoramic) feed PHOTO is re-framed into an in-spec 1080x1080 card so the platform
+        # never hard-crops the subject (Dale, 2026-08-18). In-spec photos + videos untouched;
+        # any failure keeps the raw media. Approval gate unchanged.
+        # Snapshot the feed media BEFORE the SQUARE reframe so the paired story (cloned below)
+        # never inherits the 1080x1080 feed card — a story needs the raw source (it rebuilds
+        # its own 1080x1920, or posts the raw photo when story-format is off). Autofit reframes
+        # the FEED creative only, never the story.
+        _pre_autofit_url = getattr(feed, "creative_public_url", "")
+        _maybe_format_feed(account, feed, library_path, log)
         _mark_feed(feed)
         drafts.append(feed)
         built_days += 1
@@ -463,6 +473,15 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # one-photo-per-feed cap). It carries the feed's caption + creative, marked as
         # a story. No extra media is consumed, so N photos -> N feeds + N stories.
         story = _story_from_feed(feed)
+        # The story must NOT carry the feed's SQUARE autofit reframe: restore the pre-autofit
+        # media. Story-format ON rebuilds a fresh 1080x1920 from creative_path regardless; this
+        # guard is what keeps the story correct when story-format is OFF (posts the raw photo,
+        # never a 1080x1080 square pillarboxed into a 9:16 slot).
+        if getattr(story, "creative_public_url", "") != _pre_autofit_url:
+            try:
+                story.creative_public_url = _pre_autofit_url
+            except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
+                pass
         _mark_story(story)
         # HONOR A CLIENT-EDITED STORY CAPTION: if the client edited this day's story
         # caption in the portal, re-render the story with THEIR text (not the freshly
@@ -641,6 +660,33 @@ def _maybe_format_story(account, story, feed, library_path, log):
         log(f"story format lane failed for {os.path.basename(path)}: "
             f"{type(exc).__name__}; dropping the story to avoid a captionless post")
         return False
+
+
+def _maybe_format_feed(account, feed, library_path, log):
+    """AGENT_FEED_AUTOFIT: re-frame an OUT-OF-SPEC feed PHOTO into an in-spec 1080x1080 card
+    so the platform never hard-crops the subject. ENHANCE-only: an in-spec photo, a video,
+    hosting-off, or any failure keeps the raw media (this never DROPS a post, unlike the story
+    caption guard). Mutates feed.creative_public_url in place on success."""
+    if not config.feed_autofit_enabled():
+        return
+    path = (getattr(feed, "creative_path", "") or "").strip()
+    if not path:
+        return
+    try:
+        from . import feed_image, media_host
+        asset = feed_image.get_or_make_feed_image(path, library_path, logger=log)
+        if not asset:
+            return                                    # in-spec / video / render skipped
+        if not config.hosting_enabled():
+            return                                    # cannot host the reframe -> keep raw
+        hosted = media_host.host_media(asset, account.key)
+        if hosted:
+            feed.creative_public_url = hosted
+            if getattr(feed, "thumbnail_url", ""):
+                feed.thumbnail_url = ""               # the reframe IS the media
+            log(f"feed autofit applied for {os.path.basename(path)} (odd ratio -> 1080x1080)")
+    except Exception as exc:  # noqa: BLE001 - never crash the build; keep the raw photo
+        log(f"feed autofit lane failed for {os.path.basename(path)}: {type(exc).__name__}")
 
 
 def _display_name_for(account):
