@@ -261,6 +261,7 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     lib_dir = _library_dir(base_key, out_dir)
     os.makedirs(lib_dir, exist_ok=True)
     captions = _read_captions(r2, prefixes, log)
+    contexts, consents = _read_context_consent(r2, prefixes, log)   # §8 per-file context + consent
 
     synced = 0
     skipped = 0
@@ -284,7 +285,9 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
         except OSError as exc:
             log(f"{base_key}: write failed for one object: {type(exc).__name__}")
             continue
-        _write_sidecar(lib_dir, name, key, captions.get(name, ""), log)
+        _write_sidecar(lib_dir, name, key, captions.get(name, ""), log,
+                       client_context=contexts.get(name, ""),
+                       consent=bool(consents.get(name)))
         synced += 1
 
     if synced or skipped:
@@ -307,12 +310,45 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     return {"synced": synced, "skipped": skipped}
 
 
-def _write_sidecar(lib_dir, media_name, r2_key, caption, log):
+def _read_context_consent(r2, prefixes, log):
+    """({basename: client_context}, {basename: consent_bool}) from the batch upload
+    sidecars (§8). Mirrors the batch read in _read_captions; malformed sidecars are
+    skipped, never raise."""
+    contexts, consents, seen = {}, {}, set()
+    for prefix in prefixes:
+        try:
+            keys = list(r2.list_keys(prefix) or [])
+        except Exception:  # noqa: BLE001
+            continue
+        for key in keys:
+            if key in seen or not key.endswith(_UPLOAD_SIDECAR_SUFFIX):
+                continue
+            seen.add(key)
+            data = _load_json(r2, key)
+            if not isinstance(data, dict):
+                continue
+            for name, ctx in (data.get("client_context") or {}).items():
+                if name and ctx:
+                    contexts.setdefault(str(name), str(ctx))
+            for name, ok in (data.get("consent") or {}).items():
+                if name and ok:
+                    consents.setdefault(str(name), True)
+    return contexts, consents
+
+
+def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
+                   consent=False):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
     client_note, never fabricated). Idempotent: an existing sidecar (a reviewed note)
-    is never clobbered."""
+    is never clobbered.
+
+    §8: client_context (the gym's free-text about this photo) is stored as RAW MATERIAL
+    under "client_context" (never verbatim output — the caption gate + policy screen govern
+    its use). consent is the CHECKBOX only; when set it is recorded in the DAM consent log
+    (audit trail) as 'granted', which is what lets a people photo be selected under the
+    consent guard. Consent is NEVER inferred from the presence of context text."""
     stem = os.path.splitext(media_name)[0]
     side_path = os.path.join(lib_dir, stem + ".json")
     if os.path.exists(side_path):
@@ -323,11 +359,20 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log):
         # gym's caption MUST live under "note" to reach the drafter (writing
         # "client_note" here would be silently dropped by list_creatives).
         payload["note"] = caption
+    if client_context:
+        payload["client_context"] = client_context
     try:
         with open(side_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
     except OSError as exc:
         log(f"sidecar write failed: {type(exc).__name__}")
+    if consent:
+        try:
+            from . import dam
+            dam.set_consent(os.path.join(lib_dir, media_name), "granted",
+                            granted_by="client_upload_checkbox")
+        except Exception as exc:  # noqa: BLE001 - consent audit must never fail the sync
+            log(f"consent record failed: {type(exc).__name__}")
 
 
 # ---- scan + generate: sync media, then draft the month for gyms newly ready --------
@@ -579,17 +624,15 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # near-dupe reuse. Cap the calendar at the cluster count and fire a gap alert to
             # the coach BEFORE a thin month plans.
             if config.vision_enabled_for(base):
-                from . import vision, ops_alerts
+                from . import vision
                 clusters = vision.cluster_count(lib_dir)
                 if 0 < clusters < media_count:
                     log(f"{base}: {clusters} photo clusters < {media_count} media "
                         "(near-dupes collapsed) — capping the month at clusters")
                     media_count = clusters
-                if 0 < clusters < days:
-                    ops_alerts.alert(
-                        f"{base}: only {clusters} distinct photo clusters for a {days}-day "
-                        "month (starvation gap) — ask the gym for fresh material before the "
-                        "next build; the month is capped at what the library really supports")
+                # The starvation ALERT is fired once, deduped, by _alert_thin_creative below
+                # against this (cluster-capped) media_count — so a vision gym whose distinct
+                # clusters < days is caught there without spamming every scan.
             if media_count <= 0:
                 awaiting += 1
                 results.append({"base": base, "status": "awaiting_media",

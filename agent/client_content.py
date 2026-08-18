@@ -377,7 +377,7 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # to safe generality, never blocks the day.
         verified = grounding = None
         if config.vision_enabled_for(account.key):
-            from . import vision
+            from . import vision, dam
             analysis = vision.stored_analysis(image.path)
             try:
                 with open(image.path, "rb") as _fh:
@@ -385,7 +385,16 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             except OSError:
                 _img_bytes = b""
             verified = vision.crop_verify(_img_bytes, analysis)
-            grounding = {"analysis": analysis, "verified": verified, "claims": claims}
+            # §8: the gym's own context unlocks an identity/number claim ONLY with the consent
+            # checkbox AND after the context clears the platform-policy + hard-fail screen.
+            side = dam.read_sidecar(image.path)
+            ctx = side.get("client_context", "") or ""
+            consent = str(side.get("consent", "")).lower() == "granted"
+            ctx_ok, _ctx_reasons = vision.context_usable(ctx)
+            if not ctx_ok:
+                ctx = ""                  # policy-violating context is never used (coach handles)
+            grounding = {"analysis": analysis, "verified": verified, "claims": claims,
+                         "consent": consent, "client_context": ctx}
         # Pass the ACTUAL picked creative so the caption is grounded in what the photo/
         # video shows (its sidecar note + filename + crop-verified elements).
         caption, hashtags = make_caption(account, source, voice,

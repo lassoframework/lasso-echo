@@ -86,7 +86,9 @@ def post_issues(draft, banned_words=()):
             issues += ["grounding: " + c for c in vision.grounding_contradictions(
                 getattr(draft, "caption", "") or "", grounding.get("analysis"),
                 verified=grounding.get("verified"),
-                gym_claims=grounding.get("claims") or ())]
+                gym_claims=grounding.get("claims") or (),
+                consent=grounding.get("consent", False),
+                client_context=grounding.get("client_context", ""))]
         except Exception:  # noqa: BLE001 - never let the gate itself raise
             pass
     return issues

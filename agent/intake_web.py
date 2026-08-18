@@ -291,7 +291,8 @@ def _safe_name(filename):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", base) or "upload"
 
 
-def handle_upload(token, files, note="", captions=None, r2=None, now=None):
+def handle_upload(token, files, note="", captions=None, r2=None, now=None,
+                  client_contexts=None, consents=None):
     """
     The whole upload decision, pure and offline-testable. Returns (status, body).
     404 whenever the feature is off or the token is unknown (indistinguishable on
@@ -335,9 +336,13 @@ def handle_upload(token, files, note="", captions=None, r2=None, now=None):
         return 413, {"error": "storage quota exceeded; ask us to raise it"}
 
     captions = list(captions or [])
+    client_contexts = list(client_contexts or [])   # §8 "Tell us about this photo" per file
+    consents = list(consents or [])                  # §8 permission checkbox per file
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     stored = []
     caption_map = {}
+    context_map = {}
+    consent_map = {}
     # Every R2 write is wrapped: a storage failure MID-upload (creds accepted at
     # construction but rejected by R2, a transient network fault, a bad bucket)
     # must never bubble out of the HTTP handler as an unhandled 500/503 with a
@@ -354,6 +359,15 @@ def handle_upload(token, files, note="", captions=None, r2=None, now=None):
                 cap = (captions[idx] or "").strip()[:200]
             if cap:
                 caption_map[base] = cap
+            # §8: the gym's free-text about THIS photo (raw material, never verbatim output)
+            if idx < len(client_contexts):
+                ctx = (client_contexts[idx] or "").strip()[:500]
+                if ctx:
+                    context_map[base] = ctx
+            # §8: consent is the CHECKBOX only — never inferred from context text. Consent
+            # laundering guard: a name typed in the context is NOT permission.
+            if idx < len(consents) and bool(consents[idx]):
+                consent_map[base] = True
         sidecar = {
             "note": (note or "").strip()[:500],
             "client": client,
@@ -364,6 +378,9 @@ def handle_upload(token, files, note="", captions=None, r2=None, now=None):
             # per-file caption map (STORED basename -> the gym's one line about it);
             # backward compatible: absent/empty when only a batch note was sent.
             "captions": caption_map,
+            # §8 per-file client_context + consent (checkbox); absent/empty by default.
+            "client_context": context_map,
+            "consent": consent_map,
         }
         r2.put_bytes(f"intake/{client}/incoming/{stamp}_upload.json",
                      json.dumps(sidecar).encode("utf-8"),
@@ -1031,6 +1048,15 @@ each so we know what is happening in it. All of it optional. We take it from the
      var cap=document.createElement('input'); cap.className='cap'; cap.type='text';
      cap.maxLength=200; cap.placeholder='What is happening in this one? (optional)';
      cap.addEventListener('input',function(){rec.caption=cap.value;});
+     var ctx=document.createElement('textarea'); ctx.className='cap'; ctx.rows=2;
+     ctx.maxLength=500;
+     ctx.placeholder='Who or what is in this photo? If you name someone and check the box, we may use it. Skip it and we keep captions general.';
+     ctx.addEventListener('input',function(){rec.context=ctx.value;});
+     var perm=document.createElement('label'); perm.className='perm';
+     var chk=document.createElement('input'); chk.type='checkbox';
+     chk.addEventListener('change',function(){rec.consent=chk.checked;});
+     perm.appendChild(chk);
+     perm.appendChild(document.createTextNode(" I have this person's permission to be named or featured"));
      var row2=document.createElement('div'); row2.className='row2';
      var state=document.createElement('span'); state.className='state'; state.textContent='ready';
      var rm=document.createElement('button'); rm.className='rm'; rm.type='button';
@@ -1039,7 +1065,8 @@ each so we know what is happening in it. All of it optional. We take it from the
        rec.removed=true; li.className='item gone'; render();});
      rec._state=state;
      row2.appendChild(state); row2.appendChild(rm);
-     meta.appendChild(fname); meta.appendChild(cap); meta.appendChild(row2);
+     meta.appendChild(fname); meta.appendChild(cap); meta.appendChild(ctx);
+     meta.appendChild(perm); meta.appendChild(row2);
      li.appendChild(thumb); li.appendChild(meta);
      gallery.appendChild(li);
    })(files[i]);}
@@ -1057,6 +1084,8 @@ each so we know what is happening in it. All of it optional. We take it from the
    live.forEach(function(p){
      fd.append('media',p.file,p.file.name||'upload');
      fd.append('caption',p.caption||'');
+     fd.append('context',p.context||'');
+     fd.append('consent',p.consent?'on':'');
      p._state.textContent='sending'; p._state.className='state';
    });
    fd.append('note',note.value||'');
@@ -1773,6 +1802,7 @@ def build_server(port=None):
             # caption for files[i] regardless of how many items were sent. A plain
             # single 'note' (batch-wide) still works with no captions at all.
             files, note, captions = [], "", []
+            contexts, consents = [], []       # §8 per-file "about this photo" + consent
             for part in msg.iter_parts() if msg.is_multipart() else []:
                 name = part.get_param("name", header="content-disposition")
                 if name == "note":
@@ -1782,15 +1812,28 @@ def build_server(port=None):
                     payload = part.get_payload(decode=True) or b""
                     files.append((part.get_filename() or "upload",
                                   part.get_content_type(), payload))
-                    # keep captions index-aligned to files: pad this slot now,
-                    # a following 'caption' part fills it (else it stays blank).
+                    # keep the per-file slots index-aligned to files: pad now, the
+                    # following caption/context/consent parts fill them (else blank/False).
                     captions.append("")
+                    contexts.append("")
+                    consents.append(False)
                 elif name == "caption":
                     content = part.get_content()
                     cap = content.strip() if isinstance(content, str) else ""
                     if files:                 # attach to the most recent media
                         captions[len(files) - 1] = cap
-            status, _body = handle_upload(token, files, note=note, captions=captions)
+                elif name == "context":
+                    content = part.get_content()
+                    ctx = content.strip() if isinstance(content, str) else ""
+                    if files:
+                        contexts[len(files) - 1] = ctx
+                elif name == "consent":
+                    content = part.get_content()
+                    val = content.strip().lower() if isinstance(content, str) else ""
+                    if files:                 # a checkbox sends "on"/"true"/"1" when ticked
+                        consents[len(files) - 1] = val in ("on", "true", "1", "yes")
+            status, _body = handle_upload(token, files, note=note, captions=captions,
+                                          client_contexts=contexts, consents=consents)
             if status == 200:
                 body = DONE.encode()
                 self.send_response(200)
