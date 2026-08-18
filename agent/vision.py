@@ -462,6 +462,132 @@ def content_score(analysis, pillar, *, recency=0.0):
     return score, True
 
 
+# ---- Phase 3.5: crop-verify (verify what SHIPS) ----------------------------------------
+_VERIFY_PROMPT_HEAD = (
+    "Look ONLY at this image and answer strictly as JSON, no other text. Confirm what is "
+    "actually visible; do not guess. "
+)
+
+
+def crop_verify(image_bytes, analysis, *, reader=None):
+    """§3.5 anti-hallucination: re-check the SHIPPED pixels (GBP = the 1200x900 crop, IG/FB
+    = the original, ruling 4) against the ingest analysis. Confirms the people bucket and
+    yes/no each caption-eligible (>=0.85) detail, so a caption may lean ONLY on details that
+    survived the crop. Returns {"bucket": confirmed|None, "verified_details": [survivors],
+    "ok": bool}. ANY failure degrades SAFE: ok=False, bucket=None, no verified details -> the
+    caption falls back to safe generality (never blocks the slot, §3.5)."""
+    safe = {"bucket": None, "verified_details": [], "ok": False}
+    if not analysis or analysis.get("analysis_failed"):
+        return safe
+    eligible = caption_eligible_details(analysis)
+    claimed_bucket = (analysis.get("people") or {}).get("bucket") or "none"
+    reader = reader or _verify_reader()
+    if reader is None or not image_bytes:
+        return safe
+    prompt = (_VERIFY_PROMPT_HEAD +
+              '{"people_bucket": one of none|solo|pair|small_group|crowd, '
+              '"details_present": {' +
+              ", ".join(f'"{d}": true or false' for d in eligible) +
+              "}}")
+    try:
+        raw = reader(image_bytes, prompt)
+        body = raw if isinstance(raw, dict) else json.loads(
+            raw[raw.index("{"): raw.rindex("}") + 1])
+    except Exception:  # noqa: BLE001 - a verify failure degrades safe, never raises
+        return safe
+    bucket = _one_of(body.get("people_bucket"), PEOPLE_BUCKETS, None)
+    present = body.get("details_present") or {}
+    survivors = [d for d in eligible if bool(present.get(d))]
+    return {"bucket": bucket if bucket else claimed_bucket, "verified_details": survivors,
+            "ok": True}
+
+
+def _verify_reader():
+    """A Gemini reader that takes (image_bytes, prompt). None when unarmed/keyless."""
+    from . import config
+    import os as _os
+    if not config.creative_studio_enabled():
+        return None
+    key = _os.environ.get(config.NANO_API_KEY_ENV)
+    if not key:
+        return None
+    from google import genai
+    from google.genai import types as gtypes
+    client = genai.Client(api_key=key)
+
+    def _read(image_bytes, prompt):
+        resp = client.models.generate_content(
+            model=config.OCR_MODEL,
+            contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                      prompt])
+        return getattr(resp, "text", "") or ""
+
+    return _read
+
+
+# ---- Phase 5: the grounding gate (closed 4-claim contradiction check) -------------------
+# Contradiction-ONLY (§7): fail only when a caption ASSERTS something the verified analysis
+# says is FALSE (or a high-risk unsupported claim). Claims merely absent from the analysis
+# PASS — the analysis cannot enumerate everything visible.
+# CROWD words that genuinely assert many people. Deliberately EXCLUDES "busy" and "everyone"
+# — LASSO's avatar is "busy parents/professionals" and "everyone can start", which are not
+# crowd claims; including them false-flagged clean captions.
+_CROWD_WORDS = (r"\bpacked\b", r"\bcrowd(ed)?\b", r"\bfull house\b", r"\bsold ?out\b",
+                r"\bwhole (gym|crew|team|class)\b", r"\bslammed\b", r"\bstanding room\b")
+_SOLO_WORDS = (r"\bone[ -]on[ -]one\b", r"\bsolo\b", r"\bjust you\b", r"\bprivate\b",
+               r"\bone[ -]to[ -]one\b", r"\balone\b")
+_OUTDOOR_WORDS = (r"\boutdoor\b", r"\boutside\b", r"\bparking lot\b", r"\bin the sun\b",
+                  r"\bsunshine\b")
+_NUMBER_RE = re.compile(r"\b\d+\s?%|\b\d[\d,]*\s?(lbs?|pounds?|kg|members?|clients?|days?|"
+                        r"weeks?|reps|sessions?)\b", re.IGNORECASE)
+
+
+def _rx_any(patterns, text):
+    return any(re.search(p, text or "", re.IGNORECASE) for p in patterns)
+
+
+def grounding_contradictions(caption, analysis, *, verified=None, gym_claims=()):
+    """§5/§7 grounding gate: the list of CONTRADICTIONS between a caption and the verified
+    analysis (empty = clean). Closed taxonomy — exactly four claim classes plus the high-risk
+    guards:
+      1. people quantity: a crowd word requires a crowd/small_group bucket (crop-verified);
+         a one-on-one/solo word requires solo/pair.
+      2. setting: an outdoor/outside word requires an outdoor/exterior setting.
+      3. activity: (checked via verified details/subjects; only a hard mismatch fails).
+      4. objects in the hook: an object the crop-verify REJECTED must not be asserted.
+    High-risk unsupported (always fail): identity terms (gender/appearance/age/health), and
+    numbers not backed by the gym record. Absence never fails."""
+    issues = []
+    cap = caption or ""
+    bucket = (verified or {}).get("bucket") or (analysis or {}).get("people", {}).get("bucket")
+    # 1. people quantity honesty
+    if _rx_any(_CROWD_WORDS, cap) and bucket not in ("crowd", "small_group"):
+        issues.append(f"crowd word but image is '{bucket}'")
+    if _rx_any(_SOLO_WORDS, cap) and bucket not in ("solo", "pair"):
+        issues.append(f"one-on-one/solo word but image is '{bucket}'")
+    # 2. setting honesty
+    if _rx_any(_OUTDOOR_WORDS, cap) and (analysis or {}).get("setting") not in (
+            "outdoor", "exterior"):
+        issues.append("outdoor word but image is indoors")
+    # 4. objects the crop-verify rejected (a detail that was eligible at ingest but did NOT
+    #    survive verify) must not be asserted in the caption.
+    if verified is not None and verified.get("ok"):
+        survived = set(verified.get("verified_details") or [])
+        for d in caption_eligible_details(analysis):
+            if d not in survived and d.lower() in cap.lower():
+                issues.append(f"asserts '{d}' which the crop did not confirm")
+    # high-risk: identity terms
+    idt = identity_issues(cap)
+    if idt:
+        issues.append(f"identity terms: {', '.join(idt)}")
+    # high-risk: a number not in the gym's approved claims
+    for m in _NUMBER_RE.finditer(cap):
+        frag = m.group(0)
+        if not any(frag.strip() in (c or "") for c in gym_claims):
+            issues.append(f"unsupported number '{frag.strip()}'")
+    return issues
+
+
 def cluster_count(library_path):
     """§3 starvation guard input: the number of DISTINCT near-dupe CLUSTERS in the library
     (each multi-shot burst counts once), plus every singleton. This — not the raw image

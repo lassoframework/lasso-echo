@@ -215,8 +215,23 @@ class _SourceCreative:
         self.path = stem
 
 
+def _grounded_hint(base_hint, verified):
+    """§4: fold the CROP-VERIFIED elements into the SB7 scene hint so the caption is written
+    from what actually shipped — with count honesty. Steering only; the post_quality grounding
+    gate is the hard enforcement (enforced twice, §10)."""
+    bucket = verified.get("bucket") or "unknown"
+    details = verified.get("verified_details") or []
+    parts = [base_hint] if base_hint else []
+    parts.append(f"VERIFIED IN THE IMAGE: a {bucket}"
+                 + (f"; visible: {', '.join(details)}" if details else "")
+                 + ". Write from these. Do NOT call it a crowd/packed unless the grouping is "
+                   "crowd; do NOT claim one-on-one unless it is solo/pair. Name no one; no "
+                   "gender/age/body; invent no numbers or objects not listed.")
+    return "\n".join(p for p in parts if p)
+
+
 def make_caption(account, source, voice, creative_key, creative=None,
-                 avoid_openings=()):
+                 avoid_openings=(), verified=None):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -242,6 +257,8 @@ def make_caption(account, source, voice, creative_key, creative=None,
         try:
             from .drafter import StoryBrandGenerator
             hint = photo_grounding(creative)
+            if verified and verified.get("ok"):
+                hint = _grounded_hint(hint, verified)
             cap, tags, _frags = StoryBrandGenerator().build(
                 voice, _SourceCreative(source, creative_key, photo_hint=hint),
                 account=account, avoid_openings=avoid_openings)
@@ -354,11 +371,26 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     image = pick_image(account.key, day_key, library_path,
                        exclude_keys=exclude_keys, pillar=category)
     if image is not None:
+        # §3.5 CROP-VERIFY (vision gyms): re-check the SHIPPED pixels (IG/FB = the original,
+        # ruling 4) before drafting, so the caption may lean only on details that survived.
+        # Verify-then-draft, never draft-then-verify. Best-effort: a verify failure degrades
+        # to safe generality, never blocks the day.
+        verified = grounding = None
+        if config.vision_enabled_for(account.key):
+            from . import vision
+            analysis = vision.stored_analysis(image.path)
+            try:
+                with open(image.path, "rb") as _fh:
+                    _img_bytes = _fh.read()
+            except OSError:
+                _img_bytes = b""
+            verified = vision.crop_verify(_img_bytes, analysis)
+            grounding = {"analysis": analysis, "verified": verified, "claims": claims}
         # Pass the ACTUAL picked creative so the caption is grounded in what the photo/
-        # video shows (its sidecar note + filename), not just the rotated source topic.
+        # video shows (its sidecar note + filename + crop-verified elements).
         caption, hashtags = make_caption(account, source, voice,
                                          _image_key(image), creative=image,
-                                         avoid_openings=avoid_openings)
+                                         avoid_openings=avoid_openings, verified=verified)
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -390,6 +422,14 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 pass
             print(f"[vision] weak_match pick for {account.key} {day_key} "
                   f"(pillar {category}) -> coach review")
+        # §5: carry the grounding context so the A+ gate can reject a caption that
+        # CONTRADICTS the crop-verified image (a contradiction is not A+ -> the month
+        # builder walks alternatives = the §7 regen/swap; exhausted -> the day drops).
+        if grounding is not None:
+            try:
+                draft.grounding = grounding
+            except Exception:
+                pass
         return draft
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
