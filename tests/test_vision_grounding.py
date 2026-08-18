@@ -132,3 +132,79 @@ def test_post_quality_gate_inert_without_grounding():
               hashtags=[], creative_path="", creative_public_url="https://r2/x.jpg",
               scheduled_for="")
     assert post_quality.is_a_plus(d) is True          # no grounding -> gate does not fire
+
+
+# ---- P4 audit fixes --------------------------------------------------------------------
+
+def test_unconfirmed_bucket_fails_crowd_closed():
+    a = _analysis(people={"bucket": "crowd"})   # ingest said crowd
+    v = {"bucket": None, "verified_details": [], "ok": True}   # crop could NOT confirm
+    # a crowd word must FAIL against an unconfirmed bucket (no stale-ingest license, audit 3b)
+    assert any("crowd word" in i for i in
+               vision.grounding_contradictions("A packed house every morning here", a, verified=v))
+
+
+def test_no_false_positive_on_private_outside_sunshine():
+    a = _analysis(people={"bucket": "small_group"}, setting="gym_floor")
+    v = {"bucket": "small_group", "verified_details": [], "ok": True}
+    for clean in ("A private space to train the way you want",
+                  "Outside of class we still support your goals",
+                  "Sunshine and good vibes fill the room every session"):
+        assert vision.grounding_contradictions(clean, a, verified=v) == [], clean
+
+
+def test_program_duration_numbers_not_gated():
+    a = _analysis()
+    for ok in ("Get stronger in 6 weeks with a simple plan",
+               "12 reps, 3 sets, real progress every session",
+               "Your first 7 day on ramp is easy"):
+        assert vision.grounding_contradictions(ok, a) == [], ok
+
+
+def test_weight_and_percent_numbers_still_gated():
+    a = _analysis()
+    assert any("number" in i for i in vision.grounding_contradictions("Lose 40 lbs fast", a))
+    assert any("number" in i for i in vision.grounding_contradictions("Boost results 80%", a))
+
+
+def test_number_format_variants_match_claim():
+    a = _analysis()
+    # a claim of "40 lbs" clears "40lbs" and "40 pounds" (normalized match, audit 5 strict)
+    for variant in ("Members lost 40lbs", "Members lost 40 pounds"):
+        assert vision.grounding_contradictions(variant, a, gym_claims=["lost 40 lbs"]) == [], variant
+
+
+# ---- P5 consent exception + policy screen ----------------------------------------------
+
+def test_consent_allows_client_written_identity_and_number():
+    a = _analysis()
+    ctx = "our member sarah lost 40 lbs and is now a strong woman"
+    cap = "40 lbs down and stronger than ever, that is one proud woman"
+    # WITHOUT consent -> identity + number flagged
+    assert vision.grounding_contradictions(cap, a) != []
+    # WITH consent AND the content in the client's own context -> allowed
+    assert vision.grounding_contradictions(cap, a, consent=True, client_context=ctx,
+                                           gym_claims=[]) == []
+
+
+def test_consent_does_not_launder_uncontexted_identity():
+    a = _analysis()
+    # consent granted but the term is NOT in the client context -> still flagged
+    assert any("identity" in i for i in
+               vision.grounding_contradictions("a muscular man crushed it", a,
+                                               consent=True, client_context="great session"))
+
+
+def test_policy_screen_flags_health_reviewbait_weightpromise():
+    assert vision.policy_screen("this cures anxiety and depression")
+    assert vision.policy_screen("leave us a 5 star review for a free month")
+    assert vision.policy_screen("lose 30 lbs guaranteed in 30 days")
+    assert vision.policy_screen("Great community and real coaching") == []
+
+
+def test_context_usable_gate():
+    ok, reasons = vision.context_usable("Sarah had an amazing first month with us")
+    assert ok and reasons == []
+    bad_ok, bad_reasons = vision.context_usable("we cured her diabetes, guaranteed")
+    assert bad_ok is False and bad_reasons
+    assert vision.context_usable("") == (True, [])          # empty context is fine

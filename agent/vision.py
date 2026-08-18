@@ -480,7 +480,6 @@ def crop_verify(image_bytes, analysis, *, reader=None):
     if not analysis or analysis.get("analysis_failed"):
         return safe
     eligible = caption_eligible_details(analysis)
-    claimed_bucket = (analysis.get("people") or {}).get("bucket") or "none"
     reader = reader or _verify_reader()
     if reader is None or not image_bytes:
         return safe
@@ -495,11 +494,13 @@ def crop_verify(image_bytes, analysis, *, reader=None):
             raw[raw.index("{"): raw.rindex("}") + 1])
     except Exception:  # noqa: BLE001 - a verify failure degrades safe, never raises
         return safe
+    # An UNCONFIRMED bucket must NOT fall back to the stale ingest bucket (audit 3b): the
+    # crop may have removed people. Return None so the gate fails people-count claims CLOSED
+    # rather than licensing a crowd word against pixels that no longer show a crowd.
     bucket = _one_of(body.get("people_bucket"), PEOPLE_BUCKETS, None)
     present = body.get("details_present") or {}
     survivors = [d for d in eligible if bool(present.get(d))]
-    return {"bucket": bucket if bucket else claimed_bucket, "verified_details": survivors,
-            "ok": True}
+    return {"bucket": bucket, "verified_details": survivors, "ok": True}
 
 
 def _verify_reader():
@@ -534,19 +535,81 @@ def _verify_reader():
 # crowd claims; including them false-flagged clean captions.
 _CROWD_WORDS = (r"\bpacked\b", r"\bcrowd(ed)?\b", r"\bfull house\b", r"\bsold ?out\b",
                 r"\bwhole (gym|crew|team|class)\b", r"\bslammed\b", r"\bstanding room\b")
-_SOLO_WORDS = (r"\bone[ -]on[ -]one\b", r"\bsolo\b", r"\bjust you\b", r"\bprivate\b",
-               r"\bone[ -]to[ -]one\b", r"\balone\b")
-_OUTDOOR_WORDS = (r"\boutdoor\b", r"\boutside\b", r"\bparking lot\b", r"\bin the sun\b",
-                  r"\bsunshine\b")
-_NUMBER_RE = re.compile(r"\b\d+\s?%|\b\d[\d,]*\s?(lbs?|pounds?|kg|members?|clients?|days?|"
-                        r"weeks?|reps|sessions?)\b", re.IGNORECASE)
+# SOLO words that genuinely assert one-on-one. Excludes "private"/"alone" (a "private space"
+# or "come alone or with friends" is not a one-on-one claim — scale false-positives, audit 3a).
+_SOLO_WORDS = (r"\bone[ -]on[ -]one\b", r"\bone[ -]to[ -]one\b", r"\bjust you and (a |your )?coach\b")
+# OUTDOOR words that assert a physical outdoor setting. Excludes figurative "outside"/"sunshine"
+# ("outside of class", "sunshine and good vibes") — audit 3a.
+_OUTDOOR_WORDS = (r"\boutdoors\b", r"\bparking lot\b", r"\bin the parking\b",
+                  r"\btrain(ing)? outside\b", r"\boutdoor (workout|session|class|training)\b")
+# RISKY numbers only: percentages, weights, and member/client counts — the stat-like claims a
+# receipt must back. Program durations (weeks/days/reps/sessions/minutes) are ordinary copy and
+# are NOT gated (they were false-failing "stronger in 6 weeks", audit 5).
+_NUMBER_RE = re.compile(r"\b\d+\s?%|\b\d[\d,]*\s?(lbs?|pounds?|kg|members?|clients?)\b",
+                        re.IGNORECASE)
 
 
 def _rx_any(patterns, text):
     return any(re.search(p, text or "", re.IGNORECASE) for p in patterns)
 
 
-def grounding_contradictions(caption, analysis, *, verified=None, gym_claims=()):
+# ---- Phase 6: client_context platform-policy screen (§8) --------------------------------
+# client_context is RAW MATERIAL, never verbatim output. Before any caption may use it, it
+# must pass this platform-policy screen (health/medical claims, review bait, before/after
+# weight promises) AND the full post_quality gate. Policy-violating context routes to the
+# coach, never silently becomes a caption.
+_POLICY_HEALTH = (r"\bcure[sd]?\b", r"\bheal(s|ed|ing)?\b", r"\bdiagnos", r"\btreat(s|ed|ment)?\b",
+                  r"\bdisease\b", r"\bmedical\b", r"\bclinical(ly)?\b", r"\bdoctor\b",
+                  r"\bprescri", r"\bdepression\b", r"\banxiety\b", r"\bdiabet", r"\bblood pressure\b")
+_POLICY_REVIEW_BAIT = (r"\bleave (us )?a (5|five)[ -]star\b", r"\breview us\b",
+                       r"\bgive us a review\b", r"\bin exchange for a review\b",
+                       r"\brate us\b", r"\bpost a review\b")
+_POLICY_WEIGHT_PROMISE = (r"\blose \d+\s?(lbs?|pounds?|kg)\b", r"\bguarantee[d]?\b",
+                          r"\bguaranteed results\b", r"\bmelt (away )?fat\b",
+                          r"\bdrop \d+\s?(lbs?|pounds?|sizes?)\b", r"\bburn fat fast\b")
+
+
+def policy_screen(text):
+    """§8: platform-policy issues in owner-written client_context (empty == clean). Health/
+    medical claims, review bait, and before/after weight PROMISES are real Meta/GBP policy
+    violations even when owner-written and true — so context that trips this NEVER becomes a
+    caption; it routes to the coach with the reason."""
+    issues = []
+    if _rx_any(_POLICY_HEALTH, text):
+        issues.append("health/medical claim (platform policy)")
+    if _rx_any(_POLICY_REVIEW_BAIT, text):
+        issues.append("review incentive/bait (platform policy)")
+    if _rx_any(_POLICY_WEIGHT_PROMISE, text):
+        issues.append("before/after weight promise or guarantee (platform policy)")
+    return issues
+
+
+def context_usable(client_context, *, banned_words=()):
+    """§8: (ok, reasons) — may this client_context feed a caption? It must clear the
+    platform-policy screen AND the publish-hard-fail formatting a caption cannot carry
+    (dashes, hashtags, a phone number, a banned word) — the things that would hard-fail at
+    the publish worker after approval. It is RAW MATERIAL, not a finished caption, so the
+    caption-SHAPE checks (length / thinness / scaffold) do NOT apply. Empty context is
+    trivially ok (role-words-only is the default)."""
+    ctx = (client_context or "").strip()
+    if not ctx:
+        return True, []
+    reasons = policy_screen(ctx)
+    try:
+        from . import post_quality, gbp
+        reasons += [i for i in post_quality.caption_issues(ctx, banned_words)
+                    if "dash" in i or "banned" in i]   # keep hard-fails, drop shape checks
+        if "#" in ctx:
+            reasons.append("hashtag in context")
+        if gbp.has_phone(ctx):
+            reasons.append("phone number in context")
+    except Exception:  # noqa: BLE001
+        pass
+    return (not reasons), reasons
+
+
+def grounding_contradictions(caption, analysis, *, verified=None, gym_claims=(),
+                             consent=False, client_context=""):
     """§5/§7 grounding gate: the list of CONTRADICTIONS between a caption and the verified
     analysis (empty = clean). Closed taxonomy — exactly four claim classes plus the high-risk
     guards:
@@ -559,33 +622,56 @@ def grounding_contradictions(caption, analysis, *, verified=None, gym_claims=())
     numbers not backed by the gym record. Absence never fails."""
     issues = []
     cap = caption or ""
-    bucket = (verified or {}).get("bucket") or (analysis or {}).get("people", {}).get("bucket")
+    ctx = (client_context or "").lower()
+    # bucket: when a verify ran, use its CONFIRMED bucket (may be None = unconfirmed); a
+    # people-count word is allowed only against a confirmed bucket (fail closed, audit 3b).
+    # When no verify ran, fall back to the analysis bucket.
+    if verified is not None:
+        bucket = verified.get("bucket")
+        bucket_confirmed = bool(verified.get("ok")) and bucket is not None
+    else:
+        bucket = (analysis or {}).get("people", {}).get("bucket")
+        bucket_confirmed = bucket is not None
     # 1. people quantity honesty
-    if _rx_any(_CROWD_WORDS, cap) and bucket not in ("crowd", "small_group"):
-        issues.append(f"crowd word but image is '{bucket}'")
-    if _rx_any(_SOLO_WORDS, cap) and bucket not in ("solo", "pair"):
-        issues.append(f"one-on-one/solo word but image is '{bucket}'")
+    if _rx_any(_CROWD_WORDS, cap) and not (bucket_confirmed and bucket in ("crowd",
+                                                                           "small_group")):
+        issues.append(f"crowd word but bucket not confirmed crowd (got {bucket})")
+    if _rx_any(_SOLO_WORDS, cap) and not (bucket_confirmed and bucket in ("solo", "pair")):
+        issues.append(f"one-on-one word but bucket not confirmed solo/pair (got {bucket})")
     # 2. setting honesty
     if _rx_any(_OUTDOOR_WORDS, cap) and (analysis or {}).get("setting") not in (
             "outdoor", "exterior"):
         issues.append("outdoor word but image is indoors")
-    # 4. objects the crop-verify rejected (a detail that was eligible at ingest but did NOT
-    #    survive verify) must not be asserted in the caption.
+    # 4. objects the crop-verify REJECTED (eligible at ingest but not confirmed on the crop)
+    #    must not be asserted. Word-boundary match, not substring ('chalk' != 'chalkboard').
     if verified is not None and verified.get("ok"):
         survived = set(verified.get("verified_details") or [])
+        low = cap.lower()
         for d in caption_eligible_details(analysis):
-            if d not in survived and d.lower() in cap.lower():
+            if d not in survived and re.search(r"\b" + re.escape(d.lower()) + r"\b", low):
                 issues.append(f"asserts '{d}' which the crop did not confirm")
-    # high-risk: identity terms
-    idt = identity_issues(cap)
-    if idt:
-        issues.append(f"identity terms: {', '.join(idt)}")
-    # high-risk: a number not in the gym's approved claims
+    # high-risk identity: allowed ONLY with consent AND the term in the client's OWN context
+    # (§8: the checkbox grants consent; an image-derived gender/age never does).
+    for t in identity_issues(cap):
+        if not (consent and t in ctx):
+            issues.append(f"identity term '{t}'")
+    # high-risk numbers: allowed when the number is in an approved gym claim OR (consent AND
+    # in the client's context). Normalized so format variants (40lbs vs 40 lbs) align.
+    claims_norm = [_norm_num(c) for c in gym_claims]
+    ctx_norm = _norm_num(ctx)
     for m in _NUMBER_RE.finditer(cap):
-        frag = m.group(0)
-        if not any(frag.strip() in (c or "") for c in gym_claims):
-            issues.append(f"unsupported number '{frag.strip()}'")
+        frag = m.group(0).strip()
+        fn = _norm_num(frag)
+        if not (fn and (any(fn in cn for cn in claims_norm) or (consent and fn in ctx_norm))):
+            issues.append(f"unsupported number '{frag}'")
     return issues
+
+
+def _norm_num(s):
+    """Normalize a number+unit for matching: lowercase, strip spaces, collapse pound/lbs/kg
+    synonyms so '40 lbs', '40lbs', and '40 pounds' all compare equal."""
+    t = re.sub(r"\s+", "", (s or "").lower())
+    return t.replace("pounds", "lb").replace("pound", "lb").replace("lbs", "lb")
 
 
 def cluster_count(library_path):
