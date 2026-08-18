@@ -423,7 +423,14 @@ _BTS_SLOTS = ("behind", "faq", "about", "photo", "local", "offer")
 
 
 def _prefs_for(pillar):
+    """Resolve a pillar to its content-preference profile + the matched key. EXACT match
+    first (the closed client category set: offer/service/testimonial/faq/about/promo — no
+    ambiguity), then a substring fall-through for multi-word GBP pillars ('All in one offer'
+    -> offer). This ordering keeps single-token pillars unambiguous and prevents a stray
+    substring from mis-routing a slot (audit hardening)."""
     p = (pillar or "").strip().lower()
+    if p in _SLOT_PREFS:
+        return _SLOT_PREFS[p], p
     for key, prefs in _SLOT_PREFS.items():
         if key in p:
             return prefs, key

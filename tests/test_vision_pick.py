@@ -113,3 +113,15 @@ def test_pick_image_vision_off_ignores_analysis(tmp_path, monkeypatch):
     _asset(lib, "only.png", _analysis(safety_flags=["pii_visible"]))
     pick = client_content.pick_image("gritx_ig", "2026-09-01", lib, pillar="testimonial")
     assert pick is not None and os.path.basename(pick.path) == "only.png"  # legacy ignores flags
+
+
+def test_prefs_exact_match_first():
+    # a single-token client pillar resolves by EXACT match (no substring ambiguity)
+    prefs, key = vision._prefs_for("offer")
+    assert key == "offer"
+    # a multi-word GBP pillar falls through to substring
+    _, key2 = vision._prefs_for("All in one offer")
+    assert key2 == "offer"
+    # unknown pillar -> default profile, empty key
+    _, key3 = vision._prefs_for("the portal")
+    assert key3 == ""

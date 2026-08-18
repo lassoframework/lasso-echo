@@ -43,7 +43,15 @@ Blake before any client gym; adversarial set must route 100% before any default-
   clustering was order-dependent / non-transitive); FIXED with UNION-FIND (deterministic,
   transitive-closure "burst=one cluster") + an order-independence test. Other 4 items
   CONFIRMED (no false-merge, safe starvation floor, correct windows, no rotation regression).
-- [ ] P3 pick scoring · [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
+- **[x/audit] P3 — planner content scoring** (`vision.content_score`/_SLOT_PREFS;
+  `client_content.pick_image` vision branch; `client_month_run` weak_match alert): pick_image
+  content-scores images to the slot job (activity+people+setting affinity + quality +
+  recency), excludes every flag class (guardrail 13), restricts athlete_leaning/unclear to
+  BTS slots, skips reuse-windowed clusters, below-floor → weak_match (per-build staff alert,
+  never silent). Deterministic tie-break. Legacy rotation unchanged for non-vision gyms
+  (recency now cluster-keyed via dam.rotation_key = basename fallback). Independent audit in
+  flight.
+- [ ] P4 caption chain · [ ] P5 consent · [ ] P6 rollout
 
 ---
 
