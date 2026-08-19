@@ -1,0 +1,146 @@
+"""
+GBP connection sync (gbp_conn_sync): populate gym_gbp_connections from the LIVE Zernio
+connection so the publish lane can route. Fully OFFLINE via injected store + zernio fakes.
+
+Asserts:
+  * flag OFF -> no-op, store untouched
+  * a connected Google account -> a 'connected' connection row with the location id +
+    a tz inferred from the address (FL -> America/New_York), written only on INSERT
+  * an inactive Zernio account -> 'needs_reconnect'
+  * no Google account but an existing connected row -> flipped to needs_reconnect
+  * no selectedLocationId -> skipped (cannot route)
+  * an existing row's timezone is PRESERVED across a re-sync (never clobbered)
+  * NOTHING here publishes
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from agent import gbp_conn_sync as gcs  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _armed(monkeypatch):
+    monkeypatch.setenv("AGENT_GBP_CONN_SYNC", "true")
+    yield
+
+
+class FakeStore:
+    def __init__(self, existing=None):
+        self.rows = [dict(r) for r in (existing or [])]
+        self.upserts = []
+
+    def available(self):
+        return True
+
+    def connections_for(self, key):
+        return [dict(r) for r in self.rows if r.get("portal_gym_key") == key]
+
+    def upsert_connection(self, conn):
+        self.upserts.append(dict(conn))
+        for r in self.rows:
+            if (r.get("portal_gym_key") == conn.get("portal_gym_key")
+                    and r.get("gbp_location_id") == conn.get("gbp_location_id")):
+                for k, v in conn.items():
+                    if k == "timezone":          # preserve an existing tz (mirror the store)
+                        continue
+                    r[k] = v
+                return r
+        r = dict(conn)
+        self.rows.append(r)
+        return r
+
+
+class FakeZernio:
+    def __init__(self, profiles, accounts):
+        self._p = profiles          # name -> profile_id
+        self._a = accounts          # profile_id -> accounts list
+
+    def find_profile_id(self, name):
+        return self._p.get(name)
+
+    def list_accounts(self, pid):
+        return self._a.get(pid, [])
+
+
+def _gbp_acct(loc="15450740315559491026", active=True, name="CrossFit ENG",
+              addr="326 Southwest 2nd Terrace, Cape Coral, Florida"):
+    return {"_id": "zacct_eng", "platform": "googlebusiness", "isActive": active,
+            "metadata": {"selectedLocationId": loc, "selectedLocationName": name,
+                         "locationAddress": addr,
+                         "connectedAt": "2026-08-19T18:53:19.828Z"}}
+
+
+def test_flag_off_touches_nothing(monkeypatch):
+    monkeypatch.setenv("AGENT_GBP_CONN_SYNC", "false")
+    store = FakeStore()
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": [_gbp_acct()]})
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["ok"] is False
+    assert store.upserts == []
+
+
+def test_connected_account_upserts_routable_row_with_inferred_tz():
+    store = FakeStore()
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": [_gbp_acct()]})
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["ok"] and out["connected"] == 1
+    row = store.rows[0]
+    assert row["portal_gym_key"] == "eng"
+    assert row["gbp_location_id"] == "15450740315559491026"
+    assert row["zernio_account_id"] == "zacct_eng"
+    assert row["status"] == "connected"
+    assert row["timezone"] == "America/New_York"   # inferred from 'Florida'
+    assert row["location_name"] == "CrossFit ENG"
+
+
+def test_inactive_account_is_needs_reconnect():
+    store = FakeStore()
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": [_gbp_acct(active=False)]})
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["needs_reconnect"] == 1
+    assert store.rows[0]["status"] == "needs_reconnect"
+
+
+def test_no_google_account_flips_existing_connected_to_needs_reconnect():
+    store = FakeStore(existing=[{
+        "portal_gym_key": "eng", "gbp_location_id": "15450740315559491026",
+        "zernio_profile_id": "pid_eng", "zernio_account_id": "zacct_eng",
+        "status": "connected", "timezone": "America/New_York"}])
+    # profile exists but no googlebusiness account under it anymore
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": []})
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["needs_reconnect"] == 1
+    assert store.rows[0]["status"] == "needs_reconnect"
+
+
+def test_no_selected_location_is_skipped():
+    store = FakeStore()
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": [_gbp_acct(loc="")]})
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["skipped"] == 1
+    assert store.rows == []          # nothing routable was written
+
+
+def test_existing_timezone_is_preserved_on_resync():
+    # A human corrected the tz to Chicago; a re-sync must NOT clobber it back to the
+    # address-inferred value.
+    store = FakeStore(existing=[{
+        "portal_gym_key": "eng", "gbp_location_id": "15450740315559491026",
+        "zernio_profile_id": "pid_eng", "zernio_account_id": "zacct_eng",
+        "status": "connected", "timezone": "America/Chicago"}])
+    z = FakeZernio({"eng": "pid_eng"}, {"pid_eng": [_gbp_acct()]})
+    gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert store.rows[0]["timezone"] == "America/Chicago"   # preserved, not overwritten
+
+
+def test_no_profile_is_skipped():
+    store = FakeStore()
+    z = FakeZernio({}, {})           # no profile for eng
+    out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
+    assert out["skipped"] == 1
+    assert store.upserts == []

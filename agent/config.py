@@ -438,6 +438,23 @@ def gbp_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_ENABLED", "false"))
 
 
+def gbp_conn_sync_enabled() -> bool:
+    """
+    GBP CONNECTION SYNC switch (AGENT_GBP_CONN_SYNC). OFF by default. When ON, once per
+    loop Echo reads each client gym's LIVE Google Business connection from Zernio
+    (list_accounts) and upserts its gym_gbp_connections row (zernio account + GBP
+    location id + status), so the publish lane can route.
+
+    This closes a gap: nothing else populates gym_gbp_connections (the portal was specced
+    to write it on OAuth callback but does not), so GBP publishing had no connection to
+    route through. The sync is READ-from-Zernio / WRITE-connection-row only: it NEVER
+    publishes and never touches content_calendar. A gym whose Zernio account is
+    intentionally disconnected / inactive is written status='needs_reconnect' (the
+    publish lane then holds its posts silently). Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_GBP_CONN_SYNC", "false"))
+
+
 def reporting_enabled() -> bool:
     """
     30-day reporting switch. OFF by default. When OFF, fetch_insights() returns None

@@ -513,6 +513,26 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"client media sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # GBP CONNECTION SYNC (AGENT_GBP_CONN_SYNC, OFF by default): refresh each client gym's
+    # gym_gbp_connections row from its LIVE Zernio Google Business connection so the publish
+    # lane can route (the table has no other writer). Reads Zernio + writes the connection
+    # row only — NEVER publishes, never touches content_calendar. Fully isolated: a failure
+    # never takes the draft run down.
+    if config.gbp_conn_sync_enabled():
+        try:
+            from .gbp_conn_sync import sync_gbp_connections
+            gsum = sync_gbp_connections(alert=ops_alerts.alert)
+            if gsum.get("ok"):
+                print(f"[gbp-conn-sync] synced {gsum['synced']} connection(s): "
+                      f"{gsum['connected']} connected, {gsum['needs_reconnect']} "
+                      f"needs_reconnect, {gsum['skipped']} skipped")
+            else:
+                print(f"[gbp-conn-sync] skipped: {gsum.get('reason')}")
+        except Exception as e:
+            print(f"[gbp-conn-sync] sync failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"GBP connection sync failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's

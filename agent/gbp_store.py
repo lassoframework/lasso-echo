@@ -6,8 +6,15 @@ is self-contained. Everything here is content_calendar (read-side mirror) + the
 gym_gbp_connections table; NOTHING publishes.
 """
 
+from datetime import datetime, timezone
+
 from . import config
 from .portal_calendar_store import SupabaseCalendarStore, PortalStoreError, _scrub
+
+
+def _now_iso():
+    """Current UTC time as an ISO-8601 'Z' string (updated_at/last_ok_at stamps)."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 _CAL = "content_calendar"
 _CONN = "gym_gbp_connections"
@@ -63,6 +70,51 @@ class GbpStore:
         status='connected' and routes by gbp_location_id."""
         return self._get(_CONN, {"portal_gym_key": f"eq.{portal_gym_key}",
                                  "order": "connected_at"})
+
+    def upsert_connection(self, conn):
+        """Insert or update one gym_gbp_connections row, keyed by the table's
+        unique (portal_gym_key, gbp_location_id). `conn` must carry portal_gym_key +
+        gbp_location_id (the key) plus zernio_profile_id, zernio_account_id, status, and
+        optionally location_name / timezone / connected_at / connected_by.
+
+        PRESERVES a timezone already on the row: the sync never knows the real tz (Zernio
+        does not return it), so an existing row's tz — which a human may have corrected —
+        is left untouched; tz is written ONLY when the row is created. Returns the row.
+        Idempotent: re-running with the same live connection is a no-op update."""
+        key = str(conn.get("portal_gym_key") or "")
+        loc = str(conn.get("gbp_location_id") or "")
+        if not key or not loc:
+            raise PortalStoreError(0, "upsert_connection needs portal_gym_key + gbp_location_id")
+        existing = self._get(_CONN, {"portal_gym_key": f"eq.{key}",
+                                     "gbp_location_id": f"eq.{loc}", "limit": "1"})
+        if existing:
+            # UPDATE the volatile fields only; keep timezone + connected_at + connected_by.
+            fields = {k: conn[k] for k in ("zernio_profile_id", "zernio_account_id",
+                                           "status", "location_name")
+                      if conn.get(k) is not None}
+            fields["updated_at"] = conn.get("updated_at") or _now_iso()
+            if str(conn.get("status") or "").lower() == "connected":
+                fields["last_ok_at"] = fields["updated_at"]
+            r = self._s._client().patch(
+                self._s._rest(_CONN),
+                params={"portal_gym_key": f"eq.{key}", "gbp_location_id": f"eq.{loc}"},
+                headers=self._s._headers({"Content-Type": "application/json",
+                                          "Prefer": "return=representation"}),
+                json=fields, timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            rows = r.json() or []
+            return rows[0] if rows else None
+        # INSERT a new row (timezone written once, on create).
+        r = self._s._client().post(
+            self._s._rest(_CONN),
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json=conn, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
 
     def all_connections(self):
         """Every connection row (for the nightly token-health sweep, Phase 1 §3.3, which

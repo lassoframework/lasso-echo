@@ -91,6 +91,7 @@ def _status():
     print(f"  image_grade    : {config.image_grade_enabled()}  (env AGENT_IMAGE_GRADE_ENABLED)")
     print(f"  hosting        : {config.hosting_enabled()}  (env AGENT_HOSTING_ENABLED)")
     print(f"  gbp            : {config.gbp_enabled()}  (env AGENT_GBP_ENABLED)")
+    print(f"  gbp_conn_sync  : {config.gbp_conn_sync_enabled()}  (env AGENT_GBP_CONN_SYNC; once per loop, read each client gym's LIVE Google Business connection from Zernio and upsert its gym_gbp_connections row so the publish lane can route; reads Zernio + writes the connection row only, NEVER publishes; an inactive Zernio account flips the row to needs_reconnect)")
     print(f"  reporting      : {config.reporting_enabled()}  (env AGENT_REPORTING_ENABLED)")
     print(f"  comments       : {config.comments_enabled()}  (env AGENT_COMMENTS_ENABLED)")
     print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
