@@ -50,28 +50,44 @@ _STATE_TZ = {
 }
 
 
+_STATE_NAMES = {
+    "FLORIDA": "FL", "GEORGIA": "GA", "VIRGINIA": "VA", "CALIFORNIA": "CA",
+    "ARIZONA": "AZ", "ILLINOIS": "IL", "OHIO": "OH", "MICHIGAN": "MI",
+    "INDIANA": "IN", "COLORADO": "CO", "WASHINGTON": "WA", "OREGON": "OR",
+    "NEVADA": "NV", "CONNECTICUT": "CT", "MASSACHUSETTS": "MA", "PENNSYLVANIA": "PA",
+    "MARYLAND": "MD", "MINNESOTA": "MN", "WISCONSIN": "WI", "MISSOURI": "MO",
+    "IOWA": "IA", "ARKANSAS": "AR", "LOUISIANA": "LA", "MISSISSIPPI": "MS",
+    "ALABAMA": "AL", "OKLAHOMA": "OK", "UTAH": "UT", "MAINE": "ME",
+    "HAWAII": "HI", "ALASKA": "AK", "MONTANA": "MT", "WYOMING": "WY",
+    "NEWMEXICO": "NM", "NORTHCAROLINA": "NC", "SOUTHCAROLINA": "SC", "NEWYORK": "NY",
+    "NEWJERSEY": "NJ",
+}
+
+
 def _tz_from_address(address):
-    """Best-effort IANA tz from a US location address by its state token, or None when the
-    state is ambiguous / not found (caller then defaults + flags). Pure."""
+    """Best-effort IANA tz from a US location address, or None when the state is
+    ambiguous / not found (caller then defaults + flags). PRECISE by design to avoid a
+    token collision (a street/city word like 'IN', 'OR', 'OK' must NOT be read as a state):
+
+      1. a FULL state name anywhere (word match, spaces stripped for two-word states); then
+      2. a 2-letter state code ONLY when it stands alone as a comma-delimited part
+         (optionally followed by a ZIP), i.e. the real 'state' segment of the address.
+
+    Pure. Returns the IANA tz or None."""
     import re
     if not address:
         return None
-    # match a 2-letter state token (", FL," or ", Florida" handled via a short name map)
-    toks = re.findall(r"[A-Za-z]+", address)
-    up = {t.upper() for t in toks}
-    for st, tz in _STATE_TZ.items():
-        if st in up:
-            return tz
-    _NAMES = {
-        "FLORIDA": "FL", "GEORGIA": "GA", "VIRGINIA": "VA", "CALIFORNIA": "CA",
-        "TEXAS": "TX", "ARIZONA": "AZ", "ILLINOIS": "IL", "OHIO": "OH",
-        "MICHIGAN": "MI", "INDIANA": "IN", "COLORADO": "CO", "WASHINGTON": "WA",
-        "OREGON": "OR", "NEVADA": "NV", "CONNECTICUT": "CT", "MASSACHUSETTS": "MA",
-        "PENNSYLVANIA": "PA", "MARYLAND": "MD",
-    }
-    for name, st in _NAMES.items():
-        if name in up:
-            return _STATE_TZ.get(st)
+    parts = [p.strip() for p in str(address).split(",")]
+    # 1. full state name (e.g. "... Cape Coral, Florida") — word-boundary, space-collapsed.
+    words = {re.sub(r"[^A-Z]", "", w.upper()) for p in parts for w in p.split()}
+    for name, st in _STATE_NAMES.items():
+        if name in words and st in _STATE_TZ:
+            return _STATE_TZ[st]
+    # 2. a 2-letter code that IS a whole state segment ("FL", "FL 33904", "FL 33904-1234").
+    for p in reversed(parts):
+        m = re.match(r"^([A-Za-z]{2})(?:\s+\d{5}(?:-\d{4})?)?$", p.strip())
+        if m and m.group(1).upper() in _STATE_TZ:
+            return _STATE_TZ[m.group(1).upper()]
     return None
 
 
@@ -182,11 +198,15 @@ def sync_gbp_connections(store=None, zernio=None, clients=None, logger=None, ale
             if not has_row:
                 tz = _tz_from_address(md.get("locationAddress"))
                 conn["timezone"] = tz or DEFAULT_TZ
-                if tz is None and alert:
-                    alert(f"GBP conn sync: created {base} connection with DEFAULT timezone "
-                          f"{DEFAULT_TZ} (Zernio gives none; address="
-                          f"{md.get('locationAddress')!r}) — set the real tz on the row so "
-                          "posts don't go out at the wrong hour.")
+                # Zernio never returns the tz, so a new row's tz is ALWAYS best-effort.
+                # Flag EVERY new connection for staff to verify (inferred OR defaulted) —
+                # a wrong tz publishes at the wrong hour and must never land silently.
+                if alert:
+                    how = (f"inferred {tz} from the address" if tz
+                           else f"DEFAULTED to {DEFAULT_TZ} (address unrecognized)")
+                    alert(f"GBP conn sync: new {base} connection tz {how} "
+                          f"(address={md.get('locationAddress')!r}) — VERIFY the timezone "
+                          "on the gym_gbp_connections row so posts publish at the right hour.")
 
             store.upsert_connection(conn)
             synced += 1

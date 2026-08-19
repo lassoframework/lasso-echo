@@ -138,6 +138,21 @@ def test_existing_timezone_is_preserved_on_resync():
     assert store.rows[0]["timezone"] == "America/Chicago"   # preserved, not overwritten
 
 
+def test_tz_inference_precise_no_token_collision():
+    # full state name -> correct tz
+    assert gcs._tz_from_address("326 SW 2nd Terrace, Cape Coral, Florida") == "America/New_York"
+    # 2-letter code as the state segment (with ZIP) -> correct tz
+    assert gcs._tz_from_address("100 Main St, Phoenix, AZ 85016") == "America/Phoenix"
+    # a street/city word that collides with a state code must NOT be read as a state:
+    # 'Oregon' spelled would be OR, but here only a colliding token appears in the street.
+    assert gcs._tz_from_address("5 Indiana Ave, Chicago, Illinois") == "America/Chicago"
+    # bare colliding token in a street name, no real state segment -> None (default+flag)
+    assert gcs._tz_from_address("42 OR Lane Suite IN") is None
+    # unknown / non-US -> None
+    assert gcs._tz_from_address("10 Queen St, Kitchener, Ontario") is None
+    assert gcs._tz_from_address("") is None
+
+
 def test_no_profile_is_skipped():
     store = FakeStore()
     z = FakeZernio({}, {})           # no profile for eng
