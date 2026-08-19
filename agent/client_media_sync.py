@@ -506,15 +506,18 @@ def _parse_banned_from_bible(raw):
 
 
 def _existing_feed_count(store, base_key, start, days):
-    """(count, ok): how many FEED rows the gym already has in content_calendar across
-    the planned span's months, gym-scoped. A FEED row is the unit that consumes one
-    photo (a story pairs on the same photo and an FB mirror duplicates the same feed),
-    so counting DISTINCT feed post_dates on instagram is the true 'how many photos are
-    already placed' measure to compare against the current media count.
+    """(count, ok): how many ACTIVE FEED rows the gym has in content_calendar across
+    the planned span's months. 'Active' excludes denied/killed/deleted rows so that a
+    denied post no longer blocks its own replacement: once the count drops below the
+    build target the scanner fires and generates a fresh replacement. Mirrors the build
+    query which also excludes denied+killed (portal_calendar_store line ~321).
 
-    ok=False (with count 0) means we could not read reliably (no list_month, or a read
-    error): the caller then treats the gym as NOT extendable this pass and SKIPS, so a
-    flaky read never triggers a delete-then-insert rebuild."""
+    A FEED row is the unit that consumes one photo (a story pairs on the same photo and
+    an FB mirror duplicates the same feed), so counting DISTINCT feed post_dates on
+    instagram is the true 'how many photos are placed' measure vs the media count.
+
+    ok=False (with count 0) means we could not read reliably: the caller treats the gym
+    as NOT extendable this pass and SKIPS so a flaky read never triggers a rebuild."""
     list_month = getattr(store, "list_month", None)
     if list_month is None:
         return 0, False
@@ -528,6 +531,12 @@ def _existing_feed_count(store, base_key, start, days):
             return 0, False
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            status = str(row.get("status", "")).lower()
+            # Mirror the build query: denied/killed rows are gone — don't count them
+            # as "placed". Without this, a denied post blocks its own replacement
+            # (existing_feeds stays at build_target so no rebuild fires).
+            if status in ("denied", "killed", "deleted"):
                 continue
             fmt = str(row.get("format", "")).lower()
             acct = str(row.get("account", "")).lower()

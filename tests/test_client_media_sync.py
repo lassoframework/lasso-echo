@@ -401,6 +401,33 @@ def test_equal_media_and_feeds_is_idempotent_skip():
     assert store.inserted == [] and store.deleted == []
 
 
+def test_denied_post_triggers_replacement_generation():
+    """Dale / ENG: a denied post must NOT block its own replacement.
+
+    Old bug: _existing_feed_count included denied rows, so existing_feeds stayed at
+    build_target and the scanner never rebuilt (no fresh post appeared). Fix: denied,
+    killed, and deleted rows are excluded from the count so the scanner sees a gap and
+    generates a replacement draft.
+    """
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=4)   # 4 photos in R2
+    # Existing calendar: 3 pending + 1 denied = 4 rows, but only 3 ACTIVE.
+    existing_rows = _existing_feed_calendar("gritx", "2026-08", 3) + [
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-28", "status": "denied", "image_url": "u_denied"},
+    ]
+    from datetime import date
+    store = FakeStore(existing={("gritx", "2026-08"): existing_rows})
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 8, 1), days=30)
+    assert out["ok"] is True
+    # Scanner sees 3 active feeds vs build_target of 4 -> rebuilds (generates replacement).
+    assert out["generated"] == 1, \
+        "denied post must not block its own replacement (old bug: no rebuild fired)"
+    assert store.inserted, "replacement draft must be written"
+
+
 def test_uploading_more_extends_calendar_up_to_new_count():
     """media_count > existing feed rows -> (re)build up to the new count; never past it."""
     _stock_sources("gritx_ig")
