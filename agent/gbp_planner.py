@@ -214,11 +214,16 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     rows = []
     counts = {"standard": 0, "offer": 0, "event": 0, "photo": 0, "skipped": 0}
 
+    # GBP uses its own rotation namespace (_gbp suffix) so that IG/FB calendar
+    # placement history doesn't block photos from appearing on Google Business.
+    # _vision_base recognises the _gbp suffix, so vision scoring still applies.
+    _gbp_rotation_key = account_gen_key.replace("_ig", "_gbp").replace("_fb", "_gbp")
+
     def _image_url(day_key, pillar=None):
         if image_fn is not None:
             return image_fn(day_key, used)
         # §4: pass the slot pillar so vision content-scores the pick (no-op for non-vision).
-        img = client_content.pick_image(account_gen_key, day_key, library_path,
+        img = client_content.pick_image(_gbp_rotation_key, day_key, library_path,
                                         exclude_keys=used, pillar=pillar)
         if img is None:
             return None

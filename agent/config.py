@@ -1017,7 +1017,7 @@ def vision_enabled_for(gym_key) -> bool:
 
 def _vision_base(gym_key) -> str:
     base = (gym_key or "").strip().lower()
-    for suffix in ("_ig", "_fb"):
+    for suffix in ("_ig", "_fb", "_gbp"):
         if base.endswith(suffix):
             return base[: -len(suffix)]
     return base
