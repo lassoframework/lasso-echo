@@ -52,16 +52,29 @@ def generate_gbp_caption(fact_text, voice, city):
     named. Returns a caption that PASSES gbp.caption_issues(city), or None when the LLM
     is unavailable / the output cannot be made A+ (caller skips the slot: A+ or nothing).
     Figure-fabrication gated exactly like the FB/IG SB7 path."""
-    user = (f"BRAND VOICE DOC:\n{getattr(voice, 'raw', '') or ''}\n\n"
-            f"CITY: {city}\n\nTODAY'S FACT (the only source of specifics):\n{fact_text}\n\n"
-            "Write the GBP caption now.")
-    try:
-        from .drafter import _strip_llm_scaffold
-        cap = _strip_llm_scaffold(_call_llm_caption(GBP_SYSTEM, user) or "")
-        cap = filter_platform_copy(cap).strip()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[gbp-planner] caption LLM failed: {type(exc).__name__}")
-        return None
+    from .drafter import _strip_llm_scaffold
+
+    def _attempt(user_prompt):
+        try:
+            cap = _strip_llm_scaffold(_call_llm_caption(GBP_SYSTEM, user_prompt) or "")
+            return filter_platform_copy(cap).strip()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gbp-planner] caption LLM failed: {type(exc).__name__}")
+            return None
+
+    voice_raw = getattr(voice, 'raw', '') or ''
+    base_user = (f"BRAND VOICE DOC:\n{voice_raw}\n\n"
+                 f"CITY: {city}\n\nTODAY'S FACT (the only source of specifics):\n{fact_text}\n\n"
+                 "Write the GBP caption now.")
+    cap = _attempt(base_user)
+    if cap and gbp.caption_issues(cap, city=city):
+        # City not named — retry once with an explicit reminder
+        retry_user = (base_user +
+                      f"\n\nIMPORTANT: Your previous attempt did not name the city. "
+                      f"The caption MUST include '{city}' to rank on Google Maps. "
+                      "Start the caption with the city or include it in the first sentence.")
+        cap = _attempt(retry_user)
+
     if not cap:
         return None
     if not _output_claims_cleared(cap, voice, fact_text):
