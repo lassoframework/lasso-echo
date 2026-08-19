@@ -114,7 +114,7 @@ def _library_dir(base_key, out_dir=None):
     explicit out_dir. This is where build_client_month reads the gym's real photos."""
     if out_dir:
         return out_dir
-    return os.path.join("content_library", base_key)
+    return os.path.join(config.LIBRARY_PATH, base_key)
 
 
 def _public_url_for_key(key):
