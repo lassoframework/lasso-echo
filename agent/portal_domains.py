@@ -35,6 +35,33 @@ _REGISTRY = {
         "instagram": "projectevolvepersonaltraining",
         "facebook": "Project Evolve Personal Training For Adults 40+",
     },
+    # Looked up + verified 2026-08-19 (portal-added clients, no domain column).
+    "the bolton club": {
+        "domain": "theboltonclub.com",           # Bolton, MA — small-group personal training
+    },
+    "hoosier athletic club": {
+        "domain": "hoosierathleticclub.com",      # Bloomington, IN (Hoosier CrossFit)
+        "facebook": "Hoosier Athletic Club",
+    },
+    "crossfit old glory": {
+        "domain": "oldglorygym.com",              # Ashburn, VA (Old Glory Gym)
+        "facebook": "Old Glory Gym",
+    },
+    "silk city crossfit": {
+        "domain": "silkcityfit.com",              # Manchester, CT (Silk City Fit)
+        "instagram": "silkcityfit",
+    },
+    "stillpoint fitness": {
+        "domain": "stillpointfitness.com",        # Monmouth Junction, NJ (Princeton area)
+        "instagram": "stillpoint_fitness",
+    },
+    "tricore": {
+        "domain": "tricorefit.com",               # Phoenix, AZ (TriCore Fitness)
+        "instagram": "tricore.fitness",
+    },
+    "x4 hoover": {
+        "domain": "x4fit.com",                    # Hoover, AL location of the X4 FIT brand
+    },
 }
 
 
