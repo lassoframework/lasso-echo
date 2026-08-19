@@ -713,12 +713,34 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             if existing_feeds >= build_target:
                 # Already built out to the media the gym supports (capped at `days`):
                 # idempotent. An unchanged library never rebuilds again.
+                #
+                # DENIED-SLOT BACKFILL (AGENT_DENY_BACKFILL, OFF by default): a gym AT cap
+                # can never grow, so a human-denied post would leave a permanently empty
+                # slot (the portal's "recreating" state never resolving; Dale/ENG). When
+                # armed, replace each denied feed day with a FRESH caption on a REUSED photo
+                # (INSERT-only, PENDING, all gates enforced). Isolated: any failure here
+                # never changes the has_calendar outcome for the gym.
+                backfilled = 0
+                if config.deny_backfill_enabled():
+                    try:
+                        voice = load_voice(
+                            _resolve_client_voice_path(base, account.voice_doc_path()))
+                        if voice is not None:
+                            from .client_month_run import backfill_denied_slots
+                            bf = backfill_denied_slots(
+                                account, base, start.isoformat(), days,
+                                voice=voice, library_path=lib_dir, store=store,
+                                banned_words=_banned_words_for(base), logger=log)
+                            backfilled = bf.get("backfilled", 0)
+                    except Exception as exc:  # noqa: BLE001 - never break the scan
+                        log(f"{base}: deny-backfill failed: {type(exc).__name__}")
                 skipped_existing += 1
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
                                 "existing_feeds": existing_feeds,
-                                "build_target": build_target})
+                                "build_target": build_target,
+                                "backfilled": backfilled})
                 continue
             # else: build_target > existing_feeds -> (re)build up to the cap. The
             # builder's _apply does a gym-scoped delete-then-insert (client calendars

@@ -61,7 +61,8 @@ def _image_key(creative):
     return os.path.basename(creative.path)
 
 
-def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None):
+def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
+               allow_reuse=False):
     """A creative from the account's uploaded library.
 
     LEGACY (vision off): least-recently-served within the no-repeat window, cluster-keyed
@@ -76,7 +77,12 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None)
     §4). None when nothing plannable remains.
 
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
-    approved/published rows + this build's placements)."""
+    approved/published rows + this build's placements).
+
+    allow_reuse (denied-slot backfill only): when True, the §3 per-platform reuse window is
+    IGNORED for the vision branch, so a photo still inside its reuse window is a valid pick.
+    This is the ONE case a photo may be reused — replacing a human-denied slot for a gym at
+    its creative cap. Default False = the reuse window is enforced exactly as before."""
     from . import dam
     imgs = [c for c in list_creatives(library_path)
             if c.media_type in ("image", "video")]
@@ -107,8 +113,9 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None)
             if not ok:
                 continue                   # guardrail 13: flagged/unanalyzed never auto-planned
             rk = _rkey(c)
-            if rotation.reuse_blocked(rk, account_key, day_key, served={account_key: served}):
-                continue                   # §3 per-platform reuse window
+            if not allow_reuse and rotation.reuse_blocked(
+                    rk, account_key, day_key, served={account_key: served}):
+                continue                   # §3 per-platform reuse window (skipped on backfill)
             recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
             score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
             if ok_slot:
@@ -364,7 +371,7 @@ def classify(draft):
 
 def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
-                       avoid_openings=()):
+                       avoid_openings=(), allow_reuse=False):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -409,7 +416,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     # §4: pass the day's pillar so vision content-scores the pick to the slot job (a no-op
     # for non-vision gyms, which keep least-recently-served rotation).
     image = pick_image(account.key, day_key, library_path,
-                       exclude_keys=exclude_keys, pillar=category)
+                       exclude_keys=exclude_keys, pillar=category,
+                       allow_reuse=allow_reuse)
     if image is not None:
         # §3.5 CROP-VERIFY (vision gyms): re-check the SHIPPED pixels (IG/FB = the original,
         # ruling 4) before drafting, so the caption may lean only on details that survived.

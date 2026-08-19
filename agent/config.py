@@ -1333,6 +1333,25 @@ def reel_target_sec() -> float:
     return max(10.0, min(60.0, val))
 
 
+def deny_backfill_enabled() -> bool:
+    """
+    Denied-slot BACKFILL switch (AGENT_DENY_BACKFILL). OFF by default = a denied post
+    is simply removed and (for a gym still below its creative cap) replaced by the normal
+    grow-to-cap rebuild; a gym ALREADY AT cap gets no replacement (the denied slot stays
+    empty and the portal's "recreating" state never resolves).
+
+    When ON, a gym that is AT its creative cap (more calendar slots than distinct photos,
+    so grow-to-cap is a no-op) still gets a FRESH replacement for each denied FEED day:
+    a NEW caption generated on a REUSED photo (the denied post's own photo is excluded,
+    and photos on approved/published rows are never touched). This is the ONLY path that
+    lets Echo reuse a photo, and only for backfilling a human-denied slot — the monthly
+    build's one-photo-per-feed / no-reuse rule is untouched. Every replacement still
+    clears the A+ + banned-word + fabrication gates and is written PENDING (owner-visible,
+    awaits approval). Nothing publishes. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_DENY_BACKFILL", "false"))
+
+
 def client_media_sync_enabled() -> bool:
     """
     Per-client MEDIA SYNC + auto-generate switch (AGENT_CLIENT_MEDIA_SYNC). OFF by

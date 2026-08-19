@@ -215,7 +215,7 @@ def _has_real_creative(draft):
 
 
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
-                         exclude_keys=(), avoid_openings=()):
+                         exclude_keys=(), avoid_openings=(), allow_reuse=False):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -255,7 +255,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
     draft = client_content.build_client_draft(account, day_key, voice, library_path,
                                               exclude_keys=exclude_keys,
-                                              avoid_openings=avoid_openings)
+                                              avoid_openings=avoid_openings,
+                                              allow_reuse=allow_reuse)
     if draft is None:
         return None, None
     if _accept(draft):
@@ -271,7 +272,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         alt_key = (base + timedelta(days=step)).isoformat()
         alt = client_content.build_client_draft(account, alt_key, voice, library_path,
                                                 exclude_keys=exclude_keys,
-                                                avoid_openings=avoid_openings)
+                                                avoid_openings=avoid_openings,
+                                                allow_reuse=allow_reuse)
         if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
             # on day_key (only the day is re-pointed; the caption/source/photo are the
@@ -287,6 +289,55 @@ def _row_from_draft(base_key, draft):
     month/mirror use (gym_id=base_key). PAUSED status by construction (the draft is
     PENDING; _real_row maps that to 'pending')."""
     return _mirror._real_row(base_key, draft)
+
+
+def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
+                            story_caption_override=None):
+    """Run an accepted FEED draft through its media-processing lanes (action-cut reel,
+    video poster, feed autofit) and build its PAIRED STORY on the same photo, returning
+    the drafts to emit for the day: [feed] or [feed, story].
+
+    Extracted VERBATIM from build_client_month's per-day tail so the denied-slot backfill
+    produces IDENTICAL feed+story cards (same lanes, same captionless-story guard). Mutates
+    feed.creative_public_url in place via the lanes. The caller owns loop state (built_days,
+    opening variety); this helper is stateless beyond the drafts it returns."""
+    # ACTION-CUT REEL (AGENT_CLIENT_VIDEO_EDIT, OFF by default): a VIDEO draft is edited
+    # into a fast-cut 9:16 reel and the draft's creative swaps to the hosted edit. Any
+    # failure keeps the raw video; approval gate unchanged.
+    _maybe_edit_video(account, feed, library_path, log)
+    # VIDEO PREVIEW: a video shows BLANK in the calendar slot; host a poster frame so the
+    # client sees a real frame. Display-only; best effort.
+    _attach_video_poster(account, feed, library_path, log)
+    # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec feed PHOTO is
+    # re-framed to 1080x1080. Snapshot the pre-autofit media FIRST so the paired story
+    # never inherits the square feed card.
+    _pre_autofit_url = getattr(feed, "creative_public_url", "")
+    _maybe_format_feed(account, feed, library_path, log)
+    _mark_feed(feed)
+    out = [feed]
+
+    # PAIRED STORY on the SAME photo (cloned from the feed; no second media consumed).
+    story = _story_from_feed(feed)
+    # The story must NOT carry the feed's SQUARE autofit reframe: restore the pre-autofit
+    # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
+    if getattr(story, "creative_public_url", "") != _pre_autofit_url:
+        try:
+            story.creative_public_url = _pre_autofit_url
+        except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
+            pass
+    _mark_story(story)
+    # Honor a client-edited story caption when one was passed in.
+    if story_caption_override:
+        story.caption = story_caption_override
+    # STORY FORMATTING (AGENT_STORY_FORMAT): a story publishes empty-body, so the caption
+    # must be burned onto the media; if it cannot be, DROP the story (never a captionless
+    # post). Flag OFF (baseline) keeps the raw media and always keeps the story.
+    if _maybe_format_story(account, story, feed, library_path, log):
+        out.append(story)
+    else:
+        log(f"drop {day_key} story: cannot carry its caption (a story publishes "
+            "empty-body; refusing to ship a captionless story)")
+    return out
 
 
 def _is_first_month(base_key, store, log):
@@ -440,69 +491,21 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         pub = (getattr(feed, "creative_public_url", "") or "").strip()
         if pub:
             used_keys.add(_url_basename(pub))
-        # ACTION-CUT REEL (AGENT_CLIENT_VIDEO_EDIT, OFF by default): a VIDEO draft is
-        # edited into an engaging fast-cut 9:16 reel (hook text from the day's own
-        # approved caption) and the draft's creative swaps to the hosted edit. Editing
-        # only ENHANCES: any failure keeps the raw video; approval gate unchanged.
-        _maybe_edit_video(account, feed, library_path, log)
-        # VIDEO PREVIEW: a video shows BLANK in the calendar's image slot. Generate +
-        # host a poster frame so the client SEES the video (a real frame) instead of a
-        # blank card. Display-only (the video still publishes); best effort.
-        _attach_video_poster(account, feed, library_path, log)
-        # FEED AUTOFIT (AGENT_FEED_AUTOFIT, OFF by default): an out-of-spec (odd-crop /
-        # panoramic) feed PHOTO is re-framed into an in-spec 1080x1080 card so the platform
-        # never hard-crops the subject (Dale, 2026-08-18). In-spec photos + videos untouched;
-        # any failure keeps the raw media. Approval gate unchanged.
-        # Snapshot the feed media BEFORE the SQUARE reframe so the paired story (cloned below)
-        # never inherits the 1080x1080 feed card — a story needs the raw source (it rebuilds
-        # its own 1080x1920, or posts the raw photo when story-format is off). Autofit reframes
-        # the FEED creative only, never the story.
-        _pre_autofit_url = getattr(feed, "creative_public_url", "")
-        _maybe_format_feed(account, feed, library_path, log)
-        _mark_feed(feed)
-        drafts.append(feed)
+        # PAIRED STORY on the SAME photo: N photos -> N feeds + N stories (the story
+        # reuses the feed's creative, never a second photo). All media-processing lanes
+        # (reel, poster, autofit) + the captionless-story guard live in the shared helper
+        # so the denied-slot backfill emits IDENTICAL cards.
+        story_caption_override = edited_story_caps.get(str(day_key)[:10])
+        day_drafts = _finish_feed_with_story(
+            account, feed, library_path, log, day_key=day_key,
+            story_caption_override=story_caption_override)
+        drafts.extend(day_drafts)
         built_days += 1
         # Record this accepted feed's opening so the NEXT day avoids leading the same
         # way (the cross-day repetition Ryan flagged). Blank signatures are skipped.
         sig = opening_signature(getattr(feed, "caption", "") or "")
         if sig:
             recent_openings.append(sig)
-
-        # PAIRED STORY on the SAME photo: the story mirrors the feed's real creative
-        # rather than re-picking (which would consume a SECOND photo and break the
-        # one-photo-per-feed cap). It carries the feed's caption + creative, marked as
-        # a story. No extra media is consumed, so N photos -> N feeds + N stories.
-        story = _story_from_feed(feed)
-        # The story must NOT carry the feed's SQUARE autofit reframe: restore the pre-autofit
-        # media. Story-format ON rebuilds a fresh 1080x1920 from creative_path regardless; this
-        # guard is what keeps the story correct when story-format is OFF (posts the raw photo,
-        # never a 1080x1080 square pillarboxed into a 9:16 slot).
-        if getattr(story, "creative_public_url", "") != _pre_autofit_url:
-            try:
-                story.creative_public_url = _pre_autofit_url
-            except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
-                pass
-        _mark_story(story)
-        # HONOR A CLIENT-EDITED STORY CAPTION: if the client edited this day's story
-        # caption in the portal, re-render the story with THEIR text (not the freshly
-        # generated feed caption), so a saved story caption is never discarded by the
-        # rebuild. Fabrication-safe: an edited caption already cleared the edit route's
-        # fabrication gate before it was stored. The FEED keeps its own caption.
-        story_caption_override = edited_story_caps.get(str(day_key)[:10])
-        if story_caption_override:
-            story.caption = story_caption_override
-        # STORY FORMATTING (AGENT_STORY_FORMAT): a PHOTO story's creative becomes a
-        # filled 1080x1920 card with the caption burned in; a VIDEO story's creative
-        # becomes a 9:16 story video with the caption burned in. A story publishes with
-        # an EMPTY body, so the caption MUST be on the media. If neither can be produced
-        # (flag off, or the render fails) the story would go out CAPTIONLESS (Dale, 2026
-        # -08-15) -> we DROP it instead of shipping a story with no caption. The feed
-        # still posts; only the un-captionable story is held.
-        if _maybe_format_story(account, story, feed, library_path, log):
-            drafts.append(story)
-        else:
-            log(f"drop {day_key} story: cannot carry its caption (a story publishes "
-                "empty-body; refusing to ship a captionless story)")
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
     # available was planned and must reach the coach (never silent). One summary staff alert
@@ -791,3 +794,124 @@ def _apply(base_key, rows, start, days, store, log, locked_days=()):
                 "upserted": inserted, "deleted": deleted, "months": months}
     return {"ok": True, "upserted": inserted, "inserted": inserted,
             "deleted": deleted, "months": months}
+
+
+def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
+                          library_path=None, store, banned_words=(), logger=None):
+    """Give each DENIED feed day a FRESH replacement (a NEW caption on a REUSED photo) for
+    a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op and
+    the denied slot would otherwise stay empty forever (the portal's "recreating" state
+    never resolving; Dale / ENG, 2026-08-19).
+
+    A denied FEED day is replaced ONLY when it has no active (pending/approved/published)
+    feed on that date yet, so this is IDEMPOTENT: once a pending replacement lands the next
+    pass skips it. The replacement REUSES a photo (allow_reuse — the gym has no fresh
+    creative left) but NEVER the denied post's own photo and NEVER a photo consumed by an
+    approved/published row. Every replacement clears the same A+ / banned-word / fabrication
+    gates as a normal build and is written PENDING (owner-visible, awaits approval).
+    INSERT-only: the existing calendar is never deleted. Behind AGENT_DENY_BACKFILL (OFF by
+    default) — flag off -> returns ok:False and touches nothing.
+
+    Returns {ok, backfilled, days_needing, skipped[, rows]}."""
+    log = logger or (lambda m: print(f"[deny-backfill] {m}"))
+    if not config.deny_backfill_enabled():
+        return {"ok": False, "reason": "AGENT_DENY_BACKFILL off", "backfilled": 0}
+    if account is None or not base_key or store is None or voice is None:
+        return {"ok": False, "reason": "missing account, base_key, store, or voice",
+                "backfilled": 0}
+    list_month = getattr(store, "list_month", None)
+    insert_rows = getattr(store, "insert_rows", None)
+    if list_month is None or insert_rows is None:
+        return {"ok": False, "reason": "store cannot read/insert", "backfilled": 0}
+
+    from datetime import date, timedelta
+    start = start_date if isinstance(start_date, date) \
+        else date.fromisoformat(str(start_date)[:10])
+    win_start = start.isoformat()
+    win_end = (start + timedelta(days=max(1, days) - 1)).isoformat()
+    months = sorted({(start + timedelta(days=i)).isoformat()[:7]
+                     for i in range(max(1, days))})
+
+    denied_photo_by_day = {}    # date -> the denied feed's own image basename (never re-served)
+    active_feed_days = set()    # dates already covered by a non-denied/killed feed
+    live_photo_keys = set()     # photos on approved/published/publishing rows (never reused)
+    for month in months:
+        try:
+            rows = list_month(base_key, month) or []
+        except Exception as exc:  # noqa: BLE001 - a read failure must never write blindly
+            log(f"{base_key}: calendar read failed ({type(exc).__name__}); no backfill")
+            return {"ok": False, "reason": "calendar unreadable", "backfilled": 0}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").lower()
+            # A LIVE photo is never reused, no matter WHERE it sits in the calendar:
+            # collect it regardless of the window so a replacement can never double-post
+            # a photo already approved/published on any other day.
+            if status in _PHOTO_CONSUMING_STATUSES:
+                k = _url_basename(row.get("image_url") or "")
+                if k:
+                    live_photo_keys.add(k)
+            pd = str(row.get("post_date") or "")[:10]
+            if not pd or pd < win_start or pd > win_end:
+                continue
+            fmt = str(row.get("format") or "").lower()
+            acct = str(row.get("account") or "").lower()
+            if fmt == "feed" and acct in ("instagram", "ig", ""):
+                if status == "denied":
+                    denied_photo_by_day.setdefault(
+                        pd, _url_basename(row.get("image_url") or ""))
+                elif status not in ("killed", "deleted"):
+                    active_feed_days.add(pd)
+
+    # A denied day still needs a replacement only if nothing active already covers it.
+    todo = sorted(d for d in denied_photo_by_day if d not in active_feed_days)
+    if not todo:
+        return {"ok": True, "backfilled": 0, "days_needing": 0, "skipped": 0}
+
+    banned_words = tuple(banned_words or ())
+    drafts = []
+    skipped = 0
+    for day_key in todo:
+        # Exclude the denied post's OWN photo (never hand the same one back) + every photo
+        # already live on the page. Everything else may be REUSED.
+        exclude = set(live_photo_keys)
+        own = denied_photo_by_day.get(day_key)
+        if own:
+            exclude.add(own)
+        feed, drop = _clean_draft_for_day(
+            account, day_key, voice, library_path, banned_words, log,
+            exclude_keys=exclude, allow_reuse=True)
+        if feed is None or not _has_real_creative(feed):
+            skipped += 1
+            log(f"{base_key} {day_key}: no A+ replacement could be built "
+                f"({drop or 'no usable creative'})")
+            continue
+        drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
+                                              day_key=day_key))
+
+    if not drafts:
+        return {"ok": True, "backfilled": 0, "days_needing": len(todo),
+                "skipped": skipped}
+
+    rows = _to_rows(base_key, drafts)
+    # GATE 2 safety: withhold a first-month gym's replacement exactly as its month would be.
+    # (A gym with a denied post is established by construction, so this is a guard.)
+    if (config.coach_screen_first_month_enabled() and base_key != "lasso"
+            and _is_first_month(base_key, store, log)):
+        for r in rows:
+            r["status"] = "coach_review"
+    clean_rows = [{k: v for k, v in r.items() if k != "id"}
+                  for r in rows if str(r.get("gym_id")) == str(base_key)]
+    try:
+        inserted = len(insert_rows(base_key, clean_rows) or [])
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: backfill insert failed: {type(exc).__name__}")
+        return {"ok": False, "reason": f"insert failed: {type(exc).__name__}",
+                "backfilled": 0, "days_needing": len(todo), "skipped": skipped}
+    days_done = len({r.get("post_date") for r in clean_rows
+                     if r.get("format") == "feed"})
+    log(f"{base_key}: backfilled {days_done} denied slot(s) with a fresh caption on a "
+        f"reused photo ({inserted} row(s), {skipped} day(s) unbuildable)")
+    return {"ok": True, "backfilled": days_done, "rows": inserted,
+            "days_needing": len(todo), "skipped": skipped}

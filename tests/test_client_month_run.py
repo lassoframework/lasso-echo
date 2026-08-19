@@ -526,3 +526,117 @@ def test_low_variety_month_diversifies_openings(tmp_path, monkeypatch):
     # (b) the avoid-openings signal reached the generator on later days (day 1 has no
     # prior opening, so it is absent then; it must be present on at least one later day)
     assert any(seen_avoid_blocks), "the avoid-openings signal never reached the prompt"
+
+
+# ---- DENIED-SLOT BACKFILL (fresh caption on a reused photo, at cap) ----------------
+class _FakeStoreLM(_FakeStore):
+    """A _FakeStore that can also READ a seeded calendar (list_month) and report the gym
+    as established (has_owner_visible_rows True), so GATE 2 never withholds in these tests."""
+
+    def __init__(self, seeded=None):
+        super().__init__()
+        self.seeded = seeded or {}          # {(base, "YYYY-MM"): [row, ...]}
+
+    def list_month(self, base_key, month):
+        return list(self.seeded.get((base_key, month), []))
+
+    def has_owner_visible_rows(self, base_key):
+        return True
+
+
+def _denied_feed_row(post_date, photo="photo_00.jpg", caption="old denied caption"):
+    return {"gym_id": "gritx", "account": "instagram", "format": "feed",
+            "post_date": post_date, "status": "denied", "caption": caption,
+            "image_url": f"https://gritx.media/{photo}"}
+
+
+def test_deny_backfill_flag_off_touches_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "false")
+    _stock_clean("gritx_ig")
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=_lib(tmp_path),
+                                    store=store, banned_words=())
+    assert out["ok"] is False
+    assert out["backfilled"] == 0
+    assert store.inserted == [], "flag off must never write a replacement"
+
+
+def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, "the denied day must get exactly one replacement"
+
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    fb_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "facebook"]
+    stories = [r for r in store.inserted if r["format"] == "story"]
+    # feed cross-posts to IG + FB; the paired story is IG-only (same mirror as a build).
+    assert len(ig_feed) == 1 and len(fb_feed) == 1 and len(stories) == 1
+    assert ig_feed[0]["post_date"] == "2026-08-19"
+    assert ig_feed[0]["gym_id"] == "gritx"
+    # PENDING = owner-visible, still awaits approval (the gate is never bypassed).
+    assert ig_feed[0]["status"] == "pending"
+    # rows carry NO id (the DB mints it).
+    assert "id" not in ig_feed[0]
+    # REUSED a DIFFERENT photo, never the denied post's OWN photo_00.
+    assert "photo_00" not in ig_feed[0]["image_url"], \
+        "the replacement must not hand back the denied post's own photo"
+    # a real, non-empty caption grounded in an approved source.
+    assert ig_feed[0]["caption"].strip()
+
+
+def test_deny_backfill_idempotent_when_active_feed_covers_the_day(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    # The denied day ALREADY has a fresh pending feed (a prior backfill landed): skip it.
+    seeded = {("gritx", "2026-08"): [
+        _denied_feed_row("2026-08-19"),
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-19", "status": "pending", "caption": "fresh replacement",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+    ]}
+    store = _FakeStoreLM(seeded)
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=_lib(tmp_path),
+                                    store=store, banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 0, "a covered denied day must not be backfilled again"
+    assert store.inserted == []
+
+
+def test_deny_backfill_never_reuses_a_live_photo(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=3)
+    # photo_00 is on the denied row; photo_01 + photo_02 are APPROVED/PUBLISHED elsewhere.
+    # The only photo left to reuse is... none that are free, so every candidate is a live
+    # photo except the denied one -> the replacement must be dropped, never a live-photo
+    # double-post.
+    seeded = {("gritx", "2026-08"): [
+        _denied_feed_row("2026-08-19", photo="photo_00.jpg"),
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-10", "status": "approved",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-11", "status": "published",
+         "image_url": "https://gritx.media/photo_02.jpg"},
+    ]}
+    store = _FakeStoreLM(seeded)
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    # No free photo (photo_00 excluded as the denied one; 01/02 are live) -> nothing
+    # inserted, and no approved/published photo was re-placed.
+    reused_live = [r for r in store.inserted
+                   if "photo_01" in r.get("image_url", "")
+                   or "photo_02" in r.get("image_url", "")]
+    assert reused_live == [], "a live (approved/published) photo must never be re-placed"
