@@ -594,6 +594,27 @@ def _attach_video_poster(account, draft, library_path, log):
         log(f"poster lane failed for {os.path.basename(path)}: {type(exc).__name__}")
 
 
+_INFOGRAPHIC_MARKERS = ("no_creative_",)   # house-rendered fallback card filename prefix
+
+
+def _is_infographic_creative(draft):
+    """True when a story's creative is a HOUSE-RENDERED INFOGRAPHIC (a finished, story-
+    sized card that already carries its own text) rather than a real uploaded PHOTO/VIDEO.
+
+    Blake, 2026-08-20: an infographic story must NEVER get a caption burned on top (it
+    would overlay the card's own copy); a real photo/video story MUST (a story publishes
+    empty-body, else it goes out captionless). Detection is by the house-render filename
+    marker on either the local path or the hosted url. A genuine client upload keeps its
+    intake basename (e.g. '20260812T163147Z_Skierg.mp4') and never matches, so a real
+    photo/video is never misread as an infographic and silently left captionless."""
+    for attr in ("creative_path", "creative_public_url"):
+        val = str(getattr(draft, attr, "") or "")
+        base = val.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
+        if any(base.startswith(m) for m in _INFOGRAPHIC_MARKERS) or "infographic" in base:
+            return True
+    return False
+
+
 def _maybe_format_story(account, story, feed, library_path, log):
     """Give a story its CAPTION on the media (a story publishes empty-body, so the words
     must be burned in), and report whether the story may ship:
@@ -615,6 +636,17 @@ def _maybe_format_story(account, story, feed, library_path, log):
     (return True) — this guard does not change flag-off behavior."""
     if not config.story_format_enabled():
         return True                              # baseline: unchanged, always keep
+    # INFOGRAPHIC vs PHOTO (Blake, 2026-08-20): only a real uploaded PHOTO/VIDEO gets a
+    # caption burned in. A house-rendered INFOGRAPHIC is already a finished, story-sized
+    # card carrying its own text, so a burned caption would sit ON TOP of it ("takes over
+    # the caption") — skip the burn and keep the card as-is. Real client uploads never
+    # match the house-render marker, so a genuine photo/video is never mistaken for one
+    # (and today infographics never even reach this path — this is the intent made
+    # explicit + future-proofed, never a regression for photo/video stories).
+    if _is_infographic_creative(feed):
+        log("story is a house infographic (already story-sized w/ its own text); "
+            "keeping as-is, no caption burned")
+        return True
     path = (getattr(feed, "creative_path", "") or "").strip()
     is_video = bool(path) and path.lower().endswith(_VIDEO_EXTS)
     # The STORY's own caption wins when it was overridden by a client edit; otherwise it

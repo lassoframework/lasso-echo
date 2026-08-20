@@ -196,3 +196,45 @@ def test_maybe_format_feed_never_drops_on_failure(monkeypatch, tmp_path):
     # must NOT raise and must keep the raw media (feed autofit never drops a post)
     client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
     assert feed.creative_public_url == "raw-url"
+
+
+# ---- video drawbox uses INPUT dims (the captionless-video root cause) -------------
+def test_story_video_drawbox_uses_input_dims_not_bare_hw():
+    """The drawbox band must size against the input frame (ih/iw). Bare h/w inside
+    drawbox are self-referential (the box's own size), which failed the whole ffmpeg
+    filtergraph in prod -> the video story burn returned None and published captionless
+    (Dale, 2026-08-20). Lock the fix."""
+    vf = story_image._story_video_drawtext("You are busy. We help.", "ENG")
+    box = [f for f in vf.split(",") if f.startswith("drawbox")][0]
+    assert "ih*" in box and "iw" in box, box
+    # no bare h*/w* geometry left in the drawbox segment (self-referential = broken)
+    assert "y=h*" not in box and "w=w:" not in box and "h=h*" not in box, box
+
+
+# ---- photo vs infographic: caption a real upload, never an infographic -------------
+def test_is_infographic_creative_detects_house_card():
+    ig = _Draft("cap", "/lib/no_creative_get_stronger_story.png",
+                url="https://cdn/no_creative_get_stronger_story.png")
+    photo = _Draft("cap", "/lib/20260812T163147Z_Skierg.mp4",
+                   url="https://cdn/20260812T163147Z_Skierg.mp4")
+    assert client_month_run._is_infographic_creative(ig) is True
+    assert client_month_run._is_infographic_creative(photo) is False
+
+
+def test_maybe_format_story_skips_burn_for_infographic(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_month_run.config, "story_format_enabled", lambda: True)
+    monkeypatch.setattr(client_month_run.config, "hosting_enabled", lambda: True)
+    # if the burn engine were called it would explode -> proves it is NOT called
+    def _boom(*a, **k):
+        raise AssertionError("infographic story must NOT be caption-burned")
+    monkeypatch.setattr(story_image, "get_or_make_story_image", _boom)
+    monkeypatch.setattr(story_image, "get_or_make_story_video", _boom)
+    ig_url = "https://cdn/no_creative_get_stronger_story.png"
+    feed = _Draft("Get stronger in Cape Coral.", "/lib/no_creative_get_stronger_story.png",
+                  url=ig_url)
+    story = _Draft("Get stronger in Cape Coral.", "/lib/no_creative_get_stronger_story.png",
+                   url=ig_url)
+    kept = client_month_run._maybe_format_story(_Acct(), story, feed, tmp_path,
+                                                lambda m: None)
+    assert kept is True                       # kept as-is
+    assert story.creative_public_url == ig_url  # infographic media untouched (no burn)

@@ -167,7 +167,12 @@ def _story_video_drawtext(caption, gym_name):
                  .replace(":", "\\:").replace("%", "\\%"))
 
     # A translucent bottom band behind the text for legibility, then each line.
-    filters = ["drawbox=x=0:y=h*0.62:w=w:h=h*0.38:color=black@0.55:t=fill"]
+    # drawbox resolves its geometry against the INPUT frame via ih/iw (NOT bare h/w:
+    # inside drawbox, h/w are the box's own dimensions, so 'y=h*0.62' is self-referential
+    # and this ffmpeg build fails the whole filtergraph -> the video story burn returned
+    # None and the story published captionless, Dale 2026-08-20). drawtext below correctly
+    # uses h/w for the main frame, so those stay.
+    filters = ["drawbox=x=0:y=ih*0.62:w=iw:h=ih*0.38:color=black@0.55:t=fill"]
     y = "h*0.66"
     if name:
         filters.append(
