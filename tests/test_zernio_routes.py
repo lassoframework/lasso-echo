@@ -158,8 +158,9 @@ class _FakeClient:
         self._create_conflict = create_conflict
         self.calls = []
 
-    def connect_url(self, pid, platform):
-        self.calls.append(("connect", pid, platform)); return self._connect
+    def connect_url(self, pid, platform, redirect_url=None, headless=True):
+        self.calls.append(("connect", pid, platform, redirect_url, headless))
+        return self._connect
 
     def list_accounts(self, pid):
         self.calls.append(("accounts", pid)); return self._accounts
@@ -215,13 +216,82 @@ def test_connect_allows_google_business(db_env):
     status, body = zr.handle_social_connect("gymA", "googlebusiness", client=fake)
     assert status == 200
     assert body["oauth_url"].startswith("https://accounts.google.com/")
-    assert ("connect", "new_profile", "googlebusiness") in fake.calls
+    assert any(c[:3] == ("connect", "new_profile", "googlebusiness") for c in fake.calls)
 
 
 def test_connect_url_for_google_business(db_env):
     fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=2"})
     ok, url = zr.connect_url_for("gymA", "googlebusiness", client=fake)
     assert ok is True and url.startswith("https://accounts.google.com/")
+
+
+def _connect_call(fake):
+    """The single ('connect', pid, platform, redirect_url, headless) call recorded."""
+    return next(c for c in fake.calls if c[0] == "connect")
+
+
+def test_connect_passes_portal_redirect_and_headless(db_env, monkeypatch):
+    # The portal passes its own return URL; Echo must thread it (and headless=true) to Zernio so
+    # the gym owner lands back in the LASSO portal, never the Zernio dashboard.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient()
+    ret = "https://ops.lassoframework.com/my"
+    status, body = zr.handle_social_connect("gymA", "instagram", client=fake, redirect_url=ret)
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == ret          # redirect_url threaded through unchanged
+    assert call[4] is True         # headless
+
+
+def test_connect_falls_back_to_portal_origin_never_zernio(db_env, monkeypatch):
+    # No redirect_url from the portal -> fall back to the configured portal origin + /my.
+    # The redirect is NEVER omitted, so Zernio can never default to its own dashboard.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient()
+    status, body = zr.handle_social_connect("gymA", "instagram", client=fake)
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == "https://ops.lassoframework.com/my"
+    assert call[3] and "zernio" not in call[3].lower()
+    assert call[4] is True
+
+
+def test_connect_rejects_non_http_redirect_falls_back(db_env, monkeypatch):
+    # A non-http(s) redirect_url (junk/injection) is not trusted; falls back to the portal origin.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient()
+    status, body = zr.handle_social_connect(
+        "gymA", "instagram", client=fake, redirect_url="javascript:alert(1)")
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == "https://ops.lassoframework.com/my"
+
+
+def test_client_connect_url_includes_headless_and_redirect(db_env):
+    # Verify the actual Zernio GET params carry headless=true + redirect_url (the reproduced bug
+    # was Echo omitting redirect_url so Zernio defaulted to its dashboard).
+    captured = {}
+
+    class _CapHttp:
+        def get(self, url, params=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["params"] = params
+
+            class _R:
+                status_code = 200
+                text = ""
+
+                @staticmethod
+                def json():
+                    return {"authUrl": "https://www.instagram.com/oauth/authorize?x=1"}
+            return _R()
+
+    c = z.ZernioClient(api_key="sk_test", base="https://api.zernio.com", http=_CapHttp())
+    c.connect_url("pid123", "instagram", redirect_url="https://ops.lassoframework.com/my")
+    assert captured["params"]["profileId"] == "pid123"
+    assert captured["params"]["headless"] == "true"
+    assert captured["params"]["redirect_url"] == "https://ops.lassoframework.com/my"
+    assert captured["url"].endswith("/v1/connect/instagram")
 
 
 def test_connect_url_for_rejects_bad_platform(db_env):
@@ -260,7 +330,7 @@ def test_connect_reuses_existing_profile_no_create(db_env):
     # found by name, reused its _id, and NEVER created a duplicate
     assert ("list_profiles",) in fake.calls
     assert not any(c[0] == "create" for c in fake.calls)
-    assert ("connect", "lasso_pid_24charxxxxxx", "instagram") in fake.calls
+    assert any(c[:3] == ("connect", "lasso_pid_24charxxxxxx", "instagram") for c in fake.calls)
     assert (_db.gym_get("lasso") or {}).get("zernio_profile_id") == "lasso_pid_24charxxxxxx"
 
 

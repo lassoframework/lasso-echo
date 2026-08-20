@@ -123,9 +123,21 @@ class ZernioClient:
         return self._delete(f"/v1/accounts/{account_id}")
 
     # ---- reads --------------------------------------------------------------
-    def connect_url(self, profile_id, platform):
-        """GET /v1/connect/{platform}?profileId=... -> {authUrl}."""
-        return self._get(f"/v1/connect/{platform}", {"profileId": profile_id})
+    def connect_url(self, profile_id, platform, redirect_url=None, headless=True):
+        """GET /v1/connect/{platform}?profileId=...&headless=true&redirect_url=... -> {authUrl}.
+
+        redirect_url is the post-OAuth return target: after the gym owner approves, Zernio
+        redirects the browser THERE. When it is OMITTED, Zernio sends them to its OWN
+        dashboard (zernio.com/dashboard) with billing prompts — a client must never see
+        that, so the caller (portal or an env fallback) always supplies the LASSO portal's
+        return URL. headless=true keeps the flow inside our own chrome. Same call for
+        googlebusiness (it rides this path). Return shape ({authUrl}) is unchanged."""
+        params = {"profileId": profile_id}
+        if headless:
+            params["headless"] = "true"
+        if redirect_url:
+            params["redirect_url"] = redirect_url
+        return self._get(f"/v1/connect/{platform}", params)
 
     def list_accounts(self, profile_id):
         """GET /v1/accounts?profileId=... -> {accounts:[...]}."""

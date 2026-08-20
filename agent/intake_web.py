@@ -1538,8 +1538,14 @@ def build_server(port=None):
                     return self._deny(404)
                 if pt_sub == "social-connect":
                     from urllib.parse import urlparse, parse_qs
-                    platform = (parse_qs(urlparse(self.path).query).get("platform") or [""])[0]
-                    status, body = _zr.handle_social_connect(account_key, platform)
+                    _q = parse_qs(urlparse(self.path).query)
+                    platform = (_q.get("platform") or [""])[0]
+                    # Post-OAuth return URL the portal passes so the gym owner lands back in the
+                    # LASSO portal (never the Zernio dashboard). Read the SAME way as platform;
+                    # a missing one falls back to the configured portal origin inside the handler.
+                    redirect_url = (_q.get("redirect_url") or [""])[0]
+                    status, body = _zr.handle_social_connect(account_key, platform,
+                                                             redirect_url=redirect_url)
                 elif pt_sub == "social-status":
                     status, body = _zr.handle_social_status(account_key)
                 else:
