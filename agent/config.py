@@ -845,6 +845,15 @@ def zernio_enabled() -> bool:
     return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
 
 
+def portal_public_base_url() -> str:
+    """The LASSO portal's public origin, used as the post-OAuth return target for a
+    social CONNECT so the gym owner lands back in the portal (never on the Zernio
+    dashboard). The portal normally passes its own return URL on the connect call;
+    this is the FALLBACK when it does not, so the redirect NEVER defaults to Zernio.
+    Overridable via PORTAL_PUBLIC_BASE_URL; defaults to the live portal origin."""
+    return (os.environ.get("PORTAL_PUBLIC_BASE_URL") or "https://ops.lassoframework.com").rstrip("/")
+
+
 def zernio_publish_enabled() -> bool:
     """
     Zernio client-publish lane: when armed, an approved CLIENT-gym calendar row is

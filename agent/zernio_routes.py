@@ -105,12 +105,26 @@ def provision_gym(account_key, client=None):
     return True, str(pid)
 
 
-def connect_url_for(account_key, platform, client=None):
+def _connect_redirect_url(redirect_url):
+    """The post-OAuth return URL to hand Zernio. Prefer the caller's (the portal passes its
+    own Social page); otherwise fall back to the configured portal origin + /my so the browser
+    NEVER lands on the Zernio dashboard. Only http(s) targets are trusted; anything else falls
+    back too."""
+    ru = (redirect_url or "").strip()
+    if ru.startswith("http://") or ru.startswith("https://"):
+        return ru
+    return f"{config.portal_public_base_url()}/my"
+
+
+def connect_url_for(account_key, platform, client=None, redirect_url=None):
     """OPS: the OAuth CONNECT url for a gym + platform (instagram|facebook|googlebusiness),
     find-or-creating the Zernio profile first. This is the same URL the portal handler returns;
     exposed for the CLI so ops can hand a gym owner a direct connect link (e.g. a Google
     Business connect link) without a portal round-trip. Returns (ok, url_or_error). Requires
-    zernio_enabled() (ZERNIO_API_KEY) — run on the worker where the key lives."""
+    zernio_enabled() (ZERNIO_API_KEY) — run on the worker where the key lives.
+
+    redirect_url is threaded to Zernio so the gym owner returns to the LASSO portal after
+    approving, never the Zernio dashboard; a missing one falls back to the portal origin."""
     if not config.zernio_enabled():
         return False, "zernio disabled (ZERNIO_API_KEY not set on this host)"
     if not account_key:
@@ -122,7 +136,7 @@ def connect_url_for(account_key, platform, client=None):
         pid = _ensure_profile_id(account_key, c)
         if not pid:
             return False, "could not resolve a Zernio profile for this gym"
-        data = c.connect_url(pid, platform)
+        data = c.connect_url(pid, platform, redirect_url=_connect_redirect_url(redirect_url))
     except _z.ZernioError as exc:
         return False, f"zernio {exc.status}: {exc.detail}"
     except Exception as exc:  # noqa: BLE001 - report, never crash the ops command
@@ -133,10 +147,15 @@ def connect_url_for(account_key, platform, client=None):
     return True, str(auth_url)
 
 
-def handle_social_connect(account_key, platform, client=None):
-    """GET /portal/<token>/social-connect?platform=instagram|facebook|googlebusiness
+def handle_social_connect(account_key, platform, client=None, redirect_url=None):
+    """GET /portal/<token>/social-connect?platform=instagram|facebook|googlebusiness[&redirect_url=...]
     -> {oauth_url}. Google Business connects through the SAME find-or-create profile +
-    connect_url path as IG/FB (Zernio platform key 'googlebusiness')."""
+    connect_url path as IG/FB (Zernio platform key 'googlebusiness').
+
+    redirect_url is the post-OAuth return target the PORTAL passes (its own Social page) so the
+    gym owner lands back in the LASSO portal after approving, never on the Zernio dashboard. When
+    the portal does not pass one, _connect_redirect_url falls back to the configured portal
+    origin — the redirect is NEVER omitted, so Zernio can never default to its dashboard."""
     if not config.zernio_enabled():
         return _disabled("social-connect")
     if not account_key:
@@ -148,7 +167,7 @@ def handle_social_connect(account_key, platform, client=None):
         pid = _ensure_profile_id(account_key, c)
         if not pid:
             return 502, {"error": "could not resolve a Zernio profile for this gym"}
-        data = c.connect_url(pid, platform)
+        data = c.connect_url(pid, platform, redirect_url=_connect_redirect_url(redirect_url))
     except _z.ZernioError as exc:
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
     except Exception as exc:  # network/parse: honest, never a fabricated URL
