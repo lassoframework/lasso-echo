@@ -774,3 +774,32 @@ def test_write_sidecar_records_consent_at_most_once(tmp_path, monkeypatch):
         cms._write_sidecar(lib, media, "clients/x/q.jpg", "cap", lambda *_: None,
                            client_context="ctx", consent=True)
     assert len(dam.consent_log_entries(os.path.join(lib, media))) == 1
+
+
+# ---- dynamic-gym discovery (portal-onboarded gyms auto-start) ---------------------
+def test_client_bases_excludes_dynamic_when_flag_off(monkeypatch):
+    from agent import accounts
+    from agent.accounts import Account, Platform
+    dyn = Account(key="piercefitness_ig", display_name="Pierce Fitness IG",
+                  platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    monkeypatch.setattr(cms.config, "client_scan_dynamic_enabled", lambda: False)
+    monkeypatch.setattr(accounts, "all_accounts", lambda: list(accounts.ACCOUNTS) + [dyn])
+    bases = cms._client_bases()
+    assert "piercefitness" not in bases   # flag OFF: dynamic gym not scanned (old behavior)
+
+
+def test_client_bases_includes_dynamic_when_flag_on(monkeypatch):
+    from agent import accounts
+    from agent.accounts import Account, Platform
+    dyn = Account(key="piercefitness_ig", display_name="Pierce Fitness IG",
+                  platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID")
+    monkeypatch.setattr(cms.config, "client_scan_dynamic_enabled", lambda: True)
+    monkeypatch.setattr(accounts, "all_accounts", lambda: list(accounts.ACCOUNTS) + [dyn])
+    bases = cms._client_bases()
+    assert "piercefitness" in bases        # flag ON: the portal-onboarded gym is discovered
+
+
+def test_client_bases_explicit_clients_wins_over_flag(monkeypatch):
+    monkeypatch.setattr(cms.config, "client_scan_dynamic_enabled", lambda: True)
+    # an explicit clients= list is always honored verbatim, flag irrelevant
+    assert cms._client_bases(clients=["piercefitness"]) == ["piercefitness"]

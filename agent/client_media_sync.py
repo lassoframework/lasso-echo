@@ -400,8 +400,16 @@ def _client_bases(clients=None):
     An explicit `clients` list (bases or account keys) wins. Otherwise discover from
     the account registry: every _ig client account (the client gyms), reduced to its
     base. LASSO's own accounts and blake_personal are excluded; the _fb mirrors fold
-    onto the same base as the _ig account (the generation key)."""
-    from .accounts import ACCOUNTS
+    onto the same base as the _ig account (the generation key).
+
+    DYNAMIC DISCOVERY (AGENT_CLIENT_SCAN_DYNAMIC, default OFF): with the flag ON the
+    discovery source is all_accounts() (hardcoded ACCOUNTS + the dynamic, portal-
+    onboarded gym registry) instead of ACCOUNTS alone. This is the fix for portal-
+    onboarded gyms (Pierce, 2026-08-20): they resolve via get_account() and have media
+    in R2, but the scanner never saw them because it iterated only the hardcoded list,
+    so an onboarded gym that uploaded never auto-started. Flag OFF = byte-for-byte the
+    old behavior (only the hardcoded gyms are scanned)."""
+    from .accounts import ACCOUNTS, all_accounts
 
     if clients:
         seen = []
@@ -411,8 +419,9 @@ def _client_bases(clients=None):
                 seen.append(base)
         return seen
 
+    source = all_accounts() if config.client_scan_dynamic_enabled() else ACCOUNTS
     bases = []
-    for acct in ACCOUNTS:
+    for acct in source:
         key = acct.key or ""
         if key.startswith("lasso") or key == "blake_personal":
             continue

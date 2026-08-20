@@ -1178,7 +1178,13 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    b.addEventListener("click", function(){
      if(b.classList.contains("busy")) return;
      setErr(""); b.classList.add("busy");
-     fetch(base + "/social-connect?platform=" + encodeURIComponent(b.dataset.p))
+     // Return the owner to THIS connect page after OAuth (so they see the updated
+     // "Connected" status and can link the next platform). Passing our own return URL
+     // also makes the "never land on the Zernio dashboard/pricing page" guarantee
+     // explicit at the call site, not reliant on the server-side fallback alone.
+     var ret = window.location.origin + window.location.pathname;
+     fetch(base + "/social-connect?platform=" + encodeURIComponent(b.dataset.p)
+           + "&redirect_url=" + encodeURIComponent(ret))
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
       .then(function(res){
         var url = res.j && res.j.oauth_url;

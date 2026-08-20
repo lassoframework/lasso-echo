@@ -1378,6 +1378,21 @@ def deny_backfill_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DENY_BACKFILL", "false"))
 
 
+def client_scan_dynamic_enabled() -> bool:
+    """
+    DYNAMIC-GYM DISCOVERY switch (AGENT_CLIENT_SCAN_DYNAMIC). OFF by default. When ON,
+    the client-media scanner discovers gyms from all_accounts() — the hardcoded ACCOUNTS
+    PLUS the dynamic, portal-onboarded gym registry (AGENT_DYNAMIC_ACCOUNTS) — instead of
+    the hardcoded list only.
+
+    This closes the gap where a portal-onboarded gym (registered in the dynamic registry,
+    with media uploaded to R2) was never scanned, so it never auto-started building even
+    though everything else was in place (Pierce Fitness, 2026-08-20). Flag OFF = the
+    scanner sees only the hardcoded gyms, exactly as before. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CLIENT_SCAN_DYNAMIC", "false"))
+
+
 def client_media_sync_enabled() -> bool:
     """
     Per-client MEDIA SYNC + auto-generate switch (AGENT_CLIENT_MEDIA_SYNC). OFF by
