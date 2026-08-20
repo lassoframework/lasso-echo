@@ -219,6 +219,12 @@ def test_is_infographic_creative_detects_house_card():
                    url="https://cdn/20260812T163147Z_Skierg.mp4")
     assert client_month_run._is_infographic_creative(ig) is True
     assert client_month_run._is_infographic_creative(photo) is False
+    # a REAL client upload whose own name contains 'infographic' must NOT be misread as
+    # a house infographic (prefix-only detection): else its caption is skipped ->
+    # captionless story, the exact bug. Real uploads are timestamp-prefixed.
+    real_named = _Draft("cap", "/lib/20260812T163147Z_gym_infographic.jpg",
+                        url="https://cdn/20260812T163147Z_gym_infographic.jpg")
+    assert client_month_run._is_infographic_creative(real_named) is False
 
 
 def test_maybe_format_story_skips_burn_for_infographic(monkeypatch, tmp_path):

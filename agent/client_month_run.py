@@ -603,14 +603,20 @@ def _is_infographic_creative(draft):
 
     Blake, 2026-08-20: an infographic story must NEVER get a caption burned on top (it
     would overlay the card's own copy); a real photo/video story MUST (a story publishes
-    empty-body, else it goes out captionless). Detection is by the house-render filename
-    marker on either the local path or the hosted url. A genuine client upload keeps its
-    intake basename (e.g. '20260812T163147Z_Skierg.mp4') and never matches, so a real
-    photo/video is never misread as an infographic and silently left captionless."""
+    empty-body, else it goes out captionless). Detection is the house-render filename
+    PREFIX on the local path or the hosted url.
+
+    PREFIX only, never a substring: a real client upload is stored timestamp-prefixed
+    ('20260812T163147Z_<name>', intake_web._safe_name), so it can never START with
+    'no_creative_' — but it COULD contain the word 'infographic' in its own name (e.g.
+    '..._gym_infographic.jpg'). A substring match there would skip the burn and publish
+    that real photo captionless (the exact bug we fix). The house renderer always emits
+    the 'no_creative_' prefix (even its empty-slug fallback is 'no_creative_infographic_
+    story.png'), so the prefix alone catches every infographic with zero false positives."""
     for attr in ("creative_path", "creative_public_url"):
         val = str(getattr(draft, attr, "") or "")
         base = val.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
-        if any(base.startswith(m) for m in _INFOGRAPHIC_MARKERS) or "infographic" in base:
+        if any(base.startswith(m) for m in _INFOGRAPHIC_MARKERS):
             return True
     return False
 
