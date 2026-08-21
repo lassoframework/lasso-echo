@@ -30,13 +30,67 @@ class Creative:
         return os.path.splitext(os.path.basename(self.path))[0]
 
 
+def _gym_library_dirnames():
+    """The set of directory NAMES that are a registered gym's OWN content library
+    root (the basename of every account's non-empty library_prefix, e.g. 'eng',
+    'gritx', 'topfuel', 'district_h').
+
+    CROSS-GYM ISOLATION (brand-integrity fix): LASSO's own accounts resolve their
+    library to the SHARED parent (content_library/) because their library_prefix is
+    empty. That parent holds every client gym's library as a SUBFOLDER. Without this
+    guard, list_creatives() on the parent absorbed each gym subfolder as a bogus
+    "carousel" (e.g. content_library/eng -> a 23 photo carousel), so a LASSO post
+    could ship a CLIENT gym's member photos. A gym's photo library is NEVER another
+    account's carousel: list_creatives skips any subfolder named here. Best-effort;
+    an import/registry failure returns an empty set (no isolation change, never a
+    crash) and the demo/lasso_v2 brand assets that live at the parent ROOT still
+    resolve exactly as before."""
+    try:
+        from .accounts import all_accounts
+    except Exception:
+        return set()
+    names = set()
+    for a in all_accounts():
+        prefix = (getattr(a, "library_prefix", "") or "").strip()
+        if prefix:
+            names.add(os.path.basename(os.path.normpath(prefix)))
+    return names
+
+
+def is_client_gym_asset(path):
+    """True when `path` lives inside a registered client gym's OWN library root
+    (content_library/<gym>/...). Used as the LAST-LINE brand-integrity guard so a
+    LASSO post can NEVER source a client gym's uploaded media, even if a subfolder
+    slipped past the list_creatives isolation (e.g. an unregistered upload folder is
+    handled by the caller; a REGISTERED gym folder is caught here). Best-effort:
+    returns False on any failure (no false block), matching the fail-open posture of
+    the isolation guard above (the caller still HOLDS on an unresolved asset)."""
+    try:
+        p = os.path.normpath(str(path or ""))
+        if not p:
+            return False
+        gym_roots = _gym_library_dirnames()
+        return any(seg in gym_roots for seg in p.split(os.sep))
+    except Exception:  # noqa: BLE001 - truly fail-open: never false-block on a guard
+        return False
+
+
 def list_creatives(library_path):
     creatives = []
     if not library_path or not os.path.isdir(library_path):
         return creatives
+    gym_roots = _gym_library_dirnames()
     for name in sorted(os.listdir(library_path)):
         full = os.path.join(library_path, name)
         if os.path.isdir(full):
+            # CROSS-GYM ISOLATION: a subfolder that is itself a registered gym's
+            # content library root is that gym's OWN media, never a carousel for
+            # whoever is scanning the parent (LASSO). Skip it. This is a pure
+            # correctness fix: it can only remove cross-gym contamination, never
+            # change a legitimate same-library pick (a real carousel bundle is not
+            # a gym library root).
+            if name in gym_roots:
+                continue
             # A subfolder with 2+ images is one carousel creative.
             carousel = _load_carousel(full)
             if carousel:

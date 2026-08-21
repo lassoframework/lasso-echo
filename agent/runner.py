@@ -707,6 +707,31 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             # client/non-LASSO accounts are unaffected (_skip_legacy_lasso_daily False).
             if draft is None and not _skip_legacy_lasso_daily:
                 creative = pick_next(account, acct_lib, used_creatives_for(account.key))
+                # BRAND-INTEGRITY GUARD (any SHARED-PARENT account: LASSO + blake_personal
+                # + any future empty-library_prefix owned account): such an account resolves
+                # acct_lib to the shared content_library/ parent, which holds every client
+                # gym's library as a subfolder. list_creatives already skips REGISTERED gym
+                # roots, but this is the absolute last line: if the pick is a client gym's
+                # uploaded media, DROP it. A CLIENT gym has its OWN explicit library_prefix
+                # so it never trips this (its own assets are legitimately its own); only an
+                # empty-prefix owned account can accidentally reach a client's folder. Never
+                # fall back to a client's photos: the day HOLDS with one loud alert (same
+                # posture as "a Story is never fabricated"), it does not ship the wrong asset.
+                from .library import is_client_gym_asset as _is_client_gym_asset
+                _own_prefix = (getattr(account, "library_prefix", "") or "").strip()
+                if (creative is not None and not _own_prefix
+                        and _is_client_gym_asset(creative.path)):
+                    _msg = (f"brand-integrity: {account.key} on {day_key} had NO own "
+                            f"brand asset; the library fallback picked a CLIENT gym's "
+                            f"media ({creative.path}). Dropped it (an owned/LASSO post never "
+                            f"uses a client's photos). Add a brand asset "
+                            f"(demo_/lasso_v2_ card) or the day holds.")
+                    print(f"[brand-integrity] {_msg}")
+                    ops_alerts.alert(_msg)
+                    from . import db as _db
+                    _db.audit("brand_integrity_drop", account.key, creative.path,
+                              account.key, day_key)
+                    creative = None
                 if creative is not None:
                     from .library_audit import check_creative as _check_creative
                     _issue = _check_creative(creative)
