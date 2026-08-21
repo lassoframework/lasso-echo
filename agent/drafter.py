@@ -179,10 +179,15 @@ def variant_hashtags(platform, hashtags):
 import re as _re_scaffold
 
 # Lines the LLM sometimes prepends despite "output ONLY the caption body": a markdown
-# header (# Caption Body:), a bare label (Caption:, Body:, Post:), or a preamble
-# (Here's the caption:). Stripped so scaffolding never reaches a gym's feed.
+# header (# Caption Body:), a bare or BOLDED label (Caption:, **Caption:**,
+# **CAPTION BODY:**, Body:, Post:), or a preamble (Here's the caption:). Stripped so
+# scaffolding never reaches a gym's feed. The optional [*_] runs allow markdown bold/
+# italic markers around the label (Bryan/Pierce, 2026-08-21: '**CAPTION BODY:**' leaked
+# onto a few posts because the old pattern did not tolerate the ** markers).
 _SCAFFOLD_LINE = _re_scaffold.compile(
-    r"^\s*(#{1,6}\s*)?(caption( body| text)?|body|post|here'?s[^\n:]*)\s*:?\s*$",
+    r"^\s*(?:#{1,6}\s*)?(?:[*_]{1,3}\s*)?"
+    r"(caption(?:\s+body|\s+text)?|body|post|here'?s[^\n:*_]*)"
+    r"\s*:?\s*(?:[*_]{1,3})?\s*$",
     _re_scaffold.IGNORECASE)
 
 

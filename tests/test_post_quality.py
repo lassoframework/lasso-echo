@@ -145,3 +145,11 @@ def test_strip_llm_scaffold():
     assert _strip_llm_scaffold("Caption:\nReal copy here.") == "Real copy here."
     assert _strip_llm_scaffold('"Real quoted copy."') == "Real quoted copy."
     assert _strip_llm_scaffold("Real copy, no scaffold.") == "Real copy, no scaffold."
+    # BOLDED labels the model emitted despite instructions (Bryan/Pierce, 2026-08-21):
+    # '**CAPTION BODY:**' leaked onto a few live posts. Strip the ** markers too.
+    assert _strip_llm_scaffold("**CAPTION BODY:**\n\nReal copy here.") == "Real copy here."
+    assert _strip_llm_scaffold("**Caption:**\nReal copy here.") == "Real copy here."
+    assert _strip_llm_scaffold("__Body__\nReal copy here.") == "Real copy here."
+    # a real caption that merely starts with a label-ish word is NOT over-stripped
+    assert _strip_llm_scaffold("Post-workout soreness is normal. Book now.") == \
+        "Post-workout soreness is normal. Book now."
