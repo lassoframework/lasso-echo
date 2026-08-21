@@ -416,7 +416,7 @@ class StoryBrandGenerator:
         if angle == "educational":
             block = [
                 "POST TYPE FOR THIS CAPTION: EDUCATIONAL (informational). TEACH the reader "
-                "ONE useful, TRUE point drawn ONLY from the approved source above — a how-to "
+                "ONE useful, TRUE point drawn ONLY from the approved source above: a how-to "
                 "step, a quick tip, a why-this-works, or a myth to bust. Keep it SB7: the "
                 "customer is still the hero and the gym is the guide who makes the point "
                 "simple. State no fact, number, or claim that is not in the approved source. "
