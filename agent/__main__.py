@@ -179,6 +179,8 @@ def _status():
     print(f"  whatsapp_intake: {config.whatsapp_intake_enabled()}  (env AGENT_WHATSAPP_INTAKE_ENABLED)")
     print(f"  tenant_brain   : {config.tenant_brain_enabled()}  (env AGENT_TENANT_BRAIN_ENABLED)")
     print(f"  sb7_captions   : {config.sb7_enabled()}  (env AGENT_SB7_ENABLED)")
+    print(f"  angle_rotation : {config.caption_angle_rotation_enabled()}  (env AGENT_CAPTION_ANGLE_ROTATION; rotate the SB7 problem/entry ANGLE round-robin across the month + widen the opening-avoid window to ~12; STYLE-only, never a fact, fabrication gate unchanged; OFF => only the opening is varied, window stays 6)")
+    print(f"  educational    : {config.educational_pillar_enabled()}  (env AGENT_EDUCATIONAL_PILLAR; an educational how-to/tip/why/myth-bust pillar (~1-in-N) GROUNDED ONLY in the gym's approved material — its 'educational' sources, else a reframed service/about/faq source using only that source's facts; nothing eligible SKIPS the slot, never fabricated; OFF => pillar set + rotation unchanged)")
     print(f"  draft_on_upload: {config.draft_on_upload_enabled()}  (env AGENT_DRAFT_ON_UPLOAD)")
     print(f"  intake_sync    : {config.social_intake_sync_enabled()}  (env AGENT_SOCIAL_INTAKE_SYNC)")
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")

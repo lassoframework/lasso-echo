@@ -2105,3 +2105,40 @@ def sb7_model() -> str:
     """Claude model for SB7 caption generation (env AGENT_SB7_MODEL).
     Defaults to Haiku 4.5 for speed and cost."""
     return os.environ.get("AGENT_SB7_MODEL", "claude-haiku-4-5-20251001")
+
+
+def caption_angle_rotation_enabled() -> bool:
+    """
+    Caption ANGLE rotation switch (AGENT_CAPTION_ANGLE_ROTATION). OFF by default =
+    byte-for-byte current behavior: only the OPENING is varied across a month (avoid
+    the last 6 openings + one retry), and the SB7 build gets no angle guidance.
+
+    ON (Bryan/Pierce: monthly captions felt "a bit repetitive"), the month builder
+    also rotates the underlying SB7 PROBLEM/ENTRY ANGLE round-robin across the planned
+    days and threads it into StoryBrandGenerator.build as STYLE-ONLY guidance ("Lead
+    from THIS angle this time: <angle>"), tracking the last few angles used so the model
+    avoids repeating them — and it WIDENS the opening-avoid window (all accepted openings
+    this build, capped ~12) so consecutive days diverge harder. The angle is never a
+    fact, never overrides the approved source, and never blocks a post; the figure/
+    fabrication gate is unchanged. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_ANGLE_ROTATION", "false"))
+
+
+def educational_pillar_enabled() -> bool:
+    """
+    Educational content-pillar switch (AGENT_EDUCATIONAL_PILLAR). OFF by default = zero
+    behavior change: 'educational' never enters the per-client category rotation and the
+    pillar set is exactly as today.
+
+    ON (Bryan asked for an "informational/educational" post type), a client gym with
+    educational-eligible approved material gets roughly 1-in-N posts as an EDUCATIONAL
+    how-to / tip / why-this-works / myth-bust, still SB7 (hero = the customer) but framed
+    to TEACH one useful, TRUE point. GROUNDED ONLY in the gym's approved material: it
+    draws from the gym's approved 'educational' sources when present, else it may REFRAME
+    an approved 'service' / 'about' / 'faq' source as a tip/why — but ONLY using facts in
+    that approved source. Nothing eligible -> the slot is SKIPPED (never a fabricated
+    educational fact). The figure/fabrication gate, banned-word gate, and no-dash law all
+    still run. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_EDUCATIONAL_PILLAR", "false"))

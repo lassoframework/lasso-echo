@@ -215,7 +215,8 @@ def _has_real_creative(draft):
 
 
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
-                         exclude_keys=(), avoid_openings=(), allow_reuse=False):
+                         exclude_keys=(), avoid_openings=(), allow_reuse=False,
+                         angle="", avoid_angles=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -238,7 +239,12 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
 
     avoid_openings (Ryan Parr, 2026-08-17): opening phrases already used on this build's
     earlier accepted days, threaded to the caption generator so this day does not lead
-    with the same hook as its neighbours. STYLE-only guidance; never blocks a day."""
+    with the same hook as its neighbours. STYLE-only guidance; never blocks a day.
+
+    angle / avoid_angles (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): the SB7
+    problem/entry angle this day should LEAD from and the recent angles to avoid, threaded
+    to the caption generator so the underlying angle varies across the month (not just the
+    opening). STYLE-only; never a fact, never blocks a day. Empty (flag OFF) => unchanged."""
     from . import post_quality
 
     def _accept(d):
@@ -256,7 +262,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     draft = client_content.build_client_draft(account, day_key, voice, library_path,
                                               exclude_keys=exclude_keys,
                                               avoid_openings=avoid_openings,
-                                              allow_reuse=allow_reuse)
+                                              allow_reuse=allow_reuse,
+                                              angle=angle, avoid_angles=avoid_angles)
     if draft is None:
         return None, None
     if _accept(draft):
@@ -273,7 +280,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         alt = client_content.build_client_draft(account, alt_key, voice, library_path,
                                                 exclude_keys=exclude_keys,
                                                 avoid_openings=avoid_openings,
-                                                allow_reuse=allow_reuse)
+                                                allow_reuse=allow_reuse,
+                                                angle=angle, avoid_angles=avoid_angles)
         if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
             # on day_key (only the day is re-pointed; the caption/source/photo are the
@@ -447,9 +455,20 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # feed caption and feed the recent window into the NEXT day's generation so several
     # days in a row do not lead with the same hook. STYLE-only, bounded, never a block;
     # with SB7 off (deterministic baseline) the generator ignores it, so nothing changes.
-    from .drafter import opening_signature
+    from .drafter import opening_signature, angle_for_index
     recent_openings = []            # accepted opening signatures, oldest..newest
     _OPENING_WINDOW = 6             # how many recent openings each new day must avoid
+    # ANGLE ROTATION (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): when armed,
+    # each accepted feed also gets a DISTINCT SB7 problem/entry angle round-robin (varied by
+    # a build-local index that only advances on ACCEPTED days, so the spread is dense) plus
+    # the recent angles to avoid, threaded into the caption generator. It also WIDENS the
+    # opening-avoid window to ~12 so consecutive days diverge harder. STYLE-only, never a
+    # fact, never a block. Flag OFF => no angle guidance and the window stays 6 (unchanged).
+    _angle_rotation = config.caption_angle_rotation_enabled()
+    _ANGLE_WINDOW = 3               # how many recent angles each new day must avoid
+    _WIDE_OPENING_WINDOW = 12       # widened opening-avoid window when angle rotation is on
+    recent_angles = []              # accepted angles, oldest..newest
+    angle_idx = 0                   # advances only on an ACCEPTED feed (dense round-robin)
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -464,9 +483,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             log(f"locked {day_key}: day already has approved/published content")
             continue
 
+        # Choose this day's angle (round-robin by the accepted-day index) + the recent
+        # angles to avoid, and widen the opening window, only when angle rotation is armed.
+        if _angle_rotation:
+            day_angle = angle_for_index(angle_idx)
+            day_avoid_angles = recent_angles[-_ANGLE_WINDOW:]
+            opening_window = _WIDE_OPENING_WINDOW
+        else:
+            day_angle, day_avoid_angles, opening_window = "", (), _OPENING_WINDOW
         feed, feed_drop = _clean_draft_for_day(
             account, day_key, voice, library_path, banned_words, log,
-            exclude_keys=used_keys, avoid_openings=recent_openings[-_OPENING_WINDOW:])
+            exclude_keys=used_keys, avoid_openings=recent_openings[-opening_window:],
+            angle=day_angle, avoid_angles=day_avoid_angles)
         if feed is None:
             if feed_drop:
                 skipped_banned += 1
@@ -506,6 +534,11 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         sig = opening_signature(getattr(feed, "caption", "") or "")
         if sig:
             recent_openings.append(sig)
+        # Record this accepted feed's angle + advance the round-robin so the NEXT accepted
+        # day gets a DISTINCT angle (angle rotation ON only; OFF leaves both untouched).
+        if _angle_rotation:
+            recent_angles.append(day_angle)
+            angle_idx += 1
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
     # available was planned and must reach the coach (never silent). One summary staff alert

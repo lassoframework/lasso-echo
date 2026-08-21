@@ -211,7 +211,8 @@ def test_make_caption_uses_sb7_when_enabled(monkeypatch):
     from agent.drafter import StoryBrandGenerator
     monkeypatch.setattr(
         StoryBrandGenerator, "build",
-        lambda self, voice, creative, account=None, avoid_openings=(): (
+        lambda self, voice, creative, account=None, avoid_openings=(),
+        angle="", avoid_angles=(): (
             "You are busy and stuck. Our HYROX classes meet you where you are. "
             "Show up prepared.", ["#eng"], ["body"]))
     voice = VoiceDoc(raw="ENG voice.", hashtags=["#eng"], ctas=["Book now."])
@@ -234,7 +235,8 @@ def test_make_caption_falls_back_on_sb7_error(monkeypatch):
     monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
     from agent.drafter import StoryBrandGenerator
 
-    def boom(self, voice, creative, account=None, avoid_openings=()):
+    def boom(self, voice, creative, account=None, avoid_openings=(),
+             angle="", avoid_angles=()):
         raise RuntimeError("LLM down")
     monkeypatch.setattr(StoryBrandGenerator, "build", boom)
     voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Book now."])
@@ -248,7 +250,8 @@ def test_make_caption_rejects_sb7_echoing_raw_source(monkeypatch):
     monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
     from agent.drafter import StoryBrandGenerator
     monkeypatch.setattr(StoryBrandGenerator, "build",
-                        lambda self, v, c, account=None, avoid_openings=(): ("HYROX", ["#x"], ["b"]))
+                        lambda self, v, c, account=None, avoid_openings=(),
+                        angle="", avoid_angles=(): ("HYROX", ["#x"], ["b"]))
     voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Save this."])
     cap, _ = client_content.make_caption(Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID"), _Src("HYROX"), voice, "k")
     assert "Save this." in cap                  # fell back to baseline (which adds CTA)

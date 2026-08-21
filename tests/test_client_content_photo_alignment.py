@@ -113,7 +113,7 @@ def test_make_caption_grounds_sb7_in_the_photo(monkeypatch):
     seen = {}
 
     class _FakeSB7:
-        def build(self, voice, creative, account=None, avoid_openings=()):
+        def build(self, voice, creative, account=None, avoid_openings=(), angle="", avoid_angles=()):
             seen["note"] = creative.client_note
             return ("Your kid's confidence is built in the gym.", ["#Youth"], [])
 
@@ -137,7 +137,7 @@ def test_make_caption_without_creative_has_no_scene_hint(monkeypatch):
     seen = {}
 
     class _FakeSB7:
-        def build(self, voice, creative, account=None, avoid_openings=()):
+        def build(self, voice, creative, account=None, avoid_openings=(), angle="", avoid_angles=()):
             seen["note"] = creative.client_note
             return ("A real caption body here.", ["#Fit"], [])
 

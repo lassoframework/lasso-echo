@@ -12,6 +12,10 @@ category, and a source citation (where the fact came from). The six categories:
   faq          a common question + answer
   about        who the gym is, its story, its coaches
   promo        a time-boxed promotion or event
+  educational  an informational how-to / tip / why-this-works / myth-bust the gym can teach
+               (Bryan asked for an "informational/educational" post type). GROUNDED like
+               every other category: a caption may only state facts an APPROVED educational
+               source of THIS account already carries.
 
 STATUS is the hard gate. A source is 'pending' until a human approves it; the
 drafting path (client_content) reads ONLY approved sources, so client-submitted
@@ -25,12 +29,47 @@ from these (see config.client_sources_enabled and client_content).
 """
 
 from dataclasses import dataclass
+from datetime import date
 
 from . import db
 
 # The client content set. Kept small and concrete on purpose: every category maps
 # to something a gym owner can actually hand us on day one.
-CLIENT_CATEGORIES = ("offer", "service", "testimonial", "faq", "about", "promo")
+CLIENT_CATEGORIES = ("offer", "service", "testimonial", "faq", "about", "promo",
+                     "educational")
+
+# Categories whose APPROVED sources may be REFRAMED into an educational post when a gym
+# has no dedicated 'educational' source of its own. Reframing states ONLY facts already in
+# the approved source (the figure/fabrication gate still runs); it never invents a claim.
+# Ordered by how naturally each teaches: a service explains what/why, an about the ethos,
+# an faq answers a real question.
+EDUCATIONAL_REFRAME_CATEGORIES = ("service", "about", "faq")
+
+
+def educational_source_for(account_key, day_key=None):
+    """One APPROVED source eligible to seed an EDUCATIONAL post for this account, or None
+    when nothing is eligible (the caller then SKIPS the slot — never fabricates).
+
+    Preference order, all APPROVED-only (a pending source never qualifies):
+      1. the account's own 'educational' sources, if any;
+      2. else a reframeable 'service' / 'about' / 'faq' source (facts stay verbatim; only
+         the framing becomes a tip/why — the figure/fabrication gate still governs claims).
+
+    day_key (optional) rotates the pick deterministically across the days the educational
+    slot comes up, so the same fact does not repeat back to back. Returns a ClientSource."""
+    edu = approved_sources(account_key, category="educational")
+    if edu:
+        pool = edu
+    else:
+        pool = []
+        for cat in EDUCATIONAL_REFRAME_CATEGORIES:
+            pool.extend(approved_sources(account_key, category=cat))
+    if not pool:
+        return None
+    if day_key is None:
+        return pool[0]
+    idx = date.fromisoformat(str(day_key)[:10]).toordinal() % len(pool)
+    return pool[idx]
 
 _STATUSES = ("approved", "pending")
 

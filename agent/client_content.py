@@ -36,15 +36,31 @@ def _day_ordinal(day_key):
     return date.fromisoformat(str(day_key)[:10]).toordinal()
 
 
-def category_for_day(account_key, day_key, present=None):
-    """The client category this day draws from, spread evenly across the
-    categories the account actually has approved content in. None when the account
-    has no approved sources at all."""
+def _pillars_for(account_key, present=None):
+    """The pillar-rotation list for an account: the categories it has approved content
+    in, spread evenly. When AGENT_EDUCATIONAL_PILLAR is ON and the account has an
+    educational-eligible source (its own 'educational' sources, or a reframeable
+    service/about/faq), 'educational' is guaranteed EXACTLY ONCE in the rotation so it
+    lands roughly 1-in-N days. Flag OFF => the list is exactly categories_present (today's
+    behavior). Returns [] when the account has no approved sources at all."""
     present = present if present is not None \
         else client_sources.categories_present(account_key)
-    if not present:
+    pillars = list(present)
+    if config.educational_pillar_enabled():
+        eligible = client_sources.educational_source_for(account_key) is not None
+        if eligible and "educational" not in pillars:
+            pillars.append("educational")
+    return pillars
+
+
+def category_for_day(account_key, day_key, present=None):
+    """The client category this day draws from, spread evenly across the account's
+    pillar rotation (see _pillars_for). None when the account has no approved sources
+    at all. Flag OFF => byte-for-byte the old spread over categories_present."""
+    pillars = _pillars_for(account_key, present)
+    if not pillars:
         return None
-    return present[_day_ordinal(day_key) % len(present)]
+    return pillars[_day_ordinal(day_key) % len(pillars)]
 
 
 def _source_for_day(account_key, day_key, category, present):
@@ -278,7 +294,7 @@ def _grounded_hint(base_hint, verified):
 
 
 def make_caption(account, source, voice, creative_key, creative=None,
-                 avoid_openings=(), verified=None):
+                 avoid_openings=(), verified=None, angle="", avoid_angles=()):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -299,7 +315,14 @@ def make_caption(account, source, voice, creative_key, creative=None,
     phrases used on recent planned days. It is passed to the SB7 generator as STYLE-only
     guidance so consecutive days stop leading with the same hook. It never carries a
     fact and never blocks a post; the baseline fallback ignores it (it only ever emits
-    the verbatim approved source, which the A+ / banned-word gates already govern)."""
+    the verbatim approved source, which the A+ / banned-word gates already govern).
+
+    ANGLE ROTATION (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): `angle` is the
+    SB7 problem/entry angle this day should LEAD from (or the special 'educational' post
+    type); `avoid_angles` are the recent angles to steer away from. Both are STYLE-only
+    (never a fact, never an override of the approved source) and are handed straight to
+    the SB7 generator; the baseline fallback ignores them. Empty (the default / flag OFF)
+    => no angle guidance, exactly today's behavior."""
     if config.sb7_enabled():
         try:
             from .drafter import StoryBrandGenerator
@@ -308,7 +331,8 @@ def make_caption(account, source, voice, creative_key, creative=None,
                 hint = _grounded_hint(hint, verified)
             cap, tags, _frags = StoryBrandGenerator().build(
                 voice, _SourceCreative(source, creative_key, photo_hint=hint),
-                account=account, avoid_openings=avoid_openings)
+                account=account, avoid_openings=avoid_openings,
+                angle=angle, avoid_angles=avoid_angles)
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
                 return filter_platform_copy(cap).strip(), tags
@@ -371,7 +395,8 @@ def classify(draft):
 
 def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
-                       avoid_openings=(), allow_reuse=False):
+                       avoid_openings=(), allow_reuse=False,
+                       angle="", avoid_angles=()):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -391,6 +416,17 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     avoid_openings (Ryan Parr, 2026-08-17): opening phrases used on recent planned
     days, threaded to the caption generator so consecutive days do not lead with the
     same hook. STYLE-only, never a fact, never a block.
+
+    angle / avoid_angles (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): the SB7
+    problem/entry angle this day should LEAD from and the recent angles to avoid; STYLE-
+    only, threaded straight to the SB7 generator (never a fact, never a block). Empty
+    (flag OFF) => today's behavior.
+
+    EDUCATIONAL pillar (Bryan, AGENT_EDUCATIONAL_PILLAR): when the day's rotated pillar is
+    'educational', the source is resolved from the gym's APPROVED educational material
+    (its own 'educational' sources, else a reframeable service/about/faq source) and the
+    SB7 caption is written with the 'educational' angle (TEACH one true point). If nothing
+    is eligible, the day returns None and is SKIPPED — never a fabricated educational fact.
     """
     if not config.client_sources_enabled():
         return None
@@ -399,12 +435,26 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     present = client_sources.categories_present(account.key)
     if not present:
         return None                        # no approved sources: caller falls back
+    # The rotation list (may inject 'educational' when the pillar flag is armed + eligible),
+    # used for BOTH the day's pillar and the source-rotation cycle math so they stay aligned.
+    pillars = _pillars_for(account.key, present)
     category = category_for_day(account.key, day_key, present)
-    source = _source_for_day(account.key, day_key, category, present)
+    if category == "educational":
+        # EDUCATIONAL source resolution: the gym's own approved 'educational' sources, else
+        # a reframed approved service/about/faq source (facts stay verbatim). None -> SKIP
+        # the day (the fabrication gate is never bypassed for an educational post).
+        source = client_sources.educational_source_for(account.key, day_key)
+        # Lead the SB7 caption from the educational angle unless the caller forced one.
+        if not (angle or "").strip():
+            angle = "educational"
+    else:
+        source = _source_for_day(account.key, day_key, category, pillars)
     if source is None:
         return None
     # Fabrication gate: the fact must be an approved claim for THIS account. It is,
-    # by construction (it is an approved source), but we never skip the check.
+    # by construction (it is an approved source), but we never skip the check. This runs
+    # identically for an educational source (its text is an approved-source claim), so an
+    # educational post can never smuggle in an unverified fact.
     claims = client_sources.approved_claims(account.key)
     if not rotation.is_gate_clean(source.text, approved_claims=claims):
         return None
@@ -447,7 +497,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         # video shows (its sidecar note + filename + crop-verified elements).
         caption, hashtags = make_caption(account, source, voice,
                                          _image_key(image), creative=image,
-                                         avoid_openings=avoid_openings, verified=verified)
+                                         avoid_openings=avoid_openings, verified=verified,
+                                         angle=angle, avoid_angles=avoid_angles)
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -491,7 +542,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
 
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
-                                     avoid_openings=avoid_openings)
+                                     avoid_openings=avoid_openings,
+                                     angle=angle, avoid_angles=avoid_angles)
     # Option A: a source-backed template card, when a generator is wired + armed.
     template_url = template_fn(account, source, day_key) if template_fn else None
     if template_url:

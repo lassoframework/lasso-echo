@@ -261,6 +261,36 @@ def _opening_tokens(caption):
     return []
 
 
+# CAPTION ANGLE ROTATION (Bryan/Pierce, 2026-08: monthly captions felt "a bit
+# repetitive"). Today only the OPENING is varied. Behind AGENT_CAPTION_ANGLE_ROTATION
+# (config.caption_angle_rotation_enabled, default OFF) the month builder also rotates
+# the SB7 PROBLEM/ENTRY ANGLE round-robin across the planned days, threading it into
+# StoryBrandGenerator.build as STYLE-ONLY guidance. An angle is never a fact, never
+# overrides the approved source, and never blocks a post (the figure/fabrication gate
+# still runs). A small, readable palette of gen-pop boutique-fitness entry points:
+CAPTION_ANGLES = (
+    "time-scarcity",
+    "low-energy",
+    "lack-of-accountability",
+    "low-confidence",
+    "no-results-yet",
+    "intimidation",
+    "consistency-struggle",
+    "community/belonging",
+)
+
+
+def angle_for_index(index):
+    """The rotation angle for a 0-based planned-day index (round-robin over
+    CAPTION_ANGLES). Deterministic and stable across re-runs so a rebuilt month keeps
+    its angle spread. A negative/None index maps to the first angle."""
+    try:
+        i = int(index)
+    except (TypeError, ValueError):
+        i = 0
+    return CAPTION_ANGLES[i % len(CAPTION_ANGLES)]
+
+
 def opening_signature(caption, words=_OPENING_WORDS):
     """A normalized signature of a caption's OPENING: the first `words` normalized
     words of its first non-hashtag line. Two captions that lead with the same hook
@@ -367,6 +397,47 @@ class StoryBrandGenerator:
         return "\n".join(lines) + "\n\n"
 
     @staticmethod
+    def _angle_block(angle, avoid_angles=()):
+        """A STYLE-only prompt instruction telling the model to LEAD from a specific SB7
+        problem/entry angle this time, and to avoid the recently used angles, so the
+        underlying angle varies across a month instead of only the opening (Bryan/Pierce,
+        2026-08). NEVER a source of facts and never an override of the approved source:
+        the customer's real problem still comes from the voice doc + client note, this
+        only steers WHICH true angle leads. Returns "" when no angle is supplied (flag
+        OFF or the first call), so behavior is unchanged unless the caller opts in.
+
+        EDUCATIONAL angle (Bryan's "informational/educational" post type): a special
+        angle string 'educational' switches the guidance to TEACH one useful, TRUE point
+        (a how-to / tip / why-this-works / myth-bust) drawn ONLY from the approved source,
+        still SB7 with the customer as hero and the CTA kept separate. No invented facts."""
+        angle = (angle or "").strip()
+        if not angle:
+            return ""
+        if angle == "educational":
+            block = [
+                "POST TYPE FOR THIS CAPTION: EDUCATIONAL (informational). TEACH the reader "
+                "ONE useful, TRUE point drawn ONLY from the approved source above — a how-to "
+                "step, a quick tip, a why-this-works, or a myth to bust. Keep it SB7: the "
+                "customer is still the hero and the gym is the guide who makes the point "
+                "simple. State no fact, number, or claim that is not in the approved source. "
+                "Keep the CTA separate (it is added for you)."]
+        else:
+            block = [f"LEAD FROM THIS ANGLE THIS TIME (style guidance only, NEVER a new "
+                     f"fact and NEVER an override of the approved source above): frame the "
+                     f"customer's real problem through the lens of '{angle}'. Use it only to "
+                     f"choose WHICH true angle opens the caption."]
+        seen, phrases = set(), []
+        for a in avoid_angles or ():
+            a = (a or "").strip()
+            if a and a != angle and a.lower() not in seen:
+                seen.add(a.lower())
+                phrases.append(a)
+        if phrases:
+            block.append("Do NOT repeat the angle of the recent posts: "
+                         + ", ".join(phrases) + ".")
+        return "\n".join(block) + "\n\n"
+
+    @staticmethod
     def _brain_guidance(account):
         """Fold THIS gym's learned preferences into the prompt so every edit
         makes the next caption better. Two signals, both fabrication-gated at the
@@ -410,7 +481,8 @@ class StoryBrandGenerator:
                 parts.append(f"  AFTER (preferred): {after}")
         return "\n".join(parts) + "\n\n"
 
-    def build(self, voice, creative, account=None, avoid_openings=()):
+    def build(self, voice, creative, account=None, avoid_openings=(),
+              angle="", avoid_angles=()):
         """Write one SB7 caption.
 
         avoid_openings (optional): normalized opening phrases used on RECENT planned
@@ -421,7 +493,14 @@ class StoryBrandGenerator:
         stronger nudge and prefer the more varied result; we NEVER block the post over
         it — a caption is always produced (template fallback + figure gate stay intact).
         A brand-new gym / the first day passes avoid_openings empty and behaves exactly
-        as before."""
+        as before.
+
+        angle / avoid_angles (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION):
+        angle is the SB7 problem/entry angle this caption should LEAD from (one of
+        CAPTION_ANGLES), or the special 'educational' post type; avoid_angles are the
+        recent angles to steer away from. Both are STYLE-only: they never carry a fact
+        and never override the approved source (the figure/fabrication gate still runs).
+        Empty (the default, flag OFF) => no angle guidance, exactly today's prompt."""
         client_note = (creative.client_note or "").strip()
         cta = _pick_cta(voice, creative)
         hashtags = _select_hashtags(voice, creative)
@@ -431,6 +510,7 @@ class StoryBrandGenerator:
 
         guidance = self._brain_guidance(account)
         avoid_block = self._avoid_openings_block(avoid_openings)
+        angle_block = self._angle_block(angle, avoid_angles)
         avoid_list = [p for p in (avoid_openings or ()) if (p or "").strip()]
 
         def _compose(extra_nudge=""):
@@ -438,6 +518,7 @@ class StoryBrandGenerator:
                 f"BRAND VOICE DOC:\n{voice.raw}\n\n"
                 f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
                 f"{guidance}"
+                f"{angle_block}"
                 f"{avoid_block}"
                 f"{extra_nudge}"
                 "Write a StoryBrand-structured caption body. Problem-first. "
