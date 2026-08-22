@@ -713,3 +713,42 @@ def test_account_for_skips_non_ig_fb_platforms():
     assert ca._account_for({"account": "googlebusiness"}, "eng") is None
     assert ca._account_for({"account": "youtube"}, "eng") is None
     assert ca._account_for({"account": ""}, "eng") is None
+
+
+def test_stale_story_self_heals_and_publishes_same_tick(armed, monkeypatch):
+    """Dale/ENG 2026-08-22: an edited-caption story used to strand silently on 'approved'.
+    Now the publish lane re-burns the current caption onto fresh media and publishes it in
+    the SAME tick (only holds if the re-burn cannot run)."""
+    from agent import story_image, story_reburn
+    NEW = "https://cdn/healed__story.jpg"
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url="https://cdn/old__story.jpg", caption="edited caption")
+    row["source_media_url"] = "https://cdn/raw.jpg"
+    store = _FakeStore([row])
+    store.patch_image_url = lambda gym, rid, url: store.rows[rid].__setitem__("image_url", url)
+    # OLD media is stale; the re-burned NEW media carries the caption.
+    monkeypatch.setattr(story_image, "story_media_carries_caption", lambda url, cap: url == NEW)
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda r: True)
+    monkeypatch.setattr(story_reburn, "reburn", lambda *a, **k: NEW)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    # it healed the media and published this tick, rather than holding
+    assert store.rows["s"]["image_url"] == NEW
+    assert [c[0] for c in store.published_calls] == ["s"]
+
+
+def test_stale_story_without_source_media_holds_not_publishes(armed, monkeypatch):
+    """The other side: a stale story that CANNOT re-burn (no source_media_url) is HELD,
+    never published captionless (no regression)."""
+    from agent import story_image, story_reburn
+    row = _row("s2", account="instagram", fmt="story", status="approved",
+               image_url="https://cdn/old__story.jpg", caption="edited caption")
+    store = _FakeStore([row])
+    monkeypatch.setattr(story_image, "story_media_carries_caption", lambda url, cap: False)
+    monkeypatch.setattr(story_reburn, "should_reburn", lambda r: False)  # no source_media_url
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    assert store.published_calls == []          # held, not published
+    assert store.rows["s2"]["status"] == "approved"
