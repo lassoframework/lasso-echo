@@ -145,12 +145,16 @@ def build_platform_data(*, account_id, topic_type, location_id, pillar,
         ct = (cta_type or DEFAULT_CTA).upper()
         if ct not in CTA_TYPES:
             raise GbpPayloadError(f"unknown cta_type {cta_type!r}")
-        cta = {"type": ct}
-        if ct != "CALL":                # CALL has no url; all others get UTM'd url
-            if not cta_url:
-                raise GbpPayloadError(f"{ct} CTA requires a url")
-            cta["url"] = utm_url(cta_url, pillar)
-        psd["callToAction"] = cta
+        # A GBP post's CTA button is OPTIONAL. A non-CALL CTA needs a url; when none is
+        # available (no offer/booking link resolved) OMIT the button entirely rather than
+        # failing the whole post (Dale/ENG 2026-08-22: LEARN_MORE + empty url raised and
+        # the GBP post could never publish). CALL needs no url. A post with no button is
+        # valid and still publishes.
+        if ct == "CALL":
+            psd["callToAction"] = {"type": ct}
+        elif cta_url:
+            psd["callToAction"] = {"type": ct, "url": utm_url(cta_url, pillar)}
+        # else: no url -> no callToAction (button omitted), post still valid
         if tt == "EVENT":
             if not event:
                 raise GbpPayloadError("EVENT requires event details")

@@ -300,6 +300,10 @@ class SupabaseCalendarStore:
           - status NOT in ('published','denied','killed')
           - published_at IS NULL   (never re-publish a row already sent)
           - image_url present      (a row with no creative is skipped upstream too)
+          - account IN (instagram, facebook)  (this is the IG/FB lane ONLY; a
+            googlebusiness row is published by the SEPARATE GBP worker and must never
+            enter this lane — without this filter the IG/FB lane grabbed a GBP row and
+            posted its Google caption to Instagram, Dale/ENG 2026-08-22)
         `run_date` is 'YYYY-MM-DD' (validated by the caller). Returns a list of dicts.
         Gym scoped by the gym_id=eq filter so another gym's row is never returned.
 
@@ -321,6 +325,7 @@ class SupabaseCalendarStore:
             "status": "not.in.(published,denied,killed)",
             "published_at": "is.null",
             "image_url": "not.is.null",
+            "account": "in.(instagram,facebook)",
             "order": "created_at",
         }
         r = self._client().get(

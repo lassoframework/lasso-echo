@@ -141,11 +141,50 @@ def _account_for(row, gym_id="lasso"):
     pages. Returns None when no such account exists (the row is then skipped, never
     misrouted)."""
     plat = (row.get("account") or "").strip().lower()
+    # BELT-AND-SUSPENDERS (Dale/ENG 2026-08-22): this is the IG/FB lane. A row for any
+    # OTHER platform (googlebusiness, published by its own worker) must be SKIPPED, never
+    # silently mapped to _ig. Previously any non-'facebook' account fell through to _ig,
+    # so a googlebusiness row posted its Google caption to Instagram.
+    if plat not in ("instagram", "facebook"):
+        return None
     base = (gym_id or "lasso").strip() or "lasso"
     if base == "lasso":
         return get_account("lasso_fb" if plat == "facebook" else "lasso_ig")
     suffix = "_fb" if plat == "facebook" else "_ig"
     return get_account(f"{base}{suffix}")
+
+
+def _reburn_stale_story(row, account, store):
+    """A due, approved STORY whose burned media no longer carries its CURRENT (edited)
+    caption is re-burned NOW from its raw source_media_url and its image_url swapped, so an
+    edited-caption story still posts instead of stranding silently forever (Dale/ENG
+    2026-08-22: an edited story caption held on 'approved' and never published). Returns the
+    updated row (fresh image_url that carries the caption) on success, else None (the caller
+    then holds + alerts, as before). Best-effort: never raises. Requires source_media_url on
+    the row (story_reburn.should_reburn); rows built before AGENT_STORY_SOURCE_MEDIA lack it
+    and still hold, but every new build persists it so edited stories self-heal at publish."""
+    try:
+        from . import story_reburn
+        if not story_reburn.should_reburn(row):
+            return None
+        name = (getattr(account, "display_name", "") or "").strip()
+        for suf in (" IG", " FB", " Instagram", " Facebook", " Facebook Page"):
+            if name.endswith(suf):
+                name = name[: -len(suf)].strip()
+        new_url = story_reburn.reburn(row.get("source_media_url"), row.get("caption") or "",
+                                      name, account.key)
+        if not new_url:
+            return None
+        patch = getattr(store, "patch_image_url", None)
+        if patch is not None:
+            patch(row.get("gym_id"), row.get("id"), new_url)
+        updated = dict(row)
+        updated["image_url"] = new_url
+        return updated
+    except Exception as e:  # noqa: BLE001 - a self-heal must never crash the publish lane
+        print(f"[calendar-autopublish] story self-heal reburn failed for "
+              f"{row.get('id')}: {type(e).__name__}: {e}")
+        return None
 
 
 def scheduled_iso_for_row(row, now=None):
@@ -330,9 +369,17 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # row alone. A non-story row, or a story whose media was NOT caption-burned by
         # us (raw baseline), is never affected.
         if _story_media_is_stale(row):
-            waiting.append(row_id)
-            _alert_story_needs_render(row_id, gym_id)
-            continue
+            # SELF-HEAL (Dale/ENG 2026-08-22): rather than hold this edited-caption story
+            # silently forever, re-burn the CURRENT caption onto fresh media now and swap
+            # the image_url. If it now carries the caption, publish it this tick. Only when
+            # the re-burn cannot run (no source_media_url) or still mismatches do we hold +
+            # alert (the old behavior, but now the exception, not the rule).
+            healed = _reburn_stale_story(row, account, store)
+            if healed is None or _story_media_is_stale(healed):
+                waiting.append(row_id)
+                _alert_story_needs_render(row_id, gym_id)
+                continue
+            row = healed  # freshly re-burned; falls through to the exactly-once claim below
 
         # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.
         try:

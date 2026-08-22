@@ -703,3 +703,13 @@ def test_mark_publish_failed_reverts_to_pending_only():
     _, _url, params, _headers, body = http.calls[0]
     assert params["id"] == "eq.a"
     assert body == {"status": "pending"}                 # nothing else recorded
+
+
+def test_account_for_skips_non_ig_fb_platforms():
+    # Dale/ENG 2026-08-22: a googlebusiness row must NEVER be mapped into the IG/FB lane
+    # (it was silently posting the Google caption to Instagram). _account_for returns None
+    # for any platform that is not instagram/facebook, so the caller skips it.
+    from agent import calendar_autopublish as ca
+    assert ca._account_for({"account": "googlebusiness"}, "eng") is None
+    assert ca._account_for({"account": "youtube"}, "eng") is None
+    assert ca._account_for({"account": ""}, "eng") is None

@@ -118,11 +118,19 @@ def test_event_requires_schedule():
                                 cta_url="https://gym.com/x")
 
 
-def test_non_call_cta_requires_url():
-    with pytest.raises(gbp.GbpPayloadError):
-        gbp.build_platform_data(account_id="a", topic_type="STANDARD",
-                                location_id="locations/1", pillar="p",
-                                cta_type="BOOK", cta_url="")
+def test_non_call_cta_without_url_omits_button_not_raises():
+    # Dale/ENG 2026-08-22: a non-CALL CTA with no url used to RAISE, which failed the whole
+    # GBP post so it never published. A CTA button is OPTIONAL, so now we OMIT the button
+    # (post still valid) instead of failing. A CALL CTA needs no url; a url, when present,
+    # is included.
+    psd = gbp.build_platform_data(account_id="a", topic_type="STANDARD",
+                                  location_id="locations/1", pillar="p",
+                                  cta_type="BOOK", cta_url="")["platformSpecificData"]
+    assert "callToAction" not in psd                 # omitted, not raised
+    psd2 = gbp.build_platform_data(account_id="a", topic_type="STANDARD",
+                                   location_id="locations/1", pillar="p",
+                                   cta_type="BOOK", cta_url="https://gym.com/book")["platformSpecificData"]
+    assert psd2["callToAction"]["type"] == "BOOK" and "url" in psd2["callToAction"]
 
 
 def test_bad_topic_type_raises():
