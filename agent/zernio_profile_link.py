@@ -45,6 +45,23 @@ def _fb_page_id(accounts_json):
     return ""
 
 
+def _name_candidates(row):
+    """Display-name variants to try when a UUID-keyed portal gym's base does not match its
+    Zernio profile name. Ordered, de-duped, empties dropped. e.g. 'Top Fuel Fitness' ->
+    ['Top Fuel Fitness', 'topfuelfitness', 'top_fuel_fitness', 'top fuel fitness']."""
+    name = ((row.get("display_name") or row.get("gym_name") or "")).strip()
+    if not name:
+        return []
+    variants = [name, name.lower().replace(" ", ""),
+                name.lower().replace(" ", "_"), name.lower()]
+    seen, out = set(), []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
     """Ensure every client gym's gyms.zernio_profile_id is populated from Zernio.
 
@@ -73,7 +90,17 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
             if row and (row.get("zernio_profile_id") or "").strip():
                 already += 1
                 continue                                  # never overwrite a set id
+            # Match the Zernio profile by the base key FIRST (named gyms: eng, topfuel,
+            # piercefitness), then fall back to the gym's DISPLAY NAME. A portal-onboarded
+            # gym is keyed by a UUID, so its base never matches the profile name; its Zernio
+            # profile is named after the gym, so the display-name pass links it. Any gym
+            # going forward links automatically whichever key its profile is named for.
             pid = zernio.find_profile_id(base)
+            if not pid and row:
+                for cand in _name_candidates(row):
+                    pid = zernio.find_profile_id(cand)
+                    if pid:
+                        break
             if not pid:
                 no_profile += 1
                 results.append({"gym": base, "status": "no_profile"})

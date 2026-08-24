@@ -96,6 +96,27 @@ def test_one_gym_error_never_blocks_the_rest(armed):
     assert db.rows["good"]["zernio_profile_id"] == "PIDG"
 
 
+def test_links_uuid_keyed_gym_by_display_name(armed):
+    """A portal-onboarded gym is keyed by a UUID, so its base never matches the Zernio
+    profile name. It must still link via its display name (everyone going forward)."""
+    uuid = "8a668b95-da93-41ea-b28a-df3526c529fe"
+    db = _FakeDb({uuid: {"zernio_profile_id": "", "display_name": "Top Fuel Fitness"}})
+    z = _FakeZernio(
+        {"topfuelfitness": "PIDT"},                 # profile named for the gym, not the uuid
+        accounts={"PIDT": {"accounts": [{"platform": "instagram"}]}},
+    )
+    out = zpl.link_client_profiles(bases=[uuid], zernio=z, db=db)
+    assert out["linked"] == 1
+    assert db.rows[uuid]["zernio_profile_id"] == "PIDT"
+
+
+def test_name_candidates_variants():
+    assert zpl._name_candidates({"display_name": "Top Fuel Fitness"}) == [
+        "Top Fuel Fitness", "topfuelfitness", "top_fuel_fitness", "top fuel fitness"]
+    assert zpl._name_candidates({"display_name": ""}) == []
+    assert zpl._name_candidates({"gym_name": "GritX"}) == ["GritX", "gritx"]
+
+
 def test_fb_page_id_picks_single_available_page():
     assert zpl._fb_page_id({"accounts": [
         {"platform": "facebook", "metadata": {"availablePages": [{"id": "P1"}]}}]}) == "P1"
