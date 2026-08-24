@@ -120,3 +120,24 @@ def test_no_base_url_returns_none(monkeypatch, tmp_path):
     fc = FakeClient()
     assert media_host.host_media(_file(tmp_path), "gym-a", client=fc) is None
     assert fc.put_calls == []
+
+
+# ---- download_bytes / key derivation (feed preflight re-fetch) --------------
+
+def test_key_from_public_url_roundtrip(monkeypatch):
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://pub.example.dev", raising=False)
+    key = media_host._key_from_public_url("https://pub.example.dev/echo/eng_ig/abc/My%20Photo.jpg")
+    assert key == "echo/eng_ig/abc/My Photo.jpg"          # URL-unquoted
+    # a url not under our base is not ours
+    assert media_host._key_from_public_url("https://evil.com/x.jpg") is None
+
+
+def test_download_bytes_uses_boto_get_for_our_url(monkeypatch):
+    monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://pub.example.dev", raising=False)
+
+    class _C:
+        def get_bytes(self, key):
+            assert key == "echo/eng_ig/abc/x.jpg"
+            return b"IMGBYTES"
+    got = media_host.download_bytes("https://pub.example.dev/echo/eng_ig/abc/x.jpg", client=_C())
+    assert got == b"IMGBYTES"

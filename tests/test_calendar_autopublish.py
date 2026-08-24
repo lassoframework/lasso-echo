@@ -752,3 +752,101 @@ def test_stale_story_without_source_media_holds_not_publishes(armed, monkeypatch
                     approved_only=True, catch_all=True)
     assert store.published_calls == []          # held, not published
     assert store.rows["s2"]["status"] == "approved"
+
+
+# ---- anti-flood daily cap + feed aspect preflight (Dale/Bryan 2026-08-24) ---
+
+def test_daily_cap_publishes_up_to_cap_and_drips_rest(armed, monkeypatch):
+    """A repaired gym's backlog must DRIP, not flood: with a cap of 2, only 2 of 5 due
+    rows publish this run; the rest are left approved/pending for a later day."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    store = _FakeStore([_row(x) for x in ("a", "b", "c", "d", "e")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True, daily_cap=2)
+    assert len(summary["published"]) == 2          # only the cap went out
+    assert len(pub.calls) == 2                      # only 2 network calls made
+    assert len(summary["waiting"]) == 3            # the rest dripped to a later day
+
+
+def test_daily_cap_counts_rows_already_published_today(armed, monkeypatch):
+    """The cap counts what already went out earlier today (kv), so a second run in the
+    same day does not blow past the daily limit."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 2)   # cap already used up
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    store = _FakeStore([_row("a"), _row("b")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True, daily_cap=2)
+    assert summary["published"] == []              # nothing more today
+    assert pub.calls == []
+
+
+def test_no_cap_when_daily_cap_none(armed, monkeypatch):
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 999)  # ignored when cap None
+    store = _FakeStore([_row("a"), _row("b"), _row("c")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True, daily_cap=None)
+    assert set(summary["published"]) == {"a", "b", "c"}
+
+
+def test_feed_preflight_reframes_out_of_aspect_then_publishes(armed, monkeypatch):
+    """ENG/Dale 2026-08-24: a too-tall feed photo used to 400 at Zernio and strand on
+    'approved'. The preflight reframes it to an in-spec card, swaps image_url, and the
+    row publishes in the same tick."""
+    from agent import feed_image, media_host
+    NEW = "https://cdn/NEW__feed.jpg"
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: b"RAW")
+    monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: out)  # "reframed"
+    monkeypatch.setattr(media_host, "host_media", lambda path, key: NEW)
+    row = _row("f", account="instagram", fmt="feed", status="approved",
+               image_url="https://cdn/old.jpg")
+    store = _FakeStore([row])
+    store.patch_image_url = lambda g, rid, url: store.rows[rid].__setitem__("image_url", url)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    assert store.rows["f"]["image_url"] == NEW
+    assert [rid for rid, _, _ in store.published_calls] == ["f"]
+
+
+def test_feed_preflight_noop_when_in_spec(armed, monkeypatch):
+    """An already-in-spec image is untouched and still publishes with its original url."""
+    from agent import feed_image, media_host
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: b"RAW")
+    monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: None)  # in-spec
+    row = _row("f", account="instagram", fmt="feed", status="approved",
+               image_url="https://cdn/ok.jpg")
+    store = _FakeStore([row])
+    store.patch_image_url = lambda g, rid, url: store.rows[rid].__setitem__("image_url", url)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    assert store.rows["f"]["image_url"] == "https://cdn/ok.jpg"
+    assert [rid for rid, _, _ in store.published_calls] == ["f"]
+
+
+def test_feed_preflight_skips_story_rows(armed, monkeypatch):
+    """A story is framed by its own burner; the feed preflight must never touch it."""
+    from agent import media_host
+    calls = []
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes",
+                        lambda url, client=None: calls.append(url))
+    row = _row("s", account="instagram", fmt="story", status="approved",
+               image_url="https://cdn/story.jpg")
+    store = _FakeStore([row])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    assert calls == []                             # preflight never fetched a story image

@@ -55,6 +55,35 @@ def build_feed_image(photo_path, out_path):
     return out_path
 
 
+def make_feed_safe_from_bytes(img_bytes, out_path):
+    """PUBLISH-TIME preflight from raw image bytes (no local source file needed).
+
+    Returns out_path holding an in-spec 1080x1080 card when the bytes are an out-of-spec
+    photo; returns None when the image is ALREADY in-spec (post it unchanged) or is not a
+    usable still image. Never raises — any failure returns None so the caller posts the
+    original. This is the belt to build_feed_image's suspenders: it guarantees no
+    out-of-aspect image ever reaches the platform, even for a row whose media was hosted
+    before AGENT_FEED_AUTOFIT and has no local path to re-derive from."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(img_bytes)) as im:
+            w, h = im.size
+            if not needs_autofit(w, h):
+                return None                               # already in-spec: leave alone
+            src = os.path.splitext(out_path)[0] + "__src.png"
+            im.convert("RGB").save(src, "PNG")
+        try:
+            return build_feed_image(src, out_path)
+        finally:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    except Exception:
+        return None
+
+
 def get_or_make_feed_image(photo_path, library_path, *, logger=None):
     """A hosted-ready 1080x1080 feed card for an OUT-OF-SPEC photo (cached in
     <library>/feedfit/), or None when: the flag is off, the file is not a usable photo, the

@@ -70,3 +70,34 @@ def test_unreadable_photo_never_raises(tmp_path, monkeypatch):
     bad = tmp_path / "broken.jpg"
     bad.write_bytes(b"\xff\xd8not-an-image")
     assert feed_image.get_or_make_feed_image(str(bad), str(tmp_path)) is None   # falls back
+
+
+# ---- publish-time preflight from bytes (ENG/Dale 2026-08-24) ----------------
+
+def _jpeg_bytes(w, h):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (40, 60, 90)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def test_make_feed_safe_from_bytes_reframes_too_tall(tmp_path):
+    from PIL import Image
+    out = str(tmp_path / "o.jpg")
+    safe = feed_image.make_feed_safe_from_bytes(_jpeg_bytes(600, 1080), out)  # ratio 0.56
+    assert safe == out and os.path.isfile(out)
+    with Image.open(out) as im:
+        assert im.size == (1080, 1080)                       # now in-spec
+
+
+def test_make_feed_safe_from_bytes_leaves_in_spec_alone(tmp_path):
+    out = str(tmp_path / "o.jpg")
+    assert feed_image.make_feed_safe_from_bytes(_jpeg_bytes(1080, 1080), out) is None  # square OK
+    assert feed_image.make_feed_safe_from_bytes(_jpeg_bytes(1080, 1350), out) is None  # 4:5 = 0.8 OK
+    assert not os.path.isfile(out)
+
+
+def test_make_feed_safe_from_bytes_never_raises_on_garbage(tmp_path):
+    assert feed_image.make_feed_safe_from_bytes(b"\xff\xd8not-an-image",
+                                                str(tmp_path / "o.jpg")) is None

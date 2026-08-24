@@ -25,6 +25,7 @@ Exactly-once design (the claim):
 Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
+import os
 from datetime import datetime, time, timezone
 
 from . import config
@@ -187,6 +188,76 @@ def _reburn_stale_story(row, account, store):
         return None
 
 
+def _normalize_feed_image(row, account, store):
+    """PUBLISH-TIME aspect preflight for a FEED row (ENG/Dale 2026-08-24: raw portrait
+    client photos at ratio 0.56-0.67 were REJECTED by Zernio with a 400 'Aspect ratio
+    outside Instagram's allowed range (0.75 to 1.91)', so every publish reverted to
+    'approved' and the post stranded forever while the portal still read 'Published').
+
+    If the row's hosted image is outside IG/FB's accepted feed ratio, re-frame it into an
+    in-spec 1080x1080 card, re-host, and swap image_url so the platform accepts it. Works
+    from the hosted url alone (fetch -> reframe -> host), so it heals rows built before
+    AGENT_FEED_AUTOFIT AND guarantees no out-of-aspect image ever reaches Zernio again,
+    regardless of any build-time flag. Returns the updated row on a successful swap, else
+    the row unchanged (in-spec, a video, or any failure — never blocks a post; an
+    already-in-spec image is the common case and returns instantly). Best effort: never
+    raises. Feed only; a story is framed by its own burner."""
+    try:
+        url = (row.get("image_url") or "").strip()
+        if not url or url.lower().endswith((".mp4", ".mov", ".webm")):
+            return row
+        from . import feed_image, media_host
+        if not config.hosting_enabled():
+            return row                                    # cannot re-host -> post as-is
+        img = media_host.download_bytes(url)
+        if not img:
+            return row
+        import tempfile
+        out = os.path.join(tempfile.gettempdir(),
+                           f"feedfit_{row.get('id') or 'row'}__feed.jpg")
+        safe = feed_image.make_feed_safe_from_bytes(img, out)
+        if not safe:
+            return row                                    # already in-spec: unchanged
+        hosted = media_host.host_media(safe, account.key)
+        try:
+            os.remove(safe)
+        except OSError:
+            pass
+        if not hosted or hosted == url:
+            return row
+        patch = getattr(store, "patch_image_url", None)
+        if patch is not None:
+            patch(row.get("gym_id"), row.get("id"), hosted)
+        updated = dict(row)
+        updated["image_url"] = hosted
+        print(f"[calendar-autopublish] feed preflight reframed out-of-aspect image for "
+              f"row {row.get('id')} -> in-spec 1080x1080")
+        return updated
+    except Exception as e:  # noqa: BLE001 - a preflight must never crash the publish lane
+        print(f"[calendar-autopublish] feed preflight failed for {row.get('id')}: "
+              f"{type(e).__name__}: {e}")
+        return row
+
+
+def _pub_count_today(gym_id, run_date):
+    """How many rows this gym has already published today (kv counter). Best effort -> 0."""
+    try:
+        from . import db
+        return int(db.kv_get(f"clientpub_{gym_id}_{run_date}") or 0)
+    except Exception:
+        return 0
+
+
+def _bump_pub_count(gym_id, run_date):
+    """Increment the per-gym per-day publish counter (kv). Best effort; never raises."""
+    try:
+        from . import db
+        key = f"clientpub_{gym_id}_{run_date}"
+        db.kv_set(key, str(int(db.kv_get(key) or 0) + 1))
+    except Exception:
+        pass
+
+
 def scheduled_iso_for_row(row, now=None):
     """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
     time (slot_time_for_row), in POSTING_TIMEZONE. This is what Echo hands Zernio as
@@ -205,6 +276,11 @@ def scheduled_iso_for_row(row, now=None):
         return datetime(y, m, d, int(hh), int(mm), tzinfo=tz).isoformat()
     except (ValueError, TypeError):
         return ""
+
+
+def _is_story_row(row):
+    """True when the row is a STORY (framed by its own burner, not the feed preflight)."""
+    return (row.get("format") or "feed").strip().lower() == "story"
 
 
 def _story_media_is_stale(row):
@@ -263,7 +339,7 @@ def _draft_for(row):
 
 def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 notifier=None, now=None, catch_all=False, approved_only=False,
-                zernio_publish=None, catchup_days=0):
+                zernio_publish=None, catchup_days=0, daily_cap=None):
     """
     Read gym_id's content_calendar rows dated run_date and publish each unpublished
     one to live IG/FB, EXACTLY ONCE. Returns a summary dict.
@@ -314,6 +390,14 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     failed = []
     waiting = []            # slot not arrived yet: left pending for a later run
     published_accounts = set()
+
+    # ANTI-FLOOD (2026-08-24): when a client gym's publishing is repaired after a stall
+    # (e.g. Pierce's Zernio profile was linked, or ENG's images were un-blocked), a
+    # catch_all sweep would otherwise fire EVERY stranded approved row at once — dumping
+    # a week of posts onto the gym's feed in one minute. daily_cap bounds how many this
+    # gym publishes per calendar day, so a backlog DRIPS out over days instead. Counts
+    # rows already published today (kv) plus rows published in this run. None => no cap.
+    cap_used = _pub_count_today(gym_id, run_date) if daily_cap else 0
 
     for row in rows:
         row_id = row.get("id")
@@ -380,6 +464,21 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 _alert_story_needs_render(row_id, gym_id)
                 continue
             row = healed  # freshly re-burned; falls through to the exactly-once claim below
+
+        # ANTI-FLOOD CAP: once this gym has hit its per-day publish limit, leave the rest
+        # UNTOUCHED (never claimed) so the backlog drips out on later days instead of
+        # flooding the feed. Applies only when a daily_cap is set (the client lane).
+        if daily_cap and (cap_used + len(published)) >= int(daily_cap):
+            waiting.append(row_id)
+            continue
+
+        # FEED ASPECT PREFLIGHT: a feed photo outside IG/FB's accepted ratio is re-framed
+        # to an in-spec 1080x1080 card BEFORE the network call, so Zernio never 400s on
+        # aspect ratio (ENG/Dale 2026-08-24). No-op for a story (framed by its burner) and
+        # for an already-in-spec image. Done before the claim so a re-host failure never
+        # burns the exactly-once claim.
+        if not _is_story_row(row):
+            row = _normalize_feed_image(row, account, store)
 
         # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.
         try:
@@ -450,6 +549,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 continue
             published.append(row_id)
             published_accounts.add(account.key)
+            if daily_cap:
+                _bump_pub_count(gym_id, run_date)
         else:
             try:
                 store.mark_publish_failed(
@@ -704,7 +805,8 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
                                   now=now, catch_all=True,
                                   approved_only=not autonomous,
                                   zernio_publish=zernio_publish,
-                                  catchup_days=CLIENT_CATCHUP_DAYS)
+                                  catchup_days=CLIENT_CATCHUP_DAYS,
+                                  daily_cap=config.client_daily_publish_cap())
             summary["gym"] = base
             summary["autonomous"] = autonomous
             out.append(summary)

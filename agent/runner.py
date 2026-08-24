@@ -533,6 +533,26 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"GBP connection sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # ZERNIO PROFILE LINK (Pierce 2026-08-24): backfill gyms.zernio_profile_id (the
+    # PUBLISHER's profile id) for any client gym missing it, matching the Zernio profile by
+    # name. A fully-connected gym with an empty profile id silently never publishes ("no
+    # Zernio profile id stored"); nothing else writes this column for a client gym. Reads
+    # Zernio + writes the gyms row only; idempotent; never overwrites a set id; isolated.
+    if config.zernio_profile_link_enabled():
+        try:
+            from .zernio_profile_link import link_client_profiles
+            lsum = link_client_profiles()
+            if lsum.get("ok"):
+                print(f"[zernio-profile-link] linked {lsum['linked']}, "
+                      f"already {lsum['already']}, no_profile {lsum['no_profile']}, "
+                      f"errors {lsum['errors']}")
+            else:
+                print(f"[zernio-profile-link] skipped: {lsum.get('reason')}")
+        except Exception as e:
+            print(f"[zernio-profile-link] link failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"Zernio profile link failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's

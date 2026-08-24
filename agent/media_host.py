@@ -90,6 +90,14 @@ class _S3Client:
     def put(self, key, local_path):
         self._s3.upload_file(local_path, self._bucket, key)
 
+    def get_bytes(self, key):
+        """Fetch one object's bytes, or None if absent/unreadable."""
+        try:
+            obj = self._s3.get_object(Bucket=self._bucket, Key=key)
+            return obj["Body"].read()
+        except Exception:
+            return None
+
     def list_prefix(self, prefix):
         """List objects under prefix. Returns [{key, size, last_modified}]."""
         paginator = self._s3.get_paginator("list_objects_v2")
@@ -182,6 +190,39 @@ def host_media(local_path, tenant, client=None):
                 return None
             time.sleep(min(2 ** attempt, 4))  # 1s, 2s, 4s capped
     return None
+
+
+def _key_from_public_url(url):
+    """Derive the R2 object key from a public url we minted, or None if the url is not
+    under our configured public base. Inverse of _public_url (URL-unquotes the path)."""
+    from urllib.parse import unquote
+    base = (config.S3_PUBLIC_BASE_URL or "").rstrip("/")
+    if not base or not url or not url.startswith(base + "/"):
+        return None
+    return unquote(url[len(base) + 1:])
+
+
+def download_bytes(url, client=None):
+    """Fetch the bytes of an image we already hosted, for a publish-time re-frame.
+
+    Prefers boto3 get_object by the derived key (the public r2.dev url can 403 a plain
+    HTTP GET / hotlink), falling back to a browser-UA HTTP GET for any url not under our
+    bucket. Returns bytes or None. Never raises."""
+    key = _key_from_public_url(url)
+    if key:
+        client = client or _default_client()
+        if client is not None:
+            data = client.get_bytes(key)
+            if data:
+                return data
+    # Fallback: plain HTTP GET (for a non-bucket url, or if boto3 is unavailable).
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Echo)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except Exception:
+        return None
 
 
 def host_many(local_paths, tenant, client=None):

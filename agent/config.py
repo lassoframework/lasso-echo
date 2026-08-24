@@ -1349,6 +1349,32 @@ def feed_autofit_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_FEED_AUTOFIT", "false"))
 
 
+def client_daily_publish_cap() -> int:
+    """Max posts a single CLIENT gym auto-publishes per calendar day (AGENT_CLIENT_DAILY_PUBLISH_CAP).
+
+    Anti-flood backstop (2026-08-24): when a stalled gym's publishing is repaired (Pierce's
+    Zernio profile linked, ENG's out-of-aspect images un-blocked), a catch_all sweep would
+    otherwise fire an entire backlog of approved rows onto the feed at once. This bounds the
+    daily count so a backlog DRIPS out over days. 0 or unset => no cap (the historical
+    behavior). Applies to the client lane only, never LASSO's own. Set by hand in Railway env."""
+    try:
+        return max(0, int(os.environ.get("AGENT_CLIENT_DAILY_PUBLISH_CAP", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def zernio_profile_link_enabled() -> bool:
+    """Backfill gyms.zernio_profile_id from Zernio for client gyms (AGENT_ZERNIO_PROFILE_LINK).
+
+    Pierce 2026-08-24: a gym's Zernio profile existed and was fully connected, but nothing
+    wrote gyms.zernio_profile_id (only the provisioning path did, which Pierce missed), so the
+    publisher raised 'no Zernio profile id stored' on every post. When ON, the listener links
+    each client base whose profile id is empty by matching the Zernio profile name to the base,
+    also storing the connected Facebook page id. Read-only against Zernio; idempotent; never
+    overwrites a non-empty id. OFF by default; arm by hand in Railway env."""
+    return _truthy(os.environ.get("AGENT_ZERNIO_PROFILE_LINK", "false"))
+
+
 def reel_target_sec() -> float:
     """Target action-reel length in seconds (AGENT_REEL_TARGET_SEC, default 22).
     Clamped to 10..60 (IG Reels sweet spot; never a mis-set 600s encode)."""
