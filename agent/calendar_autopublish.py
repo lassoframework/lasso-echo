@@ -197,46 +197,88 @@ def _normalize_feed_image(row, account, store):
     If the row's hosted image is outside IG/FB's accepted feed ratio, re-frame it into an
     in-spec 1080x1080 card, re-host, and swap image_url so the platform accepts it. Works
     from the hosted url alone (fetch -> reframe -> host), so it heals rows built before
-    AGENT_FEED_AUTOFIT AND guarantees no out-of-aspect image ever reaches Zernio again,
-    regardless of any build-time flag. Returns the updated row on a successful swap, else
-    the row unchanged (in-spec, a video, or any failure — never blocks a post; an
-    already-in-spec image is the common case and returns instantly). Best effort: never
-    raises. Feed only; a story is framed by its own burner."""
+    AGENT_FEED_AUTOFIT.
+
+    Return contract (fail SAFE, never fail-open onto a KNOWN-bad image):
+      - the row (unchanged or with a swapped in-spec image_url) => OK to publish. This is
+        the common case: video, in-spec image, or an unknown aspect we could not determine
+        (hosting off, fetch failed) — those pass through as before and self-heal next tick.
+      - None => HOLD: the image is CONFIRMED out-of-aspect and we could NOT re-frame/re-host
+        it, so publishing it now would 400 at Zernio and strand the row. The caller leaves it
+        approved (never claimed) and alerts, instead of shipping a known-bad image. This is
+        the fix for the auditor's fail-open gap: once we KNOW it is bad, we never send it.
+    Best effort: never raises. Feed only; a story is framed by its own burner."""
+    url = (row.get("image_url") or "").strip()
+    if not url or url.lower().endswith((".mp4", ".mov", ".webm")):
+        return row                                        # video/no-image: not our job
+    # PHASE 1 (fail-open): determine the aspect. If we cannot even read it, pass through
+    # unchanged (unknown, not known-bad) — identical to the historical behavior; it will
+    # self-heal on a later tick once R2/hosting recovers.
     try:
-        url = (row.get("image_url") or "").strip()
-        if not url or url.lower().endswith((".mp4", ".mov", ".webm")):
-            return row
         from . import feed_image, media_host
         if not config.hosting_enabled():
-            return row                                    # cannot re-host -> post as-is
+            return row
         img = media_host.download_bytes(url)
         if not img:
             return row
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(img)) as im:
+            w, h = im.size
+        if not feed_image.needs_autofit(w, h):
+            return row                                    # already in-spec: publish as-is
+    except Exception as e:  # noqa: BLE001 - could not determine aspect -> fail open
+        print(f"[calendar-autopublish] feed preflight could not read aspect for "
+              f"{row.get('id')}: {type(e).__name__}: {e}; posting as-is")
+        return row
+    # PHASE 2 (fail-safe): the image is CONFIRMED out-of-aspect. Re-frame + re-host, or HOLD.
+    try:
         import tempfile
-        out = os.path.join(tempfile.gettempdir(),
-                           f"feedfit_{row.get('id') or 'row'}__feed.jpg")
+        out = os.path.join(
+            tempfile.gettempdir(),
+            f"feedfit_{account.key}_{row.get('id') or 'row'}__feed.jpg")
         safe = feed_image.make_feed_safe_from_bytes(img, out)
-        if not safe:
-            return row                                    # already in-spec: unchanged
-        hosted = media_host.host_media(safe, account.key)
-        try:
-            os.remove(safe)
-        except OSError:
-            pass
+        hosted = media_host.host_media(safe, account.key) if safe else None
+        if safe:
+            try:
+                os.remove(safe)
+            except OSError:
+                pass
         if not hosted or hosted == url:
-            return row
+            print(f"[calendar-autopublish] feed preflight could NOT re-host an out-of-aspect "
+                  f"image for row {row.get('id')} ({w}x{h}); HOLDING (not sending a 400).")
+            return None                                   # HOLD: never ship a known-bad image
         patch = getattr(store, "patch_image_url", None)
         if patch is not None:
             patch(row.get("gym_id"), row.get("id"), hosted)
         updated = dict(row)
         updated["image_url"] = hosted
         print(f"[calendar-autopublish] feed preflight reframed out-of-aspect image for "
-              f"row {row.get('id')} -> in-spec 1080x1080")
+              f"row {row.get('id')} ({w}x{h}) -> in-spec 1080x1080")
         return updated
-    except Exception as e:  # noqa: BLE001 - a preflight must never crash the publish lane
-        print(f"[calendar-autopublish] feed preflight failed for {row.get('id')}: "
-              f"{type(e).__name__}: {e}")
-        return row
+    except Exception as e:  # noqa: BLE001 - known-bad image + reframe failed -> HOLD
+        print(f"[calendar-autopublish] feed preflight failed to fix out-of-aspect row "
+              f"{row.get('id')}: {type(e).__name__}: {e}; HOLDING (not sending a 400).")
+        return None
+
+
+def _alert_feed_needs_reframe(row_id, gym_id):
+    """Alert a human ONCE when a feed row is held because its image is confirmed out-of-aspect
+    and could not be re-framed/re-hosted this tick (so we refuse to ship a known-400 image).
+    Deduped in the shared kv so the ~1-min retry does not spam. Best effort; never raises."""
+    try:
+        from . import db, ops_alerts
+        key = f"feed_reframe_alerted_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"calendar row {row_id} (gym {gym_id}) is HELD: its feed image is outside "
+            "Instagram's accepted aspect ratio and Echo could not re-frame/re-host it this "
+            "run (likely a transient hosting/R2 issue). It will retry and self-heal, but if "
+            "it persists a human should check the source image / hosting.")
+    except Exception:
+        pass
 
 
 def _pub_count_today(gym_id, run_date):
@@ -476,9 +518,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # to an in-spec 1080x1080 card BEFORE the network call, so Zernio never 400s on
         # aspect ratio (ENG/Dale 2026-08-24). No-op for a story (framed by its burner) and
         # for an already-in-spec image. Done before the claim so a re-host failure never
-        # burns the exactly-once claim.
+        # burns the exactly-once claim. A None return means the image is CONFIRMED
+        # out-of-aspect and could NOT be fixed this tick -> HOLD (leave approved + alert)
+        # rather than ship a known-bad image that would 400 and strand the row anyway.
         if not _is_story_row(row):
-            row = _normalize_feed_image(row, account, store)
+            fixed = _normalize_feed_image(row, account, store)
+            if fixed is None:
+                waiting.append(row_id)
+                _alert_feed_needs_reframe(row_id, gym_id)
+                continue
+            row = fixed
 
         # EXACTLY-ONCE CLAIM: only the winner proceeds to a network call.
         try:

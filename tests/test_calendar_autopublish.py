@@ -792,6 +792,14 @@ def test_no_cap_when_daily_cap_none(armed, monkeypatch):
     assert set(summary["published"]) == {"a", "b", "c"}
 
 
+def _jpeg(w, h):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (30, 50, 80)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
 def test_feed_preflight_reframes_out_of_aspect_then_publishes(armed, monkeypatch):
     """ENG/Dale 2026-08-24: a too-tall feed photo used to 400 at Zernio and strand on
     'approved'. The preflight reframes it to an in-spec card, swaps image_url, and the
@@ -801,7 +809,7 @@ def test_feed_preflight_reframes_out_of_aspect_then_publishes(armed, monkeypatch
     monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
     monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
     monkeypatch.setattr(config, "hosting_enabled", lambda: True)
-    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: b"RAW")
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: _jpeg(600, 1080))
     monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: out)  # "reframed"
     monkeypatch.setattr(media_host, "host_media", lambda path, key: NEW)
     row = _row("f", account="instagram", fmt="feed", status="approved",
@@ -817,12 +825,11 @@ def test_feed_preflight_reframes_out_of_aspect_then_publishes(armed, monkeypatch
 
 def test_feed_preflight_noop_when_in_spec(armed, monkeypatch):
     """An already-in-spec image is untouched and still publishes with its original url."""
-    from agent import feed_image, media_host
+    from agent import media_host
     monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
     monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
     monkeypatch.setattr(config, "hosting_enabled", lambda: True)
-    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: b"RAW")
-    monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: None)  # in-spec
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: _jpeg(1080, 1080))
     row = _row("f", account="instagram", fmt="feed", status="approved",
                image_url="https://cdn/ok.jpg")
     store = _FakeStore([row])
@@ -832,6 +839,48 @@ def test_feed_preflight_noop_when_in_spec(armed, monkeypatch):
                     approved_only=True, catch_all=True)
     assert store.rows["f"]["image_url"] == "https://cdn/ok.jpg"
     assert [rid for rid, _, _ in store.published_calls] == ["f"]
+
+
+def test_feed_preflight_holds_known_bad_image_when_rehost_fails(armed, monkeypatch):
+    """FAIL-SAFE (audit MAJOR): when the image is CONFIRMED out-of-aspect but the re-frame /
+    re-host cannot run, the row is HELD (left approved, never published) rather than shipping
+    a known-400 image. It never gets marked published and stays retryable."""
+    from agent import feed_image, media_host
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: _jpeg(600, 1080))
+    monkeypatch.setattr(feed_image, "make_feed_safe_from_bytes", lambda b, out: out)  # reframed ok
+    monkeypatch.setattr(media_host, "host_media", lambda path, key: None)  # ...but re-host FAILS
+    monkeypatch.setattr(cap, "_alert_feed_needs_reframe", lambda rid, gym: None)
+    row = _row("f", account="instagram", fmt="feed", status="approved",
+               image_url="https://cdn/old.jpg")
+    store = _FakeStore([row])
+    store.patch_image_url = lambda g, rid, url: store.rows[rid].__setitem__("image_url", url)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              approved_only=True, catch_all=True)
+    assert store.published_calls == []             # never published a known-bad image
+    assert pub.calls == []                          # never even reached the network call
+    assert store.rows["f"]["status"] == "approved"  # held, still retryable
+    assert "f" in summary["waiting"]
+
+
+def test_feed_preflight_unknown_aspect_fails_open(armed, monkeypatch):
+    """If the aspect can't be DETERMINED (fetch failed), pass through unchanged (fail open,
+    self-heals next tick) — only a CONFIRMED-bad image is held."""
+    from agent import media_host
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_host, "download_bytes", lambda url, client=None: None)  # fetch fails
+    row = _row("f", account="instagram", fmt="feed", status="approved",
+               image_url="https://cdn/old.jpg")
+    store = _FakeStore([row])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                    approved_only=True, catch_all=True)
+    assert [rid for rid, _, _ in store.published_calls] == ["f"]  # still published as-is
 
 
 def test_feed_preflight_skips_story_rows(armed, monkeypatch):
