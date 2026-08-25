@@ -6,7 +6,72 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-17
+Last updated: 2026-08-25
+
+---
+
+## Blake's 4 rulings + 5-domain A+ sweep + studio unblock (2026-08-24/25)
+
+Nine commits, all merged to main and LIVE on both Railway services (worker `echo` +
+`echo-intake-web` deployed SUCCESS 2026-08-25 13:46, SHA e87a0f0). Suite 3013 green.
+
+### [x] Client posts silently not reaching IG/FB (8cfbf5d, 7b44903, b3afee9)
+ENG: out-of-aspect portrait photos 400'd at Zernio -> publish-time feed aspect preflight
+re-frames any out-of-aspect image to an in-spec 1080x1080 card before the network call
+(heals stuck rows + guarantees no bad aspect ever ships); preflight fails SAFE (confirmed
+out-of-aspect it cannot fix -> HOLD, never send). Pierce: gym's Zernio profile now also
+matches by DISPLAY NAME (portal UUID-keyed gyms had an unlinked profile).
+
+### [x] Studios not posting — served-ledger un-poisoned (b2216bd)
+rotation.record_served ran at PICK time, before the A+ gate dropped the draft; the frequent
+lane burned every plannable photo into its reuse window (GritX: 43,136 served rows for 193
+photos). Served is now recorded on ACCEPTANCE only.
+
+### [x] AGENT_VISION_ALLOW_FLAGS — operator-approved safety flags may auto-pick (5bf4462)
+Comma list of vision flags that no longer BLOCK auto-pick (still detected + recorded on the
+sidecar). Default EMPTY = unchanged safe default. ARMED for the studios with
+third_party_brand,person_name_in_image,minor_prominent (Blake 2026-08-25).
+
+### [x] Calendar never shrinks + rebuild churn stopped (ad5543e, 32d3381, 6513c0d)
+Never-wipe-to-empty generalized to never-SHRINK on rebuild; grow-guard (kv built_media_<base>)
+rebuilds an already-built gym ONLY when its library has grown — data safe AND the wasteful
+every-pass caption regen stops.
+
+### [x] 5-domain A+ sweep — every CRITICAL + top MAJORs closed (1392cea)
+Five independent domain audits (connecting/paying/posting/captions/portal) + live Pierce
+upload bug. CRITICALs: **SECURITY** GET /portal/gym/<key> now REQUIRES X-Portal-Key (it
+reconstructs the gym's raw portal token; unauthenticated = slug-guess portal takeover);
+**scaffold leak** SB7 fallbacks strip prompt-hint blocks + post_quality rejects hint markers
+anywhere; **publish timing truth** client lane fires each row AT its slot with publishNow
+(no more midnight catch-all sweep / future scheduledFor); **display_name clobber** fixed;
+**race guards** approve 409s mid-claim rows, mark_published stamps only the claimed row.
+MAJORs: GBP exactly-once claim + 409-dedup=success, open-redirect allowlist, per-gym edit
+claim gating, sources base<->_ig fallback + approve-sources CLI, autonomy-off hard 503 on
+shared-write failure, stall-state alerts, truncated-JPEG salvage on intake.
+
+### [~] Billing gate — AGENT_PUBLISH_BILLING_GATE (e87a0f0, flag OFF)
+A client gym whose Stripe sub shows CANCELED holds ALL publishing (rows stay approved) +
+one deduped ops alert. Fail-OPEN polarity: only positive cancellation evidence blocks; no
+key/no customer/flaky read never holds a paying gym. kv-cached ~6h, read-only Stripe.
+UNARMED — arm on Railway when Blake says go.
+
+### [x] Per-gym timezones — gyms.posting_timezone (e87a0f0)
+Each gym's slots fire on ITS OWN wall clock; publish-lane slot gate is date-aware in
+gym-local time; scheduled_at stamps in the gym's tz. Unset gyms keep global
+POSTING_TIMEZONE (zero behavior change until set). CLI: set-timezone.
+
+### [~] Infographic fill — AGENT_CLIENT_INFOGRAPHIC_FILL (e87a0f0, flag OFF)
+Blake's override of the MEDIA-ONLY law for the no-photos case: on-brand nano infographic
+cards from the gym's own APPROVED sources, SB7-captioned, full A+ gate, INSERT-only PENDING
+rows, IG+FB mirror, capped 2/pass. Wired at awaiting_media + has_calendar-running-dry.
+UNARMED — arm on Railway when Blake says go.
+
+### [ ] PORTAL SIDE OPEN — X-Portal-Key fix staged but NOT shipped (lasso-ops-portal)
+Echo LIVE now 401s the staff social-status call, so the deployed portal panel is broken
+until the portal ships: `src/app/command-center/social-status/page.tsx` (sends the header +
+no_key card) is staged UNCOMMITTED on branch feat/blog-post-self-serve, mixed with
+package.json bumps. Also needs the shared key (AGENT_PORTAL_ONBOARD_KEY value) set in the
+portal's Vercel env. HOTTEST open item.
 
 ---
 
