@@ -75,8 +75,27 @@ Vercel REST API, then verified by sha256 round-trip (env pull hash == Railway ha
 695f1300…) AND live: anon GET /portal/gym/<key> -> 401, with-key -> past auth. NEVER trust
 `vercel env add` without a pull-and-hash check. Production redeployed to bake the value.
 
-### [!] AUDIT FINDING (Blake's "make sure it's all correct", 2026-08-25): the staff
-### social-status panel has NEVER worked end-to-end — two pre-existing defects, ruling needed
+### [x] P1 + P2 BUILT, AUDITED, LIVE-VERIFIED (Blake ruled "build both", 2026-08-25)
+- **P1 (portal PR #454, squash 3e63ec0, prod READY on ops.lassoframework.com):** loadGym
+  reads echo_account_key from echo_intake_tokens by gym_id (parallel with the gyms name
+  row); the erroring gyms-column select is gone.
+- **P2 (Echo 8e48694, intake-web deployed SUCCESS 16:26):** sqlite miss -> existence via
+  Supabase echo_intake_tokens (exact eq; select never touches intake_token_encrypted);
+  fail CLOSED on no creds / error / no row BEFORE any HMAC, so no blind mint. Dead
+  decrypt_token call replaced with link_for (deterministic mint reconstruction),
+  plaintext fallback kept. Independent security audit: 0 CRITICAL / 0 MAJOR; all 4
+  MINORs applied (fallback consults R2 denylist so revoked reads REVOKED cross-container;
+  REVOKED gym serves NO link on either path; Supabase timeout 8s; hermetic secret test).
+  Suite 3022 green (+9 tests).
+- **LIVE E2E (16:27 ET):** lasso/eng/districth/topfuel -> 200 with reconstructed
+  upload_link + ACTIVE; never-onboarded slug -> 404; anon -> 401. Panel chain is whole:
+  page reads the right table, sends the right header, key matches, Echo answers.
+- Follow-up nit (pre-existing, not built): the do_GET route calls
+  handle_portal_gym_status without r2, so last_upload_at/upload_count are always null
+  on this route; wire the R2 client through if the panel should show upload activity.
+
+### Original audit finding (2026-08-25, for the record): the staff social-status panel
+### had NEVER worked end-to-end — two pre-existing defects (both now fixed above)
 The header + key were necessary but not sufficient. Verified live with the real key:
 - **P1 (portal repo):** `social-status/page.tsx` `loadGym` selects `echo_account_key` FROM
   `gyms`, but the portal DB has no such column — it lives on `echo_intake_tokens` (migration
