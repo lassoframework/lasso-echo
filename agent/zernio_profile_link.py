@@ -103,6 +103,27 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
                         break
             if not pid:
                 no_profile += 1
+                # ALERT when this is a REAL active gym (it has uploaded media), not an
+                # empty onboarding stub (audit 2026-08-25 MAJOR: 'no_profile' was a
+                # silent counter — the same symptom class as Pierce, invisible again).
+                # Deduped per gym (kv) so the per-loop runner never storms.
+                try:
+                    import os as _os
+                    lib = _os.path.join(config.LIBRARY_PATH, base)
+                    has_media = _os.path.isdir(lib) and any(
+                        _os.path.splitext(n)[1].lower() in
+                        (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov")
+                        for n in _os.listdir(lib))
+                    if has_media and not db.kv_get(f"zernio_link_alerted_{base}"):
+                        db.kv_set(f"zernio_link_alerted_{base}", "1")
+                        from . import ops_alerts
+                        ops_alerts.alert(
+                            f"gym {base} has uploaded media but NO matching Zernio "
+                            "profile (by base key or display name) — it can NEVER "
+                            "publish until its socials are connected in Zernio or the "
+                            "profile is linked by hand.")
+                except Exception:  # noqa: BLE001 - the alert never blocks the link pass
+                    pass
                 results.append({"gym": base, "status": "no_profile"})
                 continue
             page_id = ""

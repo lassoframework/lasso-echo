@@ -198,6 +198,23 @@ class GbpStore:
     def mark_status(self, row_id, status):
         return self._patch(row_id, {"status": status})
 
+    def claim_publishing(self, row_id):
+        """EXACTLY-ONCE claim for the GBP lane (audit 2026-08-25 MAJOR: the lane was
+        send-then-mark — a crash between send and mark re-sent next tick, and a deploy-
+        overlap second worker double-sent). Conditional PATCH: only a row still
+        'approved' flips to 'publishing'; zero rows updated => another worker/run owns
+        it (or its status changed) => the caller SKIPS. Mirrors the IG/FB lane's
+        mark_publishing."""
+        r = self._s._client().patch(
+            self._s._rest(_CAL),
+            params={"id": f"eq.{row_id}", "status": "eq.approved"},
+            headers=self._s._headers({"Content-Type": "application/json",
+                                      "Prefer": "return=representation"}),
+            json={"status": "publishing"}, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return bool(r.json() or [])
+
     # ---- G3 metrics (posts_published at publish; top_post_id by clicks at reconcile) --
     def bump_posts_published(self, portal_gym_key, gbp_location_id, month_iso, *,
                              now_iso, seed_top_post_id=None):

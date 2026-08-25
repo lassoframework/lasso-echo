@@ -583,6 +583,28 @@ def _alert_thin_creative(base_key, media_count, days, log):
         log(f"{base_key}: thin-creative alert failed: {type(exc).__name__}")
 
 
+def _alert_stall(base_key, stage, detail, log):
+    """A NEW-GYM STALL is never silent (audit 2026-08-25 MAJOR): every state where a
+    gym's pipeline cannot advance (no registry account, no approved sources, no voice
+    doc, unreadable calendar) fires ONE deduped ops alert — the same pattern as
+    _alert_thin_creative. Previously these were print-and-loop: a signing gym could sit
+    in no_voice/no_sources for WEEKS with nothing a human watches. Deduped per gym+stage
+    (kv) so the frequent scan never storms; a stage that RESOLVES then re-stalls
+    re-alerts only after the dedup key is cleared by hand or a different stage fires.
+    Best-effort: never raises, never blocks the scan."""
+    try:
+        from . import db, ops_alerts
+        key = f"gym_stall_alerted_{base_key}_{stage}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"gym {base_key} is STALLED at '{stage}': {detail} — its content pipeline "
+            "cannot advance until a human fixes this.")
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: stall alert failed: {type(exc).__name__}")
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -639,6 +661,9 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
 
             account = _account_for_base(base)
             if account is None:
+                _alert_stall(base, "no_account",
+                             "no registry Account resolves for this gym (missing "
+                             f"{base}_ig / dynamic-registry row)", log)
                 results.append({"base": base, "status": "no_account"})
                 continue
 
@@ -646,6 +671,13 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
 
             # A gym with no approved sources is not onboarded yet: never draft.
             if not _has_approved_sources(account.key):
+                # Only a gym that HAS uploaded media is stalled here (media + no sources
+                # = someone expects posts); a fresh gym with neither is just early.
+                if sync.get("synced", 0) or _client_media_count(lib_dir) > 0:
+                    _alert_stall(base, "no_sources",
+                                 "it has uploaded media but no APPROVED client sources; "
+                                 "run: python -m agent approve-sources --account "
+                                 f"{account.key}", log)
                 results.append({"base": base, "status": "no_sources",
                                 "synced": sync.get("synced", 0)})
                 continue
@@ -706,6 +738,9 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             if not read_ok:
                 # Could not read reliably: do NOT risk a duplicate/rebuild this pass.
                 skipped_existing += 1
+                _alert_stall(base, "calendar_unreadable",
+                             "the shared calendar could not be read (Supabase creds/"
+                             "network); no rebuild will run until it reads again", log)
                 results.append({"base": base, "status": "calendar_unreadable",
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: calendar read failed; left as-is (no rebuild)")
@@ -737,11 +772,20 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # idempotent. An unchanged library never rebuilds again. Remember the media
                 # count we are built for, so a gym that never reaches build_target (some
                 # clusters un-plannable) does not rebuild again until NEW media arrives.
-                try:
-                    from . import db as _db
-                    _db.kv_set(f"built_media_{base}", str(media_count))
-                except Exception:  # noqa: BLE001
-                    pass
+                # MARKER-DEADLOCK GUARD (audit 2026-08-25 MAJOR): stamp ONLY when the gym
+                # is MEDIA-capped (media_count <= days => every photo is placeable into
+                # this month). A DAYS-capped gym (more media than days) must NOT stamp —
+                # an at-cap gym that uploads 20 photos would stamp media_count=50 with
+                # zero of them built, then _already_built_for_media blocks every future
+                # rebuild until the library exceeds 50. For days-capped gyms the
+                # existing_feeds >= build_target check alone is the idempotence guard,
+                # and when the month window slides (feeds drop) the rebuild fires again.
+                if media_count <= days:
+                    try:
+                        from . import db as _db
+                        _db.kv_set(f"built_media_{base}", str(media_count))
+                    except Exception:  # noqa: BLE001
+                        pass
                 #
                 # DENIED-SLOT BACKFILL (AGENT_DENY_BACKFILL, OFF by default): a gym AT cap
                 # can never grow, so a human-denied post would leave a permanently empty
@@ -784,6 +828,10 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             voice = load_voice(
                 _resolve_client_voice_path(base, account.voice_doc_path()))
             if voice is None:
+                _alert_stall(base, "no_voice",
+                             "media + sources are ready but the brand-voice doc is "
+                             f"missing (expected <DATA>/brand_voice/{base}/lasso_voice.md); "
+                             "the month cannot draft until it exists", log)
                 results.append({"base": base, "status": "no_voice",
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: media ready but voice doc missing; not built")

@@ -204,7 +204,7 @@ Limits:
 
 **Gate:** Requires `AGENT_PORTAL_APPROVALS=true` in Echo's Railway env. Returns `403 {"error": "portal access is disabled"}` when the flag is off.
 
-**Auth:** No token in path. The account key is not a secret. The portal must be server-side when calling this endpoint (do not expose from a client-side browser context).
+**Auth (BREAKING CHANGE 2026-08-25):** Requires the `X-Portal-Key` header — the SAME shared key already used for `POST /portal/onboard`. Returns `401 {"error": "unauthorized"}` without it. Rationale: the response reconstructs the gym's RAW upload/portal token (`upload_link`), a capability that authenticates approve/edit/deny/uploads for that gym — an unauthenticated GET meant anyone who guessed a slug could take over that gym's portal. The portal's server-side social-status call must add the header (one line; it already holds the key for onboard).
 
 **CORS:** Same origin rules as the intake endpoint. Set `AGENT_INTAKE_PORTAL_ORIGIN` to the portal's origin.
 

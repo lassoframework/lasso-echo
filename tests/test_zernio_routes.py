@@ -473,3 +473,22 @@ def test_provision_gym_dark_without_key(tmp_path, monkeypatch):
     ok, info = zr.provision_gym("eng", client=_FakeClient())
     assert ok is False
     assert "disabled" in info
+
+
+def test_connect_rejects_untrusted_redirect_origin(db_env, monkeypatch):
+    """OPEN-REDIRECT FIX (audit 2026-08-25): a redirect_url on a NON-allowlisted origin
+    (e.g. a phishing lookalike) is never threaded to Zernio — the flow falls back to the
+    portal origin, so a real OAuth approval can never land the owner on an attacker page."""
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient()
+    status, _body = zr.handle_social_connect(
+        "gymA", "instagram", client=fake,
+        redirect_url="https://lasso-portal.evil.example/finish-setup")
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == "https://ops.lassoframework.com/my"   # fell back, never the attacker
+    # allowlisted portal PATHS still thread through unchanged
+    fake2 = _FakeClient()
+    zr.handle_social_connect("gymA", "instagram", client=fake2,
+                             redirect_url="https://ops.lassoframework.com/my/social")
+    assert _connect_call(fake2)[3] == "https://ops.lassoframework.com/my/social"

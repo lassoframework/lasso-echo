@@ -899,3 +899,85 @@ def test_feed_preflight_skips_story_rows(armed, monkeypatch):
     cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
                     approved_only=True, catch_all=True)
     assert calls == []                             # preflight never fetched a story image
+
+
+# ---- client lane fires AT the slot, publish-now, truthful published_at ----------
+# (audit 2026-08-25 CRITICAL: catch_all=True swept pre-approved rows at ~midnight, and
+#  autonomous rows were handed to Zernio as scheduled yet marked published immediately)
+
+def _zern_capture(results):
+    """A fake zernio_publish that records scheduled_for per row."""
+    def _pub(draft, account, scheduled_for=None):
+        results.append((draft.draft_id, scheduled_for))
+        return PublishResult(ok=True, mode="published", media_id="Z1")
+    return _pub
+
+
+def test_client_row_waits_for_its_slot_then_publishes_now(armed, monkeypatch):
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    # a client-gym row; route it to a fake client account so the zernio path runs
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    row = _row("cx", status="approved")
+    row["gym_id"] = "gymx"
+    store = _FakeStore([row])
+    store.rows["cx"]["gym_id"] = "gymx"
+    slot = cap.slot_time_for_row(row)                      # the row's OWN stable slot
+    hh, mm = slot.split(":")
+    before = f"{RUN_DATE}T{int(hh)-1 if int(hh) > 0 else 0:02d}:{mm}:00-04:00"
+    after = f"{RUN_DATE}T{hh}:{mm}:01-04:00"
+    sent = []
+    # BEFORE the slot: held (waiting), nothing published — no midnight firing
+    s1 = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=before,
+                         approved_only=True, catch_all=False,
+                         zernio_publish=_zern_capture(sent))
+    assert s1["published"] == [] and "cx" in s1["waiting"] and sent == []
+    # AT the slot: publishes NOW (scheduled_for=None -> truthful published_at)
+    s2 = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=after,
+                         approved_only=True, catch_all=False,
+                         zernio_publish=_zern_capture(sent))
+    assert s2["published"] == ["cx"]
+    assert sent == [(store.rows["cx"].get("draft_id") or sent[0][0], None)] or \
+           (len(sent) == 1 and sent[0][1] is None)
+
+
+def test_autonomous_client_also_publishes_now_at_slot(armed, monkeypatch):
+    """Autonomous gyms no longer hand Zernio a future scheduledFor (which was marked
+    published immediately, hours before the post existed). They fire at slot time too."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    row = _row("ax", status="pending")
+    row["gym_id"] = "gymx"
+    store = _FakeStore([row])
+    sent = []
+    s = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=LATE_NOW,
+                        approved_only=False, catch_all=False,
+                        zernio_publish=_zern_capture(sent))
+    assert s["published"] == ["ax"]
+    assert len(sent) == 1 and sent[0][1] is None            # publish NOW, never scheduled
+
+
+def test_past_date_catchup_row_is_always_due(armed, monkeypatch):
+    """A late-approved YESTERDAY row must sweep immediately (its day already passed),
+    even before today's identical wall-clock slot."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    class _Acct:
+        key = "gymx_ig"; platform = "instagram"; display_name = "Gym X"
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    row = _row("px", status="approved", post_date="2026-08-09")   # yesterday
+    row["gym_id"] = "gymx"
+    store = _FakeStore([row])
+    # store's due_rows filters post_date == run_date; widen the fake for catchup reads
+    store.due_rows = lambda gym_id, run_date, catchup_days=0: [dict(store.rows["px"])]
+    sent = []
+    early = f"{RUN_DATE}T00:05:00-04:00"                     # long before any slot
+    s = cap.publish_due(RUN_DATE, gym_id="gymx", store=store, now=early,
+                        approved_only=True, catch_all=False, catchup_days=7,
+                        zernio_publish=_zern_capture(sent))
+    assert s["published"] == ["px"] and len(sent) == 1 and sent[0][1] is None

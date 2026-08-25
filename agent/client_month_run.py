@@ -892,13 +892,23 @@ def _apply(base_key, rows, start, days, store, log, locked_days=()):
         # distinct instagram feed post_dates (the same unit the grow-guard uses).
         new_feeds = len({r.get("post_date") for r in clean_rows
                          if r.get("format") == "feed" and r.get("account") == "instagram"})
+        # POST-MERGE comparison (audit 2026-08-25 MAJOR): a grow build EXCLUDES locked
+        # (human-owned approved/published) days from its own rows — their feeds survive the
+        # delete via preserve_dates. Comparing only new_feeds against existing_feeds
+        # (which counts the locked ones) wrongly read every incremental grow as a shrink
+        # and no-op'd it, so a built gym could never grow. Compare what the calendar will
+        # hold AFTER the write: this build's feeds + the preserved locked-day feeds.
+        locked_in_span = {str(d)[:10] for d in (locked_days or ())
+                          if str(d)[:7] in set(months)}
+        post_merge_feeds = new_feeds + len(locked_in_span)
         try:
             from .client_media_sync import _existing_feed_count
             existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
         except Exception:  # noqa: BLE001 - a count failure must never block a legit build
             existing_feeds, count_ok = 0, False
-        if count_ok and existing_feeds > 0 and new_feeds < existing_feeds:
-            log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> {new_feeds}; "
+        if count_ok and existing_feeds > 0 and post_merge_feeds < existing_feeds:
+            log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> "
+                f"{post_merge_feeds} ({new_feeds} new + {len(locked_in_span)} locked); "
                 "keeping the existing calendar (grow-only, never shrink)")
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_shrink": True,

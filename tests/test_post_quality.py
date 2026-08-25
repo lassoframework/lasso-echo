@@ -153,3 +153,17 @@ def test_strip_llm_scaffold():
     # a real caption that merely starts with a label-ish word is NOT over-stripped
     assert _strip_llm_scaffold("Post-workout soreness is normal. Book now.") == \
         "Post-workout soreness is normal. Book now."
+
+
+def test_internal_hint_blocks_anywhere_are_not_a_plus():
+    """Audit 2026-08-25 CRITICAL: the scene/grounding hint blocks appended for the LLM
+    must never ship in a caption — the gate rejects them ANYWHERE, not just line one."""
+    leaked = ("Try our 6 week challenge.\n\n"
+              "WHAT THIS POST'S PHOTO/VIDEO SHOWS (reference this...): kids having fun\n"
+              "VERIFIED IN THE IMAGE: a small_group; visible: kids.")
+    issues = pq.caption_issues(leaked)
+    assert any("prompt hint block" in i for i in issues)
+    # clean caption unaffected
+    assert pq.caption_issues(
+        "Busy week? One coached hour puts you back in charge. Book your intro session "
+        "today and see what a plan feels like.") == []

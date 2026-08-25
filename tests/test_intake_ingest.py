@@ -5,6 +5,7 @@ to JPG; the client note lands as the drafter's .txt sidecar; a bad file dead-let
 with ONE ops alert and the loop continues; a re-run is idempotent (manifest).
 """
 
+import io
 import json
 import os
 import sys
@@ -159,6 +160,61 @@ def test_deadletter_with_alert_and_continue(monkeypatch, tmp_path):
     assert out["gyma"]["accepted"] == 1                 # the good file still landed
     assert any(k.startswith("intake/gyma/deadletter/") for k in r2.objects)
     assert len([n for n in rec.notices if "dead-lettered" in n]) == 1
+
+
+# ---- truncated-but-decodable JPEG is SALVAGED, not dead-lettered ------------------
+# These two tests use the REAL default converter (converter=None) so the PIL decode
+# path itself is exercised: a mobile-Safari/interrupted upload commonly cuts the
+# final ~100 bytes off an otherwise-intact JPEG, and a client photo must never be
+# silently lost when it is still decodable.
+def _real_jpeg_bytes(px=160):
+    """A real JPEG a few KB big (noisy pixels so cutting the tail leaves the
+    header and most scan data intact)."""
+    from PIL import Image
+    img = Image.new("RGB", (px, px))
+    img.putdata([((x * 7) % 256, (x * 13) % 256, (x * 29) % 256)
+                 for x in range(px * px)])
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=92)
+    return out.getvalue()
+
+
+def test_truncated_jpeg_is_salvaged_not_deadlettered(monkeypatch, tmp_path, capsys):
+    _arm(monkeypatch, tmp_path)
+    from PIL import Image, ImageFile
+    r2 = FakeR2()
+    _seed(r2, name="20260825T155821Z_photo.jpeg", data=_real_jpeg_bytes()[:-100])
+    out = intake_ingest.process_all(r2=r2, converter=None,   # REAL PIL converter
+                                    phash=_fake_phash, moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1
+    assert out["gyma"]["deadlettered"] == 0
+    assert not any(k.startswith("intake/gyma/deadletter/") for k in r2.objects)
+    # the salvage is LOUD in the log, with the unprocessed byte count
+    assert "[intake-ingest] salvaged truncated image 20260825T155821Z_photo.jpeg" \
+        in capsys.readouterr().out
+    # the filed file is a clean re-encoded JPEG: full decode works WITHOUT the flag
+    lib = tmp_path / "library" / "gyma"
+    filed = Image.open(lib / "20260825T155821Z_photo.jpg")
+    filed.load()                                        # no OSError = clean file
+    # the process-global Pillow flag was restored, never left on
+    assert ImageFile.LOAD_TRUNCATED_IMAGES is False
+
+
+def test_undecodable_bytes_still_deadletter(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
+    rec = RecordingPoster()
+    monkeypatch.setattr(ops_alerts, "_default_poster", lambda: rec)
+    r2 = FakeR2()
+    _seed(r2, name="20260825T160000Z_junk.jpg",
+          data=b"this is not an image at all, just garbage bytes" * 4)
+    out = intake_ingest.process_all(r2=r2, converter=None,   # REAL PIL converter
+                                    phash=_fake_phash, moderator=_pass_all)
+    assert out["gyma"]["deadlettered"] == 1
+    assert out["gyma"]["accepted"] == 0
+    assert any(k.startswith("intake/gyma/deadletter/") for k in r2.objects)
+    assert len([n for n in rec.notices if "dead-lettered" in n]) == 1
+    assert not (tmp_path / "library" / "gyma").exists()   # nothing filed
 
 
 # ---- idempotent re-run --------------------------------------------------------------

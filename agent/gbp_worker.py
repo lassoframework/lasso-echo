@@ -79,15 +79,35 @@ def publish_gbp_row(row, connection, *, client, draft=True):
     # A policy/other error is NOT retried (it would just fail again). Second failure -> the
     # caller's failed path.
     from .zernio import post_id_of
+
+    def _dedup_success(exc):
+        """Zernio 409 = its 24h content-hash dedup: this exact content ALREADY posted.
+        That IS success for exactly-once (audit 2026-08-25 MAJOR: it was classified as
+        a failure, so a LIVE post got a client-visible 'failed' + reject_reason and the
+        coach requeued the same duplicate forever)."""
+        if getattr(exc, "status", None) != 409:
+            return None
+        from .zernio_publisher import _existing_post_id
+        return {"ok": True, "status": "published",
+                "late_post_id": _existing_post_id(getattr(exc, "detail", "")),
+                "reject_reason": "", "mode": "draft" if draft else "live",
+                "dedup": True}
+
     try:
         resp = client.create_post_raw(payload, draft=draft)
     except Exception as e1:  # noqa: BLE001
+        dedup = _dedup_success(e1)
+        if dedup:
+            return dedup
         if not _is_transient_error(e1):
             return {"ok": False, "status": "failed", "late_post_id": "",
                     "reject_reason": _plain_reason(str(e1)) or "send error", "mode": ""}
         try:
             resp = client.create_post_raw(payload, draft=draft)   # the one retry
         except Exception as e2:  # noqa: BLE001
+            dedup = _dedup_success(e2)
+            if dedup:
+                return dedup
             return {"ok": False, "status": "failed", "late_post_id": "",
                     "reject_reason": "Google could not publish this post after a retry.",
                     "mode": ""}
@@ -296,6 +316,20 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                       f"{type(e).__name__}")
             continue
         for row in gym_rows:
+            # EXACTLY-ONCE CLAIM (audit 2026-08-25 MAJOR): flip approved -> publishing
+            # BEFORE the network call, mirroring the IG/FB lane. A lost claim (another
+            # worker/run owns the row, or its status changed) skips — a crash between
+            # send and mark can no longer re-send, and two workers can never double-send.
+            # Older stores/fakes without the method keep the historical behavior.
+            claim = getattr(store, "claim_publishing", None)
+            if claim is not None:
+                try:
+                    if not claim(row.get("id")):
+                        continue                      # someone else owns it: skip
+                except Exception as e:  # noqa: BLE001
+                    print(f"[gbp] claim failed for row {row.get('id')}: "
+                          f"{type(e).__name__}; skipping this tick")
+                    continue
             try:
                 res = publish_one(row, conns, client=client, draft=draft, alert=alert,
                                   now=(now or _utcnow()))
@@ -305,6 +339,14 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 continue
             if res.get("held"):
                 held += 1
+                if claim is not None:
+                    # release the claim: a held row (needs_reconnect etc.) must go back
+                    # to 'approved' so it retries once the hold clears, never strand in
+                    # 'publishing'.
+                    try:
+                        store.mark_status(row.get("id"), "approved")
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             if res.get("reverted"):
                 # G6: lapsed OFFER -> back to pending for a human; alert staff (not client)

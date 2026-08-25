@@ -567,3 +567,45 @@ def test_edit_requires_note_or_gbp(monkeypatch):
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
     status, body = portal_routes.handle_portal_action("edit", "lasso", "id-g", "a1")
     assert status == 400 and "caption" in body["error"].lower()
+
+
+# ---- server-side race guards (audit 2026-08-25) --------------------------------
+
+def test_set_status_refuses_publishing_and_published_rows(monkeypatch):
+    """The WRITE itself must refuse to overwrite a mid-claim/published row, no matter
+    what the handler read a moment earlier (deny-during-publish used to be swallowed)."""
+    patched = _Resp(200, [_row("id-s", gym_id="lasso", status="denied")])
+    http = _FakeHTTP(patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().set_status("lasso", "id-s", "denied")
+    _m, _u, params, _h, _p = http.calls[0]
+    assert params["status"] == "not.in.(publishing,published)"
+
+
+def test_patch_caption_refuses_publishing_and_published_rows(monkeypatch):
+    patched = _Resp(200, [_row("id-c", gym_id="lasso", status="pending", caption="x")])
+    http = _FakeHTTP(patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().patch_caption("lasso", "id-c", "x")
+    _m, _u, params, _h, _p = http.calls[0]
+    assert params["status"] == "not.in.(publishing,published)"
+
+
+def test_mark_published_only_stamps_the_claimed_row(monkeypatch):
+    """mark_published is conditioned on status='publishing' (only the row THIS worker
+    claimed); zero rows matched -> RAISES so the caller reports loudly instead of
+    silently flipping a denied/killed row to published."""
+    import pytest
+    ok = _Resp(200, [_row("id-p", gym_id="lasso", status="published")])
+    http = _FakeHTTP(patch_resp=ok)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    row = pcs.SupabaseCalendarStore().mark_published("id-p", "M1", "2026-08-25T12:00:00Z")
+    assert row["status"] == "published"
+    _m, _u, params, _h, _p = http.calls[0]
+    assert params["status"] == "eq.publishing"
+    # zero-match (out-of-band deny raced us) -> raise, never overwrite
+    empty = _Resp(200, [])
+    http2 = _FakeHTTP(patch_resp=empty)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http2)
+    with pytest.raises(pcs.PortalStoreError):
+        pcs.SupabaseCalendarStore().mark_published("id-x", "M1", "2026-08-25T12:00:00Z")

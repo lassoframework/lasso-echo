@@ -64,6 +64,43 @@ def _remux_mov(data, name, runner=None, which=None):
         return None
 
 
+def _decode_image(data, name):
+    """Image.open + FULL decode, salvaging nearly-complete files. A JPEG missing
+    its final few bytes (interrupted mobile-Safari/multipart upload) makes PIL
+    raise OSError 'image file is truncated (N bytes not processed)' even though
+    the picture is 99% intact and fully usable — and a client photo is precious,
+    so we retry ONCE with LOAD_TRUNCATED_IMAGES instead of dead-lettering. The
+    flag is Pillow PROCESS-GLOBAL, so it is set/restored tightly around the one
+    retry decode, never left on. Truly undecodable bytes (garbage, no parseable
+    header) still raise on BOTH attempts, so they still dead-letter upstream.
+    The caller re-encodes the salvaged image to a clean JPEG, so everything
+    downstream (phash, thumbnail, library, publish) gets a valid file."""
+    import re
+    from PIL import Image, ImageFile  # lazy
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()   # force the full decode HERE, where we can catch truncation
+        return img
+    except OSError as e:
+        # only the specific truncated-tail failure earns a salvage retry;
+        # anything else (unidentifiable garbage included) dead-letters as before
+        if "truncated" not in str(e):
+            raise
+        truncated_err = e
+    prev = ImageFile.LOAD_TRUNCATED_IMAGES
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = prev
+    m = re.search(r"\((\d+) bytes not processed\)", str(truncated_err))
+    unprocessed = m.group(1) if m else "unknown"
+    print(f"[intake-ingest] salvaged truncated image {name} "
+          f"({unprocessed} bytes unprocessed)")
+    return img
+
+
 def _convert_default(data, name):
     """(new_bytes, new_name): HEIC/HEIF -> JPG (orientation normalized);
     MOV -> MP4 (ffmpeg remux when available, else unchanged); MP4 passes
@@ -75,11 +112,11 @@ def _convert_default(data, name):
     if lower.endswith(".mov"):
         remuxed = _remux_mov(data, name)
         return remuxed if remuxed is not None else (data, name)
-    from PIL import Image, ImageOps  # lazy
+    from PIL import ImageOps  # lazy
     if lower.endswith((".heic", ".heif")):
         import pillow_heif  # lazy
         pillow_heif.register_heif_opener()
-    img = Image.open(io.BytesIO(data))
+    img = _decode_image(data, name)
     img = ImageOps.exif_transpose(img)
     out = io.BytesIO()
     img.convert("RGB").save(out, format="JPEG", quality=92)

@@ -418,6 +418,11 @@ def _handle_social_supabase(account_key, month, now=None):
         # GATE 2 (coach-screens-first-month): rows a coach has NOT yet released are
         # WITHHELD from the owner. 'coach_review' posts never appear in the owner /social
         # view (nor feed low_creative/awaiting) until a coach flips them to 'pending'.
+        # But remember they EXIST (audit 2026-08-25 MAJOR): a fully-built, coach-withheld
+        # first month must not show the owner the red "Echo is waiting on your uploads"
+        # banner — the calendar is built, it is just being screened.
+        has_withheld_calendar = any(
+            str((r or {}).get("status") or "").lower() == "coach_review" for r in rows)
         rows = [r for r in rows
                 if str((r or {}).get("status") or "").lower() != "coach_review"]
         posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key)) for r in rows]
@@ -431,6 +436,8 @@ def _handle_social_supabase(account_key, month, now=None):
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
     awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    if has_withheld_calendar:
+        awaiting_media = False        # built + coach-screened is NOT "waiting on uploads"
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -612,6 +619,15 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store):
         if str(row.get("status") or "").lower() == "published":
             return 200, {"ok": True, "action": "approve", "draft_id": draft_id,
                          "detail": "Already published.", "idempotent": True}
+        # MID-CLAIM GUARD (audit 2026-08-25 MAJOR): a row in 'publishing' is owned by the
+        # publisher for the seconds between the atomic claim and the result. Approving it
+        # here would flip it back to 'approved' — claimable AGAIN next tick — and the SAME
+        # creative publishes twice (a client double-tapping Approve was enough to hit
+        # this). Mirror the edit/deny/kill guard: 409, try again in a minute.
+        if str(row.get("status") or "").lower() == "publishing":
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "this post is publishing right now; try again in a "
+                                  "minute once it lands"}
         # GATE 2: a withheld first-month row cannot be approved by the owner. It stays
         # invisible in /social, but guard the action too in case an id leaks.
         if str(row.get("status") or "").lower() == "coach_review":
@@ -711,14 +727,45 @@ def _learn_from_edit(account_key, before, after, reason=""):
               f"{account_key}: {type(exc).__name__}")
 
 
+def _edit_gate_claims(account_key):
+    """The claim set an EDIT must clear for THIS gym (audit 2026-08-25 MAJOR): the gym's
+    OWN approved client sources — never LASSO's global stats, which could 'clear' a claim
+    that is false for this gym (cross-tenant clearance) while the gym's real facts got
+    false 422s. LASSO's own account keeps the global set (None -> is_gate_clean default).
+    Best effort: an unreadable source table returns [] (fail closed on figures)."""
+    base = (account_key or "").strip()
+    if not base or base.startswith("lasso"):
+        return None
+    try:
+        from . import client_sources
+        return client_sources.approved_claims(base)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _clean_edit_note(note):
+    """The no-dash copy law applied to an EDITED caption: dashes are cleaned (the same
+    filter the build lane uses) instead of bouncing the owner with an error — a client
+    typing an em dash should not lose their edit; what PUBLISHES must be dash-free
+    (previously a dashed edit sailed through and the story reburn burned it onto media)."""
+    try:
+        from .content_categories import filter_platform_copy
+        cleaned = filter_platform_copy(note or "")
+        return cleaned if (cleaned or "").strip() else (note or "")
+    except Exception:  # noqa: BLE001 - cleaning must never eat an edit
+        return note or ""
+
+
 def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store,
                           reason=""):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
         return short
+    note = _clean_edit_note(note)
     # the fabrication gate runs BEFORE any store touch: an unsupported claim is refused
-    # 422 whether or not the row exists, so a stat can never reach the caption.
-    if not _rotation.is_gate_clean(note):
+    # 422 whether or not the row exists, so a stat can never reach the caption. Gated
+    # against THIS gym's own approved claims (LASSO globals only for LASSO itself).
+    if not _rotation.is_gate_clean(note, approved_claims=_edit_gate_claims(account_key)):
         return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
                      "error": "fabrication gate: the note carries a claim with no "
                               "approved receipt. Cite an approved source or drop the "
@@ -1039,6 +1086,19 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
 
     if not want_on:
         # Manual restored: clear only. Never un-approve anything already published.
+        # HARD ERROR when the OFF write did not reach the shared plane (audit
+        # 2026-08-25 MAJOR): the publish lane reads Supabase — an OFF that only landed
+        # in the local kv leaves the gym AUTO-PUBLISHING posts the owner explicitly
+        # de-authorized, behind an {ok:true}. Turning autonomy ON degrades safely
+        # (worst case: posts wait for manual approval), so ON keeps best-effort; OFF
+        # is the de-authorization and must be durable or loudly fail so the client
+        # retries. (When the shared plane is not configured, local kv IS the plane.)
+        if config.portal_calendar_supabase_enabled() and not shared_persisted:
+            return 503, {"ok": False, "autonomous": True,
+                         "account_key": account_key, "shared_persisted": False,
+                         "error": "could not durably turn autonomy OFF (shared store "
+                                  "write failed); the gym would keep auto-publishing. "
+                                  "Please try again."}
         return 200, {"ok": True, "autonomous": False, "approved_count": 0,
                      "account_key": account_key,
                      "shared_persisted": shared_persisted}

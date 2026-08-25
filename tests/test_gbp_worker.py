@@ -511,3 +511,50 @@ def test_photo_drop_empty_caption_is_fine_not_a_rail_fail():
                format="photo")
     out = gw.publish_one(row, [_c()], client=c, draft=True)
     assert out["status"] == "published" and "empty caption" not in (out["reject_reason"] or "")
+
+
+# ---- exactly-once claim + 409-dedup-as-success (audit 2026-08-25) ----------------
+
+class _Claim409Client:
+    """create_post_raw raises a Zernio 409 (content dedup: post already live)."""
+    def create_post_raw(self, payload, *, draft=False, publish_now=True):
+        from agent.zernio import ZernioError
+        raise ZernioError(409, '{"error":"duplicate","existingPostId":"zdup_1"}')
+
+
+def test_zernio_409_dedup_is_success_not_failure():
+    """A 409 means the exact content is ALREADY live — that IS success. It used to be
+    marked 'failed' with a client-visible reject_reason while the post was on Google."""
+    out = gw.publish_gbp_row(_row(), _conn(), client=_Claim409Client(), draft=True)
+    assert out["ok"] and out["status"] == "published"
+    assert out["late_post_id"] == "zdup_1"
+    assert out.get("dedup") is True
+
+
+class _ClaimStore(_Store):
+    """A store WITH the atomic claim: rows claimable once; a second claim loses."""
+    def __init__(self, rows, conns, lose_ids=()):
+        super().__init__(rows, conns)
+        self._claimed = set()
+        self._lose = set(lose_ids)
+        self.claims = []
+
+    def claim_publishing(self, row_id):
+        self.claims.append(row_id)
+        if row_id in self._lose or row_id in self._claimed:
+            return False
+        self._claimed.add(row_id)
+        return True
+
+
+def test_publish_due_gbp_claims_before_send_and_skips_lost_claims():
+    rows = [dict(_row(), id="r1", gym_id="lasso"),
+            dict(_row(), id="r2", gym_id="lasso")]
+    store = _ClaimStore(rows, {"lasso": [_c()]}, lose_ids={"r2"})
+    c = _FakeClient()
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=True,
+                             alert=lambda m: None)
+    assert store.claims == ["r1", "r2"]            # both claims attempted
+    assert [rid for rid, _ in store.published] == ["r1"]   # only the won claim sent
+    assert len(c.calls) == 1                        # the lost claim NEVER hit the network
+    assert out["published"] == 1

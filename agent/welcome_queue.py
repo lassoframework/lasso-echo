@@ -643,6 +643,19 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
                 needs_logo += 1
                 print(f"[welcome-queue] portal gym {name} has no usable logo "
                       f"(override/scrape); NOT enqueued (drop a logo override)")
+                # ALERT once per gym (audit 2026-08-25 MAJOR): this was a print re-fired
+                # every scan that no human watches — a new client's welcome post silently
+                # never happened (Pierce). Deduped in kv; clears only by hand.
+                try:
+                    from . import db as _db, ops_alerts as _oa
+                    if not _db.kv_get(f"welcome_logo_alerted_{ak}"):
+                        _db.kv_set(f"welcome_logo_alerted_{ak}", "1")
+                        _oa.alert(
+                            f"welcome post for new gym '{name}' is BLOCKED: no usable "
+                            "logo (scrape + override both failed). Drop a logo override "
+                            "or fix the domain, or their welcome never posts.")
+                except Exception:  # noqa: BLE001 - alerting never blocks the scan
+                    pass
                 continue
 
             template = welcome_posts.pick_template(gym_key)

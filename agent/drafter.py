@@ -333,6 +333,53 @@ def _output_claims_cleared(body, voice, client_note):
     return True
 
 
+# The scene/grounding hint blocks appended to the note SB7 sees. They are PROMPT INPUT,
+# never caption copy — the template fallback used to echo the augmented note verbatim,
+# shipping this scaffolding into client calendars (audit 2026-08-25 CRITICAL).
+_HINT_MARKERS = ("WHAT THIS POST'S PHOTO/VIDEO SHOWS", "VERIFIED IN THE IMAGE")
+
+
+def _hint_free(creative):
+    """A copy of `creative` whose client_note is truncated at the first internal hint
+    marker, so the deterministic template fallback emits ONLY the approved source text —
+    never the scene/grounding scaffolding appended for the LLM. Returns the original
+    object untouched when no marker is present (the common, non-augmented case)."""
+    note = getattr(creative, "client_note", "") or ""
+    cut = min((note.find(m) for m in _HINT_MARKERS if m in note), default=-1)
+    if cut < 0:
+        return creative
+    import copy
+    clean = copy.copy(creative)
+    clean.client_note = note[:cut].strip()
+    return clean
+
+
+def _note_sb7_fallback(account_key, reason):
+    """OBSERVABILITY for the template fallback (audit 2026-08-25): count each SB7->template
+    fallback per gym per day (kv) and ALERT a human ONCE per gym/day when a build storms
+    (>= _SB7_FALLBACK_ALERT_AT in one day) — a storm means most of the month is verbatim
+    template filler, which reads repetitive (Bryan's complaint) and previously was invisible
+    outside Railway stdout. Best effort: never raises, never blocks a caption."""
+    try:
+        from datetime import date as _date
+        from . import db, ops_alerts
+        day = _date.today().isoformat()
+        key = f"sb7fallback_{account_key}_{day}"
+        n = int(db.kv_get(key) or 0) + 1
+        db.kv_set(key, str(n))
+        if n == _SB7_FALLBACK_ALERT_AT:
+            ops_alerts.alert(
+                f"SB7 caption fallback storm for {account_key}: {n} template fallbacks "
+                f"today (latest reason: {reason}). The month is filling with verbatim "
+                "source text instead of written captions — check the gym's sources/voice "
+                "and the generator prompt.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_SB7_FALLBACK_ALERT_AT = 8      # fallbacks per gym per day before a human is pinged
+
+
 class StoryBrandGenerator:
     """
     LLM-powered caption generator using the StoryBrand SB7 framework.
@@ -506,7 +553,7 @@ class StoryBrandGenerator:
         hashtags = _select_hashtags(voice, creative)
 
         if not client_note:
-            return TemplateGenerator().build(voice, creative)
+            return TemplateGenerator().build(voice, _hint_free(creative))
 
         guidance = self._brain_guidance(account)
         avoid_block = self._avoid_openings_block(avoid_openings)
@@ -548,9 +595,23 @@ class StoryBrandGenerator:
             # stat. This restores the deterministic no-fabrication floor the template
             # has; the prompt's HARD RULES are belt, this is suspenders.
             if not _output_claims_cleared(body, voice, client_note):
-                print("[sb7] output carried a number not in the approved sources; "
-                      "falling back to template (no fabrication)")
-                return TemplateGenerator().build(voice, creative)
+                # RETRY ONCE without digits (audit 2026-08-25): one stray number used to
+                # cost the whole day a written caption (straight to template). A single
+                # regeneration told to carry NO digits rescues most of these; only a
+                # second miss falls back. Same figure gate re-runs on the retry.
+                retry = _compose(
+                    "IMPORTANT: your previous attempt carried a number not present in "
+                    "the approved source. Rewrite the caption with NO digits or "
+                    "numeric claims at all; spell out nothing that implies a stat, "
+                    "price, or count that is not verbatim in the source.\n\n")
+                if retry and _output_claims_cleared(retry, voice, client_note) \
+                        and not openings_collide(retry, avoid_list):
+                    body = retry
+                else:
+                    print("[sb7] output carried a number not in the approved sources; "
+                          "falling back to template (no fabrication)")
+                    _note_sb7_fallback(getattr(account, "key", "") or "", "figure_gate")
+                    return TemplateGenerator().build(voice, _hint_free(creative))
             fragments = [body]
             if cta and not _caption_has_cta(body, voice):
                 fragments.append(cta)
@@ -559,7 +620,8 @@ class StoryBrandGenerator:
         except Exception as exc:
             print(f"[sb7] LLM caption failed ({type(exc).__name__}: {exc}), "
                   "falling back to template")
-            return TemplateGenerator().build(voice, creative)
+            _note_sb7_fallback(getattr(account, "key", "") or "", "llm_error")
+            return TemplateGenerator().build(voice, _hint_free(creative))
 
 
 class TemplateGenerator:

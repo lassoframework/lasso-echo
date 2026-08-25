@@ -1509,8 +1509,18 @@ def build_server(port=None):
         def do_GET(self):
             # Portal gym status: GET /portal/gym/<account_key>
             # Gated by AGENT_PORTAL_APPROVALS. Returns JSON. No token in path.
+            # AUTH REQUIRED (audit 2026-08-25 CRITICAL): the response reconstructs the gym's
+            # RAW upload/portal token (upload_link) — a capability that authenticates
+            # approve/edit/deny/uploads for that gym. Without auth, anyone who guessed a
+            # slug ('gritx') could take over that gym's portal. Same X-Portal-Key contract
+            # as POST /portal/onboard; auth is checked FIRST so a wrong key never even
+            # reveals whether the flag/gym exists.
             portal_key = self._portal_gym_key()
             if portal_key is not None:
+                shared_key = config.portal_onboard_key()
+                supplied = self.headers.get("X-Portal-Key", "") or ""
+                if (not shared_key) or (not hmac.compare_digest(supplied, shared_key)):
+                    return self._send_json({"error": "unauthorized"}, 401)
                 status, body = handle_portal_gym_status(portal_key)
                 return self._send_json(body, status)
 
@@ -1913,6 +1923,13 @@ def build_server(port=None):
             if length > _max_request_bytes():
                 return self._deny(413, "too large")
             raw = self.rfile.read(length)
+            # SHORT BODY GUARD: rfile.read blocks until `length` bytes or EOF,
+            # so a short read means the client hung up mid-upload (interrupted
+            # mobile connection). Parsing the partial multipart would silently
+            # file a truncated photo; reject instead so the browser surfaces a
+            # failure and the gym retries with the complete file.
+            if len(raw) < length:
+                return self._deny(400, "upload interrupted, please retry")
             msg = BytesParser(policy=email_default).parsebytes(
                 b"Content-Type: " + (self.headers.get("Content-Type") or "").encode()
                 + b"\r\n\r\n" + raw)

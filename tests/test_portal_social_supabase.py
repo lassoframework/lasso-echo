@@ -577,3 +577,14 @@ def test_approve_response_is_authoritative_only_for_target(monkeypatch):
     assert body["status"] == "approved"
     # the sibling row was never written
     assert ("day-n1", "approved") not in store.patches
+
+
+def test_approve_rejects_mid_claim_publishing_row(monkeypatch):
+    """MID-CLAIM GUARD (audit 2026-08-25): approving a row the publisher has claimed
+    ('publishing') must 409, never flip it back to a claimable status (that re-armed the
+    claim and double-posted the same creative on a client double-tap)."""
+    store = _FakeStore([_row("id-1", status="publishing")])
+    status, body = ps.handle_approve("lasso", "id-1", "U_owner", sb_store=store)
+    assert status == 409 and body["ok"] is False
+    assert "publishing right now" in body["error"]
+    assert store.patches == [], "a publishing row must never be status-patched by approve"

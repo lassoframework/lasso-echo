@@ -186,10 +186,42 @@ def _rows(account_key, status=None, category=None):
                 for r in conn.execute(q, args)]
 
 
+def _tenant_variants(account_key):
+    """Key variants one gym's sources may live under, primary first: the key as given,
+    its tenant base (eng_ig -> eng), and the base's _ig twin (eng -> eng_ig).
+
+    WHY (audit 2026-08-25 CRITICAL): the portal 7-section intake form lands sources
+    under the BASE key (the token's key), while the month builder reads them under
+    <base>_ig — a portal-onboarded gym stalled in no_sources FOREVER even after a human
+    approved its rows. Readers fall back across variants (first variant WITH rows wins;
+    never merged, so a gym with rows under both keys is not double-counted)."""
+    key = (account_key or "").strip()
+    variants = [key]
+    for suf in ("_ig", "_fb"):
+        if key.endswith(suf):
+            variants.append(key[: -len(suf)])
+            break
+    else:
+        if key:
+            variants.append(f"{key}_ig")
+    seen, out = set(), []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def approved_sources(account_key, category=None):
     """The account's APPROVED sources (optionally one category). The ONLY set the
-    drafting path may read: pending material is never returned here."""
-    return _rows(account_key, status="approved", category=category)
+    drafting path may read: pending material is never returned here. Falls back across
+    tenant key variants (see _tenant_variants) so a gym whose sources landed under its
+    base key still drafts."""
+    for key in _tenant_variants(account_key):
+        rows = _rows(key, status="approved", category=category)
+        if rows:
+            return rows
+    return []
 
 
 def pending_sources(account_key, category=None):
@@ -228,9 +260,13 @@ def approve_all(account_key):
 
 def categories_present(account_key, status="approved"):
     """The categories this account has content in, in canonical order. Drives the
-    per-client category spread in client_content."""
-    have = {s.category for s in _rows(account_key, status=status)}
-    return [c for c in CLIENT_CATEGORIES if c in have]
+    per-client category spread in client_content. Same tenant-variant fallback as
+    approved_sources so a base-keyed intake still spreads categories."""
+    for key in _tenant_variants(account_key):
+        have = {s.category for s in _rows(key, status=status)}
+        if have:
+            return [c for c in CLIENT_CATEGORIES if c in have]
+    return []
 
 
 def approved_claims(account_key):

@@ -318,3 +318,69 @@ def test_colliding_opening_never_blocks_the_post(monkeypatch):
         _voice(), _creative(), avoid_openings=["you're juggling too much"])
     assert caption.strip()                              # a caption is always produced
     assert "Book your intro session." in caption        # CTA still appended
+
+
+# ---- scaffold-leak + retry-once (audit 2026-08-25 CRITICAL) --------------------
+
+_AUGMENTED_NOTE = (
+    "Try our 6 week transformation challenge for busy parents."
+    "\n\nWHAT THIS POST'S PHOTO/VIDEO SHOWS (reference this so the caption matches the "
+    "image; it is a scene hint, NOT a source of facts, numbers, offers, or names to "
+    "state): Youth fitness fun\nVERIFIED IN THE IMAGE: a small_group; visible: kids. "
+    "Do NOT call it a crowd/packed unless the grouping is crowd."
+)
+
+
+def test_template_fallback_never_leaks_hint_scaffolding(monkeypatch):
+    """CRITICAL: when SB7 falls back to the template, the caption must carry ONLY the
+    approved source text — never the internal scene/grounding hint blocks appended for
+    the LLM (these leaked verbatim into client calendars)."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    # the LLM always emits an unsourced figure -> figure gate rejects the first AND the
+    # retry -> template fallback
+    monkeypatch.setattr(drafter, "_call_llm_caption",
+                        lambda s, u: "Get 40% off your first month.")
+    creative = _creative(note=_AUGMENTED_NOTE)
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert "WHAT THIS POST'S PHOTO/VIDEO SHOWS" not in caption
+    assert "VERIFIED IN THE IMAGE" not in caption
+    assert "6 week transformation challenge" in caption     # the real source survives
+
+
+def test_llm_error_fallback_never_leaks_hint_scaffolding(monkeypatch):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    monkeypatch.setattr(drafter, "_call_llm_caption",
+                        lambda s, u: (_ for _ in ()).throw(RuntimeError("boom")))
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), _creative(note=_AUGMENTED_NOTE))
+    assert "WHAT THIS POST'S PHOTO/VIDEO SHOWS" not in caption
+    assert "VERIFIED IN THE IMAGE" not in caption
+    assert "6 week transformation challenge" in caption
+
+
+def test_figure_gate_retry_once_rescues_the_day(monkeypatch):
+    """A single stray digit no longer costs the whole day a written caption: one
+    regeneration (told: no digits) is attempted, and a clean retry is KEPT instead of
+    falling back to the template."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    bodies = iter(["Get 40% off your first month for just $99.",     # rejected
+                   "Busy week? One coached hour puts you back in charge."])  # clean retry
+    calls = []
+    def _fake(s, u):
+        calls.append(u)
+        return next(bodies)
+    monkeypatch.setattr(drafter, "_call_llm_caption", _fake)
+    creative = _creative(note="Our coaches meet you where you are.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert "40%" not in caption and "$99" not in caption
+    assert "back in charge" in caption                     # the retry shipped
+    assert len(calls) == 2                                  # exactly one retry
+    assert "NO digits" in calls[1]                          # the nudge was threaded
+
+
+def test_hint_free_helper_strips_only_the_hint():
+    c = _creative(note=_AUGMENTED_NOTE)
+    clean = drafter._hint_free(c)
+    assert clean.client_note == "Try our 6 week transformation challenge for busy parents."
+    # no marker -> the SAME object back, untouched
+    c2 = _creative(note="Plain approved source text.")
+    assert drafter._hint_free(c2) is c2

@@ -175,10 +175,19 @@ class SupabaseCalendarStore:
         PATCH the row's status, filtered by BOTH id and gym_id (second isolation
         guard). Returns the updated row dict, or None when zero rows matched
         (treated as 404 by the caller). Never touches a row whose gym_id differs.
+
+        SERVER-SIDE RACE GUARD (audit 2026-08-25 MAJOR): also filtered by
+        status NOT IN (publishing, published) — every caller is a portal action
+        (approve/deny/kill/coach-release), and none may overwrite a row the publisher
+        has claimed (seconds-wide window) or already published. The handlers 409 these
+        states from their own pre-read; this makes the WRITE itself refuse when the
+        state changed between that read and this patch (deny-during-publish used to be
+        silently swallowed by the later mark_published, or worse, re-arm a claim).
         """
         params = {
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
+            "status": "not.in.(publishing,published)",
         }
         r = self._client().patch(
             self._rest(_TABLE),
@@ -264,10 +273,17 @@ class SupabaseCalendarStore:
         """PATCH the row's caption AND revert status to 'pending', filtered by BOTH id
         and gym_id. Editing a caption resets the approval so the owner re-approves the
         new wording — this prevents approving one text then silently posting another.
-        Returns the updated row dict, or None when zero rows matched (treated as 404)."""
+        Returns the updated row dict, or None when zero rows matched (treated as 404).
+
+        SERVER-SIDE RACE GUARD (audit 2026-08-25 MAJOR): status NOT IN (publishing,
+        published) — an edit landing in the seconds the publisher owns the row would
+        reset it to 'pending', making it claimable AGAIN next tick (the same creative
+        publishes twice, with different words so Zernio's dedup cannot save it). The
+        handler 409s from its pre-read; this makes the write itself refuse the race."""
         params = {
             "id": f"eq.{row_id}",
             "gym_id": f"eq.{account_key}",
+            "status": "not.in.(publishing,published)",
         }
         r = self._client().patch(
             self._rest(_TABLE),
@@ -514,10 +530,14 @@ class SupabaseCalendarStore:
     def mark_published(self, row_id, media_id, published_at):
         """
         Record a successful publish: status='published', published_at=<now iso>,
-        late_post_id=<media_id>. Filtered by id only (the row was already claimed by
-        mark_publishing, so no other worker can be here). Returns the updated row or None.
+        late_post_id=<media_id>. Filtered by id AND status='publishing' (audit
+        2026-08-25 MAJOR): only the row THIS worker claimed may be stamped. If an
+        out-of-band write somehow changed the status mid-flight (a denied/killed row
+        must never be flipped to published), zero rows match and we RAISE so the
+        caller reports it loudly (the post may be live; a human reconciles) instead
+        of silently overwriting the client's decision. Returns the updated row.
         """
-        params = {"id": f"eq.{row_id}"}
+        params = {"id": f"eq.{row_id}", "status": "eq.publishing"}
         r = self._client().patch(
             self._rest(_TABLE),
             params=params,
@@ -535,7 +555,15 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
-        return rows[0] if rows else None
+        if not rows:
+            # The claimed row is no longer 'publishing' — an out-of-band write raced us.
+            # Raise (never silently overwrite a deny/kill): the caller's except branch
+            # reports "published but the mark_published write failed" loudly, and a human
+            # reconciles the live post against the client's decision.
+            raise PortalStoreError(
+                409, f"row {row_id} is not in 'publishing'; refusing to stamp published "
+                     "over an out-of-band status change")
+        return rows[0]
 
     def mark_publish_failed(self, row_id, revert_status="pending"):
         """

@@ -724,3 +724,23 @@ def test_apply_allows_growth(tmp_path):
     res = cmr._apply("gritx", incoming, date(2026, 8, 26), 30, store, lambda m: None)
     assert res["ok"] is True and not res.get("noop_shrink") and not res.get("noop_empty")
     assert store.deleted != [] and store.inserted != []
+
+
+def test_apply_shrink_guard_counts_preserved_locked_days(tmp_path):
+    """GROWTH FIX (audit 2026-08-25): a grow build excludes locked (approved/published)
+    days from its own rows — those feeds SURVIVE the delete. The shrink guard must compare
+    the POST-MERGE total (new + locked), or every incremental grow reads as a shrink and
+    no-ops, meaning a built gym could never grow."""
+    from datetime import date
+    # 5 existing IG feeds: 3 locked (human-owned) + 2 pending drafts
+    existing = [f"2026-08-{d:02d}" for d in range(26, 31)]
+    store = _CountingStore(existing)
+    locked = ["2026-08-26", "2026-08-27", "2026-08-28"]
+    # the grow build emits 4 NEW feed days (excludes the 3 locked): post-merge = 7 > 5
+    incoming = [{"gym_id": "gritx", "post_date": f"2026-09-{d:02d}", "format": "feed",
+                 "account": "instagram", "status": "pending", "image_url": "u"}
+                for d in range(1, 5)]
+    res = cmr._apply("gritx", incoming, date(2026, 8, 26), 30, store, lambda m: None,
+                     locked_days=locked)
+    assert not res.get("noop_shrink"), "post-merge growth must proceed, not no-op"
+    assert store.inserted, "the grow build's rows must be written"

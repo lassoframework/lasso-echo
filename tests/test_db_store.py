@@ -148,3 +148,24 @@ def test_caption_newline_round_trip_through_store(tmp_path):
         f"Expected repr: {repr(caption)}\n"
         f"Got repr:      {repr(got.caption)}"
     )
+
+
+def test_gym_upsert_preserves_display_name_when_not_passed(monkeypatch, tmp_path):
+    """Audit 2026-08-25 CRITICAL: single-field upserts (upload_link, zernio_profile_id,
+    baseline...) used to ERASE the stored display_name to '' — onboard.run even wiped its
+    own write in the same call, blanking the gyms-table name for every portal gym and
+    killing the zernio-profile-link display-name fallback. An empty display_name arg now
+    means 'leave the stored name alone'; a non-empty one still updates it."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import db as _db
+    _db.gym_upsert("uuidgym", display_name="Pierce Fitness")
+    _db.gym_upsert("uuidgym", upload_link="https://x/u/tok")       # no name passed
+    row = _db.gym_get("uuidgym")
+    assert row["display_name"] == "Pierce Fitness"                  # preserved
+    assert row["upload_link"] == "https://x/u/tok"
+    _db.gym_upsert("uuidgym", zernio_profile_id="PID9")             # another field-only
+    row = _db.gym_get("uuidgym")
+    assert row["display_name"] == "Pierce Fitness"
+    assert row["zernio_profile_id"] == "PID9"
+    _db.gym_upsert("uuidgym", display_name="Pierce Wellness")       # explicit rename works
+    assert _db.gym_get("uuidgym")["display_name"] == "Pierce Wellness"

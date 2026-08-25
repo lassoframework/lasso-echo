@@ -473,14 +473,35 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # whose slot has not arrived is left UNTOUCHED (never claimed) so a later
         # tick this same day drips it out. catch_all bypasses the gate so the last
         # slot / the once-a-day draw sweeps every straggler (NO ORPHANS). A row whose
-        # slot has passed is never skipped for timing.
-        if not catch_all and not is_due(row, now):
+        # slot has passed is never skipped for timing. A row dated BEFORE run_date
+        # (catchup_days) is always due — its day already passed; is_due() compares
+        # time-of-day only, so without this a late-approved yesterday row would wait
+        # for today's identical wall-clock slot for no reason.
+        past_date = str(row.get("post_date") or run_date)[:10] < str(run_date)[:10]
+        if not catch_all and not past_date and not is_due(row, now):
             waiting.append(row_id)
             continue
 
         account = _account_for(row, gym_id)
         if account is None:
             # No mappable account: leave the row untouched (never claimed), skip it.
+            # ALERT for an IG/FB row (audit 2026-08-25 MAJOR): an APPROVED post that can
+            # never route (registry drift — the Pierce onboarding stall class) used to
+            # skip silently on every tick forever. Non-IG/FB rows (googlebusiness) are
+            # another lane's job and stay silent. Deduped per row in kv.
+            plat = (row.get("account") or "").strip().lower()
+            if plat in ("instagram", "facebook"):
+                try:
+                    from . import db as _db, ops_alerts as _oa
+                    if not _db.kv_get(f"noaccount_alerted_{row_id}"):
+                        _db.kv_set(f"noaccount_alerted_{row_id}", "1")
+                        _oa.alert(
+                            f"calendar row {row_id} (gym {gym_id}, {plat}) cannot "
+                            f"publish: no registry account '{gym_id}_"
+                            f"{'fb' if plat == 'facebook' else 'ig'}' exists. The post "
+                            "is skipped every tick until the account is registered.")
+                except Exception:  # noqa: BLE001 - alerting never blocks the lane
+                    pass
             skipped.append(row_id)
             continue
 
@@ -553,18 +574,21 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # (returns would_publish when off), so a client row is never sent live
             # unless both are armed.
             #
-            # PUBLISH NOW ON MANUAL APPROVAL (approved_only): a client who taps Approve
-            # expects the post LIVE, not scheduled to a later slot the same day — and a
-            # row we hand Zernio with a FUTURE scheduledFor is 'scheduled', not on the
-            # feed yet, while Echo marked it 'published' (Dale: "I don't see the post to
-            # their main feed"). So a manually-approved post publishes immediately.
-            # An AUTONOMOUS gym (approved_only=False) keeps the slot time so its
-            # pending posts still DRIP across the day instead of firing all at once.
+            # CLIENT LANE = PUBLISH NOW, ALWAYS (audit 2026-08-25 CRITICAL). The lane
+            # only reaches here once the row's own slot has ARRIVED (the slot gate above;
+            # publish_client_gyms no longer bypasses it with catch_all), so firing
+            # immediately IS firing at the slot time — for manual approvals AND
+            # autonomous gyms alike. Handing Zernio a FUTURE scheduledFor is what broke
+            # trust twice: (a) pre-approved posts swept at the day's first tick fired at
+            # ~midnight instead of their slot (Dale: "the times ECHO lists as publish
+            # time are not accurate"), and (b) a scheduled hand-off was immediately
+            # marked 'published' with a published_at that was a lie, hours before the
+            # post existed on the feed, with no reconcile if Zernio dropped it. Publish
+            # now at slot time makes published_at truthful and needs no reconcile.
             if account.key.startswith("lasso"):
                 result = publisher(draft, account)
             else:
-                sched = None if approved_only else scheduled_iso_for_row(row, now)
-                result = zernio_publish(draft, account, scheduled_for=sched)
+                result = zernio_publish(draft, account, scheduled_for=None)
         except Exception as e:
             # A real publish error: revert the claim so it retries next run. A CLIENT
             # row (approved_only) reverts to 'approved' so a transient failure never
@@ -819,12 +843,15 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
 def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
                         zernio_publish=None):
     """Publish every client gym's APPROVED, due calendar rows to the gym's OWN IG/FB
-    via Zernio, scheduled at each row's slot time. Self-gating: publish_due checks
+    via Zernio, firing each row AT its own slot time with publishNow (2026-08-25: no
+    future scheduledFor hand-offs — those fired pre-approved rows at ~midnight and
+    stamped published_at before the post was live). Self-gating: publish_due checks
     AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED, and the zernio publisher checks
-    AGENT_ZERNIO_PUBLISH, so this is a no-op unless all three are armed. A client post
-    is due the moment it is approved (we hand Zernio the future slot time), so
-    catch_all=True; approved_only=True means an un-approved row is never published.
-    Per-gym isolation: one gym's failure never blocks another. Returns per-gym summaries."""
+    AGENT_ZERNIO_PUBLISH, so this is a no-op unless all three are armed. The ~1-min
+    listener cadence drips each gym's day out slot by slot; a past-date approved row
+    (catchup_days) is swept immediately. approved_only=True means an un-approved row is
+    never published. Per-gym isolation: one gym's failure never blocks another.
+    Returns per-gym summaries."""
     if not config.calendar_autopublish_enabled() or not config.publish_enabled():
         return []
     if not config.zernio_publish_enabled():
@@ -850,8 +877,14 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
                     autonomous = bool(SupabaseCalendarStore().gym_autonomy(base))
             except Exception:
                 autonomous = False
+            # SLOT-GATED (audit 2026-08-25 CRITICAL): catch_all=False — a client row
+            # publishes when ITS OWN slot arrives, not at the day's first sweep.
+            # catch_all=True here made every pre-approved row fire at ~midnight (the
+            # first tick of its post_date). No orphans: a same-day row whose slot has
+            # passed is is_due on every later tick, and a PAST-DATE row (catchup_days)
+            # is always due — the lane runs every ~1 min, so nothing is stranded.
             summary = publish_due(run_date, gym_id=base, store=store, notifier=notifier,
-                                  now=now, catch_all=True,
+                                  now=now, catch_all=False,
                                   approved_only=not autonomous,
                                   zernio_publish=zernio_publish,
                                   catchup_days=CLIENT_CATCHUP_DAYS,

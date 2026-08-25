@@ -774,6 +774,7 @@ _COMMANDS = {
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
+        ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
         ("welcome-kit", "client welcome kit PDF"),
@@ -2312,6 +2313,37 @@ def main(argv=None):
     elif cmd == "seed-sources":
         from .seed_sources import cli as seed_sources_cli
         seed_sources_cli(argv[1:])
+    elif cmd == "approve-sources":
+        # The approval surface seed-sources' --review flow pointed at but which never
+        # existed (audit 2026-08-25): list a gym's PENDING sources, approve one by id, or
+        # approve all. Human-run only; the drafting path reads ONLY approved sources.
+        from . import client_sources as _cs
+        _args = argv[1:]
+        _acct = ""
+        _sid = None
+        _all = "--all" in _args
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--id" and i + 1 < len(_args):
+                _sid = _args[i + 1]; i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent approve-sources --account <key> "
+                  "[--all | --id <source_id>]")
+        elif _all:
+            n = _cs.approve_all(_acct)
+            print(f"approved {n} pending source(s) for {_acct}")
+        elif _sid is not None:
+            ok = _cs.approve_source(int(_sid))
+            print(f"source {_sid}: {'approved' if ok else 'not found / not pending'}")
+        else:
+            rows = _cs.pending_sources(_acct)
+            if not rows:
+                print(f"{_acct}: no pending sources")
+            for s in rows:
+                print(f"  [{s.id}] {s.category}: {s.text[:100]} ({s.citation})")
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])

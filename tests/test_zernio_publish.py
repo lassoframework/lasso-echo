@@ -381,7 +381,12 @@ def test_publish_due_routes_client_through_zernio(monkeypatch):
     assert store.published and store.published[0][1] == "zp1"     # late_post_id recorded
 
 
-def test_publish_due_autonomous_keeps_slot_schedule(monkeypatch):
+def test_publish_due_autonomous_publishes_now_at_slot(monkeypatch):
+    """CONTRACT CHANGE (audit 2026-08-25): an autonomous gym no longer hands Zernio a
+    future scheduledFor (that was immediately marked published with a published_at hours
+    before the post existed, with no reconcile). The lane's slot gate fires the row AT
+    its slot; the send itself is always publish-NOW (scheduled_for=None) so published_at
+    is truthful. The day still DRIPS because each row's own slot gates it."""
     _arm(monkeypatch)
     monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
     rows = [{"id": "r1", "gym_id": "eng", "account": "instagram", "status": "pending",
@@ -395,12 +400,11 @@ def test_publish_due_autonomous_keeps_slot_schedule(monkeypatch):
         from agent.zernio_publisher import PublishResult
         return PublishResult(ok=True, mode="published", media_id="zp1")
 
-    # autonomous gym (approved_only=False): pending posts DRIP at their slot time
     out = cap.publish_due("2026-08-13", gym_id="eng", store=store, approved_only=False,
                           zernio_publish=fake_zernio, catch_all=True)
     assert out["ok"] and out["published"] == ["r1"]
-    assert zcalls[0][0] == "eng_ig" and zcalls[0][1] and "2026-08-13T" in zcalls[0][1], \
-        "an autonomous gym keeps the slot schedule so posts spread across the day"
+    assert zcalls[0][0] == "eng_ig" and zcalls[0][1] is None, \
+        "the send is publish-NOW; the slot gate (not Zernio scheduling) does the dripping"
 
 
 def test_publish_due_skips_unapproved_client_row(monkeypatch):

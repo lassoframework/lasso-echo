@@ -105,14 +105,38 @@ def provision_gym(account_key, client=None):
     return True, str(pid)
 
 
+def _allowed_redirect_origins():
+    """The ONLY origins a post-OAuth redirect may land on: the LASSO portal and the
+    intake-web service itself. Overridable additions via AGENT_CONNECT_REDIRECT_ORIGINS
+    (comma list of https origins), for a future portal domain change without a deploy."""
+    import os as _os
+    origins = {config.portal_public_base_url().rstrip("/").lower()}
+    try:
+        from .intake_web import _upload_base_url
+        origins.add(_upload_base_url().rstrip("/").lower())
+    except Exception:  # noqa: BLE001 - the portal origin alone is a safe allowlist
+        pass
+    extra = _os.environ.get("AGENT_CONNECT_REDIRECT_ORIGINS", "") or ""
+    for o in extra.split(","):
+        o = o.strip().rstrip("/").lower()
+        if o.startswith("https://"):
+            origins.add(o)
+    return origins
+
+
 def _connect_redirect_url(redirect_url):
     """The post-OAuth return URL to hand Zernio. Prefer the caller's (the portal passes its
-    own Social page); otherwise fall back to the configured portal origin + /my so the browser
-    NEVER lands on the Zernio dashboard. Only http(s) targets are trusted; anything else falls
-    back too."""
+    own Social page) — but ONLY when its ORIGIN is allowlisted (audit 2026-08-25 MAJOR:
+    accepting any http(s) url was an open redirect — a phisher holding a gym's portal link
+    could route the owner through a REAL OAuth approval onto an attacker page). Anything
+    else falls back to the configured portal origin + /my so the browser NEVER lands on
+    the Zernio dashboard or an untrusted site."""
     ru = (redirect_url or "").strip()
     if ru.startswith("http://") or ru.startswith("https://"):
-        return ru
+        low = ru.lower()
+        for origin in _allowed_redirect_origins():
+            if low == origin or low.startswith(origin + "/"):
+                return ru
     return f"{config.portal_public_base_url()}/my"
 
 

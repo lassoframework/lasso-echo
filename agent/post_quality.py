@@ -34,6 +34,14 @@ _DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
 _SCAFFOLD_RE = re.compile(
     r"^\s*(#{1,6}\s|(caption( body| text)?|body|post)\s*:)", re.IGNORECASE)
 
+# INTERNAL PROMPT HINT BLOCKS anywhere in the caption (audit 2026-08-25 CRITICAL): the
+# scene/grounding hints appended to the note SB7 sees ("WHAT THIS POST'S PHOTO/VIDEO
+# SHOWS...", "VERIFIED IN THE IMAGE...") leaked into client calendars when the template
+# fallback echoed the augmented note verbatim. The fallback is fixed to strip them at the
+# source; this gate is the belt so NO path can ever ship prompt scaffolding to a client.
+_HINT_LEAK_RE = re.compile(
+    r"WHAT THIS POST'S PHOTO/VIDEO SHOWS|VERIFIED IN THE IMAGE", re.IGNORECASE)
+
 
 def _content_words(caption):
     """Every word of real caption copy: the whole caption MINUS hashtag-only lines.
@@ -62,6 +70,9 @@ def caption_issues(caption, banned_words=()):
     if _SCAFFOLD_RE.match(cap):
         issues.append("caption starts with LLM scaffolding (a header or a "
                       "'Caption:'/'Body:' label), not real copy")
+    if _HINT_LEAK_RE.search(cap):
+        issues.append("caption carries an internal prompt hint block "
+                      "(scene/grounding scaffolding), not client copy")
     low = cap.lower()
     for w in banned_words or ():
         w = (w or "").strip().lower()

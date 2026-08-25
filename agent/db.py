@@ -413,7 +413,18 @@ def gym_upsert(account_key, display_name='', **fields):
     placeholders = ', '.join(['?'] * len(all_cols)) + ", datetime('now')"
     col_str = ', '.join(all_cols) + ', updated_at'
 
-    update_parts = [f"{c} = excluded.{c}" for c in all_cols if c != 'account_key']
+    # PRESERVE display_name when not passed (audit 2026-08-25 CRITICAL): almost every
+    # caller upserts a single field (upload_link, zernio_profile_id, baseline...) and
+    # omits display_name — the old unconditional `display_name = excluded.display_name`
+    # then ERASED the stored name to ''. onboard.run even wiped its own write within one
+    # call (writes the name, then gym_upsert(key, upload_link=...) blanks it), which
+    # emptied the gyms-table name for every portal gym and killed the zernio-profile-link
+    # display-name fallback (a UUID-keyed gym then silently never publishes). An empty
+    # display_name arg now means "leave the stored name alone"; pass a non-empty name to
+    # change it.
+    update_parts = [f"{c} = excluded.{c}" for c in all_cols
+                    if c != 'account_key'
+                    and not (c == 'display_name' and not (display_name or '').strip())]
     update_parts.append("updated_at = datetime('now')")
     update_str = ', '.join(update_parts)
 

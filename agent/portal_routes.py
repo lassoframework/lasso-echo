@@ -301,8 +301,14 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
             if note:
                 # FABRICATION GATE (same gate as the Part-B route): a note that introduces
                 # a stat/percentage/price with no approved receipt NEVER enters the caption.
+                # Gated against THIS gym's own approved claims + dash-cleaned first
+                # (audit 2026-08-25: LASSO's global stats must not clear a client claim,
+                # and a dashed edit must not reach media).
                 from . import rotation as _rotation
-                if not _rotation.is_gate_clean(note):
+                from .portal_social import _clean_edit_note, _edit_gate_claims
+                note = _clean_edit_note(note)
+                if not _rotation.is_gate_clean(
+                        note, approved_claims=_edit_gate_claims(account_key)):
                     return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
                                  "error": "fabrication gate: the note carries a claim "
                                           "with no approved receipt. Cite an approved "
