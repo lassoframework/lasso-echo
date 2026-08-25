@@ -870,6 +870,18 @@ def _apply(base_key, rows, start, days, store, log, locked_days=()):
         # place (it only wipes fresh drafts). A rebuild can no longer revert an approval.
         from .portal_calendar_store import preserve_and_prune
         clean_rows, _locked = preserve_and_prune(store, base_key, months, clean_rows)
+        # NEVER WIPE TO EMPTY (TopFuel, 2026-08-25): a rebuild that produced NO rows must not
+        # delete an existing calendar. This happens when the grow-guard re-triggers a build
+        # for a gym that is effectively built out (its build_target counts photo clusters, but
+        # some are un-plannable), then every plannable photo is inside its reuse window from
+        # the PRIOR build, so pick_image returns None and the build is empty. Deleting-then-
+        # inserting-nothing wiped the whole calendar every listener cycle. An empty build is a
+        # NO-OP on the store; the existing calendar (drafts + approvals) is preserved intact.
+        if not clean_rows:
+            log(f"{base_key}: rebuild produced no rows; keeping the existing calendar "
+                "(no delete — never wipe to empty)")
+            return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
+                    "months": months, "noop_empty": True}
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:

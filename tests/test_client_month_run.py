@@ -664,3 +664,18 @@ def test_month_build_records_served_only_for_accepted_feeds(tmp_path, monkeypatc
     assert len(served) == len(feed_ig)
     # distinct photo per record (no double-count of the same cluster)
     assert len(served) == len({a[1] for a in served})
+
+
+def test_apply_empty_build_never_wipes_existing_calendar(tmp_path):
+    """NEVER WIPE TO EMPTY (TopFuel 2026-08-25): a rebuild that produced 0 rows must NOT
+    delete the existing calendar. The listener re-triggered a build for a built-out gym, the
+    reuse window blocked every re-pick so the build was empty, and delete-then-insert-nothing
+    wiped the whole calendar every cycle. An empty build is now a store no-op."""
+    from datetime import date
+    store = _FakeStore()
+    res = cmr._apply("gritx", [], date(2026, 8, 26), 30, store, lambda m: None)
+    assert res["ok"] is True
+    assert res.get("noop_empty") is True
+    assert store.deleted == [], "an empty rebuild must not delete anything"
+    assert store.inserted == []
+    assert res["deleted"] == 0 and res["upserted"] == 0
