@@ -385,6 +385,14 @@ Proven end-to-end on 100% real LASSO material (no fabrication):
   `resolve_connection` binds LASSO's single connection at publish time. **Your only actions:** click
   Connect on LASSO's GBP listing, then approve the pending posts.
 
+### GATE 2 REVERSED (Blake ruling 2026-08-25): coach screening is OFF
+Blake does not want a coach reviewing every gym's first month ("that is pending on the
+first month, take that off"). AGENT_COACH_SCREEN_FIRST_MONTH=false and
+AGENT_GBP_COACH_SCREEN=false set on the echo worker; first months now write straight to
+`pending` (owner sees them immediately). Zero rows were held in coach_review at flip
+time, so nothing needed releasing. The code paths stay in place (flags could re-arm
+later); GATE 1 (OFFER-only-when-confirmed) is unchanged.
+
 ### [x] Two planner gates (Blake, 2026-08-17) — "a failure we can't eat"
 Both live in the Echo planner (+ the Echo backend read), NOT the Vercel portal. Defaults CLOSED.
 - **GATE 1 — OFFER-only-when-confirmed.** `plan_gbp_month(offer_confirmed=...)`: the OFFER slot is
