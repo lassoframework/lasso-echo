@@ -66,12 +66,15 @@ cards from the gym's own APPROVED sources, SB7-captioned, full A+ gate, INSERT-o
 rows, IG+FB mirror, capped 2/pass. Wired at awaiting_media + has_calendar-running-dry.
 UNARMED — arm on Railway when Blake says go.
 
-### [ ] PORTAL SIDE OPEN — X-Portal-Key fix staged but NOT shipped (lasso-ops-portal)
-Echo LIVE now 401s the staff social-status call, so the deployed portal panel is broken
-until the portal ships: `src/app/command-center/social-status/page.tsx` (sends the header +
-no_key card) is staged UNCOMMITTED on branch feat/blog-post-self-serve, mixed with
-package.json bumps. Also needs the shared key (AGENT_PORTAL_ONBOARD_KEY value) set in the
-portal's Vercel env. HOTTEST open item.
+### [x] PORTAL SIDE SHIPPED — X-Portal-Key fix live (lasso-ops-portal PR #453, 2026-08-25)
+The staff social-status panel now sends X-Portal-Key: PR #453 (squash a032244) merged to
+portal main; Vercel production deploy READY 15:52 ET, aliased ops.lassoframework.com.
+BONUS gap closed: the portal code reads AGENT_PORTAL_KEY but Vercel only had the orphaned
+AGENT_PORTAL_ONBOARD_KEY (no code reads it) — so portal-intake-sync had been silently
+not_configured. AGENT_PORTAL_KEY added to Vercel Production, value copied directly from
+Echo's Railway AGENT_PORTAL_ONBOARD_KEY (never printed), so both sides match by
+construction. Verified: Echo 401s anonymous GET /portal/gym/<key>. The shared checkout's
+unrelated staged work (package.json bumps on feat/blog-post-self-serve) was left untouched.
 
 ---
 
