@@ -599,6 +599,42 @@ def handle_portal_intake(token, body, r2=None, now=None):
     return 200, resp
 
 
+def _supabase_token_gym(account_key, http=None):
+    """The portal Supabase echo_intake_tokens row for an Echo account key, or None.
+
+    Existence fallback for containers without the /data volume (intake-web),
+    where the local gyms table is empty. Reads SUPABASE_URL +
+    SUPABASE_SERVICE_ROLE_KEY lazily (never logged); ANY failure — no creds,
+    HTTP error, exception — returns None so the caller fails CLOSED to 404. A
+    gym is never invented and a token is never minted for a key the portal
+    does not hold."""
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key or not account_key:
+        return None
+    try:
+        client = http
+        if client is None:
+            import requests  # lazy, matches portal_gyms' pattern
+            client = requests
+        r = client.get(
+            f"{url}/rest/v1/echo_intake_tokens",
+            params={"select": "gym_id,echo_account_key",
+                    "echo_account_key": f"eq.{account_key}",
+                    "limit": "1"},
+            headers={"apikey": key,
+                     "Authorization": f"Bearer {key}",
+                     "Accept": "application/json"},
+            timeout=8,  # miss-path holds a server thread; keep the outage cap short
+        )
+        if r.status_code >= 400:
+            return None
+        rows = r.json() or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
 def handle_portal_gym_status(account_key, r2=None):
     """
     Portal gym status endpoint (GET /portal/gym/<account_key>).
@@ -608,16 +644,18 @@ def handle_portal_gym_status(account_key, r2=None):
 
     Response shape:
       account_key    - the gym's account key
-      upload_link    - the reconstructed upload link (decrypted when
-                       AGENT_INTAKE_ENC_KEY is set, else from upload_link column),
-                       or null when unavailable
+      upload_link    - the reconstructed upload link (minted via link_for when
+                       AGENT_INTAKE_SIGNING_SECRET is set, else from the stored
+                       upload_link column), or null when unavailable
       token_status   - ACTIVE, REVOKED, or NOT_SET
       last_upload_at - timestamp of most recent object in R2 incoming/, or null
       upload_count   - count of objects in R2 incoming/, or null
       intake_status  - same as token_status (alias for the portal UI)
 
     Returns 403 when AGENT_PORTAL_APPROVALS is OFF.
-    Returns 404 when the account_key is not found in the gyms table.
+    Returns 404 when the account_key is in neither the local gyms table nor the
+    portal Supabase echo_intake_tokens table (the fallback for volume-less
+    containers whose local gyms table is empty).
     """
     if not config.portal_approvals_enabled():
         return 403, {"error": "portal access is disabled"}
@@ -625,20 +663,36 @@ def handle_portal_gym_status(account_key, r2=None):
     from . import db as _db
     gym_row = _db.gym_get(account_key)
     if gym_row is None:
-        return 404, {"error": "gym not found"}
+        # intake-web has no /data volume, so its local gyms table is empty (the
+        # committed echo.db ships 0 rows) and every real key 404'd here. The
+        # portal's echo_intake_tokens row is the shared truth for "this gym was
+        # onboarded": present -> serve reconstructed status; absent / no creds /
+        # any error -> 404 (fail CLOSED — never blind-mint: a minted token for a
+        # never-onboarded slug would still verify and accept uploads under it).
+        if _supabase_token_gym(account_key) is None:
+            return 404, {"error": "gym not found"}
+        gym_row = {}
+        # The token_status shim only reflects secret presence, so consult the R2
+        # denylist too — otherwise a revoked gym would read ACTIVE from this
+        # container while the worker (sqlite row) reports REVOKED.
+        if is_revoked(account_key, r2=r2):
+            token_status_val = "REVOKED"
+        else:
+            token_status_val = intake_tokens.token_status(account_key)["status"].upper()
+    else:
+        token_status_val = (gym_row.get("token_status") or "NOT_SET").upper()
 
-    token_status_val = (gym_row.get("token_status") or "NOT_SET").upper()
-
-    # Upload link: prefer decrypted reconstruction (AGENT_INTAKE_ENC_KEY set),
-    # fall back to the plaintext upload_link column stored at onboard time.
-    upload_link = gym_row.get("upload_link")
-    try:
-        from . import intake_tokens as _it
-        raw = _it.decrypt_token(account_key)
-        if raw:
-            upload_link = _upload_base_url() + "/u/" + raw
-    except Exception:
-        pass  # encryption unavailable: use stored plaintext link
+    # Upload link: reconstruct via the deterministic mint (link_for is the ONE
+    # place links are built; '' when the signing secret is unset), falling back
+    # to the plaintext upload_link column stored at onboard time. The previous
+    # decrypt_token call named a function that never existed; its AttributeError
+    # was swallowed, so the plaintext column was silently always used. A REVOKED
+    # gym gets NO link: the denylist would 404 it at use anyway, but a status
+    # panel must not display a live-looking link for a revoked gym.
+    if token_status_val == "REVOKED":
+        upload_link = None
+    else:
+        upload_link = link_for(account_key) or gym_row.get("upload_link") or None
 
     # R2 metadata: last upload and count from intake/<account_key>/incoming/.
     last_upload_at = None

@@ -124,8 +124,11 @@ def test_per_token_rate_limit_constant():
 # ---- 3. Portal endpoint returns gym info when flag ON --------------------------
 
 def test_portal_endpoint_returns_gym_info(monkeypatch):
-    """GET /portal/gym/<key> returns JSON with account_key and intake_status."""
+    """GET /portal/gym/<key> returns JSON with account_key and intake_status.
+    Signing secret cleared so this test PINS the no-secret -> stored-plaintext
+    link fallback (with a secret set, the minted reconstruction wins)."""
     monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.delenv("AGENT_INTAKE_SIGNING_SECRET", raising=False)
 
     conn = _make_db()
     _insert_gym(conn, "gymportal", token="portal-tok-11111",
@@ -186,8 +189,11 @@ def test_portal_endpoint_returns_gym_info_with_r2(monkeypatch):
 
 
 def test_portal_endpoint_not_found(monkeypatch):
-    """Returns 404 when account_key not in gyms table."""
+    """Returns 404 when account_key is in neither sqlite nor the Supabase
+    echo_intake_tokens fallback (creds cleared so the test stays hermetic)."""
     monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
     monkeypatch.setattr("agent.db.gym_get", lambda k: None)
 
     status_code, body = intake_web.handle_portal_gym_status("unknowngym")
