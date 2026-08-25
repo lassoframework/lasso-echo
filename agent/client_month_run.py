@@ -882,6 +882,27 @@ def _apply(base_key, rows, start, days, store, log, locked_days=()):
                 "(no delete — never wipe to empty)")
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_empty": True}
+        # NEVER SHRINK (TopFuel 2026-08-25): a grow-to-cap rebuild must only GROW, never
+        # replace a good calendar with a SMALLER one. The grow-guard can re-trigger a build
+        # for a gym that is already built out (build_target counts photo clusters, some of
+        # which are un-plannable), and the reuse window then blocks re-picking most photos, so
+        # the rebuild yields only a FEW feeds. Deleting-then-inserting-fewer shrank the
+        # calendar every cycle (TopFuel drifted 39 -> 21 -> 3). If this build placed fewer
+        # feeds than already exist, keep the existing calendar untouched. Feeds are counted as
+        # distinct instagram feed post_dates (the same unit the grow-guard uses).
+        new_feeds = len({r.get("post_date") for r in clean_rows
+                         if r.get("format") == "feed" and r.get("account") == "instagram"})
+        try:
+            from .client_media_sync import _existing_feed_count
+            existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
+        except Exception:  # noqa: BLE001 - a count failure must never block a legit build
+            existing_feeds, count_ok = 0, False
+        if count_ok and existing_feeds > 0 and new_feeds < existing_feeds:
+            log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> {new_feeds}; "
+                "keeping the existing calendar (grow-only, never shrink)")
+            return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
+                    "months": months, "noop_shrink": True,
+                    "existing_feeds": existing_feeds, "new_feeds": new_feeds}
         delete_month = getattr(store, "delete_month", None)
         for month in months:
             if delete_month is not None:

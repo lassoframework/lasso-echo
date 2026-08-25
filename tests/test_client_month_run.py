@@ -679,3 +679,48 @@ def test_apply_empty_build_never_wipes_existing_calendar(tmp_path):
     assert store.deleted == [], "an empty rebuild must not delete anything"
     assert store.inserted == []
     assert res["deleted"] == 0 and res["upserted"] == 0
+
+
+class _CountingStore(_FakeStore):
+    """A fake store with list_month, so _existing_feed_count can read a prior calendar."""
+    def __init__(self, existing_feed_dates=()):
+        super().__init__()
+        # one IG feed row per date
+        self._existing = [{"post_date": d, "format": "feed", "account": "instagram",
+                           "status": "pending"} for d in existing_feed_dates]
+
+    def list_month(self, base_key, month):
+        return [r for r in self._existing if str(r["post_date"]).startswith(month)]
+
+
+def test_apply_never_shrinks_an_existing_calendar(tmp_path):
+    """A grow-to-cap rebuild that placed FEWER feeds than already exist (reuse window blocked
+    most re-picks) must keep the existing calendar, not shrink it (TopFuel 39 -> 21 -> 3)."""
+    from datetime import date
+    existing = [f"2026-08-{d:02d}" for d in range(26, 26 + 13)]  # 13 existing IG feeds
+    store = _CountingStore(existing)
+    # incoming rebuild only managed to place 1 IG feed (+ its fb mirror + story)
+    incoming = [
+        {"gym_id": "gritx", "post_date": "2026-08-26", "format": "feed",
+         "account": "instagram", "status": "pending", "image_url": "u"},
+        {"gym_id": "gritx", "post_date": "2026-08-26", "format": "feed",
+         "account": "facebook", "status": "pending", "image_url": "u"},
+        {"gym_id": "gritx", "post_date": "2026-08-26", "format": "story",
+         "account": "instagram", "status": "pending", "image_url": "u"},
+    ]
+    res = cmr._apply("gritx", incoming, date(2026, 8, 26), 30, store, lambda m: None)
+    assert res.get("noop_shrink") is True
+    assert store.deleted == [], "a shrinking rebuild must not delete the bigger calendar"
+    assert store.inserted == []
+
+
+def test_apply_allows_growth(tmp_path):
+    """A rebuild that GROWS (more feeds than exist) proceeds normally (delete-then-insert)."""
+    from datetime import date
+    store = _CountingStore(["2026-08-26"])          # 1 existing IG feed
+    incoming = [{"gym_id": "gritx", "post_date": f"2026-08-{d:02d}", "format": "feed",
+                 "account": "instagram", "status": "pending", "image_url": "u"}
+                for d in range(26, 26 + 5)]          # 5 new IG feeds
+    res = cmr._apply("gritx", incoming, date(2026, 8, 26), 30, store, lambda m: None)
+    assert res["ok"] is True and not res.get("noop_shrink") and not res.get("noop_empty")
+    assert store.deleted != [] and store.inserted != []
