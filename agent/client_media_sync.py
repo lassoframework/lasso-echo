@@ -719,9 +719,29 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # frequent scan never storms the channel; re-fires only if the count moves.
             if 0 < media_count < days:
                 _alert_thin_creative(base, media_count, days, log)
-            if existing_feeds >= build_target:
+            # ANTI-CHURN (TopFuel, 2026-08-25): rebuild ONLY when there is a real reason.
+            # A gym whose build_target counts un-plannable photo clusters can NEVER reach
+            # build_target (existing_feeds stays below it forever), so without this it rebuilt
+            # every scan — now a no-op thanks to the never-shrink guard in _apply, but still
+            # wasteful (it re-runs caption generation each pass). We remember the media_count
+            # we last built for; an already-built gym (existing_feeds > 0) whose library has
+            # NOT grown is left alone. It rebuilds again only when NEW media arrives.
+            try:
+                from . import db as _db
+                _built_marker = int(_db.kv_get(f"built_media_{base}") or 0)
+            except Exception:  # noqa: BLE001
+                _built_marker = 0
+            _already_built_for_media = existing_feeds > 0 and media_count <= _built_marker
+            if existing_feeds >= build_target or _already_built_for_media:
                 # Already built out to the media the gym supports (capped at `days`):
-                # idempotent. An unchanged library never rebuilds again.
+                # idempotent. An unchanged library never rebuilds again. Remember the media
+                # count we are built for, so a gym that never reaches build_target (some
+                # clusters un-plannable) does not rebuild again until NEW media arrives.
+                try:
+                    from . import db as _db
+                    _db.kv_set(f"built_media_{base}", str(media_count))
+                except Exception:  # noqa: BLE001
+                    pass
                 #
                 # DENIED-SLOT BACKFILL (AGENT_DENY_BACKFILL, OFF by default): a gym AT cap
                 # can never grow, so a human-denied post would leave a permanently empty
@@ -777,6 +797,13 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 banned_words=banned, logger=log)
             if built.get("ok"):
                 generated += 1
+                # Remember the media count this build covered, so the next scan does not
+                # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
+                try:
+                    from . import db as _db
+                    _db.kv_set(f"built_media_{base}", str(media_count))
+                except Exception:  # noqa: BLE001
+                    pass
                 results.append({"base": base, "status": "generated",
                                 "synced": sync.get("synced", 0),
                                 "upserted": built.get("upserted", 0)})
