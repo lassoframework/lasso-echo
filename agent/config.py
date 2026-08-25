@@ -1041,6 +1041,20 @@ def vision_enabled_for(gym_key) -> bool:
     return _vision_base(gym_key) in vision_gyms()
 
 
+def vision_allowed_flags() -> set:
+    """Safety flags the planner may AUTO-PICK a photo despite (AGENT_VISION_ALLOW_FLAGS).
+
+    Comma list of any of: third_party_brand, minor_prominent, person_name_in_image,
+    pii_visible, unsanitary, injury_visible, identity_leak. Default EMPTY = every flag holds
+    the photo from auto-pick (the safe, unchanged behavior). A listed flag is STILL detected
+    and recorded on the sidecar; it simply no longer blocks auto-planning, so a gym whose
+    photos carry that flag can still post (Blake 2026-08-25: allow third_party_brand,
+    person_name_in_image, minor_prominent so the studios' real gym photos go through). Set by
+    hand in Railway env; a business decision on brand/likeness/consent risk, not a default."""
+    raw = os.environ.get("AGENT_VISION_ALLOW_FLAGS", "") or ""
+    return {t.strip().lower() for t in raw.split(",") if t.strip()}
+
+
 def _vision_base(gym_key) -> str:
     base = (gym_key or "").strip().lower()
     for suffix in ("_ig", "_fb", "_gbp"):

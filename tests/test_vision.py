@@ -83,6 +83,29 @@ def test_auto_plannable_excludes_each_flag_class():
     assert vision.auto_plannable({"analysis_failed": True})[0] is False
 
 
+def test_vision_allow_flags_let_photos_through(monkeypatch):
+    """AGENT_VISION_ALLOW_FLAGS (Blake 2026-08-25): a listed flag no longer HOLDS a photo from
+    auto-pick (still detected/recorded). Default empty = every flag blocks (unchanged)."""
+    base = {"one_line": "a class", "quality": {"usable": True}, "avatar_fit": "genpop"}
+    brand = vision.coerce_analysis({**base, "safety_flags": ["third_party_brand"]})
+    minor = vision.coerce_analysis({**base, "safety_flags": ["minor_prominent"]})
+    named = vision.coerce_analysis({**base, "contains_person_name": True})
+    # default: all three are blocked
+    monkeypatch.delenv("AGENT_VISION_ALLOW_FLAGS", raising=False)
+    assert vision.auto_plannable(brand)[0] is False
+    assert vision.auto_plannable(minor)[0] is False
+    assert vision.auto_plannable(named)[0] is False
+    # armed: the three Blake allowed now pass
+    monkeypatch.setenv("AGENT_VISION_ALLOW_FLAGS",
+                       "third_party_brand,minor_prominent,person_name_in_image")
+    assert vision.auto_plannable(brand) == (True, [])
+    assert vision.auto_plannable(minor) == (True, [])
+    assert vision.auto_plannable(named) == (True, [])
+    # a NON-allowed flag still blocks even when others are allowed
+    pii = vision.coerce_analysis({**base, "safety_flags": ["pii_visible"]})
+    assert vision.auto_plannable(pii)[0] is False
+
+
 def test_bts_restricted():
     # athlete / athlete_leaning are unrestricted now; only `unclear` stays BTS-only
     assert vision.bts_restricted(vision.coerce_analysis({"one_line": "x",

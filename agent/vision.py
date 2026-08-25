@@ -292,11 +292,15 @@ def auto_plannable(analysis):
         return False, ["no analysis"]
     if analysis.get("version") != VISION_VERSION:
         return False, ["stale analysis version"]
+    # AGENT_VISION_ALLOW_FLAGS: flags the operator has decided may auto-pick despite (still
+    # detected + recorded, just no longer blocking). Default empty = every flag blocks.
+    from . import config
+    allowed = config.vision_allowed_flags()
     if analysis.get("safety_flags"):
-        reasons += [f"safety:{f}" for f in analysis["safety_flags"]]
-    if analysis.get("contains_person_name"):
+        reasons += [f"safety:{f}" for f in analysis["safety_flags"] if f not in allowed]
+    if analysis.get("contains_person_name") and "person_name_in_image" not in allowed:
         reasons.append("person_name_in_image")
-    if analysis.get("identity_flag"):
+    if analysis.get("identity_flag") and "identity_leak" not in allowed:
         reasons.append("identity_leak")
     if not (analysis.get("quality") or {}).get("usable", False):
         reasons.append("unusable")
