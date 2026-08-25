@@ -255,3 +255,27 @@ def test_make_caption_rejects_sb7_echoing_raw_source(monkeypatch):
     voice = VoiceDoc(raw="v", hashtags=["#eng"], ctas=["Save this."])
     cap, _ = client_content.make_caption(Account(key="eng_ig", display_name="CrossFit ENG", platform=Platform.INSTAGRAM, token_env="T", target_id_env="TID"), _Src("HYROX"), voice, "k")
     assert "Save this." in cap                  # fell back to baseline (which adds CTA)
+
+
+# ---- record_serve gate (rotation-ledger poisoning fix, TopFuel/GritX 2026-08-25) ----
+
+def test_record_serve_flag_defers_the_served_write(tmp_path, monkeypatch):
+    """build_client_draft(record_serve=False) must NOT record the pick as served — the month
+    builder defers that to draft ACCEPTANCE. Recording at pick time poisoned the ledger:
+    picked-then-dropped drafts pushed every plannable photo into its reuse window, so
+    pick_image returned None and nothing published. Default (record_serve=True) still records
+    at pick, preserving the single-draft runner path."""
+    acct = _client(tmp_path)
+    _stock_sources(acct.key)
+    lib = _lib(tmp_path, n=5)
+    voice = _voice()
+    calls = []
+    monkeypatch.setattr(rotation, "record_served", lambda *a, **k: calls.append(a))
+
+    d1 = client_content.build_client_draft(acct, "2026-07-01", voice, lib, record_serve=False)
+    assert d1 is not None and d1.creative_path
+    assert calls == [], "record_serve=False must not write to the served ledger at pick time"
+
+    d2 = client_content.build_client_draft(acct, "2026-07-02", voice, lib)   # default True
+    assert d2 is not None and d2.creative_path
+    assert len(calls) == 1, "default path must still record at pick (runner single-draft path)"

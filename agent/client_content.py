@@ -396,7 +396,7 @@ def classify(draft):
 def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
                        avoid_openings=(), allow_reuse=False,
-                       angle="", avoid_angles=()):
+                       angle="", avoid_angles=(), record_serve=True):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -506,7 +506,13 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 public_url = hosted
         # Record on the CLUSTER key (dam.rotation_key; basename when unclustered) so the
         # per-platform reuse windows + no-repeat window see a near-dupe burst as one asset.
-        rotation.record_served(account.key, dam.rotation_key(image.path), category, day_key)
+        # record_serve=False (the month builder) DEFERS this to draft ACCEPTANCE: recording
+        # at pick time poisoned the rotation ledger, because the builder picks+records then
+        # the A+ gate DROPS the draft (and the alt-day loop picks again), so every plannable
+        # photo drifted into its reuse window and pick_image returned None -> "caption ready,
+        # no image" -> nothing published (TopFuel/GritX, 2026-08-25).
+        if record_serve:
+            rotation.record_served(account.key, dam.rotation_key(image.path), category, day_key)
         draft = Draft(
             draft_id=_make_id(account.key, image.path, scheduled_for),
             account_key=account.key,

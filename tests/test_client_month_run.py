@@ -640,3 +640,27 @@ def test_deny_backfill_never_reuses_a_live_photo(monkeypatch, tmp_path):
                    if "photo_01" in r.get("image_url", "")
                    or "photo_02" in r.get("image_url", "")]
     assert reused_live == [], "a live (approved/published) photo must never be re-placed"
+
+
+def test_month_build_records_served_only_for_accepted_feeds(tmp_path, monkeypatch):
+    """ROTATION POISON FIX (TopFuel/GritX 2026-08-25): served is recorded ONCE per ACCEPTED
+    feed, never per pick attempt. The old pick-time record inflated the ledger (the A+ /
+    alt-day loop picks many candidates per placed day, most dropped), pushing every plannable
+    photo into its reuse window so pick_image returned None and nothing published."""
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    served = []
+    monkeypatch.setattr(rotation, "record_served", lambda *a, **k: served.append(a))
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert feed_ig, "no feeds built"
+    # exactly one served-record per ACCEPTED feed day — not per pick attempt
+    assert len(served) == len(feed_ig)
+    # distinct photo per record (no double-count of the same cluster)
+    assert len(served) == len({a[1] for a in served})

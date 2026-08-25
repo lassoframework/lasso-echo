@@ -263,7 +263,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
                                               exclude_keys=exclude_keys,
                                               avoid_openings=avoid_openings,
                                               allow_reuse=allow_reuse,
-                                              angle=angle, avoid_angles=avoid_angles)
+                                              angle=angle, avoid_angles=avoid_angles,
+                                              record_serve=False)
     if draft is None:
         return None, None
     if _accept(draft):
@@ -281,7 +282,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
                                                 exclude_keys=exclude_keys,
                                                 avoid_openings=avoid_openings,
                                                 allow_reuse=allow_reuse,
-                                                angle=angle, avoid_angles=avoid_angles)
+                                                angle=angle, avoid_angles=avoid_angles,
+                                                record_serve=False)
         if _accept(alt):
             # Re-home the alternative draft onto the real day so the calendar row sits
             # on day_key (only the day is re-pointed; the caption/source/photo are the
@@ -290,6 +292,22 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
             alt.scheduled_for = draft.scheduled_for
             return alt, None
     return None, f"not A+: {'; '.join(first_issues)}"
+
+
+def _record_feed_served(account, feed, day_key):
+    """Record an ACCEPTED feed's photo as served for rotation — only once the day has cleared
+    the A+ gate, the real-creative check, and the no-reuse check, i.e. it is actually KEPT.
+    This replaces the old pick-time record inside build_client_draft that poisoned the ledger
+    (see build_client_draft record_serve). Best effort; never raises, never blocks a build."""
+    try:
+        from . import rotation, dam
+        path = (getattr(feed, "creative_path", "") or "").strip()
+        if not path:
+            return
+        rotation.record_served(account.key, dam.rotation_key(path),
+                               getattr(feed, "category", "") or "", day_key)
+    except Exception as e:  # noqa: BLE001
+        print(f"[client-month] served-record skipped for {day_key}: {type(e).__name__}: {e}")
 
 
 def _row_from_draft(base_key, draft):
@@ -524,6 +542,10 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         # (reel, poster, autofit) + the captionless-story guard live in the shared helper
         # so the denied-slot backfill emits IDENTICAL cards.
         story_caption_override = edited_story_caps.get(str(day_key)[:10])
+        # ACCEPTED: the feed survived every gate and is being placed. Record its photo as
+        # served NOW (not at pick time) so rotation reflects only KEPT days — never the
+        # picked-then-dropped attempts that used to poison the ledger.
+        _record_feed_served(account, feed, day_key)
         day_drafts = _finish_feed_with_story(
             account, feed, library_path, log, day_key=day_key,
             story_caption_override=story_caption_override)
@@ -958,6 +980,7 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             log(f"{base_key} {day_key}: no A+ replacement could be built "
                 f"({drop or 'no usable creative'})")
             continue
+        _record_feed_served(account, feed, day_key)   # KEPT: record only accepted backfills
         drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
                                               day_key=day_key))
 
