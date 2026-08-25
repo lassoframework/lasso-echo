@@ -66,15 +66,35 @@ cards from the gym's own APPROVED sources, SB7-captioned, full A+ gate, INSERT-o
 rows, IG+FB mirror, capped 2/pass. Wired at awaiting_media + has_calendar-running-dry.
 UNARMED — arm on Railway when Blake says go.
 
-### [x] PORTAL SIDE SHIPPED — X-Portal-Key fix live (lasso-ops-portal PR #453, 2026-08-25)
-The staff social-status panel now sends X-Portal-Key: PR #453 (squash a032244) merged to
-portal main; Vercel production deploy READY 15:52 ET, aliased ops.lassoframework.com.
-BONUS gap closed: the portal code reads AGENT_PORTAL_KEY but Vercel only had the orphaned
-AGENT_PORTAL_ONBOARD_KEY (no code reads it) — so portal-intake-sync had been silently
-not_configured. AGENT_PORTAL_KEY added to Vercel Production, value copied directly from
-Echo's Railway AGENT_PORTAL_ONBOARD_KEY (never printed), so both sides match by
-construction. Verified: Echo 401s anonymous GET /portal/gym/<key>. The shared checkout's
-unrelated staged work (package.json bumps on feat/blog-post-self-serve) was left untouched.
+### [x] X-Portal-Key header fix SHIPPED (lasso-ops-portal PR #453) — but see the audit below
+PR #453 (squash a032244) merged to portal main; Vercel production READY, aliased
+ops.lassoframework.com. AGENT_PORTAL_KEY set in Vercel Production. HARD LESSON on the key:
+`vercel env add` silently stores an EMPTY value from piped/redirected stdin (CLI 54.13.0
+says "Added" either way) — the first three attempts stored "". Final set went through the
+Vercel REST API, then verified by sha256 round-trip (env pull hash == Railway hash,
+695f1300…) AND live: anon GET /portal/gym/<key> -> 401, with-key -> past auth. NEVER trust
+`vercel env add` without a pull-and-hash check. Production redeployed to bake the value.
+
+### [!] AUDIT FINDING (Blake's "make sure it's all correct", 2026-08-25): the staff
+### social-status panel has NEVER worked end-to-end — two pre-existing defects, ruling needed
+The header + key were necessary but not sufficient. Verified live with the real key:
+- **P1 (portal repo):** `social-status/page.tsx` `loadGym` selects `echo_account_key` FROM
+  `gyms`, but the portal DB has no such column — it lives on `echo_intake_tokens` (migration
+  0254, keyed by gym_id; real values are base slugs: lasso, eng, districth, gritx, topfuel,
+  piercefitness…). The Supabase query errors -> every gym renders "not found".
+- **P2 (Echo, intake_web.handle_portal_gym_status):** intake-web has NO volume, so
+  db.gym_get reads the repo-committed echo.db (0 gyms) -> authed requests 404 for EVERY
+  real key (verified live: lasso/eng/districth all 404 with a valid key). Also the
+  upload-link reconstruction calls `intake_tokens.decrypt_token()` which DOES NOT EXIST
+  (AttributeError swallowed by bare except — dead code). The real reconstruction primitive
+  is the deterministic `intake_tokens.mint()`; existence should resolve via Supabase
+  echo_intake_tokens (intake-web has SUPABASE_URL + service key), never by blind-minting
+  (a mint for a never-onboarded slug still verifies -> uploads would land under it).
+Neither defect is new — the endpoint 404'd before the auth change too. Fix plan needs
+Blake's go: (P1) page reads echo_account_key from echo_intake_tokens by gym_id;
+(P2) endpoint falls back to Supabase-token existence + mint-reconstructed upload link
+when sqlite misses. Both small; P2 touches a raw-token surface so it gets the full
+build->independent audit loop.
 
 ---
 
