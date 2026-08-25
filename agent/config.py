@@ -1377,6 +1377,32 @@ def client_daily_publish_cap() -> int:
         return 0
 
 
+def posting_timezone_for(gym_key) -> str:
+    """The POSTING timezone for one gym (Blake 2026-08-25: 'build a time zone for each
+    one'). Reads gyms.posting_timezone for the tenant base (eng_ig -> eng); falls back
+    to the global POSTING_TIMEZONE (America/New_York) when unset/invalid, so every
+    existing gym behaves exactly as before until a per-gym value is set by hand
+    (python -m agent set-timezone --account <key> --tz America/Denver). Validated
+    against ZoneInfo so a typo can never crash the publish lane."""
+    base = (gym_key or "").strip()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    if base and base != "lasso":
+        try:
+            from . import db
+            row = db.gym_get(base) or {}
+            tz = (row.get("posting_timezone") or "").strip()
+            if tz:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(tz)                      # raises on an invalid name
+                return tz
+        except Exception:  # noqa: BLE001 - fall back, never break publishing
+            pass
+    return POSTING_TIMEZONE
+
+
 def zernio_profile_link_enabled() -> bool:
     """Backfill gyms.zernio_profile_id from Zernio for client gyms (AGENT_ZERNIO_PROFILE_LINK).
 

@@ -981,3 +981,58 @@ def test_past_date_catchup_row_is_always_due(armed, monkeypatch):
                         approved_only=True, catch_all=False, catchup_days=7,
                         zernio_publish=_zern_capture(sent))
     assert s["published"] == ["px"] and len(sent) == 1 and sent[0][1] is None
+
+
+# ---- per-gym posting timezone (Blake 2026-08-25) ---------------------------------
+
+def test_gym_timezone_slots_fire_on_the_gyms_own_wall_clock(armed, monkeypatch):
+    """A Denver gym's 18:30 slot fires at 18:30 DENVER time (20:30 ET), not 18:30 ET."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "posting_timezone_for",
+                        lambda gym: "America/Denver" if gym == "gymden" else "America/New_York")
+    class _Acct:
+        key = "gymden_ig"; platform = "instagram"; display_name = "Gym Denver"
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    row = _row("d1", status="approved")
+    row["gym_id"] = "gymden"
+    store = _FakeStore([row])
+    store.rows["d1"]["gym_id"] = "gymden"
+    slot = cap.slot_time_for_row(row)                    # e.g. "18:30"
+    hh, mm = slot.split(":")
+    sent = []
+    def _z(draft, account, scheduled_for=None):
+        sent.append(scheduled_for)
+        return PublishResult(ok=True, mode="published", media_id="Z")
+    # at slot time ET (= slot-2h in Denver): NOT due for the Denver gym
+    at_slot_et = f"{RUN_DATE}T{hh}:{mm}:01-04:00"
+    s1 = cap.publish_due(RUN_DATE, gym_id="gymden", store=store, now=at_slot_et,
+                         approved_only=True, catch_all=False, zernio_publish=_z)
+    assert s1["published"] == [] and "d1" in s1["waiting"]
+    # at slot time DENVER (= slot+2h ET): due, publishes now
+    at_slot_denver = f"{RUN_DATE}T{int(hh)+2:02d}:{mm}:01-04:00"
+    s2 = cap.publish_due(RUN_DATE, gym_id="gymden", store=store, now=at_slot_denver,
+                         approved_only=True, catch_all=False, zernio_publish=_z)
+    assert s2["published"] == ["d1"] and sent == [None]
+
+
+def test_future_local_date_row_waits_even_when_et_day_has_turned(armed, monkeypatch):
+    """DATE-AWARE gate: at 00:30 ET it is still YESTERDAY in Los Angeles — an LA gym's
+    rows dated the new ET day must NOT fire the evening before their local date."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    monkeypatch.setattr(config, "posting_timezone_for",
+                        lambda gym: "America/Los_Angeles")
+    class _Acct:
+        key = "gymla_ig"; platform = "instagram"; display_name = "Gym LA"
+    monkeypatch.setattr(cap, "_account_for", lambda row, gym_id: _Acct())
+    row = _row("la1", status="approved")                 # dated RUN_DATE
+    row["gym_id"] = "gymla"
+    store = _FakeStore([row])
+    store.rows["la1"]["gym_id"] = "gymla"
+    # 00:30 ET on RUN_DATE = 21:30 LA time the previous evening
+    just_past_midnight_et = f"{RUN_DATE}T00:30:00-04:00"
+    s = cap.publish_due(RUN_DATE, gym_id="gymla", store=store,
+                        now=just_past_midnight_et, approved_only=True,
+                        catch_all=False, zernio_publish=lambda *a, **k: None)
+    assert s["published"] == [] and "la1" in s["waiting"]

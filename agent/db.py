@@ -142,6 +142,13 @@ def connect(path=None):
             conn.execute("ALTER TABLE gyms ADD COLUMN zernio_default_fb_page_id TEXT")
         except Exception:
             pass
+    # additive gyms migration (Blake 2026-08-25): per-gym posting timezone. Null =>
+    # the global POSTING_TIMEZONE, so nothing changes until set by hand per gym.
+    if "posting_timezone" not in gyms_have:
+        try:
+            conn.execute("ALTER TABLE gyms ADD COLUMN posting_timezone TEXT")
+        except Exception:
+            pass
     # additive gyms migration (Part A): trailing-90d posting baseline captured at
     # onboarding. baseline_posts_per_week is the number Echo's before/after story
     # reads from; baseline_captured_at timestamps when it was set. Existing rows
@@ -397,6 +404,7 @@ def gym_upsert(account_key, display_name='', **fields):
         'token_revoked', 'intake_token_encrypted', 'upload_link', 'publish_flag',
         'publish_creds', 'publish_creds_status',
         'zernio_profile_id', 'zernio_default_fb_page_id',
+        'posting_timezone',
         'baseline_posts_per_week', 'baseline_captured_at',
         'stripe_customer_id',
     }

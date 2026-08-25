@@ -95,14 +95,16 @@ def assign_slots(rows):
     return out
 
 
-def _local_now(now=None):
+def _local_now(now=None, tz_name=None):
     """
-    Current wall-clock time in config.POSTING_TIMEZONE as a timezone-aware
-    datetime. `now` is injectable for tests: pass an ISO string or a datetime.
-    Never uses Date.now-style nondeterminism when `now` is supplied.
+    Current wall-clock time in tz_name (default config.POSTING_TIMEZONE) as a
+    timezone-aware datetime. `now` is injectable for tests: pass an ISO string or a
+    datetime. Never uses Date.now-style nondeterminism when `now` is supplied.
+    tz_name is the PER-GYM posting timezone (Blake 2026-08-25): a Denver gym's slots
+    are Denver wall-clock, not Eastern.
     """
     from zoneinfo import ZoneInfo
-    tz = ZoneInfo(config.POSTING_TIMEZONE)
+    tz = ZoneInfo(tz_name or config.POSTING_TIMEZONE)
     if now is None:
         return datetime.now(tz)
     if isinstance(now, datetime):
@@ -116,22 +118,23 @@ def _local_now(now=None):
     return dt.astimezone(tz)
 
 
-def _slot_reached(slot_time, now=None):
-    """True when the wall-clock "HH:MM" slot_time (in POSTING_TIMEZONE) is <= the
-    current local time. `now` is injectable (see _local_now)."""
-    local = _local_now(now)
+def _slot_reached(slot_time, now=None, tz_name=None):
+    """True when the wall-clock "HH:MM" slot_time (in the gym's posting timezone) is
+    <= the current local time. `now` is injectable (see _local_now)."""
+    local = _local_now(now, tz_name)
     hh, mm = str(slot_time).split(":")
     slot = time(int(hh), int(mm))
     return local.timetz().replace(tzinfo=None) >= slot
 
 
-def is_due(row, now=None):
+def is_due(row, now=None, tz_name=None):
     """
     True when a ROW's OWN stable slot time (slot_time_for_row) is <= the current
-    local time. Compares the row's own slot, so a row is NEVER published before its
-    slot and its slot never moves when a sibling publishes. `now` is injectable.
+    local time IN THE GYM'S POSTING TIMEZONE (tz_name; default the global one).
+    Compares the row's own slot, so a row is NEVER published before its slot and its
+    slot never moves when a sibling publishes. `now` is injectable.
     """
-    return _slot_reached(slot_time_for_row(row), now)
+    return _slot_reached(slot_time_for_row(row), now, tz_name)
 
 
 def _account_for(row, gym_id="lasso"):
@@ -300,11 +303,11 @@ def _bump_pub_count(gym_id, run_date):
         pass
 
 
-def scheduled_iso_for_row(row, now=None):
+def scheduled_iso_for_row(row, now=None, tz_name=None):
     """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
-    time (slot_time_for_row), in POSTING_TIMEZONE. This is what Echo hands Zernio as
-    `scheduledFor` so the client sees exactly when the post publishes. Returns '' when
-    the row has no post_date."""
+    time (slot_time_for_row), in the GYM'S posting timezone (tz_name; default the
+    global POSTING_TIMEZONE). This is the display stamp the client sees for exactly
+    when the post publishes. Returns '' when the row has no post_date."""
     from datetime import date as _date
     from zoneinfo import ZoneInfo
     post_date = (row.get("post_date") or "").strip()
@@ -314,7 +317,7 @@ def scheduled_iso_for_row(row, now=None):
     hh, mm = str(slot).split(":")
     try:
         y, m, d = (int(x) for x in post_date.split("-"))
-        tz = ZoneInfo(config.POSTING_TIMEZONE)
+        tz = ZoneInfo(tz_name or config.POSTING_TIMEZONE)
         return datetime(y, m, d, int(hh), int(mm), tzinfo=tz).isoformat()
     except (ValueError, TypeError):
         return ""
@@ -441,6 +444,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     # rows already published today (kv) plus rows published in this run. None => no cap.
     cap_used = _pub_count_today(gym_id, run_date) if daily_cap else 0
 
+    # PER-GYM TIMEZONE (Blake 2026-08-25): a gym's slots are ITS OWN wall clock, not
+    # Eastern. Resolved once per run; unset gyms fall back to the global tz so nothing
+    # changes until a per-gym value is set (python -m agent set-timezone).
+    gym_tz = config.posting_timezone_for(gym_id)
+    gym_local_today = _local_now(now, gym_tz).date().isoformat()
+
     for row in rows:
         row_id = row.get("id")
         # SHOW THE TIME: stamp the row's deterministic go-live time (scheduled_at) so
@@ -452,7 +461,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             try:
                 stamper = getattr(store, "stamp_scheduled", None)
                 if stamper is not None:
-                    stamper(row_id, scheduled_iso_for_row(row, now))
+                    stamper(row_id, scheduled_iso_for_row(row, now, gym_tz))
             except Exception as e:
                 print(f"[calendar-autopublish] scheduled_at stamp failed for "
                       f"{row_id}: {type(e).__name__}: {e}")
@@ -469,16 +478,20 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             waiting.append(row_id)
             continue
 
-        # SLOT GATE: publish nothing before the row's OWN stable slot time. A row
-        # whose slot has not arrived is left UNTOUCHED (never claimed) so a later
-        # tick this same day drips it out. catch_all bypasses the gate so the last
-        # slot / the once-a-day draw sweeps every straggler (NO ORPHANS). A row whose
-        # slot has passed is never skipped for timing. A row dated BEFORE run_date
-        # (catchup_days) is always due — its day already passed; is_due() compares
-        # time-of-day only, so without this a late-approved yesterday row would wait
-        # for today's identical wall-clock slot for no reason.
-        past_date = str(row.get("post_date") or run_date)[:10] < str(run_date)[:10]
-        if not catch_all and not past_date and not is_due(row, now):
+        # SLOT GATE, gym-local and DATE-AWARE: publish nothing before the row's OWN
+        # stable slot time in the GYM'S timezone. A row whose slot has not arrived is
+        # left UNTOUCHED (never claimed) so a later tick drips it out; catch_all
+        # bypasses the gate (LASSO's last-slot straggler sweep). Date-awareness
+        # (Blake 2026-08-25, per-gym tz): the row's post_date is compared against the
+        # gym's LOCAL calendar day — a past-local-date row (catchup) is always due; a
+        # FUTURE-local-date row always waits, so a Pacific gym's "today (ET)" rows can
+        # no longer fire the evening before its local date; a same-local-day row waits
+        # for its slot on the gym's own wall clock.
+        row_date = str(row.get("post_date") or run_date)[:10]
+        past_date = row_date < gym_local_today
+        future_date = row_date > gym_local_today
+        if not catch_all and (future_date or
+                              (not past_date and not is_due(row, now, gym_tz))):
             waiting.append(row_id)
             continue
 
@@ -859,6 +872,19 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
     out = []
     for base in client_gym_bases():
         try:
+            # BILLING GATE (Blake 2026-08-25): a gym whose subscription shows CANCELED
+            # in Stripe holds ALL publishing (rows stay approved; nothing goes live).
+            # Fail-open by design: only POSITIVE evidence of cancellation blocks — a
+            # missing customer id or a flaky Stripe read never stops a paying gym.
+            # kv-cached (~6h) so the ~1-min tick never hammers Stripe; alerts once.
+            try:
+                from .publish_billing_gate import publishing_blocked
+                if publishing_blocked(base):
+                    out.append({"ok": True, "gym": base, "billing_held": True,
+                                "published": [], "failed": [], "waiting": []})
+                    continue
+            except Exception:  # noqa: BLE001 - the gate itself must never block the lane
+                pass
             # PER-GYM AUTONOMY (never portfolio-wide): the gym owner's own Autonomous
             # toggle. TWO sources, either arms it for THIS gym only: the portal's
             # Supabase echo_gym_settings row (the toggle in the client's calendar UI)

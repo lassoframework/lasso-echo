@@ -139,6 +139,10 @@ def _status():
     print(f"  feed_autofit   : {config.feed_autofit_enabled()}  (env AGENT_FEED_AUTOFIT; re-frame an OUT-OF-SPEC feed PHOTO (ratio outside 0.8..1.91) into an in-spec 1080x1080 card — whole photo on a blurred cover fill, never cropped; in-spec photos + videos untouched; ENHANCE only, any failure posts the raw photo; OFF => raw photo posts)")
     print(f"  client_daily_publish_cap: {config.client_daily_publish_cap()}  (env AGENT_CLIENT_DAILY_PUBLISH_CAP; max posts ONE client gym auto-publishes per calendar day — anti-flood backstop so a repaired backlog DRIPS out over days instead of dumping a week of posts at once; 0/unset => no cap; client lane only, never LASSO)")
     print(f"  zernio_profile_link: {config.zernio_profile_link_enabled()}  (env AGENT_ZERNIO_PROFILE_LINK; once per loop, backfill gyms.zernio_profile_id (the PUBLISHER's profile id) for any client gym missing it by matching the Zernio profile name to the base, also storing the connected FB page id; reads Zernio + writes the gyms row only, NEVER publishes; idempotent, never overwrites a set id — fixes a connected gym that silently never published, e.g. Pierce 2026-08-24)")
+    from .publish_billing_gate import gate_enabled as _billgate_enabled
+    print(f"  publish_billing_gate: {_billgate_enabled()}  (env AGENT_PUBLISH_BILLING_GATE; hold a CLIENT gym's publishing when Stripe shows its subscription CANCELED — positive evidence only, every doubt fails OPEN so a paying gym is never held; kv-cached ~6h; one deduped alert per flip; read-only against Stripe, never touches billing)")
+    from .client_infographic_fill import fill_enabled as _igfill_enabled
+    print(f"  client_infographic_fill: {_igfill_enabled()}  (env AGENT_CLIENT_INFOGRAPHIC_FILL; when a client gym has NO fresh photos left for upcoming days, generate on-brand nano INFOGRAPHIC posts from its own APPROVED sources to fill the gaps (Blake 2026-08-25: 'if they dont upload, scan their website and make an infographic') — pending rows, approval-gated, capped per run, never replaces a photo day; OFF => days simply stay empty as before)")
     print(f"  client_media_sync: {config.client_media_sync_enabled()}  (env AGENT_CLIENT_MEDIA_SYNC; daily, pull each onboarded client gym's uploaded photos/videos out of R2 into its content library, then build its DRAFT month from its REAL media if it has media + approved sources + no calendar yet; client calendars are DRAFTS, never published; needs AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES too)")
     print(f"  client_scan_dynamic: {config.client_scan_dynamic_enabled()}  (env AGENT_CLIENT_SCAN_DYNAMIC; the client-media scanner discovers gyms from all_accounts() — hardcoded ACCOUNTS PLUS the dynamic portal-onboarded registry — so a portal-onboarded gym that uploaded media auto-starts building; OFF => only hardcoded gyms are scanned)")
     print(f"  deny_backfill  : {config.deny_backfill_enabled()}  (env AGENT_DENY_BACKFILL; a gym AT its creative cap gets a FRESH replacement for each DENIED feed day — a NEW caption on a REUSED photo, never the denied post's own photo and never an approved/published one; INSERT-only, PENDING, all A+/banned/fabrication gates enforced; OFF => a denied slot stays empty at cap)")
@@ -775,6 +779,7 @@ _COMMANDS = {
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
+        ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
         ("welcome-kit", "client welcome kit PDF"),
@@ -2313,6 +2318,33 @@ def main(argv=None):
     elif cmd == "seed-sources":
         from .seed_sources import cli as seed_sources_cli
         seed_sources_cli(argv[1:])
+    elif cmd == "set-timezone":
+        # Per-gym posting timezone (Blake 2026-08-25): slots fire on the gym's own wall
+        # clock. Unset gyms keep the global POSTING_TIMEZONE (America/New_York).
+        _args = argv[1:]
+        _acct = _tzname = ""
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--tz" and i + 1 < len(_args):
+                _tzname = _args[i + 1]; i += 2; continue
+            i += 1
+        if not _acct or not _tzname:
+            print("usage: python -m agent set-timezone --account <base-key> "
+                  "--tz America/Denver")
+        else:
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(_tzname)
+            except Exception:
+                print(f"invalid timezone: {_tzname!r} (must be an IANA name like "
+                      "America/Chicago)")
+            else:
+                from . import db as _dbm
+                _dbm.gym_upsert(_acct, posting_timezone=_tzname)
+                print(f"{_acct}: posting_timezone = {_tzname} "
+                      f"(effective = {config.posting_timezone_for(_acct)})")
     elif cmd == "approve-sources":
         # The approval surface seed-sources' --review flow pointed at but which never
         # existed (audit 2026-08-25): list a gym's PENDING sources, approve one by id, or

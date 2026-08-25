@@ -583,6 +583,23 @@ def _alert_thin_creative(base_key, media_count, days, log):
         log(f"{base_key}: thin-creative alert failed: {type(exc).__name__}")
 
 
+def _maybe_infographic_fill(base, account, store, log):
+    """Blake 2026-08-25: a gym with NO fresh photos for upcoming days gets on-brand
+    infographic posts from its own approved sources instead of going dark. Behind
+    AGENT_CLIENT_INFOGRAPHIC_FILL (client_infographic_fill self-gates); INSERT-only,
+    pending rows, capped per pass. Best effort: never blocks or fails the scan."""
+    try:
+        from .client_infographic_fill import fill_enabled, fill_gaps
+        if not fill_enabled() or store is None or account is None:
+            return
+        voice = load_voice(_resolve_client_voice_path(base, account.voice_doc_path()))
+        if voice is None:
+            return                                    # the no_voice stall alert covers this
+        fill_gaps(base, account, store, voice=voice, logger=log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base}: infographic fill failed: {type(exc).__name__}")
+
+
 def _alert_stall(base_key, stage, detail, log):
     """A NEW-GYM STALL is never silent (audit 2026-08-25 MAJOR): every state where a
     gym's pipeline cannot advance (no registry account, no approved sources, no voice
@@ -702,6 +719,9 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # clusters < days is caught there without spamming every scan.
             if media_count <= 0:
                 awaiting += 1
+                # NO PHOTOS AT ALL: the exact "if they don't upload" case — fill
+                # upcoming days with approved-source infographic cards (self-gated).
+                _maybe_infographic_fill(base, account, store, log)
                 results.append({"base": base, "status": "awaiting_media",
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: awaiting media (no usable photos/videos yet)")
@@ -808,6 +828,11 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                     except Exception as exc:  # noqa: BLE001 - never break the scan
                         log(f"{base}: deny-backfill failed: {type(exc).__name__}")
                 skipped_existing += 1
+                # BUILT-OUT gym whose calendar may still run dry AHEAD (photos
+                # exhausted / reuse-blocked): fill upcoming EMPTY days with
+                # approved-source infographic cards (self-gated, insert-only — a real
+                # photo day is never touched).
+                _maybe_infographic_fill(base, account, store, log)
                 results.append({"base": base, "status": "has_calendar",
                                 "synced": sync.get("synced", 0),
                                 "media_count": media_count,
