@@ -584,6 +584,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"calendar grade sweep failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # METRICS SYNC (Wave 7.1, TAP 3 armed 2026-08-26): nightly Zernio analytics
+    # pull into post_metrics. Self-gates on AGENT_METRICS_SYNC (default OFF ->
+    # no-op). Read-only on the social side; dedupes by platformPostId; external
+    # posts flagged and never trained on. monthly_retro is deliberately NOT
+    # scheduled — the first retro is a human-reviewed run after a full closed
+    # month of clean metrics (WAVE6_HUMAN_TAPS.md TAP 3 step 2).
+    try:
+        from .metrics_sync import run as _metrics_sync_run
+        _msum = _metrics_sync_run()
+        if _msum.get("ok"):
+            print(f"[metrics-sync] {_msum.get('rows_written', 0)} snapshot row(s) written")
+    except Exception as e:
+        print(f"[metrics-sync] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's

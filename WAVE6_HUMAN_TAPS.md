@@ -9,7 +9,13 @@ learning loop.
 
 ## TAP 1: Second Publisher Disconnect
 
-**Status: PENDING BLAKE TAP**
+**Status: DONE — executed 2026-08-26 on Blake's explicit authorization.**
+Duplicate Zernio IG account 6a74b3efd0fe733d1abc6fc1 disconnected (grace period
+ended 2026-08-26 21:18Z; 535 external post mirrors cleaned, 0 scheduled posts
+lost). accounts_list verified: exactly one lassoframework Instagram remains
+(6a69fc9cdf17280d93d0727f). Remaining follow-ups: audit Meta Business Suite
+native scheduler for residual queued posts; monitor the 14:10 ET pattern for
+one week to confirm it stops.
 
 See wave0_publisher_finding.md for the evidence and recommendation.
 Blake must confirm which Zernio account to disconnect before we proceed.
@@ -90,9 +96,20 @@ AGENT_CALENDAR_GRADE=true
 
 ## TAP 3: Wave 7 Learning Loop Flags (AGENT_METRICS_SYNC, then AGENT_LEARNING_LOOP)
 
-**Status: PENDING BLAKE TAP (all gyms). Both flags are built, tested on synthetic
-months, and default OFF. The first monthly_retro has deliberately NEVER been run
-on real data — that is this tap.**
+**Status: STEPS 1 + 3 FLAGS ARMED 2026-08-26 on Blake's authorization. Step 2
+(the closed-month wait) is in progress; the first monthly_retro on real data
+has still NEVER run and stays a reviewed manual run.**
+
+Executed 2026-08-26: AGENT_METRICS_SYNC=true (nightly pull wired into the daily
+draw; calendar join fixed and verified live — Echo posts land matched, unknown
+posts land external and never train). AGENT_LEARNING_LOOP=true (lever stamping,
+experiment labeling, and playbook consumption armed — the playbook is empty so
+planner behavior is unchanged until the first retro writes one).
+
+REMAINING: wait for the first FULL CLOSED MONTH of clean metrics (September
+2026 is the first candidate; August is tainted by the second publisher), then
+run the first monthly_retro manually per Step 3 below and review before
+trusting it. monthly_retro is deliberately NOT scheduled anywhere.
 
 Order is strict, per gym: METRICS FIRST, RETRO ONLY AFTER A FULL CLOSED MONTH OF
 CLEAN METRICS.
