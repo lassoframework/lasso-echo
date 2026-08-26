@@ -67,3 +67,33 @@ def watch_ratio(avg_watch_time_ms, duration_seconds) -> float | None:
     if ms <= 0 or dur <= 0:
         return None
     return (float(ms) / 1000.0) / float(dur)
+
+
+# ---- hook-quality fields (20260827), reels only. PURE, null-not-zero. -----------
+
+def reel_skip_rate(metrics: dict) -> float | None:
+    """The stored platform skip rate (post_metrics.reels_skip_rate) as a real
+    number, or None when Zernio did not report one — never a fabricated 0."""
+    v = (metrics or {}).get("reels_skip_rate")
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def reel_watch_ratio(metrics: dict) -> float | None:
+    """The reel's watch ratio from a post_metrics row. Prefers the direct avg
+    watch time (watch_time_ms); when absent, derives the average from
+    watch_total_ms / views (total watch time spread over the views that
+    produced it). Returns None when no honest computation exists."""
+    m = metrics or {}
+    dur = _num(m.get("video_seconds"))
+    if dur <= 0:
+        return None
+    avg_ms = _num(m.get("watch_time_ms"))
+    if avg_ms > 0:
+        return watch_ratio(avg_ms, dur)
+    total_ms = _num(m.get("watch_total_ms"))
+    views = _num(m.get("views"))
+    if total_ms <= 0 or views <= 0:
+        return None
+    return watch_ratio(total_ms / views, dur)

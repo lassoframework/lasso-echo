@@ -355,3 +355,77 @@ def test_missing_metric_stays_null_not_zero(monkeypatch):
     assert row["saves"] is None
     assert row["shares"] is None
     assert row["reach"] is None
+
+
+# ---------------------------------------------------------------------------
+# hook-quality fields (20260827): reels_skip_rate, watch_total_ms,
+# engagement_rate, is_ad — entry-level first, record fallback, null-not-zero.
+# ---------------------------------------------------------------------------
+
+def test_hook_quality_fields_land_from_realistic_payload(monkeypatch):
+    entry = _entry("reel_1")
+    entry["analytics"] = {
+        "likes": 42, "reach": 900, "comments": 4, "views": 1200,
+        "reelsSkipRate": 0.37, "igReelsVideoViewTotalTime": 5400000,
+        "engagementRate": 0.051, "igReelsAvgWatchTime": 4500,
+        "videoDurationSeconds": 12,
+    }
+    rec = _record("z1", [entry], PUBLISHED)
+    rec["mediaProductType"] = "REELS"
+    aj = {"hasAnalyticsAccess": True, "accounts": _ACCOUNTS, "posts": [rec]}
+    _, store, _ = _run(monkeypatch, aj)
+    row = store.inserted[0]
+    assert row["reels_skip_rate"] == 0.37
+    assert row["watch_total_ms"] == 5400000
+    assert row["engagement_rate"] == 0.051
+    assert row["is_ad"] is False  # not reported -> honest default false
+
+
+def test_is_ad_captured_entry_level_first_record_fallback(monkeypatch):
+    # entry-level isAd wins
+    entry = _entry("ad_1")
+    entry["isAd"] = True
+    aj = {"hasAnalyticsAccess": True, "accounts": _ACCOUNTS,
+          "posts": [_record("z1", [entry], PUBLISHED)]}
+    _, store, _ = _run(monkeypatch, aj)
+    assert store.inserted[0]["is_ad"] is True
+
+    # record-level fallback when the entry carries none
+    rec = _record("z2", [_entry("ad_2")], PUBLISHED)
+    rec["isAd"] = True
+    aj2 = {"hasAnalyticsAccess": True, "accounts": _ACCOUNTS, "posts": [rec]}
+    _, store2, _ = _run(monkeypatch, aj2)
+    assert store2.inserted[0]["is_ad"] is True
+
+
+def test_hook_quality_fields_stay_null_not_zero(monkeypatch):
+    aj = {"hasAnalyticsAccess": True, "accounts": _ACCOUNTS,
+          "posts": [_record("z1", [_entry("p9")], PUBLISHED)]}
+    _, store, _ = _run(monkeypatch, aj)
+    row = store.inserted[0]
+    assert row["reels_skip_rate"] is None
+    assert row["watch_total_ms"] is None
+    assert row["engagement_rate"] is None
+    assert row["is_ad"] is False  # the one non-null field (column default false)
+
+
+def test_learning_score_reel_helpers_pure():
+    from agent import learning_score as ls
+    # skip rate: the stored value or None, never fabricated
+    assert ls.reel_skip_rate({"reels_skip_rate": 0.4}) == 0.4
+    assert ls.reel_skip_rate({"reels_skip_rate": None}) is None
+    assert ls.reel_skip_rate({}) is None
+    assert ls.reel_skip_rate({"reels_skip_rate": True}) is None  # bool rejected
+    # watch ratio: direct avg first
+    direct = ls.reel_watch_ratio(
+        {"watch_time_ms": 6000, "video_seconds": 12})
+    assert direct == 0.5
+    # derived from watch_total_ms / views when the avg is absent
+    derived = ls.reel_watch_ratio(
+        {"watch_total_ms": 5400000, "views": 1200, "video_seconds": 12})
+    assert abs(derived - (5400000 / 1200 / 1000 / 12)) < 1e-9
+    # no honest computation -> None
+    assert ls.reel_watch_ratio({"watch_total_ms": 5400000,
+                                "video_seconds": 12}) is None
+    assert ls.reel_watch_ratio({"views": 1200, "video_seconds": 12}) is None
+    assert ls.reel_watch_ratio({"watch_time_ms": 6000}) is None

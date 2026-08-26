@@ -99,6 +99,9 @@ def scoring_rows(metrics_rows):
             "score": s,
             "published_at": r.get("published_at"),
             "external": bool(r.get("external")),
+            # is_ad (20260827): a boosted/paid post — observed only, same
+            # treatment as external (informs the baseline, never trains).
+            "is_ad": bool(r.get("is_ad")),
             "format": str(r.get("format") or r.get("media_product_type")
                           or "unknown").lower(),
             "pillar": r.get("pillar"),
@@ -117,11 +120,13 @@ LEVERS = ("hook_family", "ask_type", "time_slot", "caption_len_band", "pillar")
 
 
 def lever_stats(scored, now):
-    """Format-stratified, recency-weighted lever stats over INTERNAL scored
-    posts: {lever: {(format, value): {n, mean_score, evidence[]}}}. External
-    posts never reach this function (guard: we don't learn from posts we
-    didn't shape)."""
-    strata = guards.stratify_by_format([p for p in scored if not p["external"]])
+    """Format-stratified, recency-weighted lever stats over INTERNAL ORGANIC
+    scored posts: {lever: {(format, value): {n, mean_score, evidence[]}}}.
+    External posts never reach this function (guard: we don't learn from posts
+    we didn't shape), and neither do is_ad posts (paid reach poisons organic
+    lever comparisons — observed only, same treatment as external)."""
+    strata = guards.stratify_by_format(
+        [p for p in scored if not p["external"] and not p.get("is_ad")])
     stats = {}
     for fmt, posts in sorted(strata.items()):
         for lever in LEVERS:
@@ -182,13 +187,15 @@ def experiment_verdict(scored, month):
     experiment_label '<lever>:<month>' — surfaced on the metrics row as
     experiment_label). Both sides must clear the sample floor for a verdict;
     otherwise it is honestly inconclusive."""
-    exp = [p for p in scored if not p["external"] and p.get("experiment_label")]
+    exp = [p for p in scored if not p["external"] and not p.get("is_ad")
+           and p.get("experiment_label")]
     if not exp:
         return {"status": "none", "detail": "no labeled experiment rows this month"}
     label = exp[0]["experiment_label"]
     lever = label.split(":", 1)[0]
     control = [p for p in scored
-               if not p["external"] and not p.get("experiment_label")]
+               if not p["external"] and not p.get("is_ad")
+               and not p.get("experiment_label")]
     if not guards.sample_floor(exp) or not guards.sample_floor(control):
         return {"status": "inconclusive", "label": label,
                 "detail": f"below sample floor ({len(exp)} experiment / "

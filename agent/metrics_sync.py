@@ -125,6 +125,9 @@ def platform_entries(records):
                 "analytics": e.get("analytics") or rec.get("analytics") or {},
                 "mediaProductType": rec.get("mediaProductType"),
                 "publishedAt": e.get("publishedAt") or rec.get("publishedAt"),
+                # entry-level first, record fallback (the analytics pattern);
+                # a paid/boosted post is observed, never trained on.
+                "isAd": e.get("isAd") if e.get("isAd") is not None else rec.get("isAd"),
             })
     return out
 
@@ -207,6 +210,15 @@ def build_metric_row(gym_id, post, accounts, snapshot_day, calendar_row=None):
         "watch_time_ms": watch,
         "video_seconds": _metric(a, "videoDurationSeconds"),
         "followers_at_snapshot": _followers_for_post(post, accounts),
+        # Hook-quality fields (20260827): null-not-zero like every metric.
+        "reels_skip_rate": _metric(a, "reelsSkipRate"),
+        "watch_total_ms": _metric(a, "igReelsVideoViewTotalTime"),
+        "engagement_rate": _metric(a, "engagementRate"),
+        # is_ad: boosted/paid post — observed only, NEVER trains the playbook
+        # (same treatment as external). Entry-level rode in via platform_entries;
+        # the analytics dict is the fallback. Column is not-null default false.
+        "is_ad": bool(post.get("isAd") if post.get("isAd") is not None
+                      else a.get("isAd") or False),
     }
 
 

@@ -53,10 +53,11 @@ class FakeRetroStore:
 
 
 def _row(pid, hook, likes, published, external=False, fmt="photo",
-         experiment_label=None):
+         experiment_label=None, is_ad=False):
     return {"gym_id": "gym1", "platform": "instagram",
             "platform_post_id": pid, "snapshot_day": 7,
-            "external": external, "format": fmt, "pillar": "community",
+            "external": external, "is_ad": is_ad,
+            "format": fmt, "pillar": "community",
             "hook_family": hook, "ask_type": "booking_link",
             "time_slot": "morning", "caption_len_band": "mid",
             "published_at": published, "reach": 500, "likes": likes,
@@ -225,6 +226,49 @@ def test_external_posts_inform_baseline_but_never_train(monkeypatch):
     assert ("hook_family", "story_open") not in claimed
     diff = store.retros[0]["playbook_diff"]
     assert "story_open" not in str(diff.get("hook_family_weights", {}))
+
+
+def test_is_ad_posts_inform_baseline_but_never_train(monkeypatch):
+    """is_ad rows get the SAME treatment as external rows (20260827): a pile
+    of boosted boost_hook posts must not put boost_hook into the findings or
+    the playbook — paid reach never trains the organic playbook."""
+    months = {"2026-08": _month_rows("2026-08"),
+              "2026-07": _month_rows("2026-07")}
+    for i in range(8):
+        months["2026-08"].append(
+            _row(f"ad{i}", "boost_hook", 500,
+                 f"2026-08-{5 + i:02d}T12:00:00Z", is_ad=True))
+    store = FakeRetroStore(months)
+    result = _run(store, monkeypatch)
+    findings = result["gyms"][0]["findings"]
+    claimed = {(f["lever"], f["value"])
+               for f in findings["keep_doing"] + findings["stop_doing"]}
+    assert ("hook_family", "boost_hook") not in claimed
+    diff = store.retros[0]["playbook_diff"]
+    assert "boost_hook" not in str(diff.get("hook_family_weights", {}))
+    # ...but the ad rows DO inform the baseline (whole-feed reality), so the
+    # baseline with ads present differs from the organic-only one.
+    organic_only = FakeRetroStore({"2026-08": _month_rows("2026-08"),
+                                   "2026-07": _month_rows("2026-07")})
+    organic_result = _run(organic_only, monkeypatch)
+    assert (result["gyms"][0]["findings"]["baseline"]
+            != organic_result["gyms"][0]["findings"]["baseline"])
+
+
+def test_is_ad_experiment_rows_never_reach_the_verdict():
+    """A labeled experiment row that was boosted is excluded from the verdict
+    on BOTH sides (same as external)."""
+    scored = monthly_retro.scoring_rows(
+        [_row(f"e{i}", "question", 60, f"2026-08-{10 + i:02d}T12:00:00Z",
+              experiment_label="hook_family:2026-08") for i in range(6)]
+        + [_row(f"c{i}", "bold_claim", 30, f"2026-08-{10 + i:02d}T15:00:00Z")
+           for i in range(6)]
+        + [_row("adx", "question", 900, "2026-08-20T12:00:00Z",
+                experiment_label="hook_family:2026-08", is_ad=True)])
+    verdict = monthly_retro.experiment_verdict(scored, "2026-08")
+    assert verdict["status"] == "evaluated"
+    assert verdict["experiment_n"] == 6  # the boosted row did not sneak in
+    assert "instagram:adx:d7" not in verdict["evidence"]
 
 
 # ---------------------------------------------------------------------------
