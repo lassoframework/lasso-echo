@@ -446,6 +446,30 @@ Full suite: 2430 passed, 4 pre-existing higgsfield failures (unrelated), 0 new f
 
 ---
 
+## Wave 0 — Preflight: second publisher + forward-book dedupe (2026-08-26, commit 39fbf62)
+
+### [x] 0.1 Second publisher investigation
+Evidence assembled in `wave0_publisher_finding.md`: 29 posts on lassoframework IG
+(Aug 10-26) not attributable to Echo's calendar; duplicate Zernio IG connections
+(6a69fc9cdf17280d93d0727f in Default profile, 6a74b3efd0fe733d1abc6fc1 in lasso
+profile); 14:10 ET cadence pattern on the unexplained posts. Recommendation +
+disconnect checklist surfaced to #ops. NOTHING disconnected — Blake tap required
+(WAVE6_HUMAN_TAPS.md TAP 1).
+
+### [x] 0.2 Forward-book dedupe job — agent/jobs/dedupe_forward_book.py
+Groups future pending rows per gym by caption_hash (Wave 3 definition), keeps the
+earliest, denies the rest with reject_reason='duplicate_purge_2026_08' through
+portal_calendar_store (never direct SQL). Behind AGENT_DEDUPE_FORWARD_BOOK
+(default OFF; OFF forces dry-run). tests/test_dedupe_forward_book.py green.
+
+### [x] 0.2 EXECUTED for lasso (2026-08-26, Blake-authorized one-shot)
+Dry-run then live via `railway run --service echo`: 369 pending future rows,
+300 duplicates denied, 69 unique kept, 0 errors. Before/after posted to #ops.
+Flag set inline for the one-shot only; Railway env untouched. Freed slots refill
+via the planner once the Wave 5 A-gate is armed.
+
+---
+
 ## Portal go-live: intake upload-URL fix + encrypted portal tokens written (2026-08-06, SHA 587177b)
 
 Executed the portal go-live handoff so the client Social Media page turns on.
