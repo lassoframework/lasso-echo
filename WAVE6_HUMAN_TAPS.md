@@ -27,7 +27,12 @@ The code will not disconnect anything automatically.
 
 ## TAP 2: Per-Gym AGENT_CALENDAR_GRADE Flag Flips
 
-**Status: PENDING BLAKE TAP (all gyms)**
+**Status: DONE — executed 2026-08-26 on Blake's authorization ("do 2").**
+All five per-gym flags + the global default are ARMED on the echo Railway
+service. Sweeps + digests ran clean for every gym. Baseline grades (all
+pre-A-gate content, expected low): lasso F36/F22, eng F14/F25, gritx F37/F37,
+piercefitness F34/F37, topfuel D60/F40. The nightly sweep now runs in the
+daily draw; forward books rise to A as the planner restages under the gate.
 
 Rollout order per spec. Set each flag in Railway one at a time, then run the
 sweep and digest before moving to the next gym:
