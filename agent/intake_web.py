@@ -1097,8 +1097,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
       padding:9px 10px;font-size:14px}
  .row2{display:flex;justify-content:space-between;align-items:center;margin-top:7px}
  .state{font-size:12px;color:var(--steel)}
- .state.ok{color:var(--sky);font-weight:700}
+ .state.ok{color:#7DDB8A;font-weight:700}
  .state.err{color:#FFB4B4;font-weight:700}
+ #counter{display:none;font-size:14px;font-weight:700;color:#7DDB8A;margin:14px 0 0}
  .rm{background:none;border:none;color:#FFB4B4;font-size:13px;font-weight:700;
       padding:2px 4px;cursor:pointer}
  .note{width:100%;background:var(--cream);color:var(--navy);border:none;border-radius:10px;
@@ -1122,6 +1123,7 @@ each so we know what is happening in it. All of it optional. We take it from the
 
 <textarea class="note" id="note" maxlength="500"
   placeholder="Anything about the whole batch? (optional)"></textarea>
+<div id="counter"></div>
 <div id="banner"></div>
 <button class="send" id="send" disabled>Send it to LASSO</button>
 </div>
@@ -1135,18 +1137,30 @@ each so we know what is happening in it. All of it optional. We take it from the
  var addmore=document.getElementById('addmore');
  var sendBtn=document.getElementById('send');
  var banner=document.getElementById('banner');
+ var counter=document.getElementById('counter');
  var note=document.getElementById('note');
+ var received={photos:0,videos:0};
 
  function isVideo(f){return (f.type||'').indexOf('video')===0
     || /\\.(mp4|mov|m4v|qt)$/i.test(f.name||'');}
 
+ function updateCounter(){
+   var parts=[];
+   if(received.photos)parts.push(received.photos+(received.photos>1?' photos':' photo'));
+   if(received.videos)parts.push(received.videos+(received.videos>1?' videos':' video'));
+   if(!parts.length){counter.style.display='none';return;}
+   counter.style.display='block';
+   counter.textContent='\\u2713 '+parts.join(' and ')+' received';
+ }
+
  function render(){
    var live=picked.filter(function(p){return !p.removed;});
+   var pending=live.filter(function(p){return !p.sent;});
    emptymsg.style.display = live.length ? 'none':'block';
    addmore.style.display = live.length ? 'block':'none';
-   sendBtn.disabled = live.length===0;
-   sendBtn.textContent = live.length>1
-     ? ('Send '+live.length+' items to LASSO') : 'Send it to LASSO';
+   sendBtn.disabled = pending.length===0;
+   sendBtn.textContent = pending.length>1
+     ? ('Send '+pending.length+' items to LASSO') : 'Send it to LASSO';
  }
 
  function addFiles(files){
@@ -1197,7 +1211,7 @@ each so we know what is happening in it. All of it optional. We take it from the
  input.addEventListener('change',function(e){if(e.target.files&&e.target.files.length)addFiles(e.target.files);});
 
  sendBtn.addEventListener('click',function(){
-   var live=picked.filter(function(p){return !p.removed;});
+   var live=picked.filter(function(p){return !p.removed && !p.sent;});
    if(!live.length) return;
    sendBtn.disabled=true; banner.className=''; banner.textContent='';
    var fd=new FormData();
@@ -1209,27 +1223,38 @@ each so we know what is happening in it. All of it optional. We take it from the
      p._state.textContent='sending'; p._state.className='state';
    });
    fd.append('note',note.value||'');
+   // The server answers 2xx only AFTER every file is durably stored, so the
+   // green check below is honest: it means "your file is safely with LASSO."
    fetch(window.location.pathname,{method:'POST',body:fd}).then(function(r){
      if(r.ok){
-       live.forEach(function(p){p.sent=true;p._state.textContent='sent';p._state.className='state ok';});
+       live.forEach(function(p){
+         p.sent=true;
+         p._state.textContent='\\u2713 received';
+         p._state.className='state ok';
+         if(isVideo(p.file)){received.videos++;}else{received.photos++;}
+       });
+       updateCounter();
        banner.className='ok';
-       banner.textContent='Got it. '+live.length+(live.length>1?' items are':' item is')+
-         ' in. We will take it from here.';
+       banner.textContent='Received! Your content is in. New posts built from '+
+         'these usually appear in your approval queue within the hour. '+
+         'You approve everything before it posts.';
        sendBtn.textContent='Sent'; sendBtn.disabled=true;
+       render();
      } else {
-       live.forEach(function(p){p._state.textContent='not sent';p._state.className='state err';});
+       live.forEach(function(p){p._state.textContent='not sent, tap Send to retry';p._state.className='state err';});
        banner.className='err';
        banner.textContent = r.status===413
-         ? 'That batch was too large. Remove a few and try again.'
-         : (r.status===400 ? 'One of those files was not a photo or video.'
-         : (r.status===503 ? 'Our upload storage is briefly unavailable. Please try again in a few minutes.'
-                           : 'Something went wrong. Please try again.'));
+         ? 'That batch was too large. It did not go through. Remove a few and try again.'
+         : (r.status===400 ? 'One of those files was not a photo or video. Nothing was saved. Please check and try again.'
+         : (r.status===503 ? 'Our upload storage is briefly unavailable. Your files did not go through yet. Please try again in a few minutes.'
+                           : 'Something went wrong and your files did not go through. Please try again.'));
        sendBtn.disabled=false;
      }
    }).catch(function(){
-     banner.className='err'; banner.textContent='Network hiccup. Please try again.';
+     banner.className='err';
+     banner.textContent='Network hiccup. Your files did not go through yet. Please try again.';
      sendBtn.disabled=false;
-     live.forEach(function(p){p._state.textContent='not sent';p._state.className='state err';});
+     live.forEach(function(p){p._state.textContent='not sent, tap Send to retry';p._state.className='state err';});
    });
  });
 
@@ -1239,9 +1264,12 @@ each so we know what is happening in it. All of it optional. We take it from the
 </body></html>"""
 
 # Kept for the no-JS fallback POST and any legacy client: a full-page success view.
+# Same honest confirmation copy as the JS banner (rendered only after storage).
 DONE = ("<!doctype html><html><body style='font-family:sans-serif;background:#121E3C;"
-        "color:#FAF6F0;padding:40px;text-align:center'><h1>Got it.</h1>"
-        "<p>Your content is in. We will take it from here.</p></body></html>")
+        "color:#FAF6F0;padding:40px;text-align:center'><h1>Received!</h1>"
+        "<p>Your content is in. New posts built from these usually appear in "
+        "your approval queue within the hour. You approve everything before "
+        "it posts.</p></body></html>")
 
 
 # ---- the LASSO self-serve CONNECT page (Zernio: IG, FB, Google Business) ----------
