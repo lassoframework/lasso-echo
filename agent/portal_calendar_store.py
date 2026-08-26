@@ -778,6 +778,29 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def rows_in_range(self, account_key, start_iso, end_iso):
+        """Return all non-denied content_calendar rows for account_key with
+        post_date in [start_iso, end_iso] inclusive, ordered by post_date.
+        Used by the grade_sweep job (Wave 6): trailing-30 and forward-book
+        windows are both graded from this read. Denied rows (e.g. the
+        duplicate purge) never count for or against a grade."""
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "status": "neq.denied",
+            "post_date": f"gte.{start_iso}",
+            "order": "post_date",
+            "limit": "1000",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={**params, "and": f"(post_date.lte.{end_iso})"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
         belongs to another gym can never be deleted through this account_key. Returns the
