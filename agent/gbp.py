@@ -27,8 +27,23 @@ TARGET_MIN, TARGET_MAX = 150, 300     # the planner target band
 HOOK_CHARS = 80                       # Google truncates ~here in Search
 MIN_CONTENT_WORDS = 12                # reuse the A+ floor: a real caption, not a stub
 
-# no em/en/figure-dash/minus, and no hyphen used AS a dash (spaced or doubled)
-_DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
+# no em/en/figure-dash/minus (the unicode dash class lives ONLY in copy_gate,
+# Wave 1 law), and no hyphen used AS a dash (spaced or doubled)
+from . import copy_gate as _copy_gate
+
+_HYPHEN_AS_DASH_RE = re.compile(r"(?:\s-\s)|--")
+
+
+class _DashCheck:
+    """Duck-typed stand-in for the old local dash regex: .search() hits on any
+    copy_gate banned dash OR a hyphen used as a dash (spaced / doubled)."""
+    @staticmethod
+    def search(text):
+        s = str(text or "")
+        return _copy_gate._DASH_RE.search(s) or _HYPHEN_AS_DASH_RE.search(s)
+
+
+_DASH_RE = _DashCheck()
 _HASHTAG_RE = re.compile(r"(?:^|\s)#\w")
 # a phone number: a 10-digit US number in any common shape, OR a bare 7-digit local
 # number (555-0198 / 555 0198 / 555.0198). The 3-then-4 local shape is specific enough

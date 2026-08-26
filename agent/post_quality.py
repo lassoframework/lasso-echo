@@ -25,9 +25,25 @@ import re
 MIN_CAPTION_CHARS = 40
 MIN_CONTENT_WORDS = 12
 
-# Any real dash: em/en/figure/horizontal-bar/minus, or a hyphen used AS a dash
-# (surrounded by spaces, or a double hyphen). A hyphen inside a word (co-op) is fine.
-_DASH_RE = re.compile(r"[‐-―−]|(?:\s-\s)|--")
+# Any real dash: the copy_gate banned set (em/en/figure/horizontal-bar/minus), or a
+# hyphen used AS a dash (surrounded by spaces, or a double hyphen). A hyphen inside a
+# word (co-op) is fine. The unicode dash class lives ONLY in copy_gate (Wave 1 law);
+# this local pattern carries just the ASCII hyphen-as-punctuation shapes.
+from . import copy_gate as _copy_gate
+
+_HYPHEN_AS_DASH_RE = re.compile(r"(?:\s-\s)|--")
+
+
+class _DashCheck:
+    """Duck-typed stand-in for the old local dash regex: .search() hits on any
+    copy_gate banned dash OR a hyphen used as a dash (spaced / doubled)."""
+    @staticmethod
+    def search(text):
+        s = str(text or "")
+        return _copy_gate._DASH_RE.search(s) or _HYPHEN_AS_DASH_RE.search(s)
+
+
+_DASH_RE = _DashCheck()
 
 # LLM scaffolding that must never reach a feed: a markdown header, or a bare
 # 'Caption:'/'Body:' label line (the model occasionally prepends these).

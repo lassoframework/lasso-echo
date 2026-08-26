@@ -143,7 +143,9 @@ def build_report(now=None):
     lines.append(f"flags vs last week: {_flags_delta(current)}")
     lines.append(f"by hand this week: {_by_hand_item(runway_by_account, pending)}")
     text = "\n".join(lines)
-    assert "—" not in text and "–" not in text, "weekly report carries a dash"
+    # Delegates to copy_gate.violations (single house-style gate).
+    from . import copy_gate
+    assert "banned_dash" not in copy_gate.violations(text), "weekly report carries a dash"
     return text, current
 
 

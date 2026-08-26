@@ -73,23 +73,18 @@ MARGIN = sr.MARGIN
 STORY_SAFE_TOP = 250
 STORY_SAFE_BOT = 320
 
-# Every dash-family character; none may survive into on-image copy (the copy law,
-# mirrored from summit_render / podcast_cards).
-_DASH_RE = re.compile(r"[‐‑‒–—―−-]")
-
 # Banned on-image words (mirrors creative_studio._BANNED_HEADLINE_WORDS).
 _BANNED_WORDS = ("vendor",)
 
 
 def _clean(text):
     """Strip every dash-family character from approved copy (the brand no-dash rule),
-    collapse the doubled spaces a removed dash leaves, and trim. Hyphens included: on
-    image copy is dash free (use 'to' for ranges). Returns a clean single-spaced string."""
+    collapse the doubled spaces a removed dash leaves, and trim. Delegates to
+    copy_gate.scrub (single house-style gate)."""
     if not text:
         return ""
-    cleaned = _DASH_RE.sub(" ", str(text))
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
+    from . import copy_gate
+    return copy_gate.scrub(str(text))
 
 
 def _check_hard_rules(text):

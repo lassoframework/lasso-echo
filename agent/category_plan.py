@@ -260,3 +260,108 @@ def format_summary(month_result):
             if st in spread:
                 lines.append(f"  {st:15s} {spread[st]}")
     return "\n".join(lines)
+
+
+# ---- Quota / cap enforcement (AGENT_CATEGORY_QUOTAS, default OFF) ----------------------
+#
+# Grounding rails (apply whenever quotas are evaluated):
+#   - proof/results drafts come ONLY from stored, approved assets; if the pool is empty
+#     the slot falls back to 'community' and an ops alert fires. Never fabricate.
+#   - offer posts are only built while the gym's active offer flag is live; when an offer
+#     expires, every remaining 'offer' slot automatically becomes 'invite'.
+#   - Avatar filter (gen-pop only; no serious athletes / competitive CrossFit / HYROX) is
+#     applied upstream at the creative level and is NOT relaxed by any quota rule.
+#   - Human tap (pending -> approve/deny) is untouched; quotas govern what REACHES the
+#     approval queue, not whether approval is required.
+
+# 25% hard cap: if any single category exceeds this share of the month's posts it is a
+# plan-level violation regardless of which profile generated the plan.
+CATEGORY_HARD_CAP_PCT = 25.0
+
+# LASSO B2B minimum weekly counts (AGENT_CATEGORY_QUOTAS, profile="B2B").
+# These are weekly MINIMUMS, not maxima. The fixed 7-day schedule is unchanged.
+B2B_WEEKLY_MIN = {
+    "proof": 2,
+    "call": 3,
+}
+
+# Gym monthly minimums (AGENT_CATEGORY_QUOTAS, profile="GYM").
+# Applies to months with 26-31 posting slots.
+GYM_MONTHLY_MIN = {
+    "results":    4,
+    "offer":      4,   # only while gym has a live offer; expired -> slot becomes 'invite'
+    "faces":      3,
+    "community":  5,
+    "education":  6,
+    # invite fills remaining gaps (no minimum)
+}
+
+
+def category_pct(plan_rows, category):
+    """
+    The percentage of plan_rows that belong to `category`. Returns 0.0 when
+    plan_rows is empty. Pure: no side effects.
+
+    plan_rows is any iterable of dicts with a "category" key, as returned by
+    month_plan()["entries"] or week_plan()[0].
+    """
+    rows = list(plan_rows)
+    if not rows:
+        return 0.0
+    count = sum(1 for r in rows if r.get("category") == category)
+    return round(100.0 * count / len(rows), 10)
+
+
+def validate_quotas(plan_rows, profile="GYM"):
+    """
+    Check plan_rows against the standing quotas for `profile`. Returns a list of
+    human-readable violation strings; an empty list means all quotas are met.
+    Gated behind AGENT_CATEGORY_QUOTAS (default OFF). When the flag is OFF this
+    function still runs (it is pure), but the CALLERS should gate on the flag
+    before acting on the result.
+
+    profile="GYM"  — checks GYM_MONTHLY_MIN counts and the 25% hard cap.
+    profile="B2B"  — checks B2B_WEEKLY_MIN counts (per-week; plan_rows should be
+                     a single week's entries) and the 25% hard cap.
+    profile="ANY"  — checks the 25% hard cap only.
+
+    Violation string format:
+      "<category>_below_min:<actual>/<required>"   e.g. "proof_below_min:1/2"
+      "category_over_cap:<category>:<pct>%"        e.g. "category_over_cap:doctrine:28%"
+
+    Grounding rails:
+      - proof/results violations are advisory; the slot fallback logic in the
+        creative layer (not here) converts empty-pool slots to 'community' + alert.
+      - offer violations are skipped when the gym's live-offer flag is not set;
+        callers should strip 'offer' rows before calling if the offer is expired.
+    """
+    rows = list(plan_rows)
+    violations = []
+
+    all_categories = set(r.get("category", "") for r in rows)
+
+    # 25% hard cap (applies to every profile)
+    for cat in all_categories:
+        if not cat:
+            continue
+        pct = category_pct(rows, cat)
+        if pct > CATEGORY_HARD_CAP_PCT:
+            violations.append(
+                f"category_over_cap:{cat}:{pct:.0f}%"
+            )
+
+    # Profile-specific minimums
+    if profile == "GYM":
+        for cat, min_count in GYM_MONTHLY_MIN.items():
+            actual = sum(1 for r in rows if r.get("category") == cat)
+            if actual < min_count:
+                violations.append(f"{cat}_below_min:{actual}/{min_count}")
+
+    elif profile == "B2B":
+        # plan_rows should be one week (7 entries) for B2B weekly minimum checks
+        for cat, min_count in B2B_WEEKLY_MIN.items():
+            actual = sum(1 for r in rows if r.get("category") == cat)
+            if actual < min_count:
+                violations.append(f"{cat}_below_min:{actual}/{min_count}")
+
+    return violations

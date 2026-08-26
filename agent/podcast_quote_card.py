@@ -42,18 +42,23 @@ PODCAST_NAME = "GYM MARKETING MADE SIMPLE PODCAST"
 _BRAND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "brand")
 WORDMARK = os.path.join(_BRAND_DIR, "lasso_wordmark.png")
 
-# Every dash family character; none may survive into on-image copy (the copy law,
-# mirrored from podcast_cards / podcast_release).
-_DASH_RE = re.compile(r"[‐‑‒–—―−-]")
+_QUOTE_ANY_HYPHEN_RE = re.compile(r"-")  # any ASCII hyphen is banned in verbatim quotes
 
 
 def _guard_verbatim(quote_text):
-    """Refuse a quote carrying any dash family character. Raised loudly so a
-    dashed line is fixed at the source, never silently rendered."""
-    if _DASH_RE.search(quote_text or ""):
+    """Refuse a quote carrying any banned dash or any ASCII hyphen. Raised loudly
+    so a dashed line is fixed at the source, never silently rendered.
+    Delegates to copy_gate.violations for em/en/intraword detection; also checks
+    for any ASCII hyphen (including ' - ' between spaces) since verbatim quotes
+    must be completely hyphen-free."""
+    from . import copy_gate
+    v = copy_gate.violations(quote_text or "")
+    if not v and _QUOTE_ANY_HYPHEN_RE.search(quote_text or ""):
+        v = ["hyphen"]
+    if v:
         raise ValueError(
             "quote card refused: quote text carries a dash character (em, en, or "
-            "hyphen). On-image copy is dash free; use 'to' not a dash range.")
+            f"hyphen) [{', '.join(v)}]. On-image copy is dash free; use 'to' not a dash range.")
 
 
 def split_caps_emphasis(quote_text, caps_span=None):

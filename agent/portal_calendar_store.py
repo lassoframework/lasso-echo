@@ -30,6 +30,9 @@ import calendar as _calendar
 
 from . import config
 
+# Wave 3: caption cooldown ledger. Imported lazily inside insert_rows when
+# AGENT_CAPTION_COOLDOWN is ON so the flag-off path has zero cost.
+
 _TABLE = "content_calendar"
 
 # Portal facing statuses. The action verbs map to these column values.
@@ -563,6 +566,21 @@ class SupabaseCalendarStore:
             raise PortalStoreError(
                 409, f"row {row_id} is not in 'publishing'; refusing to stamp published "
                      "over an out-of-band status change")
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp the published caption in the
+        # ledger so future cooldown checks include this post. Read straight off
+        # the returned representation row; failure is NEVER fatal (the publish
+        # already landed; the ledger is a best-effort cache).
+        if config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger as _ledger
+                _row = rows[0]
+                _gid = str(_row.get("gym_id") or "")
+                _cap = _row.get("caption") or ""
+                _date = str(_row.get("post_date") or (published_at or "")[:10])
+                if _gid and _cap and _date:
+                    _ledger.record_published(_gid, _cap, _date)
+            except Exception:
+                pass  # ledger stamp failure is never fatal
         return rows[0]
 
     def mark_publish_failed(self, row_id, revert_status="pending"):
@@ -637,7 +655,22 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         out = r.json() or []
-        return [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
+        # the caption ledger so future planner runs see the cooldown. Failure is
+        # non-fatal (the rows were already inserted; the ledger is a best-effort
+        # cache). Only fires when the flag is ON; the flag-off path is a no-op.
+        if config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger as _ledger
+                for row in inserted:
+                    caption = row.get("caption") or ""
+                    post_date = row.get("post_date") or ""
+                    if caption and post_date:
+                        _ledger.record_staged(account_key, caption, post_date)
+            except Exception:
+                pass  # ledger stamp failure is never fatal
+        return inserted
 
     def delete_month(self, account_key, month, *, preserve_human=True,
                      preserve_dates=()):
@@ -699,6 +732,52 @@ class SupabaseCalendarStore:
                 locked.add(_slot_key(row))
         return locked
 
+    def deny_with_reason(self, account_key, row_id, reject_reason):
+        """PATCH one row to status='denied' and reject_reason=<reject_reason>,
+        filtered by BOTH id AND gym_id so a row belonging to another gym is
+        never touched. Used by the dedupe_forward_book job (Wave 0.2).
+        Returns the updated row dict, or None when zero rows matched."""
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        for row in rows:
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
+    def list_pending_future(self, account_key, today_iso):
+        """Return all content_calendar rows for account_key where status='pending'
+        and post_date > today_iso. Used by the dedupe_forward_book job."""
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "status": "eq.pending",
+            "post_date": f"gt.{today_iso}",
+            "order": "post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
         belongs to another gym can never be deleted through this account_key. Returns the
@@ -713,7 +792,6 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
-
 
 def preserve_and_prune(store, account_key, months, rows):
     """Shared guard for every delete-then-insert rebuild lane (client month, real month,

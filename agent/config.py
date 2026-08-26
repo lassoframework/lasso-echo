@@ -1183,6 +1183,20 @@ def grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
 
 
+def calendar_grade_enabled() -> bool:
+    """
+    Calendar A-gate switch (AGENT_CALENDAR_GRADE). OFF by default. When ON, the
+    real_month_planner will not stage a planned month unless it scores >= 90 (A)
+    on the LASSO Social Report Card rubric. The planner remediates and rescores
+    in a loop (up to 4 passes); if the plan still fails after 4 passes, staging
+    is blocked and a human-decision ops alert fires. The calendar_autopublish
+    publish loop also rechecks copy_gate + caption_ledger before each publish
+    when this flag is ON. Distinct from AGENT_GRADE_ENABLED (reporting) and
+    AGENT_STYLE_GATE_ENABLED (image gate). Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CALENDAR_GRADE", "false"))
+
+
 def connect_grade_enabled() -> bool:
     """
     Connect-to-grade switch. OFF by default: /connect behavior is byte
@@ -2082,6 +2096,33 @@ def services_category_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SERVICES_CATEGORY", "false"))
 
 
+def category_quotas_enabled() -> bool:
+    """
+    Category quota enforcement for content plans. OFF by default = zero behavior
+    change; existing plan logic runs exactly as before. When ON, validate_quotas()
+    results are acted upon by the plan builders:
+
+    B2B profile (LASSO own accounts):
+      proof >= 2 per week  (from stored, approved social proof assets only)
+      call  >= 3 per week  (direct CTA posts driving a next step)
+      No category > 25% of the month
+
+    Gym profile (client accounts):
+      results   >= 4 per month  (approved before/afters and transformations only)
+      offer     >= 4 per month  (only while a live offer is set; expired -> 'invite')
+      faces     >= 3 per month
+      community >= 5 per month
+      education >= 6 per month
+      invite fills remaining gaps
+      No category > 25% of the month
+
+    Summit ramp and existing weekly caps (podcast/b2b/platform/book) are unchanged.
+    Human approval tap and publish-off default are untouched.
+    Arm by hand: AGENT_CATEGORY_QUOTAS=true
+    """
+    return _truthy(os.environ.get("AGENT_CATEGORY_QUOTAS", "false"))
+
+
 def intake_worker_enabled() -> bool:
     """
     Intake pipeline worker: turns incoming R2 uploads into library-ready assets.
@@ -2224,3 +2265,109 @@ def educational_pillar_enabled() -> bool:
     still run. Arm by hand in Railway env.
     """
     return _truthy(os.environ.get("AGENT_EDUCATIONAL_PILLAR", "false"))
+
+
+def dedupe_forward_book_enabled() -> bool:
+    """
+    Forward-book deduplication job switch. OFF by default. When OFF, the job
+    `agent/jobs/dedupe_forward_book.py` is a no-op (dry-run only) and makes no
+    writes to content_calendar. When ON, the job groups future pending rows per
+    gym by caption_hash, keeps the earliest occurrence, and moves the rest to
+    'denied' with reject_reason='duplicate_purge_2026_08' via
+    portal_calendar_store. Arm by hand in Railway env; only Blake enables this.
+    This is a one-shot Wave 0 cleanup job — it is not part of the daily runner.
+    """
+    return _truthy(os.environ.get("AGENT_DEDUPE_FORWARD_BOOK", "false"))
+
+
+def caption_cooldown_enabled() -> bool:
+    """
+    Caption repeat-cooldown ledger switch. OFF by default. When ON:
+      - caption_ledger.is_on_cooldown() is called before a draft is accepted
+        into the real-month plan (real_month_planner.py).
+      - caption_ledger.record_staged() is called when a new calendar row is
+        staged (portal_calendar_store.py insert_rows).
+      - caption_ledger.record_published() is called after a successful autopublish
+        (calendar_autopublish.py mark_published area).
+      - The backfill job (agent/jobs/backfill_caption_ledger.py) can seed the
+        ledger from existing content_calendar rows.
+
+    When OFF, all caption_ledger calls are bypassed and today is byte-for-byte
+    unchanged. Arm by hand: AGENT_CAPTION_COOLDOWN=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_COOLDOWN", "false"))
+
+
+def metrics_sync_enabled() -> bool:
+    """
+    Wave 7 metrics ingestion switch (AGENT_METRICS_SYNC). OFF by default = zero
+    behavior change: agent/metrics_sync.py is a no-op. When ON, a nightly per-gym
+    pull of Zernio analytics (source=all) lands post_metrics snapshots at post-age
+    days 1, 3, 7, 28, deduped by platformPostId (the duplicate lassoframework IG
+    connection returns the same post under two account ids; one row wins). Posts
+    with no content_calendar match are stored with calendar_id null and
+    external=true; external rows inform the baseline and NEVER train the playbook.
+    READ ONLY: nothing here publishes, approves, or touches any social account.
+    Arm by hand: AGENT_METRICS_SYNC=true (Railway env). HUMAN TAP REQUIRED —
+    see WAVE6_HUMAN_TAPS.md TAP 3.
+    """
+    return _truthy(os.environ.get("AGENT_METRICS_SYNC", "false"))
+
+
+def learning_loop_enabled() -> bool:
+    """
+    Wave 7 learning loop switch (AGENT_LEARNING_LOOP). OFF by default = zero
+    behavior change: lever stamping, playbook consumption, experiment labeling,
+    and the monthly retro are all dark. When ON: new calendar rows are stamped
+    with their levers (hook_family, ask_type, time_slot, caption_len_band), the
+    planner biases pillar/slot selection toward the gym's versioned gym_playbook
+    (INSIDE the Wave 2 floors and the Wave 5 A-gate, never against them), ~15%
+    of slots become labeled experiments, and agent/jobs/monthly_retro.py runs on
+    the 5th for the prior month. The optimizer can NEVER touch quota floors,
+    avatar rails, ask rules, consent rules, or the copy gate (playbook.py
+    PROTECTED_KEYS), and playbook drift is capped at plus or minus 20% per weight
+    per month. Every post still lands pending; the human approval tap is
+    untouched. Arm by hand per WAVE6_HUMAN_TAPS.md TAP 3: metrics first
+    (AGENT_METRICS_SYNC), the retro only after a full closed month of clean
+    metrics.
+    """
+    return _truthy(os.environ.get("AGENT_LEARNING_LOOP", "false"))
+
+
+def mentions_enabled() -> bool:
+    """
+    Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior
+    change: tag_allowlist.handles_for_category() returns [] and no @handles are
+    appended to any caption. When ON, the tag_allowlist consent gate is active:
+    only handles present in gym_tag_allowlist are ever used, member handles require
+    consent=true, and the appropriate handle(s) for the caption category are appended
+    to the caption text as plain @handle lines. Never tags an account not on the list;
+    never tags a member without explicit consent. Arm by hand: AGENT_MENTIONS=true.
+    """
+    return _truthy(os.environ.get("AGENT_MENTIONS", "false"))
+
+
+def calendar_grade_enabled_for(gym_id: str) -> bool:
+    """Per-gym grade enforcement. Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper()} first,
+    then falls back to AGENT_CALENDAR_GRADE. Rollout order: lasso first, then ENG,
+    GRITX, Pierce, TopFuel, then default-ON for new onboards.
+    HUMAN TAP REQUIRED to flip each gym's flag on Railway.
+
+    Examples:
+      AGENT_CALENDAR_GRADE_LASSO=true   -> lasso gym grades enforced
+      AGENT_CALENDAR_GRADE_ENG=true     -> CrossFit ENG grades enforced
+      AGENT_CALENDAR_GRADE_GRITX=true   -> GritX grades enforced
+      AGENT_CALENDAR_GRADE_PIERCEFITNESS=true -> Pierce Fitness grades enforced
+      AGENT_CALENDAR_GRADE_TOPFUEL=true -> TopFuel grades enforced
+      AGENT_CALENDAR_GRADE=true         -> global default ON (new onboards)
+
+    When no per-gym flag is set, falls back to the global AGENT_CALENDAR_GRADE
+    switch (calendar_grade_enabled()). Behind AGENT_CALENDAR_GRADE as the global
+    gate: when the global flag is OFF and no per-gym override is set, returns False
+    for every gym (byte-for-byte current behavior unchanged).
+    """
+    gym_env = f"AGENT_CALENDAR_GRADE_{gym_id.upper().replace('-', '_')}"
+    gym_val = os.environ.get(gym_env)
+    if gym_val is not None:
+        return _truthy(gym_val)
+    return calendar_grade_enabled()

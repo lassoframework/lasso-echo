@@ -140,6 +140,27 @@ def publish(draft, account, client=None, scheduled_for=None,
     # NEVER created while Echo marked it published (Dale's missing IG story, 2026-08-13).
     body = "" if story else (getattr(draft, "caption", "") or "")
 
+    # AGENT_MENTIONS: append validated @handle mentions (newline-separated) to the
+    # caption when the flag is ON. @handles in caption text are rendered by Zernio
+    # as live mentions. Stories carry no caption, so mentions are skipped for stories.
+    if body and config.mentions_enabled():
+        _category = (getattr(draft, "category", "") or "").strip().lower()
+        _gym_id = (getattr(draft, "gym_id", "") or
+                   getattr(draft, "account_key", account.key) or account.key)
+        # Strip tenant suffix (eng_ig -> eng) to match gym_tag_allowlist gym_id
+        for _suf in ("_ig", "_fb"):
+            if _gym_id.endswith(_suf):
+                _gym_id = _gym_id[: -len(_suf)]
+                break
+        if _category:
+            try:
+                from .tag_allowlist import handles_for_category
+                _handles = handles_for_category(_gym_id, _category)
+                if _handles:
+                    body = body.rstrip() + "\n" + "\n".join(f"@{h}" for h in _handles)
+            except Exception:
+                pass  # mention failures are non-fatal; the post still goes out
+
     # PAST SLOT -> publish NOW: Zernio treats a missing scheduledFor + publishNow=true
     # as immediate. Handing it a past timestamp risks a 400/undefined behavior, and a
     # row approved after its slot passed should just go out (catch_all semantics).

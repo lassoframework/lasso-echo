@@ -580,6 +580,41 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         draft.account_key = account.key
         draft.platform = account.platform
 
+        # PUBLISH-TIME RECHECK (AGENT_CALENDAR_GRADE, default OFF)
+        # Re-validates copy_gate + caption_ledger immediately before the network
+        # call. A row that passes the gate at planning time but was edited after
+        # staging (e.g. a dash snuck into the caption) is caught here, reverted
+        # to pending, and never sent to a live audience.
+        if config.calendar_grade_enabled():
+            from agent import copy_gate as _cg, caption_ledger as _cl, ops_alerts as _oa
+            _cap = row.get("caption") or ""
+            _viols = _cg.violations(_cap)
+            if _viols:
+                try:
+                    store.mark_publish_failed(
+                        row_id, revert_status="pending")
+                except Exception:
+                    pass
+                _oa.alert(
+                    f"publish recheck: row {row_id} has copy violations {_viols}, "
+                    f"reverted to pending"
+                )
+                failed.append(row_id)
+                continue
+            if _cl.is_on_cooldown(gym_id, _cap, row.get("post_date", ""),
+                                  db=None):
+                try:
+                    store.mark_publish_failed(
+                        row_id, revert_status="pending")
+                except Exception:
+                    pass
+                _oa.alert(
+                    f"publish recheck: row {row_id} caption on cooldown, "
+                    f"reverted to pending"
+                )
+                failed.append(row_id)
+                continue
+
         try:
             # ROUTE BY GYM: LASSO publishes via the Meta-direct lane (unchanged). A
             # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio. The zernio

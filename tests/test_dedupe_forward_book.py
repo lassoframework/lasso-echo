@@ -1,15 +1,22 @@
 """
-tests/test_dedupe_forward_book.py
-==================================
-Wave 0 — dedupe_forward_book unit tests.
+Tests for agent/jobs/dedupe_forward_book.py — Wave 0.2.
 
-Covers:
-  1. caption_hash normalizes correctly (tags stripped, case folded, punct removed).
-  2. dry-run does not issue any writes.
-  3. When 3 rows share a hash, 2 become denied and 1 (earliest by post_date) survives.
+Offline. No Supabase calls; the store is injected with a fake.
+Coverage:
+  - caption_hash: tag/handle stripping, case normalization, punctuation removal,
+    truncation at 200 chars.
+  - find_duplicates: single row (no dupes), all-unique, all-same, mixed, tiebreak
+    on post_date then id.
+  - dedupe_gym: dry-run makes no writes; live run calls deny_with_reason for each
+    dupe; partial-error path returns correct error count.
+  - run(): AGENT_DEDUPE_FORWARD_BOOK=false forces dry-run even when not explicitly
+    requested; flag=true + dry_run=False allows real writes.
+  - reject_reason: every denied row carries 'duplicate_purge_2026_08'.
+  - Keeper is always the earliest post_date in a group.
 """
 
-import json
+from __future__ import annotations
+
 import os
 import sys
 
@@ -17,140 +24,18 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from agent.jobs.dedupe_forward_book import caption_hash, _dedupe_gym  # noqa: E402
+from agent.jobs.dedupe_forward_book import (
+    caption_hash,
+    dedupe_gym,
+    find_duplicates,
+    run,
+)
+from agent.portal_calendar_store import PortalStoreError
 
 
 # ---------------------------------------------------------------------------
-# 1. caption_hash normalisation
+# Helpers
 # ---------------------------------------------------------------------------
-
-class TestCaptionHash:
-    def test_basic_hash_is_16_chars_hex(self):
-        h = caption_hash("Hello world")
-        assert len(h) == 16
-        assert all(c in "0123456789abcdef" for c in h)
-
-    def test_case_insensitive(self):
-        assert caption_hash("Hello World") == caption_hash("hello world")
-        assert caption_hash("UPPER CASE TEXT") == caption_hash("upper case text")
-
-    def test_hashtags_stripped(self):
-        a = caption_hash("Great class today #fitness #crossfit")
-        b = caption_hash("Great class today")
-        assert a == b
-
-    def test_at_mentions_stripped(self):
-        a = caption_hash("Tag us @lassoframework when you show up")
-        b = caption_hash("Tag us  when you show up")
-        assert a == b
-
-    def test_punctuation_removed(self):
-        a = caption_hash("Ready. Set. Go! Your best self is waiting...")
-        b = caption_hash("ready set go your best self is waiting")
-        assert a == b
-
-    def test_whitespace_collapsed(self):
-        a = caption_hash("  lots   of   spaces  ")
-        b = caption_hash("lots of spaces")
-        assert a == b
-
-    def test_emojis_and_unicode_stripped(self):
-        # Non-[a-z0-9 ] chars are removed, so emojis vanish
-        a = caption_hash("Join us \U0001f4aa for the best workout")
-        b = caption_hash("join us  for the best workout")
-        assert a == b
-
-    def test_truncation_at_200_chars(self):
-        # Two strings that differ only after position 200 should hash the same
-        base = "a" * 200
-        long_a = base + "extra stuff here"
-        long_b = base + "completely different"
-        assert caption_hash(long_a) == caption_hash(long_b)
-
-    def test_none_input_doesnt_crash(self):
-        # caption can be None in the DB; we coerce with str()
-        h = caption_hash(None)  # type: ignore[arg-type]
-        assert len(h) == 16
-
-    def test_empty_string(self):
-        h = caption_hash("")
-        assert len(h) == 16
-
-    def test_only_tags_gives_stable_hash(self):
-        # After stripping all tags you have empty string — stable, not an error
-        a = caption_hash("#hashtag1 #hashtag2 @user")
-        b = caption_hash("#different #tags @other")
-        # Both reduce to empty => same hash
-        assert a == b
-
-    def test_different_captions_give_different_hashes(self):
-        a = caption_hash("You deserve the best training in town")
-        b = caption_hash("We help busy parents get strong without sacrificing family time")
-        assert a != b
-
-
-# ---------------------------------------------------------------------------
-# Fake store + HTTP layer
-# ---------------------------------------------------------------------------
-
-class _FakeResp:
-    def __init__(self, status_code=200, payload=None):
-        self.status_code = status_code
-        self._payload = payload if payload is not None else []
-        self.text = ""
-
-    def json(self):
-        return self._payload
-
-
-class _FakeHTTP:
-    """
-    Captures GET and PATCH calls.  GET returns the pre-loaded rows list.
-    PATCH is recorded but returns 200 with the patched row.
-    """
-    def __init__(self, rows=None):
-        self.get_calls = []
-        self.patch_calls = []
-        self._rows = rows or []
-
-    def get(self, url, params=None, headers=None, timeout=None):
-        self.get_calls.append({"url": url, "params": params or {}})
-        return _FakeResp(200, list(self._rows))
-
-    def patch(self, url, params=None, headers=None, json=None, timeout=None):
-        self.patch_calls.append({"url": url, "params": params or {}, "json": json})
-        # Return the row that was patched (simplified)
-        return _FakeResp(200, [{"id": (params or {}).get("id", "").replace("eq.", "")}])
-
-
-class _FakeStore:
-    """
-    Minimal stand-in for SupabaseCalendarStore.
-    Implements only the interface _dedupe_gym touches.
-    """
-    def __init__(self, rows=None):
-        self._http = _FakeHTTP(rows=rows)
-        self._url = "https://fake.supabase.co"
-        self._key = "fake-key"
-        self.set_status_calls = []
-        self.patch_reason_calls = []
-
-    def _client(self):
-        return self._http
-
-    def _headers(self, extra=None):
-        h = {"apikey": self._key}
-        if extra:
-            h.update(extra)
-        return h
-
-    def _rest(self, table):
-        return f"{self._url}/rest/v1/{table}"
-
-    def set_status(self, account_key, row_id, new_status):
-        self.set_status_calls.append((account_key, row_id, new_status))
-        return {"id": row_id, "status": new_status}
-
 
 def _row(row_id, post_date, caption, gym_id="lasso", status="pending"):
     return {
@@ -162,159 +47,327 @@ def _row(row_id, post_date, caption, gym_id="lasso", status="pending"):
     }
 
 
-# ---------------------------------------------------------------------------
-# 2. dry-run does not write
-# ---------------------------------------------------------------------------
+class FakeStore:
+    """Injectable fake for SupabaseCalendarStore."""
 
-class TestDryRun:
-    def test_dry_run_issues_no_writes(self, monkeypatch):
-        """dry_run=True must never call set_status or issue a PATCH."""
-        caption = "You deserve to feel strong and energized every single day"
-        rows = [
-            _row("id-1", "2026-09-01", caption),
-            _row("id-2", "2026-09-02", caption),
-            _row("id-3", "2026-09-03", caption),
-        ]
-        store = _FakeStore(rows=rows)
+    def __init__(self, pending_rows=None, deny_error=False):
+        self._pending_rows = list(pending_rows or [])
+        self._deny_error = deny_error
+        self.denied_calls = []   # list of (gym_id, row_id, reject_reason)
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=True)
+    def list_pending_future(self, gym_id, today_iso):
+        return [r for r in self._pending_rows if r.get("gym_id") == gym_id]
 
-        # No set_status calls
-        assert store.set_status_calls == [], (
-            "dry-run must not call set_status"
-        )
-        # No PATCH calls from the HTTP layer
-        assert store._http.patch_calls == [], (
-            "dry-run must not issue any PATCH"
-        )
-        # But the result should still report what WOULD have been denied
-        assert result["rows_denied"] == 2
-        assert result["duplicate_groups"] == 1
-
-    def test_dry_run_with_no_duplicates_is_silent(self, monkeypatch):
-        rows = [
-            _row("id-1", "2026-09-01", "First unique post about accountability"),
-            _row("id-2", "2026-09-02", "Second unique post about community strength"),
-        ]
-        store = _FakeStore(rows=rows)
-
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=True)
-
-        assert store.set_status_calls == []
-        assert result["rows_denied"] == 0
-        assert result["duplicate_groups"] == 0
+    def deny_with_reason(self, gym_id, row_id, reject_reason):
+        self.denied_calls.append((gym_id, row_id, reject_reason))
+        if self._deny_error:
+            raise PortalStoreError(500, "forced test error")
+        # Simulate PostgREST returning the patched row.
+        return {"id": row_id, "gym_id": gym_id, "status": "denied", "reject_reason": reject_reason}
 
 
 # ---------------------------------------------------------------------------
-# 3. 3 rows same hash -> 2 denied, earliest survives
+# caption_hash tests
 # ---------------------------------------------------------------------------
 
-class TestDedupeLogic:
-    def test_three_rows_same_hash_denies_two_keeps_earliest(self, monkeypatch):
-        """
-        When 3 rows share the same caption hash:
-          - The row with the EARLIEST post_date is kept (not denied).
-          - The 2 later rows are denied.
-        """
-        caption = "We help busy moms get strong without giving up family time"
+class TestCaptionHash:
+    def test_same_text_same_hash(self):
+        assert caption_hash("Hello world") == caption_hash("Hello world")
+
+    def test_case_insensitive(self):
+        assert caption_hash("Hello World") == caption_hash("hello world")
+
+    def test_hashtags_stripped(self):
+        assert caption_hash("hello #fitness #gym") == caption_hash("hello")
+
+    def test_handles_stripped(self):
+        assert caption_hash("tag @coach_amanda today") == caption_hash("tag  today")
+
+    def test_punctuation_removed(self):
+        assert caption_hash("Hello, world!") == caption_hash("hello world")
+
+    def test_extra_whitespace_collapsed(self):
+        assert caption_hash("hello  world") == caption_hash("hello world")
+
+    def test_truncation_at_200_chars(self):
+        long_text = "a" * 300
+        # The hash is computed on first 200 chars; both 250 and 300 produce same hash.
+        assert caption_hash("a" * 250) == caption_hash(long_text)
+
+    def test_different_texts_different_hashes(self):
+        assert caption_hash("Join us for a free class") != caption_hash("Transform your body in 30 days")
+
+    def test_returns_16_hex_chars(self):
+        h = caption_hash("some caption")
+        assert len(h) == 16
+        assert all(c in "0123456789abcdef" for c in h)
+
+    def test_empty_string(self):
+        h = caption_hash("")
+        assert isinstance(h, str) and len(h) == 16
+
+    def test_none_coerced(self):
+        h = caption_hash(None)  # type: ignore[arg-type]
+        assert isinstance(h, str) and len(h) == 16
+
+
+# ---------------------------------------------------------------------------
+# find_duplicates tests
+# ---------------------------------------------------------------------------
+
+class TestFindDuplicates:
+    def test_single_row_is_keeper(self):
+        rows = [_row("id1", "2026-09-01", "Join us today")]
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 1
+        assert len(dupes) == 0
+
+    def test_all_unique_captions_all_keepers(self):
         rows = [
-            _row("id-early",  "2026-09-01", caption),
-            _row("id-middle", "2026-09-10", caption),
-            _row("id-late",   "2026-09-20", caption),
+            _row("id1", "2026-09-01", "Caption A"),
+            _row("id2", "2026-09-02", "Caption B"),
+            _row("id3", "2026-09-03", "Caption C"),
         ]
-        store = _FakeStore(rows=rows)
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 3
+        assert len(dupes) == 0
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
-
-        assert result["rows_denied"] == 2
-        assert result["duplicate_groups"] == 1
-        assert result["total_pending"] == 3
-
-        denied_ids = [call[1] for call in store.set_status_calls]
-        assert "id-early" not in denied_ids, "earliest row must survive"
-        assert "id-middle" in denied_ids
-        assert "id-late" in denied_ids
-        assert all(call[2] == "denied" for call in store.set_status_calls)
-
-    def test_earliest_post_date_is_kept_regardless_of_insertion_order(self, monkeypatch):
-        """Rows arrive in reverse chronological order; earliest still survives."""
-        caption = "The coach sees what you cannot see in your own form and fixes it"
+    def test_all_same_caption_keeps_earliest(self):
         rows = [
-            _row("id-late",   "2026-10-15", caption),  # listed first, latest date
-            _row("id-early",  "2026-09-01", caption),  # listed last, earliest date
-            _row("id-middle", "2026-09-30", caption),
+            _row("id3", "2026-09-03", "Same caption text"),
+            _row("id1", "2026-09-01", "Same caption text"),
+            _row("id2", "2026-09-02", "Same caption text"),
         ]
-        store = _FakeStore(rows=rows)
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 1
+        assert len(dupes) == 2
+        assert keepers[0]["id"] == "id1"
+        assert set(d["id"] for d in dupes) == {"id2", "id3"}
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
-
-        denied_ids = [call[1] for call in store.set_status_calls]
-        assert "id-early" not in denied_ids
-        assert "id-late" in denied_ids
-        assert "id-middle" in denied_ids
-
-    def test_unique_captions_are_untouched(self, monkeypatch):
+    def test_mixed_groups(self):
         rows = [
-            _row("id-a", "2026-09-01", "Unique caption about accountability partners"),
-            _row("id-b", "2026-09-02", "Unique caption about community and belonging"),
-            _row("id-c", "2026-09-03", "Unique caption about momentum over motivation"),
+            _row("id1", "2026-09-01", "Unique A"),
+            _row("id2", "2026-09-02", "Shared caption"),
+            _row("id3", "2026-09-03", "Shared caption"),
+            _row("id4", "2026-09-04", "Unique B"),
         ]
-        store = _FakeStore(rows=rows)
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 3   # Unique A, earliest Shared, Unique B
+        assert len(dupes) == 1
+        assert dupes[0]["id"] == "id3"
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
-
-        assert result["rows_denied"] == 0
-        assert result["duplicate_groups"] == 0
-        assert store.set_status_calls == []
-
-    def test_two_groups_of_duplicates(self, monkeypatch):
-        """Two separate duplicate groups are independently resolved."""
-        cap_a = "You showed up. That is where the transformation begins every time."
-        cap_b = "Small group coaching means every rep gets expert eyes on your form."
+    def test_keeper_is_earliest_post_date(self):
         rows = [
-            _row("a1", "2026-09-01", cap_a),
-            _row("a2", "2026-09-08", cap_a),
-            _row("b1", "2026-09-02", cap_b),
-            _row("b2", "2026-09-09", cap_b),
-            _row("b3", "2026-09-16", cap_b),
+            _row("id2", "2026-10-05", "Duplicate caption"),
+            _row("id1", "2026-09-01", "Duplicate caption"),
         ]
-        store = _FakeStore(rows=rows)
+        keepers, dupes = find_duplicates(rows)
+        assert keepers[0]["id"] == "id1"
+        assert dupes[0]["id"] == "id2"
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
-
-        assert result["duplicate_groups"] == 2
-        assert result["rows_denied"] == 3  # 1 from group_a + 2 from group_b
-
-        denied_ids = [call[1] for call in store.set_status_calls]
-        assert "a1" not in denied_ids  # earliest of group_a
-        assert "a2" in denied_ids
-        assert "b1" not in denied_ids  # earliest of group_b
-        assert "b2" in denied_ids
-        assert "b3" in denied_ids
-
-    def test_empty_gym_returns_zeros(self, monkeypatch):
-        store = _FakeStore(rows=[])
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
-
-        assert result["total_pending"] == 0
-        assert result["rows_denied"] == 0
-        assert result["duplicate_groups"] == 0
-
-    def test_hashtag_variants_treated_as_same_caption(self, monkeypatch):
-        """Same body text with different hashtag sets should hash identically."""
-        base = "Come find out why our members never miss a Monday"
-        cap_a = base + " #fitness #gym #goals"
-        cap_b = base + " #strongertogether #crossfit"
+    def test_tiebreak_on_id_when_same_date(self):
         rows = [
-            _row("id-1", "2026-09-01", cap_a),
-            _row("id-2", "2026-09-08", cap_b),
+            _row("id_b", "2026-09-01", "Same caption for tiebreak"),
+            _row("id_a", "2026-09-01", "Same caption for tiebreak"),
         ]
-        store = _FakeStore(rows=rows)
+        keepers, dupes = find_duplicates(rows)
+        # "id_a" < "id_b" lexicographically.
+        assert keepers[0]["id"] == "id_a"
+        assert dupes[0]["id"] == "id_b"
 
-        result = _dedupe_gym(store, "lasso", "2026-08-26", dry_run=False)
+    def test_hash_normalization_treated_as_duplicate(self):
+        # These captions differ only by case and hashtag — same hash, so duplicate.
+        rows = [
+            _row("id1", "2026-09-01", "Join our community #gym"),
+            _row("id2", "2026-09-02", "JOIN OUR COMMUNITY"),
+        ]
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 1
+        assert len(dupes) == 1
+        assert keepers[0]["id"] == "id1"
 
-        assert result["duplicate_groups"] == 1
-        assert result["rows_denied"] == 1
-        denied_ids = [call[1] for call in store.set_status_calls]
-        assert "id-1" not in denied_ids
-        assert "id-2" in denied_ids
+    def test_empty_list(self):
+        keepers, dupes = find_duplicates([])
+        assert keepers == []
+        assert dupes == []
+
+    def test_none_caption_rows_grouped_together(self):
+        rows = [
+            _row("id1", "2026-09-01", None),
+            _row("id2", "2026-09-02", None),
+        ]
+        keepers, dupes = find_duplicates(rows)
+        assert len(keepers) == 1
+        assert len(dupes) == 1
+
+
+# ---------------------------------------------------------------------------
+# dedupe_gym tests
+# ---------------------------------------------------------------------------
+
+class TestDedupeGym:
+    def _run(self, rows, dry_run=False, deny_error=False):
+        store = FakeStore(pending_rows=rows, deny_error=deny_error)
+        result = dedupe_gym("lasso", store, "2026-09-01", dry_run)
+        return result, store
+
+    def test_dry_run_makes_no_writes(self):
+        rows = [
+            _row("id1", "2026-09-02", "Same caption"),
+            _row("id2", "2026-09-03", "Same caption"),
+        ]
+        result, store = self._run(rows, dry_run=True)
+        assert store.denied_calls == []
+        assert result["duplicates_found"] == 1
+        assert result["duplicates_denied"] == 0
+
+    def test_live_run_denies_duplicates(self):
+        rows = [
+            _row("id1", "2026-09-02", "Same caption"),
+            _row("id2", "2026-09-03", "Same caption"),
+        ]
+        result, store = self._run(rows, dry_run=False)
+        assert len(store.denied_calls) == 1
+        gym_id, row_id, reason = store.denied_calls[0]
+        assert gym_id == "lasso"
+        assert row_id == "id2"
+        assert reason == "duplicate_purge_2026_08"
+        assert result["duplicates_denied"] == 1
+        assert result["errors"] == 0
+
+    def test_reject_reason_is_duplicate_purge_2026_08(self):
+        rows = [
+            _row("id1", "2026-09-02", "Repeated"),
+            _row("id2", "2026-09-03", "Repeated"),
+            _row("id3", "2026-09-04", "Repeated"),
+        ]
+        result, store = self._run(rows, dry_run=False)
+        for _gym, _row_id, reason in store.denied_calls:
+            assert reason == "duplicate_purge_2026_08"
+
+    def test_no_duplicates_makes_no_writes(self):
+        rows = [
+            _row("id1", "2026-09-02", "Caption A"),
+            _row("id2", "2026-09-03", "Caption B"),
+        ]
+        result, store = self._run(rows, dry_run=False)
+        assert store.denied_calls == []
+        assert result["duplicates_found"] == 0
+        assert result["duplicates_denied"] == 0
+
+    def test_error_in_deny_counted(self):
+        rows = [
+            _row("id1", "2026-09-02", "Same caption"),
+            _row("id2", "2026-09-03", "Same caption"),
+        ]
+        result, store = self._run(rows, dry_run=False, deny_error=True)
+        assert result["errors"] == 1
+        assert result["duplicates_denied"] == 0
+
+    def test_result_counts_total_pending(self):
+        rows = [_row(f"id{i}", f"2026-09-0{i+1}", f"Caption {i}") for i in range(5)]
+        result, _ = self._run(rows, dry_run=True)
+        assert result["total_pending"] == 5
+
+    def test_gym_id_scoped_correctly(self):
+        # Store has rows for two gyms; only 'lasso' rows should be returned by the fake.
+        rows = [
+            _row("id1", "2026-09-02", "Same", gym_id="lasso"),
+            _row("id2", "2026-09-03", "Same", gym_id="lasso"),
+            _row("id3", "2026-09-02", "Same", gym_id="other_gym"),
+        ]
+        store = FakeStore(pending_rows=rows)
+        result = dedupe_gym("lasso", store, "2026-09-01", dry_run=True)
+        # Only the two 'lasso' rows are considered.
+        assert result["total_pending"] == 2
+
+    def test_multiple_dupe_groups(self):
+        rows = [
+            _row("id1", "2026-09-02", "Caption A"),
+            _row("id2", "2026-09-03", "Caption A"),
+            _row("id3", "2026-09-02", "Caption B"),
+            _row("id4", "2026-09-03", "Caption B"),
+            _row("id5", "2026-09-04", "Caption C"),  # unique
+        ]
+        result, store = self._run(rows, dry_run=False)
+        # Two groups of two: one dupe per group = 2 denied.
+        assert result["duplicates_found"] == 2
+        assert result["duplicates_denied"] == 2
+        assert result["errors"] == 0
+
+
+# ---------------------------------------------------------------------------
+# run() tests — flag behaviour
+# ---------------------------------------------------------------------------
+
+class TestRunFunction:
+    def test_flag_off_forces_dry_run(self, monkeypatch):
+        """When AGENT_DEDUPE_FORWARD_BOOK is not set (OFF), run() must not write."""
+        monkeypatch.delenv("AGENT_DEDUPE_FORWARD_BOOK", raising=False)
+        rows = [
+            _row("id1", "2026-09-02", "Dup caption", gym_id="lasso"),
+            _row("id2", "2026-09-03", "Dup caption", gym_id="lasso"),
+        ]
+        store = FakeStore(pending_rows=rows)
+        # Suppress ops_alerts posting (no Slack token in tests).
+        monkeypatch.setattr("agent.ops_alerts.alert", lambda *a, **kw: None)
+        results = run(gym_ids=["lasso"], store=store, dry_run=False)
+        # Even though dry_run=False was passed, the missing flag should force dry-run.
+        assert store.denied_calls == [], "flag OFF must prevent writes"
+        assert results[0]["duplicates_found"] == 1
+
+    def test_flag_on_dry_run_false_allows_writes(self, monkeypatch):
+        """When flag is ON and dry_run=False, real writes happen."""
+        monkeypatch.setenv("AGENT_DEDUPE_FORWARD_BOOK", "true")
+        rows = [
+            _row("id1", "2026-09-02", "Dup", gym_id="lasso"),
+            _row("id2", "2026-09-03", "Dup", gym_id="lasso"),
+        ]
+        store = FakeStore(pending_rows=rows)
+        monkeypatch.setattr("agent.ops_alerts.alert", lambda *a, **kw: None)
+        results = run(gym_ids=["lasso"], store=store, dry_run=False)
+        assert len(store.denied_calls) == 1
+        assert results[0]["duplicates_denied"] == 1
+
+    def test_flag_on_dry_run_true_no_writes(self, monkeypatch):
+        """When flag is ON but dry_run=True, no writes happen."""
+        monkeypatch.setenv("AGENT_DEDUPE_FORWARD_BOOK", "true")
+        rows = [
+            _row("id1", "2026-09-02", "Dup", gym_id="lasso"),
+            _row("id2", "2026-09-03", "Dup", gym_id="lasso"),
+        ]
+        store = FakeStore(pending_rows=rows)
+        monkeypatch.setattr("agent.ops_alerts.alert", lambda *a, **kw: None)
+        results = run(gym_ids=["lasso"], store=store, dry_run=True)
+        assert store.denied_calls == []
+        assert results[0]["duplicates_denied"] == 0
+
+    def test_multiple_gyms_processed(self, monkeypatch):
+        monkeypatch.setenv("AGENT_DEDUPE_FORWARD_BOOK", "true")
+        rows = [
+            _row("id1", "2026-09-02", "Same", gym_id="gym_a"),
+            _row("id2", "2026-09-03", "Same", gym_id="gym_a"),
+            _row("id3", "2026-09-02", "Same", gym_id="gym_b"),
+            _row("id4", "2026-09-03", "Same", gym_id="gym_b"),
+        ]
+        store = FakeStore(pending_rows=rows)
+        monkeypatch.setattr("agent.ops_alerts.alert", lambda *a, **kw: None)
+        results = run(gym_ids=["gym_a", "gym_b"], store=store, dry_run=False)
+        assert len(results) == 2
+        assert results[0]["gym_id"] == "gym_a"
+        assert results[1]["gym_id"] == "gym_b"
+        assert results[0]["duplicates_denied"] == 1
+        assert results[1]["duplicates_denied"] == 1
+
+    def test_returns_result_list(self, monkeypatch):
+        monkeypatch.delenv("AGENT_DEDUPE_FORWARD_BOOK", raising=False)
+        store = FakeStore(pending_rows=[])
+        monkeypatch.setattr("agent.ops_alerts.alert", lambda *a, **kw: None)
+        results = run(gym_ids=["lasso"], store=store)
+        assert isinstance(results, list)
+        assert len(results) == 1
+        assert "gym_id" in results[0]
+        assert "total_pending" in results[0]
+        assert "duplicates_found" in results[0]
+        assert "duplicates_denied" in results[0]
+        assert "errors" in results[0]

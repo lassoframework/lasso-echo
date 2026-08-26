@@ -10,25 +10,463 @@ Last updated: 2026-08-26
 
 ---
 
-## Wave 0 — Preflight (2026-08-26)
+## Wave 7 — The Learning Loop (2026-08-26, AGENT_METRICS_SYNC + AGENT_LEARNING_LOOP)
 
-All Wave 0 tasks complete. Suite 3055 green.
+Both flags default OFF: [~] built-unarmed. Flag flip = human tap (WAVE6_HUMAN_TAPS.md TAP 3:
+metrics first, retro only after a full closed month of clean metrics). When OFF the system is
+byte-for-byte unchanged. DO NOT run the first monthly_retro on real data — built and proven on
+synthetic months only. Every post still lands pending; the human approval tap is untouched.
 
-### [x] 0.1 — Second publisher investigation (wave0_publisher_finding.md)
-Live feed carried 65 posts Aug 10-26; Echo's calendar accounts for only 36. Root cause
-confirmed: TWO duplicate Zernio Instagram connections both wired to @lassoframework.
-  - ID 6a69fc9cdf17280d93d0727f (token exp 2026-09-27) — the one Echo is booked against.
-  - ID 6a74b3efd0fe733d1abc6fc1 (token exp 2026-10-06) — the second publisher. 29 posts.
-No third-party scheduler implicated. Recommended action: disconnect the newer duplicate
-(6a74b3efd0fe733d1abc6fc1). Nothing disconnected. ACTION REQUIRED: Blake tap to confirm.
-Finding written to wave0_publisher_finding.md and #echoclaude.
+### [~] 7.1 Metrics ingestion — agent/metrics_sync.py (AGENT_METRICS_SYNC, default OFF)
+  - Nightly per gym: Zernio analytics pull with source=all; snapshots at post-age days 1/3/7/28
+  - Dedupe by platformPostId (duplicate lassoframework IG connection -> one row wins)
+  - Calendar join via late_post_id, platformPostId fallback; no match -> calendar_id null, external=true
+  - External rows inform the baseline, NEVER train the playbook; null-not-zero on every metric
+  - Injectable zernio client + store; run(gyms=None, now=None); read only on the social side
+  - Migration applied to Supabase (ooqcvmcjspeltuuhcvlh): post_metrics_20260826 (+ migrations/*.sql in repo)
 
-### [x] 0.2 — dedupe_forward_book job (agent/jobs/dedupe_forward_book.py)
-Groups future 'pending' content_calendar rows by caption_hash (SHA256 of normalized
-caption, first 16 hex chars). Keeps earliest, denies the rest with
-reject_reason='duplicate_purge_2026_08'. All writes via SupabaseCalendarStore, never
-direct SQL. --dry-run flag logs without writing. Behind AGENT_DEDUPE_FORWARD_BOOK
-(default OFF). 20 tests green in tests/test_dedupe_forward_book.py.
+### [~] 7.2 Feature stamping — agent/lever_stamp.py + calendar lever columns
+  - hook_family / ask_type / caption_len_band / time_slot classifiers (ask regexes = copy_gate ASK_RE families)
+  - has_member_face only ever from the vision sidecar, never guessed
+  - Stamped at stage time in real_month_planner.apply_month_plan (behind AGENT_LEARNING_LOOP)
+  - Historical backfill: agent/jobs/backfill_levers.py (best-effort, same heuristics, behind flag)
+  - Migration applied: calendar_lever_columns_20260826 (5 additive columns)
+
+### [~] 7.3 The score — agent/learning_score.py
+  - engagement_value = 1*likes + 3*comments + 4*shares + 4*saves + 3*clicks + 5*follows
+  - score = engagement_value / max(reach, 0.10 * followers_at_snapshot); day-7 scoring snapshot,
+    day-28 for follows attribution only; reels watch_ratio = avg_watch_time / duration
+
+### [~] 7.4 Honesty guards — agent/learning_guards.py (each a testable function, regression-tested)
+  - sample_floor (MIN_SAMPLE=6); within-gym only (structural); rolling 90-day recency weighting;
+    persistence_rule (>=30% lift two consecutive months, or one month at 12+/side);
+    format-stratified comparisons; month_is_tainted (second publisher / >20% follower spike / paid boosts)
+  - Synthetic viral-fluke regression proves the playbook does NOT move on noise (807-like outlier month)
+
+### [~] 7.5 gym_playbook + bounds — agent/playbook.py
+  - load_playbook / propose_update (NEW version row every write, updated_by='monthly_retro',
+    evidence jsonb required, old versions immutable — the store is insert-only by construction)
+  - apply_bounds: plus/minus 20% drift cap per weight per month; PROTECTED_KEYS refused outright
+    (quota floors, avatar rails, ask rules, offer rules, consent, copy gate, approval/publish gates)
+  - Migration applied: gym_playbook_20260826 (gym_playbook + monthly_retro tables)
+
+### [~] 7.6 Cross-gym priors — agent/playbook.py compute_priors / seed_playbook_from_priors / break_tie
+  - Non-tainted gyms only, anonymous lever aggregates; exactly two jobs (seed a new gym's day-one
+    playbook; break ties under the sample floor); own evidence always overrides
+
+### [~] 7.7 Experiments — playbook.label_experiments wired into the planner (behind AGENT_LEARNING_LOOP)
+  - ~15% of feed slots labeled '<lever>:<YYYY-MM>'; ONE lever under test per gym per month
+  - Migration applied: experiment_column_20260826 (content_calendar.experiment_label)
+
+### [~] 7.8 Monthly retro — agent/jobs/monthly_retro.py (runs the 5th for the prior month, behind flag)
+  - Matured metrics -> taint check -> lever scores vs rolling baseline -> experiment verdict ->
+    top 3 keep / top 3 stop (with evidence row keys) -> bounded playbook update -> monthly_retro row
+  - Digest to the gym's coach channel (SlackPoster notice pattern); LASSO's retro to #ops (ops_alerts)
+  - NEVER cites a number without a post_metrics row behind it; digest scrubbed through copy_gate
+  - run(month=None, gyms=None, store=None, now=None, notifier=None) — fully injectable; tested on
+    synthetic months ONLY (never pointed at real data in this wave)
+
+### [~] Planner consumption (behind AGENT_LEARNING_LOOP)
+  - real_month_planner reads load_playbook(gym_id): fallback pillar order biased by pillar_weights,
+    time_slot stamps biased by top_time_slots — INSIDE the Wave 2 floors and Wave 5 A-gate, never against them
+
+### [x] Tests — 59 new tests, all green; full suite green (2536 passed; test_higgsfield_renderer
+    fails only on this machine's missing higgsfield_client pip module, pre-existing on HEAD)
+  - tests/test_metrics_sync.py (dedupe across duplicate accounts, external flagging, join + fallback, flag-off no-op, source=all, null-not-zero)
+  - tests/test_learning_guards.py (sample floor 5-vs-6, persistence rule variants, taint exclusion, drift cap, viral-fluke regression)
+  - tests/test_playbook_bounds.py (floor/rail/consent/copy-gate refusals, drift clamps, version increments, immutability, priors)
+  - tests/test_monthly_retro.py (deterministic synthetic findings, bounded diff, evidence-backed digest, tainted month observed-not-trained)
+
+### Flags (both [~] built-unarmed; flag flip = human tap, WAVE6_HUMAN_TAPS.md TAP 3)
+  - [~] AGENT_METRICS_SYNC — default OFF
+  - [~] AGENT_LEARNING_LOOP — default OFF
+
+---
+
+## Wave 6 — Rollout infrastructure (2026-08-26, per-gym AGENT_CALENDAR_GRADE_{GYM_ID})
+
+All new behavior behind AGENT_CALENDAR_GRADE as the global gate (default OFF). When OFF the system is byte-for-byte unchanged.
+Two human taps in this wave cannot be performed autonomously. See WAVE6_HUMAN_TAPS.md.
+
+### [x] 6.1 Per-gym grade toggle infrastructure — config.calendar_grade_enabled_for()
+Added calendar_grade_enabled_for(gym_id) to agent/config.py:
+  - Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper().replace('-','_')} first (per-gym override)
+  - Falls back to calendar_grade_enabled() (global AGENT_CALENDAR_GRADE)
+  - Rollout order per spec: lasso -> ENG -> GRITX -> Pierce -> TopFuel -> global default-ON
+  - HUMAN TAP REQUIRED to flip each gym's flag on Railway (see WAVE6_HUMAN_TAPS.md TAP 2)
+Updated real_month_planner.py apply_month_plan():
+  - calendar_grade_enabled() -> calendar_grade_enabled_for(account_key) for per-gym enforcement
+  - Added Wave 6 refill comment: re-run planner after dedupe_forward_book.run() to refill freed slots
+
+### [x] 6.2 Rollout digest job — agent/jobs/rollout_digest.py
+Created agent/jobs/rollout_digest.py with run(gyms=None, store=None) -> list[str]:
+  - For each gym: reads gym_social_grades (trailing_30 + forward_book) for before/after grade picture
+  - Reads count of denied rows with reject_reason='duplicate_purge_2026_08' (Wave 0.2 purged slots)
+  - Reads count of pending rows in content_calendar (refilled slots)
+  - Reads count of seeded gym_tag_allowlist entries (mentions seeded)
+  - Formats a one-page digest per gym ending with "READY FOR FLAG FLIP (human tap required)"
+  - Behind AGENT_CALENDAR_GRADE; returns informational message when OFF
+  - Injectable store for tests; Supabase REST + Content-Range count headers for live path
+  - CLI: python3 -m agent jobs rollout_digest [--gym GYM_ID ...]
+
+### [x] 6.3 Flag-flip checklist — WAVE6_HUMAN_TAPS.md
+Created WAVE6_HUMAN_TAPS.md at repo root:
+  - TAP 1: PENDING BLAKE TAP — second publisher disconnect (wave0_publisher_finding.md evidence)
+  - TAP 2: PENDING BLAKE TAP — per-gym AGENT_CALENDAR_GRADE flag flips (all 5 gyms + global)
+  - Exact Railway env var names + post-flip verification commands for each gym
+
+### [x] 6.4 Forward book refill stubs
+Added comment in real_month_planner.py apply_month_plan() docstring:
+  "Wave 6: after dedupe_forward_book.run(), re-run this planner for each gym to refill freed
+   slots. Everything refilled lands 'pending' — coaches tap through."
+
+### [x] 6.5 Tests — tests/test_wave6_rollout.py
+7 tests, all green (5 required + 2 bonus):
+  1. calendar_grade_enabled_for('lasso'): AGENT_CALENDAR_GRADE=false + AGENT_CALENDAR_GRADE_LASSO=true -> True
+  2. calendar_grade_enabled_for('eng'): AGENT_CALENDAR_GRADE=false, no per-gym flag -> False
+  3. calendar_grade_enabled_for('topfuel'): AGENT_CALENDAR_GRADE=true (global) -> True (inherits)
+  4. rollout_digest.run() returns list of strings with gym name + "READY FOR FLAG FLIP"
+  5. WAVE6_HUMAN_TAPS.md exists and mentions both human taps (TAP 1 publisher, TAP 2 per-gym)
+  6. (bonus) rollout_digest.run() returns flag-off message when AGENT_CALENDAR_GRADE=false
+  7. (bonus) calendar_grade_enabled_for('pierce-fitness') resolves to AGENT_CALENDAR_GRADE_PIERCE_FITNESS
+
+Human taps: TAP 1 (publisher disconnect) and TAP 2 (all per-gym flag flips) are PENDING BLAKE TAP.
+
+Full suite: 2477 passed, 6 skipped, 0 new failures (pre-existing higgsfield_renderer failure excluded; unrelated missing module).
+
+---
+
+## Wave 5 — Calendar grader: A gate (2026-08-26, AGENT_CALENDAR_GRADE)
+
+All new behavior behind AGENT_CALENDAR_GRADE (default OFF). When OFF the system is byte-for-byte unchanged.
+
+### [x] 5.1 agent/calendar_grade.py created
+Deterministic, offline LASSO Social Report Card grader. Six legs: consistency (20), content_mix (20), caption_craft (20), visual_match/proof_numbers (15), right_audience (15), path_to_join (10). Total 100 points; A_THRESHOLD = 90. Distinct from grade_gate.py (image gate).
+Key behaviors:
+  - _consistency: day-gap detection (-4/gap-of-1, -8/gap->3), caption_hash dup detection (-8 per dup occurrence after first; floors at 0)
+  - _content_mix: inline 25% category cap (-3 each), unbacked proof slots (-4 each); category_plan.validate_quotas used when quotas passed in
+  - _caption_craft: hard block (any copy_gate violation = 0 for whole leg); soft flags (-1 each, floor at 8); median caption < 150 = -4
+  - _visual_match (GYM): no vision_derived = -3; stock asset = -5; mixed template_ids = -3
+  - _proof_numbers (B2B): numbers in caption (want >=8, -1/missing); @mentions (want >=8, -1/missing); mixed gym_count claims = -3
+  - _right_audience: athlete-avatar leak on first line = -5 each; elite/advanced language = -2 each
+  - _path_to_join: missing ask = -1 each; GYM booking terms (want >=5) = -1/missing; B2B call asks (want >=12) = -1/missing; bare URL as only ask = -1 each
+CalendarGrade dataclass: .total (int), .letter (str), .scores (dict), .defects (list of (leg, row_ref, reason) tuples)
+
+### [x] 5.2 Enforcement loop in real_month_planner.py
+Added behind AGENT_CALENDAR_GRADE flag in apply_month_plan():
+  - Grades the planned rows before staging (profile via _profile_for: LASSO=B2B, clients=GYM)
+  - Remediation loop: up to 4 passes (_remediate: clears dup captions, appends missing asks, rebalances over-cap categories)
+  - If still < 90 after 4 passes: ops_alert fires ("NOT STAGING") and returns {"ok": False, ...}
+  - If >= 90: attaches grade summary to return dict ("Grade: A (92/100)")
+  - Added _profile_for(gym_id) and _remediate(rows, defects) helpers
+  - config.calendar_grade_enabled() added to agent/config.py (AGENT_CALENDAR_GRADE, default false)
+
+### [x] 5.3 Publish-time recheck in calendar_autopublish.py
+Added behind AGENT_CALENDAR_GRADE flag in publish_due() immediately after EXACTLY-ONCE CLAIM and before the route-by-gym publish block:
+  - copy_gate.violations check: row with banned dash/intraword hyphen reverts to pending + ops_alert fires
+  - caption_ledger.is_on_cooldown check: row on cooldown reverts to pending + ops_alert fires
+  - Both checks are non-fatal to other rows; only the flagged row is held
+
+### [x] 5.4 gym_social_grades table + grade_sweep job
+SQL migration "gym_social_grades_20260826" applied to Supabase project ooqcvmcjspeltuuhcvlh (success:true):
+  - gym_social_grades table: id uuid pk, gym_id text, "window" text (trailing_30|forward_book), total int, letter text, scores jsonb, defects jsonb, graded_at timestamptz
+  - Index: gym_social_grades_gym_window on (gym_id, "window", graded_at desc)
+  - Note: "window" is quoted (PostgreSQL reserved word)
+agent/jobs/grade_sweep.py created:
+  - run(gyms, store, now, alert_fn): nightly per-gym grader; trailing 30 days + forward book
+  - Writes to gym_social_grades via injectable store.insert_grade or Supabase REST
+  - Alerts coach channel (ops_alerts.alert) when either grade < B (80)
+  - Behind AGENT_CALENDAR_GRADE; no-op when OFF
+  - __main__ block for standalone: python3 -m agent jobs grade_sweep
+
+### [x] 5.5 Tests
+tests/test_calendar_grade.py: 10 tests, all green
+  1. Perfect 28-post month grades A (>= 90)
+  2. 20 duplicate captions -> consistency score 0, total < 90
+  3. 0 ask-containing posts -> path_to_join <= 4
+  4. Summit at 44% -> content_mix cap violation defect
+  5. Em-dash caption -> caption_craft = 0
+  6. profile="B2B" uses proof_numbers (not visual_match)
+  7. grade_month returns CalendarGrade with all fields
+  8. Band logic: total 90->A, 89->B, 79->C, 69->D, 59->F
+  9. A_THRESHOLD is 90
+  10. Defects present for violated legs
+
+tests/test_planner_gate.py: 4 tests, all green
+  1. Flag ON + plan >= 90 -> stages normally (ok=True)
+  2. Flag ON + plan fails then remediation fixes it -> stages after loop
+  3. Flag ON + 4 passes can't fix -> NOT staged, one alert fired
+  4. Flag OFF -> no grade check, stages regardless
+
+Full suite: 2470 passed, 6 skipped, 0 new failures (pre-existing higgsfield_renderer failure excluded; unrelated missing module).
+
+---
+
+## Wave 4 — Tagging, end to end (2026-08-26, AGENT_MENTIONS)
+
+All new behavior behind AGENT_MENTIONS (default OFF). When OFF the system is byte-for-byte unchanged.
+
+### [x] 4.1 Supabase migrations applied (project ooqcvmcjspeltuuhcvlh)
+- mentions_column_20260826: `alter table content_calendar add column if not exists mentions jsonb not null default '[]';`
+- gym_tag_allowlist_20260826: `create table if not exists gym_tag_allowlist (gym_id text, handle text, kind text check (kind in ('own','coach','member','partner')), consent boolean default false, primary key (gym_id, handle));`
+Both applied via MCP mcp__claude_ai_Supabase__apply_migration. success:true.
+
+### [x] 4.2 agent/tag_allowlist.py created
+Consent-gated handle allowlist for @mentions in captions.
+Functions:
+  allowlisted_handles(gym_id, kind=None, consent_only=False, store=None) -> list[str]
+    Returns handles from gym_tag_allowlist optionally filtered by kind and consent.
+  validate_mentions(gym_id, mentions, store=None) -> list[str]
+    Returns only allowlisted mentions; drops non-list handles and members without consent silently.
+  handles_for_category(gym_id, category, store=None) -> list[str]
+    Returns [] when AGENT_MENTIONS OFF; otherwise returns kind-appropriate handles per _CATEGORY_KINDS map.
+    results/proof -> member (consented) + own; faces -> coach; LASSO b2b -> partner; default -> own.
+Store injectable for tests; Supabase REST used in live path.
+
+### [x] 4.3 agent/jobs/seed_tag_allowlist.py created
+One-shot seed job (behind AGENT_MENTIONS):
+  - Each gym in client_gym_bases(): seeds own IG handle (kind='own', consent=True) from dynamic registry
+  - LASSO: seeds own handle (AGENT_LASSO_IG_HANDLE env, default 'lassoframework') + all connected client handles from Zernio (kind='partner', consent=True)
+  - Logs to agent/jobs/seed_log_allowlist.txt
+  - run(zernio_client=None, log_path=...) -> {seeded, skipped, gyms}
+  - Has __main__ block for standalone execution
+
+### [x] 4.4 zernio_publisher.py — mention wiring in publish()
+When AGENT_MENTIONS ON and body (caption) is non-empty:
+  - Strips gym tenant suffix (_ig/_fb) to get gym_id
+  - Calls handles_for_category(gym_id, category) from tag_allowlist
+  - Appends handles as @handle lines (newline-separated) after the caption body
+  - Stories skip this block (body is '' for stories)
+  - Failures are non-fatal: post still goes out if handle resolution errors
+
+### [x] 4.5 Copy gate interlock verified
+python3 -c "from agent.copy_gate import scrub; print(scrub('@coach_amanda great session'))"
+Output: '@coach_amanda great session' — @handles pass through _PROTECTED_RE untouched.
+
+### [x] 4.6 config.mentions_enabled() added
+AGENT_MENTIONS (default false). Printed in __main__.py _status() so test_status_completeness passes.
+
+### [x] 4.7 tests/test_mentions.py — 12 tests, all green
+Spec's 8 required tests + 4 bonus:
+  1. validate_mentions: own handle on allowlist (consent=True) -> returned
+  2. validate_mentions: handle NOT on allowlist -> silently dropped
+  3. validate_mentions: member handle without consent -> silently dropped
+  4. validate_mentions: member handle WITH consent -> returned
+  5. handles_for_category: AGENT_MENTIONS=OFF -> returns []
+  6. handles_for_category: AGENT_MENTIONS=ON, category='faces' -> coach handles only
+  7. allowlisted_handles: kind='member', consent_only=True -> only consented members
+  8. copy_gate.scrub leaves @handle untouched in caption
+  9. validate_mentions strips leading @ from input handles
+ 10. handles_for_category with empty allowlist -> []
+ 11. validate_mentions with empty input -> []
+ 12. handles_for_category 'results' -> member (consented) + own
+
+Full suite: 2456 passed (excluding pre-existing higgsfield_renderer failure, unrelated), 6 skipped, 0 new failures.
+
+---
+
+## Wave 3 — Repeat cooldown: caption_ledger (2026-08-26, AGENT_CAPTION_COOLDOWN)
+
+All new behavior behind AGENT_CAPTION_COOLDOWN (default OFF). When OFF the system is
+byte-for-byte unchanged.
+
+### [x] 3.1 agent/caption_ledger.py created
+60-day caption cooldown + same-month hard block + 30-day concept gap.
+
+Functions:
+  caption_hash(text) — normalized SHA-256 fingerprint, 16-char hex. Strips @handles
+    and #tags, lowercases, removes non-alphanumeric, collapses whitespace, truncates at 200.
+  ledger_key(gym_id, h) — kv key for a gym+hash pair.
+  is_on_cooldown(gym_id, caption_text, planned_date, db=None) -> bool
+    Returns True when last_used is within COOLDOWN_DAYS (60) of planned_date, OR
+    when last_used is in the same calendar month (HARD_BLOCK_SAME_MONTH=True).
+    Returns False on any error — never blocks content on kv failure.
+  record_staged(gym_id, caption_text, date_str, db=None)
+    Upserts kv: {"last_used": "YYYY-MM-DD", "uses": N}. last_used advances only
+    when date_str is more recent than the stored value (backfill safety).
+  record_published(gym_id, caption_text, date_str, db=None) — same pattern.
+  concept_is_on_cooldown(gym_id, concept_key, planned_date, db=None) -> bool
+    30-day gap for doctrine/education concept pool. Same kv pattern.
+  record_concept_used(gym_id, concept_key, date_str, db=None)
+
+Constants: COOLDOWN_DAYS=60, HARD_BLOCK_SAME_MONTH=True, CONCEPT_COOLDOWN_DAYS=30.
+All db calls are injectable; defaults to agent.db via lazy import.
+
+### [x] 3.2 SQL migration applied (Supabase ooqcvmcjspeltuuhcvlh)
+Migration name: caption_ledger_20260826
+Table:
+  caption_ledger (gym_id text, caption_hash text, last_used date, uses int default 1,
+                  primary key (gym_id, caption_hash))
+Applied via MCP mcp__claude_ai_Supabase__apply_migration. Supabase returned success:true.
+
+### [x] 3.3 agent/real_month_planner.py — cooldown check wired into _build_feed_with_fallback
+Behind AGENT_CAPTION_COOLDOWN.
+  _cooldown_checked(first_draft, builder, target, day_key, cat, log, _max_attempts=3)
+    Up to 3 builder calls per pillar; if all 3 hit cooldown, falls through to the next
+    real fallback pillar. Never ships a repeat, never fabricates.
+  _resolve_gym_id(target) — resolves account_key from str or object.
+  _draft_caption(draft) — extracts caption text from Draft.
+  Lazy import of caption_ledger so flag-off path has zero cost.
+
+### [x] 3.4 agent/portal_calendar_store.py — record_staged() wired in insert_rows
+Behind AGENT_CAPTION_COOLDOWN. After a successful POST, iterates the returned rows
+and calls caption_ledger.record_staged(gym_id, caption, post_date). Failure is
+non-fatal (rows are already inserted; ledger is best-effort cache).
+
+### [x] 3.5 agent/portal_calendar_store.py — record_published() wired in mark_published
+mark_published(row_id, media_id, published_at, gym_id, caption, post_date) added to
+SupabaseCalendarStore. Behind AGENT_CAPTION_COOLDOWN: after a successful PATCH to
+'published', calls caption_ledger.record_published(). Also added:
+  due_rows(gym_id, run_date, catchup_days=0)
+  mark_publishing(row_id, gym_id) -> bool (atomic claim)
+  mark_publish_failed(row_id, gym_id)
+  stamp_scheduled(row_id, scheduled_at, gym_id)
+These are the autopublish store methods calendar_autopublish.py calls; they live here
+so tests can inject a FakeStore without needing the real file.
+
+### [x] 3.6 agent/jobs/backfill_caption_ledger.py created
+Reads all historical content_calendar rows from Supabase in PAGE_SIZE=1000 pages.
+Hashes each caption and calls caption_ledger.record_staged(). Reports count per gym.
+Behind AGENT_CAPTION_COOLDOWN (no-op when OFF). Has run(dry_run=False, http=None)
+function callable standalone or from CLI (python -m agent.jobs.backfill_caption_ledger).
+--dry-run flag counts without writing.
+
+### [x] 3.7 concept-level cooldown in caption_ledger.py
+CONCEPT_COOLDOWN_DAYS=30. concept_is_on_cooldown() / record_concept_used() added.
+Same kv pattern; concept_key is a short identifier like 'doctrine:speed_to_lead'.
+
+### [x] 3.8 tests/test_caption_ledger.py — 12 tests, all green
+Spec's 8 required tests + 4 additional:
+  1. caption_hash normalizes @/# tags and punct (same as "ready set go")
+  2. caption_hash whitespace invariant
+  3. is_on_cooldown False for brand-new caption (not in kv)
+  4. is_on_cooldown True when last_used 30 days ago (within 60-day window)
+  5. is_on_cooldown False when last_used 61 days ago (outside window)
+  6. HARD_BLOCK_SAME_MONTH: same month blocks even 5 days apart
+  7. record_staged / is_on_cooldown round-trip: staged -> next day is blocked
+  8. concept_is_on_cooldown: blocks within 30 days, allows at 30+ days
+  9. record_staged increments uses counter and advances last_used
+ 10. ledger_key is gym-scoped (gym1 != gym2)
+ 11. is_on_cooldown returns False on kv error (never blocks content)
+ 12. record_staged silently passes on kv error (never raises)
+
+config.caption_cooldown_enabled() flag added (AGENT_CAPTION_COOLDOWN, default false).
+Printed in __main__.py _status() so test_status_completeness passes.
+
+Full suite: 2444 passed, 1 pre-existing higgsfield_renderer failure (unrelated),
+6 skipped, 0 new failures.
+
+---
+
+## Wave 2 — proof/call categories, quotas, 25% cap (2026-08-26, AGENT_CATEGORY_QUOTAS)
+
+### [x] agent/content_categories.py — CATEGORIES and GYM_PILLARS updated
+CATEGORIES expanded from 6 to 8: added "proof" (stored, approved social proof assets;
+empty pool falls back to 'community' + ops alert, never fabricated) and "call"
+(direct CTA posts driving a next step).
+GYM_PILLARS tuple added: ("results", "education", "community", "faces", "offer", "invite").
+Six gen-pop boutique fitness pillars for client gym account monthly quota planning.
+schedule_for_day() docstring updated: notes that proof/call and GYM_PILLARS are governed
+by the quota layer, not the fixed 7-day LASSO B2B schedule.
+
+### [x] agent/category_plan.py — quotas, caps, validate_quotas(), category_pct()
+All new behavior behind AGENT_CATEGORY_QUOTAS (default OFF); existing plan logic unchanged.
+
+Constants added:
+  CATEGORY_HARD_CAP_PCT = 25.0  (hard: any category over 25% = violation)
+  B2B_WEEKLY_MIN = {proof: 2, call: 3}
+  GYM_MONTHLY_MIN = {results: 4, offer: 4, faces: 3, community: 5, education: 6}
+
+Functions added:
+  category_pct(plan_rows, category) -> float
+    Percentage of plan_rows that belong to category. Pure, no side effects.
+  validate_quotas(plan_rows, profile="GYM") -> list[str]
+    Violation strings (empty = compliant). profile = GYM | B2B | ANY.
+    Violation format: "<cat>_below_min:<actual>/<required>" or "category_over_cap:<cat>:<pct>%"
+
+Grounding rails documented as inline comments:
+  - proof/results: stored, approved assets only; empty pool -> community + alert
+  - offer: only while gym's live offer is set; expired -> invite
+  - Avatar filter (gen-pop only) is upstream, not relaxed by quota rules
+  - Human tap is untouched; quotas govern what reaches the approval queue
+
+### [x] agent/config.py — category_quotas_enabled() flag added
+category_quotas_enabled() reads AGENT_CATEGORY_QUOTAS (default false). Full docstring
+documents both B2B and GYM quota behaviors, summit ramp unchanged note, and hard rails.
+AGENT_CATEGORY_QUOTAS added to _status() in __main__.py so test_status_completeness passes.
+
+### [x] tests/test_category_plan.py — 24 tests total (14 pre-existing + 10 new Wave 2)
+Wave 2 tests added:
+  test_categories_includes_proof / test_categories_includes_call
+  test_gym_pillars_has_six_entries / test_gym_pillars_includes_all_required
+  test_validate_quotas_violation_for_zero_proof_posts
+  test_validate_quotas_violation_for_zero_call_posts
+  test_validate_quotas_compliant_b2b_plan_no_violations
+  test_validate_quotas_no_violations_for_compliant_plan
+  test_category_pct_one_of_four_returns_25 / _empty_rows / _all_same
+  test_25_pct_cap_violation_detected / _format / test_exactly_25_pct_is_not_a_violation
+
+Full suite: 2444 passed, 4 pre-existing higgsfield_renderer failures (unrelated), 0 new failures.
+
+---
+
+## Wave 1 — copy_gate.py single dash gate, 9 call sites migrated (2026-08-26)
+
+### [x] agent/copy_gate.py created
+Single house-style gate for every piece of client-facing text Echo emits.
+Functions: scrub() (rewrite, never reject), violations() (hard failures),
+soft_flags() (quality flags for calendar grader), ASK_RE (CTA detection).
+URL/handle/hashtag hyphens pass through untouched. Intraword hyphens
+become spaces. Banned dashes (em/en/figure/bar/minus) become ", ".
+
+### [x] 9 call sites migrated to copy_gate
+Files that shrunk their local dash logic:
+- welcome_review.py: no_banned_copy() now delegates to copy_gate.violations()
+- video_editor.py: build_higgsfield_prompt() uses copy_gate.scrub()
+- creative_studio.py: _scrub_dashes() delegates to copy_gate._DASH_RE (prompt
+  text only; intraword hyphens like 'left-aligned' preserved in prompts)
+- voice_template.py: render_template() assertion delegates to copy_gate.violations()
+- weekly_report.py: build_report() assertion delegates to copy_gate.violations()
+- pdf_report.py: _scrub() applies PDF typography then copy_gate.scrub()
+- podcast_quote_card.py: _guard_verbatim() uses copy_gate.violations() + hyphen check
+- no_creative_fallback.py: _clean() delegates to copy_gate.scrub()
+- clipper_render.py: scrub_onscreen() delegates to copy_gate.scrub()
+Also migrated: content_categories.py, podcast_release.py (found by repo-wide guard).
+Backward-compat shim (_DashRE) added to podcast_release for existing importers
+(podcast_cards, podcast_learn, podcast_month, podcast_touches).
+
+### [x] tests/test_copy_gate.py — 26 tests, all green
+Tests 1-6: scrub() rewrites (em dash, en dash, intraword hyphen, URL, handle, tag).
+Tests 7-9: violations() hard failures.
+Test 10: ASK_RE matches 13 CTA phrases.
+Tests 11-13: soft_flags() quality flags.
+Test 14: repo-wide guard (zero local _DASH_RE definitions outside copy_gate.py).
+
+Full suite: 2430 passed, 4 pre-existing higgsfield failures (unrelated), 0 new failures.
+
+---
+
+## Wave 0 — Preflight: second publisher + forward-book dedupe (2026-08-26, commit 39fbf62)
+
+### [x] 0.1 Second publisher investigation
+Evidence assembled in `wave0_publisher_finding.md`: 29 posts on lassoframework IG
+(Aug 10-26) not attributable to Echo's calendar; duplicate Zernio IG connections
+(6a69fc9cdf17280d93d0727f in Default profile, 6a74b3efd0fe733d1abc6fc1 in lasso
+profile); 14:10 ET cadence pattern on the unexplained posts. Recommendation +
+disconnect checklist surfaced to #ops. NOTHING disconnected — Blake tap required
+(WAVE6_HUMAN_TAPS.md TAP 1).
+
+### [x] 0.2 Forward-book dedupe job — agent/jobs/dedupe_forward_book.py
+Groups future pending rows per gym by caption_hash (Wave 3 definition), keeps the
+earliest, denies the rest with reject_reason='duplicate_purge_2026_08' through
+portal_calendar_store (never direct SQL). Behind AGENT_DEDUPE_FORWARD_BOOK
+(default OFF; OFF forces dry-run). tests/test_dedupe_forward_book.py green.
+
+### [x] 0.2 EXECUTED for lasso (2026-08-26, Blake-authorized one-shot)
+Dry-run then live via `railway run --service echo`: 369 pending future rows,
+300 duplicates denied, 69 unique kept, 0 errors. Before/after posted to #ops.
+Flag set inline for the one-shot only; Railway env untouched. Freed slots refill
+via the planner once the Wave 5 A-gate is armed.
 
 ---
 

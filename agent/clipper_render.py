@@ -51,14 +51,18 @@ _VENDOR_RE = re.compile(r"(?i)\bvendors\b|\bvendor\b")
 
 def scrub_onscreen(text):
     """Enforce the LASSO on-screen text rules on any burned-in string:
-      - no em dashes, en dashes, or hyphens (replaced with a space)
+      - no em dashes, en dashes, or hyphens (replaced via copy_gate.scrub)
       - never the word 'vendor' (replaced with 'partner')
     Applies to captions and text cards so the render pipeline's no-dash /
     no-vendor promise holds for everything the viewer actually reads. This is a
     mechanical spelling fix, not a claim edit (dash -> space keeps the words;
     vendor -> partner is LASSO's own house term)."""
-    t = str(text or "")
-    t = t.replace("—", " ").replace("–", " ").replace("-", " ")
+    from . import copy_gate
+    t = copy_gate.scrub(str(text or ""))
+    # ON-SCREEN text is stricter than caption copy: NO ASCII hyphen survives at all
+    # (copy_gate.scrub keeps a spaced ' - ' and protected-URL hyphens; burned-in text
+    # must carry none, matching the pre-copy_gate on-screen law).
+    t = t.replace("-", " ")
     t = _VENDOR_RE.sub(lambda m: "PARTNERS" if m.group(0).lower().endswith("s")
                        else "PARTNER", t) if t.isupper() else _VENDOR_RE.sub(
         lambda m: "partners" if m.group(0).lower().endswith("s") else "partner", t)

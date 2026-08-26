@@ -59,6 +59,68 @@ from . import config
 from . import content_categories as _cats
 from . import real_calendar_mirror as _mirror
 
+
+# ---------------------------------------------------------------------------
+# Wave 5: calendar grade gate helpers (behind AGENT_CALENDAR_GRADE)
+# ---------------------------------------------------------------------------
+
+def _profile_for(gym_id):
+    """Resolve the grading profile (GYM or B2B) for a gym_id.
+    LASSO itself is B2B; all client gyms are GYM. Pure, no I/O."""
+    if str(gym_id or "").strip().lower() in ("lasso", "lasso_demo", ""):
+        return "B2B"
+    return "GYM"
+
+
+def _remediate(rows, defects):
+    """Best-effort in-place remediation pass driven by the defect list.
+
+    Touches ONLY the remediable structural defects (no fabricated copy):
+    - Duplicate captions: replace dup rows with an empty caption (forces a
+      skip on next plan; the planner never invents content to fill it).
+    - Missing ask: append ' Sign up today.' from the approved ASK_RE set when
+      no ask is present (the only safe mechanical fix — a real CTA phrase).
+    - Category over 25%: tag the excess rows with a fallback pillar label so
+      the content_mix score improves on the next pass.
+    """
+    from agent.caption_ledger import caption_hash as _ch
+    from agent.copy_gate import ASK_RE
+
+    # 1. De-duplicate captions: clear the text on rows after the first occurrence.
+    seen_hashes = {}
+    for row in rows:
+        cap = row.get("caption") or ""
+        h = _ch(cap)
+        if h in seen_hashes:
+            row["caption"] = ""          # blank the dup — empty never hashes to a match
+        else:
+            seen_hashes[h] = True
+
+    # 2. Append an ask where none exists (the smallest safe addition).
+    for row in rows:
+        cap = row.get("caption") or ""
+        if cap and not ASK_RE.search(cap):
+            row["caption"] = cap.rstrip() + " Sign up today."
+
+    # 3. Mark excess category rows with a fallback pillar so mix scores better.
+    from collections import Counter
+    n = max(1, len(rows))
+    cats = [r.get("pillar") or r.get("category") or "" for r in rows]
+    counts = Counter(cats)
+    fallback = "doctrine"
+    for row in rows:
+        cat = row.get("pillar") or row.get("category") or ""
+        pct = counts.get(cat, 0) / n
+        if pct > 0.25:
+            row["pillar"] = fallback
+            row["category"] = fallback
+            counts[cat] -= 1
+            counts[fallback] = counts.get(fallback, 0) + 1
+
+# Wave 3: caption cooldown — imported lazily inside _build_feed_with_fallback
+# so import never fails when the flag is OFF (default) and the module is unused.
+# The guard at every call site is config.caption_cooldown_enabled().
+
 # The weekly rotation, keyed by weekday abbr. This is the SAME seven-day schedule the
 # runner drives from (content_categories._DAILY_SCHEDULE); we read the category leg of
 # it so the month calendar matches exactly what Echo posts day to day:
@@ -570,6 +632,20 @@ def _build_feed_with_fallback(slot, builders, target, log):
     # The slot's own category leads; then the fallbacks, skipping the primary and any
     # category with no builder wired. Dedupe preserves order.
     order = [slot.category] + [c for c in _FALLBACK_ORDER if c != slot.category]
+    # Wave 7 (AGENT_LEARNING_LOOP, default OFF): bias the FALLBACK order toward the
+    # gym's versioned playbook pillar weights (agent/playbook.py). This only changes
+    # which REAL pillar fills a fallback day — the slot's own category still leads,
+    # no content is invented, and the staged month still passes the Wave 5 A-gate
+    # (floors are graded downstream, never traded away here). Any failure degrades
+    # to the unbiased order, byte-identical to flag-off behavior.
+    if config.learning_loop_enabled():
+        try:
+            from . import playbook as _pb
+            fallbacks = [c for c in _FALLBACK_ORDER if c != slot.category]
+            order = [slot.category] + _pb.bias_pillar_order(
+                fallbacks, _pb.load_playbook(_resolve_gym_id(target)))
+        except Exception:
+            pass
     for cat in order:
         if cat in tried:
             continue
@@ -579,12 +655,94 @@ def _build_feed_with_fallback(slot, builders, target, log):
             continue  # no builder wired for this pillar; try the next real one
         draft = _safe_call(builder, target, slot.post_date, log,
                            f"{slot.post_date} {cat} feed")
+        if draft is None:
+            continue
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): before accepting this draft, check whether
+        # its caption is within the repeat cooldown window. Up to 3 attempts pulling
+        # the next concept from the builder; after 3 cooldown hits fall through to the
+        # next pillar in the order so the day still fills from a real pillar.
+        if not config.caption_cooldown_enabled():
+            if cat != slot.category:
+                log(f"fill {slot.post_date}: {slot.category} had no content; the "
+                    f"{cat} pillar filled the day (real fallback, not fabricated)")
+            return draft, cat
+        # Cooldown is enabled — check and retry up to 3 attempts.
+        draft = _cooldown_checked(draft, builder, target, slot.post_date, cat, log)
         if draft is not None:
             if cat != slot.category:
                 log(f"fill {slot.post_date}: {slot.category} had no content; the "
                     f"{cat} pillar filled the day (real fallback, not fabricated)")
             return draft, cat
+        # All 3 attempts for this pillar were on cooldown — fall through to next pillar.
+        log(f"skip {slot.post_date} {cat}: caption cooldown blocked after 3 attempts; "
+            "trying next real pillar")
     return None, None
+
+
+def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
+                      _max_attempts=3):
+    """Return the first draft from builder that is not on cooldown (up to
+    _max_attempts total, including first_draft). Returns None when all attempts
+    are on cooldown so the caller falls through to the next pillar.
+
+    Only called when AGENT_CAPTION_COOLDOWN is ON. Lazy-imports caption_ledger
+    so the flag-off path never pays the import cost."""
+    try:
+        from . import caption_ledger as _ledger
+    except Exception:
+        return first_draft  # import failure: pass through, never block
+
+    # Determine the account_key (gym_id) from `target` — target may be a string
+    # key or an object with an account_key / key attribute.
+    gym_id = _resolve_gym_id(target)
+
+    attempts = [first_draft]
+    for attempt in range(1, _max_attempts):
+        d = attempts[-1]
+        caption = _draft_caption(d)
+        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+            return d
+        log(f"caption cooldown hit {attempt}/{_max_attempts} for "
+            f"{day_key} {cat}: retrying builder for next concept")
+        next_d = _safe_call(builder, target, day_key, log,
+                            f"{day_key} {cat} feed (cooldown retry {attempt})")
+        if next_d is None:
+            break
+        attempts.append(next_d)
+    # Check the last draft if it was just appended without a check
+    if attempts:
+        last = attempts[-1]
+        caption = _draft_caption(last)
+        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+            return last
+    return None
+
+
+def _resolve_gym_id(target):
+    """Best-effort gym_id from a target that may be a str, an account object,
+    or None. Falls back to '' (the ledger key is then gym-unscoped for the
+    empty gym, which is a safe no-op)."""
+    if target is None:
+        return ""
+    if isinstance(target, str):
+        return target
+    for attr in ("account_key", "key", "gym_id", "id"):
+        val = getattr(target, attr, None)
+        if val:
+            return str(val)
+    return str(target)
+
+
+def _draft_caption(draft):
+    """Extract the caption text from a Draft, tolerating different attribute names."""
+    if draft is None:
+        return ""
+    for attr in ("caption", "text", "body", "copy"):
+        val = getattr(draft, attr, None)
+        if val:
+            return str(val)
+    # Fall back to str representation (won't match anything in the ledger — safe)
+    return ""
 
 
 def _safe_call(builder, target, day_key, log, label):
@@ -700,13 +858,60 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     /social + approve/deny key off the DB-returned uuid.
 
     Writes calendar rows only. NOTHING here publishes. Returns a summary dict; never
-    raises out (a store error is reported, not a partial silent failure)."""
+    raises out (a store error is reported, not a partial silent failure).
+
+    # Wave 6: after dedupe_forward_book.run(), re-run this planner for each gym
+    #  to refill freed slots. Everything refilled lands 'pending' — coaches tap through.
+    """
     if not account_key or sb_store is None:
         return {"ok": False, "reason": "missing account_key or store",
                 "upserted": 0, "deleted": 0}
     if account_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
+
+    # CALENDAR GRADE GATE (AGENT_CALENDAR_GRADE / per-gym override, default OFF)
+    # The gate runs over the planned rows (as calendar dicts), not the draft objects,
+    # so the grader sees the same shape it would score in production. The rows list is
+    # assembled early (before the delete/insert) for the grade pass.
+    # Wave 6: calendar_grade_enabled_for(gym_id) checks the per-gym override env var
+    # (AGENT_CALENDAR_GRADE_{GYM_ID}) first, falling back to the global flag. Each gym
+    # is enabled individually via Railway env; HUMAN TAP REQUIRED per gym. See WAVE6_HUMAN_TAPS.md.
+    if config.calendar_grade_enabled_for(account_key):
+        from agent.calendar_grade import grade_month, A_THRESHOLD as _AT
+        from agent import ops_alerts
+
+        _profile = _profile_for(account_key)
+        # Build a preview of the planned rows for grading (id-less, gym-scoped).
+        _grade_rows = [
+            {k: v for k, v in r.items() if k != "id"}
+            for r in to_calendar_rows(
+                [d for d in (drafts or [])
+                 if not _mirror._demo.is_demo_draft_id(_mirror._row_source_id(d))],
+                account_key,
+            )
+            if str(r.get("gym_id")) == str(account_key)
+        ]
+        grade = grade_month(_grade_rows, profile=_profile)
+        attempts = 0
+        while grade.total < _AT and attempts < 4:
+            attempts += 1
+            _remediate(_grade_rows, grade.defects)
+            grade = grade_month(_grade_rows, profile=_profile)
+        if grade.total < _AT:
+            ops_alerts.alert(
+                f"calendar grade gate: {account_key} scored {grade.total} "
+                f"({grade.letter}) after 4 remediation passes. Top defects: "
+                f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
+            )
+            return {"ok": False,
+                    "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
+                    "grade": grade.total, "letter": grade.letter,
+                    "upserted": 0, "deleted": 0}
+        # Attach grade summary to the result below
+        _grade_summary = f"Grade: {grade.letter} ({grade.total}/100)"
+    else:
+        _grade_summary = None
 
     # Drop any demo-id draft up front (a real gym never carries a demo id), keying off the
     # draft's OWN id since the row no longer carries one. Then map to id-less rows and
@@ -716,6 +921,34 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     rows = [{k: v for k, v in r.items() if k != "id"}
             for r in to_calendar_rows(real_drafts, account_key)
             if str(r.get("gym_id")) == str(account_key)]
+
+    # Wave 7 (AGENT_LEARNING_LOOP, default OFF): feature stamping + playbook
+    # consumption + labeled experiments at stage time.
+    #   - lever_stamp fills hook_family / ask_type / caption_len_band / time_slot
+    #     on every staged row (the retro can only learn levers it can see);
+    #   - the gym's playbook top_time_slots bias the time_slot stamps;
+    #   - ~15% of feed slots get an experiment_label — ONE lever under test per
+    #     gym per month (agent/playbook.py label_experiments).
+    # Nothing here changes captions, creative, status, floors, or the approval
+    # path: every row still lands 'pending'. Any failure degrades to unstamped
+    # rows, byte-identical to flag-off behavior.
+    if config.learning_loop_enabled():
+        try:
+            from . import lever_stamp as _levers
+            from . import playbook as _pb
+            _playbook = _pb.load_playbook(account_key)
+            for _i, _row in enumerate(rows):
+                _levers.stamp_row(_row)
+                _pref = _pb.preferred_time_slot(_playbook, _i)
+                if _pref:
+                    _row["time_slot"] = _pref
+            _months_touched = sorted({r["post_date"][:7] for r in rows
+                                      if r.get("post_date")})
+            if _months_touched:
+                _pb.label_experiments(rows, account_key, _months_touched[0],
+                                      _playbook)
+        except Exception:
+            pass
 
     # Reconcile the FULL planned span plus every month a real row lands in: DELETE all of
     # the gym's rows there first (demo and prior real), so a re-run is idempotent.
@@ -738,5 +971,8 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted}
 
-    return {"ok": True, "upserted": inserted, "inserted": inserted,
-            "deleted": deleted, "months": months}
+    result = {"ok": True, "upserted": inserted, "inserted": inserted,
+              "deleted": deleted, "months": months}
+    if _grade_summary:
+        result["grade"] = _grade_summary
+    return result

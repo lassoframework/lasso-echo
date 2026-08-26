@@ -13,6 +13,9 @@ Seven categories cover every draftable content source:
   doctrine  - regular LASSO pillars from lasso_now.md (house doctrine)
   services  - LASSO own accounts ONLY; drawn from brand_voice/lasso_services.md;
               stub or missing file = SKIP (never fabricate)
+  proof     - verified social proof assets (testimonials, before/afters, case studies);
+              only from stored, approved assets; empty pool -> fallback 'community' + alert
+  call      - direct CTA posts driving a specific next step (book a call, tour, trial)
 
 Platform sub-topics (10 items, rotates deterministically; no repeat within 10 days):
   ads, google, nurture, website, social, portal,
@@ -40,7 +43,18 @@ All functions are gated behind config.category_rotation_enabled() in the callers
 
 import re
 
-CATEGORIES = ("podcast", "platform", "b2b", "summit", "book", "doctrine")
+CATEGORIES = ("podcast", "platform", "b2b", "summit", "book", "doctrine", "proof", "call")
+
+# Gym content pillars — used by validate_quotas() in category_plan.py and the gym
+# calendar builder to slot client-account posts into the right thematic bucket.
+# Six pillars cover every gen-pop boutique fitness content angle:
+#   results    - transformations, outcomes, before/afters (from stored approved assets only)
+#   education  - how-to, tips, myth-busting, science-backed content
+#   community  - member spotlights, culture, team, events
+#   faces      - real people: members, coaches, owner; humanizes the brand
+#   offer      - active promotions; slot becomes 'invite' when offer expires
+#   invite     - soft CTA, gap-fill; "come try us", referral, open-door
+GYM_PILLARS = ("results", "education", "community", "faces", "offer", "invite")
 
 PLATFORM_SUBTOPICS = (
     "ads", "google", "nurture", "website", "social",
@@ -50,8 +64,7 @@ PLATFORM_SUBTOPICS = (
 # Regex patterns for the wording filter
 _VENDOR_LOGINS_RE = re.compile(r'\bvendors?\s+logins?\b', re.IGNORECASE)
 _VENDOR_RE = re.compile(r'\bvendors?\b', re.IGNORECASE)
-# All dash-family characters: em dash, en dash, figure dash, non-breaking hyphen, hyphen-minus
-_DASH_RE = re.compile(r'[—–‒‐-]')
+# _DASH_RE removed — dash scrubbing now delegated to copy_gate.scrub
 
 
 def filter_platform_copy(text):
@@ -74,10 +87,9 @@ def filter_platform_copy(text):
         return "companies" if m.group(0).lower().endswith("s") else "company"
 
     text = _VENDOR_RE.sub(_vendor_repl, text)
-    # Strip all dash characters, replace with space
-    text = _DASH_RE.sub(" ", text)
-    # Collapse runs of spaces, trim
-    text = re.sub(r" {2,}", " ", text).strip()
+    # Strip all dash characters via copy_gate.scrub (single house-style gate)
+    from . import copy_gate
+    text = copy_gate.scrub(text)
     return text
 
 
@@ -158,6 +170,11 @@ def schedule_for_day(day_key):
     Returns None when AGENT_CATEGORY_ROTATION is OFF.
     posting_format: "video" | "infographic".
     fallback_format: "infographic" for video slots; None for infographic-only slots.
+
+    The fixed 7-day LASSO B2B schedule uses the original six CATEGORIES only.
+    The newer "proof" and "call" categories (LASSO B2B weekly minimums) and
+    GYM_PILLARS (gym account monthly quotas) are governed by the quota layer
+    in category_plan.validate_quotas() rather than this per-day schedule.
     """
     from . import config as _cfg
     if not _cfg.category_rotation_enabled():
