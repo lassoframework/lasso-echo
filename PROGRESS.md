@@ -10,6 +10,50 @@ Last updated: 2026-08-26
 
 ---
 
+## Post A-Grade upgrades 2026-08-26/27
+
+Four upgrades, all authorized by Blake, built sequentially. New flags default OFF in code;
+Blake's session arms them after audit. Suite green before each commit.
+
+### [~] Reply-needed coach alerts — agent/inbox_alerts.py (AGENT_INBOX_ALERTS, default OFF — UNARMED)
+  - Daily READ-ONLY sweep per gym (client gyms + lasso): unhandled post comments
+    (GET /v1/inbox/comments + per-post threads), mentions, reviews (FB + Google Business) from Zernio
+  - Classifier: member_comment / spam / neutral; homoglyph-normalized (the live topfuel spam
+    uses Cyrillic lookalikes: "hit hеr uр οn snap"); pinned in tests/test_inbox_alerts.py
+  - ONE card per gym per day max (kv stamp inbox_alert_<gym>_<date>, written only after a send);
+    card only when actionable; capped at 5 lines, each with real URL + text (100-char truncate)
+  - Coach channel via accounts.slack_channel, ops channel fallback (monthly_retro notifier pattern)
+  - NEVER replies/hides/deletes; per-gym AND per-source error isolation; wired in runner daily section
+  - DRY run against live topfuel data proven (4 member comments + 1 homoglyph spam caught; no Slack sent)
+
+### [~] Hook-quality metric fields — metrics_sync (rides AGENT_METRICS_SYNC, ALREADY ARMED -> live next nightly run)
+  - post_metrics + reels_skip_rate, watch_total_ms (igReelsVideoViewTotalTime), engagement_rate,
+    is_ad (not null default false); migration applied: post_metrics_hook_fields_20260827
+  - is_ad rows are observed only, NEVER train the playbook (same treatment as external) —
+    excluded in monthly_retro lever_stats + experiment_verdict, still inform the baseline
+  - learning_score: reel_skip_rate + reel_watch_ratio (direct avg first, watch_total_ms/views fallback)
+
+### [~] Engaged-audience demographics — agent/jobs/demographics_sync.py (AGENT_AUDIENCE_DEMOGRAPHICS, default OFF — UNARMED)
+  - Weekly per gym (7-day kv gate, zernio_link_ts pattern): IG follower AND engaged-audience
+    breakdowns by age/city/country/gender -> gym_audience_demographics (verbatim jsonb, never reshaped)
+  - Migration applied: gym_audience_demographics_20260827; run(gyms=None) callable standalone
+  - Monthly retro digest cites the newest STORED engaged row ("Engaged audience: 61% women,
+    peak 35 to 44" — no dashes); no row or flag OFF -> no line
+
+### [x] Upload confirmation — agent/intake_web.py (no new flag; display-only UX fix, Chris Shimley / Top Fuel ask)
+  - Per-file green check ("received") + running "N photos and M videos received" counter
+  - Completion banner: "Received! Your content is in. New posts built from these usually appear
+    in your approval queue within the hour. You approve everything before it posts." (dash-free)
+  - Backend already answered 2xx only after durable R2 store (verified + pinned in
+    tests/test_upload_confirmation.py: mid-batch storage failure -> 503, never a fake success)
+  - Honest failure copy ("not sent, tap Send to retry"); sent items never re-post on a later Send
+
+Arming status: AGENT_INBOX_ALERTS unarmed, AGENT_AUDIENCE_DEMOGRAPHICS unarmed (both need
+Blake's Railway env flip + audit). Hook fields ride the already-armed AGENT_METRICS_SYNC.
+Upload confirmation is live-on-deploy (no flag; echo-intake-web service redeploy required).
+
+---
+
 ## Wave 7 — The Learning Loop (2026-08-26, AGENT_METRICS_SYNC + AGENT_LEARNING_LOOP)
 
 Both flags default OFF: [~] built-unarmed. Flag flip = human tap (WAVE6_HUMAN_TAPS.md TAP 3:
