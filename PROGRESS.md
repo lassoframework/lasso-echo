@@ -10,6 +10,79 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 7 — The Learning Loop (2026-08-26, AGENT_METRICS_SYNC + AGENT_LEARNING_LOOP)
+
+Both flags default OFF: [~] built-unarmed. Flag flip = human tap (WAVE6_HUMAN_TAPS.md TAP 3:
+metrics first, retro only after a full closed month of clean metrics). When OFF the system is
+byte-for-byte unchanged. DO NOT run the first monthly_retro on real data — built and proven on
+synthetic months only. Every post still lands pending; the human approval tap is untouched.
+
+### [~] 7.1 Metrics ingestion — agent/metrics_sync.py (AGENT_METRICS_SYNC, default OFF)
+  - Nightly per gym: Zernio analytics pull with source=all; snapshots at post-age days 1/3/7/28
+  - Dedupe by platformPostId (duplicate lassoframework IG connection -> one row wins)
+  - Calendar join via late_post_id, platformPostId fallback; no match -> calendar_id null, external=true
+  - External rows inform the baseline, NEVER train the playbook; null-not-zero on every metric
+  - Injectable zernio client + store; run(gyms=None, now=None); read only on the social side
+  - Migration applied to Supabase (ooqcvmcjspeltuuhcvlh): post_metrics_20260826 (+ migrations/*.sql in repo)
+
+### [~] 7.2 Feature stamping — agent/lever_stamp.py + calendar lever columns
+  - hook_family / ask_type / caption_len_band / time_slot classifiers (ask regexes = copy_gate ASK_RE families)
+  - has_member_face only ever from the vision sidecar, never guessed
+  - Stamped at stage time in real_month_planner.apply_month_plan (behind AGENT_LEARNING_LOOP)
+  - Historical backfill: agent/jobs/backfill_levers.py (best-effort, same heuristics, behind flag)
+  - Migration applied: calendar_lever_columns_20260826 (5 additive columns)
+
+### [~] 7.3 The score — agent/learning_score.py
+  - engagement_value = 1*likes + 3*comments + 4*shares + 4*saves + 3*clicks + 5*follows
+  - score = engagement_value / max(reach, 0.10 * followers_at_snapshot); day-7 scoring snapshot,
+    day-28 for follows attribution only; reels watch_ratio = avg_watch_time / duration
+
+### [~] 7.4 Honesty guards — agent/learning_guards.py (each a testable function, regression-tested)
+  - sample_floor (MIN_SAMPLE=6); within-gym only (structural); rolling 90-day recency weighting;
+    persistence_rule (>=30% lift two consecutive months, or one month at 12+/side);
+    format-stratified comparisons; month_is_tainted (second publisher / >20% follower spike / paid boosts)
+  - Synthetic viral-fluke regression proves the playbook does NOT move on noise (807-like outlier month)
+
+### [~] 7.5 gym_playbook + bounds — agent/playbook.py
+  - load_playbook / propose_update (NEW version row every write, updated_by='monthly_retro',
+    evidence jsonb required, old versions immutable — the store is insert-only by construction)
+  - apply_bounds: plus/minus 20% drift cap per weight per month; PROTECTED_KEYS refused outright
+    (quota floors, avatar rails, ask rules, offer rules, consent, copy gate, approval/publish gates)
+  - Migration applied: gym_playbook_20260826 (gym_playbook + monthly_retro tables)
+
+### [~] 7.6 Cross-gym priors — agent/playbook.py compute_priors / seed_playbook_from_priors / break_tie
+  - Non-tainted gyms only, anonymous lever aggregates; exactly two jobs (seed a new gym's day-one
+    playbook; break ties under the sample floor); own evidence always overrides
+
+### [~] 7.7 Experiments — playbook.label_experiments wired into the planner (behind AGENT_LEARNING_LOOP)
+  - ~15% of feed slots labeled '<lever>:<YYYY-MM>'; ONE lever under test per gym per month
+  - Migration applied: experiment_column_20260826 (content_calendar.experiment_label)
+
+### [~] 7.8 Monthly retro — agent/jobs/monthly_retro.py (runs the 5th for the prior month, behind flag)
+  - Matured metrics -> taint check -> lever scores vs rolling baseline -> experiment verdict ->
+    top 3 keep / top 3 stop (with evidence row keys) -> bounded playbook update -> monthly_retro row
+  - Digest to the gym's coach channel (SlackPoster notice pattern); LASSO's retro to #ops (ops_alerts)
+  - NEVER cites a number without a post_metrics row behind it; digest scrubbed through copy_gate
+  - run(month=None, gyms=None, store=None, now=None, notifier=None) — fully injectable; tested on
+    synthetic months ONLY (never pointed at real data in this wave)
+
+### [~] Planner consumption (behind AGENT_LEARNING_LOOP)
+  - real_month_planner reads load_playbook(gym_id): fallback pillar order biased by pillar_weights,
+    time_slot stamps biased by top_time_slots — INSIDE the Wave 2 floors and Wave 5 A-gate, never against them
+
+### [x] Tests — 59 new tests, all green; full suite green (2536 passed; test_higgsfield_renderer
+    fails only on this machine's missing higgsfield_client pip module, pre-existing on HEAD)
+  - tests/test_metrics_sync.py (dedupe across duplicate accounts, external flagging, join + fallback, flag-off no-op, source=all, null-not-zero)
+  - tests/test_learning_guards.py (sample floor 5-vs-6, persistence rule variants, taint exclusion, drift cap, viral-fluke regression)
+  - tests/test_playbook_bounds.py (floor/rail/consent/copy-gate refusals, drift clamps, version increments, immutability, priors)
+  - tests/test_monthly_retro.py (deterministic synthetic findings, bounded diff, evidence-backed digest, tainted month observed-not-trained)
+
+### Flags (both [~] built-unarmed; flag flip = human tap, WAVE6_HUMAN_TAPS.md TAP 3)
+  - [~] AGENT_METRICS_SYNC — default OFF
+  - [~] AGENT_LEARNING_LOOP — default OFF
+
+---
+
 ## Wave 6 — Rollout infrastructure (2026-08-26, per-gym AGENT_CALENDAR_GRADE_{GYM_ID})
 
 All new behavior behind AGENT_CALENDAR_GRADE as the global gate (default OFF). When OFF the system is byte-for-byte unchanged.

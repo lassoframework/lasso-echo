@@ -1811,6 +1811,42 @@ def caption_cooldown_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CAPTION_COOLDOWN", "false"))
 
 
+def metrics_sync_enabled() -> bool:
+    """
+    Wave 7 metrics ingestion switch (AGENT_METRICS_SYNC). OFF by default = zero
+    behavior change: agent/metrics_sync.py is a no-op. When ON, a nightly per-gym
+    pull of Zernio analytics (source=all) lands post_metrics snapshots at post-age
+    days 1, 3, 7, 28, deduped by platformPostId (the duplicate lassoframework IG
+    connection returns the same post under two account ids; one row wins). Posts
+    with no content_calendar match are stored with calendar_id null and
+    external=true; external rows inform the baseline and NEVER train the playbook.
+    READ ONLY: nothing here publishes, approves, or touches any social account.
+    Arm by hand: AGENT_METRICS_SYNC=true (Railway env). HUMAN TAP REQUIRED —
+    see WAVE6_HUMAN_TAPS.md TAP 3.
+    """
+    return _truthy(os.environ.get("AGENT_METRICS_SYNC", "false"))
+
+
+def learning_loop_enabled() -> bool:
+    """
+    Wave 7 learning loop switch (AGENT_LEARNING_LOOP). OFF by default = zero
+    behavior change: lever stamping, playbook consumption, experiment labeling,
+    and the monthly retro are all dark. When ON: new calendar rows are stamped
+    with their levers (hook_family, ask_type, time_slot, caption_len_band), the
+    planner biases pillar/slot selection toward the gym's versioned gym_playbook
+    (INSIDE the Wave 2 floors and the Wave 5 A-gate, never against them), ~15%
+    of slots become labeled experiments, and agent/jobs/monthly_retro.py runs on
+    the 5th for the prior month. The optimizer can NEVER touch quota floors,
+    avatar rails, ask rules, consent rules, or the copy gate (playbook.py
+    PROTECTED_KEYS), and playbook drift is capped at plus or minus 20% per weight
+    per month. Every post still lands pending; the human approval tap is
+    untouched. Arm by hand per WAVE6_HUMAN_TAPS.md TAP 3: metrics first
+    (AGENT_METRICS_SYNC), the retro only after a full closed month of clean
+    metrics.
+    """
+    return _truthy(os.environ.get("AGENT_LEARNING_LOOP", "false"))
+
+
 def mentions_enabled() -> bool:
     """
     Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior

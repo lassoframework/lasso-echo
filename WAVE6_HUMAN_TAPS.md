@@ -1,8 +1,9 @@
-# Wave 6 Human Taps Required
+# Echo Human Taps Required (Waves 6-7)
 
-Two actions in this wave cannot be performed autonomously. Both require Blake's explicit
-decision and a Railway variable change. Neither is gated behind code; the infrastructure
-is fully built and waiting.
+These actions cannot be performed autonomously. Each requires Blake's explicit
+decision and a Railway variable change. None is gated behind code; the infrastructure
+is fully built and waiting. TAP 1 and TAP 2 are Wave 6; TAP 3 arms the Wave 7
+learning loop.
 
 ---
 
@@ -79,6 +80,52 @@ every new onboard inherits grade enforcement automatically:
 ```
 AGENT_CALENDAR_GRADE=true
 ```
+
+---
+
+## TAP 3: Wave 7 Learning Loop Flags (AGENT_METRICS_SYNC, then AGENT_LEARNING_LOOP)
+
+**Status: PENDING BLAKE TAP (all gyms). Both flags are built, tested on synthetic
+months, and default OFF. The first monthly_retro has deliberately NEVER been run
+on real data — that is this tap.**
+
+Order is strict, per gym: METRICS FIRST, RETRO ONLY AFTER A FULL CLOSED MONTH OF
+CLEAN METRICS.
+
+### Step 1: Arm the nightly metrics pull (read only)
+```
+# Railway env set:
+AGENT_METRICS_SYNC=true
+
+# Then verify the pull (read only, writes post_metrics rows, publishes nothing):
+python3 -m agent status                 # metrics_sync should read true
+python3 -c "from agent import metrics_sync; import json; print(json.dumps(metrics_sync.run(), indent=2, default=str))"
+```
+Check post_metrics in Supabase: rows deduped by platformPostId, external posts
+flagged external=true with calendar_id null. Let this run nightly.
+
+### Step 2: Wait for a FULL CLOSED MONTH of clean metrics
+Do not proceed until an entire calendar month has day-1/3/7/28 snapshots and the
+duplicate-connection dedupe has been eyeballed. TAP 1 (the second publisher)
+matters here too: an active second publisher taints every month it touches, and
+a tainted month is observed but never trained on.
+
+### Step 3: Arm the learning loop (stamping, playbook consumption, experiments, retro)
+```
+AGENT_LEARNING_LOOP=true
+
+# First retro run — ON THE CLOSED MONTH ONLY, review output before trusting it:
+python3 -m agent.jobs.monthly_retro --month YYYY-MM --gym lasso
+```
+Roll out gym by gym (lasso first, the Wave 6 order). The retro writes a versioned
+gym_playbook row with evidence behind every change; each weight moves at most
+plus or minus 20% per month and any version can be reverted by reading the prior row.
+
+### What these flags can NEVER do (enforced in code, regression tested)
+- Touch quota floors, avatar rails, ask rules, consent rules, or the copy gate
+  (agent/playbook.py PROTECTED_KEYS refuses them outright).
+- Publish, approve, or bypass the human approval tap — every post still lands pending.
+- Train on external posts, tainted months, or below-floor samples.
 
 ---
 

@@ -632,6 +632,20 @@ def _build_feed_with_fallback(slot, builders, target, log):
     # The slot's own category leads; then the fallbacks, skipping the primary and any
     # category with no builder wired. Dedupe preserves order.
     order = [slot.category] + [c for c in _FALLBACK_ORDER if c != slot.category]
+    # Wave 7 (AGENT_LEARNING_LOOP, default OFF): bias the FALLBACK order toward the
+    # gym's versioned playbook pillar weights (agent/playbook.py). This only changes
+    # which REAL pillar fills a fallback day — the slot's own category still leads,
+    # no content is invented, and the staged month still passes the Wave 5 A-gate
+    # (floors are graded downstream, never traded away here). Any failure degrades
+    # to the unbiased order, byte-identical to flag-off behavior.
+    if config.learning_loop_enabled():
+        try:
+            from . import playbook as _pb
+            fallbacks = [c for c in _FALLBACK_ORDER if c != slot.category]
+            order = [slot.category] + _pb.bias_pillar_order(
+                fallbacks, _pb.load_playbook(_resolve_gym_id(target)))
+        except Exception:
+            pass
     for cat in order:
         if cat in tried:
             continue
@@ -907,6 +921,34 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     rows = [{k: v for k, v in r.items() if k != "id"}
             for r in to_calendar_rows(real_drafts, account_key)
             if str(r.get("gym_id")) == str(account_key)]
+
+    # Wave 7 (AGENT_LEARNING_LOOP, default OFF): feature stamping + playbook
+    # consumption + labeled experiments at stage time.
+    #   - lever_stamp fills hook_family / ask_type / caption_len_band / time_slot
+    #     on every staged row (the retro can only learn levers it can see);
+    #   - the gym's playbook top_time_slots bias the time_slot stamps;
+    #   - ~15% of feed slots get an experiment_label — ONE lever under test per
+    #     gym per month (agent/playbook.py label_experiments).
+    # Nothing here changes captions, creative, status, floors, or the approval
+    # path: every row still lands 'pending'. Any failure degrades to unstamped
+    # rows, byte-identical to flag-off behavior.
+    if config.learning_loop_enabled():
+        try:
+            from . import lever_stamp as _levers
+            from . import playbook as _pb
+            _playbook = _pb.load_playbook(account_key)
+            for _i, _row in enumerate(rows):
+                _levers.stamp_row(_row)
+                _pref = _pb.preferred_time_slot(_playbook, _i)
+                if _pref:
+                    _row["time_slot"] = _pref
+            _months_touched = sorted({r["post_date"][:7] for r in rows
+                                      if r.get("post_date")})
+            if _months_touched:
+                _pb.label_experiments(rows, account_key, _months_touched[0],
+                                      _playbook)
+        except Exception:
+            pass
 
     # Reconcile the FULL planned span plus every month a real row lands in: DELETE all of
     # the gym's rows there first (demo and prior real), so a re-run is idempotent.
