@@ -2314,6 +2314,21 @@ def metrics_sync_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_METRICS_SYNC", "false"))
 
 
+def inbox_alerts_enabled() -> bool:
+    """
+    Reply-needed coach alerts switch (AGENT_INBOX_ALERTS). OFF by default = zero
+    behavior change: agent/inbox_alerts.py is a no-op. When ON, a daily per-gym
+    READ-ONLY sweep pulls unhandled inbound engagement from Zernio (post comments,
+    mentions, reviews), classifies each item (member_comment / spam / neutral),
+    and posts AT MOST one Slack card per gym per day (kv stamp
+    inbox_alert_<gym>_<date>) to the gym's coach channel (ops channel fallback)
+    when actionable items exist. NEVER replies, hides, or deletes anything —
+    a human does the actual engagement. Arm by hand: AGENT_INBOX_ALERTS=true
+    (Railway env). HUMAN TAP REQUIRED.
+    """
+    return _truthy(os.environ.get("AGENT_INBOX_ALERTS", "false"))
+
+
 def learning_loop_enabled() -> bool:
     """
     Wave 7 learning loop switch (AGENT_LEARNING_LOOP). OFF by default = zero

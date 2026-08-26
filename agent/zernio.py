@@ -445,6 +445,42 @@ class ZernioClient:
         merged["_pages_capped"] = pages_capped
         return merged
 
+    # ---- inbox + demographics reads (Wave 8; READ ONLY — nothing in this
+    # section ever replies, hides, deletes, likes, or writes anything) --------
+    def list_inbox_comments(self, profile_id, limit=50, platform=None):
+        """GET /v1/inbox/comments?profileId=... -> {data:[{id, accountId,
+        accountUsername, platform, content(post caption), createdTime,
+        permalink, commentCount, likeCount}], pagination, meta}. Verified live
+        2026-08-26 against topfuel. Posts WITH comments carry commentCount>0;
+        the thread itself comes from inbox_post_comments. Cached ~10 min server
+        side (fine for a daily sweep)."""
+        params = {"profileId": profile_id, "limit": int(limit)}
+        if platform:
+            params["platform"] = str(platform)
+        return self._get("/v1/inbox/comments", params)
+
+    def inbox_post_comments(self, post_id, account_id, limit=25):
+        """GET /v1/inbox/comments/{postId}?accountId=... -> {comments:[{id,
+        message, createdTime, from:{name, username, isOwner}, replyCount,
+        replies:[...], isHidden, url, platform}], pagination, meta}. Verified
+        live 2026-08-26. READ ONLY."""
+        return self._get(f"/v1/inbox/comments/{post_id}",
+                         {"accountId": account_id, "limit": int(limit)})
+
+    def list_inbox_mentions(self, profile_id, limit=25):
+        """GET /v1/inbox/mentions?profileId=... -> {data:[...], pagination,
+        meta}. READ ONLY."""
+        return self._get("/v1/inbox/mentions",
+                         {"profileId": profile_id, "limit": int(limit)})
+
+    def list_inbox_reviews(self, profile_id, limit=25):
+        """GET /v1/inbox/reviews?profileId=... -> {data:[{id, platform,
+        accountId, reviewer:{name}, text, created, hasReply, reply?, rating?,
+        reviewUrl}], pagination, summary}. Facebook + Google Business reviews
+        aggregated. Verified live 2026-08-26. READ ONLY."""
+        return self._get("/v1/inbox/reviews",
+                         {"profileId": profile_id, "limit": int(limit)})
+
     # ---- writes (provisioning) ---------------------------------------------
     def create_profile(self, name):
         """POST /v1/profiles {name} -> {..._id}. Per-gym provisioning.

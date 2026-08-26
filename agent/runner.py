@@ -600,6 +600,20 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # INBOX ALERTS (flag AGENT_INBOX_ALERTS, default OFF -> no-op): daily
+    # READ-ONLY sweep of unhandled comments/mentions/reviews per gym, one
+    # coach-channel card per gym per day max (kv-stamped). Never replies,
+    # hides, or deletes. Isolated: a sweep failure never blocks the draft run.
+    try:
+        from .inbox_alerts import run as _inbox_alerts_run
+        _iasum = _inbox_alerts_run()
+        if _iasum.get("ok"):
+            print(f"[inbox-alerts] {_iasum.get('cards_sent', 0)} card(s) sent")
+    except Exception as e:
+        print(f"[inbox-alerts] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"inbox alerts sweep failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     # MONTHLY RETRO (Wave 7.8, TAP 3 closed 2026-08-26): on/after the 5th, run
     # the prior month's retro once (kv-stamped per month). Self-gates on
     # AGENT_LEARNING_LOOP. The 7.4 honesty guards protect every run: a tainted
