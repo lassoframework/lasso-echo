@@ -95,9 +95,6 @@ def red_regions(img, mask_zone=None, min_cells=4):
     return regions
 
 
-BANNED_CHARS = ("—", "–", "-")  # em dash, en dash, hyphen — kept for backward compat
-
-
 def no_banned_copy(text):
     """True when the text is free of banned dash characters and the word 'vendor'.
     Delegates dash detection to copy_gate.violations (single house-style gate)."""

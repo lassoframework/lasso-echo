@@ -562,15 +562,12 @@ def _route_model(headline="", facts=None):
 
 
 def _scrub_dashes(text):
-    """Strip em/en dashes from approved copy (the brand no-dash rule).
-    Uses copy_gate._DASH_RE for the banned-dash pass only; intraword
-    hyphens in the PROMPT text (e.g. 'left-aligned') are NOT converted because
-    they are valid technical markup in the generation prompt, not client-facing copy."""
+    """Strip em/en dashes from AI generation prompt text (the brand no-dash rule).
+    Delegates to copy_gate.scrub_prompt(), which converts banned dashes to a space
+    and preserves intraword hyphens (e.g. 'left-aligned') — valid technical markup
+    in generation prompts, not client-facing copy."""
     from . import copy_gate
-    if not text:
-        return ""
-    cleaned = copy_gate._DASH_RE.sub(" ", str(text))
-    return re.sub(r"[ \t]{2,}", " ", cleaned)
+    return copy_gate.scrub_prompt(text)
 
 
 def build_prompt(headline, facts, aspect=None, pixels=None, surface=None,

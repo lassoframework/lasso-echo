@@ -34,6 +34,17 @@ def scrub(text: str) -> str:
     out.append(_scrub_plain(s[last:]))
     return "".join(out).strip()
 
+def scrub_prompt(text: str) -> str:
+    """Scrub banned dashes from AI generation prompt text (not client-facing copy).
+    Banned dashes become a space (not ', ') and intraword hyphens are preserved
+    because they are valid technical markup in generation prompts (e.g. 'left-aligned').
+    URLs, @handles and #tags pass through untouched."""
+    if not text:
+        return ""
+    s = str(text)
+    cleaned = _DASH_RE.sub(" ", s)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
 def _scrub_plain(t: str) -> str:
     t = _DASH_RE.sub(", ", t)
     t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
