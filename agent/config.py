@@ -1795,3 +1795,16 @@ def caption_cooldown_enabled() -> bool:
     unchanged. Arm by hand: AGENT_CAPTION_COOLDOWN=true (Railway env).
     """
     return _truthy(os.environ.get("AGENT_CAPTION_COOLDOWN", "false"))
+
+
+def mentions_enabled() -> bool:
+    """
+    Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior
+    change: tag_allowlist.handles_for_category() returns [] and no @handles are
+    appended to any caption. When ON, the tag_allowlist consent gate is active:
+    only handles present in gym_tag_allowlist are ever used, member handles require
+    consent=true, and the appropriate handle(s) for the caption category are appended
+    to the caption text as plain @handle lines. Never tags an account not on the list;
+    never tags a member without explicit consent. Arm by hand: AGENT_MENTIONS=true.
+    """
+    return _truthy(os.environ.get("AGENT_MENTIONS", "false"))

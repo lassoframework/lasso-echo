@@ -10,6 +10,69 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 4 — Tagging, end to end (2026-08-26, AGENT_MENTIONS)
+
+All new behavior behind AGENT_MENTIONS (default OFF). When OFF the system is byte-for-byte unchanged.
+
+### [x] 4.1 Supabase migrations applied (project ooqcvmcjspeltuuhcvlh)
+- mentions_column_20260826: `alter table content_calendar add column if not exists mentions jsonb not null default '[]';`
+- gym_tag_allowlist_20260826: `create table if not exists gym_tag_allowlist (gym_id text, handle text, kind text check (kind in ('own','coach','member','partner')), consent boolean default false, primary key (gym_id, handle));`
+Both applied via MCP mcp__claude_ai_Supabase__apply_migration. success:true.
+
+### [x] 4.2 agent/tag_allowlist.py created
+Consent-gated handle allowlist for @mentions in captions.
+Functions:
+  allowlisted_handles(gym_id, kind=None, consent_only=False, store=None) -> list[str]
+    Returns handles from gym_tag_allowlist optionally filtered by kind and consent.
+  validate_mentions(gym_id, mentions, store=None) -> list[str]
+    Returns only allowlisted mentions; drops non-list handles and members without consent silently.
+  handles_for_category(gym_id, category, store=None) -> list[str]
+    Returns [] when AGENT_MENTIONS OFF; otherwise returns kind-appropriate handles per _CATEGORY_KINDS map.
+    results/proof -> member (consented) + own; faces -> coach; LASSO b2b -> partner; default -> own.
+Store injectable for tests; Supabase REST used in live path.
+
+### [x] 4.3 agent/jobs/seed_tag_allowlist.py created
+One-shot seed job (behind AGENT_MENTIONS):
+  - Each gym in client_gym_bases(): seeds own IG handle (kind='own', consent=True) from dynamic registry
+  - LASSO: seeds own handle (AGENT_LASSO_IG_HANDLE env, default 'lassoframework') + all connected client handles from Zernio (kind='partner', consent=True)
+  - Logs to agent/jobs/seed_log_allowlist.txt
+  - run(zernio_client=None, log_path=...) -> {seeded, skipped, gyms}
+  - Has __main__ block for standalone execution
+
+### [x] 4.4 zernio_publisher.py — mention wiring in publish()
+When AGENT_MENTIONS ON and body (caption) is non-empty:
+  - Strips gym tenant suffix (_ig/_fb) to get gym_id
+  - Calls handles_for_category(gym_id, category) from tag_allowlist
+  - Appends handles as @handle lines (newline-separated) after the caption body
+  - Stories skip this block (body is '' for stories)
+  - Failures are non-fatal: post still goes out if handle resolution errors
+
+### [x] 4.5 Copy gate interlock verified
+python3 -c "from agent.copy_gate import scrub; print(scrub('@coach_amanda great session'))"
+Output: '@coach_amanda great session' — @handles pass through _PROTECTED_RE untouched.
+
+### [x] 4.6 config.mentions_enabled() added
+AGENT_MENTIONS (default false). Printed in __main__.py _status() so test_status_completeness passes.
+
+### [x] 4.7 tests/test_mentions.py — 12 tests, all green
+Spec's 8 required tests + 4 bonus:
+  1. validate_mentions: own handle on allowlist (consent=True) -> returned
+  2. validate_mentions: handle NOT on allowlist -> silently dropped
+  3. validate_mentions: member handle without consent -> silently dropped
+  4. validate_mentions: member handle WITH consent -> returned
+  5. handles_for_category: AGENT_MENTIONS=OFF -> returns []
+  6. handles_for_category: AGENT_MENTIONS=ON, category='faces' -> coach handles only
+  7. allowlisted_handles: kind='member', consent_only=True -> only consented members
+  8. copy_gate.scrub leaves @handle untouched in caption
+  9. validate_mentions strips leading @ from input handles
+ 10. handles_for_category with empty allowlist -> []
+ 11. validate_mentions with empty input -> []
+ 12. handles_for_category 'results' -> member (consented) + own
+
+Full suite: 2456 passed (excluding pre-existing higgsfield_renderer failure, unrelated), 6 skipped, 0 new failures.
+
+---
+
 ## Wave 3 — Repeat cooldown: caption_ledger (2026-08-26, AGENT_CAPTION_COOLDOWN)
 
 All new behavior behind AGENT_CAPTION_COOLDOWN (default OFF). When OFF the system is

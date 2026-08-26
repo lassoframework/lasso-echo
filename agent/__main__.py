@@ -194,6 +194,7 @@ def _status():
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
     print(f"  dedupe_fwd_book : {config.dedupe_forward_book_enabled()}  (env AGENT_DEDUPE_FORWARD_BOOK; Wave 0.2 one-shot dedup job, default OFF)")
     print(f"  caption_cooldown: {config.caption_cooldown_enabled()}  (env AGENT_CAPTION_COOLDOWN; Wave 3 repeat-cooldown ledger, default OFF)")
+    print(f"  mentions       : {config.mentions_enabled()}  (env AGENT_MENTIONS; Wave 4 tag_allowlist @mention tagging, default OFF)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
