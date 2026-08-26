@@ -6,7 +6,7 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 ---
 
@@ -93,6 +93,27 @@ Vercel REST API, then verified by sha256 round-trip (env pull hash == Railway ha
 - Follow-up nit (pre-existing, not built): the do_GET route calls
   handle_portal_gym_status without r2, so last_upload_at/upload_count are always null
   on this route; wire the R2 client through if the panel should show upload activity.
+
+### [x] Hill Country partial-connection fix + connection_watch (2026-08-26, commit 24ac033)
+Root cause: Hill Country connected Instagram only; Meta's Instagram OAuth dialog mentions
+Facebook Pages permissions, so Gina reasonably believed all three platforms were connected.
+Nothing on our side noticed for days — she reported it in Slack herself.
+
+**UX fix (intake_web.py CONNECT_PAGE):** "All three need their own approval" explicit warning
+above the platform buttons; "Not yet" state on unlinked platforms with a counter showing
+"X of 3 connected. Y still to go." and "All set" on full connection. Closes the Meta-dialog
+confusion for every future gym owner.
+
+**Systemic fix (agent/connection_watch.py, ARMED):** Sweeps every client gym via Zernio
+every 6h (paced). When a gym has SOME platforms but not all, and that exact missing set has
+persisted past the 24h grace window, fires ONE deduped ops alert naming the missing platforms
+and the CLI command to mint the gym's connect link. Fully connected clears stamps so a later
+disconnect + partial re-alerts. Zero connected is not partial (onboarding lane owns that).
+Per-gym Zernio errors never block the sweep. AGENT_CONNECTION_WATCH armed on Railway worker.
+Tests: 10 new (all green); full suite 3032 green.
+
+Send Gina her connect link to complete Facebook + Google Business:
+https://echo-intake-web-production.up.railway.app/portal/aGlsbGNvdW50cnk.xni0RY7v8gfglQd3fy5eKj1vgm0/connect
 
 ### Original audit finding (2026-08-25, for the record): the staff social-status panel
 ### had NEVER worked end-to-end — two pre-existing defects (both now fixed above)
