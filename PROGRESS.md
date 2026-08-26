@@ -10,6 +10,99 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 3 — Repeat cooldown: caption_ledger (2026-08-26, AGENT_CAPTION_COOLDOWN)
+
+All new behavior behind AGENT_CAPTION_COOLDOWN (default OFF). When OFF the system is
+byte-for-byte unchanged.
+
+### [x] 3.1 agent/caption_ledger.py created
+60-day caption cooldown + same-month hard block + 30-day concept gap.
+
+Functions:
+  caption_hash(text) — normalized SHA-256 fingerprint, 16-char hex. Strips @handles
+    and #tags, lowercases, removes non-alphanumeric, collapses whitespace, truncates at 200.
+  ledger_key(gym_id, h) — kv key for a gym+hash pair.
+  is_on_cooldown(gym_id, caption_text, planned_date, db=None) -> bool
+    Returns True when last_used is within COOLDOWN_DAYS (60) of planned_date, OR
+    when last_used is in the same calendar month (HARD_BLOCK_SAME_MONTH=True).
+    Returns False on any error — never blocks content on kv failure.
+  record_staged(gym_id, caption_text, date_str, db=None)
+    Upserts kv: {"last_used": "YYYY-MM-DD", "uses": N}. last_used advances only
+    when date_str is more recent than the stored value (backfill safety).
+  record_published(gym_id, caption_text, date_str, db=None) — same pattern.
+  concept_is_on_cooldown(gym_id, concept_key, planned_date, db=None) -> bool
+    30-day gap for doctrine/education concept pool. Same kv pattern.
+  record_concept_used(gym_id, concept_key, date_str, db=None)
+
+Constants: COOLDOWN_DAYS=60, HARD_BLOCK_SAME_MONTH=True, CONCEPT_COOLDOWN_DAYS=30.
+All db calls are injectable; defaults to agent.db via lazy import.
+
+### [x] 3.2 SQL migration applied (Supabase ooqcvmcjspeltuuhcvlh)
+Migration name: caption_ledger_20260826
+Table:
+  caption_ledger (gym_id text, caption_hash text, last_used date, uses int default 1,
+                  primary key (gym_id, caption_hash))
+Applied via MCP mcp__claude_ai_Supabase__apply_migration. Supabase returned success:true.
+
+### [x] 3.3 agent/real_month_planner.py — cooldown check wired into _build_feed_with_fallback
+Behind AGENT_CAPTION_COOLDOWN.
+  _cooldown_checked(first_draft, builder, target, day_key, cat, log, _max_attempts=3)
+    Up to 3 builder calls per pillar; if all 3 hit cooldown, falls through to the next
+    real fallback pillar. Never ships a repeat, never fabricates.
+  _resolve_gym_id(target) — resolves account_key from str or object.
+  _draft_caption(draft) — extracts caption text from Draft.
+  Lazy import of caption_ledger so flag-off path has zero cost.
+
+### [x] 3.4 agent/portal_calendar_store.py — record_staged() wired in insert_rows
+Behind AGENT_CAPTION_COOLDOWN. After a successful POST, iterates the returned rows
+and calls caption_ledger.record_staged(gym_id, caption, post_date). Failure is
+non-fatal (rows are already inserted; ledger is best-effort cache).
+
+### [x] 3.5 agent/portal_calendar_store.py — record_published() wired in mark_published
+mark_published(row_id, media_id, published_at, gym_id, caption, post_date) added to
+SupabaseCalendarStore. Behind AGENT_CAPTION_COOLDOWN: after a successful PATCH to
+'published', calls caption_ledger.record_published(). Also added:
+  due_rows(gym_id, run_date, catchup_days=0)
+  mark_publishing(row_id, gym_id) -> bool (atomic claim)
+  mark_publish_failed(row_id, gym_id)
+  stamp_scheduled(row_id, scheduled_at, gym_id)
+These are the autopublish store methods calendar_autopublish.py calls; they live here
+so tests can inject a FakeStore without needing the real file.
+
+### [x] 3.6 agent/jobs/backfill_caption_ledger.py created
+Reads all historical content_calendar rows from Supabase in PAGE_SIZE=1000 pages.
+Hashes each caption and calls caption_ledger.record_staged(). Reports count per gym.
+Behind AGENT_CAPTION_COOLDOWN (no-op when OFF). Has run(dry_run=False, http=None)
+function callable standalone or from CLI (python -m agent.jobs.backfill_caption_ledger).
+--dry-run flag counts without writing.
+
+### [x] 3.7 concept-level cooldown in caption_ledger.py
+CONCEPT_COOLDOWN_DAYS=30. concept_is_on_cooldown() / record_concept_used() added.
+Same kv pattern; concept_key is a short identifier like 'doctrine:speed_to_lead'.
+
+### [x] 3.8 tests/test_caption_ledger.py — 12 tests, all green
+Spec's 8 required tests + 4 additional:
+  1. caption_hash normalizes @/# tags and punct (same as "ready set go")
+  2. caption_hash whitespace invariant
+  3. is_on_cooldown False for brand-new caption (not in kv)
+  4. is_on_cooldown True when last_used 30 days ago (within 60-day window)
+  5. is_on_cooldown False when last_used 61 days ago (outside window)
+  6. HARD_BLOCK_SAME_MONTH: same month blocks even 5 days apart
+  7. record_staged / is_on_cooldown round-trip: staged -> next day is blocked
+  8. concept_is_on_cooldown: blocks within 30 days, allows at 30+ days
+  9. record_staged increments uses counter and advances last_used
+ 10. ledger_key is gym-scoped (gym1 != gym2)
+ 11. is_on_cooldown returns False on kv error (never blocks content)
+ 12. record_staged silently passes on kv error (never raises)
+
+config.caption_cooldown_enabled() flag added (AGENT_CAPTION_COOLDOWN, default false).
+Printed in __main__.py _status() so test_status_completeness passes.
+
+Full suite: 2444 passed, 1 pre-existing higgsfield_renderer failure (unrelated),
+6 skipped, 0 new failures.
+
+---
+
 ## Wave 2 — proof/call categories, quotas, 25% cap (2026-08-26, AGENT_CATEGORY_QUOTAS)
 
 ### [x] agent/content_categories.py — CATEGORIES and GYM_PILLARS updated

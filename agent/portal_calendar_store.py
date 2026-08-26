@@ -30,6 +30,9 @@ import calendar as _calendar
 
 from . import config
 
+# Wave 3: caption cooldown ledger. Imported lazily inside insert_rows when
+# AGENT_CAPTION_COOLDOWN is ON so the flag-off path has zero cost.
+
 _TABLE = "content_calendar"
 
 # Portal facing statuses. The action verbs map to these column values.
@@ -187,7 +190,22 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         out = r.json() or []
-        return [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
+        # the caption ledger so future planner runs see the cooldown. Failure is
+        # non-fatal (the rows were already inserted; the ledger is a best-effort
+        # cache). Only fires when the flag is ON; the flag-off path is a no-op.
+        if config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger as _ledger
+                for row in inserted:
+                    caption = row.get("caption") or ""
+                    post_date = row.get("post_date") or ""
+                    if caption and post_date:
+                        _ledger.record_staged(account_key, caption, post_date)
+            except Exception:
+                pass  # ledger stamp failure is never fatal
+        return inserted
 
     def delete_month(self, account_key, month):
         """DELETE every content_calendar row for account_key whose post_date falls inside
@@ -275,6 +293,154 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+    # ---- autopublish store methods (used by calendar_autopublish.py) --------
+
+    def due_rows(self, gym_id, run_date, catchup_days=0):
+        """Return content_calendar rows for gym_id that are due for autopublish:
+        status in ('approved', 'pending') and post_date between
+        (run_date - catchup_days) and run_date, with a non-empty image_url.
+        Ordered post_date ASC."""
+        import calendar as _cal
+        from datetime import date, timedelta
+        run = date.fromisoformat(run_date)
+        start = (run - timedelta(days=max(0, int(catchup_days)))).isoformat()
+        params = {
+            "gym_id": f"eq.{gym_id}",
+            "post_date": [f"gte.{start}", f"lte.{run_date}"],
+            "image_url": "neq.",
+            "order": "post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return [x for x in rows
+                if x.get("status") in ("approved", "pending")
+                and x.get("image_url")
+                and str(x.get("gym_id")) == str(gym_id)]
+
+    def mark_publishing(self, row_id, gym_id):
+        """Atomically claim a row: PATCH status 'pending'|'approved' -> 'publishing',
+        filtered by BOTH id AND gym_id. Returns True when THIS call won the claim
+        (exactly one row updated), False otherwise (another worker beat us)."""
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{gym_id}",
+        }
+        # Use a PATCH that only fires when the current status is still
+        # 'pending' or 'approved' — a second concurrent PATCH finds
+        # status='publishing' and returns 0 rows, so False.
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "publishing"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return False
+        rows = r.json() or []
+        return any(str(x.get("gym_id")) == str(gym_id)
+                   and x.get("status") == "publishing"
+                   for x in rows)
+
+    def mark_published(self, row_id, media_id, published_at, gym_id="",
+                       caption="", post_date=""):
+        """Mark a row as published. Writes status='published', published_at, and
+        optionally late_post_id (the social platform's media/post id).
+
+        Wave 3 (AGENT_CAPTION_COOLDOWN): after a successful write, stamps the
+        caption in the caption ledger so future planner runs see the cooldown.
+        Failure of the ledger stamp is non-fatal.
+
+        `gym_id`, `caption`, and `post_date` are optional kwargs used only for
+        the ledger stamp; callers that do not need the stamp may omit them.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+        }
+        if gym_id:
+            params["gym_id"] = f"eq.{gym_id}"
+        payload = {
+            "status": "published",
+            "published_at": published_at,
+        }
+        if media_id:
+            payload["late_post_id"] = media_id
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp the published caption in the
+        # ledger so future cooldown checks include this post. Non-fatal.
+        if config.caption_cooldown_enabled() and caption and post_date:
+            try:
+                from . import caption_ledger as _ledger
+                _gid = gym_id or (rows[0].get("gym_id") if rows else "")
+                _date = post_date or published_at[:10] if published_at else ""
+                if _gid and _date:
+                    _ledger.record_published(_gid, caption, _date)
+            except Exception:
+                pass
+        return rows
+
+    def mark_publish_failed(self, row_id, gym_id=""):
+        """Revert a 'publishing' claim back to 'pending' so the row retries
+        next tick. Filtered by id (and gym_id when provided)."""
+        params = {"id": f"eq.{row_id}"}
+        if gym_id:
+            params["gym_id"] = f"eq.{gym_id}"
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "pending"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
+    def stamp_scheduled(self, row_id, scheduled_at, gym_id=""):
+        """Write scheduled_at timestamp to a row (best-effort; failure is logged
+        by the caller but never fatal to the publish flow)."""
+        params = {"id": f"eq.{row_id}"}
+        if gym_id:
+            params["gym_id"] = f"eq.{gym_id}"
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"scheduled_at": scheduled_at},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return []
+        return r.json() or []
 
 
 # ---------------------------------------------------------------------------

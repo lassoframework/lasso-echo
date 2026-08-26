@@ -1777,3 +1777,21 @@ def dedupe_forward_book_enabled() -> bool:
     This is a one-shot Wave 0 cleanup job — it is not part of the daily runner.
     """
     return _truthy(os.environ.get("AGENT_DEDUPE_FORWARD_BOOK", "false"))
+
+
+def caption_cooldown_enabled() -> bool:
+    """
+    Caption repeat-cooldown ledger switch. OFF by default. When ON:
+      - caption_ledger.is_on_cooldown() is called before a draft is accepted
+        into the real-month plan (real_month_planner.py).
+      - caption_ledger.record_staged() is called when a new calendar row is
+        staged (portal_calendar_store.py insert_rows).
+      - caption_ledger.record_published() is called after a successful autopublish
+        (calendar_autopublish.py mark_published area).
+      - The backfill job (agent/jobs/backfill_caption_ledger.py) can seed the
+        ledger from existing content_calendar rows.
+
+    When OFF, all caption_ledger calls are bypassed and today is byte-for-byte
+    unchanged. Arm by hand: AGENT_CAPTION_COOLDOWN=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_COOLDOWN", "false"))

@@ -59,6 +59,10 @@ from . import config
 from . import content_categories as _cats
 from . import real_calendar_mirror as _mirror
 
+# Wave 3: caption cooldown — imported lazily inside _build_feed_with_fallback
+# so import never fails when the flag is OFF (default) and the module is unused.
+# The guard at every call site is config.caption_cooldown_enabled().
+
 # The weekly rotation, keyed by weekday abbr. This is the SAME seven-day schedule the
 # runner drives from (content_categories._DAILY_SCHEDULE); we read the category leg of
 # it so the month calendar matches exactly what Echo posts day to day:
@@ -579,12 +583,94 @@ def _build_feed_with_fallback(slot, builders, target, log):
             continue  # no builder wired for this pillar; try the next real one
         draft = _safe_call(builder, target, slot.post_date, log,
                            f"{slot.post_date} {cat} feed")
+        if draft is None:
+            continue
+        # Wave 3 (AGENT_CAPTION_COOLDOWN): before accepting this draft, check whether
+        # its caption is within the repeat cooldown window. Up to 3 attempts pulling
+        # the next concept from the builder; after 3 cooldown hits fall through to the
+        # next pillar in the order so the day still fills from a real pillar.
+        if not config.caption_cooldown_enabled():
+            if cat != slot.category:
+                log(f"fill {slot.post_date}: {slot.category} had no content; the "
+                    f"{cat} pillar filled the day (real fallback, not fabricated)")
+            return draft, cat
+        # Cooldown is enabled — check and retry up to 3 attempts.
+        draft = _cooldown_checked(draft, builder, target, slot.post_date, cat, log)
         if draft is not None:
             if cat != slot.category:
                 log(f"fill {slot.post_date}: {slot.category} had no content; the "
                     f"{cat} pillar filled the day (real fallback, not fabricated)")
             return draft, cat
+        # All 3 attempts for this pillar were on cooldown — fall through to next pillar.
+        log(f"skip {slot.post_date} {cat}: caption cooldown blocked after 3 attempts; "
+            "trying next real pillar")
     return None, None
+
+
+def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
+                      _max_attempts=3):
+    """Return the first draft from builder that is not on cooldown (up to
+    _max_attempts total, including first_draft). Returns None when all attempts
+    are on cooldown so the caller falls through to the next pillar.
+
+    Only called when AGENT_CAPTION_COOLDOWN is ON. Lazy-imports caption_ledger
+    so the flag-off path never pays the import cost."""
+    try:
+        from . import caption_ledger as _ledger
+    except Exception:
+        return first_draft  # import failure: pass through, never block
+
+    # Determine the account_key (gym_id) from `target` — target may be a string
+    # key or an object with an account_key / key attribute.
+    gym_id = _resolve_gym_id(target)
+
+    attempts = [first_draft]
+    for attempt in range(1, _max_attempts):
+        d = attempts[-1]
+        caption = _draft_caption(d)
+        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+            return d
+        log(f"caption cooldown hit {attempt}/{_max_attempts} for "
+            f"{day_key} {cat}: retrying builder for next concept")
+        next_d = _safe_call(builder, target, day_key, log,
+                            f"{day_key} {cat} feed (cooldown retry {attempt})")
+        if next_d is None:
+            break
+        attempts.append(next_d)
+    # Check the last draft if it was just appended without a check
+    if attempts:
+        last = attempts[-1]
+        caption = _draft_caption(last)
+        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+            return last
+    return None
+
+
+def _resolve_gym_id(target):
+    """Best-effort gym_id from a target that may be a str, an account object,
+    or None. Falls back to '' (the ledger key is then gym-unscoped for the
+    empty gym, which is a safe no-op)."""
+    if target is None:
+        return ""
+    if isinstance(target, str):
+        return target
+    for attr in ("account_key", "key", "gym_id", "id"):
+        val = getattr(target, attr, None)
+        if val:
+            return str(val)
+    return str(target)
+
+
+def _draft_caption(draft):
+    """Extract the caption text from a Draft, tolerating different attribute names."""
+    if draft is None:
+        return ""
+    for attr in ("caption", "text", "body", "copy"):
+        val = getattr(draft, attr, None)
+        if val:
+            return str(val)
+    # Fall back to str representation (won't match anything in the ledger — safe)
+    return ""
 
 
 def _safe_call(builder, target, day_key, log, label):
