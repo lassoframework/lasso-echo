@@ -10,6 +10,28 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 0 — Preflight (2026-08-26)
+
+All Wave 0 tasks complete. Suite 3055 green.
+
+### [x] 0.1 — Second publisher investigation (wave0_publisher_finding.md)
+Live feed carried 65 posts Aug 10-26; Echo's calendar accounts for only 36. Root cause
+confirmed: TWO duplicate Zernio Instagram connections both wired to @lassoframework.
+  - ID 6a69fc9cdf17280d93d0727f (token exp 2026-09-27) — the one Echo is booked against.
+  - ID 6a74b3efd0fe733d1abc6fc1 (token exp 2026-10-06) — the second publisher. 29 posts.
+No third-party scheduler implicated. Recommended action: disconnect the newer duplicate
+(6a74b3efd0fe733d1abc6fc1). Nothing disconnected. ACTION REQUIRED: Blake tap to confirm.
+Finding written to wave0_publisher_finding.md and #echoclaude.
+
+### [x] 0.2 — dedupe_forward_book job (agent/jobs/dedupe_forward_book.py)
+Groups future 'pending' content_calendar rows by caption_hash (SHA256 of normalized
+caption, first 16 hex chars). Keeps earliest, denies the rest with
+reject_reason='duplicate_purge_2026_08'. All writes via SupabaseCalendarStore, never
+direct SQL. --dry-run flag logs without writing. Behind AGENT_DEDUPE_FORWARD_BOOK
+(default OFF). 20 tests green in tests/test_dedupe_forward_book.py.
+
+---
+
 ## Blake's 4 rulings + 5-domain A+ sweep + studio unblock (2026-08-24/25)
 
 Nine commits, all merged to main and LIVE on both Railway services (worker `echo` +
