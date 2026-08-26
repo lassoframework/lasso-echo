@@ -98,10 +98,11 @@ def test_perfect_month_grades_A():
 # ---------------------------------------------------------------------------
 
 def test_duplicate_captions_grades_F_on_consistency():
-    """20 duplicate captions must zero the consistency leg.
-    The spec says 'scores 0 on this leg after first dup'; the overall letter
-    tracks the total across all legs — with 20 identical caption rows the
-    consistency leg is 0 regardless of other legs."""
+    """20 duplicate captions must zero the consistency leg and yield an F overall.
+
+    Spec (ECHO_A_GRADE_SPEC.md line 286): 'the 20x repeat month grades F on
+    consistency'. When consistency hits 0 from duplicate captions the total is
+    capped to 59 so the letter is always F, not D or C."""
     same_cap = _perfect_caption(0)
     rows = [_make_row(
         post_date=f"2026-09-{(i + 1):02d}",
@@ -113,11 +114,12 @@ def test_duplicate_captions_grades_F_on_consistency():
     assert result.scores["consistency"] == 0, (
         f"Expected consistency=0 with 20 dups, got {result.scores['consistency']}"
     )
-    # The total with consistency=0 and all other legs at max would be 80,
-    # so with additional penalties (content_mix cap, no per-caption variation)
-    # the total should be well below 90 (failing the A gate).
-    assert result.total < 90, (
-        f"Expected total < 90 with 20 identical captions, got {result.total}"
+    assert result.letter == "F", (
+        f"Spec requires 20x repeat month grades F; got letter={result.letter!r} "
+        f"(total={result.total}, scores={result.scores})"
+    )
+    assert result.total < 60, (
+        f"Expected total < 60 (F range) with 20 identical captions, got {result.total}"
     )
 
 

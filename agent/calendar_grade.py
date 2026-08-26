@@ -71,6 +71,17 @@ def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
     scores["right_audience"] = _right_audience(rows, profile, defects)
     scores["path_to_join"]   = _path(rows, profile, defects)
     total = sum(scores.values())
+
+    # Spec: "the 20x repeat month grades F on consistency."
+    # When consistency is zeroed by duplicate captions, the calendar cannot
+    # score above F overall — cap total at 59 to ensure letter == "F".
+    consistency_dup = any(
+        d[0] == "consistency" and "repeated" in d[2]
+        for d in defects
+    )
+    if scores["consistency"] == 0 and consistency_dup:
+        total = min(total, 59)
+
     letter = next(l for floor, l in BANDS if total >= floor)
     return CalendarGrade(total, letter, scores, defects)
 
