@@ -119,9 +119,11 @@ def test_wave6_human_taps_md_exists_and_covers_both_taps():
 
     assert "TAP 1" in content, "WAVE6_HUMAN_TAPS.md must document TAP 1 (publisher disconnect)"
     assert "TAP 2" in content, "WAVE6_HUMAN_TAPS.md must document TAP 2 (per-gym flag flips)"
-    # Both taps should reference the human action required
-    assert "PENDING BLAKE TAP" in content, (
-        "both taps must be marked PENDING BLAKE TAP"
+    # Every tap must carry an explicit status: PENDING until Blake taps, then
+    # DONE with execution evidence. (All three taps were executed 2026-08-26 on
+    # Blake's explicit authorization, so PENDING is no longer required here.)
+    assert "PENDING BLAKE TAP" in content or "DONE" in content, (
+        "each tap must be marked PENDING BLAKE TAP or DONE with evidence"
     )
     # TAP 1 — publisher disconnect evidence
     assert "wave0_publisher_finding" in content or "disconnect" in content.lower(), (
