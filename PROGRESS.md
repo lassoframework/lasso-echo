@@ -10,6 +10,72 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 5 — Calendar grader: A gate (2026-08-26, AGENT_CALENDAR_GRADE)
+
+All new behavior behind AGENT_CALENDAR_GRADE (default OFF). When OFF the system is byte-for-byte unchanged.
+
+### [x] 5.1 agent/calendar_grade.py created
+Deterministic, offline LASSO Social Report Card grader. Six legs: consistency (20), content_mix (20), caption_craft (20), visual_match/proof_numbers (15), right_audience (15), path_to_join (10). Total 100 points; A_THRESHOLD = 90. Distinct from grade_gate.py (image gate).
+Key behaviors:
+  - _consistency: day-gap detection (-4/gap-of-1, -8/gap->3), caption_hash dup detection (-8 per dup occurrence after first; floors at 0)
+  - _content_mix: inline 25% category cap (-3 each), unbacked proof slots (-4 each); category_plan.validate_quotas used when quotas passed in
+  - _caption_craft: hard block (any copy_gate violation = 0 for whole leg); soft flags (-1 each, floor at 8); median caption < 150 = -4
+  - _visual_match (GYM): no vision_derived = -3; stock asset = -5; mixed template_ids = -3
+  - _proof_numbers (B2B): numbers in caption (want >=8, -1/missing); @mentions (want >=8, -1/missing); mixed gym_count claims = -3
+  - _right_audience: athlete-avatar leak on first line = -5 each; elite/advanced language = -2 each
+  - _path_to_join: missing ask = -1 each; GYM booking terms (want >=5) = -1/missing; B2B call asks (want >=12) = -1/missing; bare URL as only ask = -1 each
+CalendarGrade dataclass: .total (int), .letter (str), .scores (dict), .defects (list of (leg, row_ref, reason) tuples)
+
+### [x] 5.2 Enforcement loop in real_month_planner.py
+Added behind AGENT_CALENDAR_GRADE flag in apply_month_plan():
+  - Grades the planned rows before staging (profile via _profile_for: LASSO=B2B, clients=GYM)
+  - Remediation loop: up to 4 passes (_remediate: clears dup captions, appends missing asks, rebalances over-cap categories)
+  - If still < 90 after 4 passes: ops_alert fires ("NOT STAGING") and returns {"ok": False, ...}
+  - If >= 90: attaches grade summary to return dict ("Grade: A (92/100)")
+  - Added _profile_for(gym_id) and _remediate(rows, defects) helpers
+  - config.calendar_grade_enabled() added to agent/config.py (AGENT_CALENDAR_GRADE, default false)
+
+### [x] 5.3 Publish-time recheck in calendar_autopublish.py
+Added behind AGENT_CALENDAR_GRADE flag in publish_due() immediately after EXACTLY-ONCE CLAIM and before the route-by-gym publish block:
+  - copy_gate.violations check: row with banned dash/intraword hyphen reverts to pending + ops_alert fires
+  - caption_ledger.is_on_cooldown check: row on cooldown reverts to pending + ops_alert fires
+  - Both checks are non-fatal to other rows; only the flagged row is held
+
+### [x] 5.4 gym_social_grades table + grade_sweep job
+SQL migration "gym_social_grades_20260826" applied to Supabase project ooqcvmcjspeltuuhcvlh (success:true):
+  - gym_social_grades table: id uuid pk, gym_id text, "window" text (trailing_30|forward_book), total int, letter text, scores jsonb, defects jsonb, graded_at timestamptz
+  - Index: gym_social_grades_gym_window on (gym_id, "window", graded_at desc)
+  - Note: "window" is quoted (PostgreSQL reserved word)
+agent/jobs/grade_sweep.py created:
+  - run(gyms, store, now, alert_fn): nightly per-gym grader; trailing 30 days + forward book
+  - Writes to gym_social_grades via injectable store.insert_grade or Supabase REST
+  - Alerts coach channel (ops_alerts.alert) when either grade < B (80)
+  - Behind AGENT_CALENDAR_GRADE; no-op when OFF
+  - __main__ block for standalone: python3 -m agent jobs grade_sweep
+
+### [x] 5.5 Tests
+tests/test_calendar_grade.py: 10 tests, all green
+  1. Perfect 28-post month grades A (>= 90)
+  2. 20 duplicate captions -> consistency score 0, total < 90
+  3. 0 ask-containing posts -> path_to_join <= 4
+  4. Summit at 44% -> content_mix cap violation defect
+  5. Em-dash caption -> caption_craft = 0
+  6. profile="B2B" uses proof_numbers (not visual_match)
+  7. grade_month returns CalendarGrade with all fields
+  8. Band logic: total 90->A, 89->B, 79->C, 69->D, 59->F
+  9. A_THRESHOLD is 90
+  10. Defects present for violated legs
+
+tests/test_planner_gate.py: 4 tests, all green
+  1. Flag ON + plan >= 90 -> stages normally (ok=True)
+  2. Flag ON + plan fails then remediation fixes it -> stages after loop
+  3. Flag ON + 4 passes can't fix -> NOT staged, one alert fired
+  4. Flag OFF -> no grade check, stages regardless
+
+Full suite: 2470 passed, 6 skipped, 0 new failures (pre-existing higgsfield_renderer failure excluded; unrelated missing module).
+
+---
+
 ## Wave 4 — Tagging, end to end (2026-08-26, AGENT_MENTIONS)
 
 All new behavior behind AGENT_MENTIONS (default OFF). When OFF the system is byte-for-byte unchanged.

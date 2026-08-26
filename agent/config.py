@@ -948,6 +948,20 @@ def grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GRADE_ENABLED", "false"))
 
 
+def calendar_grade_enabled() -> bool:
+    """
+    Calendar A-gate switch (AGENT_CALENDAR_GRADE). OFF by default. When ON, the
+    real_month_planner will not stage a planned month unless it scores >= 90 (A)
+    on the LASSO Social Report Card rubric. The planner remediates and rescores
+    in a loop (up to 4 passes); if the plan still fails after 4 passes, staging
+    is blocked and a human-decision ops alert fires. The calendar_autopublish
+    publish loop also rechecks copy_gate + caption_ledger before each publish
+    when this flag is ON. Distinct from AGENT_GRADE_ENABLED (reporting) and
+    AGENT_STYLE_GATE_ENABLED (image gate). Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_CALENDAR_GRADE", "false"))
+
+
 def connect_grade_enabled() -> bool:
     """
     Connect-to-grade switch. OFF by default: /connect behavior is byte

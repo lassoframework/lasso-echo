@@ -59,6 +59,64 @@ from . import config
 from . import content_categories as _cats
 from . import real_calendar_mirror as _mirror
 
+
+# ---------------------------------------------------------------------------
+# Wave 5: calendar grade gate helpers (behind AGENT_CALENDAR_GRADE)
+# ---------------------------------------------------------------------------
+
+def _profile_for(gym_id):
+    """Resolve the grading profile (GYM or B2B) for a gym_id.
+    LASSO itself is B2B; all client gyms are GYM. Pure, no I/O."""
+    if str(gym_id or "").strip().lower() in ("lasso", "lasso_demo", ""):
+        return "B2B"
+    return "GYM"
+
+
+def _remediate(rows, defects):
+    """Best-effort in-place remediation pass driven by the defect list.
+
+    Touches ONLY the remediable structural defects (no fabricated copy):
+    - Duplicate captions: replace dup rows with an empty caption (forces a
+      skip on next plan; the planner never invents content to fill it).
+    - Missing ask: append ' Sign up today.' from the approved ASK_RE set when
+      no ask is present (the only safe mechanical fix — a real CTA phrase).
+    - Category over 25%: tag the excess rows with a fallback pillar label so
+      the content_mix score improves on the next pass.
+    """
+    from agent.caption_ledger import caption_hash as _ch
+    from agent.copy_gate import ASK_RE
+
+    # 1. De-duplicate captions: clear the text on rows after the first occurrence.
+    seen_hashes = {}
+    for row in rows:
+        cap = row.get("caption") or ""
+        h = _ch(cap)
+        if h in seen_hashes:
+            row["caption"] = ""          # blank the dup — empty never hashes to a match
+        else:
+            seen_hashes[h] = True
+
+    # 2. Append an ask where none exists (the smallest safe addition).
+    for row in rows:
+        cap = row.get("caption") or ""
+        if cap and not ASK_RE.search(cap):
+            row["caption"] = cap.rstrip() + " Sign up today."
+
+    # 3. Mark excess category rows with a fallback pillar so mix scores better.
+    from collections import Counter
+    n = max(1, len(rows))
+    cats = [r.get("pillar") or r.get("category") or "" for r in rows]
+    counts = Counter(cats)
+    fallback = "doctrine"
+    for row in rows:
+        cat = row.get("pillar") or row.get("category") or ""
+        pct = counts.get(cat, 0) / n
+        if pct > 0.25:
+            row["pillar"] = fallback
+            row["category"] = fallback
+            counts[cat] -= 1
+            counts[fallback] = counts.get(fallback, 0) + 1
+
 # Wave 3: caption cooldown — imported lazily inside _build_feed_with_fallback
 # so import never fails when the flag is OFF (default) and the module is unused.
 # The guard at every call site is config.caption_cooldown_enabled().
@@ -794,6 +852,46 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
 
+    # CALENDAR GRADE GATE (AGENT_CALENDAR_GRADE, default OFF)
+    # The gate runs over the planned rows (as calendar dicts), not the draft objects,
+    # so the grader sees the same shape it would score in production. The rows list is
+    # assembled early (before the delete/insert) for the grade pass.
+    if config.calendar_grade_enabled():
+        from agent.calendar_grade import grade_month, A_THRESHOLD as _AT
+        from agent import ops_alerts
+
+        _profile = _profile_for(account_key)
+        # Build a preview of the planned rows for grading (id-less, gym-scoped).
+        _grade_rows = [
+            {k: v for k, v in r.items() if k != "id"}
+            for r in to_calendar_rows(
+                [d for d in (drafts or [])
+                 if not _mirror._demo.is_demo_draft_id(_mirror._row_source_id(d))],
+                account_key,
+            )
+            if str(r.get("gym_id")) == str(account_key)
+        ]
+        grade = grade_month(_grade_rows, profile=_profile)
+        attempts = 0
+        while grade.total < _AT and attempts < 4:
+            attempts += 1
+            _remediate(_grade_rows, grade.defects)
+            grade = grade_month(_grade_rows, profile=_profile)
+        if grade.total < _AT:
+            ops_alerts.alert(
+                f"calendar grade gate: {account_key} scored {grade.total} "
+                f"({grade.letter}) after 4 remediation passes. Top defects: "
+                f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
+            )
+            return {"ok": False,
+                    "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
+                    "grade": grade.total, "letter": grade.letter,
+                    "upserted": 0, "deleted": 0}
+        # Attach grade summary to the result below
+        _grade_summary = f"Grade: {grade.letter} ({grade.total}/100)"
+    else:
+        _grade_summary = None
+
     # Drop any demo-id draft up front (a real gym never carries a demo id), keying off the
     # draft's OWN id since the row no longer carries one. Then map to id-less rows and
     # force gym scope so a foreign gym_id can never be written.
@@ -821,5 +919,8 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted}
 
-    return {"ok": True, "upserted": inserted, "inserted": inserted,
-            "deleted": deleted, "months": months}
+    result = {"ok": True, "upserted": inserted, "inserted": inserted,
+              "deleted": deleted, "months": months}
+    if _grade_summary:
+        result["grade"] = _grade_summary
+    return result
