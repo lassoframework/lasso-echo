@@ -1,15 +1,32 @@
 """metrics_sync.py — Wave 7.1 metrics ingestion (flag AGENT_METRICS_SYNC, default OFF).
 
 Nightly per gym: pull Zernio analytics (source=all, so EXTERNAL posts — posts
-Echo did not publish — arrive too), join each post to content_calendar via
-late_post_id, falling back to platformPostId, and snapshot its metrics at
-post-age days 1, 3, 7, 28. Engagement is a decay curve: comparing a 2-day-old
-post against a 3-week-old one is how naive loops lie to themselves.
+Echo did not publish — arrive too), join each post to content_calendar, and
+snapshot its metrics at post-age days 1, 3, 7, 28. Engagement is a decay
+curve: comparing a 2-day-old post against a 3-week-old one is how naive loops
+lie to themselves.
+
+THE JOIN (verified live 2026-08-26 — the shapes that broke the first cut):
+- An analytics record's TOP-LEVEL platformPostId is NULL; the real platform
+  post ids live in its platforms[] entries (a cross-post carries one entry per
+  platform, each with its own platformPostId and analytics dict).
+- The analytics record `_id` is NOT the Zernio post id that
+  content_calendar.late_post_id stores — different id space. The bridge is the
+  profile's Zernio-CREATED posts (GET /v1/posts): each carries the `_id` the
+  calendar stored plus the same platforms[].platformPostId. So:
+    entry.platformPostId -> zernio posts map -> zernio post _id
+      -> content_calendar.late_post_id.
+  The raw platformPostId is still offered as find_calendar's fallback: legacy
+  rows (e.g. lasso's pre-Zernio publishes) stored the PLATFORM post id in
+  late_post_id directly.
+- Zernio's isExternal flag is UNRELIABLE (it comes back true even for posts
+  Echo itself published) and is NEVER consulted for classification. external
+  is the JOIN's verdict alone: no calendar match after a proper join.
 
 HARD RULES (Blake's Wave 7 rails):
-- DEDUPE BY platformPostId. The duplicate lassoframework IG connection returns
-  the same post under two account ids; ONE row wins per (platform,
-  platformPostId, snapshot_day).
+- DEDUPE BY platformPostId at the platform-ENTRY level. The duplicate
+  lassoframework IG connection returns the same post under two account ids;
+  ONE row wins per (platform, platformPostId, snapshot_day).
 - A post with NO calendar match is stored with calendar_id null and
   external=true. External rows inform the gym's baseline but NEVER train the
   playbook (we don't learn from posts we didn't shape, and we don't let the
@@ -62,25 +79,74 @@ def _metric(analytics, key):
     return v if isinstance(v, (int, float)) else None
 
 
-def dedupe_posts(posts):
-    """Dedupe a Zernio posts page by (platform, platformPostId): the duplicate
-    lassoframework connection returns the same post under two account ids, and
-    exactly ONE row may win. First occurrence wins (newest-first stream); a
-    post with no platformPostId falls back to its Zernio _id so it still keys
-    uniquely; a post with neither is dropped (it cannot be deduped or keyed)."""
+def platform_entries(records):
+    """Flatten analytics records into per-platform-entry post views, deduped by
+    (platform, platformPostId). The record's top-level platformPostId is NULL
+    in the real Zernio shape; the ids live in platforms[] — a cross-posted
+    record carries one entry per platform, each with its own platformPostId
+    and analytics, and each becomes its OWN view (own metrics row). Dedupe is
+    entry-level: the duplicate lassoframework connection surfaces the same
+    platformPostId under two account ids and exactly ONE view wins (first
+    occurrence, newest-first stream).
+
+    Per view: platformPostId falls back to the record `_id` only when the
+    entry carries none (so the PK never collides on null); the analytics dict
+    is the ENTRY's, falling back to the record-level one; a record with no
+    platforms[] at all degrades to a single view built from its own fields.
+    A view with neither id is dropped (it cannot be deduped or keyed)."""
     seen = set()
     out = []
-    for p in posts or []:
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        entries = [e for e in rec.get("platforms") or [] if isinstance(e, dict)]
+        if not entries:
+            entries = [{}]  # degenerate record: itself is the single entry
+        for e in entries:
+            platform = e.get("platform") or rec.get("platform") or ""
+            entry_pid = e.get("platformPostId") or rec.get("platformPostId")
+            pid = entry_pid or rec.get("_id")
+            if not pid:
+                continue
+            key = (str(platform), str(pid))
+            if key in seen:
+                continue
+            seen.add(key)
+            acct = e.get("accountId") or rec.get("accountId")
+            if isinstance(acct, dict):  # /v1/posts populates it; analytics sends a str
+                acct = acct.get("_id") or acct.get("id")
+            out.append({
+                "_id": rec.get("_id"),
+                "platform": platform,
+                "platformPostId": str(pid),
+                "entry_platform_post_id": str(entry_pid) if entry_pid else None,
+                "late_post_id_hint": rec.get("latePostId"),  # rarely set; a join input
+                "accountId": acct,
+                "analytics": e.get("analytics") or rec.get("analytics") or {},
+                "mediaProductType": rec.get("mediaProductType"),
+                "publishedAt": e.get("publishedAt") or rec.get("publishedAt"),
+            })
+    return out
+
+
+def build_posts_map(zernio_posts):
+    """{platformPostId(str) -> zernio post _id(str)} from a profile's
+    Zernio-created posts (ZernioClient.posts_window). Each post's platforms[]
+    entries carry the per-platform platformPostId; the post `_id` is what
+    content_calendar.late_post_id stores. First mapping wins (newest first)."""
+    out = {}
+    for p in zernio_posts or []:
         if not isinstance(p, dict):
             continue
-        pid = p.get("platformPostId") or p.get("_id")
-        if not pid:
+        zid = p.get("_id") or p.get("id")
+        if not zid:
             continue
-        key = (str(p.get("platform") or ""), str(pid))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
+        for e in p.get("platforms") or []:
+            if not isinstance(e, dict):
+                continue
+            pid = e.get("platformPostId")
+            if pid:
+                out.setdefault(str(pid), str(zid))
     return out
 
 
@@ -237,17 +303,23 @@ def _default_gyms():
         return ["lasso"]
 
 
-def sync_gym(gym_id, analytics_json, store, now):
+def sync_gym(gym_id, analytics_json, store, now, posts_map=None):
     """Fold one gym's analytics JSON into post_metrics rows and insert them.
-    Pure over its inputs except the store calls. Returns a summary dict."""
+    Pure over its inputs except the store calls. `posts_map` is the
+    {platformPostId -> zernio post _id} bridge (build_posts_map) that lets an
+    analytics entry reach content_calendar.late_post_id. Returns a summary
+    dict carrying per-gym matched/external counts."""
     aj = analytics_json or {}
-    posts = dedupe_posts(aj.get("posts") or [])
+    posts_map = posts_map or {}
     accounts = aj.get("accounts") or []
+    entries = platform_entries(aj.get("posts") or [])
     rows = []
-    external_count = 0
-    for post in posts:
-        pid = str(post.get("platformPostId") or post.get("_id") or "")
-        platform = post.get("platform") or ""
+    matched_posts = 0
+    external_posts = 0
+    external_rows = 0
+    for post in entries:
+        pid = post["platformPostId"]
+        platform = post["platform"]
         try:
             existing = store.existing_days(gym_id, platform, pid)
         except Exception:
@@ -255,33 +327,42 @@ def sync_gym(gym_id, analytics_json, store, now):
         due = due_snapshot_days(post.get("publishedAt"), now, existing)
         if not due:
             continue
-        cal = None
-        # External posts (isExternal) get NO calendar lookup shortcut — we still
-        # try the join first; a real Echo post mislabeled external must not lose
-        # its calendar link. No match (either way) -> external=true.
+        # THE JOIN: entry platformPostId -> zernio posts map -> late_post_id.
+        # The raw platformPostId is offered as find_calendar's fallback (legacy
+        # rows, e.g. lasso's, stored the PLATFORM post id in late_post_id).
+        # Zernio's isExternal flag is NEVER consulted — it comes back true even
+        # for posts Echo itself published. No match (either path) -> external.
+        epid = post.get("entry_platform_post_id")
+        zernio_post_id = (posts_map.get(epid) if epid else None) \
+            or post.get("late_post_id_hint")
         try:
             cal = store.find_calendar(
-                gym_id,
-                late_post_id=post.get("_id"),
-                platform_post_id=post.get("platformPostId"))
+                gym_id, late_post_id=zernio_post_id, platform_post_id=epid)
         except Exception:
             cal = None
+        if cal and cal.get("id"):
+            matched_posts += 1
+        else:
+            external_posts += 1
         for day in due:
             row = build_metric_row(gym_id, post, accounts, day, calendar_row=cal)
             if row["external"]:
-                external_count += 1
+                external_rows += 1
             rows.append(row)
     inserted = store.insert_metrics(rows) if rows else 0
-    return {"gym_id": gym_id, "posts_seen": len(posts),
-            "rows_inserted": inserted, "external_rows": external_count}
+    return {"gym_id": gym_id, "posts_seen": len(entries),
+            "rows_inserted": inserted, "matched_posts": matched_posts,
+            "external_posts": external_posts, "external_rows": external_rows}
 
 
 def run(gyms=None, now=None, zernio=None, store=None):
     """The nightly sync. Behind AGENT_METRICS_SYNC (default OFF -> no-op, no
     client constructed, no network touched). Per gym: resolve the gym's Zernio
     profile by name, pull analytics with source=all over the snapshot window,
-    and land the due snapshots. A gym with no Zernio profile or a failed pull
-    is REPORTED and skipped — never guessed."""
+    pull the profile's Zernio-created posts to build the platformPostId ->
+    zernio post id join map, and land the due snapshots. A gym with no Zernio
+    profile or a failed pull (analytics OR posts — a missing map would silently
+    flag Echo's own posts external) is REPORTED and skipped — never guessed."""
     if not config.metrics_sync_enabled():
         return {"ok": False, "reason": "AGENT_METRICS_SYNC is OFF (default). "
                                        "No pull performed.", "gyms": []}
@@ -309,7 +390,14 @@ def run(gyms=None, now=None, zernio=None, store=None):
                             "reason": f"analytics pull failed: {type(exc).__name__}"})
             continue
         try:
-            summary = sync_gym(gym_id, aj, store, now)
+            zposts = zernio.posts_window(profile_id, days=_WINDOW_DAYS)
+        except Exception as exc:  # noqa: BLE001
+            results.append({"gym_id": gym_id, "ok": False,
+                            "reason": f"zernio posts pull failed: {type(exc).__name__}"})
+            continue
+        posts_map = build_posts_map(zposts)
+        try:
+            summary = sync_gym(gym_id, aj, store, now, posts_map=posts_map)
             summary["ok"] = True
             results.append(summary)
         except Exception as exc:  # noqa: BLE001

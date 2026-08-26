@@ -258,6 +258,52 @@ class ZernioClient:
         return self._post(f"/v1/accounts/{account_id}/gmb-media", payload,
                           headers=headers)
 
+    def list_posts(self, profile_id, page=1, limit=50):
+        """GET /v1/posts?profileId=... -> {posts:[...], pagination:{page,limit,total,pages}}.
+
+        The profile's Zernio-CREATED posts (what Echo scheduled/published through
+        Zernio), newest-first by scheduledFor. Pagination on THIS endpoint is
+        PAGE-based (`skip` is accepted but ignored — probed live 2026-08-26).
+        Each post's platforms[] entries carry the per-platform platformPostId
+        (the id the metrics join keys on) alongside the Zernio post `_id` that
+        content_calendar.late_post_id stores. Read-only."""
+        return self._get("/v1/posts", {"profileId": profile_id,
+                                       "page": int(page), "limit": int(limit)})
+
+    def posts_window(self, profile_id, days, page_limit=50, max_pages=20):
+        """The profile's Zernio-created posts covering the last `days`, as a list.
+
+        Pages newest-first (list_posts), accumulating until a page's OLDEST
+        scheduledFor is already before the window start, the pagination total is
+        reached, a page comes back empty, or max_pages is hit (defensive cap).
+        Mirrors analytics_window's stop rules on the page-based posts endpoint.
+        A post with no parseable scheduledFor is KEPT (never dropped by the
+        pager). Read-only: no writes ever issued."""
+        cutoff = None
+        if isinstance(days, (int, float)) and days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=float(days))
+        posts = []
+        page = 1
+        while page <= max_pages:
+            resp = self.list_posts(profile_id, page=page, limit=page_limit) or {}
+            batch = [p for p in (resp.get("posts") or []) if isinstance(p, dict)]
+            if not batch:
+                break
+            posts.extend(batch)
+            if cutoff is not None:
+                oldest = None
+                for p in batch:
+                    ts = _parse_iso(p.get("scheduledFor") or p.get("createdAt"))
+                    if ts is not None and (oldest is None or ts < oldest):
+                        oldest = ts
+                if oldest is not None and oldest < cutoff:
+                    break
+            total = (resp.get("pagination") or {}).get("total")
+            if isinstance(total, (int, float)) and len(posts) >= int(total):
+                break
+            page += 1
+        return posts
+
     def analytics(self, profile_id, skip=0, limit=50, source=None):
         """GET /v1/analytics?profileId=... -> the analytics JSON (read-only add-on).
 
