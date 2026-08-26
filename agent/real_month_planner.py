@@ -844,7 +844,11 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     /social + approve/deny key off the DB-returned uuid.
 
     Writes calendar rows only. NOTHING here publishes. Returns a summary dict; never
-    raises out (a store error is reported, not a partial silent failure)."""
+    raises out (a store error is reported, not a partial silent failure).
+
+    # Wave 6: after dedupe_forward_book.run(), re-run this planner for each gym
+    #  to refill freed slots. Everything refilled lands 'pending' — coaches tap through.
+    """
     if not account_key or sb_store is None:
         return {"ok": False, "reason": "missing account_key or store",
                 "upserted": 0, "deleted": 0}
@@ -852,11 +856,14 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
 
-    # CALENDAR GRADE GATE (AGENT_CALENDAR_GRADE, default OFF)
+    # CALENDAR GRADE GATE (AGENT_CALENDAR_GRADE / per-gym override, default OFF)
     # The gate runs over the planned rows (as calendar dicts), not the draft objects,
     # so the grader sees the same shape it would score in production. The rows list is
     # assembled early (before the delete/insert) for the grade pass.
-    if config.calendar_grade_enabled():
+    # Wave 6: calendar_grade_enabled_for(gym_id) checks the per-gym override env var
+    # (AGENT_CALENDAR_GRADE_{GYM_ID}) first, falling back to the global flag. Each gym
+    # is enabled individually via Railway env; HUMAN TAP REQUIRED per gym. See WAVE6_HUMAN_TAPS.md.
+    if config.calendar_grade_enabled_for(account_key):
         from agent.calendar_grade import grade_month, A_THRESHOLD as _AT
         from agent import ops_alerts
 

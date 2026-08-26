@@ -1822,3 +1822,29 @@ def mentions_enabled() -> bool:
     never tags a member without explicit consent. Arm by hand: AGENT_MENTIONS=true.
     """
     return _truthy(os.environ.get("AGENT_MENTIONS", "false"))
+
+
+def calendar_grade_enabled_for(gym_id: str) -> bool:
+    """Per-gym grade enforcement. Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper()} first,
+    then falls back to AGENT_CALENDAR_GRADE. Rollout order: lasso first, then ENG,
+    GRITX, Pierce, TopFuel, then default-ON for new onboards.
+    HUMAN TAP REQUIRED to flip each gym's flag on Railway.
+
+    Examples:
+      AGENT_CALENDAR_GRADE_LASSO=true   -> lasso gym grades enforced
+      AGENT_CALENDAR_GRADE_ENG=true     -> CrossFit ENG grades enforced
+      AGENT_CALENDAR_GRADE_GRITX=true   -> GritX grades enforced
+      AGENT_CALENDAR_GRADE_PIERCEFITNESS=true -> Pierce Fitness grades enforced
+      AGENT_CALENDAR_GRADE_TOPFUEL=true -> TopFuel grades enforced
+      AGENT_CALENDAR_GRADE=true         -> global default ON (new onboards)
+
+    When no per-gym flag is set, falls back to the global AGENT_CALENDAR_GRADE
+    switch (calendar_grade_enabled()). Behind AGENT_CALENDAR_GRADE as the global
+    gate: when the global flag is OFF and no per-gym override is set, returns False
+    for every gym (byte-for-byte current behavior unchanged).
+    """
+    gym_env = f"AGENT_CALENDAR_GRADE_{gym_id.upper().replace('-', '_')}"
+    gym_val = os.environ.get(gym_env)
+    if gym_val is not None:
+        return _truthy(gym_val)
+    return calendar_grade_enabled()

@@ -10,6 +10,59 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 6 — Rollout infrastructure (2026-08-26, per-gym AGENT_CALENDAR_GRADE_{GYM_ID})
+
+All new behavior behind AGENT_CALENDAR_GRADE as the global gate (default OFF). When OFF the system is byte-for-byte unchanged.
+Two human taps in this wave cannot be performed autonomously. See WAVE6_HUMAN_TAPS.md.
+
+### [x] 6.1 Per-gym grade toggle infrastructure — config.calendar_grade_enabled_for()
+Added calendar_grade_enabled_for(gym_id) to agent/config.py:
+  - Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper().replace('-','_')} first (per-gym override)
+  - Falls back to calendar_grade_enabled() (global AGENT_CALENDAR_GRADE)
+  - Rollout order per spec: lasso -> ENG -> GRITX -> Pierce -> TopFuel -> global default-ON
+  - HUMAN TAP REQUIRED to flip each gym's flag on Railway (see WAVE6_HUMAN_TAPS.md TAP 2)
+Updated real_month_planner.py apply_month_plan():
+  - calendar_grade_enabled() -> calendar_grade_enabled_for(account_key) for per-gym enforcement
+  - Added Wave 6 refill comment: re-run planner after dedupe_forward_book.run() to refill freed slots
+
+### [x] 6.2 Rollout digest job — agent/jobs/rollout_digest.py
+Created agent/jobs/rollout_digest.py with run(gyms=None, store=None) -> list[str]:
+  - For each gym: reads gym_social_grades (trailing_30 + forward_book) for before/after grade picture
+  - Reads count of denied rows with reject_reason='duplicate_purge_2026_08' (Wave 0.2 purged slots)
+  - Reads count of pending rows in content_calendar (refilled slots)
+  - Reads count of seeded gym_tag_allowlist entries (mentions seeded)
+  - Formats a one-page digest per gym ending with "READY FOR FLAG FLIP (human tap required)"
+  - Behind AGENT_CALENDAR_GRADE; returns informational message when OFF
+  - Injectable store for tests; Supabase REST + Content-Range count headers for live path
+  - CLI: python3 -m agent jobs rollout_digest [--gym GYM_ID ...]
+
+### [x] 6.3 Flag-flip checklist — WAVE6_HUMAN_TAPS.md
+Created WAVE6_HUMAN_TAPS.md at repo root:
+  - TAP 1: PENDING BLAKE TAP — second publisher disconnect (wave0_publisher_finding.md evidence)
+  - TAP 2: PENDING BLAKE TAP — per-gym AGENT_CALENDAR_GRADE flag flips (all 5 gyms + global)
+  - Exact Railway env var names + post-flip verification commands for each gym
+
+### [x] 6.4 Forward book refill stubs
+Added comment in real_month_planner.py apply_month_plan() docstring:
+  "Wave 6: after dedupe_forward_book.run(), re-run this planner for each gym to refill freed
+   slots. Everything refilled lands 'pending' — coaches tap through."
+
+### [x] 6.5 Tests — tests/test_wave6_rollout.py
+7 tests, all green (5 required + 2 bonus):
+  1. calendar_grade_enabled_for('lasso'): AGENT_CALENDAR_GRADE=false + AGENT_CALENDAR_GRADE_LASSO=true -> True
+  2. calendar_grade_enabled_for('eng'): AGENT_CALENDAR_GRADE=false, no per-gym flag -> False
+  3. calendar_grade_enabled_for('topfuel'): AGENT_CALENDAR_GRADE=true (global) -> True (inherits)
+  4. rollout_digest.run() returns list of strings with gym name + "READY FOR FLAG FLIP"
+  5. WAVE6_HUMAN_TAPS.md exists and mentions both human taps (TAP 1 publisher, TAP 2 per-gym)
+  6. (bonus) rollout_digest.run() returns flag-off message when AGENT_CALENDAR_GRADE=false
+  7. (bonus) calendar_grade_enabled_for('pierce-fitness') resolves to AGENT_CALENDAR_GRADE_PIERCE_FITNESS
+
+Human taps: TAP 1 (publisher disconnect) and TAP 2 (all per-gym flag flips) are PENDING BLAKE TAP.
+
+Full suite: 2477 passed, 6 skipped, 0 new failures (pre-existing higgsfield_renderer failure excluded; unrelated missing module).
+
+---
+
 ## Wave 5 — Calendar grader: A gate (2026-08-26, AGENT_CALENDAR_GRADE)
 
 All new behavior behind AGENT_CALENDAR_GRADE (default OFF). When OFF the system is byte-for-byte unchanged.
