@@ -533,6 +533,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"GBP connection sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # PARTIAL-CONNECTION WATCH (Hill Country 2026-08-26): alert staff when a gym has
+    # connected some platforms but not all three past the grace window — the owner
+    # completed one OAuth and reasonably believed all were connected; the CLIENT had to
+    # report it. Read-only against Zernio; self-paced via kv (default one sweep per 6h);
+    # one deduped alert per (gym, missing set). Isolated: never takes the draft run down.
+    if config.connection_watch_enabled():
+        try:
+            from .connection_watch import watch_connections
+            wsum = watch_connections(alert=ops_alerts.alert)
+            if wsum.get("ok") and wsum.get("reason") != "paced":
+                print(f"[connection-watch] checked {wsum.get('checked', 0)} gym(s): "
+                      f"{wsum.get('partial', 0)} partial, {wsum.get('alerted', 0)} "
+                      f"alerted, {wsum.get('skipped', 0)} skipped")
+        except Exception as e:
+            print(f"[connection-watch] failed: {type(e).__name__}: {e}")
+
     # ZERNIO PROFILE LINK (Pierce 2026-08-24): backfill gyms.zernio_profile_id (the
     # PUBLISHER's profile id) for any client gym missing it, matching the Zernio profile by
     # name. A fully-connected gym with an empty profile id silently never publishes ("no

@@ -215,16 +215,20 @@ def _upload_base_url():
 def link_for(client_key, kind="u"):
     """The full signed intake link for a client key, or '' when it cannot be built
     (no signing secret set). kind='u' is the media upload page; kind='intake' is
-    the seven-section form. This is the ONE place a link is minted: the intake-link
-    CLI calls it today and a future authenticated mint endpoint calls the same
-    function, so the signing secret never leaves this service and never reaches the
-    ops portal. Absolute when AGENT_UPLOAD_BASE_URL is set, else a relative path."""
+    the seven-section form; kind='connect' is the self-serve social connect page
+    (/portal/<token>/connect). This is the ONE place a link is minted: the
+    intake-link CLI calls it today and a future authenticated mint endpoint calls
+    the same function, so the signing secret never leaves this service and never
+    reaches the ops portal. Absolute when AGENT_UPLOAD_BASE_URL is set, else a
+    relative path."""
     try:
         token = intake_tokens.mint(client_key)
     except ValueError:
         return ""
-    path = "intake" if kind == "intake" else "u"
     base = _upload_base_url()
+    if kind == "connect":
+        return f"{base}/portal/{token}/connect"
+    path = "intake" if kind == "intake" else "u"
     return f"{base}/{path}/{token}"
 
 
@@ -1209,6 +1213,9 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <h1>Connect your accounts</h1>
  <p class="sub">Link the accounts for __GYM__ so we can publish for you. You will be sent to
   the platform to approve, then brought right back.</p>
+ <p class="sub" style="font-weight:700">All three need their own approval. One login screen may
+  mention the others, but each platform only connects when you click its button below.</p>
+ <p class="sub" id="prog" style="color:#5EB9E6;font-weight:700"></p>
  <button class="btn" data-p="instagram"><span>Connect Instagram</span><span class="state" id="s-instagram"></span></button>
  <button class="btn" data-p="facebook"><span>Connect Facebook</span><span class="state" id="s-facebook"></span></button>
  <button class="btn" data-p="googlebusiness"><span>Connect Google Business</span><span class="state" id="s-googlebusiness"></span></button>
@@ -1220,13 +1227,23 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  var TOKEN = "__TOKEN__";
  var base = "/portal/" + encodeURIComponent(TOKEN);
  function setErr(m){ document.getElementById("err").textContent = m || ""; }
- // Reflect current IG/FB connection state (status endpoint tracks IG/FB only).
+ // Reflect every platform's live state so an owner can SEE what is still unlinked
+ // (Hill Country 2026-08-26: one Meta approval felt like all three, and nothing on
+ // this page said otherwise). Connected fills in green; the rest read "Not yet".
  fetch(base + "/social-status").then(function(r){return r.ok?r.json():null;}).then(function(j){
    if(!j||!j.platforms) return;
+   var done = 0;
    ["instagram","facebook","googlebusiness"].forEach(function(p){
      var st = j.platforms[p]||{}; var el = document.getElementById("s-"+p);
-     if(el && st.connected){ el.textContent = st.expired ? "Reconnect" : "Connected"; }
+     if(!el) return;
+     if(st.connected){ el.textContent = st.expired ? "Reconnect" : "Connected"; if(!st.expired) done++; }
+     else { el.textContent = "Not yet"; el.style.color = "#8FA3B8"; }
    });
+   var prog = document.getElementById("prog");
+   if(prog){
+     if(done >= 3){ prog.textContent = "All 3 connected. You are all set."; prog.style.color = "#157A47"; }
+     else { prog.textContent = done + " of 3 connected. " + (3-done) + " still to go."; }
+   }
  }).catch(function(){});
  document.querySelectorAll(".btn").forEach(function(b){
    b.addEventListener("click", function(){

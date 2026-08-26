@@ -455,6 +455,22 @@ def gbp_conn_sync_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_CONN_SYNC", "false"))
 
 
+def connection_watch_enabled() -> bool:
+    """
+    PARTIAL-CONNECTION WATCH switch (AGENT_CONNECTION_WATCH). OFF by default. When ON,
+    the loop checks each client gym's Zernio profile and fires ONE deduped ops alert
+    when a gym has connected SOME platforms but not all three (instagram, facebook,
+    googlebusiness) for longer than the grace window — the Hill Country case
+    (2026-08-26): the owner completed the Instagram OAuth, and because Meta's dialog
+    mentions Facebook Pages during that login, reasonably believed Facebook and Google
+    were connected too. Nothing alerted staff; the CLIENT had to report it. Read-only
+    against Zernio; alerts only, never publishes, never writes gym state.
+    Grace hours: AGENT_CONNECTION_WATCH_GRACE_HOURS (default 24).
+    Pace: at most one sweep per AGENT_CONNECTION_WATCH_EVERY_HOURS (default 6).
+    """
+    return _truthy(os.environ.get("AGENT_CONNECTION_WATCH", "false"))
+
+
 def reporting_enabled() -> bool:
     """
     30-day reporting switch. OFF by default. When OFF, fetch_insights() returns None

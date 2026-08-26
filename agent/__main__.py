@@ -220,6 +220,7 @@ def _status():
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
+    print(f"  conn_watch     : {config.connection_watch_enabled()}  (env AGENT_CONNECTION_WATCH; sweep client gyms every ~6h via Zernio; one deduped ops alert when a gym is partially connected past the 24h grace window — covers the Hill Country Instagram-only scenario; OFF => no sweep)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
@@ -1523,11 +1524,13 @@ def main(argv=None):
         else:
             form = link_for(account, kind="intake")
             upload = link_for(account, kind="u")
+            connect = link_for(account, kind="connect")
             if not os.environ.get("AGENT_UPLOAD_BASE_URL", "").strip():
                 print("note: AGENT_UPLOAD_BASE_URL not set; showing relative paths.")
             print(f"account : {account.strip().lower()}")
             print(f"intake  : {form}")
             print(f"upload  : {upload}")
+            print(f"connect : {connect}")
     elif cmd in ("intake-revoke", "intake-unrevoke"):
         # Kill (or restore) ONE gym's signed link via the R2 denylist, without
         # rotating the shared secret on everyone. Runs where R2 creds live.
