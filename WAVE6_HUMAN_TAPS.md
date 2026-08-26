@@ -96,20 +96,26 @@ AGENT_CALENDAR_GRADE=true
 
 ## TAP 3: Wave 7 Learning Loop Flags (AGENT_METRICS_SYNC, then AGENT_LEARNING_LOOP)
 
-**Status: STEPS 1 + 3 FLAGS ARMED 2026-08-26 on Blake's authorization. Step 2
-(the closed-month wait) is in progress; the first monthly_retro on real data
-has still NEVER run and stays a reviewed manual run.**
+**Status: DONE — completed 2026-08-26 on Blake's authorization ("finish tap 3").**
 
-Executed 2026-08-26: AGENT_METRICS_SYNC=true (nightly pull wired into the daily
-draw; calendar join fixed and verified live — Echo posts land matched, unknown
-posts land external and never train). AGENT_LEARNING_LOOP=true (lever stamping,
-experiment labeling, and playbook consumption armed — the playbook is empty so
-planner behavior is unchanged until the first retro writes one).
+Executed:
+- AGENT_METRICS_SYNC=true — nightly pull wired into the daily draw; calendar
+  join fixed and verified live (Echo posts land matched, unknown posts land
+  external and never train).
+- AGENT_LEARNING_LOOP=true — lever stamping, experiment labeling, playbook
+  consumption armed.
+- monthly_retro SCHEDULED: runs in the daily draw on/after the 5th for the
+  prior month, once per month (kv stamp monthly_retro_done_YYYY-MM).
+- FIRST REAL-DATA RETRO RUN (reviewed, 2026-08 partial): 6 retro rows written,
+  4 months correctly marked tainted (second publisher signals), 0 playbook
+  versions written — the guards held exactly as designed. Every gym got its
+  next-month experiment assigned. The playbook stays empty until a clean
+  closed month earns a change; September 2026 is the first candidate and the
+  first scheduled retro fires 2026-10-05.
 
-REMAINING: wait for the first FULL CLOSED MONTH of clean metrics (September
-2026 is the first candidate; August is tainted by the second publisher), then
-run the first monthly_retro manually per Step 3 below and review before
-trusting it. monthly_retro is deliberately NOT scheduled anywhere.
+The loop is closed: plan -> gate at A -> publish -> measure -> learn -> plan
+better. No human tap remains in the loop; the guards (taint, sample floor of
+6, two-month persistence, ±20% drift cap, PROTECTED_KEYS) protect every run.
 
 Order is strict, per gym: METRICS FIRST, RETRO ONLY AFTER A FULL CLOSED MONTH OF
 CLEAN METRICS.

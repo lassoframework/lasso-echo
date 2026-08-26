@@ -600,6 +600,30 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # MONTHLY RETRO (Wave 7.8, TAP 3 closed 2026-08-26): on/after the 5th, run
+    # the prior month's retro once (kv-stamped per month). Self-gates on
+    # AGENT_LEARNING_LOOP. The 7.4 honesty guards protect every run: a tainted
+    # or thin month is observed and stored but trains nothing — the playbook
+    # only moves on clean evidence within the ±20% bound.
+    if config.learning_loop_enabled():
+        try:
+            from datetime import date as _date
+            from . import db as _db
+            _today = _date.today()
+            if _today.day >= 5:
+                from .jobs.monthly_retro import prior_month, run as _retro_run
+                _pm = prior_month(_today)
+                _stamp = f"monthly_retro_done_{_pm}"
+                if not _db.kv_get(_stamp):
+                    _db.kv_set(_stamp, _today.isoformat())
+                    _rsum = _retro_run(month=_pm)
+                    print(f"[monthly-retro] {_pm}: "
+                          f"{len((_rsum or {}).get('gyms', []))} gym(s) processed")
+        except Exception as e:
+            print(f"[monthly-retro] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"monthly retro failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's
