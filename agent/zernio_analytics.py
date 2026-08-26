@@ -227,6 +227,7 @@ def _before_after(all_posts, in_window, days, cutoff, now):
                     if (after_lo is not None and now is not None) else months_window)
 
     reach_after = _per_month(_sum_present(after_posts, "reach"), after_months)
+    impressions_after = _per_month(_sum_present(after_posts, "impressions"), after_months)
     follows_after = _per_month(_sum_present(after_posts, "follows"), after_months)
     saves_after = _per_month(_sum_present(after_posts, "saves"), after_months)
     likes_after = _per_month(_sum_present(after_posts, "likes"), after_months)
@@ -234,6 +235,7 @@ def _before_after(all_posts, in_window, days, cutoff, now):
     shares_after = _per_month(_sum_present(after_posts, "shares"), after_months)
 
     reach_before = None
+    impressions_before = None
     follows_before = None
     saves_before = None
     likes_before = None
@@ -250,6 +252,8 @@ def _before_after(all_posts, in_window, days, cutoff, now):
         before_months = _months_between(earliest, cutoff)
         reach_before = _per_month(
             _sum_present_range(all_posts, "reach", None, cutoff), before_months)
+        impressions_before = _per_month(
+            _sum_present_range(all_posts, "impressions", None, cutoff), before_months)
         follows_before = _per_month(
             _sum_present_range(all_posts, "follows", None, cutoff), before_months)
         saves_before = _per_month(
@@ -268,6 +272,7 @@ def _before_after(all_posts, in_window, days, cutoff, now):
         # follows stays None.
         "followers_per_month": {"before": follows_before, "after": follows_after},
         "reach_per_month": {"before": reach_before, "after": reach_after},
+        "impressions_per_month": {"before": impressions_before, "after": impressions_after},
         "saves_per_month": {"before": saves_before, "after": saves_after},
         "likes_per_month": {"before": likes_before, "after": likes_after},
         "comments_per_month": {"before": comments_before, "after": comments_after},
@@ -445,7 +450,22 @@ def map_metrics(analytics_json, days, baseline_ppw, baseline_at,
     # cutoff comes from echo_start else baseline_captured_at; when neither exists the
     # 'before' legs stay null. learnings is None until a published month of data exists.
     echo_cut = _echo_cutoff(baseline_at, echo_start=echo_start)
+    basis = "pre_echo" if echo_cut is not None else None
+    # No pre-Echo baseline captured: fall back to a rolling TREND split so every metric
+    # still shows an honest before->after — a typical earlier month vs the recent window,
+    # up OR down, never fabricated. Only when real history exists OLDER than the window (a
+    # brand-new gym has no 'before' yet and correctly stays "so far"). basis tells the
+    # portal how to label it ("Before Echo" vs a neutral "Before -> Now" trend).
+    if echo_cut is None and isinstance(days, (int, float)) and days > 0:
+        from datetime import timedelta as _td2
+        trend_cut = now - _td2(days=float(days))
+        has_prior = any(((_parse_iso((p or {}).get("publishedAt")) or now) < trend_cut)
+                        for p in all_posts)
+        if has_prior:
+            echo_cut = trend_cut
+            basis = "trend"
     before_after = _before_after(all_posts, in_window, days, echo_cut, now)
+    before_after["basis"] = basis
     learnings = _learnings(published)
 
     return {

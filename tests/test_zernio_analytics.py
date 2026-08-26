@@ -406,16 +406,53 @@ def test_before_after_engagement_leg_null_and_present_zero():
 
 
 def test_before_after_no_overall_key():
-    """_before_after returns only the six per-month metrics; the portal derives 'overall'
-    from the four engagement metrics, so no 'overall' key is emitted here."""
+    """_before_after returns the seven per-month metrics (incl. impressions) plus a 'basis'
+    tag; the portal derives 'overall' from the engagement metrics, so no 'overall' key is
+    emitted here."""
     aj = {"hasAnalyticsAccess": True, "accounts": [], "posts": [
         _dated_post(2, analytics={"reach": 10})]}
     ba = za.map_metrics(aj, 30, None, None)["before_after"]
     assert "overall" not in ba
     assert set(ba.keys()) == {
-        "followers_per_month", "reach_per_month", "saves_per_month",
-        "likes_per_month", "comments_per_month", "shares_per_month",
+        "followers_per_month", "reach_per_month", "impressions_per_month", "saves_per_month",
+        "likes_per_month", "comments_per_month", "shares_per_month", "basis",
     }
+
+
+def test_before_after_trend_split_when_no_baseline():
+    """No pre-Echo baseline but real history older than the window -> a rolling TREND split:
+    basis='trend', and impressions (like every metric) gets an honest before->after (here a
+    DECLINE, never dressed up). A brand-new gym with only recent posts stays basis=None."""
+    now = datetime(2026, 8, 26, tzinfo=timezone.utc)
+    # Older posts (60-90d ago) strong; recent posts (within 30d) weaker -> honest decline.
+    old = [_dated_post(75, analytics={"reach": 500, "impressions": 900, "likes": 40}),
+           _dated_post(65, analytics={"reach": 500, "impressions": 900, "likes": 40})]
+    recent = [_dated_post(5, analytics={"reach": 100, "impressions": 180, "likes": 8})]
+    ba = za.map_metrics({"hasAnalyticsAccess": True, "accounts": [], "posts": old + recent},
+                        30, None, None, now=now)["before_after"]
+    assert ba["basis"] == "trend"
+    assert ba["impressions_per_month"]["before"] is not None
+    assert ba["impressions_per_month"]["after"] is not None
+    # honest direction: recent per-month impressions < prior per-month impressions
+    assert ba["impressions_per_month"]["after"] < ba["impressions_per_month"]["before"]
+
+    # Brand-new gym: only recent posts, nothing older than the window -> no 'before'.
+    ba_new = za.map_metrics({"hasAnalyticsAccess": True, "accounts": [], "posts": recent},
+                            30, None, None, now=now)["before_after"]
+    assert ba_new["basis"] is None
+    assert ba_new["impressions_per_month"]["before"] is None
+
+
+def test_before_after_basis_pre_echo_when_baseline_given():
+    """An explicit echo_start (a captured pre-Echo baseline) -> basis='pre_echo', so the
+    portal may honestly label it 'Before Echo'."""
+    now = datetime(2026, 8, 26, tzinfo=timezone.utc)
+    posts = [_dated_post(75, analytics={"reach": 500, "impressions": 900}),
+             _dated_post(5, analytics={"reach": 100, "impressions": 180})]
+    echo_start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    ba = za.map_metrics({"hasAnalyticsAccess": True, "accounts": [], "posts": posts},
+                        30, None, None, now=now, echo_start=echo_start)["before_after"]
+    assert ba["basis"] == "pre_echo"
 
 
 def test_learnings_from_top_posts():
