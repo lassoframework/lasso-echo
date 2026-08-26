@@ -360,6 +360,25 @@ def _daily_scheduler(store):
                 # AGENT_ZERNIO_PUBLISH (a no-op unless armed); one gym never blocks another.
                 calendar_autopublish.publish_client_gyms(
                     _local_today, notifier=ops_alerts._default_poster())
+                # Zernio profile re-link (hourly): a gym that connects Zernio mid-day
+                # gets its profile_id populated here so approved posts can publish
+                # the same day instead of waiting until the next morning's daily draw.
+                # Rate-limited to once/hour via kv; idempotent (skips already-linked gyms).
+                if config.zernio_profile_link_enabled():
+                    try:
+                        import time as _time
+                        from . import db as _db
+                        from .zernio_profile_link import link_client_profiles
+                        _link_ts = float(_db.kv_get("zernio_link_ts") or 0)
+                        if _time.time() - _link_ts > 3600:
+                            _db.kv_set("zernio_link_ts", str(_time.time()))
+                            _lsum = link_client_profiles()
+                            if _lsum.get("linked"):
+                                print(f"[zernio-profile-link] linked "
+                                      f"{_lsum['linked']} gym(s) mid-cycle")
+                    except Exception as _le:
+                        print(f"[zernio-profile-link] listener link failed: "
+                              f"{type(_le).__name__}: {_le}")
                 # Stale-'publishing' watchdog (alert-only, never reverts): a worker
                 # that died between the claim and the publish leaves a row stuck;
                 # this surfaces it to a human instead of silent forever-orphaning.
