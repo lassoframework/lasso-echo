@@ -76,11 +76,14 @@ class ZernioClient:
         import requests  # lazy, matches the repo pattern
         return requests
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, headers=None):
+        hdrs = {"Authorization": f"Bearer {self.api_key}"}
+        if headers:
+            hdrs.update(headers)
         r = self._client().get(
             self.base + path,
             params=params or {},
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers=hdrs,
             timeout=30,
         )
         if r.status_code >= 400:
@@ -180,6 +183,71 @@ class ZernioClient:
     def list_facebook_pages(self, account_id):
         """GET /v1/accounts/{id}/facebook-page -> {pages:[{_id,name}]}."""
         return self._get(f"/v1/accounts/{account_id}/facebook-page")
+
+    # ---- headless OAuth finalization (docs: "Standard vs Headless Mode") -----
+    # In headless mode Zernio does NOT auto-create the account after OAuth: it
+    # redirects the browser back to our redirect_url with tempToken/userProfile/
+    # step/connect_token (GBP: pendingDataToken, step=select_location) and the
+    # integrator must call the selection endpoints below to finalize. Without
+    # them every Facebook/Google grant is silently dropped (Hill Country,
+    # 2026-08-26). Tokens are FORWARDED, never logged.
+
+    def _connect_headers(self, connect_token):
+        """The X-Connect-Token header dict for a headless selection call, or None.
+        Docs: 'Use the X-Connect-Token header if connecting via API key' — Echo
+        always connects via API key, so the token is forwarded when present."""
+        return {"X-Connect-Token": str(connect_token)} if connect_token else None
+
+    def fb_pages_after_oauth(self, profile_id, temp_token, user_profile=None,
+                             connect_token=None):
+        """GET /v1/connect/facebook/select-page?profileId=..&tempToken=.. ->
+        {pages:[{id,name}]}: the FB Pages the user can manage after OAuth.
+        temp_token/user_profile come from the OAuth redirect params; user_profile
+        is passed through as the (decoded) JSON string when provided."""
+        params = {"profileId": str(profile_id), "tempToken": str(temp_token)}
+        if user_profile:
+            params["userProfile"] = user_profile
+        return self._get("/v1/connect/facebook/select-page", params,
+                         headers=self._connect_headers(connect_token))
+
+    def fb_select_page(self, profile_id, page_id, temp_token, user_profile=None,
+                       connect_token=None):
+        """POST /v1/connect/facebook/select-page: finalize the headless flow by
+        saving the selected Page — THIS is the call that creates the account on
+        the profile. Body per docs: {profileId, pageId, tempToken, userProfile}
+        where userProfile is the DECODED JSON object from the redirect param."""
+        payload = {"profileId": str(profile_id), "pageId": str(page_id),
+                   "tempToken": str(temp_token)}
+        if user_profile is not None:
+            payload["userProfile"] = user_profile
+        return self._post("/v1/connect/facebook/select-page", payload,
+                          headers=self._connect_headers(connect_token))
+
+    def gbp_locations_after_oauth(self, profile_id, pending_data_token,
+                                  connect_token=None):
+        """GET /v1/connect/googlebusiness/locations: the GBP locations the user
+        can manage after OAuth. Uses pendingDataToken (from the OAuth callback
+        redirect, step=select_location) WITHOUT consuming it, so it remains
+        valid for select-location."""
+        params = {"profileId": str(profile_id),
+                  "pendingDataToken": str(pending_data_token)}
+        return self._get("/v1/connect/googlebusiness/locations", params,
+                         headers=self._connect_headers(connect_token))
+
+    def gbp_select_location(self, profile_id, location_id, pending_data_token,
+                            account_id=None, connect_token=None):
+        """POST /v1/connect/googlebusiness/select-location: finalize the headless
+        GBP flow by saving the selected location (creates the account). Body per
+        docs: {profileId, locationId, pendingDataToken, accountId?} — tokens and
+        profile data are stored server-side, so no userProfile is sent. accountId
+        (the owning 'accounts/123' resource, returned per-location by the list
+        call) is recommended for accounts owning many locations."""
+        payload = {"profileId": str(profile_id), "locationId": str(location_id),
+                   "pendingDataToken": str(pending_data_token)}
+        if account_id:
+            payload["accountId"] = str(account_id)
+        return self._post("/v1/connect/googlebusiness/select-location", payload,
+                          headers=self._connect_headers(connect_token))
 
     def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
                     page_id=None, platform=None, story=False):
@@ -478,6 +546,36 @@ def map_pages(pages_json):
         if pid and name:
             out.append({"id": str(pid), "name": str(name)})
     return {"pages": out}
+
+
+def map_locations(locations_json):
+    """Zernio GBP {locations:[...]} -> portal {locations:[{id,name,account_id}]}.
+
+    Tolerant of key spellings (probing the live shape needs a real OAuth grant, so
+    the mapper accepts the documented variants): id from id/_id/locationId/name
+    (GBP resource names look like 'locations/123'), display name from
+    title/displayName/locationName/name, owning account from accountId/account.
+    Drops entries with no id. Never fabricates a name (falls back to the id)."""
+    raw = locations_json or {}
+    entries = raw.get("locations") if isinstance(raw, dict) else raw
+    if entries is None and isinstance(raw, dict):
+        entries = raw.get("data")
+    out = []
+    for loc in entries or []:
+        if not isinstance(loc, dict):
+            continue
+        lid = (loc.get("id") or loc.get("_id") or loc.get("locationId")
+               or loc.get("name"))
+        if not lid:
+            continue
+        name = (loc.get("title") or loc.get("displayName")
+                or loc.get("locationName"))
+        if not name and loc.get("name") and str(loc.get("name")) != str(lid):
+            name = loc.get("name")
+        acct = loc.get("accountId") or loc.get("account")
+        out.append({"id": str(lid), "name": str(name or lid),
+                    "account_id": str(acct) if acct else ""})
+    return {"locations": out}
 
 
 def facebook_account_id(accounts_json):

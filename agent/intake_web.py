@@ -1281,6 +1281,7 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <button class="btn" data-p="instagram"><span>Connect Instagram</span><span class="state" id="s-instagram"></span></button>
  <button class="btn" data-p="facebook"><span>Connect Facebook</span><span class="state" id="s-facebook"></span></button>
  <button class="btn" data-p="googlebusiness"><span>Connect Google Business</span><span class="state" id="s-googlebusiness"></span></button>
+ <div id="pick"></div>
  <div class="err" id="err"></div>
  <p class="note">Google Business needs a verified Google Business Profile. Nothing posts without
   your approval on every post.</p>
@@ -1310,6 +1311,86 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
        else { prog.textContent = done + " of 3 connected. " + (3-done) + " still to go."; }
      }
    }).catch(function(){});
+ }
+ // ---- headless OAuth RETURN leg (Hill Country 2026-08-26) -------------------
+ // After the owner approves on Facebook/Google, the flow bounces the browser back
+ // HERE with step + tempToken (GBP: pendingDataToken) query params. The account is
+ // NOT created yet at that point: this page must ask Echo to finish the selection,
+ // or the whole grant is silently dropped. One page or location finishes itself;
+ // several render a picker below; zero or an expired link say so honestly.
+ var _qp = new URLSearchParams(window.location.search);
+ var PLATFORM_LABEL = {facebook:"Facebook", googlebusiness:"Google Business"};
+ function stripReturnParams(){
+   history.replaceState(null, "", window.location.pathname);
+ }
+ function returnParams(){
+   return { step: _qp.get("step") || "", platform: _qp.get("platform") || "",
+            tempToken: _qp.get("tempToken") || "",
+            userProfile: _qp.get("userProfile") || "",
+            connect_token: _qp.get("connect_token") || "",
+            pendingDataToken: _qp.get("pendingDataToken") || "" };
+ }
+ function setProg(m, ok){
+   var prog = document.getElementById("prog");
+   if(prog){ prog.textContent = m || ""; prog.style.color = ok ? "#157A47" : "#5EB9E6"; }
+ }
+ function finishConnection(choiceId){
+   var body = returnParams();
+   if(choiceId) body.choice_id = choiceId;
+   var label = PLATFORM_LABEL[body.step === "select_location" ? "googlebusiness" : "facebook"];
+   setProg("Finishing your " + label + " connection...");
+   fetch(base + "/connect/finalize", {method:"POST",
+         headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res){
+      var j = res.j || {};
+      if(res.ok && j.finalized){
+        stripReturnParams();
+        document.getElementById("pick").innerHTML = "";
+        setProg(label + " is connected.", true);
+        refreshStatus();
+        return;
+      }
+      if(res.ok && j.options && j.options.length === 0){
+        stripReturnParams(); setProg("");
+        setErr("The " + label + " login you used does not manage any " +
+               (label === "Facebook" ? "Facebook Pages" : "business locations") +
+               ". Please log in with the account that owns your " +
+               (label === "Facebook" ? "page" : "listing") +
+               ", then tap " + label + " to try again.");
+        return;
+      }
+      if(res.ok && j.options && j.options.length > 1){
+        setProg("Almost done. Which one should we publish to?");
+        var pick = document.getElementById("pick");
+        pick.innerHTML = "";
+        j.options.forEach(function(o){
+          var b = document.createElement("button");
+          b.className = "btn";
+          b.textContent = o.name || o.id;
+          b.addEventListener("click", function(){
+            if(b.classList.contains("busy")) return;
+            b.classList.add("busy"); setErr("");
+            finishConnection(o.id);
+          });
+          pick.appendChild(b);
+        });
+        return;
+      }
+      // Expired/used link or any other failure: honest message, never a silent bounce.
+      stripReturnParams(); setProg("");
+      document.getElementById("pick").innerHTML = "";
+      setErr("That link expired before we could finish. Tap " + label +
+             " below to try again.");
+    })
+    .catch(function(){
+      setProg("");
+      setErr("Network error while finishing the connection. Tap " +
+             (label || "the platform") + " below to try again.");
+    });
+ }
+ if(_qp.get("step") && (_qp.get("tempToken") || _qp.get("pendingDataToken"))){
+   finishConnection("");
  }
  // Reflect every platform's live state so an owner can SEE what is still unlinked
  // (Hill Country 2026-08-26: one Meta approval felt like all three, and nothing on
@@ -1914,6 +1995,28 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 status, resp = _zr.handle_facebook_page_select(account_key, body.get("page_id", ""))
+                return self._send_json(resp, status)
+
+            # Zernio headless OAuth FINALIZE: POST /portal/<token>/connect/finalize.
+            # The connect page forwards the OAuth return-leg params (step, tempToken,
+            # userProfile, connect_token, pendingDataToken) plus an optional choice_id;
+            # Echo lists the pages/locations and completes the selection against Zernio
+            # (auto-selecting when there is exactly one). Token->account; revoked = 404.
+            # POST (not GET) so the temp tokens ride the body, never a loggable path.
+            m_finalize = re.match(r"^/portal/([A-Za-z0-9_.-]{8,})/connect/finalize$",
+                                  self.path.split("?")[0])
+            if m_finalize:
+                account_key = client_for_token(m_finalize.group(1))
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                status, resp = _zr.handle_connect_finalize(account_key, body)
                 return self._send_json(resp, status)
 
             # Zernio DISCONNECT: POST /portal/<token>/social-disconnect?platform=instagram|facebook.

@@ -11,7 +11,10 @@ Portal contract (these return exactly what the portal expects Echo to return):
   GET  social-status             -> {platforms:{instagram:{connected,handle,expired}, facebook:{...}}}
   GET  facebook-pages            -> {pages:[{id,name}]}
   POST facebook-page-select      -> {ok}
+  POST connect/finalize          -> {ok, finalized, platform, selected?|options?} (headless OAuth return leg)
 """
+
+import json as _json
 
 from . import config, db as _db
 from . import zernio as _z
@@ -324,6 +327,206 @@ def handle_facebook_pages(account_key, client=None):
     except Exception as exc:
         return 502, {"error": f"zernio call failed: {type(exc).__name__}"}
     return 200, _z.map_pages(pages)
+
+
+def headless_params(source):
+    """Normalize the Zernio headless-OAuth redirect params from a query string or a
+    dict (the connect page forwards them as JSON) into one canonical dict:
+      {step, platform, temp_token, user_profile (DECODED dict or None),
+       user_profile_raw (JSON string or ''), connect_token, pending_data_token}
+
+    Zernio's redirect (docs 'Standard vs Headless Mode') carries tempToken,
+    userProfile (URL-encoded JSON), step, connect_token; Google Business
+    additionally carries pendingDataToken (step=select_location). PURE: no I/O,
+    never logs — the values are secrets-adjacent tokens."""
+    if isinstance(source, str):
+        from urllib.parse import urlsplit, parse_qs
+        qs = urlsplit(source).query or (source if "=" in source else "")
+        parsed = parse_qs(qs)
+        src = {k: v[0] for k, v in parsed.items() if v}
+    elif isinstance(source, dict):
+        src = source
+    else:
+        src = {}
+
+    def _s(*names):
+        for n in names:
+            v = src.get(n)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    raw_profile = src.get("userProfile") or src.get("user_profile") or ""
+    profile = None
+    if isinstance(raw_profile, dict):
+        profile = raw_profile
+        raw_profile = _json.dumps(raw_profile)
+    elif raw_profile:
+        raw_profile = str(raw_profile)
+        # Tolerate a still URL-encoded value (a client that forwarded the raw param).
+        candidate = raw_profile
+        if "%" in candidate and "{" not in candidate:
+            from urllib.parse import unquote
+            candidate = unquote(candidate)
+        try:
+            decoded = _json.loads(candidate)
+            if isinstance(decoded, dict):
+                profile = decoded
+                raw_profile = candidate
+        except (ValueError, TypeError):
+            profile = None
+    else:
+        raw_profile = ""
+
+    return {
+        "step": _s("step"),
+        "platform": _s("platform"),
+        "temp_token": _s("tempToken", "temp_token"),
+        "user_profile": profile,
+        "user_profile_raw": raw_profile,
+        "connect_token": _s("connect_token", "connectToken"),
+        "pending_data_token": _s("pendingDataToken", "pending_data_token"),
+    }
+
+
+def _store_fb_page_id(account_key, page_id):
+    """Persist gyms.zernio_default_fb_page_id (the publisher requires it). Preserves
+    display_name per the gym_upsert contract. Returns True on success."""
+    try:
+        existing = _db.gym_get(account_key) or {}
+        _db.gym_upsert(account_key,
+                       display_name=existing.get("display_name") or "",
+                       zernio_default_fb_page_id=str(page_id))
+        return True
+    except Exception:  # noqa: BLE001 - the connection itself succeeded; report, don't lose it
+        return False
+
+
+def _account_row_id(accounts_json, platform):
+    """Any Zernio account _id of `platform` under the profile ('' if none) — the
+    existence check after a headless finalize (a just-created account counts even
+    if Zernio's list momentarily omits status fields)."""
+    for a in (accounts_json or {}).get("accounts") or []:
+        if isinstance(a, dict) and (a.get("platform") or "").lower() == platform \
+                and a.get("_id"):
+            return str(a["_id"])
+    return ""
+
+
+def _finalize_facebook(account_key, pid, page, params, c):
+    """Finalize ONE chosen Facebook page: select it in Zernio, VERIFY the account
+    row now exists, then persist the page id for the publisher. Returns (status, dict)."""
+    c.fb_select_page(pid, page["id"], params["temp_token"],
+                     user_profile=params["user_profile"],
+                     connect_token=params["connect_token"] or None)
+    # Only claim success (and only store the page binding) after the account row
+    # is REALLY there — the exact class of silent failure this flow fixes.
+    acct_id = _account_row_id(c.list_accounts(pid), "facebook")
+    if not acct_id:
+        return 502, {"error": "the connection did not complete",
+                     "detail": "no Facebook account appeared after selection"}
+    stored = _store_fb_page_id(account_key, page["id"])
+    out = {"ok": True, "finalized": True, "platform": "facebook",
+           "selected": {"id": page["id"], "name": page.get("name") or ""}}
+    if not stored:
+        out["warning"] = "connected, but the page binding could not be stored"
+    return 200, out
+
+
+def _finalize_googlebusiness(account_key, pid, loc, params, c):
+    """Finalize ONE chosen Google Business location and verify the account row."""
+    c.gbp_select_location(pid, loc["id"], params["pending_data_token"],
+                          account_id=loc.get("account_id") or None,
+                          connect_token=params["connect_token"] or None)
+    acct_id = _account_row_id(c.list_accounts(pid), "googlebusiness")
+    if not acct_id:
+        return 502, {"error": "the connection did not complete",
+                     "detail": "no Google Business account appeared after selection"}
+    return 200, {"ok": True, "finalized": True, "platform": "googlebusiness",
+                 "selected": {"id": loc["id"], "name": loc.get("name") or ""}}
+
+
+def handle_connect_finalize(account_key, body, client=None):
+    """POST /portal/<token>/connect/finalize — the headless OAuth RETURN leg.
+
+    In headless mode Zernio does not create the account after OAuth; it bounces the
+    browser back to the connect page with tempToken/userProfile/step/connect_token
+    (GBP: pendingDataToken, step=select_location) and the integrator must call the
+    selection endpoints. Echo had ZERO handling for that return leg, so every
+    Facebook/Google grant was silently dropped (Hill Country, 2026-08-26). This
+    handler closes the loop:
+
+      body = the redirect params (forwarded by the connect page JS) + optionally
+             {choice_id, choice_name, choice_account_id} once the owner has picked.
+
+      * no choice + EXACTLY ONE page/location -> auto-select it server-side
+        (the common gym case) and return {finalized:true, selected}.
+      * no choice + several -> {finalized:false, options:[{id,name}]} for the
+        branded picker. ZERO -> {finalized:false, options:[]} (the login used has
+        no page access; the page says so honestly).
+      * choice_id present -> finalize that one.
+
+    A Zernio 4xx (expired/used tempToken) returns 400 {expired:true} so the page
+    can say "that link expired" instead of silently bouncing. On a successful
+    Facebook finalize the gym row's zernio_default_fb_page_id is upserted — but
+    only after re-checking list_accounts confirms the account was created."""
+    if not config.zernio_enabled():
+        return _disabled("connect-finalize")
+    if not account_key:
+        return 400, {"error": "missing account_key"}
+    params = headless_params(body if isinstance(body, dict) else {})
+    step = params["step"]
+    if step not in ("select_page", "select_location"):
+        return 400, {"error": "step must be select_page or select_location"}
+    if step == "select_page" and not params["temp_token"]:
+        return 400, {"error": "missing tempToken"}
+    if step == "select_location" and not (params["pending_data_token"]
+                                          or params["temp_token"]):
+        return 400, {"error": "missing pendingDataToken"}
+    if step == "select_location" and not params["pending_data_token"]:
+        # Docs say GBP sends pendingDataToken; tolerate a tempToken-only redirect.
+        params["pending_data_token"] = params["temp_token"]
+
+    pid = _resolve_profile_id(account_key)
+    if not pid:
+        return 400, {"error": "no social profile yet; start the connection again"}
+
+    body = body if isinstance(body, dict) else {}
+    choice_id = str(body.get("choice_id") or "").strip()
+    c = _client(client)
+    try:
+        if step == "select_page":
+            listed = _z.map_pages(c.fb_pages_after_oauth(
+                pid, params["temp_token"],
+                user_profile=params["user_profile_raw"] or None,
+                connect_token=params["connect_token"] or None))
+            options = listed["pages"]
+            platform, finalize = "facebook", _finalize_facebook
+        else:
+            listed = _z.map_locations(c.gbp_locations_after_oauth(
+                pid, params["pending_data_token"],
+                connect_token=params["connect_token"] or None))
+            options = listed["locations"]
+            platform, finalize = "googlebusiness", _finalize_googlebusiness
+
+        if choice_id:
+            chosen = next((o for o in options if o["id"] == choice_id), None)
+            if chosen is None:
+                return 400, {"error": "that choice is not one of the available "
+                                      "options"}
+            return finalize(account_key, pid, chosen, params, c)
+        if len(options) == 1:
+            return finalize(account_key, pid, options[0], params, c)
+        return 200, {"ok": True, "finalized": False, "platform": platform,
+                     "options": options}
+    except _z.ZernioError as exc:
+        if 400 <= exc.status < 500:
+            # Expired/used tempToken or a rejected selection: honest, retryable.
+            return 400, {"error": f"zernio {exc.status}", "expired": True,
+                         "detail": exc.detail}
+        return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
+    except Exception as exc:  # network/parse: honest, never a silent bounce
+        return 502, {"error": f"zernio call failed: {type(exc).__name__}"}
 
 
 def handle_facebook_page_select(account_key, page_id, client=None):
