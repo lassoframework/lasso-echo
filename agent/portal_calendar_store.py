@@ -215,6 +215,52 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
 
+    def deny_with_reason(self, account_key, row_id, reject_reason):
+        """PATCH one row to status='denied' and reject_reason=<reject_reason>,
+        filtered by BOTH id AND gym_id so a row belonging to another gym is
+        never touched. Used by the dedupe_forward_book job (Wave 0.2).
+        Returns the updated row dict, or None when zero rows matched."""
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        for row in rows:
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
+    def list_pending_future(self, account_key, today_iso):
+        """Return all content_calendar rows for account_key where status='pending'
+        and post_date > today_iso. Used by the dedupe_forward_book job."""
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "status": "eq.pending",
+            "post_date": f"gt.{today_iso}",
+            "order": "post_date",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
         belongs to another gym can never be deleted through this account_key. Returns the

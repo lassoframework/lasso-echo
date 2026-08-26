@@ -1737,3 +1737,16 @@ def sb7_model() -> str:
     """Claude model for SB7 caption generation (env AGENT_SB7_MODEL).
     Defaults to Haiku 4.5 for speed and cost."""
     return os.environ.get("AGENT_SB7_MODEL", "claude-haiku-4-5-20251001")
+
+
+def dedupe_forward_book_enabled() -> bool:
+    """
+    Forward-book deduplication job switch. OFF by default. When OFF, the job
+    `agent/jobs/dedupe_forward_book.py` is a no-op (dry-run only) and makes no
+    writes to content_calendar. When ON, the job groups future pending rows per
+    gym by caption_hash, keeps the earliest occurrence, and moves the rest to
+    'denied' with reject_reason='duplicate_purge_2026_08' via
+    portal_calendar_store. Arm by hand in Railway env; only Blake enables this.
+    This is a one-shot Wave 0 cleanup job — it is not part of the daily runner.
+    """
+    return _truthy(os.environ.get("AGENT_DEDUPE_FORWARD_BOOK", "false"))

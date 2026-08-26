@@ -191,6 +191,7 @@ def _status():
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
+    print(f"  dedupe_fwd_book : {config.dedupe_forward_book_enabled()}  (env AGENT_DEDUPE_FORWARD_BOOK; Wave 0.2 one-shot dedup job, default OFF)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")
