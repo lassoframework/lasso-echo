@@ -146,7 +146,7 @@ def test_valid_token_lands_pending_sources(server, monkeypatch):
     # the HELD proposal carries basics + approver, not applied live
     prop = json.loads(db.kv_get("account_proposal_gym_alpha_ig"))
     assert prop["gym_name"] == "Gym Alpha"
-    assert prop["ig_handle"] == "@gymalpha"
+    assert prop["ig_handle"] == "gymalpha"  # @ stripped at normalize
     assert prop["approver_name"] == "Alex Alpha (Owner)"
     assert "3175550100" in prop["approver_contact"]
 

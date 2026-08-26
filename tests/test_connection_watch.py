@@ -147,6 +147,21 @@ def test_connect_page_says_each_platform_needs_its_own_approval():
     assert 'id="prog"' in CONNECT_PAGE
 
 
+def test_connect_page_opens_oauth_in_new_tab_and_polls_on_focus():
+    """OAuth must open in _blank so the original page stays alive to detect return.
+    Hill Country 2026-08-26: window.location.href navigated the same tab away,
+    leaving no mechanism to update the connected badges afterward."""
+    from agent.intake_web import CONNECT_PAGE
+    # New tab — NOT same-tab navigation
+    assert 'window.open(url, "_blank"' in CONNECT_PAGE
+    assert "window.location.href = url" not in CONNECT_PAGE
+    # Focus listener re-polls when user returns from the OAuth window
+    assert 'addEventListener("focus"' in CONNECT_PAGE
+    assert "refreshStatus" in CONNECT_PAGE
+    # Backup interval poll so mobile/embedded contexts work too
+    assert "setInterval" in CONNECT_PAGE
+
+
 def test_connect_link_kind(monkeypatch):
     """kind='connect' mints the /portal/<token>/connect URL."""
     import agent.intake_web as iw

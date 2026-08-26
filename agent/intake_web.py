@@ -483,49 +483,111 @@ def normalize_portal_intake(body):
     """The portal's nested 7-section JSON flattened to the intake answers shape
     the listener's ingest already lands (fact sections -> PENDING sources; gym
     basics + approver -> the HELD account proposal; the rest is bible material
-    kept in the archived payload)."""
+    kept in the archived payload).
+
+    New fields added 2026-08-26 (form v2):
+      gym.about            -> about  (fills the 'about' source category; was always "")
+      gym.google_business  -> google_business (GBP profile name/URL; in proposal)
+      gym.gym_type         -> prepended to about
+      voice.content_goal   -> appended to voice block
+      voice.hashtags       -> appended to voice block
+      offers.upcoming_promos -> appended to offers
+      audience.age_range   -> prepended to audience block
+      media (object)       -> structured media_notes (has_media / hero_shots / off_limits / notes)
+      approver.best_time   -> appended to approver_contact
+      approver.upload_contact -> appended to approver_contact
+    """
     body = body or {}
     gym = body.get("gym") or {}
     voice = body.get("voice") or {}
     offers = body.get("offers") or {}
     audience = body.get("audience") or {}
     proof = body.get("proof") or {}
+    media = body.get("media") or {}
     approver = body.get("approver") or {}
 
+    # -- Voice --
     voice_parts = [
         f"Vibe: {_lines(voice.get('vibe'))}" if voice.get("vibe") else "",
+        f"Content goal: {_lines(voice.get('content_goal'))}"
+        if voice.get("content_goal") else "",
         f"Words to use: {_lines(voice.get('words_to_use'))}"
         if voice.get("words_to_use") else "",
         f"Words to never use: {_lines(voice.get('words_to_never_use'))}"
         if voice.get("words_to_never_use") else "",
+        f"Hashtags: {_lines(voice.get('hashtags'))}"
+        if voice.get("hashtags") else "",
         f"Sample posts: {_lines(voice.get('sample_post_links'))}"
         if voice.get("sample_post_links") else "",
     ]
+
+    # -- Audience --
     audience_parts = [
+        f"Age range: {_lines(audience.get('age_range'))}"
+        if audience.get("age_range") else "",
         f"Ideal member: {_lines(audience.get('ideal_member'))}"
         if audience.get("ideal_member") else "",
         f"Prior struggles: {_lines(audience.get('prior_struggles'))}"
         if audience.get("prior_struggles") else "",
     ]
+
+    # -- About: gym_type prefix + story --
+    about_parts = [
+        f"Type: {str(gym.get('gym_type', '')).strip()}"
+        if gym.get("gym_type") else "",
+        _lines(gym.get("about")) or "",
+    ]
+    about_text = "\n".join(p for p in about_parts if p)
+
+    # -- Offers: front_door + upcoming promos --
+    offers_parts = [
+        _lines(offers.get("front_door_offer")) or "",
+        f"Upcoming promos: {_lines(offers.get('upcoming_promos'))}"
+        if offers.get("upcoming_promos") else "",
+    ]
+    offers_text = "\n".join(p for p in offers_parts if p)
+
+    # -- Media notes: structured object (v2) or legacy string (v1) --
+    if media:
+        media_parts = [
+            f"Has media: {_lines(media.get('has_media'))}" if media.get("has_media") else "",
+            f"Hero shots: {_lines(media.get('hero_shots'))}" if media.get("hero_shots") else "",
+            f"Off limits: {_lines(media.get('off_limits'))}" if media.get("off_limits") else "",
+            f"Notes: {_lines(media.get('notes'))}" if media.get("notes") else "",
+        ]
+        media_notes_text = "\n".join(p for p in media_parts if p)
+    else:
+        media_notes_text = _lines(body.get("media_notes")) or ""
+
+    # -- Approver --
     name = str(approver.get("name", "")).strip()
     role = str(approver.get("role", "")).strip()
-    contact = ", ".join(v for v in (str(approver.get("cell", "")).strip(),
-                                    str(approver.get("email", "")).strip()) if v)
+    contact_parts = [
+        str(approver.get("cell", "")).strip(),
+        str(approver.get("email", "")).strip(),
+    ]
+    if approver.get("best_time"):
+        contact_parts.append(f"best time: {str(approver.get('best_time', '')).strip()}")
+    if approver.get("upload_contact"):
+        contact_parts.append(f"uploads: {str(approver.get('upload_contact', '')).strip()}")
+    contact = ", ".join(v for v in contact_parts if v)
+
     return {
         "gym_name": str(gym.get("name", "")).strip(),
         "city": _lines(gym.get("locations")),
         "website": str(gym.get("website", "")).strip(),
-        "ig_handle": str(gym.get("ig_handle", "")).strip(),
+        "ig_handle": str(gym.get("ig_handle", "")).strip().lstrip("@"),
         "fb_page": str(gym.get("fb_page", "")).strip(),
-        "about": "",
+        "google_business": str(gym.get("google_business", "")).strip(),
+        "about": about_text,
         "voice": "\n".join(p for p in voice_parts if p),
-        "offers": _lines(offers.get("front_door_offer")),
+        "offers": offers_text,
         "services": _lines(offers.get("services")),
         "pricing_rule": _lines(offers.get("exact_pricing_wording")),
         "audience": "\n".join(p for p in audience_parts if p),
         "proof": "\n".join(v for v in (_lines(proof.get("wins")),
                                        _lines(proof.get("verifiable_numbers"))) if v),
-        "media_notes": _lines(body.get("media_notes")),
+        "media_notes": media_notes_text,
         "approver_name": f"{name} ({role})" if name and role else (name or role),
         "approver_contact": contact,
     }
@@ -1226,40 +1288,63 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <script>
  var TOKEN = "__TOKEN__";
  var base = "/portal/" + encodeURIComponent(TOKEN);
+ var _pollTimer = null;
+ var _pollCount = 0;
  function setErr(m){ document.getElementById("err").textContent = m || ""; }
+ // Fetch live platform status and update every badge + the progress line.
+ function refreshStatus(){
+   fetch(base + "/social-status").then(function(r){return r.ok?r.json():null;}).then(function(j){
+     if(!j||!j.platforms) return;
+     var done = 0;
+     ["instagram","facebook","googlebusiness"].forEach(function(p){
+       var st = j.platforms[p]||{}; var el = document.getElementById("s-"+p);
+       if(!el) return;
+       if(st.connected){ el.textContent = st.expired ? "Reconnect" : "Connected";
+                         el.style.color = "#157A47"; if(!st.expired) done++; }
+       else { el.textContent = "Not yet"; el.style.color = "#8FA3B8"; }
+     });
+     var prog = document.getElementById("prog");
+     if(prog){
+       if(done >= 3){ prog.textContent = "All 3 connected. You are all set."; prog.style.color = "#157A47";
+                      clearInterval(_pollTimer); _pollTimer = null; }
+       else { prog.textContent = done + " of 3 connected. " + (3-done) + " still to go."; }
+     }
+   }).catch(function(){});
+ }
  // Reflect every platform's live state so an owner can SEE what is still unlinked
  // (Hill Country 2026-08-26: one Meta approval felt like all three, and nothing on
  // this page said otherwise). Connected fills in green; the rest read "Not yet".
- fetch(base + "/social-status").then(function(r){return r.ok?r.json():null;}).then(function(j){
-   if(!j||!j.platforms) return;
-   var done = 0;
-   ["instagram","facebook","googlebusiness"].forEach(function(p){
-     var st = j.platforms[p]||{}; var el = document.getElementById("s-"+p);
-     if(!el) return;
-     if(st.connected){ el.textContent = st.expired ? "Reconnect" : "Connected"; if(!st.expired) done++; }
-     else { el.textContent = "Not yet"; el.style.color = "#8FA3B8"; }
-   });
-   var prog = document.getElementById("prog");
-   if(prog){
-     if(done >= 3){ prog.textContent = "All 3 connected. You are all set."; prog.style.color = "#157A47"; }
-     else { prog.textContent = done + " of 3 connected. " + (3-done) + " still to go."; }
-   }
- }).catch(function(){});
+ refreshStatus();
+ // When the user returns to this tab after completing OAuth in the new window,
+ // the focus event fires and we re-poll immediately. A backup interval keeps
+ // polling every 4 seconds for up to 3 minutes in case focus does not fire.
+ window.addEventListener("focus", function(){ refreshStatus(); });
  document.querySelectorAll(".btn").forEach(function(b){
    b.addEventListener("click", function(){
      if(b.classList.contains("busy")) return;
      setErr(""); b.classList.add("busy");
-     // Return the owner to THIS connect page after OAuth (so they see the updated
-     // "Connected" status and can link the next platform). Passing our own return URL
-     // also makes the "never land on the Zernio dashboard/pricing page" guarantee
-     // explicit at the call site, not reliant on the server-side fallback alone.
      var ret = window.location.origin + window.location.pathname;
      fetch(base + "/social-connect?platform=" + encodeURIComponent(b.dataset.p)
            + "&redirect_url=" + encodeURIComponent(ret))
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
       .then(function(res){
         var url = res.j && res.j.oauth_url;
-        if(res.ok && url){ window.location.href = url; }
+        if(res.ok && url){
+          // Open OAuth in a NEW tab so this page stays alive and can detect the return.
+          // Hill Country 2026-08-26: navigating the same tab away meant the status
+          // fetch never ran again, so badges were permanently stuck on "Not yet".
+          window.open(url, "_blank", "noopener");
+          b.classList.remove("busy");
+          // Start backup polling (4s, max 45 ticks = 3 min) to catch the return even
+          // if focus event does not fire (e.g. mobile Safari, embedded webview).
+          if(_pollTimer) clearInterval(_pollTimer);
+          _pollCount = 0;
+          _pollTimer = setInterval(function(){
+            _pollCount++;
+            refreshStatus();
+            if(_pollCount >= 45){ clearInterval(_pollTimer); _pollTimer = null; }
+          }, 4000);
+        }
         else { b.classList.remove("busy"); setErr((res.j && (res.j.detail||res.j.error)) || "Could not start the connection. Please try again."); }
       })
       .catch(function(){ b.classList.remove("busy"); setErr("Network error. Please try again."); });

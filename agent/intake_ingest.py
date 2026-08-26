@@ -292,7 +292,7 @@ def _land_intake_form(client, payload, r2, key, manifest):
     # UPDATES the pending proposal rather than stacking a second one.
     proposal = {k: (answers.get(k) or "").strip()
                 for k in ("gym_name", "city", "website", "ig_handle", "fb_page",
-                          "approver_name", "approver_contact")}
+                          "google_business", "approver_name", "approver_contact")}
     if any(proposal.values()):
         db.kv_set(f"account_proposal_{client}", json.dumps(
             {**proposal, "timestamp": payload.get("timestamp", "")}))
