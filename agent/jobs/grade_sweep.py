@@ -105,9 +105,6 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     """
     from agent import config
 
-    if not config.calendar_grade_enabled():
-        return {"ok": False, "reason": "AGENT_CALENDAR_GRADE is OFF"}
-
     from agent.calendar_grade import grade_month
     from agent.real_month_planner import _profile_for
 
@@ -132,6 +129,15 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         gyms = client_gym_bases() or []
         if "lasso" not in gyms:
             gyms = ["lasso"] + list(gyms)
+
+    # Per-gym rollout: sweep any gym whose per-gym flag (or the global flag)
+    # is on. A sweep gated only on the global flag would skip every gym during
+    # the gym-by-gym rollout, which is exactly when the nightly grades matter.
+    gyms = [g for g in gyms if config.calendar_grade_enabled_for(g)]
+    if not gyms:
+        return {"ok": False,
+                "reason": "AGENT_CALENDAR_GRADE off for every requested gym "
+                          "(per-gym AGENT_CALENDAR_GRADE_{GYM} and global both false)"}
 
     results = {}
     for gym_id in gyms:

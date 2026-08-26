@@ -569,6 +569,21 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"Zernio profile link failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # CALENDAR GRADE SWEEP (Wave 6 rollout, 2026-08-26): nightly grades for every
+    # gym whose AGENT_CALENDAR_GRADE_{GYM} (or the global flag) is on. The sweep
+    # itself filters to enabled gyms and no-ops when none qualify; read + grade +
+    # gym_social_grades write only, never touches the calendar. Isolated: a sweep
+    # failure never blocks the draft run.
+    try:
+        from .jobs.grade_sweep import run as _grade_sweep_run
+        _gsum = _grade_sweep_run()
+        if _gsum.get("ok"):
+            print(f"[grade-sweep] swept {len(_gsum.get('gyms', {}))} gym(s)")
+    except Exception as e:
+        print(f"[grade-sweep] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"calendar grade sweep failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     for account in (accounts or active_accounts()):
         # FLEET ISOLATION (flagless hardening): one account's API error,
         # missing token, or empty library never blocks another account's

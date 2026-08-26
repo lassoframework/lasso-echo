@@ -219,12 +219,17 @@ def run(gyms=None, store=None) -> list:
     """
     from agent import config
 
-    if not config.calendar_grade_enabled():
-        return ["[rollout-digest] AGENT_CALENDAR_GRADE is OFF. No digest produced. "
-                "Flip the flag per WAVE6_HUMAN_TAPS.md then re-run."]
-
     if gyms is None:
         gyms = _default_gyms()
+
+    # Per-gym rollout: a gym qualifies for a digest when its own flag or the
+    # global flag is on. Gating only on the global flag would blank the digest
+    # during the gym-by-gym rollout, which is exactly when it is needed.
+    gyms = [g for g in gyms if config.calendar_grade_enabled_for(g)]
+    if not gyms:
+        return ["[rollout-digest] AGENT_CALENDAR_GRADE is OFF for every requested "
+                "gym (per-gym and global). Flip a flag per WAVE6_HUMAN_TAPS.md "
+                "then re-run."]
 
     digests = []
     for gym_id in gyms:
