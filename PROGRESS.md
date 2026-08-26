@@ -6,7 +6,43 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-06
+Last updated: 2026-08-26
+
+---
+
+## Wave 1 — copy_gate.py single dash gate, 9 call sites migrated (2026-08-26)
+
+### [x] agent/copy_gate.py created
+Single house-style gate for every piece of client-facing text Echo emits.
+Functions: scrub() (rewrite, never reject), violations() (hard failures),
+soft_flags() (quality flags for calendar grader), ASK_RE (CTA detection).
+URL/handle/hashtag hyphens pass through untouched. Intraword hyphens
+become spaces. Banned dashes (em/en/figure/bar/minus) become ", ".
+
+### [x] 9 call sites migrated to copy_gate
+Files that shrunk their local dash logic:
+- welcome_review.py: no_banned_copy() now delegates to copy_gate.violations()
+- video_editor.py: build_higgsfield_prompt() uses copy_gate.scrub()
+- creative_studio.py: _scrub_dashes() delegates to copy_gate._DASH_RE (prompt
+  text only; intraword hyphens like 'left-aligned' preserved in prompts)
+- voice_template.py: render_template() assertion delegates to copy_gate.violations()
+- weekly_report.py: build_report() assertion delegates to copy_gate.violations()
+- pdf_report.py: _scrub() applies PDF typography then copy_gate.scrub()
+- podcast_quote_card.py: _guard_verbatim() uses copy_gate.violations() + hyphen check
+- no_creative_fallback.py: _clean() delegates to copy_gate.scrub()
+- clipper_render.py: scrub_onscreen() delegates to copy_gate.scrub()
+Also migrated: content_categories.py, podcast_release.py (found by repo-wide guard).
+Backward-compat shim (_DashRE) added to podcast_release for existing importers
+(podcast_cards, podcast_learn, podcast_month, podcast_touches).
+
+### [x] tests/test_copy_gate.py — 26 tests, all green
+Tests 1-6: scrub() rewrites (em dash, en dash, intraword hyphen, URL, handle, tag).
+Tests 7-9: violations() hard failures.
+Test 10: ASK_RE matches 13 CTA phrases.
+Tests 11-13: soft_flags() quality flags.
+Test 14: repo-wide guard (zero local _DASH_RE definitions outside copy_gate.py).
+
+Full suite: 2430 passed, 4 pre-existing higgsfield failures (unrelated), 0 new failures.
 
 ---
 

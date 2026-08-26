@@ -50,8 +50,7 @@ PLATFORM_SUBTOPICS = (
 # Regex patterns for the wording filter
 _VENDOR_LOGINS_RE = re.compile(r'\bvendors?\s+logins?\b', re.IGNORECASE)
 _VENDOR_RE = re.compile(r'\bvendors?\b', re.IGNORECASE)
-# All dash-family characters: em dash, en dash, figure dash, non-breaking hyphen, hyphen-minus
-_DASH_RE = re.compile(r'[—–‒‐-]')
+# _DASH_RE removed — dash scrubbing now delegated to copy_gate.scrub
 
 
 def filter_platform_copy(text):
@@ -74,10 +73,9 @@ def filter_platform_copy(text):
         return "companies" if m.group(0).lower().endswith("s") else "company"
 
     text = _VENDOR_RE.sub(_vendor_repl, text)
-    # Strip all dash characters, replace with space
-    text = _DASH_RE.sub(" ", text)
-    # Collapse runs of spaces, trim
-    text = re.sub(r" {2,}", " ", text).strip()
+    # Strip all dash characters via copy_gate.scrub (single house-style gate)
+    from . import copy_gate
+    text = copy_gate.scrub(text)
     return text
 
 

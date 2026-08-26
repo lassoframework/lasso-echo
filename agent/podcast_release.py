@@ -38,9 +38,17 @@ from . import config, creative_studio, db, media_host, ops_alerts, schedule
 from . import podcast_feed
 from .drafter import Draft, DraftStatus, _make_id
 
-# Every dash family character (em, en, figure, horizontal bar, minus, ASCII
-# hyphen): none may survive into client-facing copy.
-_DASH_RE = re.compile(r"[‐‑‒–—―−-]")
+# _DASH_RE: backward-compat shim — delegates to copy_gate.violations so
+# existing callers (podcast_cards, podcast_learn, podcast_month, podcast_touches)
+# continue to work without changes, while the single gate lives in copy_gate.
+class _DashRE:
+    """Shim so _DASH_RE.search(text) delegates to copy_gate.violations."""
+    def search(self, text):
+        from . import copy_gate
+        return bool(copy_gate.violations(text or ""))
+
+_DASH_RE = _DashRE()
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _TITLE_EP_PREFIX = re.compile(r"^\s*(?:episode|ep\.?)\s*\d+\s*[:.]?\s*", re.IGNORECASE)
 
@@ -48,8 +56,9 @@ RELEASE_HASHTAGS = ["#lassoframework", "#gymowner", "#podcast"]
 
 
 def _dash_free(text):
-    """Remove every dash family character; collapse the spaces removals leave."""
-    return re.sub(r"\s{2,}", " ", _DASH_RE.sub(" ", text or "")).strip()
+    """Remove every dash family character via copy_gate.scrub (single house-style gate)."""
+    from . import copy_gate
+    return copy_gate.scrub(text or "")
 
 
 def about_line(description):

@@ -138,9 +138,10 @@ def _tokens(text):
 
 def build_higgsfield_prompt(visual):
     """Wrap a scene description in the house-style guidance to produce the final
-    Higgsfield prompt. Strips any dashes so no on-image text rule stays intact."""
-    scene = str(visual or "").strip()
-    scene = scene.replace("—", " ").replace("–", " ").replace("-", " ")
+    Higgsfield prompt. Strips any dashes via copy_gate.scrub so the no on-image
+    text rule stays intact."""
+    from . import copy_gate
+    scene = copy_gate.scrub(str(visual or ""))
     scene = re.sub(r"(?i)\bvendors?\b", "partner", scene)
     scene = re.sub(r"\s+", " ", scene).strip()
     if not scene.endswith("."):

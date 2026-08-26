@@ -562,12 +562,14 @@ def _route_model(headline="", facts=None):
 
 
 def _scrub_dashes(text):
-    """Strip em/en dashes from approved copy (the brand no-dash rule). Hyphens and
-    newlines are left intact; only the doubled spaces a removed dash leaves are
-    collapsed."""
+    """Strip em/en dashes from approved copy (the brand no-dash rule).
+    Uses copy_gate._DASH_RE for the banned-dash pass only; intraword
+    hyphens in the PROMPT text (e.g. 'left-aligned') are NOT converted because
+    they are valid technical markup in the generation prompt, not client-facing copy."""
+    from . import copy_gate
     if not text:
         return ""
-    cleaned = str(text).replace("—", " ").replace("–", " ")
+    cleaned = copy_gate._DASH_RE.sub(" ", str(text))
     return re.sub(r"[ \t]{2,}", " ", cleaned)
 
 

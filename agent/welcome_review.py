@@ -95,14 +95,17 @@ def red_regions(img, mask_zone=None, min_cells=4):
     return regions
 
 
-BANNED_CHARS = ("—", "–", "-")  # em dash, en dash, hyphen
+BANNED_CHARS = ("—", "–", "-")  # em dash, en dash, hyphen — kept for backward compat
 
 
 def no_banned_copy(text):
+    """True when the text is free of banned dash characters and the word 'vendor'.
+    Delegates dash detection to copy_gate.violations (single house-style gate)."""
+    from . import copy_gate
     t = str(text or "")
     if "vendor" in t.lower():
         return False
-    return not any(c in t for c in BANNED_CHARS)
+    return not copy_gate.violations(t)
 
 
 def grade_welcome(image_path, on_card_text, template, vision_client=None, fmt="feed"):

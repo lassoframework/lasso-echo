@@ -180,8 +180,10 @@ def render_template(out_path=None):
     content = "\n".join(lines)
 
     # Safety assertion: no em dash or en dash should survive the render.
-    assert "—" not in content, "em dash found in rendered template"
-    assert "–" not in content, "en dash found in rendered template"
+    # Delegates to copy_gate.violations (single house-style gate).
+    from . import copy_gate
+    v = copy_gate.violations(content)
+    assert "banned_dash" not in v, "em/en dash found in rendered template"
 
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:

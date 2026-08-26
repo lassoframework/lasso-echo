@@ -26,9 +26,14 @@ CREAM = "#FAF6F0"
 
 def _scrub(text):
     """Defense in depth: no em dashes, en dashes, or stray hyphens-as-dashes in
-    rendered copy. Word-internal hyphens are rewritten with a space."""
+    rendered copy. Routes through copy_gate.scrub (the single house-style gate)
+    then applies PDF-specific typography (em -> ', ', en -> ' to ')."""
+    from . import copy_gate
+    # copy_gate.scrub handles banned dashes and intraword hyphens; the PDF layer
+    # then applies its own typographic substitutions on whatever remains.
     t = str(text).replace("—", ", ").replace("–", " to ")
-    return re.sub(r"\s+-\s+", ", ", t)
+    t = re.sub(r"\s+-\s+", ", ", t)
+    return copy_gate.scrub(t)
 
 
 def brand_for(account):
