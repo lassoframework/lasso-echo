@@ -10,6 +10,58 @@ Last updated: 2026-08-26
 
 ---
 
+## Wave 2 — proof/call categories, quotas, 25% cap (2026-08-26, AGENT_CATEGORY_QUOTAS)
+
+### [x] agent/content_categories.py — CATEGORIES and GYM_PILLARS updated
+CATEGORIES expanded from 6 to 8: added "proof" (stored, approved social proof assets;
+empty pool falls back to 'community' + ops alert, never fabricated) and "call"
+(direct CTA posts driving a next step).
+GYM_PILLARS tuple added: ("results", "education", "community", "faces", "offer", "invite").
+Six gen-pop boutique fitness pillars for client gym account monthly quota planning.
+schedule_for_day() docstring updated: notes that proof/call and GYM_PILLARS are governed
+by the quota layer, not the fixed 7-day LASSO B2B schedule.
+
+### [x] agent/category_plan.py — quotas, caps, validate_quotas(), category_pct()
+All new behavior behind AGENT_CATEGORY_QUOTAS (default OFF); existing plan logic unchanged.
+
+Constants added:
+  CATEGORY_HARD_CAP_PCT = 25.0  (hard: any category over 25% = violation)
+  B2B_WEEKLY_MIN = {proof: 2, call: 3}
+  GYM_MONTHLY_MIN = {results: 4, offer: 4, faces: 3, community: 5, education: 6}
+
+Functions added:
+  category_pct(plan_rows, category) -> float
+    Percentage of plan_rows that belong to category. Pure, no side effects.
+  validate_quotas(plan_rows, profile="GYM") -> list[str]
+    Violation strings (empty = compliant). profile = GYM | B2B | ANY.
+    Violation format: "<cat>_below_min:<actual>/<required>" or "category_over_cap:<cat>:<pct>%"
+
+Grounding rails documented as inline comments:
+  - proof/results: stored, approved assets only; empty pool -> community + alert
+  - offer: only while gym's live offer is set; expired -> invite
+  - Avatar filter (gen-pop only) is upstream, not relaxed by quota rules
+  - Human tap is untouched; quotas govern what reaches the approval queue
+
+### [x] agent/config.py — category_quotas_enabled() flag added
+category_quotas_enabled() reads AGENT_CATEGORY_QUOTAS (default false). Full docstring
+documents both B2B and GYM quota behaviors, summit ramp unchanged note, and hard rails.
+AGENT_CATEGORY_QUOTAS added to _status() in __main__.py so test_status_completeness passes.
+
+### [x] tests/test_category_plan.py — 24 tests total (14 pre-existing + 10 new Wave 2)
+Wave 2 tests added:
+  test_categories_includes_proof / test_categories_includes_call
+  test_gym_pillars_has_six_entries / test_gym_pillars_includes_all_required
+  test_validate_quotas_violation_for_zero_proof_posts
+  test_validate_quotas_violation_for_zero_call_posts
+  test_validate_quotas_compliant_b2b_plan_no_violations
+  test_validate_quotas_no_violations_for_compliant_plan
+  test_category_pct_one_of_four_returns_25 / _empty_rows / _all_same
+  test_25_pct_cap_violation_detected / _format / test_exactly_25_pct_is_not_a_violation
+
+Full suite: 2444 passed, 4 pre-existing higgsfield_renderer failures (unrelated), 0 new failures.
+
+---
+
 ## Wave 1 — copy_gate.py single dash gate, 9 call sites migrated (2026-08-26)
 
 ### [x] agent/copy_gate.py created

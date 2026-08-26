@@ -1632,6 +1632,33 @@ def services_category_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SERVICES_CATEGORY", "false"))
 
 
+def category_quotas_enabled() -> bool:
+    """
+    Category quota enforcement for content plans. OFF by default = zero behavior
+    change; existing plan logic runs exactly as before. When ON, validate_quotas()
+    results are acted upon by the plan builders:
+
+    B2B profile (LASSO own accounts):
+      proof >= 2 per week  (from stored, approved social proof assets only)
+      call  >= 3 per week  (direct CTA posts driving a next step)
+      No category > 25% of the month
+
+    Gym profile (client accounts):
+      results   >= 4 per month  (approved before/afters and transformations only)
+      offer     >= 4 per month  (only while a live offer is set; expired -> 'invite')
+      faces     >= 3 per month
+      community >= 5 per month
+      education >= 6 per month
+      invite fills remaining gaps
+      No category > 25% of the month
+
+    Summit ramp and existing weekly caps (podcast/b2b/platform/book) are unchanged.
+    Human approval tap and publish-off default are untouched.
+    Arm by hand: AGENT_CATEGORY_QUOTAS=true
+    """
+    return _truthy(os.environ.get("AGENT_CATEGORY_QUOTAS", "false"))
+
+
 def intake_worker_enabled() -> bool:
     """
     Intake pipeline worker: turns incoming R2 uploads into library-ready assets.

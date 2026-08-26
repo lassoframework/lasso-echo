@@ -189,6 +189,7 @@ def _status():
     print(f"  fal_image_model : {config.fal_image_model()}  (env AGENT_FAL_IMAGE_MODEL)")
     print(f"  podcast_auto   : {config.podcast_auto_enabled()}  (env AGENT_PODCAST_AUTO_ENABLED)")
     print(f"  services_cat   : {config.services_category_enabled()}  (env AGENT_SERVICES_CATEGORY)")
+    print(f"  category_quotas: {config.category_quotas_enabled()}  (env AGENT_CATEGORY_QUOTAS)")
     print(f"  intake_worker  : {config.intake_worker_enabled()}  (env AGENT_INTAKE_WORKER)")
     print(f"  onboard_automint: {config.onboard_automint_enabled()}  (env AGENT_ONBOARD_AUTOMINT)")
     print(f"  dedupe_fwd_book : {config.dedupe_forward_book_enabled()}  (env AGENT_DEDUPE_FORWARD_BOOK; Wave 0.2 one-shot dedup job, default OFF)")
