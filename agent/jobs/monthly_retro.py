@@ -345,6 +345,11 @@ def build_digest(gym_id, month, findings, tainted):
     nxt = findings.get("next_experiment")
     if nxt:
         lines.append(f"Next month's experiment: {nxt}")
+    # Demographics line (20260827): present ONLY when a stored
+    # gym_audience_demographics row backs it — never guessed.
+    demo = findings.get("demographics")
+    if demo:
+        lines.append(demo)
     adopted = findings.get("adopted") or []
     if adopted:
         for a in adopted:
@@ -490,9 +495,27 @@ def retro_for_gym(gym_id, month, store, now, notifier):
             else:
                 adopted = []
 
+    # Demographics line (20260827, flag AGENT_AUDIENCE_DEMOGRAPHICS): cite the
+    # newest STORED engaged-audience row when one exists. Flag OFF or no row ->
+    # no line, no store constructed. Never fails the retro.
+    demographics_line = None
+    if config.audience_demographics_enabled():
+        try:
+            from agent.jobs import demographics_sync as _demo
+            if hasattr(store, "latest_demographics"):
+                engaged_row = store.latest_demographics(gym_id, "engaged")
+            else:
+                engaged_row = _demo.SupabaseDemographicsStore().latest(
+                    gym_id, "engaged")
+            demographics_line = _demo.digest_line(engaged_row)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[monthly-retro] demographics read failed for {gym_id}: "
+                  f"{type(exc).__name__}")
+
     findings = {
         "keep_doing": keep,
         "stop_doing": stop,
+        "demographics": demographics_line,
         "experiment": exp,
         "next_experiment": pb_mod.experiment_lever_for(gym_id, next_month(month)),
         "adopted": adopted,

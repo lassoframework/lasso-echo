@@ -2329,6 +2329,20 @@ def inbox_alerts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_INBOX_ALERTS", "false"))
 
 
+def audience_demographics_enabled() -> bool:
+    """
+    Per-gym engaged-audience demographics switch (AGENT_AUDIENCE_DEMOGRAPHICS).
+    OFF by default = zero behavior change: agent/jobs/demographics_sync.py is a
+    no-op. When ON, a weekly per-gym pull (kv-stamped, 7-day gate) of Zernio's
+    Instagram demographics (follower AND engaged-audience breakdowns by
+    age/city/country/gender) lands in gym_audience_demographics. READ ONLY on
+    the social side; the monthly retro digest cites a stored row when one
+    exists, never a guess. Arm by hand: AGENT_AUDIENCE_DEMOGRAPHICS=true
+    (Railway env). HUMAN TAP REQUIRED.
+    """
+    return _truthy(os.environ.get("AGENT_AUDIENCE_DEMOGRAPHICS", "false"))
+
+
 def learning_loop_enabled() -> bool:
     """
     Wave 7 learning loop switch (AGENT_LEARNING_LOOP). OFF by default = zero

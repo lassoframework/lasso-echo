@@ -229,6 +229,7 @@ def _status():
     print(f"  metrics_sync   : {config.metrics_sync_enabled()}  (env AGENT_METRICS_SYNC; Wave 7 nightly Zernio analytics -> post_metrics snapshots, read only, default OFF)")
     print(f"  learning_loop  : {config.learning_loop_enabled()}  (env AGENT_LEARNING_LOOP; Wave 7 lever stamping + gym_playbook consumption + monthly retro, default OFF)")
     print(f"  inbox_alerts   : {config.inbox_alerts_enabled()}  (env AGENT_INBOX_ALERTS; daily read-only comments/mentions/reviews sweep -> one coach card per gym per day, default OFF)")
+    print(f"  audience_demos : {config.audience_demographics_enabled()}  (env AGENT_AUDIENCE_DEMOGRAPHICS; weekly IG follower + engaged demographics -> gym_audience_demographics, read only, default OFF)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")

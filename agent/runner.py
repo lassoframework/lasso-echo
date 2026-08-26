@@ -614,6 +614,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"inbox alerts sweep failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # AUDIENCE DEMOGRAPHICS (flag AGENT_AUDIENCE_DEMOGRAPHICS, default OFF ->
+    # no-op): weekly per-gym IG follower + engaged demographics into
+    # gym_audience_demographics. Called daily; the per-gym 7-day kv gate makes
+    # it weekly. Read only on the social side; isolated like its siblings.
+    if config.audience_demographics_enabled():
+        try:
+            from .jobs.demographics_sync import run as _demo_sync_run
+            _dsum = _demo_sync_run()
+            if _dsum.get("ok"):
+                _dwrote = sum(g.get("rows_written", 0) for g in _dsum.get("gyms", []))
+                print(f"[demographics-sync] {_dwrote} row(s) written")
+        except Exception as e:
+            print(f"[demographics-sync] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"demographics sync failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # MONTHLY RETRO (Wave 7.8, TAP 3 closed 2026-08-26): on/after the 5th, run
     # the prior month's retro once (kv-stamped per month). Self-gates on
     # AGENT_LEARNING_LOOP. The 7.4 honesty guards protect every run: a tainted

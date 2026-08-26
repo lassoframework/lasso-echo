@@ -481,6 +481,19 @@ class ZernioClient:
         return self._get("/v1/inbox/reviews",
                          {"profileId": profile_id, "limit": int(limit)})
 
+    def instagram_demographics(self, account_id, metric="follower_demographics",
+                               timeframe="this_month", breakdown=None):
+        """GET /v1/analytics/instagram/demographics?accountId=... ->
+        {success, accountId, platform, metric, timeframe, demographics:{age,
+        city, country, gender}, note}. `metric` is follower_demographics or
+        engaged_audience_demographics. Requires 100+ followers and the
+        Analytics add-on. READ ONLY."""
+        params = {"accountId": account_id, "metric": str(metric),
+                  "timeframe": str(timeframe)}
+        if breakdown:
+            params["breakdown"] = str(breakdown)
+        return self._get("/v1/analytics/instagram/demographics", params)
+
     # ---- writes (provisioning) ---------------------------------------------
     def create_profile(self, name):
         """POST /v1/profiles {name} -> {..._id}. Per-gym provisioning.
