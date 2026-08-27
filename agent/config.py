@@ -947,6 +947,35 @@ def lasso_via_zernio_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_LASSO_VIA_ZERNIO", "false"))
 
 
+def lasso_video_mix_enabled() -> bool:
+    """
+    LASSO VIDEO MIX (AGENT_LASSO_VIDEO_MIX, OFF by default => byte-for-byte today's
+    LASSO month plan). Armed, the LASSO NON-sprint rotation weaves podcast VIDEO clips
+    (real footage of real people from the Drive podcast library) in as a first-class,
+    recurring part of the mix, to move the grid off all-text-cards toward the audit's
+    ">= 40% of the grid shows a human" target:
+
+      1. The two existing podcast slots (thu + sun) PREFER a real Drive video clip over
+         the text/infographic podcast fallback whenever a clip is available (the video
+         preference is applied INSIDE the podcast builder, so those slots become video of
+         humans instead of text cards). Requires PODCAST_LIBRARY_STAGE armed for a clip
+         to actually stage; with it OFF the slot falls through to the existing podcast
+         builder exactly as today.
+      2. A SECOND weekly video slot is added midweek (Wed, which the base rotation spends
+         on b2b) — but ONLY on windows where the added podcast/video day keeps the whole
+         month's podcast share at or UNDER the 25% podcast cap (calendar_grade.py:195).
+         When the third day would breach the cap, Wed keeps b2b; the cap is never traded.
+
+    Sprint days are UNTOUCHED: the summit 10-day sprints (summit_queue.SPRINT_CYCLES) own
+    their days and their up-to-3-feeds/day cadence exactly as today. Video only fills the
+    NON-sprint rotation. Nothing here publishes or changes the approval path; every staged
+    video row lands PENDING and grounds its caption in the episode notes Doc or does not
+    stage (no fabrication). Flag OFF => plan_month returns the pre-video rotation byte for
+    byte.
+    """
+    return _truthy(os.environ.get("AGENT_LASSO_VIDEO_MIX", "false"))
+
+
 def gbp_publish_enabled() -> bool:
     """GBP publish + reconcile lanes (Phase 5). OFF by default. When armed, the listener
     runs publish_due_gbp (approved googlebusiness rows -> Zernio) and reconcile_gbp

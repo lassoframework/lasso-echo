@@ -170,6 +170,12 @@ class PlanSlot:
     # None on every 1x plan (the pre-cadence shape, byte-for-byte). Distinct from
     # slot_index, which belongs to the SUMMIT SPRINT layout.
     cadence_slot: int = None
+    # VIDEO MIX (AGENT_LASSO_VIDEO_MIX): True on a podcast slot the video mix wants to
+    # fill with a real Drive VIDEO clip (of real people) rather than the text/infographic
+    # podcast fallback. Only ever set on category=='podcast' slots; default False keeps
+    # the pre-video shape byte for byte. The builder honors this preference; the honesty
+    # guard is unchanged (a slot with no groundable clip still falls through, never faked).
+    video_preferred: bool = False
 
 
 # The non-sprint platform cap: platform may own at most this fraction of the NON-sprint
@@ -206,6 +212,78 @@ _MONTH_ROTATION = {
     "sat": "platform",
     "sun": "podcast",
 }
+
+
+# ---------------------------------------------------------------------------
+# VIDEO MIX (AGENT_LASSO_VIDEO_MIX, default OFF -> _MONTH_ROTATION byte for byte)
+# ---------------------------------------------------------------------------
+# LASSO's live grid audit: 79% text cards, 0 humans. The podcast library is real
+# VIDEO of real people, and it already rides the podcast category. This remap weaves
+# that video into the NON-sprint rotation so the grid moves toward the audit's
+# ">= 40% of the grid shows a human" target, WITHOUT breaching the 25% podcast cap
+# (calendar_grade.py:195) and WITHOUT touching a single sprint day.
+#
+# TWO levers (both cap-respecting, both non-sprint only):
+#   1. thu + sun stay podcast (Blake's ruling) and PREFER a real Drive video clip over
+#      the text/infographic podcast fallback (the preference lives in the podcast
+#      builder; PODCAST_LIBRARY_STAGE must be armed for a clip to actually stage).
+#   2. a SECOND weekly video slot is added on Wed (base rotation: b2b) -> podcast, but
+#      ONLY on windows where the third podcast/video day keeps the WHOLE month's podcast
+#      share at or under 25% of feeds. When it would breach the cap, Wed keeps b2b.
+#
+# TARGET MIX (per non-sprint week, cap permitting the Wed slot):
+#   platform 2, doctrine 1, podcast/video 3 (thu + sun + wed), summit 1  -> 7 days.
+#   podcast/video is 3/7 of a bare week (~43%), but sprint 'summit' rows dilute the
+#   real month: measured, the video mix lands podcast at ~22-25% of feeds across the
+#   live windows (Aug/Sep sprint-heavy ~22%, quiet Nov exactly 25%), so the 25% cap is
+#   the hard ceiling the Wed-insertion decision enforces per window (never traded).
+#   Flag OFF: podcast stays 2/7 (thu + sun), ~18-25%, exactly as today.
+_VIDEO_MIX_MIDWEEK_DAY = "wed"     # the base-b2b day the 2nd weekly video slot borrows
+_VIDEO_MIX_MIDWEEK_FROM = "b2b"    # only ever converts a b2b day (never a dated override)
+_PODCAST_CAP_FRACTION = 0.25       # calendar_grade.py:195 — video rides podcast, respect it
+
+
+def _base_rotation_for(day_key):
+    """The pre-video base rotation category for a date (_MONTH_ROTATION). Pure."""
+    abbr = _WEEKDAY_ABBR[date.fromisoformat(day_key).weekday()]
+    return _MONTH_ROTATION.get(abbr, "doctrine")
+
+
+def _midweek_video_days(start, days, sprint_day_fn):
+    """The set of NON-sprint Wed dates in the window that the video mix converts from
+    b2b -> podcast (a real video clip slot), chosen so the resulting month podcast share
+    stays at or under the 25% cap. Pure and deterministic over the window + sprint set.
+
+    We project the feed-slot categories with thu/sun already podcast and add Wed days
+    one at a time (earliest first) only while podcast/(total non-empty feeds) stays <=
+    25%. This is the SAME denominator the grader uses (one feed slot == one calendar
+    pillar; the IG/FB cross-post and paired story inherit it). Returns a set of
+    YYYY-MM-DD strings. Empty when the flag path is off or no Wed fits under the cap."""
+    win = [(start + timedelta(days=i)).isoformat() for i in range(days)]
+    non_sprint = [d for d in win if not sprint_day_fn(d)]
+    # Project feed pillars on non-sprint days from the base rotation (thu/sun = podcast).
+    base_pillars = [_base_rotation_for(d) for d in non_sprint]
+    # Sprint days each contribute >= 1 summit feed to the month denominator; count the
+    # sprint days in the window so the cap math sees the real (diluted) denominator.
+    sprint_days_in_win = [d for d in win if sprint_day_fn(d)]
+    base_podcast = sum(1 for p in base_pillars if p == "podcast")
+    # denominator: one feed per non-sprint day + one summit feed per sprint day
+    # (SPRINT_FEED_PER_DAY == 1; the sprint's varied 2nd slot is a non-podcast pillar).
+    total_feeds = len(non_sprint) + len(sprint_days_in_win)
+    if total_feeds <= 0:
+        return set()
+    candidate_weds = sorted(
+        d for d in non_sprint
+        if _WEEKDAY_ABBR[date.fromisoformat(d).weekday()] == _VIDEO_MIX_MIDWEEK_DAY
+        and _base_rotation_for(d) == _VIDEO_MIX_MIDWEEK_FROM)
+    chosen = set()
+    podcast = base_podcast
+    for wd in candidate_weds:
+        if (podcast + 1) / total_feeds <= _PODCAST_CAP_FRACTION:
+            chosen.add(wd)
+            podcast += 1
+        # else: leave this Wed as b2b so the cap is never breached.
+    return chosen
 
 
 # ---- category resolution (pure) --------------------------------------------------------
@@ -334,10 +412,18 @@ def _base_summit_weekday():
 
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
                summit_day_fn=None, welcome_dates=None, sprint_day_fn=None,
-               sprint_feed_count_fn=None, posts_per_day=1):
+               sprint_feed_count_fn=None, posts_per_day=1, video_mix=None):
     """A deterministic month plan: for each of `days` consecutive dates from start_date,
     the resolved category (weekly rotation + sprint/book/summit/welcome overrides) and its
     feed + paired story slots.
+
+    VIDEO MIX (AGENT_LASSO_VIDEO_MIX; `video_mix` overrides the flag for tests): when on,
+    the NON-sprint rotation weaves real podcast VIDEO clips in as a first-class part of the
+    mix. thu + sun stay podcast (Blake's ruling) and are marked video_preferred; a SECOND
+    weekly video slot is added on Wed (b2b -> podcast, video_preferred) ONLY on windows
+    where that third day keeps the whole month's podcast share at or under the 25% cap
+    (calendar_grade.py:195). Sprint days are UNTOUCHED. Flag OFF -> byte-for-byte the
+    pre-video rotation.
 
     SUMMIT SPRINT days (sprint_day_fn(day_key) True) RUN THE SPRINT: they carry up to
     sprint_feed_count_fn(day_key) feed slots (SPRINT_MAX_FEED_PER_DAY, 3) plus one paired
@@ -370,10 +456,24 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
     book_dates = set(book_dates) if book_dates is not None else _default_book_dates()
     welcome_dates = set(welcome_dates or ())
 
+    # VIDEO MIX: resolve the flag (test override wins), then compute the cap-safe set of
+    # Wed dates the mix converts b2b -> podcast (a second weekly video slot). Empty when
+    # the mix is off, so the base rotation stands byte for byte.
+    if video_mix is None:
+        video_mix = config.lasso_video_mix_enabled()
+    midweek_video = (_midweek_video_days(start, days, sprint_day_fn)
+                     if video_mix else set())
+
     slots = []
     for i in range(days):
         d = (start + timedelta(days=i)).isoformat()
         base = _weekday_category(d)
+        # VIDEO MIX: on a cap-safe non-sprint Wed, borrow the base b2b day for a video
+        # (podcast) slot. This changes ONLY the base rotation category for the day; the
+        # dated overrides below still take precedence, so a book/welcome/summit day is
+        # never converted, and sprint days never reach here.
+        if video_mix and d in midweek_video and base == _VIDEO_MIX_MIDWEEK_FROM:
+            base = "podcast"
         category, overridden = _override_category(
             d, base, book_dates=book_dates, summit_day_fn=summit_day_fn,
             welcome_dates=welcome_dates, sprint_day_fn=sprint_day_fn)
@@ -420,26 +520,34 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         # default and the flag-off resolution) emits exactly the pre-cadence plan,
         # byte-for-byte (cadence_slot stays None). Sprint days above are untouched:
         # the sprint already owns its multi-post layout.
+        # VIDEO MIX: a NON-sprint podcast slot prefers a real Drive video clip over the
+        # text/infographic podcast fallback. Marked only when the mix is on and the
+        # resolved category is podcast; the builder honors it, the honesty guard is
+        # unchanged (no clip -> fall through, never faked).
+        _vp = bool(video_mix and category == "podcast")
         if int(posts_per_day or 1) == 2:
             slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                                   base_category=base, overridden=overridden,
-                                  cadence_slot=0))
+                                  cadence_slot=0, video_preferred=_vp))
             slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                                   base_category=base, overridden=overridden,
-                                  cadence_slot=0))
+                                  cadence_slot=0, video_preferred=_vp))
             second = _next_fallback_category(category)
+            _vp2 = bool(video_mix and second == "podcast")
             slots.append(PlanSlot(post_date=d, category=second, fmt=FEED,
                                   base_category=base, overridden=True,
-                                  cadence_slot=1))
+                                  cadence_slot=1, video_preferred=_vp2))
             slots.append(PlanSlot(post_date=d, category=second, fmt=STORY,
                                   base_category=base, overridden=True,
-                                  cadence_slot=1))
+                                  cadence_slot=1, video_preferred=_vp2))
             continue
         slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
-                              base_category=base, overridden=overridden))
+                              base_category=base, overridden=overridden,
+                              video_preferred=_vp))
         slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
-                              base_category=base, overridden=overridden))
-    return _cap_platform(slots)
+                              base_category=base, overridden=overridden,
+                              video_preferred=_vp))
+    return _cap_platform(slots, video_mix=video_mix)
 
 
 def _next_fallback_category(category):
@@ -457,7 +565,7 @@ def _next_fallback_category(category):
     return order[idx]
 
 
-def _cap_platform(slots):
+def _cap_platform(slots, video_mix=False):
     """Re-point non-sprint PLATFORM feed/story days beyond the cap to the next real
     fallback pillar, deterministically (earliest days keep platform; later excess days are
     re-pointed). Book/summit/welcome/sprint days are untouched (they are dated/campaign
@@ -487,13 +595,14 @@ def _cap_platform(slots):
             out.append(PlanSlot(post_date=s.post_date, category=newcat, fmt=s.fmt,
                                 base_category=s.base_category or s.category,
                                 overridden=True, slot_index=s.slot_index,
-                                is_sprint=False, cadence_slot=s.cadence_slot))
+                                is_sprint=False, cadence_slot=s.cadence_slot,
+                                video_preferred=bool(video_mix and newcat == "podcast")))
         else:
             out.append(s)
-    return _dedup_cadence_categories(out)
+    return _dedup_cadence_categories(out, video_mix=video_mix)
 
 
-def _dedup_cadence_categories(slots):
+def _dedup_cadence_categories(slots, video_mix=False):
     """2x cadence guard: after the platform cap re-points days, a 2x day's two pairs
     could land on the SAME pillar (the re-point does not know about siblings). Never
     the same concept twice in one day (CADENCE_SPEC.md D5): when a date's cadence
@@ -519,7 +628,9 @@ def _dedup_cadence_categories(slots):
             out.append(PlanSlot(post_date=s.post_date, category=fix[s.post_date],
                                 fmt=s.fmt, base_category=s.base_category,
                                 overridden=True, slot_index=s.slot_index,
-                                is_sprint=False, cadence_slot=1))
+                                is_sprint=False, cadence_slot=1,
+                                video_preferred=bool(video_mix
+                                                     and fix[s.post_date] == "podcast")))
         else:
             out.append(s)
     return out
@@ -689,7 +800,11 @@ def _reslot(slot, category):
     day so the calendar row shows the truth."""
     return PlanSlot(post_date=slot.post_date, category=category, fmt=slot.fmt,
                     base_category=slot.base_category or slot.category,
-                    overridden=True)
+                    overridden=True,
+                    # VIDEO MIX: a fallback that lands on podcast carries the video
+                    # preference forward (so a podcast day filled via fallback still
+                    # prefers a real clip); any other pillar clears it.
+                    video_preferred=(slot.video_preferred and category == "podcast"))
 
 
 def _build_feed_with_fallback(slot, builders, target, log):

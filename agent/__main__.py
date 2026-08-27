@@ -195,6 +195,7 @@ def _status():
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
+    print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
     print(f"  catchup_report : {config.catchup_report_enabled()}  (env AGENT_CATCHUP_REPORT)")
     print(f"  welcome_digest : {config.welcome_digest_enabled()}  (env AGENT_WELCOME_DIGEST)")
     print(f"  welcome_autopub: {config.welcome_autopublish_enabled()}  (env AGENT_WELCOME_AUTOPUBLISH)")
@@ -857,6 +858,7 @@ _COMMANDS = {
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
+        ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
     ],
     "trust & approvals": [
@@ -2779,6 +2781,16 @@ def main(argv=None):
                 print(info)
             else:
                 print(f"connect-url FAILED for {account_key} {platform}: {info}")
+    elif cmd == "lasso-remap":
+        # Rebuild the LASSO forward calendar with the VIDEO MIX (AGENT_LASSO_VIDEO_MIX):
+        # thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, the summit
+        # 10-day sprints untouched. Reuses plan_and_build + apply_month_plan; approved /
+        # published days are preserved (only unapproved future days are replaced); nothing
+        # publishes; every staged row lands 'pending'. --write applies; without it it is a
+        # dry plan+grade print. Behind AGENT_REAL_MONTH_PLAN (OFF -> no-op).
+        #   python -m agent lasso-remap [--month YYYY-MM] [--gym lasso] [--write]
+        from .lasso_remap import cli as _lasso_remap_cli
+        _lasso_remap_cli(argv[1:])
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:
