@@ -331,14 +331,15 @@ class _AlertCapture:
         return None
 
 
-def test_story_no_genuine_9_16_asset_skips_and_fires_alert(monkeypatch):
+def test_story_no_genuine_9_16_asset_skips_silently(monkeypatch):
     """Plain library feed creative with no genuine 9:16 asset: the Story is SKIPPED
-    (never a cropped feed card) and ops_alert fires with a named reason and the day,
-    instead of reusing/cropping the feed image."""
+    (never a cropped feed card) and NO ops alert fires. A skipped story is a normal
+    outcome (video/audiogram/concept-card feeds have no 9:16 sibling by design; the
+    feed still posts, the story is supplementary), so it must not storm Slack
+    (Blake 2026-08-27: the podcast-video launch fired dozens of per-day story-skip
+    alerts). It logs instead."""
     monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
     monkeypatch.delenv("AGENT_HOSTING_ENABLED", raising=False)
-    # Library creative: path does not start with 'nano_' so not a studio creative,
-    # and there is no *_story sibling on disk -> no genuine 9:16 asset.
     fd = _feed_draft(creative_path="library_asset.png", creative_public_url="",
                      source_fragments=[])
     capturer = _AlertCapture()
@@ -346,10 +347,8 @@ def test_story_no_genuine_9_16_asset_skips_and_fires_alert(monkeypatch):
     monkeypatch.setattr(_stories.ops_alerts, "alert", capturer.alert)
     result = stories.build_story_draft(_acct(), DAY, feed_draft=fd)
     assert result is None, "story must be skipped when no genuine 9:16 asset exists"
-    assert any("skipped" in m for m in capturer.messages), \
-        f"expected 'skipped' in alert messages, got: {capturer.messages}"
-    assert any(DAY in m for m in capturer.messages), \
-        "alert must name the day so ops can identify the skipped draft"
+    assert not capturer.messages, \
+        f"a skipped story must NOT fire an ops alert (storm), got: {capturer.messages}"
 
 
 def test_story_never_reuses_feed_image(monkeypatch):

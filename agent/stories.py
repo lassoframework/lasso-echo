@@ -106,13 +106,16 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                                         art["path"], hosted, fragments)
 
     # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
-    # crop the day's feed image into a Story frame. Fire one alert so ops knows.
-    ops_alerts.alert(
-        f"story draft skipped for {account.key} on {day_key}: no genuine 9:16 asset "
-        f"available (no premade *_story sibling for "
-        f"{os.path.basename(feed_draft.creative_path or '(no path)')}, and no "
-        f"purpose-built 9:16 studio render). A Story is never a cropped feed card."
-    )
+    # crop the day's feed image into a Story frame. A skipped story is a NORMAL
+    # outcome, not an incident: a video clip / audiogram / b2b concept card has no
+    # 9:16 sibling by design, and the FEED still posts fine (the story is
+    # supplementary). This used to fire one ops alert PER DAY PER ACCOUNT, which
+    # storms Slack the moment a month of video staged (Blake, 2026-08-27: dozens of
+    # "story draft skipped" lines from the podcast-video launch). Downgraded to a
+    # log line: the feed posts, the story is simply absent, no Slack noise.
+    print(f"[stories] skip {account.key} {day_key}: no genuine 9:16 asset for "
+          f"{os.path.basename(feed_draft.creative_path or '(no path)')} "
+          "(feed still posts; story is supplementary, never a cropped feed card)")
     return None
 
 
