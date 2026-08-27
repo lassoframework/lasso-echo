@@ -754,6 +754,23 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # PODCAST LIBRARY INDEX (PODCAST_LIBRARY_INDEX, default ON per the build
+    # spec): nightly walk of the podcast Drive folder into podcast_asset —
+    # classify, upsert, mark vanished ids removed_from_drive, budgeted ffprobe
+    # pass, deny sweep, ONE summary line to #ops. POSTS NOTHING. The lane is
+    # INERT without a GOOGLE_DRIVE_SA_JSON key (one log line, no network), so
+    # default-ON is safe. Isolated: an index failure never blocks the draft run.
+    if config.podcast_library_index_enabled():
+        try:
+            from .jobs.index_podcast_library import run as _podcast_index_run
+            _pxsum = _podcast_index_run()
+            if not _pxsum.get("ok"):
+                print(f"[podcast-index] skipped: {_pxsum.get('reason', '')}")
+        except Exception as e:
+            print(f"[podcast-index] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"podcast library index failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # INBOX ALERTS (flag AGENT_INBOX_ALERTS, default OFF -> no-op): daily
     # READ-ONLY sweep of unhandled comments/mentions/reviews per gym, one
     # coach-channel card per gym per day max (kv-stamped). Never replies,

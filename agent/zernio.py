@@ -494,6 +494,51 @@ class ZernioClient:
             params["breakdown"] = str(breakdown)
         return self._get("/v1/analytics/instagram/demographics", params)
 
+    # ---- media uploads (podcast library lane; docs: /guides/media-uploads) ---
+    def media_generate_upload_link(self, filename, content_type):
+        """POST /v1/media/presign {filename, contentType} -> {uploadUrl,
+        publicUrl}. The presigned-upload flow from the Zernio media guide:
+        PUT the bytes to uploadUrl, then reference publicUrl in mediaItems.
+        Uploads sit in temporary storage ~7 days until a post using them
+        publishes, so callers presign near stage/publish time, never weeks
+        ahead."""
+        return self._post("/v1/media/presign",
+                          {"filename": str(filename),
+                           "contentType": str(content_type)})
+
+    def media_upload_file(self, upload_url, path, content_type):
+        """Streamed PUT of a local file to a presigned uploadUrl (up to 5 GB per
+        the media guide; a podcast clip is ~250 MB, streamed so it never sits in
+        RAM). The presigned URL carries its own auth — no Bearer header. Raises
+        ZernioError on a non-2xx."""
+        with open(path, "rb") as fh:
+            r = self._client().put(upload_url, data=fh,
+                                   headers={"Content-Type": str(content_type)},
+                                   timeout=600)
+        if r.status_code >= 400:
+            raise ZernioError(r.status_code, (r.text or "")[:200])
+        return True
+
+    def media_check_upload_status(self, public_url, tries=5, wait=2.0,
+                                  sleeper=None):
+        """True once the uploaded object is fetchable at its publicUrl (HEAD
+        2xx/3xx), polling up to `tries` with `wait`s between. False when it
+        never reports ready — the caller must NOT stage a post around media
+        that is not ready (publish_guard's media_missing rail backs this up at
+        publish time)."""
+        import time as _time
+        sleeper = sleeper or _time.sleep
+        for attempt in range(max(1, int(tries))):
+            try:
+                r = self._client().head(public_url, timeout=30)
+                if r.status_code < 400:
+                    return True
+            except Exception:  # noqa: BLE001 - a transient HEAD error is a retry
+                pass
+            if attempt < tries - 1:
+                sleeper(wait)
+        return False
+
     # ---- writes (provisioning) ---------------------------------------------
     def create_profile(self, name):
         """POST /v1/profiles {name} -> {..._id}. Per-gym provisioning.

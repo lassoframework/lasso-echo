@@ -55,6 +55,22 @@ def real_builders_map(account):
         acct = _accts.get_account(account)
 
     def _podcast(_target, day_key):
+        # PODCAST LIBRARY (PODCAST_LIBRARY_STAGE, default OFF): when armed, a
+        # podcast slot FIRST tries the real Drive clip lane — pick_clip ->
+        # notes-grounded caption -> download+ffprobe validate -> Zernio upload
+        # -> a PENDING Draft. None (empty pool, missing notes Doc, failed
+        # validation/upload) falls through to the existing month podcast
+        # builder, exactly the spec's flow; the lane's own deduped alerts have
+        # already fired. Flag OFF -> byte-for-byte today's behavior.
+        if config.podcast_library_stage_enabled():
+            try:
+                from . import podcast_library_builder as _plib
+                draft = _plib.build_podcast_clip_draft(acct, day_key)
+                if draft is not None:
+                    return draft
+            except Exception as e:  # noqa: BLE001 - the lane never sinks the slot
+                print(f"[podcast-library] builder failed: {type(e).__name__}: {e}; "
+                      "falling through to the existing podcast builder")
         return podcast_month.build_month_podcast_draft(acct, day_key)
 
     def _platform(_target, day_key):

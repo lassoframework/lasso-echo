@@ -10,6 +10,57 @@ Last updated: 2026-08-27
 
 ---
 
+## Podcast library ingest Waves 1-4 (2026-08-27, feat/podcast-library)
+
+Spec: docs/PODCAST_LIBRARY_BUILD_SPEC.md. Wave 5 (auto-clipping) deliberately
+NOT built. Everything staged lands PENDING; the human tap is untouched.
+
+### [~] Wave 1 — Drive access (built, suite green, committed, NOT armed)
+  - agent/integrations/drive_client.py: SA readonly client (GOOGLE_DRIVE_SA_JSON,
+    falls back to AGENT_GDRIVE_SA_JSON), list_children/walk/download/
+    export_doc_text, 6h kv tree cache, streaming .part-then-rename downloads,
+    injectable transport (fully offline-testable). No key -> available() False,
+    lane inert.
+
+### [~] Wave 2 — index (podcast_asset in Supabase; migration NOT applied)
+  - migrations/podcast_asset_20260827.sql — ARMING STEP, apply by hand
+  - agent/podcast_index.py: spec classifier (episode from NEAREST ANCESTOR
+    folder, never the filename; unknown names log+skip), §2.3 postability gate
+    (fail closed, unprobed=null=never selectable), ffprobe helper, PostgREST
+    store (paged; indexer never touches probe/selector columns)
+  - agent/jobs/index_podcast_library.py: nightly in run_daily behind
+    PODCAST_LIBRARY_INDEX (default ON, inert without the SA key); idempotent;
+    vanished ids -> removed_from_drive; budgeted probe pass
+    (PODCAST_PROBE_MAX_PER_RUN, 20); deny sweep; one-line #ops summary
+
+### [~] Wave 3 — selector (agent/podcast_selector.py)
+  - pick_clip: least-used longest-unused postable; 120d clip + 21d episode
+    cooldowns; empty pool -> ONE deduped alert + fall through
+  - stamps used_count/last_used_at ONLY at stage time; deny rollback via the
+    Slack deny hook (approvals.py) AND the nightly observe_denials sweep
+
+### [~] Wave 4 — grounded captions + planner wiring
+  - agent/podcast_caption.py: caption grounds in the episode notes Doc or the
+    slot does NOT stage (one deduped alert); 150-500 chars, hook first line,
+    exactly one ask, copy_gate clean; guest @handle only from doc + allowlist
+  - agent/podcast_library_builder.py + real_month_run._podcast: pick -> caption
+    -> download+ffprobe validate -> Zernio presign/upload/ready -> PENDING
+    draft, behind PODCAST_LIBRARY_STAGE (default OFF)
+  - agent/zernio.py: media_generate_upload_link (POST /v1/media/presign),
+    media_upload_file (streamed PUT), media_check_upload_status
+  - podcast rows recheck through publish_guard like any row (tested)
+
+### Arming checklist (in order; none done yet)
+  1. Create the GCP service account (drive.readonly), download its key
+  2. Blake shares `Podcast Episodes` (1hfkXefD7kwOWkNIHSc0jOHLkUFbrh-C6) to the
+     SA email as Viewer
+  3. Set GOOGLE_DRIVE_SA_JSON in Railway env (by hand, never committed)
+  4. Apply migrations/podcast_asset_20260827.sql to Supabase by hand
+  5. Watch one week of nightly [podcast-index] summaries (clip counts + probes)
+  6. Flip PODCAST_LIBRARY_STAGE=true
+
+---
+
 ## Publish-path hardening (2026-08-27, feat/publish-guard-idempotency)
 
 Three items, one branch (Blake's WIRING.md spec + the live LASSO IG duplicates).

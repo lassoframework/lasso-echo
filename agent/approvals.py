@@ -134,6 +134,14 @@ def handle_action(action, draft, actor_slack_id, note="",
             tenant_brain.record_event(account_key, "deny_reason", reason=note)
         except Exception:
             pass
+        # Podcast library (Wave 3 rail): a denied PODCAST clip returns to the
+        # selector pool — its used_count/last_used_at stamp is rolled back.
+        # Best effort and category-gated inside the hook; never blocks the deny.
+        try:
+            from . import podcast_selector
+            podcast_selector.on_draft_denied(draft)
+        except Exception:
+            pass
         return ActionResult(ok=True, action="deny", draft_id=draft.draft_id,
                             detail="Draft denied. Recreate queued.")
 

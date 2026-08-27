@@ -419,6 +419,50 @@ def podcast_audit_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PODCAST_AUDIT_ENABLED", "false"))
 
 
+def podcast_library_index_enabled() -> bool:
+    """
+    Podcast library nightly indexer switch (PODCAST_LIBRARY_BUILD_SPEC.md).
+    Env PODCAST_LIBRARY_INDEX, DEFAULT ON per the spec: the indexer walks the
+    podcast Drive folder into podcast_asset and POSTS NOTHING. ON is safe
+    because the lane is INERT without a GOOGLE_DRIVE_SA_JSON key (the job
+    no-ops with one log line). Rollout: index ON for a week, read the nightly
+    summaries, then flip PODCAST_LIBRARY_STAGE.
+    """
+    return _truthy(os.environ.get("PODCAST_LIBRARY_INDEX", "true"))
+
+
+def podcast_library_stage_enabled() -> bool:
+    """
+    Podcast library STAGING switch (selector + grounded caption + Zernio upload
+    + stage as PENDING). Env PODCAST_LIBRARY_STAGE, OFF by default — flip only
+    after a week of clean index summaries (clip counts + probe results look
+    right). Everything staged still lands 'pending'; the human tap is untouched.
+    """
+    return _truthy(os.environ.get("PODCAST_LIBRARY_STAGE", "false"))
+
+
+def google_drive_sa_json() -> str:
+    """
+    The Google service-account key for read-only podcast Drive access: env
+    GOOGLE_DRIVE_SA_JSON (a file path or the inline JSON), falling back to the
+    existing AGENT_GDRIVE_SA_JSON (podcast_source.py convention) so one key
+    serves both Drive readers. Scope is drive.readonly only. NEVER logged,
+    printed, committed, or returned in any card or report.
+    """
+    return (os.environ.get("GOOGLE_DRIVE_SA_JSON", "")
+            or os.environ.get("AGENT_GDRIVE_SA_JSON", ""))
+
+
+def podcast_library_folder_id() -> str:
+    """
+    The Drive folder id of the `Podcast Episodes` root the indexer walks. Env
+    PODCAST_LIBRARY_FOLDER_ID; defaults to the verified 2026-08-27 root from
+    the build spec (§0).
+    """
+    return os.environ.get("PODCAST_LIBRARY_FOLDER_ID",
+                          "1hfkXefD7kwOWkNIHSc0jOHLkUFbrh-C6")
+
+
 def content_brain_enabled() -> bool:
     """
     Daily content brain switch. OFF by default. When OFF (or for a non-LASSO

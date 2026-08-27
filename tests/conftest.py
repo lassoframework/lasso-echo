@@ -33,6 +33,11 @@ _CRED_PREFIXES = (
     # renderer inside tests that assert "no renderer without a key". FAL_ and
     # REPLICATE_ are the sibling render services; GH_TOKEN is plain hygiene.
     "HF_", "FAL_", "REPLICATE_", "GH_TOKEN",
+    # Podcast library lane (PODCAST_LIBRARY_BUILD_SPEC.md): the spec's flags are
+    # unprefixed (PODCAST_LIBRARY_INDEX / _STAGE / _FOLDER_ID) and the Drive key
+    # is GOOGLE_DRIVE_SA_JSON — strip both families so an armed container can
+    # never hand a test a live Drive key or a flipped stage flag.
+    "PODCAST_", "GOOGLE_DRIVE_",
 )
 
 
