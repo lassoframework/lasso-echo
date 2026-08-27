@@ -226,23 +226,67 @@ def enqueue(entry, host_fn=None):
 
 # ---- serving: one item per day, shared across the fan-out ------------------------------
 
+# FRESHNESS WINDOW (Blake 2026-08-27: "i only want last 90 days of new clients
+# posting, alot of those already have been posted"): a welcome is NEWS. A queued
+# entry that sat blocked (usually on a logo) past this window is stale — the gym
+# is no longer new, and pre-ledger clients were often welcomed by the old manual
+# process, so re-posting reads as a duplicate. Serve-time guard: anything queued
+# longer than this is expired IN PLACE (never served, audited, one log line),
+# and the pop moves on to the next fresh item. A gym's created_at >= its queue
+# time, so queue age is a safe lower bound on client age.
+MAX_WELCOME_AGE_DAYS = 90
+
+
+def _expire_stale_queued(conn, day_key):
+    """Mark queued rows older than MAX_WELCOME_AGE_DAYS as 'expired' (never
+    served). Returns the expired rows so the CALLER can audit AFTER releasing
+    db._lock (db.audit takes the same non-reentrant lock — auditing in here
+    deadlocks). Runs inside the caller's lock; UPDATE only, no other db calls."""
+    from datetime import datetime, timedelta
+    cutoff = (datetime.fromisoformat(str(day_key)[:10])
+              - timedelta(days=MAX_WELCOME_AGE_DAYS)).isoformat()
+    stale = [dict(r) for r in conn.execute(
+        "SELECT id, gym_key, name FROM welcome_queue "
+        "WHERE status='queued' AND created_at < ?", (cutoff,)).fetchall()]
+    for r in stale:
+        conn.execute("UPDATE welcome_queue SET status='expired' WHERE id=?",
+                     (r["id"],))
+        print(f"[welcome-queue] expired {r['gym_key']} ('{r['name']}'): queued "
+              f"over {MAX_WELCOME_AGE_DAYS} days, no longer a new client")
+    return stale
+
+
 def next_for_day(day_key):
     """The welcome to serve on day_key. Idempotent and order-independent: the first
     caller on a given day pops the OLDEST queued item and marks it served for that
     day; every later caller that day (the second account's feed, the story) gets the
-    SAME item. Returns a dict, or None when the queue is empty."""
-    with db._lock, _conn() as conn:
-        row = conn.execute("SELECT * FROM welcome_queue WHERE served_day=? "
-                           "ORDER BY id LIMIT 1", (day_key,)).fetchone()
-        if row is None:
-            row = conn.execute("SELECT * FROM welcome_queue WHERE status='queued' "
-                               "ORDER BY id LIMIT 1").fetchone()
+    SAME item. Stale queued items (older than MAX_WELCOME_AGE_DAYS) are expired,
+    never served. Returns a dict, or None when the queue is empty."""
+    expired = []
+    try:
+        with db._lock, _conn() as conn:
+            row = conn.execute("SELECT * FROM welcome_queue WHERE served_day=? "
+                               "ORDER BY id LIMIT 1", (day_key,)).fetchone()
             if row is None:
-                return None
-            conn.execute("UPDATE welcome_queue SET status='served', served_day=? "
-                         "WHERE id=?", (day_key, row["id"]))
-            conn.commit()
-        return dict(row)
+                expired = _expire_stale_queued(conn, day_key)
+                row = conn.execute("SELECT * FROM welcome_queue WHERE "
+                                   "status='queued' ORDER BY id LIMIT 1").fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+                conn.execute("UPDATE welcome_queue SET status='served', served_day=? "
+                             "WHERE id=?", (day_key, row["id"]))
+                conn.commit()
+            return dict(row)
+    finally:
+        # Audit OUTSIDE db._lock (db.audit re-acquires it; inside = deadlock).
+        for r in expired:
+            try:
+                db.audit("welcome_expired", r["gym_key"],
+                         f"queued > {MAX_WELCOME_AGE_DAYS} days; never served",
+                         r["gym_key"], str(day_key)[:10])
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def queue_status():

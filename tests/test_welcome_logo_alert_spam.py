@@ -323,3 +323,34 @@ def test_gyms_by_ids_returns_raw_rows_including_excluded(creds):
     rows = [_row("lead1", "Dean Holcomb", status="onboarding")]
     out = portal_gyms.PortalGymsReader(http=_FakeHTTP(rows)).gyms_by_ids(["lead1"])
     assert out and out[0]["status"] == "onboarding"
+
+
+# ---- 90-day freshness window (Blake 2026-08-27) ------------------------------------
+
+def test_stale_queued_welcome_expires_never_serves(tmp_path, monkeypatch):
+    """A welcome queued > MAX_WELCOME_AGE_DAYS ago is expired in place: the gym is
+    no longer a new client (and was often already welcomed pre-ledger)."""
+    from agent import welcome_queue as wq, db
+    with db._lock, wq._conn() as conn:
+        conn.execute(
+            "INSERT INTO welcome_queue (gym_key, name, status, created_at) "
+            "VALUES (?,?,?,?)", ("portal:old", "Old Gym", "queued", "2026-04-01T00:00:00"))
+        conn.execute(
+            "INSERT INTO welcome_queue (gym_key, name, status, created_at) "
+            "VALUES (?,?,?,?)", ("portal:new", "New Gym", "queued", "2026-08-20T00:00:00"))
+        conn.commit()
+    row = wq.next_for_day("2026-08-27")
+    assert row is not None and row["gym_key"] == "portal:new"   # stale one skipped
+    with wq._conn() as conn:
+        old = conn.execute("SELECT status FROM welcome_queue WHERE gym_key='portal:old'").fetchone()
+        assert old["status"] == "expired"                        # never served
+
+
+def test_fresh_queue_empty_after_all_expire(tmp_path):
+    from agent import welcome_queue as wq, db
+    with db._lock, wq._conn() as conn:
+        conn.execute(
+            "INSERT INTO welcome_queue (gym_key, name, status, created_at) "
+            "VALUES (?,?,?,?)", ("portal:old2", "Old Gym 2", "queued", "2026-01-01T00:00:00"))
+        conn.commit()
+    assert wq.next_for_day("2026-08-27") is None
