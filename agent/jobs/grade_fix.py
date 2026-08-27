@@ -23,7 +23,23 @@ WHAT IT FIXES (never fabricates, never publishes, never auto-approves):
   c. Category over-cap (a pillar above 25% of the book): the excess wipeable
      dates get a caption regenerated from a DIFFERENT approved source category
      on the same photo, and the rows' pillar is re-pointed to the pillar that
-     actually wrote the new caption (the label always tells the truth).
+     actually wrote the new caption (the label always tells the truth). The
+     pass ITERATES (bounded) until every category is at or under 25% or no
+     more wipeable rows can honestly move.
+  d. Caption craft + path (Blake, 2026-08-27 "make it an A+ from our end"):
+     a fully wipeable day whose caption trips the grader's craft checks
+     (no_ask / thin_caption / hook_too_long, the same copy_gate.soft_flags the
+     calendar grader scores) gets a FRESH caption regenerated on the SAME
+     photo through the same gated builder path. The regenerated caption is
+     swapped in ONLY when it actually clears the bar (exactly one ask, first
+     line inside the hook band, length 150 to 500, zero soft flags, zero hard
+     violations); otherwise the row keeps its current caption, so a decent
+     caption is never traded for a worse one. When the book carries fewer
+     than 5 booking-term asks (the path_to_join GYM leg), the regen of these
+     ALREADY FLAGGED days is biased to carry the gym's REAL booking CTA (the
+     first booking-term CTA in its approved voice-doc rotation; nothing is
+     ever invented, and a missing CTA is an honest skip). Days that already
+     pass are never touched.
 
 HARD GUARANTEES:
   * Only WIPEABLE (pending/draft/queued) rows are ever patched. The store's
@@ -35,9 +51,17 @@ HARD GUARANTEES:
 """
 from __future__ import annotations
 
-from agent import config
+from agent import config, copy_gate
+from agent.calendar_grade import _BOOKING_RE
 from agent.caption_ledger import caption_hash
 from agent.portal_calendar_store import _WIPEABLE_STATUSES
+
+# The craft soft flags this module repairs (calendar_grade._caption_craft
+# scores copy_gate.soft_flags; these three are the fixable caption defects).
+_CRAFT_FLAGS = ("no_ask", "thin_caption", "hook_too_long")
+_CAPTION_MIN, _CAPTION_MAX = 150, 500   # regen acceptance band (grader median wants >= 150)
+_HOOK_MAX = 125                          # copy_gate hook_too_long band
+_OVERCAP_MAX_ITER = 6                    # bounded convergence for the over-cap pass
 
 
 def _default_db():
@@ -56,7 +80,7 @@ def _is_wipeable(row) -> bool:
 
 def remediate_forward_book(gym_id, rows, store, *, profile, defects,
                            today_iso, caption_regen=None, gap_filler=None,
-                           db=None, logger=None) -> dict:
+                           booking_cta=None, db=None, logger=None) -> dict:
     """Best-effort self-remediation for one gym's forward book.
 
     Args:
@@ -71,18 +95,24 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
                        (caption, category) | None. Defaults to the client build
                        context (None for B2B / when the context is unavailable).
         gap_filler:    injectable (gym_id, profile, store, today_iso, log, db) -> str.
+        booking_cta:   injectable approved booking CTA string (the craft pass
+                       resolves it from the gym's voice-doc CTA rotation when
+                       None and the book is short of booking asks).
         db:            injectable kv module (agent.db).
 
-    Returns {ok, captions_fixed, repillared, gap_fill, skipped, actions}.
+    Returns {ok, captions_fixed, repillared, craft_fixed, craft_attempted,
+             booking_asks_added, gap_fill, skipped, actions}.
     """
     log = logger or (lambda m: print(f"[grade-fix] {m}"))
     if not config.grade_self_fix_enabled():
         return {"ok": False, "reason": "AGENT_GRADE_SELF_FIX off",
-                "captions_fixed": 0, "repillared": 0, "gap_fill": "none",
-                "skipped": 0, "actions": []}
+                "captions_fixed": 0, "repillared": 0, "craft_fixed": 0,
+                "craft_attempted": 0, "booking_asks_added": 0,
+                "gap_fill": "none", "skipped": 0, "actions": []}
 
     actions = []
     result = {"ok": True, "captions_fixed": 0, "repillared": 0,
+              "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
 
@@ -102,13 +132,26 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     if dup_fixed:
         actions.append(f"rewrote {dup_fixed} duplicate caption day(s) fresh on the same photo")
 
-    # ---- c) category over-cap ----------------------------------------------
+    # ---- c) category over-cap (iterates to convergence) ---------------------
     over_fixed, over_skipped = _fix_overcap(
         gym_id, rows, store, defects, caption_regen, avoid, log)
     result["repillared"] = over_fixed
     result["skipped"] += over_skipped
     if over_fixed:
         actions.append(f"re-pillared {over_fixed} over-cap day(s) from a different approved source")
+
+    # ---- d) caption craft + path (booking asks) ------------------------------
+    craft_fixed, craft_attempted, booking_added = _fix_craft(
+        gym_id, rows, store, profile, caption_regen, avoid, log,
+        booking_cta=booking_cta)
+    result["craft_fixed"] = craft_fixed
+    result["craft_attempted"] = craft_attempted
+    result["booking_asks_added"] = booking_added
+    result["skipped"] += max(0, craft_attempted - craft_fixed)
+    if craft_fixed:
+        actions.append(f"rewrote {craft_fixed} caption(s) that tripped craft flags (ask/hook/length)")
+    if booking_added:
+        actions.append(f"carried the gym's real booking CTA onto {booking_added} day(s)")
 
     # ---- b) day gaps ---------------------------------------------------------
     gap_dates = [str(d[1])[:10] for d in (defects or [])
@@ -187,11 +230,25 @@ def _cat_of(row):
     return (row.get("pillar") or row.get("category") or "")
 
 
+def _over_cap_cats(rows):
+    """Categories currently above 25% of the book (the grader's own bar)."""
+    from collections import Counter
+    n = len(rows)
+    if not n:
+        return []
+    counts = Counter(_cat_of(r) for r in rows)
+    return sorted(cat for cat, count in counts.items() if count / n > 0.25)
+
+
 def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
-    """Re-pillar excess wipeable days of an over-25% category by regenerating
-    their caption from a DIFFERENT approved source category (the pillar label
-    follows the caption that actually wrote the day). Latest days move first;
-    a day with any human-owned row never moves. Returns (days_fixed, days_skipped)."""
+    """Iterate the over-cap move until every category is at or under 25% of
+    the plan or no more wipeable rows can honestly move. Activation is still
+    gated on the GRADER's defect list (this pass never runs speculatively);
+    after the first pass the over-cap set is recomputed from the live rows so
+    a single sweep converges instead of leaving residue (eng offer 31%, pierce
+    49% both survived the old single pass). Bounded at _OVERCAP_MAX_ITER; an
+    iteration that moves nothing stops the loop (honest stop).
+    Returns (days_fixed, days_skipped)."""
     over_cats = [str(d[1]) for d in (defects or [])
                  if d and d[0] == "content_mix" and "over 25%" in str(d[2])]
     if not over_cats:
@@ -199,6 +256,25 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
     if caption_regen is None:
         return 0, len(over_cats)
 
+    total_fixed = total_skipped = 0
+    for _ in range(_OVERCAP_MAX_ITER):
+        fixed, skipped = _overcap_pass(gym_id, rows, over_cats, store,
+                                       caption_regen, avoid, log)
+        total_fixed += fixed
+        total_skipped += skipped
+        over_cats = _over_cap_cats(rows)
+        if not over_cats or fixed == 0:
+            break
+    return total_fixed, total_skipped
+
+
+def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log):
+    """One over-cap move wave: re-pillar excess wipeable days of each over-25%
+    category by regenerating their caption from a DIFFERENT approved source
+    category (the pillar label follows the caption that actually wrote the
+    day). Latest days move first; a day with any human-owned row never moves;
+    a move that would push the TARGET category itself over 25% is skipped so
+    the loop converges instead of ping-ponging. Returns (days_fixed, days_skipped)."""
     from collections import Counter
     n = len(rows) or 1
     counts = Counter(_cat_of(r) for r in rows)
@@ -230,9 +306,12 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
             if not new_cat or str(new_cat).lower() == str(cat).lower():
                 skipped += 1                   # the content does not support a move
                 continue
+            moved = len(grp)
+            if (counts.get(new_cat, 0) + moved) / n > 0.25:
+                skipped += 1                   # target has no headroom: honest skip
+                continue
             if _patch_date_rows(gym_id, grp, store, new_cap, new_cat, log):
                 fixed += 1
-                moved = len(grp)
                 excess -= moved
                 counts[cat] -= moved
                 counts[new_cat] = counts.get(new_cat, 0) + moved
@@ -240,6 +319,139 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
             else:
                 skipped += 1
     return fixed, skipped
+
+
+# ---------------------------------------------------------------------------
+# d) caption craft + path (booking asks)
+# ---------------------------------------------------------------------------
+
+def _ask_count(text) -> int:
+    return len(list(copy_gate.ASK_RE.finditer(str(text or ""))))
+
+
+def _craft_flags(caption):
+    """The fixable craft flags this caption trips (grader's own soft flags)."""
+    flags = set(copy_gate.soft_flags(caption or ""))
+    return [f for f in _CRAFT_FLAGS if f in flags]
+
+
+def _clears_craft(caption) -> bool:
+    """The post-regen assertion: a fresh caption replaces a flagged one ONLY
+    when it is strictly clean — exactly one ask, first line inside the hook
+    band, length 150 to 500, zero hard violations, zero soft flags. Anything
+    less and the row keeps its current caption (never swap in a worse one)."""
+    cap = (caption or "").strip()
+    if not cap or copy_gate.violations(cap):
+        return False
+    if _ask_count(cap) != 1:
+        return False
+    first = cap.splitlines()[0].strip()
+    if not first or len(first) > _HOOK_MAX:
+        return False
+    if not (_CAPTION_MIN <= len(cap) <= _CAPTION_MAX):
+        return False
+    if copy_gate.soft_flags(cap):
+        return False
+    return True
+
+
+def _booking_deficit(rows) -> int:
+    """How many more booking-term rows the path_to_join GYM leg wants
+    (>= min(5, n) rows carrying a booking-specific ask)."""
+    n = len(rows)
+    have = sum(1 for r in rows if _BOOKING_RE.search(r.get("caption") or ""))
+    return max(0, min(5, n) - have)
+
+
+def _booking_cta_for(gym_id, log):
+    """The gym's REAL booking CTA: the first CTA in its approved voice-doc
+    rotation that is both a booking term and a recognized ask. The intake has
+    no separate booking-link field today, so the voice doc is the only source;
+    a gym without one gets an honest skip (never an invented CTA)."""
+    try:
+        from agent.client_media_sync import (_account_for_base,
+                                             _resolve_client_voice_path)
+        from agent.voice import load_voice
+        account = _account_for_base(gym_id)
+        if account is None:
+            return None
+        voice = load_voice(_resolve_client_voice_path(gym_id, account.voice_doc_path()))
+        for cta in (getattr(voice, "ctas", None) or []):
+            text = copy_gate.scrub(str(cta or "")).strip()
+            if text and _BOOKING_RE.search(text) and copy_gate.ASK_RE.search(text):
+                return text
+    except Exception as exc:  # noqa: BLE001 - the bias is best effort
+        log(f"{gym_id}: booking CTA unavailable: {type(exc).__name__}")
+    return None
+
+
+def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
+               booking_cta=None):
+    """Regenerate the caption of every fully wipeable day that trips a craft
+    flag (no_ask / thin_caption / hook_too_long), on the SAME photo, through
+    the same gated builder machinery. A fresh caption lands only when it
+    clears _clears_craft; otherwise the day keeps its caption (tracked as
+    attempted-but-not-fixed). While the book is short of booking-term asks,
+    a regenerated day whose fresh caption carries no ask gets the gym's REAL
+    booking CTA appended as its single ask (approved copy only). Days that
+    already pass are never touched. B2B/LASSO is out of scope by design (its
+    gaps are content supply, owned by the pillar builders).
+    Returns (days_fixed, days_attempted, booking_asks_added)."""
+    if profile == "B2B" or caption_regen is None:
+        return 0, 0, 0
+
+    deficit = _booking_deficit(rows)
+    if deficit and booking_cta is None:
+        booking_cta = _booking_cta_for(gym_id, log)
+
+    # One post spans same-date rows sharing a caption (IG feed + FB mirror +
+    # paired story); group by (date, hash) so the day moves together and a 2x
+    # day's two distinct posts stay independent.
+    groups: dict = {}
+    for r in rows:
+        d = str(r.get("post_date") or "")[:10]
+        h = caption_hash(r.get("caption") or "")
+        groups.setdefault((d, h), []).append(r)
+
+    fixed = attempted = booking_added = 0
+    for (d, _h), grp in sorted(groups.items()):
+        if any(not _is_wipeable(r) for r in grp):
+            continue                            # human-owned day: never touched
+        cap = grp[0].get("caption") or ""
+        if not _craft_flags(cap):
+            continue                            # already passes: never touched
+        attempted += 1
+        out = None
+        try:
+            out = caption_regen(grp[0], avoid, "")
+        except Exception as exc:  # noqa: BLE001
+            log(f"{gym_id} {d}: craft regen raised {type(exc).__name__}")
+        if not out:
+            log(f"{gym_id} {d}: no fresh caption could be built for the "
+                "craft flags; left in place")
+            continue
+        new_cap, new_cat = out
+        new_cap = (new_cap or "").strip()
+        carried_cta = False
+        if (deficit > 0 and booking_cta
+                and not _BOOKING_RE.search(new_cap)
+                and _ask_count(new_cap) == 0):
+            # The already-flagged day is the honest place to carry the gym's
+            # real booking CTA: it becomes the caption's single ask.
+            new_cap = f"{new_cap}\n{booking_cta}".strip()
+            carried_cta = True
+        if not new_cap or new_cap in avoid or not _clears_craft(new_cap):
+            log(f"{gym_id} {d}: regenerated caption does not clear the craft "
+                "bar; keeping the current caption")
+            continue
+        if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
+            fixed += 1
+            avoid.add(new_cap)
+            if _BOOKING_RE.search(new_cap):
+                deficit = max(0, deficit - len(grp))
+                if carried_cta:
+                    booking_added += 1
+    return fixed, attempted, booking_added
 
 
 # ---------------------------------------------------------------------------

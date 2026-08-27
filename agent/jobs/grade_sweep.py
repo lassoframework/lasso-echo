@@ -12,7 +12,10 @@ SELF-FIX MODE (AGENT_GRADE_SELF_FIX, default OFF; Blake's 2026-08-27 ruling
 "it should fix it on its own without sending me alot of slacks"). Flag OFF ->
 everything above is byte-for-byte unchanged. Flag ON:
   * a forward book below A is first self-remediated (agent/jobs/grade_fix.py)
-    and then REGRADED; the final grade is what lands in gym_social_grades;
+    and then REGRADED; the final grade is what lands in gym_social_grades.
+    Remediation runs in up to _MAX_FIX_PASSES passes per sweep: another pass
+    runs only while the regraded score IMPROVED and is still below A (heavy
+    lanes keep their own once-per-gym-per-day kv stamp inside grade_fix);
   * trailing_30 is graded + stored but NEVER alerts (history is not fixable);
   * a still-below-A forward book alerts ONLY when the (score, defect set)
     differs from the last alerted state for that gym (kv stamp) AND at most
@@ -103,6 +106,32 @@ def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
             f"{grade.total} ({grade.letter}). "
             f"Top defects: {top_defects}. Review the forward book or trailing posts."
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-fix remediation loop (AGENT_GRADE_SELF_FIX only)
+# ---------------------------------------------------------------------------
+
+_MAX_FIX_PASSES = 3
+
+_FIX_COUNT_KEYS = ("captions_fixed", "repillared", "craft_fixed",
+                   "craft_attempted", "booking_asks_added", "skipped")
+
+
+def _merge_fix(agg: dict, step: dict) -> dict:
+    """Fold one remediation pass into the aggregated per-gym fix report."""
+    for k in _FIX_COUNT_KEYS:
+        agg[k] = int(agg.get(k) or 0) + int((step or {}).get(k) or 0)
+    seen = agg.setdefault("actions", [])
+    for a in (step or {}).get("actions") or []:
+        if a not in seen:
+            seen.append(a)
+    gap = (step or {}).get("gap_fill")
+    if gap and gap != "none" and agg.get("gap_fill") in (None, "none"):
+        agg["gap_fill"] = gap
+    agg["ok"] = bool(agg.get("ok", True)) and bool((step or {}).get("ok", False))
+    agg["passes"] = int(agg.get("passes") or 0) + 1
+    return agg
 
 
 # ---------------------------------------------------------------------------
@@ -237,19 +266,30 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
             f_grade = grade_month(forward_rows, profile=profile)
             fix = None
             if self_fix and f_grade.total < A_THRESHOLD:
-                # Self-remediate, re-read, regrade. The FINAL grade is stored.
-                try:
-                    from agent.jobs import grade_fix
-                    fix = grade_fix.remediate_forward_book(
-                        gym_id, forward_rows, store, profile=profile,
-                        defects=f_grade.defects, today_iso=today_str)
-                except Exception as exc:  # noqa: BLE001 - never sink the sweep
-                    print(f"[grade-sweep] {gym_id}: self-fix failed: "
-                          f"{type(exc).__name__}: {exc}")
-                    fix = {"ok": False, "actions": []}
-                forward_rows = _fetch_rows(store, gym_id, today_str,
-                                           forward_end) or forward_rows
-                f_grade = grade_month(forward_rows, profile=profile)
+                # Self-remediate, re-read, regrade — up to _MAX_FIX_PASSES
+                # passes, another only while the score IMPROVED and the book
+                # is still below A. The FINAL grade is what gets stored.
+                fix = {"ok": True, "passes": 0, "gap_fill": "none",
+                       "actions": []}
+                for _pass in range(_MAX_FIX_PASSES):
+                    prev_total = f_grade.total
+                    try:
+                        from agent.jobs import grade_fix
+                        step = grade_fix.remediate_forward_book(
+                            gym_id, forward_rows, store, profile=profile,
+                            defects=f_grade.defects, today_iso=today_str)
+                    except Exception as exc:  # noqa: BLE001 - never sink the sweep
+                        print(f"[grade-sweep] {gym_id}: self-fix failed: "
+                              f"{type(exc).__name__}: {exc}")
+                        step = {"ok": False, "actions": []}
+                    _merge_fix(fix, step)
+                    forward_rows = _fetch_rows(store, gym_id, today_str,
+                                               forward_end) or forward_rows
+                    f_grade = grade_month(forward_rows, profile=profile)
+                    if (not step.get("ok")
+                            or f_grade.total >= A_THRESHOLD
+                            or f_grade.total <= prev_total):
+                        break
             _write_grade(store, gym_id, "forward_book", f_grade)
             if not self_fix:
                 _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)

@@ -178,6 +178,19 @@ Blake's session arms them after audit. Suite green before each commit.
     still < A, (score, defect-set) changed vs last kv stamp, max one per gym per day, <= 3 lines;
     plus max ONE aggregated sweep summary line per run. Flag OFF: sweep + alerts byte-for-byte today
   - Tests: tests/test_grade_self_fix.py (12) + test_calendar_grade.py rubric updates (4 new)
+  - [~] CAPTION-CRAFT + PATH EXTENSION (2026-08-27 pm, feat/grade-fix-caption-craft; Blake:
+    "only focus on the caption and mixture, make it an A+ from our end"): same flag, passes
+    ordered dups -> over-cap -> craft/path -> regrade. Craft pass regenerates flagged wipeable
+    days (no_ask / thin_caption / hook_too_long) fresh on the SAME photo; the fresh caption
+    lands ONLY when it clears the bar (exactly one ask, hook <= 125 chars, length 150 to 500,
+    zero soft flags) — never swaps a decent caption for a worse one (attempted/succeeded tracked).
+    Booking-ask leg: when < 5 forward rows carry a booking term, ask-free regen days carry the
+    gym's REAL voice-doc booking CTA (no intake booking-link field exists; missing CTA = honest
+    skip, never invented). Over-cap pass now ITERATES (bounded 6, target-headroom guard) until
+    every category <= 25% or nothing can honestly move. Sweep runs up to 3 remediation passes
+    while the regraded score improves (gap lanes keep their once-per-gym-per-day kv stamp).
+    LASSO/B2B craft pass skipped by design (its gaps are content supply). Flag OFF byte-for-byte.
+    Tests: test_grade_self_fix.py now 29.
 
 ### [x] Reply-needed coach alerts — agent/inbox_alerts.py (AGENT_INBOX_ALERTS=true, ARMED + VERIFIED LIVE 2026-08-27: "[inbox-alerts] 2 card(s) sent" in worker logs)
   - Daily READ-ONLY sweep per gym (client gyms + lasso): unhandled post comments

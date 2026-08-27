@@ -412,6 +412,337 @@ def test_self_fixed_to_a_alerts_only_summary(_self_fix_on, monkeypatch):
     assert "1 self-fixed to A" in alerts[0]
 
 
+# ---------------------------------------------------------------------------
+# Craft/path pass: flagged captions regenerated on the same photo; the fresh
+# caption must ACTUALLY clear the flags or the row keeps its caption
+# ---------------------------------------------------------------------------
+
+def _no_ask_caption(i):
+    """150+ chars, short hook, NO ask and NO booking term."""
+    hook = f"Small wins add up fast at our gym. Number {i}."
+    body = (
+        "\nOur members show what steady effort looks like in real life. "
+        "Coaches guide every class with care and the community keeps the "
+        "energy warm for beginners and busy parents alike."
+    )
+    return hook + body
+
+
+def _thin_caption(i):
+    """Under 120 chars (thin_caption) but carries exactly one ask."""
+    return f"Great vibes in class today. Sign up today. Post {i}."
+
+
+def _long_hook_caption(i):
+    """First line over 125 chars (hook_too_long); one ask in the body."""
+    hook = (
+        "Every single person who walks through our doors this month is "
+        "going to find out exactly why our members keep telling their "
+        f"friends about class number {i} here at the gym."
+    )
+    body = "\nOur coaches meet you where you are. Sign up today."
+    return hook + body
+
+
+def _remediate(rows, store, regen, *, defects=(), booking_cta=None,
+               profile="GYM"):
+    return grade_fix.remediate_forward_book(
+        "gritx", rows, store, profile=profile, defects=list(defects),
+        today_iso=TODAY, caption_regen=regen,
+        gap_filler=lambda *a, **k: "none", booking_cta=booking_cta)
+
+
+def test_craft_no_ask_regen_gets_exactly_one_ask(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [
+        _row(1, "2026-09-01", _no_ask_caption(1)),            # flagged: no_ask
+        _row(2, "2026-09-02", _a_caption(2)),                 # passes: untouched
+    ]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store, lambda r, a, c="": (_a_caption(40), "education"))
+    assert out["craft_attempted"] == 1
+    assert out["craft_fixed"] == 1
+    assert rows[0]["caption"] == _a_caption(40)
+    assert grade_fix._ask_count(rows[0]["caption"]) == 1
+    # The passing row was never touched
+    assert rows[1]["caption"] == _a_caption(2)
+    assert store.patched_ids == ["row_1"]
+
+
+def test_craft_thin_caption_regen_meets_length(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(1, "2026-09-01", _thin_caption(1))]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store, lambda r, a, c="": (_a_caption(41), "education"))
+    assert out["craft_fixed"] == 1
+    assert 150 <= len(rows[0]["caption"]) <= 500
+
+
+def test_craft_long_hook_regen_shortens_hook(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(1, "2026-09-01", _long_hook_caption(1))]
+    store = _FakeStore(rows)
+    assert len(_long_hook_caption(1).splitlines()[0]) > 125
+    out = _remediate(rows, store, lambda r, a, c="": (_a_caption(42), "education"))
+    assert out["craft_fixed"] == 1
+    assert len(rows[0]["caption"].splitlines()[0]) <= 125
+
+
+def test_craft_never_swaps_in_worse_caption(monkeypatch):
+    """A regen that cannot clear the bar (thin, ask-free) leaves the row
+    exactly as it was: attempted, not fixed."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    original = _thin_caption(1)
+    rows = [_row(1, "2026-09-01", original)]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store, lambda r, a, c="": ("Nice day at the gym.", ""))
+    assert out["craft_attempted"] == 1
+    assert out["craft_fixed"] == 0
+    assert rows[0]["caption"] == original
+    assert store.patched_ids == []
+
+
+def test_craft_never_touches_approved_rows(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    flagged = _thin_caption(7)
+    rows = [
+        _row(1, "2026-09-01", flagged, status="approved"),    # human-owned
+        _row(2, "2026-09-02", _thin_caption(8)),              # wipeable, flagged
+    ]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store, lambda r, a, c="": (_a_caption(43), "education"))
+    assert rows[0]["caption"] == flagged
+    assert rows[0]["status"] == "approved"
+    assert "row_1" not in store.patched_ids
+    assert out["craft_fixed"] == 1 and store.patched_ids == ["row_2"]
+
+
+def test_craft_mirrors_move_together(monkeypatch):
+    """A flagged day's IG feed + FB mirror + story get the same fresh caption."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    cap = _no_ask_caption(9)
+    rows = [
+        _row(1, "2026-09-01", cap),
+        _row(2, "2026-09-01", cap, account="facebook"),
+        _row(3, "2026-09-01", cap, fmt="story"),
+    ]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store, lambda r, a, c="": (_a_caption(44), "education"))
+    assert out["craft_fixed"] == 1
+    assert rows[0]["caption"] == rows[1]["caption"] == rows[2]["caption"] == _a_caption(44)
+
+
+def test_craft_pass_skips_b2b(monkeypatch):
+    """LASSO/B2B is out of scope by design: its gaps are content supply."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    original = _thin_caption(5)
+    rows = [_row(1, "2026-09-01", original, gym_id="lasso")]
+    store = _FakeStore(rows)
+    out = grade_fix.remediate_forward_book(
+        "lasso", rows, store, profile="B2B", defects=[], today_iso=TODAY,
+        caption_regen=lambda r, a, c="": (_a_caption(45), "education"),
+        gap_filler=lambda *a, **k: "none",
+        booking_cta="Book your intro class this week.")
+    assert out["craft_attempted"] == 0 and out["craft_fixed"] == 0
+    assert rows[0]["caption"] == original
+
+
+def test_craft_flag_off_is_noop():
+    rows = [_row(1, "2026-09-01", _thin_caption(1))]
+    store = _FakeStore(rows)
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, store, profile="GYM", defects=[], today_iso=TODAY,
+        caption_regen=lambda r, a, c="": (_a_caption(46), "education"),
+        gap_filler=lambda *a, **k: "none")
+    assert out["ok"] is False
+    assert rows[0]["caption"] == _thin_caption(1)
+    assert store.patched_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Booking-term asks (path_to_join GYM leg): the gym's REAL CTA, never invented
+# ---------------------------------------------------------------------------
+
+def test_booking_cta_carried_onto_flagged_rows(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    cta = "Book your intro class this week."
+    # Zero booking-term rows on the book; the flagged day is ask-free after
+    # regen, so the gym's real CTA becomes its single (booking) ask.
+    rows = [
+        _row(1, "2026-09-01", _no_ask_caption(1)),            # flagged
+        _row(2, "2026-09-02", _no_ask_caption(2)),            # flagged
+    ]
+    store = _FakeStore(rows)
+    fresh = iter([_no_ask_caption(60), _no_ask_caption(61)])
+    out = _remediate(rows, store,
+                     lambda r, a, c="": (next(fresh), "education"),
+                     booking_cta=cta)
+    assert out["craft_fixed"] == 2
+    assert out["booking_asks_added"] == 2
+    for r in rows:
+        assert r["caption"].endswith(cta)
+        assert grade_fix._ask_count(r["caption"]) == 1
+        assert grade_fix._BOOKING_RE.search(r["caption"])
+
+
+def test_booking_cta_not_added_when_caption_already_has_ask(monkeypatch):
+    """A fresh caption with its own single ask is accepted as-is; the CTA is
+    only appended to an ask-free caption (exactly-one-ask stays true)."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(1, "2026-09-01", _no_ask_caption(1))]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store,
+                     lambda r, a, c="": (_a_caption(62), "education"),
+                     booking_cta="Book your intro class this week.")
+    assert out["craft_fixed"] == 1
+    assert out["booking_asks_added"] == 0
+    assert rows[0]["caption"] == _a_caption(62)
+
+
+def test_booking_cta_never_invented(monkeypatch):
+    """No real booking CTA available (test env has no voice doc): an ask-free
+    regen cannot clear the bar and the row is honestly left unchanged."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    original = _no_ask_caption(1)
+    rows = [_row(1, "2026-09-01", original)]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store,
+                     lambda r, a, c="": (_no_ask_caption(63), "education"))
+    assert out["craft_attempted"] == 1
+    assert out["craft_fixed"] == 0
+    assert out["booking_asks_added"] == 0
+    assert rows[0]["caption"] == original
+
+
+def test_rows_with_booking_asks_already_passing_untouched(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(i, f"2026-09-{i:02d}", _a_caption(i)) for i in range(1, 7)]
+    store = _FakeStore(rows)
+    out = _remediate(rows, store,
+                     lambda r, a, c="": (_a_caption(70), "education"),
+                     booking_cta="Book your intro class this week.")
+    assert out["craft_attempted"] == 0
+    assert out["booking_asks_added"] == 0
+    assert store.patched_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Over-cap iteration: converge to <= 25% per category, or stop honestly
+# ---------------------------------------------------------------------------
+
+def test_overcap_iterates_until_under_cap(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(i, f"2026-09-{i:02d}", _a_caption(i), pillar="offer")
+            for i in range(1, 9)]                             # 8 rows, 100% offer
+    store = _FakeStore(rows)
+    defects = [("content_mix", "offer", "offer is 100% of posts (over 25%)")]
+    outs = iter([(_a_caption(80), "community"), (_a_caption(81), "community"),
+                 (_a_caption(82), "education"), (_a_caption(83), "education"),
+                 (_a_caption(84), "coach"), (_a_caption(85), "coach"),
+                 (_a_caption(86), "story"), (_a_caption(87), "story")])
+    out = _remediate(rows, store, lambda r, a, c="": next(outs),
+                     defects=defects)
+    assert out["repillared"] == 6
+    from collections import Counter
+    counts = Counter(r["pillar"] for r in rows)
+    n = len(rows)
+    assert all(c / n <= 0.25 for c in counts.values()), counts
+
+
+def test_overcap_stops_honestly_when_no_headroom(monkeypatch):
+    """Regen only ever offers one target category: the pass moves what fits
+    under that target's own 25% cap, then stops (no ping-pong, no loop)."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = [_row(i, f"2026-09-{i:02d}", _a_caption(i), pillar="offer")
+            for i in range(1, 9)]
+    store = _FakeStore(rows)
+    defects = [("content_mix", "offer", "offer is 100% of posts (over 25%)")]
+    counter = {"n": 90}
+
+    def regen(row, avoid, avoid_category=""):
+        counter["n"] += 1
+        return _a_caption(counter["n"]), "community"
+
+    out = _remediate(rows, store, regen, defects=defects)
+    # community holds 2 of 8 (25%); the rest cannot honestly move
+    assert out["repillared"] == 2
+    from collections import Counter
+    counts = Counter(r["pillar"] for r in rows)
+    assert counts["community"] == 2 and counts["offer"] == 6
+
+
+# ---------------------------------------------------------------------------
+# Sweep multi-pass: up to 3 remediation passes while the score improves
+# ---------------------------------------------------------------------------
+
+def _multi_pass_book():
+    """9 consecutive days; one caption repeated on days 1..5 (consistency 0 +
+    dup cap -> 59) and a 3-of-9 community pillar (mix defect that no pass
+    fixes). Un-dupping one day at a time walks the score 59 -> 78 -> 87 -> A."""
+    pillars = ["community", "community", "community", "education", "coach",
+               "invite", "story", "offer", "welcome"]
+    rows = []
+    for i in range(9):
+        cap = _a_caption(1) if i < 5 else _a_caption(i + 1)
+        rows.append(_row(i + 1, f"2026-09-{(i + 1):02d}", cap,
+                         pillar=pillars[i]))
+    return rows
+
+
+def test_multi_pass_improves_then_stops_at_a(_self_fix_on, monkeypatch):
+    rows = _multi_pass_book()
+    store = _FakeStore(rows)
+    calls = []
+    # Each fake pass honestly un-dups part of the book: pass 1 fixes two dup
+    # days, passes 2 and 3 one each. Score improves every pass, reaching A
+    # exactly at the 3-pass cap.
+    plan = iter([["row_2", "row_3"], ["row_4"], ["row_5"]])
+
+    def fake_remediate(gym_id, f_rows, f_store, *, profile, defects,
+                       today_iso, **kw):
+        calls.append(gym_id)
+        fixed = 0
+        for rid in next(plan):
+            for r in f_store.rows:
+                if r["id"] == rid:
+                    r["caption"] = _a_caption(200 + len(calls) * 10 + fixed)
+                    fixed += 1
+        return {"ok": True, "captions_fixed": fixed, "repillared": 0,
+                "craft_fixed": 0, "craft_attempted": 0,
+                "booking_asks_added": 0, "gap_fill": "none", "skipped": 0,
+                "actions": [f"pass {len(calls)}"]}
+
+    monkeypatch.setattr(grade_fix, "remediate_forward_book", fake_remediate)
+    alerts = []
+    result = _sweep(store, alerts)
+    assert calls == ["gritx"] * 3, calls
+    assert result["self_fixed"] == ["gritx"]
+    fix = result["gyms"]["gritx"]["self_fix"]
+    assert fix["passes"] == 3
+    assert fix["captions_fixed"] == 4
+    fwd = [g for g in store.grades if g["window"] == "forward_book"]
+    assert fwd and fwd[-1]["letter"] == "A"
+
+
+def test_multi_pass_stops_when_score_does_not_improve(_self_fix_on, monkeypatch):
+    rows = _forward_rows_with_dups()
+    store = _FakeStore(rows)
+    calls = []
+
+    def fake_remediate(gym_id, f_rows, f_store, **kw):
+        calls.append(gym_id)                      # changes nothing
+        return {"ok": True, "captions_fixed": 0, "repillared": 0,
+                "craft_fixed": 0, "craft_attempted": 0,
+                "booking_asks_added": 0, "gap_fill": "none", "skipped": 0,
+                "actions": []}
+
+    monkeypatch.setattr(grade_fix, "remediate_forward_book", fake_remediate)
+    alerts = []
+    result = _sweep(store, alerts)
+    assert calls == ["gritx"], "no improvement must stop after one pass"
+    assert result["held"] == ["gritx"]
+
+
 def test_all_a_books_stay_silent(_self_fix_on):
     rows = [_row(i, f"2026-09-{(i + 1):02d}", _a_caption(i),
                  pillar=["community", "education", "coach", "invite", "story"][i % 5])
