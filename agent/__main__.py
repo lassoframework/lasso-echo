@@ -1578,16 +1578,29 @@ def main(argv=None):
     elif cmd == "draft-bible":
         # MANUAL onboarding tool: intake doc -> DRAFT bible + social proof under
         # brand_voice/drafts/<client>/. Never auto-activated; a human copies files.
-        client, intake, args = "", "", argv[1:]
+        # --from-form <path|r2-key|client>: render the ARCHIVED portal intake JSON
+        # into the numbered BRAND_VOICE_INTAKE.md first (for human editing and
+        # approval; that mode drafts, activates, and approves NOTHING).
+        client, intake, from_form, args = "", "", "", argv[1:]
         i = 0
         while i < len(args):
             if args[i] == "--client" and i + 1 < len(args):
                 client = args[i + 1]; i += 2; continue
             if args[i] == "--intake" and i + 1 < len(args):
                 intake = args[i + 1]; i += 2; continue
+            if args[i] == "--from-form" and i + 1 < len(args):
+                from_form = args[i + 1]; i += 2; continue
             i += 1
-        if not client or not intake:
-            print("usage: python -m agent draft-bible --client <key> --intake <path>")
+        if from_form:
+            from .bible_drafter import run_from_form
+            out_path = run_from_form(from_form, client=client or None)
+            print("INTAKE DOC written (HUMAN edits + approves; nothing activated):\n"
+                  f"  {out_path}\n"
+                  "Next: review it, confirm every proof permission, fill the TODOs,\n"
+                  f"then run: python -m agent draft-bible --client <key> --intake {out_path}")
+        elif not client or not intake:
+            print("usage: python -m agent draft-bible --client <key> --intake <path>\n"
+                  "       python -m agent draft-bible --from-form <path|r2-key|client> [--client <key>]")
         else:
             from .bible_drafter import run as draft_bible_run
             bible_path, proof_path = draft_bible_run(client, intake)
