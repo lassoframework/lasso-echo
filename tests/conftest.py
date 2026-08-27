@@ -52,5 +52,13 @@ def _isolated_db(tmp_path, monkeypatch):
         from agent import config as _config
         monkeypatch.setattr(_config, "POST_LOG_PATH",
                             str(tmp_path / "post_log_test.jsonl"), raising=False)
+        # LIBRARY QUARANTINE (2026-08-27, second import-time leak): the container
+        # bakes AGENT_LIBRARY_PATH=/data/content_library into config.LIBRARY_PATH
+        # at import, so sync tests wrote 40 fake 11-byte test photos into the REAL
+        # gritx library (cleaned by hand the same day). Rebind to the local-dev
+        # default (repo-relative content_library) — the exact world the tests are
+        # written against; the data volume is never touched.
+        monkeypatch.setattr(_config, "LIBRARY_PATH", "content_library",
+                            raising=False)
     except Exception:
         pass
