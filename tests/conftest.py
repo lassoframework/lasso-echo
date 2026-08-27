@@ -36,3 +36,10 @@ def _isolated_db(tmp_path, monkeypatch):
         if key.startswith(_CRED_PREFIXES):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo_test.db"))
+    # DATA-VOLUME QUARANTINE: in the production container /data EXISTS and holds
+    # REAL gym media/state, so every default-/data path (content_library, brain,
+    # clipper cache) resolves to live data and tests that expect an empty world
+    # fail (14 media-sync failures in the 2026-08-27 container run) or, worse,
+    # could write beside real files. Point the data root at an EMPTY per-test dir
+    # (deliberately not created — matching a dev machine with no volume).
+    monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path / "data"))
