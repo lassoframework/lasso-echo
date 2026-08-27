@@ -42,6 +42,18 @@ _WANT_COLS = ("id", "name", "slug", "created_at", "gym_brand",
 # one wins. None exist on the live table today; this future-proofs a later portal column.
 _DOMAIN_COLS = ("domain", "website", "site", "url")
 
+# gyms.status values that are NOT a welcomeable client. Evidence (live gyms table,
+# project ooqcvmcjspeltuuhcvlh, queried 2026-08-27): the table holds four statuses —
+# active (119), onboarding (28), inactive (5), archived (3). EVERY person-name lead
+# stub in the 45-day window ('Joe Floria', 'Dean Holcomb', 'Ryan Brack', 'Juan
+# Martinez', 'Nora M Matthew', ...) carries status='onboarding' (a lead who started
+# the funnel, not a client), and the duplicate rows behind double alerts ('Bird Dog
+# CrossFit', 'The Bolton Club') carry status='archived'. Every known real client is
+# status='active'. Excluding these three states removed all of the 2026-08-27 junk
+# alerts. A NULL, empty, or unrecognized future status is NOT excluded (fail open:
+# never drop a possibly-real gym on a status we have not seen).
+_EXCLUDED_STATUSES = {"onboarding", "inactive", "archived"}
+
 
 class PortalGymsError(Exception):
     """A Supabase call failed. Detail is scrubbed of any secret before raising."""
@@ -139,8 +151,10 @@ class PortalGymsReader:
         so it is ""). Creds absent -> [] (nothing read, worker unchanged).
 
         Demo / load-test / verification gyms are excluded when those flag columns exist,
-        so a welcome is never generated for a non-real gym. A gym with no name is skipped
-        (it cannot make a card)."""
+        and so are rows in a known non-client status (onboarding lead stubs, inactive,
+        archived — see _EXCLUDED_STATUSES), so a welcome is never generated for a
+        non-real gym or a lead who merely started the funnel. A gym with no name is
+        skipped (it cannot make a card)."""
         if not self.available():
             return []
         cols = self.real_columns()
@@ -197,14 +211,48 @@ class PortalGymsReader:
             o["owner_name"] = owners.get(str(o["gym_id"]), "")
         return out
 
+    def gyms_by_ids(self, gym_ids):
+        """RAW gyms rows for the given ids (no window, no exclusion filter): the prune
+        lane needs to SEE a row's current status/flags to judge it, so this returns the
+        rows as-is, selecting only columns that actually exist. RAISES on any failure —
+        no creds, missing load-bearing columns, an HTTP error — so a caller can never
+        mistake an outage for 'row gone' and prune a real gym on bad data."""
+        ids = [str(g) for g in gym_ids if g]
+        if not ids:
+            return []
+        if not self.available():
+            raise PortalGymsError(0, "no supabase creds; cannot judge portal rows")
+        cols = self.real_columns()
+        for required in ("id", "name"):
+            if required not in cols:
+                raise PortalGymsError(0, f"gyms table missing column {required!r}")
+        select_cols = [c for c in _WANT_COLS if c in cols]
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={"select": ",".join(select_cols), "id": f"in.({','.join(ids)})"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalGymsError(r.status_code, _scrub((r.text or "")[:200]))
+        return list(r.json() or [])
 
-def _is_excluded(row):
-    """A demo / load-test / verification gym is never a real client to welcome. The
-    flag columns may be absent on some rows (older schema); absent = not excluded."""
+
+def is_excluded(row):
+    """True when a gyms row is NOT a real client to welcome: a demo / load-test /
+    verification gym, or a row whose status is a known non-client state (onboarding
+    lead stub, inactive, archived — see _EXCLUDED_STATUSES for the live-data
+    evidence). Flag/status columns may be absent on some rows (older schema);
+    absent, NULL, or an unrecognized status = not excluded (never drop a
+    possibly-real gym on missing data)."""
     for flag in ("is_demo", "load_test", "is_verification"):
         if bool(row.get(flag)):
             return True
-    return False
+    status = str(row.get("status") or "").strip().lower()
+    return status in _EXCLUDED_STATUSES
+
+
+_is_excluded = is_excluded  # internal alias (kept for existing callers)
 
 
 def list_recent_portal_gyms(days=45, reader=None):
@@ -214,6 +262,13 @@ def list_recent_portal_gyms(days=45, reader=None):
     reads SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY lazily."""
     reader = reader or PortalGymsReader()
     return reader.list_recent_portal_gyms(days=days)
+
+
+def gyms_by_ids(gym_ids, reader=None):
+    """Module-level convenience: RAW gyms rows for the given ids (see
+    PortalGymsReader.gyms_by_ids). Raises on any read failure; never guesses."""
+    reader = reader or PortalGymsReader()
+    return reader.gyms_by_ids(gym_ids)
 
 
 def _scrub(text):

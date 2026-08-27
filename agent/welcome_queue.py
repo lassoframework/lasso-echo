@@ -570,6 +570,79 @@ def _norm_name(name):
     return " ".join((name or "").lower().split())
 
 
+def _portal_ak(gym_id):
+    """The synthetic account key for a portal gym (logo override lookup + alert
+    stamps), derived the one way everywhere so stamps and overrides always match."""
+    return "portal_" + re.sub(r"[^a-z0-9]+", "_", str(gym_id).lower()).strip("_")
+
+
+# ---- logo-blocked alert: ONE summary line per sweep, deduped per (gym, state) ----------
+
+_LOGO_ALERT_PREFIX = "welcome_logo_alerted_"
+
+
+def _logo_block_sig(has_override, domain):
+    """The block STATE for one gym, stored as the kv stamp value. The alert re-fires
+    only when this changes: an override appearing/disappearing or the domain changing
+    is a state change worth a fresh line; the same broken state on the next sweep is
+    not."""
+    return f"blocked|override={'yes' if has_override else 'no'}|domain={domain or 'none'}"
+
+
+def _clear_logo_alert(ak):
+    """The gym's logo resolved (or its queue entry was pruned): drop the stamp so a
+    FUTURE re-block alerts again instead of being swallowed by a stale stamp."""
+    try:
+        if db.kv_get(_LOGO_ALERT_PREFIX + ak):
+            db.kv_set(_LOGO_ALERT_PREFIX + ak, "")
+    except Exception:  # noqa: BLE001 - stamp hygiene never blocks the scan
+        pass
+
+
+def _alert_blocked_logos(blocked):
+    """AT MOST ONE Slack line per sweep for logo-blocked welcomes, and only when
+    something actually changed. Each entry in `blocked` is {name, ak, sig}.
+
+    Dedup contract (Blake, 2026-08-27, after ~30 repeated per-gym lines per sweep):
+      * a gym alerts ONCE per block state (kv stamp = its state sig); the same
+        broken state on the next sweep is silent (a log line only, never Slack).
+      * a STATE CHANGE (logo override appears -> gym enqueues and the stamp is
+        cleared; domain changes -> sig differs) re-fires for that gym.
+      * everything new in a sweep collapses into ONE summary line, never N lines.
+
+    DURABLE-OR-SILENT (same rule as _alert_needs_media, gritx storm 2026-08-27):
+    where the kv store is ephemeral (no AGENT_DB_PATH, no data volume) the stamps
+    die with the process and dedup is impossible, so such a process logs locally
+    and stays OFF Slack. Returns the count of newly-alerted gyms."""
+    if not blocked:
+        return 0
+    try:
+        if not db.kv_is_durable():
+            print(f"[welcome-queue] {len(blocked)} welcome(s) blocked on logo; ops "
+                  "alert SUPPRESSED: the kv store here is ephemeral (no AGENT_DB_PATH "
+                  "and no data volume), so the dedup stamp cannot persist and alerting "
+                  "would storm on every run")
+            return 0
+        new = [b for b in blocked
+               if db.kv_get(_LOGO_ALERT_PREFIX + b["ak"]) != b["sig"]]
+        if not new:
+            print(f"[welcome-queue] {len(blocked)} welcome(s) still blocked on logo "
+                  "(all already alerted); no re-alert")
+            return 0
+        for b in new:
+            db.kv_set(_LOGO_ALERT_PREFIX + b["ak"], b["sig"])
+        names = ", ".join(f"'{b['name']}'" for b in new[:8])
+        if len(new) > 8:
+            names += f" and {len(new) - 8} more"
+        ops_alerts.alert(
+            f"welcome queue: {len(blocked)} blocked on logo (deduped), {len(new)} "
+            f"new: {names}. Drop a logo override or fix the domain, or their welcome "
+            "never posts.")
+        return len(new)
+    except Exception:  # noqa: BLE001 - alerting never blocks the scan
+        return 0
+
+
 def _queue_has_name(name):
     """True when a welcome_queue row (queued OR already-served) carries this gym name
     (normalized). The queue row is never deleted once it exists, so this catches a gym
@@ -595,7 +668,12 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
       * same gym already in welcome_queue (by normalized name, from either source) ->
         skipped, so a client present in BOTH Stripe and portal is welcomed exactly once.
       * a gym with no usable logo (no override AND no scrapable domain) is reported
-        needs_logo and NOT enqueued (never a logo-less card).
+        needs_logo and NOT enqueued (never a logo-less card). Blocked gyms surface as
+        AT MOST ONE Slack summary line per sweep, deduped per (gym, block state) via
+        kv stamps that re-fire only on a state change (_alert_blocked_logos).
+      * only real clients are considered at all: list_recent_portal_gyms excludes
+        demo/test/verification rows AND known non-client statuses (onboarding lead
+        stubs, inactive, archived), so a person-name lead never enters the queue.
 
     Creds absent (no SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY) -> list is empty and this
     no-ops: the Stripe path is byte-for-byte unchanged. Requires AGENT_HOSTING_ENABLED to
@@ -615,6 +693,7 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
         return {"scanned": False, "reason": f"portal read failed: {type(e).__name__}: {e}"}
 
     enqueued = needs_logo = already = deduped = 0
+    blocked = []
     for g in gyms:
         try:
             gym_id = g.get("gym_id")
@@ -635,7 +714,7 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
             # portal carries no domain column, so fall back to the curated portal_domains
             # registry (real domains the agent looks up, so no human need send a site);
             # else needs_logo, NOT enqueued.
-            ak = "portal_" + re.sub(r"[^a-z0-9]+", "_", str(gym_id).lower()).strip("_")
+            ak = _portal_ak(gym_id)
             override = welcome_posts.portal_logo_override(ak, gym_key=gym_key)
             domain = (g.get("domain") or "").strip() or portal_domains.domain_for(name, gym_id)
             logo = scraper(domain, ak, override_path=override, out_dir=None)
@@ -643,20 +722,16 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
                 needs_logo += 1
                 print(f"[welcome-queue] portal gym {name} has no usable logo "
                       f"(override/scrape); NOT enqueued (drop a logo override)")
-                # ALERT once per gym (audit 2026-08-25 MAJOR): this was a print re-fired
-                # every scan that no human watches — a new client's welcome post silently
-                # never happened (Pierce). Deduped in kv; clears only by hand.
-                try:
-                    from . import db as _db, ops_alerts as _oa
-                    if not _db.kv_get(f"welcome_logo_alerted_{ak}"):
-                        _db.kv_set(f"welcome_logo_alerted_{ak}", "1")
-                        _oa.alert(
-                            f"welcome post for new gym '{name}' is BLOCKED: no usable "
-                            "logo (scrape + override both failed). Drop a logo override "
-                            "or fix the domain, or their welcome never posts.")
-                except Exception:  # noqa: BLE001 - alerting never blocks the scan
-                    pass
+                # Collected for ONE deduped summary alert after the loop (Blake
+                # 2026-08-27: the old per-gym line here re-fired ~30 lines per sweep).
+                blocked.append({"name": name, "ak": ak,
+                                "sig": _logo_block_sig(bool(override), domain)})
                 continue
+
+            # A usable logo now exists: the block state (if any) is over. Clear the
+            # alert stamp so a FUTURE re-block (override removed, domain broken)
+            # alerts again instead of dying against a stale stamp.
+            _clear_logo_alert(ak)
 
             template = welcome_posts.pick_template(gym_key)
             # Owner name the client typed at onboarding (from onboarding_intake via
@@ -673,12 +748,89 @@ def scan_portal_and_enqueue(reader=None, scraper=None, host_fn=None, window_days
         except Exception as e:  # one bad gym never stops the scan
             print(f"[welcome-queue] portal enqueue failed for {g.get('name')}: "
                   f"{type(e).__name__}: {e}")
+    # One summary line per sweep at most, deduped per (gym, block state) in kv.
+    logo_alerted_new = _alert_blocked_logos(blocked)
     return {
         "scanned": True,
         "source": "portal",
         "enqueued": enqueued,
         "portal_seen": len(gyms),
         "needs_logo": needs_logo,
+        "logo_alerted_new": logo_alerted_new,
         "already_welcomed": already,
         "deduped_with_stripe": deduped,
     }
+
+
+# ---- prune: queued portal entries whose source row no longer passes the filter ---------
+
+def prune_portal_junk(reader=None, dry_run=False):
+    """Remove QUEUED portal-sourced welcome rows whose portal `gyms` row now fails the
+    client filter (status onboarding/inactive/archived, or a demo/load-test/verification
+    flag) or is gone from the portal entirely. Cleanup for junk that entered the queue
+    before the status filter existed (2026-08-27: lead stubs like 'Dean Holcomb' and
+    archived duplicates like the second 'Bird Dog CrossFit').
+
+    Safety rails, in order:
+      * only rows with gym_key 'portal:...' AND status='queued' are candidates: a
+        SERVED row is posted history and a Stripe-keyed row has a paying subscription
+        behind it — neither is ever touched.
+      * the portal rows are re-read by id at prune time (gyms_by_ids RAISES on any
+        failure); a failed read prunes NOTHING (unsure = keep, never guess).
+      * every removal is printed AND audited (welcome_pruned) — never silent.
+      * a pruned gym's welcome ledger stamp and logo-alert stamp are cleared, so if
+        the SAME portal row later becomes a real active client it is welcomed (and,
+        if blocked, alerted) fresh.
+
+    dry_run=True lists what WOULD be pruned without deleting anything. Returns
+    {"pruned": [{gym_key, name, reason}], "kept": [names], "dry_run": bool}
+    plus an "error" key when the portal read failed."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, gym_key, name FROM welcome_queue "
+            "WHERE status='queued' AND gym_key LIKE 'portal:%' ORDER BY id").fetchall()
+    rows = [dict(r) for r in rows]
+    if not rows:
+        print("[welcome-queue] prune: no queued portal welcomes; nothing to judge")
+        return {"pruned": [], "kept": [], "dry_run": dry_run}
+
+    ids = [r["gym_key"].split(":", 1)[1] for r in rows]
+    try:
+        portal_rows = portal_gyms.gyms_by_ids(ids, reader=reader)
+    except Exception as e:
+        msg = (f"portal read failed ({type(e).__name__}); pruned NOTHING "
+               "(unsure = keep, never guess)")
+        print(f"[welcome-queue] prune aborted: {msg}")
+        return {"pruned": [], "kept": [r["name"] for r in rows],
+                "error": msg, "dry_run": dry_run}
+    by_id = {str(p.get("id")): p for p in portal_rows}
+
+    pruned, kept = [], []
+    for r in rows:
+        gym_id = r["gym_key"].split(":", 1)[1]
+        prow = by_id.get(str(gym_id))
+        if prow is None:
+            reason = "portal row gone (removed at source)"
+        elif portal_gyms.is_excluded(prow):
+            status = str(prow.get("status") or "").strip().lower()
+            reason = f"fails client filter (status={status or 'demo/test flag'!r})"
+        else:
+            kept.append(r["name"])
+            continue
+        pruned.append({"gym_key": r["gym_key"], "name": r["name"], "reason": reason})
+        verb = "DRY RUN, would remove" if dry_run else "removing"
+        print(f"[welcome-queue] prune: {verb} {r['name']} ({r['gym_key']}): {reason}")
+        if dry_run:
+            continue
+        with db._lock, _conn() as conn:
+            conn.execute("DELETE FROM welcome_queue WHERE id=? AND status='queued'",
+                         (r["id"],))
+            conn.commit()
+        # Un-stamp the ledger + alert stamp: a later REAL activation of this portal
+        # row welcomes (and, if blocked, alerts) fresh instead of being swallowed.
+        db.kv_set(welcome_posts.LEDGER_PREFIX + r["gym_key"], "")
+        _clear_logo_alert(_portal_ak(gym_id))
+        db.audit("welcome_pruned", r["gym_key"], f"{r['name']}: {reason}", "lasso", "")
+    print(f"[welcome-queue] prune{' (dry run)' if dry_run else ''}: "
+          f"{len(pruned)} pruned, {len(kept)} kept")
+    return {"pruned": pruned, "kept": kept, "dry_run": dry_run}

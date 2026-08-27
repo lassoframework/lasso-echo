@@ -815,7 +815,7 @@ _COMMANDS = {
         ("welcome-templates", "render 10 welcome-new-gym templates + 20 proofs, grade, post review set to Slack (--post)"),
         ("welcome-client", "generate one real welcome post for a gym from a kept template, held for approval (--template/--name/--owner/--logo)"),
         ("welcome-backfill", "pull brand-new clients (last N days by subscription), scrape logos, make feed+story welcomes, surface held (--days/--post/--dry-run)"),
-        ("welcome-queue", "manage the one-per-day welcome drip: --build-manifest hosts the catch-up cards for Railway seeding, --seed enqueues locally, no args shows the queue (drip behind AGENT_WELCOME_QUEUE_ENABLED)"),
+        ("welcome-queue", "manage the one-per-day welcome drip: --build-manifest hosts the catch-up cards for Railway seeding, --seed enqueues locally, --prune [--dry-run] removes queued portal entries that fail the client filter, no args shows the queue (drip behind AGENT_WELCOME_QUEUE_ENABLED)"),
         ("demo-calendar", "the 30-day done-for-you demo calendar: --images-dir hosts the rendered cards to R2 + writes the manifest, --from-manifest seeds the queue, no args shows status (behind AGENT_DEMO_CALENDAR_ENABLED)"),
         ("send-card", "post an approval card to Slack for an existing PENDING draft (by draft_id)"),
     ],
@@ -1329,15 +1329,31 @@ def _welcome_backfill(args):
 
 
 def _welcome_queue(args):
-    """python -m agent welcome-queue [--seed] [--status]
+    """python -m agent welcome-queue [--seed] [--prune [--dry-run]] [--status]
 
     Manage the one-per-day welcome DRIP. Default (no args) prints the queue.
     --seed runs the Stripe scan once and enqueues every READY new-client welcome
     (feed + story, hosted to R2) for the catch-up; the drip stays dark until
     AGENT_WELCOME_QUEUE_ENABLED is armed by hand. Requires AGENT_HOSTING_ENABLED +
     STRIPE_API_KEY for --seed.
+    --prune re-reads each QUEUED portal-sourced entry's live gyms row and removes
+    those that fail the client filter (status onboarding/inactive/archived, or a
+    demo/test flag) or are gone from the portal — the 2026-08-27 lead-stub cleanup.
+    Served rows and Stripe-keyed rows are never touched, a failed portal read prunes
+    nothing, and every removal is printed + audited. --dry-run lists without deleting.
     """
     from . import welcome_queue as _wq
+    if "--prune" in args:
+        summary = _wq.prune_portal_junk(dry_run="--dry-run" in args)
+        if summary.get("error"):
+            print(f"welcome-queue: prune aborted: {summary['error']}")
+            return
+        label = "would prune" if summary["dry_run"] else "pruned"
+        print(f"welcome-queue: {label} {len(summary['pruned'])} entr(y/ies), "
+              f"kept {len(summary['kept'])}.")
+        for p in summary["pruned"]:
+            print(f"  {p['name']:<30} {p['reason']}")
+        return
     if "--build-manifest" in args:
         if not config.hosting_enabled():
             print("welcome-queue: AGENT_HOSTING_ENABLED not set; cannot host cards. Run:\n"
