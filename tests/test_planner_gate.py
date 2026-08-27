@@ -73,10 +73,12 @@ def _make_good_plan_rows():
     pillars = ["platform", "doctrine", "b2b", "podcast", "summit"]
     rows = []
     for i in range(10):
-        # Short hook (< 125 chars), varied per row to avoid dup hashes
+        # Short hook LINE (< 125 chars, newline-terminated so the hook is the
+        # first line and the hook_too_long soft flag never fires), varied per
+        # row to avoid dup hashes.
         hook = f"Feeling stuck at {i + 30}? Real results start here."
         body = (
-            " Busy parents and working professionals thrive in our 30-minute format. "
+            "\nBusy parents and working professionals thrive in our 30-minute format. "
             "No prior experience needed. Every class is beginner friendly. "
             f"Get started today and book your free intro session. #{i}"
         )

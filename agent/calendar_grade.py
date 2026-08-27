@@ -4,6 +4,23 @@ Social Report Card rubric. Deterministic, offline, no API calls.
 A calendar that cannot score >= 90 (A) DOES NOT STAGE. The planner remediates
 and rescores in a loop; only an A reaches the human approval queue.
 Distinct from grade_gate.py, which grades individual card IMAGES.
+
+GYM PROFILE RUBRIC (Blake's ruling, 2026-08-27): the GYM profile does NOT
+grade image quality. Clients upload their own media; Echo controls captions
+and content mix only, so a gym can never be held below A for the photos it
+chose to send. The visual_match leg is SKIPPED for GYM and the remaining five
+legs (raw max 85) are RENORMALIZED to 0-100 by scaling the raw sum by 100/85
+(chosen over redistributing visual's 15 points into other legs so every leg
+keeps its documented point values and no leg's internal math changes). The
+B2B profile still grades proof_numbers under the visual_match leg out of a
+raw 100, unchanged. Letter bands and A_THRESHOLD=90 apply to the normalized
+total for both profiles.
+
+DUPLICATE COUNTING: one calendar post deliberately spans several rows — a
+feed is cross-posted to Instagram AND Facebook, and its paired story carries
+the same caption on the same date. Same-date rows sharing a caption hash are
+therefore ONE post, never a repeat; a hash that appears on MORE THAN ONE
+post_date is a true duplicate and is penalized per extra date.
 """
 from __future__ import annotations
 
@@ -25,6 +42,10 @@ WEIGHTS = {
 }
 A_THRESHOLD = 90
 BANDS = ((90, "A"), (80, "B"), (70, "C"), (60, "D"), (0, "F"))
+
+# GYM profile: visual_match is skipped (clients own their media), so the raw
+# max is 85 and the total is renormalized to 0-100 (see module docstring).
+_GYM_RAW_MAX = sum(WEIGHTS.values()) - WEIGHTS["visual_match"]  # 85
 
 # Athlete-avatar leak words (first-line scan)
 _ATHLETE_WORDS = re.compile(
@@ -64,13 +85,19 @@ def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
     scores["consistency"]    = _consistency(rows, defects)
     scores["content_mix"]    = _content_mix(rows, profile, quotas, defects)
     scores["caption_craft"]  = _caption_craft(rows, defects)
-    scores["visual_match"]   = (
-        _proof_numbers(rows, defects) if profile == "B2B"
-        else _visual_match(rows, defects)
-    )
+    if profile == "B2B":
+        # B2B grades proof numbers under the visual_match leg (unchanged).
+        scores["visual_match"] = _proof_numbers(rows, defects)
+    # GYM: NO visual_match leg. Clients upload their own media; Echo controls
+    # captions and mix only, so image quality is never graded (Blake, 2026-08-27).
     scores["right_audience"] = _right_audience(rows, profile, defects)
     scores["path_to_join"]   = _path(rows, profile, defects)
-    total = sum(scores.values())
+    raw = sum(scores.values())
+    if profile == "B2B":
+        total = raw
+    else:
+        # Renormalize the five remaining legs (raw max 85) to 0-100.
+        total = int(raw * 100 / _GYM_RAW_MAX + 0.5)
 
     # Spec: "the 20x repeat month grades F on consistency."
     # When consistency is zeroed by duplicate captions, the calendar cannot
@@ -111,17 +138,22 @@ def _consistency(rows, defects) -> int:
             except ValueError:
                 pass
 
-    # -- Duplicate caption_hash within the plan --
-    hashes: list = []
+    # -- Duplicate caption_hash across DISTINCT post dates --
+    # One post spans several rows BY DESIGN: a feed is cross-posted to
+    # Instagram AND Facebook, and its paired story shares the caption on the
+    # same date. Same-date rows sharing a hash are ONE post, not a repeat; a
+    # hash seen on MORE THAN ONE date is a true duplicate (-8 per extra date).
+    dates_by_hash: dict = {}
     for row in rows:
         cap = row.get("caption") or ""
-        hashes.append(caption_hash(cap))
+        h = caption_hash(cap)
+        d = str(row.get("post_date") or "")[:10]
+        dates_by_hash.setdefault(h, set()).add(d)
 
-    from collections import Counter
-    hash_counts = Counter(hashes)
-    for h, count in hash_counts.items():
+    for h, ds in dates_by_hash.items():
+        count = len(ds)
         if count > 1:
-            # First occurrence is "used", every additional is a dup
+            # First date is "used", every additional date is a dup
             dups = count - 1
             defects.append(("consistency", h[:8], f"caption hash {h[:8]} repeated {count} times"))
             score -= 8 * dups
@@ -221,7 +253,9 @@ def _caption_craft(rows, defects) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Leg: visual_match (max 15, GYM profile)
+# Leg: visual_match (max 15) — NO LONGER GRADED for the GYM profile
+# (Blake, 2026-08-27: clients upload their own media; Echo owns captions and
+# mix only). Kept for reference/tooling; grade_month never calls it.
 # ---------------------------------------------------------------------------
 
 def _visual_match(rows, defects) -> int:

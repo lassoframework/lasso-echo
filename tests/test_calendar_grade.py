@@ -227,10 +227,17 @@ def test_grade_month_returns_calendar_grade():
     assert isinstance(result.letter, str)
     assert isinstance(result.scores, dict)
     assert isinstance(result.defects, list)
-    # All expected legs present
+    # GYM legs (Blake 2026-08-27: image quality is NOT graded for clients, so
+    # visual_match is absent and the remaining five legs renormalize to 0-100)
     for leg in ("consistency", "content_mix", "caption_craft",
-                "visual_match", "right_audience", "path_to_join"):
+                "right_audience", "path_to_join"):
         assert leg in result.scores, f"Missing score leg: {leg}"
+    assert "visual_match" not in result.scores, (
+        "GYM profile must not grade the visual_match leg (client-owned media)"
+    )
+    # B2B keeps the visual_match (proof_numbers) leg, unchanged
+    b2b = grade_month(rows, profile="B2B")
+    assert "visual_match" in b2b.scores
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +273,92 @@ def test_a_threshold_is_90():
 
 
 # ---------------------------------------------------------------------------
+# GYM rubric renormalization (Blake 2026-08-27: clients upload their own
+# media, so image quality is never graded; the five remaining legs scale
+# 100/85 to keep the total 0-100)
+# ---------------------------------------------------------------------------
+
+def test_gym_a_achievable_with_client_photos_of_any_quality():
+    """A GYM month with stock-looking, non-vision-derived uploads but clean
+    captions/mix must still grade A: Echo controls captions and mix only."""
+    rows = []
+    pillars = ["community", "results", "education", "coach", "invite",
+               "story", "faq"]
+    for i in range(28):
+        rows.append(_make_row(
+            post_date=f"2026-09-{(i + 1):02d}" if i < 30 else "",
+            caption=_perfect_caption(i),
+            pillar=pillars[i % len(pillars)],
+            vision_derived=False,
+            media_url="https://stockphotos.com/upload.jpg",
+            template_id=f"tmpl_{i % 3}",       # mixed templates: also not graded
+            media_kind="photo",
+        ))
+    result = grade_month(rows, profile="GYM")
+    assert result.total >= 90, (
+        f"Client-photo month must reach A regardless of image quality; got "
+        f"{result.total} ({result.letter}), scores={result.scores}, "
+        f"defects={result.defects}"
+    )
+    assert result.letter == "A"
+
+
+def test_gym_renormalization_math():
+    """Perfect GYM month: raw 85/85 -> 100. One 1-day gap: raw 81 -> 95
+    (int(81 * 100 / 85 + 0.5))."""
+    rows = _perfect_month(28)
+    perfect = grade_month(rows, profile="GYM")
+    assert perfect.total == 100, (
+        f"Perfect month should renormalize to 100, got {perfect.total} "
+        f"({perfect.scores})"
+    )
+    # Introduce exactly one 1-day gap (-4 on consistency): drop 2026-09-02.
+    gapped = [r for r in rows if r["post_date"] != "2026-09-02"]
+    g = grade_month(gapped, profile="GYM")
+    assert g.scores["consistency"] == 16, g.scores
+    assert g.total == 95, (
+        f"raw 81 must renormalize to 95, got {g.total} ({g.scores})"
+    )
+
+
+def test_same_date_cross_post_and_story_are_one_post_not_dups():
+    """A feed cross-posted to IG + FB with its paired story shares ONE caption
+    on ONE date by design: no consistency dup defect, consistency stays 20."""
+    rows = []
+    for i in range(10):
+        d = f"2026-09-{(i + 1):02d}"
+        cap = _perfect_caption(i)
+        rows.append(_make_row(post_date=d, caption=cap, pillar="platform"))
+        fb = _make_row(post_date=d, caption=cap, pillar="platform")
+        fb["account"] = "facebook"
+        rows.append(fb)
+        story = _make_row(post_date=d, caption=cap, pillar="platform")
+        story["format"] = "story"
+        rows.append(story)
+    result = grade_month(rows, profile="GYM")
+    dup_defects = [d for d in result.defects
+                   if d[0] == "consistency" and "repeated" in d[2]]
+    assert not dup_defects, (
+        f"Same-date cross-post/story mirrors must not count as dups: {dup_defects}"
+    )
+    assert result.scores["consistency"] == 20
+
+
+def test_cross_date_repeat_still_counts_as_dup():
+    """The SAME caption on two different dates is a true repeat: -8."""
+    cap = _perfect_caption(1)
+    rows = [
+        _make_row(post_date="2026-09-01", caption=cap),
+        _make_row(post_date="2026-09-02", caption=cap),
+    ]
+    result = grade_month(rows, profile="GYM")
+    dup_defects = [d for d in result.defects
+                   if d[0] == "consistency" and "repeated 2 times" in d[2]]
+    assert dup_defects, f"Cross-date repeat must be a dup defect: {result.defects}"
+    assert result.scores["consistency"] <= 12
+
+
+# ---------------------------------------------------------------------------
 # Test 10: defect tuples present for each violated leg
 # ---------------------------------------------------------------------------
 
@@ -273,8 +366,10 @@ def test_defects_present_for_violations():
     # Rows with multiple deliberate violations:
     # - em-dash (caption_craft)
     # - no ask (path_to_join)
-    # - not vision_derived + stock (visual_match)
     # - athlete-avatar leak (right_audience)
+    # Stock / not-vision-derived media is deliberately included: the GYM
+    # profile no longer grades image quality (client-owned media), so it must
+    # produce NO visual_match defects.
     rows = [
         _make_row(
             post_date=f"2026-09-{(i + 1):02d}",
@@ -288,9 +383,11 @@ def test_defects_present_for_violations():
     result = grade_month(rows, profile="GYM")
     # caption_craft violation (em-dash) -> score = 0 (no defect tuple needed since it's a hard 0)
     assert result.scores["caption_craft"] == 0
-    # visual_match defects (stock detected)
+    # GYM never emits visual_match defects (image quality is not graded)
     visual_defects = [d for d in result.defects if d[0] == "visual_match"]
-    assert visual_defects, "Expected visual_match defects for stock media"
+    assert not visual_defects, (
+        f"GYM profile must not grade visuals, got: {visual_defects}"
+    )
     # right_audience defects (athlete-avatar leak)
     audience_defects = [d for d in result.defects if d[0] == "right_audience"]
     assert audience_defects, "Expected right_audience defects for compete/competition hook"

@@ -7,9 +7,23 @@ For each gym:
 4. Alert coach channel when either grade drops below B (80)
 
 Behind AGENT_CALENDAR_GRADE flag. Run via: python3 -m agent jobs grade_sweep
+
+SELF-FIX MODE (AGENT_GRADE_SELF_FIX, default OFF; Blake's 2026-08-27 ruling
+"it should fix it on its own without sending me alot of slacks"). Flag OFF ->
+everything above is byte-for-byte unchanged. Flag ON:
+  * a forward book below A is first self-remediated (agent/jobs/grade_fix.py)
+    and then REGRADED; the final grade is what lands in gym_social_grades;
+  * trailing_30 is graded + stored but NEVER alerts (history is not fixable);
+  * a still-below-A forward book alerts ONLY when the (score, defect set)
+    differs from the last alerted state for that gym (kv stamp) AND at most
+    once per gym per day, in <= 3 lines saying what was auto-fixed and what
+    remains;
+  * at most ONE aggregated sweep summary line fires per run, and only when
+    something changed (a gym self-fixed to A or a new held alert fired).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date, timedelta, timezone, datetime
 
@@ -80,7 +94,8 @@ def _write_grade(store_or_db, gym_id: str, window: str, grade) -> None:
 
 
 def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
-    """Fire one ops alert when a grade drops below B (80)."""
+    """Fire one ops alert when a grade drops below B (80). LEGACY path: only
+    used when AGENT_GRADE_SELF_FIX is OFF (byte-for-byte today's behavior)."""
     if grade.total < 80:
         top_defects = [d[2] for d in (grade.defects or [])[:3]]
         alert_fn(
@@ -88,6 +103,56 @@ def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
             f"{grade.total} ({grade.letter}). "
             f"Top defects: {top_defects}. Review the forward book or trailing posts."
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-fix alert policy (AGENT_GRADE_SELF_FIX only)
+# ---------------------------------------------------------------------------
+
+def _defect_state_hash(grade) -> str:
+    """A stable fingerprint of the grade's defect SET (order-independent)."""
+    parts = sorted(str(d[2]) for d in (grade.defects or []))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+
+def _should_alert_held(gym_id: str, grade, today_str: str, db=None) -> bool:
+    """Held-alert dedup: fire only when the (score, defect set) differs from
+    the last alerted state for this gym AND at most once per gym per day.
+    Durable-or-silent (the repo's alert-dedup convention): a process without a
+    durable kv would re-alert every run, so it stays silent instead."""
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        if hasattr(_db, "kv_is_durable") and not _db.kv_is_durable():
+            return False
+        key = f"grade_alert_state_{gym_id}"
+        raw = _db.kv_get(key, "")
+        state = json.loads(raw) if raw else {}
+        new = {"total": grade.total, "defects": _defect_state_hash(grade)}
+        if (state.get("total") == new["total"]
+                and state.get("defects") == new["defects"]):
+            return False                       # same state as last alert: quiet
+        if state.get("date") == today_str:
+            return False                       # already alerted this gym today
+        new["date"] = today_str
+        _db.kv_set(key, json.dumps(new))
+        return True
+    except Exception:  # noqa: BLE001 - alert plumbing must never break the sweep
+        return False
+
+
+def _held_alert_text(gym_id: str, grade, fix: dict) -> str:
+    """<= 3 lines: score, what self-fix repaired, what remains."""
+    fixed_txt = "; ".join((fix or {}).get("actions") or []) or "nothing auto-fixable"
+    remaining = [str(d[2]) for d in (grade.defects or [])[:3]]
+    return (
+        f"calendar grade: {gym_id} forward book held at {grade.total} "
+        f"({grade.letter}) after self-fix.\n"
+        f"Auto-fixed: {fixed_txt}.\n"
+        f"Remaining: {remaining}"
+    )
 
 
 def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
@@ -105,7 +170,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     """
     from agent import config
 
-    from agent.calendar_grade import grade_month
+    from agent.calendar_grade import A_THRESHOLD, grade_month
     from agent.real_month_planner import _profile_for
 
     if alert_fn is None:
@@ -139,6 +204,11 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                 "reason": "AGENT_CALENDAR_GRADE off for every requested gym "
                           "(per-gym AGENT_CALENDAR_GRADE_{GYM} and global both false)"}
 
+    # SELF-FIX MODE (AGENT_GRADE_SELF_FIX, default OFF). OFF -> the legacy
+    # per-gym-per-window alert path below runs byte-for-byte as today.
+    self_fix = config.grade_self_fix_enabled()
+    fixed_gyms, held_gyms, alerted_gyms = [], [], []
+
     results = {}
     for gym_id in gyms:
         profile = _profile_for(gym_id)
@@ -149,7 +219,10 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         if trailing_rows:
             t_grade = grade_month(trailing_rows, profile=profile)
             _write_grade(store, gym_id, "trailing_30", t_grade)
-            _alert_low_grade(gym_id, "trailing_30", t_grade, alert_fn)
+            if not self_fix:
+                _alert_low_grade(gym_id, "trailing_30", t_grade, alert_fn)
+            # self-fix ON: trailing NEVER alerts (history is not fixable);
+            # the grade is still stored above for the portal/digest.
             gym_result["trailing_30"] = {
                 "total": t_grade.total,
                 "letter": t_grade.letter,
@@ -162,13 +235,42 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         forward_rows = _fetch_rows(store, gym_id, today_str, forward_end)
         if forward_rows:
             f_grade = grade_month(forward_rows, profile=profile)
+            fix = None
+            if self_fix and f_grade.total < A_THRESHOLD:
+                # Self-remediate, re-read, regrade. The FINAL grade is stored.
+                try:
+                    from agent.jobs import grade_fix
+                    fix = grade_fix.remediate_forward_book(
+                        gym_id, forward_rows, store, profile=profile,
+                        defects=f_grade.defects, today_iso=today_str)
+                except Exception as exc:  # noqa: BLE001 - never sink the sweep
+                    print(f"[grade-sweep] {gym_id}: self-fix failed: "
+                          f"{type(exc).__name__}: {exc}")
+                    fix = {"ok": False, "actions": []}
+                forward_rows = _fetch_rows(store, gym_id, today_str,
+                                           forward_end) or forward_rows
+                f_grade = grade_month(forward_rows, profile=profile)
             _write_grade(store, gym_id, "forward_book", f_grade)
-            _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)
+            if not self_fix:
+                _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)
+            else:
+                if fix is not None and f_grade.total >= A_THRESHOLD:
+                    fixed_gyms.append(gym_id)
+                if f_grade.total < A_THRESHOLD:
+                    held_gyms.append(gym_id)
+                    # Alert ONLY when remediation ran, the book is still
+                    # below A, the state changed, and none fired today yet.
+                    if fix is not None and _should_alert_held(gym_id, f_grade,
+                                                              today_str):
+                        alert_fn(_held_alert_text(gym_id, f_grade, fix))
+                        alerted_gyms.append(gym_id)
             gym_result["forward_book"] = {
                 "total": f_grade.total,
                 "letter": f_grade.letter,
                 "rows": len(forward_rows),
             }
+            if fix is not None:
+                gym_result["self_fix"] = fix
         else:
             gym_result["forward_book"] = {"total": None, "reason": "no rows"}
 
@@ -177,7 +279,19 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
               f"trailing={gym_result.get('trailing_30',{}).get('letter','N/A')} "
               f"forward={gym_result.get('forward_book',{}).get('letter','N/A')}")
 
-    return {"ok": True, "gyms": results}
+    # ONE aggregated summary line per run, only when something changed
+    # (replaces the per-gym-per-window spam when self-fix is armed).
+    if self_fix and (fixed_gyms or alerted_gyms):
+        held_txt = ", ".join(held_gyms) if held_gyms else "none"
+        alert_fn(f"grade sweep: {len(results)} gyms, "
+                 f"{len(fixed_gyms)} self-fixed to A, "
+                 f"{len(held_gyms)} held ({held_txt})")
+
+    out = {"ok": True, "gyms": results}
+    if self_fix:
+        out["self_fixed"] = fixed_gyms
+        out["held"] = held_gyms
+    return out
 
 
 if __name__ == "__main__":

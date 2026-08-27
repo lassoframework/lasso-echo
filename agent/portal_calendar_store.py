@@ -838,6 +838,46 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None):
+        """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
+        AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
+        status IN (pending,draft,queued) guard, so a human-owned row (approved /
+        published / publishing / denied / killed / failed) can NEVER be modified
+        through this method no matter what the caller passes — the hard guarantee
+        that self-remediation only ever rewrites fresh machine drafts. Status
+        stays 'pending' (the approval gate is untouched: the row remains in the
+        owner's approval queue; nothing is auto-approved). Returns the updated
+        row dict, or None when zero rows matched."""
+        fields = {}
+        if caption is not None:
+            fields["caption"] = caption
+        if pillar is not None:
+            fields["pillar"] = pillar
+        if not fields:
+            return None
+        fields["status"] = "pending"
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=fields,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def list_pending_future(self, account_key, today_iso):
         """Return all content_calendar rows for account_key where status='pending'
         and post_date > today_iso. Used by the dedupe_forward_book job."""

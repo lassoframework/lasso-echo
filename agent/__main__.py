@@ -102,6 +102,7 @@ def _status():
     print(f"  connect_grade  : {config.connect_grade_enabled()}  (env AGENT_CONNECT_GRADE_ENABLED)")
     print(f"  grade          : {config.grade_enabled()}  (env AGENT_GRADE_ENABLED)")
     print(f"  calendar_grade : {config.calendar_grade_enabled()}  (env AGENT_CALENDAR_GRADE; A-gate on month planning + publish recheck; default OFF)")
+    print(f"  grade_self_fix : {config.grade_self_fix_enabled()}  (env AGENT_GRADE_SELF_FIX; nightly sweep self-remediates a below-A forward book (dup captions rewritten, over-cap days re-pillared, gaps refilled via existing lanes) then regrades; trailing never alerts; held alerts deduped to one per gym per day; default OFF)")
     print(f"  monthly_review : {config.monthly_review_enabled()}  (env AGENT_MONTHLY_REVIEW_ENABLED)")
     print(f"  knowledge      : {config.knowledge_enabled()}  (env AGENT_KNOWLEDGE_ENABLED)")
     print(f"  runway         : {config.runway_enabled()}  (env AGENT_RUNWAY_ENABLED)")

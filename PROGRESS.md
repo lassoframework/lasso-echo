@@ -70,6 +70,24 @@ SAVES the preference while dark; behavior follows only after the env flip.
 Four upgrades, all authorized by Blake, built sequentially. New flags default OFF in code;
 Blake's session arms them after audit. Suite green before each commit.
 
+### [~] Grade self-remediation + quiet alerts — agent/jobs/grade_fix.py (AGENT_GRADE_SELF_FIX, default OFF; Blake 2026-08-27: "it should fix it on its own without sending me alot of slacks")
+  - GYM RUBRIC (rides AGENT_CALENDAR_GRADE, scoring definition): visual_match leg SKIPPED for
+    GYM (clients upload their own media; Echo owns captions + mix only); remaining 5 legs
+    (raw 85) renormalized x100/85 to 0-100; B2B proof_numbers untouched; bands + A_THRESHOLD 90 unchanged
+  - DUP COUNTING (scoring definition, needs Blake's eyes): same-date IG feed + FB mirror +
+    paired story are ONE post (by-design caption sharing); a hash on >1 post_date is the true dup.
+    Without this every client book graded F forever on its own cross-post mirrors
+  - Self-fix (flag ON, forward book < A): true dup days rewritten FRESH on the SAME photo via
+    _clean_draft_for_day (A+ gate, banned words, copy gate, variety), PATCHed pending-only
+    (store.patch_pending_plan carries a server-side wipeable status filter: approved/published/
+    denied can NEVER be touched); over-cap days re-pillared from a different approved source;
+    gaps refilled ONLY via existing lanes (client grow scan / LASSO real month refill, once per
+    gym per day); unfillable gaps recorded once in kv, never re-announced
+  - ALERT POLICY (flag ON): trailing_30 never alerts; forward_book alerts only after remediation,
+    still < A, (score, defect-set) changed vs last kv stamp, max one per gym per day, <= 3 lines;
+    plus max ONE aggregated sweep summary line per run. Flag OFF: sweep + alerts byte-for-byte today
+  - Tests: tests/test_grade_self_fix.py (12) + test_calendar_grade.py rubric updates (4 new)
+
 ### [x] Reply-needed coach alerts — agent/inbox_alerts.py (AGENT_INBOX_ALERTS=true, ARMED + VERIFIED LIVE 2026-08-27: "[inbox-alerts] 2 card(s) sent" in worker logs)
   - Daily READ-ONLY sweep per gym (client gyms + lasso): unhandled post comments
     (GET /v1/inbox/comments + per-post threads), mentions, reviews (FB + Google Business) from Zernio

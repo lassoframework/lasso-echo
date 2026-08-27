@@ -1197,6 +1197,31 @@ def calendar_grade_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CALENDAR_GRADE", "false"))
 
 
+def grade_self_fix_enabled() -> bool:
+    """
+    Grade SELF-REMEDIATION switch (AGENT_GRADE_SELF_FIX). OFF by default: the
+    nightly grade sweep behaves exactly as today (grade + store + the legacy
+    below-B alert per gym per window, every sweep).
+
+    When ON (Blake's ruling, 2026-08-27: "it should fix it on its own without
+    sending me alot of slacks"):
+      * a FORWARD BOOK below A is self-remediated (agent/jobs/grade_fix.py:
+        true duplicate captions rewritten fresh on the same photo, over-cap
+        days re-pillared from a different approved source, day gaps refilled
+        through the EXISTING grow/refill lanes only) and then REGRADED;
+      * trailing_30 is still graded and stored but NEVER alerts (history is
+        not fixable);
+      * forward_book alerts only when remediation ran AND the score is still
+        below A AND the (score, defect set) changed since the last alert, at
+        most once per gym per day, plus at most ONE aggregated sweep summary
+        line per run.
+    Only WIPEABLE (pending/draft/queued) rows are ever patched; approved /
+    published / denied rows are never touched, nothing is auto-approved, and
+    nothing publishes. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_GRADE_SELF_FIX", "false"))
+
+
 def connect_grade_enabled() -> bool:
     """
     Connect-to-grade switch. OFF by default: /connect behavior is byte
