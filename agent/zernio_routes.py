@@ -60,18 +60,24 @@ def _ensure_profile_id(account_key, client):
     if pid:
         return pid
     row = _db.gym_get(account_key) or {}
-    name = row.get("gym_name") or row.get("display_name") or account_key
+    gym_name = row.get("gym_name") or ""
+    display_name = row.get("display_name") or ""
+    # The name a NEW profile would be created under (first non-empty of gym_name/display_name/key).
+    name = gym_name or display_name or account_key
 
-    # 2) reuse an existing profile of this name (the common case: LASSO already provisioned)
-    pid = client.find_profile_id(name)
+    # 2) reuse an existing profile matching ANY known alias (Zanshin/Pete 2026-08-27): a gym's Zernio
+    #    profile is often pre-created by ops under a HUMAN name ("Zanshin Fitness") while Echo looks it
+    #    up by the account_key. Trying the account_key AND the display/gym name finds the real,
+    #    populated profile so we never create a duplicate empty one that strands connections.
+    pid = client.find_profile_id_any(account_key, display_name, gym_name)
 
-    # 3) none found -> create; 4) 409 -> the profile exists, re-find it
+    # 3) none found -> create; 4) 409 -> the profile exists, re-find it (by every alias)
     if not pid:
         try:
             pid = _created_profile_id(client.create_profile(name))
         except _z.ZernioError as exc:
             if exc.status == 409:
-                pid = client.find_profile_id(name)
+                pid = client.find_profile_id_any(name, account_key, display_name, gym_name)
             else:
                 raise
             if not pid:
