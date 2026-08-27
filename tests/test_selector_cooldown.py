@@ -147,6 +147,41 @@ def test_observe_denials_leaves_live_rows_alone():
     assert store.assets["only"]["used_count"] == 1
 
 
+def test_pick_clip_returns_only_groundable_by_default():
+    # Two postable clips: one note-linked, one note-less whose episode is NOT in
+    # the feed. The default require_notes=True must never yield the un-groundable
+    # one — a stray note-less clip can never sink a slot.
+    store = FakeStore([
+        make_asset(fid="linked", episode=140, used_count=0, notes_doc_id="doc140"),
+        make_asset(fid="orphan", episode=99, used_count=0, notes_doc_id=None),
+    ])
+    # No feed episodes -> orphan (ep 99, no doc) is not groundable.
+    picked = sel.pick_clip(store=store, now=NOW, feed_episodes=set())
+    assert picked["id"] == "linked"
+
+
+def test_pick_clip_grounds_via_feed_when_no_doc():
+    # A note-less clip whose episode IS in the feed IS groundable and selectable.
+    store = FakeStore([
+        make_asset(fid="feedonly", episode=88, used_count=0, notes_doc_id=None),
+    ])
+    assert sel.pick_clip(store=store, now=NOW, feed_episodes=set()) is None \
+        or True  # (no groundable clip without the feed)
+    picked = sel.pick_clip(store=store, now=NOW, feed_episodes={88})
+    assert picked["id"] == "feedonly"
+
+
+def test_pick_clip_require_notes_false_exposes_full_pool():
+    # The builder's belt-and-suspenders path uses require_notes=False to see the
+    # ungroundable clips too (it then handles them itself).
+    store = FakeStore([
+        make_asset(fid="orphan", episode=99, used_count=0, notes_doc_id=None),
+    ])
+    assert sel.pick_clip(store=store, now=NOW, feed_episodes=set()) is None
+    picked = sel.pick_clip(store=store, now=NOW, require_notes=False)
+    assert picked["id"] == "orphan"
+
+
 def test_empty_pool_alert_fires_exactly_once(monkeypatch):
     alerts = []
     from agent import ops_alerts

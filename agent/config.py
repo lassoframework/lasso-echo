@@ -714,6 +714,18 @@ def weekly_report_enabled() -> bool:
 # the poll STOPS LOUD (missing data is reported, never guessed).
 PODCAST_FEED_URL = os.environ.get("AGENT_PODCAST_FEED_URL", "")
 
+# The show's public RSS feed, used to GROUND podcast-clip captions (the feed
+# description is the authoritative "what this episode is about"). Separate from
+# the Part-A watcher's AGENT_PODCAST_FEED_URL and NOT gated by
+# AGENT_PODCAST_ENABLED: the library builder grounds captions off this feed even
+# when the detection pipeline is dark. Defaults to the verified live feed.
+PODCAST_RSS_GROUNDING_URL_DEFAULT = "https://anchor.fm/s/1d186894/podcast/rss"
+
+
+def podcast_rss_grounding_url() -> str:
+    return (os.environ.get("AGENT_PODCAST_RSS_URL", "").strip()
+            or PODCAST_RSS_GROUNDING_URL_DEFAULT)
+
 
 def podcast_enabled():
     """

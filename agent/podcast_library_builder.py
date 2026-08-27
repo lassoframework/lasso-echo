@@ -33,6 +33,45 @@ from .drafter import Draft, DraftStatus
 _MAX_CLIP_ATTEMPTS = 3  # validation failures try the next clip, bounded
 
 
+def _episode_asset_ids(store, episode):
+    """Every asset id of `episode` in the store — so an un-groundable pick can
+    exclude its whole episode and move to the next groundable clip (a stray
+    un-groundable pick must never sink a slot). Read failure -> [] (the attempt
+    loop simply retries; bounded by _MAX_CLIP_ATTEMPTS)."""
+    try:
+        return [a.get("id") for a in store.list_assets()
+                if a.get("episode") == episode and a.get("id")]
+    except Exception as e:  # noqa: BLE001
+        print(f"[podcast-builder] episode-asset sweep failed for ep {episode}: "
+              f"{type(e).__name__}: {e}")
+        return []
+
+
+def _grounding_feed_map():
+    """The RSS feed's {episode -> entry} grounding map, best-effort. Any failure
+    -> {} (grounding then leans on the Drive Doc alone). Never raises."""
+    try:
+        from . import podcast_feed_notes as _fn
+        return _fn.episode_map()
+    except Exception as e:  # noqa: BLE001
+        print(f"[podcast-builder] feed grounding map lookup failed "
+              f"({type(e).__name__}: {e}); grounding on Drive Docs only")
+        return {}
+
+
+def _cap_feed_text(feed_map, episode):
+    """The flattened feed grounding text (title + description) for `episode`, or
+    '' when the feed does not carry it."""
+    try:
+        entry = (feed_map or {}).get(int(episode)) if episode is not None else None
+    except (TypeError, ValueError):
+        entry = None
+    if not entry:
+        return ""
+    from . import podcast_feed_notes as _fn
+    return _fn.feed_text_for_grounding(entry)
+
+
 def _upload_clip(zc, path, filename, http=None):
     """Presign -> streamed PUT -> readiness check. Returns the hosted public
     URL, or None (logged) when any leg fails. Never logs a token."""
@@ -57,10 +96,14 @@ def _upload_clip(zc, path, filename, http=None):
 
 def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
                              zernio_client=None, probe_fn=None,
-                             allowlist_fn=None, now=None):
+                             allowlist_fn=None, now=None, feed_map=None):
     """A PENDING podcast Draft for `day_key` from the Drive clip library, or
     None (the planner then falls through to the existing podcast logic). Only
-    ever called when PODCAST_LIBRARY_STAGE is ON (the caller gates)."""
+    ever called when PODCAST_LIBRARY_STAGE is ON (the caller gates).
+
+    `feed_map` ({episode -> {'title','description','pubdate'}}) is the RSS feed
+    grounding map; pass it to keep the slot offline/deterministic (tests do), or
+    leave None to have it fetched best-effort (6h-cached)."""
     from .integrations import drive_client as _dc
 
     store = store or _idx.default_store()
@@ -79,39 +122,51 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
     platform = getattr(account, "platform", None) or acct_key or ""
     gym_base = _sel.base_gym_key(acct_key)
 
+    # The RSS feed is the PRIMARY grounding source now (Blake 2026-08-27). Fetch
+    # its episode map ONCE for this slot (6h-cached, best-effort empty on failure)
+    # and hand the selector the set of episodes the feed grounds so it prefers
+    # groundable clips.
+    feed_map = _grounding_feed_map() if feed_map is None else dict(feed_map)
+    feed_episodes = set(feed_map.keys())
+
     tried = []
     for _attempt in range(_MAX_CLIP_ATTEMPTS):
-        asset = _sel.pick_clip(store=store, now=now, exclude_ids=tuple(tried))
+        asset = _sel.pick_clip(store=store, now=now, exclude_ids=tuple(tried),
+                               feed_episodes=feed_episodes)
         if asset is None:
             return None  # pool empty: pick_clip already fired the one deduped alert
         tried.append(asset["id"])
         episode = asset.get("episode")
 
-        # HARD RAIL (spec Wave 4): notes Doc missing or empty -> the slot does
-        # NOT stage. One deduped alert per episode. No next-clip attempt: every
-        # clip of the episode grounds in the same doc.
+        # Assemble grounding: RSS feed entry (primary) + Drive show-notes Doc
+        # (supplement/fallback). Either source alone can ground the caption.
+        feed_text = _cap_feed_text(feed_map, episode)
         notes_doc_id = asset.get("notes_doc_id")
-        if not notes_doc_id:
-            _idx.dedup_alert(f"notes_missing:{episode}",
-                             f"podcast episode {episode} has no show-notes Doc in "
-                             "Drive; its clips cannot stage (caption must ground "
-                             "in the notes).")
-            return None
-        try:
-            notes_text = drive.export_doc_text(notes_doc_id)
-        except Exception as e:  # noqa: BLE001
-            print(f"[podcast-builder] notes export failed for ep {episode}: "
-                  f"{type(e).__name__}: {e}")
-            return None
-        if not str(notes_text or "").strip():
-            _idx.dedup_alert(f"notes_empty:{episode}",
-                             f"podcast episode {episode} show-notes Doc exports "
-                             "EMPTY; its clips cannot stage (caption must ground "
-                             "in the notes).")
-            return None
+        notes_text = ""
+        if str(notes_doc_id or "").strip():
+            try:
+                notes_text = drive.export_doc_text(notes_doc_id) or ""
+            except Exception as e:  # noqa: BLE001 - a Doc read failure falls back to the feed
+                print(f"[podcast-builder] notes export failed for ep {episode}: "
+                      f"{type(e).__name__}: {e}; leaning on the feed if it grounds")
+                notes_text = ""
 
-        caption, meta = _cap.draft_caption(episode, notes_text, gym_id=gym_base,
-                                           allowlist_fn=allowlist_fn)
+        # HARD RAIL (belt and suspenders): pick_clip already filters to groundable
+        # clips, so an un-groundable asset only reaches here if a stray slips the
+        # selector (or a Doc that exported empty while the feed also lacks it).
+        # When it does, alert once for the episode, exclude EVERY asset of that
+        # episode, and try the NEXT groundable clip — a stray un-groundable pick
+        # must never sink a slot that has groundable clips left.
+        if not str(feed_text or "").strip() and not str(notes_text or "").strip():
+            _idx.dedup_alert(f"notes_missing:{episode}",
+                             f"podcast episode {episode} has neither an RSS feed "
+                             "entry nor a show-notes Doc; its clips cannot stage "
+                             "(caption must ground in real episode text).")
+            tried.extend(_episode_asset_ids(store, episode))
+            continue
+
+        caption, meta = _cap.draft_caption(episode, notes_text, feed_text=feed_text,
+                                           gym_id=gym_base, allowlist_fn=allowlist_fn)
         if not caption:
             print(f"[podcast-builder] ep {episode}: caption could not ground "
                   f"({(meta or {}).get('reason')}); slot not staged")
@@ -164,6 +219,11 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
             except OSError:
                 pass
 
+        ground_frags = []
+        if str(feed_text or "").strip():
+            ground_frags.append(f"rss_feed:episode_{episode}")
+        if str(notes_text or "").strip() and str(notes_doc_id or "").strip():
+            ground_frags.append(f"drive_doc:{notes_doc_id}")
         draft = Draft(
             draft_id=f"podlib_{episode}_{asset.get('clip_index') or 0}_{day_key}",
             account_key=acct_key,
@@ -177,8 +237,7 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
             day_key=day_key,
             draft_type="podcast",
             category="podcast",
-            source_fragments=[f"drive_doc:{notes_doc_id}",
-                              f"drive_clip:{asset['id']}"]
+            source_fragments=ground_frags + [f"drive_clip:{asset['id']}"]
                              + [f"claim:{c}" for c in (meta or {}).get("claims", [])],
         )
         # Stamp ONLY now that the slot is staged; a coach deny rolls this back

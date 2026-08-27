@@ -138,3 +138,45 @@ def test_probe_failure_stays_unprobed_never_postable():
     out = _run(FakeDrive(_tree()), store, probe_fn=lambda p: None, budget=10)
     assert out["probed"] == 0
     assert store.assets["clip140s1"]["postable"] is None  # fail closed
+
+
+def test_notes_link_stamps_every_clip_of_an_episode():
+    # An episode with a Doc: EVERY clip/audiogram of it carries notes_doc_id.
+    tree = _tree() + [
+        video("clip140s2", "GMMS-140-S2.mp4", "promo140", size=200_000_000),
+    ]
+    store = FakeStore()
+    _run(FakeDrive(tree), store)
+    assert store.assets["clip140s1"]["notes_doc_id"] == "doc140"
+    assert store.assets["clip140s2"]["notes_doc_id"] == "doc140"
+    assert store.assets["ag140"]["notes_doc_id"] == "doc140"
+
+
+def test_reindex_links_notes_added_after_the_clip():
+    # A linking-GAP repair: clips indexed BEFORE the Doc existed get linked on a
+    # later re-index once the Doc is in the walk — idempotently.
+    no_doc = [f for f in _tree() if f.id != "doc140"]
+    store = FakeStore()
+    _run(FakeDrive(no_doc), store)
+    assert store.assets["clip140s1"]["notes_doc_id"] is None  # no Doc yet
+    # Doc appears; a standalone re-index stamps notes_doc_id on the clip.
+    out = _run(FakeDrive(_tree()), store)
+    assert store.assets["clip140s1"]["notes_doc_id"] == "doc140"
+    assert out["updated"] >= 1
+    # Idempotent: a third run with the Doc present writes nothing new.
+    store.updates.clear()
+    _run(FakeDrive(_tree()), store)
+    assert store.updates == []
+
+
+def test_multi_doc_episode_links_deterministically():
+    # An episode with TWO notes Docs: the SAME Doc (smallest id) links every run,
+    # so a re-index never thrashes notes_doc_id back and forth.
+    tree = _tree() + [doc("doc140b", "GMMS 140 alt notes", "f140")]
+    store = FakeStore()
+    _run(FakeDrive(tree), store)
+    linked = store.assets["clip140s1"]["notes_doc_id"]
+    assert linked == "doc140"  # 'doc140' < 'doc140b'
+    store.updates.clear()
+    _run(FakeDrive(tree), store)
+    assert store.updates == []  # deterministic: nothing flips on re-run

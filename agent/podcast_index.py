@@ -220,7 +220,13 @@ def build_rows(files, now_iso=None, log=None):
             "indexed_at": now_iso,
         })
         if kind == KIND_NOTES:
-            notes_by_episode[episode] = f.id
+            # An episode can carry MORE THAN ONE notes Doc. Pick deterministically
+            # (smallest id wins) so a re-index links the SAME Doc every run —
+            # last-seen-wins would flip notes_doc_id run to run and thrash the
+            # PATCH. EVERY clip/audiogram of an episode with a Doc gets linked.
+            prev = notes_by_episode.get(episode)
+            if prev is None or str(f.id) < str(prev):
+                notes_by_episode[episode] = f.id
     for row in rows:
         row["notes_doc_id"] = notes_by_episode.get(row["episode"])
     return rows, skipped

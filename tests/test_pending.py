@@ -25,7 +25,8 @@ def _build(store=None, drive=None, zc=None, day="2026-09-03"):
     drive = drive or FakeDrive(docs={"doc140": NOTES_DOC_TEXT})
     zc = zc or FakeZernio()
     d = builder.build_podcast_clip_draft(ACCT, day, store=store, drive=drive,
-                                         zernio_client=zc, probe_fn=_probe_ok)
+                                         zernio_client=zc, probe_fn=_probe_ok,
+                                         feed_map={})
     return d, store, zc
 
 
@@ -75,7 +76,7 @@ def test_failed_gate_marks_asset_and_tries_next_clip():
     d = builder.build_podcast_clip_draft(
         ACCT, "2026-09-03", store=store,
         drive=FakeDrive(docs={"doc140": NOTES_DOC_TEXT}),
-        zernio_client=FakeZernio(), probe_fn=probe_wide)
+        zernio_client=FakeZernio(), probe_fn=probe_wide, feed_map={})
     assert d is None
     assert store.assets["wide"]["postable"] is False   # written back, fail closed
     assert store.assets["wide"]["used_count"] == 0

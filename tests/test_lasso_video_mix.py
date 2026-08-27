@@ -312,13 +312,14 @@ def test_video_row_stages_pending_via_zernio_upload():
              "title": "ep130_clip.mp4", "kind": "clip", "clip_index": 0,
              "size_bytes": 2048}
 
-    def _pick(*, store, now, exclude_ids):
+    def _pick(*, store, now, exclude_ids, feed_episodes=None, **_kw):
         return asset if not exclude_ids else None
 
     def _probe(path):
         return {"width": 1080, "height": 1920, "duration_sec": 30.0}
 
-    def _cap(episode, notes_text, gym_id=None, allowlist_fn=None):
+    def _cap(episode, notes_text=None, *, feed_text=None, gym_id=None,
+             allowlist_fn=None):
         return ("Real people, real wins from EP130. Book your intro today.",
                 {"claims": ["member wins"]})
 
@@ -333,7 +334,7 @@ def test_video_row_stages_pending_via_zernio_upload():
     try:
         draft = plib.build_podcast_clip_draft(
             "lasso", "2026-09-10", store=_Store(), drive=_Drive(),
-            zernio_client=z, probe_fn=_probe)
+            zernio_client=z, probe_fn=_probe, feed_map={})
     finally:
         _sel.pick_clip, _sel.stamp_use = orig_pick, orig_stamp
         _pc.draft_caption = orig_draft

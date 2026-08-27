@@ -55,9 +55,47 @@ def base_gym_key(account_key):
     return base
 
 
+def _grounding_feed_episodes():
+    """The set of episode numbers the show RSS feed grounds, best-effort. Any
+    failure -> empty set (grounding then leans on notes_doc_id alone). Never
+    raises out of the pick."""
+    try:
+        from . import podcast_feed_notes as _fn
+        return set(_fn.episode_map().keys())
+    except Exception as e:  # noqa: BLE001
+        print(f"[podcast-selector] feed grounding lookup failed "
+              f"({type(e).__name__}: {e}); grounding on notes_doc_id only")
+        return set()
+
+
+def _is_groundable(asset, feed_episodes):
+    """A clip is groundable when the RSS feed has its episode OR its own
+    notes_doc_id is set. Either source lets the caption ground in real text."""
+    if str(asset.get("notes_doc_id") or "").strip():
+        return True
+    ep = asset.get("episode")
+    try:
+        return ep is not None and int(ep) in feed_episodes
+    except (TypeError, ValueError):
+        return False
+
+
 def pick_clip(exclude_recent_days: int = CLIP_COOLDOWN_DAYS, *, store=None,
-              now=None, exclude_ids=()):
-    """The least-used, longest-unused postable clip, or None.
+              now=None, exclude_ids=(), require_notes=True, feed_episodes=None):
+    """The least-used, longest-unused STAGEABLE clip, or None.
+
+    STAGEABLE = postable AND (when require_notes, the default) the clip's episode
+    is GROUNDABLE. GROUNDABLE = the episode is in the RSS feed (`feed_episodes`)
+    OR the clip's own notes_doc_id is set. The caption must ground in a real
+    source, so a clip whose episode has neither can never stage; selecting only
+    groundable clips means a stray un-groundable clip never sinks a slot that has
+    groundable clips available. `require_notes=False` exposes the full postable
+    pool for the builder's belt-and-suspenders rail and for tests.
+
+    `feed_episodes` is the set of episode numbers the show feed grounds; pass it
+    (a set) to keep the pick offline/deterministic, or leave None to have it
+    fetched best-effort from podcast_feed_notes (empty on any failure, so
+    grounding then leans on notes_doc_id alone).
 
     Order: used_count ASC, last_used_at ASC NULLS FIRST (id tiebreak for
     determinism). Skips any clip used inside `exclude_recent_days` and any
@@ -81,6 +119,17 @@ def pick_clip(exclude_recent_days: int = CLIP_COOLDOWN_DAYS, *, store=None,
     clip_cutoff = now - timedelta(days=int(exclude_recent_days))
     episode_cutoff = now - timedelta(days=EPISODE_COOLDOWN_DAYS)
 
+    # Only reach for the feed when it can actually matter: require_notes is on,
+    # the caller did not supply the set, and at least one postable clip lacks a
+    # Doc (its episode might still ground via the feed). A pool that is fully
+    # note-linked never needs a fetch.
+    if require_notes and feed_episodes is None:
+        need_feed = any(a.get("postable") is True
+                        and not str(a.get("notes_doc_id") or "").strip()
+                        for a in assets)
+        feed_episodes = _grounding_feed_episodes() if need_feed else set()
+    feed_episodes = feed_episodes or set()
+
     episode_last_use = {}
     for a in assets:
         ts = _parse_ts(a.get("last_used_at"))
@@ -94,6 +143,8 @@ def pick_clip(exclude_recent_days: int = CLIP_COOLDOWN_DAYS, *, store=None,
     for a in assets:
         if a.get("postable") is not True:      # null (unprobed) and false both fail closed
             continue
+        if require_notes and not _is_groundable(a, feed_episodes):
+            continue  # neither feed nor Doc grounds this episode: never stageable
         if a.get("id") in exclude_ids:
             continue
         used_at = _parse_ts(a.get("last_used_at"))

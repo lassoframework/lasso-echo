@@ -1,9 +1,19 @@
 """
 podcast_caption.py — ground a podcast clip's caption in the episode's REAL
-show-notes Doc (PODCAST_LIBRARY_BUILD_SPEC.md Wave 4). The caption comes from
-the actual episode, never invention — that is the whole point.
+source material. The caption comes from the actual episode, never invention —
+that is the whole point.
 
-HARD RAIL: notes Doc missing or exports empty -> the slot does NOT stage (the
+GROUNDING ORDER (Blake's 2026-08-27 ruling):
+  1. PRIMARY: the show's RSS feed entry for the episode (title + description).
+     The feed description is the authoritative "what this episode is about", so
+     it makes the caption ACCURATE and widens the groundable pool past the Drive
+     Docs. Passed in as `feed_text`.
+  2. FALLBACK / SUPPLEMENT: the Drive show-notes Doc (`notes_text`). Used when
+     the feed lacks the episode, and appended after the feed text when both
+     exist so extra concrete claims can still be pulled from the Doc.
+A clip is GROUNDABLE when EITHER source carries content for its episode.
+
+HARD RAIL: neither source has usable content -> the slot does NOT stage (the
 builder returns None and fires ONE deduped alert). Echo does not write a
 caption about an episode it cannot read.
 
@@ -114,17 +124,40 @@ def _guest_mention(parsed, gym_id, allowlist_fn=None):
     return "", ""
 
 
-def draft_caption(episode, notes_text, *, gym_id="lasso", allowlist_fn=None):
-    """A grounded caption for one clip of `episode`, or None when the doc cannot
-    support one (empty export, too little concrete material, or a copy_gate
-    failure). Returns (caption, meta) — meta carries what grounded it (title,
-    claims used, tagged handle) for source_fragments/audit.
+def _combine_sources(feed_text, notes_text):
+    """The grounding text the caption is built from, and which source led.
 
-    Never fabricates: every line is the doc's own text (scrubbed), the episode
+    The RSS feed entry (title + description) is PRIMARY, so it leads: parse_notes
+    reads the first line as the hook/title, which must be the accurate feed
+    title. The Drive Doc is appended after it (supplement) or used alone
+    (fallback). Returns (text, source) where source is 'feed', 'feed+doc',
+    'doc', or '' when neither carries content."""
+    feed = str(feed_text or "").strip()
+    doc = str(notes_text or "").strip()
+    if feed and doc:
+        return feed + "\n" + doc, "feed+doc"
+    if feed:
+        return feed, "feed"
+    if doc:
+        return doc, "doc"
+    return "", ""
+
+
+def draft_caption(episode, notes_text=None, *, feed_text=None, gym_id="lasso",
+                  allowlist_fn=None):
+    """A grounded caption for one clip of `episode`, or None when no source can
+    support one (both empty, too little concrete material, or a copy_gate
+    failure). Grounds on the RSS `feed_text` first, falling back to / supplemented
+    by the Drive `notes_text` (see module docstring). Returns (caption, meta) —
+    meta carries what grounded it (title, claims used, tagged handle, which
+    source) for source_fragments/audit.
+
+    Never fabricates: every line is the source's own text (scrubbed), the episode
     number, or the one fixed ask."""
-    if not str(notes_text or "").strip():
+    ground_text, source = _combine_sources(feed_text, notes_text)
+    if not ground_text:
         return None, {"reason": "notes_empty"}
-    parsed = parse_notes(notes_text)
+    parsed = parse_notes(ground_text)
     claims = parsed["claims"]
     if not claims:
         return None, {"reason": "no_concrete_claims"}
@@ -174,4 +207,5 @@ def draft_caption(episode, notes_text, *, gym_id="lasso", allowlist_fn=None):
         return None, {"reason": "ask_count_not_one"}
 
     return caption, {"title": parsed["title"], "claims": body_budget[:chosen],
-                     "guest": parsed["guest"], "tagged_handle": tagged}
+                     "guest": parsed["guest"], "tagged_handle": tagged,
+                     "ground_source": source}
