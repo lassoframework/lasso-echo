@@ -158,7 +158,19 @@ def test_looks_svg_detects_markup_and_ext():
 
 
 def test_svg_logo_is_rasterized_and_accepted(tmp_path):
-    pytest.importorskip("cairosvg")
+    # Import through the PRODUCTION loader. On the Railway (Nixpacks) image a
+    # bare `import cairosvg` raises OSError — cairocffi's dlopen cannot see the
+    # apt libcairo from the Nix python, and importorskip only catches
+    # ImportError, so this test FAILED (not skipped) in the container while the
+    # real worker path works fine: _rasterize_svg always calls _preload_cairo
+    # (nix-store libcairo, RTLD_GLOBAL) before importing cairosvg. Exercise the
+    # exact same path here; skip only when even that leaves cairo unavailable
+    # (a dev box with no cairo at all).
+    ws._preload_cairo()
+    try:
+        import cairosvg  # noqa: F401
+    except Exception:
+        pytest.skip("cairosvg/cairo unavailable even via ws._preload_cairo")
     html = '<img src="/brand-logo.svg" class="logo">'
     images = {"https://gym.com/brand-logo.svg": _svg_bytes()}
     fh, fb = _fetchers(html, images)

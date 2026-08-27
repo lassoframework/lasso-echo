@@ -27,6 +27,12 @@ _CRED_PREFIXES = (
     "AGENT_", "ECHO_", "SUPABASE_", "SLACK_", "ANTHROPIC_", "OPENAI_",
     "GEMINI_", "GOOGLE_API", "ZERNIO_", "LATE_", "R2_", "AWS_", "STRIPE_",
     "META_", "OPUS_", "CLOUDFLARE_", "HIGGSFIELD_",
+    # HF_API_KEY/HF_API_SECRET are the Higgsfield renderer creds the container
+    # actually carries (higgsfield_renderer._hf_key reads HF_KEY / HF_API_KEY /
+    # HF_API_SECRET) — with them present, build_renderer() returned a live
+    # renderer inside tests that assert "no renderer without a key". FAL_ and
+    # REPLICATE_ are the sibling render services; GH_TOKEN is plain hygiene.
+    "HF_", "FAL_", "REPLICATE_", "GH_TOKEN",
 )
 
 
@@ -60,5 +66,13 @@ def _isolated_db(tmp_path, monkeypatch):
         # written against; the data volume is never touched.
         monkeypatch.setattr(_config, "LIBRARY_PATH", "content_library",
                             raising=False)
+        # CHANNEL-GUARD QUARANTINE (2026-08-27, fourth import-time bake): the
+        # container sets AGENT_SLACK_CHANNEL_ID, baked into config.SLACK_CHANNEL_ID
+        # at import. runner.run_daily's channel-ownership guard skips EVERY
+        # non-lasso account with no slack_channel whenever that constant is
+        # non-empty — so all 10 run_daily tests (gates/idempotent/retry-storm/
+        # launch-sim) drafted ZERO cards in the container while passing locally,
+        # where the constant is "". Rebind to the local-dev default.
+        monkeypatch.setattr(_config, "SLACK_CHANNEL_ID", "", raising=False)
     except Exception:
         pass
