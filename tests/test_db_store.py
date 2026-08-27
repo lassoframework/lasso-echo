@@ -169,3 +169,22 @@ def test_gym_upsert_preserves_display_name_when_not_passed(monkeypatch, tmp_path
     assert row["zernio_profile_id"] == "PID9"
     _db.gym_upsert("uuidgym", display_name="Pierce Wellness")       # explicit rename works
     assert _db.gym_get("uuidgym")["display_name"] == "Pierce Wellness"
+
+
+# ---- kv durability signal (gritx needs-media storm guard, 2026-08-27) --------------
+def test_kv_is_durable_signals(monkeypatch, tmp_path):
+    """kv_is_durable: True with an explicit AGENT_DB_PATH (every test, and any
+    deliberately configured process) or a mounted data volume; False on the CWD
+    echo.db fallback (dev checkout / verify run / a service without the volume),
+    where a dedup stamp dies with the process."""
+    from agent import db
+    # explicit db path -> durable (conftest's default posture)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "x.db"))
+    assert db.kv_is_durable() is True
+    # no db path + no data volume -> EPHEMERAL
+    monkeypatch.delenv("AGENT_DB_PATH", raising=False)
+    monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path / "missing_volume"))
+    assert db.kv_is_durable() is False
+    # a mounted data dir -> durable
+    monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
+    assert db.kv_is_durable() is True

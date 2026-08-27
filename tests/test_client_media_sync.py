@@ -803,3 +803,52 @@ def test_client_bases_explicit_clients_wins_over_flag(monkeypatch):
     monkeypatch.setattr(cms.config, "client_scan_dynamic_enabled", lambda: True)
     # an explicit clients= list is always honored verbatim, flag irrelevant
     assert cms._client_bases(clients=["piercefitness"]) == ["piercefitness"]
+
+
+# ---- district_h regression (2026-08-27): no-sources gym with media must not crash --
+def test_no_sources_with_local_media_reports_no_sources_not_error(monkeypatch):
+    """A gym with NO approved sources whose library already holds media (and nothing
+    newly synced) evaluated _client_media_count BEFORE the function-local import line
+    that bound it, so every scan died with UnboundLocalError ('district_h: scan
+    failed: UnboundLocalError'). It must report no_sources (one stall alert), never
+    an error, and never block the other gyms."""
+    from agent import ops_alerts
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: fired.append(m))
+    lib = os.path.join("content_library", "gritx")
+    os.makedirs(lib, exist_ok=True)
+    with open(os.path.join(lib, "old_photo.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xffFAKEJPEG")           # media present, no sources at all
+
+    out = cms.scan_and_generate(clients=["gritx"], store=FakeStore(), r2=FakeR2())
+
+    assert out["ok"] is True
+    (res,) = out["results"]
+    assert res["status"] == "no_sources"             # NOT "error"
+    assert any("no APPROVED client sources" in m for m in fired)
+
+
+# ---- infographic fill lane actually executes under the armed flag ------------------
+def test_infographic_fill_lane_actually_runs(monkeypatch):
+    """AGENT_CLIENT_INFOGRAPHIC_FILL armed: the awaiting-media branch must reach
+    fill_gaps with a LOADED voice. The module-level helper used to lean on
+    scan_and_generate's function-local `load_voice` import (invisible in its scope),
+    so every armed call NameError'd and the lane NEVER ran fleet-wide."""
+    monkeypatch.setenv("AGENT_CLIENT_INFOGRAPHIC_FILL", "true")
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    from agent import client_infographic_fill as cif
+    calls = []
+
+    def _fake_fill(base, account, store, *, voice, logger=None, **kw):
+        calls.append((base, account.key, voice is not None))
+        return {"ok": True, "filled": 0}
+
+    monkeypatch.setattr(cif, "fill_gaps", _fake_fill)
+
+    out = cms.scan_and_generate(clients=["gritx"], store=FakeStore(), r2=FakeR2())
+
+    assert out["ok"] is True
+    (res,) = out["results"]
+    assert res["status"] == "awaiting_media"         # no media: the exact fill case
+    assert calls == [("gritx", "gritx_ig", True)]    # the lane RAN, with a real voice

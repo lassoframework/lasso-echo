@@ -1095,3 +1095,37 @@ def test_recheck_floor_and_rail_off_when_grade_flag_off(armed, monkeypatch):
     pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert "thin2" in summary["published"]                 # pre-cadence behavior
+
+
+# ---- repeat-failure alert dedup per (row, reason) per day (topfuel_fb 2026-08-27) --
+def test_repeat_failure_alert_once_per_day_per_reason(monkeypatch):
+    """A stuck row that needs a HUMAN (e.g. 'no Facebook page selected') must alert
+    once when it crosses the threshold and then at most once per UTC day per distinct
+    reason, NOT on every ~1-min retry. The retry loop itself is untouched (the counter
+    keeps counting; nothing here blocks another attempt)."""
+    from datetime import datetime, timezone
+    from agent import ops_alerts
+    fired = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: fired.append(m))
+    exc = RuntimeError("topfuel_fb: no Facebook page selected; the gym must pick a page.")
+    day1 = datetime(2026, 8, 27, 14, 0, tzinfo=timezone.utc)
+
+    for _ in range(8):                                # attempts 1..8, same reason
+        cap._note_repeat_failure("row-8151a344", "topfuel", exc, now=day1)
+    assert len(fired) == 1                            # threshold alert, then silence
+    assert "no Facebook page selected" in fired[0]
+
+    day2 = datetime(2026, 8, 28, 9, 0, tzinfo=timezone.utc)
+    for _ in range(3):                                # still stuck the next day
+        cap._note_repeat_failure("row-8151a344", "topfuel", exc, now=day2)
+    assert len(fired) == 2                            # one nudge per day, no more
+
+    # a DIFFERENT failure reason is new signal: it gets one alert of its own
+    cap._note_repeat_failure("row-8151a344", "topfuel",
+                             ValueError("token expired"), now=day2)
+    assert len(fired) == 3
+
+    # a different ROW crossing the threshold alerts independently
+    for _ in range(5):
+        cap._note_repeat_failure("row-other", "topfuel", exc, now=day2)
+    assert len(fired) == 4

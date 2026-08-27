@@ -590,6 +590,11 @@ def _maybe_infographic_fill(base, account, store, log):
     pending rows, capped per pass. Best effort: never blocks or fails the scan."""
     try:
         from .client_infographic_fill import fill_enabled, fill_gaps
+        # Module-level helper: load_voice must be imported HERE. It used to lean on
+        # scan_and_generate's function-local import, which is invisible in this scope,
+        # so every armed call NameError'd and the fill lane never ran (fleet-wide
+        # "[client-media-sync] <gym>: infographic fill failed: NameError").
+        from .voice import load_voice
         if not fill_enabled() or store is None or account is None:
             return
         voice = load_voice(_resolve_client_voice_path(base, account.voice_doc_path()))
@@ -663,6 +668,12 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
         store = _default_store()
 
     from .voice import load_voice
+    # Import BEFORE the loop's first use (the no-sources branch below). This was a
+    # function-local import further down, which made the name local to the WHOLE
+    # function: a gym with no approved sources and nothing newly synced hit the
+    # media-count check before the import line executed -> UnboundLocalError ->
+    # "[client-media-sync] district_h: scan failed: UnboundLocalError" every scan.
+    from .client_month_run import _client_media_count
 
     bases = _client_bases(clients)
     results = []
@@ -701,7 +712,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
 
             # Media guard: reuse the builder's own count/awaiting-media check so this
             # path and the builder agree on what counts as usable media.
-            from .client_month_run import _client_media_count
+            # (_client_media_count is imported once above the loop — a second local
+            # import here is what caused the district_h UnboundLocalError.)
             media_count = _client_media_count(lib_dir)
             # §3 STARVATION GUARD (vision on): count distinct near-dupe CLUSTERS, not raw
             # images, so a burst of the same shot cannot inflate the month into forced

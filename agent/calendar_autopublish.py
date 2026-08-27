@@ -750,23 +750,40 @@ REPEAT_FAILURE_ALERT_AT = 5     # consecutive failures before a human is alerted
 CLIENT_CATCHUP_DAYS = 7
 
 
-def _note_repeat_failure(row_id, gym_id, exc):
-    """Count consecutive publish failures per row (kv) and ALERT a human ONCE when a
-    row keeps failing — the lane retries every ~1 min, so without this a broken row
+def _note_repeat_failure(row_id, gym_id, exc, now=None):
+    """Count consecutive publish failures per row (kv) and ALERT a human when a row
+    keeps failing — the lane retries every ~1 min, so without this a broken row
     (bad payload, missing page, dead account) fails silently forever behind a print.
-    Best effort: never raises, never blocks the lane. The counter is cleared lazily
-    (a published row simply stops being counted)."""
+
+    DEDUPED PER (row, failure reason) PER DAY (topfuel_fb 'no Facebook page selected',
+    2026-08-27): a stuck row that needs a HUMAN action (pick a page, reconnect) used
+    to be able to re-alert on every attempt; now it alerts once when it crosses the
+    threshold and then at most once per UTC day per distinct reason while it stays
+    stuck. A NEW failure reason on the same row alerts on its own (it is new signal).
+    The RETRY behavior is untouched — the row keeps retrying every run; only the
+    Slack noise is capped. Best effort: never raises, never blocks the lane. The
+    counter is cleared lazily (a published row simply stops being counted)."""
     try:
+        import hashlib
+        from datetime import datetime, timezone
         from . import db, ops_alerts
         key = f"pubfail_{row_id}"
         n = int(db.kv_get(key) or 0) + 1
         db.kv_set(key, str(n))
-        if n == REPEAT_FAILURE_ALERT_AT:
-            ops_alerts.alert(
-                f"calendar row {row_id} (gym {gym_id}) has failed to publish "
-                f"{n} times in a row: {type(exc).__name__}: {str(exc)[:160]}. "
-                "It will keep retrying, but a human should look — this is usually "
-                "a payload/connection problem, not a blip.")
+        if n < REPEAT_FAILURE_ALERT_AT:
+            return
+        reason = f"{type(exc).__name__}: {str(exc)[:160]}"
+        rhash = hashlib.sha256(reason.encode("utf-8", "replace")).hexdigest()[:12]
+        day = (now or datetime.now(timezone.utc)).date().isoformat()
+        dedup_key = f"pubfail_alerted_{row_id}_{rhash}_{day}"
+        if db.kv_get(dedup_key):
+            return
+        db.kv_set(dedup_key, "1")
+        ops_alerts.alert(
+            f"calendar row {row_id} (gym {gym_id}) has failed to publish "
+            f"{n} times in a row: {reason}. "
+            "It will keep retrying, but a human should look — this is usually "
+            "a payload/connection problem, not a blip.")
     except Exception:
         pass
 
