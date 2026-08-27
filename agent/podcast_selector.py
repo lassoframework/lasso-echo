@@ -166,8 +166,15 @@ def pick_clip(exclude_recent_days: int = CLIP_COOLDOWN_DAYS, *, store=None,
     # alerts once more.
     _idx.clear_alert_stamp(_POOL_EMPTY_STAMP)
 
+    # CLIPS BEFORE AUDIOGRAMS (Blake's "faces on the grid" goal, 2026-08-27): a
+    # talking-head CLIP (S1-S4) shows a real person; an audiogram is an audio
+    # waveform with no face. LASSO's grid needs humans, so a clip is always
+    # preferred over an audiogram; audiograms fill only when every clip is on
+    # cooldown. Least-used fairness still orders WITHIN each kind.
+    _KIND_RANK = {"clip": 0, "audiogram": 1}
     _floor = datetime.min.replace(tzinfo=timezone.utc)
     candidates.sort(key=lambda a: (
+        _KIND_RANK.get((a.get("kind") or "").lower(), 2),
         int(a.get("used_count") or 0),
         _parse_ts(a.get("last_used_at")) or _floor,   # NULLS FIRST
         str(a.get("id") or "")))

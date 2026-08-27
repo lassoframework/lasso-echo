@@ -198,3 +198,34 @@ def test_empty_pool_alert_fires_exactly_once(monkeypatch):
     store.assets.pop("new")
     assert sel.pick_clip(store=store, now=NOW) is None
     assert len(alerts) == 2
+
+
+def test_pick_clip_prefers_clips_over_audiograms():
+    """Blake's faces-on-the-grid goal: a talking-head clip is picked before an
+    audiogram (no face), even when the audiogram is 'older'. Audiograms fill only
+    when clips are exhausted/on cooldown."""
+    from agent import podcast_selector as ps
+
+    class _Store:
+        def available(self): return True
+        def list_assets(self):
+            return [
+                {"id": "aud1", "episode": 90, "kind": "audiogram", "postable": True,
+                 "notes_doc_id": "d1", "used_count": 0, "last_used_at": None},
+                {"id": "clip1", "episode": 137, "kind": "clip", "postable": True,
+                 "notes_doc_id": "d2", "used_count": 0, "last_used_at": None},
+            ]
+    pick = ps.pick_clip(store=_Store(), feed_episodes={90, 137})
+    assert pick["id"] == "clip1", f"expected the clip, got {pick['id']}"
+
+
+def test_audiogram_used_when_no_clip_available():
+    from agent import podcast_selector as ps
+
+    class _Store:
+        def available(self): return True
+        def list_assets(self):
+            return [{"id": "aud1", "episode": 90, "kind": "audiogram", "postable": True,
+                     "notes_doc_id": "d1", "used_count": 0, "last_used_at": None}]
+    pick = ps.pick_clip(store=_Store(), feed_episodes={90})
+    assert pick["id"] == "aud1"
