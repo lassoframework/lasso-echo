@@ -128,3 +128,65 @@ def test_needs_media_persists_through_store(tmp_path):
     store.put(d)
     got = store.get(d.draft_id)
     assert got.needs_media is True
+
+
+# ---- 6. DURABLE-OR-SILENT (gritx storm, 2026-08-27) ---------------------------
+# An Echo process whose kv store is EPHEMERAL (no AGENT_DB_PATH, no data volume:
+# a dev checkout, a verify run, a service without the volume) cannot persist the
+# needs-media dedup stamp, so it re-alerted the same days on every run. Such a
+# process must stay OFF Slack entirely; the draft itself is unchanged.
+def test_needs_media_alert_silent_when_kv_ephemeral(tmp_path, monkeypatch):
+    from agent import db
+    fired = _wire_alerts(monkeypatch)
+    monkeypatch.setattr(db, "kv_is_durable", lambda: False)
+    acct = _client()
+    cs.add_source(acct.key, "offer", "Free intro session", "website /start")
+    d = client_content.build_client_draft(acct, "2026-10-01", _voice(),
+                                          _empty_lib(tmp_path))
+    assert d is not None and d.needs_media is True   # the held draft is unchanged
+    assert fired == []                               # but Slack stays silent
+
+
+# ---- 7. STORM REGRESSION: fresh kv + 11 days + 3 runs -------------------------
+def test_needs_media_storm_regression_three_runs_durable(tmp_path, monkeypatch):
+    """The 2026-08-27 storm shape: 11 October days built 3 times over. On a DURABLE
+    kv the dedup must cap the total at 11 alerts (one per day, ever)."""
+    fired = _wire_alerts(monkeypatch)
+    acct = _client()
+    cs.add_source(acct.key, "offer", "Free intro session", "website /start")
+    lib = _empty_lib(tmp_path)
+    days = [f"2026-10-{d:02d}" for d in range(1, 12)]
+    for _run in range(3):
+        for day in days:
+            client_content.build_client_draft(acct, day, _voice(), lib)
+    assert len(fired) == 11
+
+
+def test_needs_media_storm_zero_alerts_from_ephemeral_process(tmp_path, monkeypatch):
+    """The same 3x11 storm run from a process with no durable kv fires NOTHING."""
+    from agent import db
+    fired = _wire_alerts(monkeypatch)
+    monkeypatch.setattr(db, "kv_is_durable", lambda: False)
+    acct = _client()
+    cs.add_source(acct.key, "offer", "Free intro session", "website /start")
+    lib = _empty_lib(tmp_path)
+    for _run in range(3):
+        for d in range(1, 12):
+            client_content.build_client_draft(acct, f"2026-10-{d:02d}", _voice(), lib)
+    assert fired == []
+
+
+# ---- 8. PREVIEW OPT-OUT: alerts_enabled=False ----------------------------------
+def test_preview_build_never_alerts_and_never_stamps(tmp_path, monkeypatch):
+    """A preview/plan build (alerts_enabled=False) is not an operational event: no
+    ops alert AND no dedup stamp, so the real worker's later build still alerts."""
+    fired = _wire_alerts(monkeypatch)
+    acct = _client()
+    cs.add_source(acct.key, "offer", "Free intro session", "website /start")
+    lib = _empty_lib(tmp_path)
+    d = client_content.build_client_draft(acct, "2026-10-01", _voice(), lib,
+                                          alerts_enabled=False)
+    assert d is not None and d.needs_media is True
+    assert fired == []                               # preview: silent
+    client_content.build_client_draft(acct, "2026-10-01", _voice(), lib)
+    assert len(fired) == 1                           # the real build still alerts once

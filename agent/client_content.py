@@ -367,12 +367,34 @@ class _CtaKey:
         self.path = stem
 
 
-def _alert_needs_media(account_key, day_key, category):
+def _alert_needs_media(account_key, day_key, category, enabled=True):
     """One ops alert per account per day when a caption is ready but no image is
-    available. Deduped so a re-run never storms the channel."""
+    available. Deduped so a re-run never storms the channel.
+
+    DURABLE-OR-SILENT (gritx storm, 2026-08-27): the dedup lives in the kv store,
+    so the alert may fire ONLY where that stamp actually persists across runs
+    (db.kv_is_durable). A process on the CWD-fallback echo.db (dev checkout,
+    verify run, a service without the data volume) re-sent the same 11 day-alerts
+    on every pass because its stamps died with the process; such a process now
+    logs the state locally and stays OFF Slack. The worker (/data volume) is
+    durable, so its legitimate needs-media alert is unchanged.
+
+    enabled=False is the explicit PREVIEW opt-out for callers building drafts as
+    a preview/plan exercise: a preview is not an operational event, so it never
+    alerts (and never stamps the day, so the real worker still alerts later)."""
     from . import db, ops_alerts
     key = f"needs_media_alerted_{account_key}_{day_key}"
     if db.kv_get(key):
+        return
+    if not enabled:
+        print(f"[client-content] {account_key} {day_key}: needs-media ({category}); "
+              "preview build, ops alert suppressed")
+        return
+    if not db.kv_is_durable():
+        print(f"[client-content] {account_key} {day_key}: needs-media ({category}); "
+              "ops alert SUPPRESSED: the kv store here is ephemeral (no AGENT_DB_PATH "
+              "and no data volume), so the dedup stamp cannot persist and alerting "
+              "would storm on every run")
         return
     db.kv_set(key, "1")
     ops_alerts.alert(
@@ -396,7 +418,8 @@ def classify(draft):
 def build_client_draft(account, day_key, voice, library_path, poster=None,
                        s3_client=None, template_fn=None, exclude_keys=(),
                        avoid_openings=(), allow_reuse=False,
-                       angle="", avoid_angles=(), record_serve=True):
+                       angle="", avoid_angles=(), record_serve=True,
+                       alerts_enabled=True):
     """
     The day's client draft, sourced from the account's approved sources + library.
     Returns None only when the client-sources flag is off, the voice doc is
@@ -421,6 +444,11 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     problem/entry angle this day should LEAD from and the recent angles to avoid; STYLE-
     only, threaded straight to the SB7 generator (never a fact, never a block). Empty
     (flag OFF) => today's behavior.
+
+    alerts_enabled (gritx storm, 2026-08-27): False marks this build as a PREVIEW —
+    the needs-media ops alert is suppressed (logged only) and no dedup stamp is
+    written, so the real worker's later build still alerts once. Default True keeps
+    every existing caller byte-for-byte.
 
     EDUCATIONAL pillar (Bryan, AGENT_EDUCATIONAL_PILLAR): when the day's rotated pillar is
     'educational', the source is resolved from the gym's APPROVED educational material
@@ -568,7 +596,9 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
             category=category,
         )
     # Option B: mark the day needs-media (held, one ops alert). NOT blocked.
-    _alert_needs_media(account.key, day_key, category)
+    # alerts_enabled=False (a preview/plan caller) suppresses the ops alert: a
+    # preview is not an operational event (2026-08-27 gritx storm rule).
+    _alert_needs_media(account.key, day_key, category, enabled=alerts_enabled)
     return Draft(
         draft_id=_make_id(account.key, f"needsmedia_{source.id}", scheduled_for),
         account_key=account.key,

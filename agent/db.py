@@ -260,6 +260,20 @@ def kv_set(key, value):
         conn.commit()
 
 
+def kv_is_durable():
+    """True when the kv store PERSISTS across process runs: an explicit AGENT_DB_PATH
+    or the mounted data volume (AGENT_DATA_DIR, default /data). The CWD-fallback
+    ./echo.db (a dev checkout, a worktree, a verify run, or a service deployed
+    WITHOUT the volume) is EPHEMERAL: a dedup stamp written there dies with the
+    process, so kv-deduped ops alerts fired from such a process re-fire on every
+    run. Alert dedup callers use this to go DURABLE-OR-SILENT (the 2026-08-27 gritx
+    needs-media storm: an out-of-band Echo process with a throwaway sqlite re-sent
+    the same 11 day-alerts on every pass because its stamps never persisted)."""
+    if os.environ.get("AGENT_DB_PATH"):
+        return True
+    return os.path.isdir(os.environ.get("AGENT_DATA_DIR", "/data"))
+
+
 # ---- per-account autonomy flag ----------------------------------------------------
 # A gym owner flips "Autonomous" in the portal. When ON, Echo stops requiring a
 # per-post approval for THAT account: currently-pending posts are auto-approved and
