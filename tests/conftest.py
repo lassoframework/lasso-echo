@@ -15,10 +15,24 @@ import os
 
 import pytest
 
+# CREDENTIAL QUARANTINE (2026-08-27, the gritx storm post-mortem): a suite run
+# INSIDE the production container executed tests against LIVE creds — flags were
+# armed (fixed by the AGENT_*/ECHO_* sweep below) but raw credentials are not
+# AGENT_-prefixed, so handle_cadence's dual-write reached the REAL Supabase
+# (gritx posts_per_day flipped to 2 by a test actor) and client-month tests
+# fired REAL Slack alerts through the live token. Tests are OFFLINE by
+# convention: every known credential/prefix is stripped so no test can ever
+# reach a production plane, no matter where the suite runs.
+_CRED_PREFIXES = (
+    "AGENT_", "ECHO_", "SUPABASE_", "SLACK_", "ANTHROPIC_", "OPENAI_",
+    "GEMINI_", "GOOGLE_API", "ZERNIO_", "LATE_", "R2_", "AWS_", "STRIPE_",
+    "META_", "OPUS_", "CLOUDFLARE_", "HIGGSFIELD_",
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolated_db(tmp_path, monkeypatch):
     for key in list(os.environ):
-        if key.startswith("AGENT_") or key.startswith("ECHO_"):
+        if key.startswith(_CRED_PREFIXES):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo_test.db"))
