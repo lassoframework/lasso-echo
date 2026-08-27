@@ -920,9 +920,31 @@ def zernio_publish_enabled() -> bool:
     published (or scheduled) to the gym's OWN connected IG/FB via Zernio POST /v1/posts.
     OFF by default. This is layered UNDER the global publish kill switch: BOTH
     AGENT_ZERNIO_PUBLISH and AGENT_PUBLISH_ENABLED must be armed or nothing goes live
-    (the publisher returns would_publish). LASSO's own accounts stay on meta_direct.
+    (the publisher returns would_publish). LASSO's own accounts stay on meta_direct
+    unless AGENT_LASSO_VIA_ZERNIO (below) additionally routes them through this lane.
     """
     return _truthy(os.environ.get("AGENT_ZERNIO_PUBLISH", "false"))
+
+
+def lasso_via_zernio_enabled() -> bool:
+    """
+    LASSO-VIA-ZERNIO cutover (AGENT_LASSO_VIA_ZERNIO, OFF by default => byte-for-byte
+    today's routing). Armed, the LASSO gym's own content_calendar rows publish through
+    the SAME Zernio lane as the seven client gyms (publish_client_gyms ->
+    zernio_publisher, profile id read from the 'lasso' gyms row like any client), and
+    every Meta-direct calendar lane for LASSO stands down (run_slot_ticks and the
+    runner's once/day publish_due) so exactly ONE lane can ever own a lasso row — no
+    double publish. WHY (Blake 2026-08-27): metrics_sync ingests Zernio analytics;
+    LASSO's Meta-direct posts read there as an external/second publisher and taint
+    LASSO's own months for the learning loop. One publish path = one guard set =
+    A-gate parity. Requires setup first (python -m agent lasso-zernio-setup):
+    gyms.zernio_profile_id + gyms.zernio_default_fb_page_id must be stamped for
+    'lasso' or the lane HOLDS with ONE deduped alert — it never drops a post and
+    never falls back to Meta-direct (a fallback would recreate the second-publisher
+    taint). Layered UNDER AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED +
+    AGENT_ZERNIO_PUBLISH: all three must also be armed or nothing goes live.
+    """
+    return _truthy(os.environ.get("AGENT_LASSO_VIA_ZERNIO", "false"))
 
 
 def gbp_publish_enabled() -> bool:
@@ -1469,7 +1491,10 @@ def client_daily_publish_cap() -> int:
     Zernio profile linked, ENG's out-of-aspect images un-blocked), a catch_all sweep would
     otherwise fire an entire backlog of approved rows onto the feed at once. This bounds the
     daily count so a backlog DRIPS out over days. 0 or unset => no cap (the historical
-    behavior). Applies to the client lane only, never LASSO's own. Set by hand in Railway env."""
+    behavior). Applies to the client (Zernio) lane only — which INCLUDES lasso once
+    AGENT_LASSO_VIA_ZERNIO is armed, so keep it 0 or >= LASSO's daily row count (2 feeds
+    + a story = 3) at cutover; the Meta-direct LASSO lane never had it. Set by hand in
+    Railway env."""
     try:
         return max(0, int(os.environ.get("AGENT_CLIENT_DAILY_PUBLISH_CAP", "0") or 0))
     except (TypeError, ValueError):

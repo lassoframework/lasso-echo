@@ -423,6 +423,68 @@ def _clear_publish_blocked(gym_id):
         pass
 
 
+# ---- LASSO-via-Zernio cutover (AGENT_LASSO_VIA_ZERNIO) ------------------------
+# WHY (Blake 2026-08-27): metrics_sync ingests Zernio analytics; LASSO's
+# Meta-direct-published posts read there as an external/second publisher and taint
+# LASSO's own months for the learning loop. One publish path = one guard set =
+# A-gate parity. Armed, LASSO's calendar rows publish through the SAME zernio lane
+# as the client gyms (publish_client_gyms below) and every Meta-direct lasso lane
+# stands down. Flag OFF (the default) is byte-for-byte today's routing.
+
+_LASSO_ZERNIO_HOLD_KEY = "lasso_zernio_hold_alerted"
+
+
+def _lasso_zernio_missing():
+    """The setup pieces the LASSO-via-Zernio lane still needs on the 'lasso' gyms
+    row ([] when ready): gyms.zernio_profile_id and gyms.zernio_default_fb_page_id,
+    both stamped by `python -m agent lasso-zernio-setup`. Fail-OPEN on a read error
+    (returns []): the zernio publisher's own resolvers are the hard backstop — a
+    genuinely missing profile/page raises there, the row reverts and retries, and
+    nothing is ever dropped or sent Meta-direct."""
+    try:
+        from . import db
+        row = db.gym_get("lasso") or {}
+        missing = []
+        if not str(row.get("zernio_profile_id") or "").strip():
+            missing.append("gyms.zernio_profile_id")
+        if not str(row.get("zernio_default_fb_page_id") or "").strip():
+            missing.append("gyms.zernio_default_fb_page_id")
+        return missing
+    except Exception:
+        return []
+
+
+def _alert_lasso_zernio_hold(missing):
+    """ONE deduped ops alert while the armed LASSO-via-Zernio lane is HELD on
+    incomplete setup (kv-deduped; re-armed by _clear_lasso_zernio_hold once the
+    setup completes, so a future regression alerts again). Best effort; never
+    raises into the lane."""
+    try:
+        from . import db, ops_alerts
+        if db.kv_get(_LASSO_ZERNIO_HOLD_KEY):
+            return
+        db.kv_set(_LASSO_ZERNIO_HOLD_KEY, "1")
+        ops_alerts.alert(
+            "AGENT_LASSO_VIA_ZERNIO is armed but LASSO's Zernio setup is incomplete "
+            f"(missing: {', '.join(missing)}). LASSO calendar rows are HELD — nothing "
+            "is dropped and nothing falls back to Meta-direct (a fallback would "
+            "recreate the second-publisher taint in Zernio analytics). Run: "
+            "python -m agent lasso-zernio-setup")
+    except Exception:
+        pass
+
+
+def _clear_lasso_zernio_hold():
+    """Re-arm the deduped setup-hold alert once LASSO's Zernio setup is complete
+    (the state changed). Best effort; never raises."""
+    try:
+        from . import db
+        if db.kv_get(_LASSO_ZERNIO_HOLD_KEY):
+            db.kv_set(_LASSO_ZERNIO_HOLD_KEY, "")
+    except Exception:
+        pass
+
+
 def _draft_for(row):
     """Build a PENDING Draft from a content_calendar row for meta_publisher.publish."""
     fmt = (row.get("format") or "feed").strip().lower()
@@ -475,6 +537,22 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     if not config.publish_enabled():
         return {"ok": False, "reason": "publish flag OFF (draft-only)",
                 "date": run_date}
+
+    # LASSO-VIA-ZERNIO CUTOVER HOLD (AGENT_LASSO_VIA_ZERNIO): when the flag is
+    # armed but the 'lasso' gyms row lacks its Zernio profile id or selected FB
+    # page, the WHOLE lasso lane HOLDS here — no row is read, claimed, or
+    # published, ONE deduped alert fires, and there is NO Meta-direct fallback
+    # (that would recreate the second-publisher taint in Zernio analytics that
+    # this flag exists to kill). Rows stay pending/approved untouched and publish
+    # on the first tick after `python -m agent lasso-zernio-setup` completes.
+    if (gym_id or "lasso").strip() == "lasso" and config.lasso_via_zernio_enabled():
+        _missing = _lasso_zernio_missing()
+        if _missing:
+            _alert_lasso_zernio_hold(_missing)
+            return {"ok": False, "held": True, "date": run_date,
+                    "reason": ("lasso-via-zernio setup incomplete: "
+                               + ", ".join(_missing))}
+        _clear_lasso_zernio_hold()
 
     if store is None:
         from .portal_calendar_store import SupabaseCalendarStore
@@ -727,7 +805,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # post existed on the feed, with no reconcile if Zernio dropped it. Publish
                 # now at slot time makes published_at truthful and needs no reconcile.
                 _tr.t("api_request", draft.caption or "")
-                if account.key.startswith("lasso"):
+                # LASSO routing is FLAG-SPLIT (AGENT_LASSO_VIA_ZERNIO): flag OFF
+                # (default) keeps LASSO on the Meta-direct publisher, byte-for-byte.
+                # Flag ON sends a lasso row through the SAME zernio publisher as a
+                # client row — this single choke point makes a Meta-direct publish
+                # of a lasso calendar row IMPOSSIBLE under the flag no matter which
+                # caller reached here (WHY: a Meta-direct post reads as an external
+                # second publisher in Zernio analytics and taints metrics_sync's
+                # LASSO months for the learning loop).
+                if account.key.startswith("lasso") and \
+                        not config.lasso_via_zernio_enabled():
                     result = publisher(draft, account)
                 else:
                     result = zernio_publish(draft, account, scheduled_for=None)
@@ -874,6 +961,14 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
     """
     if not config.calendar_autopublish_enabled():
         return []
+    # LASSO-VIA-ZERNIO (AGENT_LASSO_VIA_ZERNIO): when armed, the zernio client lane
+    # (publish_client_gyms) OWNS LASSO's calendar rows on the same ~1-min listener
+    # cadence, so this Meta-direct slot lane stands down ENTIRELY for the lasso gym —
+    # exactly ONE lane can ever claim a lasso row (no double publish, no lane race).
+    # Slot-fire kv markers are not burned, so disarming the flag restores this lane
+    # cleanly. Any other gym_id (none today) is untouched.
+    if (gym_id or "lasso").strip() == "lasso" and config.lasso_via_zernio_enabled():
+        return []
     if kv is None:
         kv = _kv_default()
 
@@ -906,10 +1001,12 @@ def run_slot_ticks(run_date, *, gym_id="lasso", store=None, publisher=None,
 
 
 # ---- client-gym publish lane (Zernio) ---------------------------------------
-# LASSO auto-publishes its own calendar via Meta-direct (above). A CLIENT gym's
-# path is different: the client APPROVES a post in the portal, and Echo then
-# publishes it to the gym's OWN connected IG/FB via Zernio, SCHEDULED at the row's
-# slot time. This function is the client counterpart to run_slot_ticks.
+# LASSO auto-publishes its own calendar via Meta-direct (above) — unless
+# AGENT_LASSO_VIA_ZERNIO is armed, in which case LASSO joins THIS lane like an
+# eighth client gym and the Meta-direct lasso lanes stand down. A CLIENT gym's
+# path: the client APPROVES a post in the portal, and Echo then publishes it to
+# the gym's OWN connected IG/FB via Zernio at the row's slot time. This function
+# is the client counterpart to run_slot_ticks.
 
 def client_gym_bases():
     """Distinct client-gym tenant bases (non-LASSO) from the account registry:
@@ -1015,8 +1112,20 @@ def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,
         return []
     if not config.zernio_publish_enabled():
         return []
+    bases = client_gym_bases()
+    # LASSO-VIA-ZERNIO (AGENT_LASSO_VIA_ZERNIO): LASSO's own calendar rows join this
+    # lane and publish through Zernio exactly like a client gym — same guard set
+    # (slot gate, autonomy, catchup window, daily cap, exactly-once claim; the
+    # billing gate fail-opens for lasso by design). The Meta-direct lasso lanes
+    # (run_slot_ticks + the runner's once/day publish_due) stand down under the
+    # flag, so this lane is the ONLY owner of a lasso row. Setup incomplete =>
+    # publish_due HOLDS the lasso pass with one deduped alert (never a drop, never
+    # a Meta-direct fallback). client_gym_bases itself stays lasso-free so every
+    # other consumer (metrics_sync, inbox_alerts, jobs) is unchanged.
+    if config.lasso_via_zernio_enabled():
+        bases = ["lasso"] + [b for b in bases if b != "lasso"]
     out = []
-    for base in client_gym_bases():
+    for base in bases:
         try:
             # BILLING GATE (Blake 2026-08-25): a gym whose subscription shows CANCELED
             # in Stripe holds ALL publishing (rows stay approved; nothing goes live).

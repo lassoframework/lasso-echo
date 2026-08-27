@@ -1209,7 +1209,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # gym_id='lasso' and publishes each unpublished one to live IG/FB EXACTLY ONCE (an
     # atomic status claim per row). Isolated from drafting/approval; a failure here never
     # takes the draft run down. The manual approval path is untouched.
-    if config.calendar_autopublish_enabled():
+    # LASSO-VIA-ZERNIO (AGENT_LASSO_VIA_ZERNIO): armed, this Meta-direct once/day
+    # sweep for gym_id='lasso' stands down — the listener's publish_client_gyms
+    # zernio lane OWNS LASSO's calendar rows (its ~1-min cadence + is_due-on-every-
+    # tick + catchup window replace this catch_all net), so exactly ONE lane can
+    # ever claim a lasso row and LASSO's posts stop reading as a second publisher
+    # in Zernio analytics (metrics_sync learning-loop taint).
+    if config.calendar_autopublish_enabled() and not config.lasso_via_zernio_enabled():
         try:
             from . import calendar_autopublish
             # catch_all=True: this is the ONCE/DAY draw, so it must be a safety net

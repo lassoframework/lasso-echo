@@ -194,6 +194,7 @@ def _status():
     print(f"  intake_sync    : {config.social_intake_sync_enabled()}  (env AGENT_SOCIAL_INTAKE_SYNC)")
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
+    print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  catchup_report : {config.catchup_report_enabled()}  (env AGENT_CATCHUP_REPORT)")
     print(f"  welcome_digest : {config.welcome_digest_enabled()}  (env AGENT_WELCOME_DIGEST)")
     print(f"  welcome_autopub: {config.welcome_autopublish_enabled()}  (env AGENT_WELCOME_AUTOPUBLISH)")
@@ -855,6 +856,7 @@ _COMMANDS = {
         ("gbp-check", "Google Business Profile check"),
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
+        ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
     ],
     "trust & approvals": [
@@ -2735,6 +2737,23 @@ def main(argv=None):
                 print("The gym can now connect Google Business Profile / GBM in Zernio.")
             else:
                 print(f"provision FAILED for {account_key}: {info}")
+    elif cmd == "lasso-zernio-setup":
+        # LASSO-via-Zernio setup (AGENT_LASSO_VIA_ZERNIO): stamp the 'lasso' gyms row
+        # with its Zernio profile id + Facebook page (auto-pick, or --page <id> when
+        # ambiguous) and the lasso autonomy kv. Idempotent; run on the worker
+        # (ZERNIO_API_KEY lives there):
+        #   railway ssh --service echo /opt/venv/bin/python -m agent lasso-zernio-setup
+        page = ""
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] == "--page" and i + 1 < len(args_rest):
+                page = args_rest[i + 1]; i += 2; continue
+            i += 1
+        from .lasso_zernio_setup import run as _lzs_run
+        _lzs_out = _lzs_run(page_id=page or None)
+        if not _lzs_out.get("ok"):
+            raise SystemExit(1)
     elif cmd == "zernio-connect-url":
         # Print a gym's OAuth CONNECT url for a platform so ops can hand the owner a direct
         # link (e.g. Google Business). Run on the worker (ZERNIO_API_KEY lives there):

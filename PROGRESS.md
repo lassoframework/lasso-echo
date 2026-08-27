@@ -61,6 +61,28 @@ NOT built. Everything staged lands PENDING; the human tap is untouched.
 
 ---
 
+## LASSO-via-Zernio cutover (2026-08-27, feat/lasso-via-zernio, Blake's ruling)
+
+### [~] AGENT_LASSO_VIA_ZERNIO (default OFF => byte-for-byte today; built, suite green, not pushed)
+  - WHY: metrics_sync ingests Zernio analytics; LASSO's Meta-direct posts read
+    there as an external/second publisher and taint LASSO's own months for the
+    learning loop. One publish path = one guard set = A-gate parity.
+  - Armed: LASSO's calendar rows publish through publish_client_gyms ->
+    zernio_publisher exactly like the seven client gyms (profile/page resolved
+    from the 'lasso' gyms row); the Meta-direct lasso lanes (run_slot_ticks +
+    the runner once/day sweep) stand down, plus a routing choke point inside
+    publish_due makes a Meta-direct lasso publish impossible under the flag.
+  - Cutover safety: missing gyms.zernio_profile_id / zernio_default_fb_page_id
+    => the lasso lane HOLDS with ONE deduped alert (no drop, no Meta fallback).
+  - Setup CLI (idempotent): python -m agent lasso-zernio-setup [--page <id>] —
+    stamps profile 6a74a3b977a9ae3719f5c0c0, picks the FB page via
+    list_facebook_pages (auto when unambiguous), stamps lasso autonomy so
+    today's no-approval model is kept (only the publisher changes).
+  - Note when arming: AGENT_CLIENT_DAILY_PUBLISH_CAP now applies to lasso too —
+    keep it 0 or >= LASSO's daily row count (2 feeds + story = 3).
+
+---
+
 ## Publish-path hardening (2026-08-27, feat/publish-guard-idempotency)
 
 Three items, one branch (Blake's WIRING.md spec + the live LASSO IG duplicates).
