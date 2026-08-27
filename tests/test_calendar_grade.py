@@ -391,3 +391,36 @@ def test_defects_present_for_violations():
     # right_audience defects (athlete-avatar leak)
     audience_defects = [d for d in result.defects if d[0] == "right_audience"]
     assert audience_defects, "Expected right_audience defects for compete/competition hook"
+
+
+def test_content_mix_sprint_summit_is_exempt():
+    """Blake's 10-day sprint ruling: summit concentration inside a sprint window is
+    intended, not a content_mix defect. Summit dated on a sprint day must not trip
+    the 25% cap, while every other category (and off-sprint summit) still does."""
+    from agent import calendar_grade as cg
+    from agent import summit_queue as sq
+    sprint = sorted(sq.sprint_days())
+    assert sprint, "need sprint days for this test"
+    rows = [{"pillar": "summit", "post_date": d, "caption": "x", "format": "feed"}
+            for d in sprint[:24]]
+    # a handful of genuinely balanced off-sprint content
+    rows += [{"pillar": "doctrine", "post_date": "2026-12-01", "caption": "x", "format": "feed"},
+             {"pillar": "platform", "post_date": "2026-12-02", "caption": "x", "format": "feed"},
+             {"pillar": "podcast", "post_date": "2026-12-03", "caption": "x", "format": "feed"},
+             {"pillar": "b2b", "post_date": "2026-12-04", "caption": "x", "format": "feed"}]
+    defects = []
+    cg._content_mix(rows, "B2B", None, defects)
+    summit_defects = [d for d in defects if d[1] == "summit"]
+    assert not summit_defects, f"sprint summit must be exempt, got {summit_defects}"
+
+
+def test_content_mix_off_sprint_summit_still_capped():
+    """Summit OUTSIDE any sprint window is capped exactly as before (regression)."""
+    from agent import calendar_grade as cg
+    rows = [{"pillar": "summit", "post_date": "2026-12-10", "caption": "x", "format": "feed"}
+            for _ in range(10)]
+    rows += [{"pillar": "doctrine", "post_date": "2026-12-11", "caption": "x", "format": "feed"}
+             for _ in range(10)]
+    defects = []
+    cg._content_mix(rows, "B2B", None, defects)
+    assert any(d[1] == "summit" for d in defects), "off-sprint summit must still cap"

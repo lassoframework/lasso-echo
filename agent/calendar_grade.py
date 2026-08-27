@@ -184,14 +184,35 @@ def _content_mix(rows, profile, quotas, defects) -> int:
         except Exception:
             pass
 
-    # Inline quota check: count categories
+    # Inline quota check: count categories.
+    # SPRINT AWARENESS (Blake's 10-day sprint ruling): a summit SPRINT window is
+    # intentionally summit-heavy (the backward-anchored cadence that tightens into
+    # a continuous run before the event). Counting that intended concentration as a
+    # content_mix defect would fail every summit-season month the A-gate must stage.
+    # So summit rows dated inside a sprint window do NOT count toward the 25% cap
+    # (they are Blake's design, not a mix flaw). Every OTHER category, and summit
+    # OUTSIDE a sprint window, is capped exactly as before.
     from collections import Counter
-    cats = [r.get("pillar") or r.get("category") or "" for r in rows]
-    cat_counts = Counter(cats)
+    try:
+        from . import summit_queue as _sq
+        _sprint = set(_sq.sprint_days())
+    except Exception:  # noqa: BLE001 - a summit-queue import issue never breaks grading
+        _sprint = set()
 
-    # Each category over 25% of rows: -3
+    def _counts_toward_cap(r):
+        cat = (r.get("pillar") or r.get("category") or "")
+        if cat == "summit" and str(r.get("post_date") or "")[:10] in _sprint:
+            return False  # intended sprint concentration, not a defect
+        return True
+
+    capped_rows = [r for r in rows if _counts_toward_cap(r)]
+    cats = [r.get("pillar") or r.get("category") or "" for r in capped_rows]
+    cat_counts = Counter(cats)
+    denom = len(capped_rows) or n
+
+    # Each category over 25% of the CAP-ELIGIBLE rows: -3
     for cat, count in cat_counts.items():
-        pct = count / n
+        pct = count / denom
         if pct > 0.25:
             defects.append(("content_mix", cat, f"{cat} is {pct:.0%} of posts (over 25%)"))
             score -= 3
