@@ -106,16 +106,25 @@ def build_story_draft(account, day_key, *, feed_draft=None,
                                         art["path"], hosted, fragments)
 
     # No genuine 9:16 asset available: SKIP the Story for the day. Never reuse or
-    # crop the day's feed image into a Story frame. A skipped story is a NORMAL
-    # outcome, not an incident: a video clip / audiogram / b2b concept card has no
-    # 9:16 sibling by design, and the FEED still posts fine (the story is
-    # supplementary). This used to fire one ops alert PER DAY PER ACCOUNT, which
-    # storms Slack the moment a month of video staged (Blake, 2026-08-27: dozens of
-    # "story draft skipped" lines from the podcast-video launch). Downgraded to a
-    # log line: the feed posts, the story is simply absent, no Slack noise.
-    print(f"[stories] skip {account.key} {day_key}: no genuine 9:16 asset for "
-          f"{os.path.basename(feed_draft.creative_path or '(no path)')} "
-          "(feed still posts; story is supplementary, never a cropped feed card)")
+    # crop the day's feed image into a Story frame.
+    #
+    # TWO cases, only ONE is an incident (Blake 2026-08-27, the podcast-video launch
+    # stormed Slack with per-day story-skips):
+    #   * a STUDIO creative that COULD render a 9:16 but the studio came back dark /
+    #     the render failed -> a real "studio is down" incident, KEEP the ops alert.
+    #   * a VIDEO clip / audiogram / b2b concept card / plain library image that has
+    #     no 9:16 sibling BY DESIGN -> normal. The feed still posts; the story is
+    #     supplementary. LOG only, never Slack (this was the entire storm).
+    _basename = os.path.basename(feed_draft.creative_path or "(no path)")
+    if _is_studio_creative(feed_draft):
+        ops_alerts.alert(
+            f"story draft skipped for {account.key} on {day_key}: the studio render "
+            f"came back dark for {_basename} (no purpose-built 9:16 studio asset and "
+            f"no premade *_story sibling). A Story is never a cropped feed card."
+        )
+    else:
+        print(f"[stories] skip {account.key} {day_key}: no 9:16 sibling for "
+              f"{_basename} (feed still posts; story is supplementary, by design)")
     return None
 
 
