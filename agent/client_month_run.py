@@ -397,7 +397,8 @@ def _is_first_month(base_key, store, log):
 
 
 def build_client_month(account, base_key, start_date, days=30, *, voice,
-                       library_path=None, store, banned_words=(), logger=None):
+                       library_path=None, store, banned_words=(), logger=None,
+                       allow_reshape=False):
     """Assemble a month of PAUSED client calendar rows FROM THE GYM'S OWN UPLOADED
     MEDIA and apply them via `store`.
 
@@ -641,7 +642,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
             "until a coach releases it; GATE 2)")
     result = _apply(base_key, rows, start, days, store, log,
-                    locked_days=locked_feed_days)
+                    locked_days=locked_feed_days, allow_reshape=allow_reshape)
     result["days"] = built_days
     result["feeds"] = built_feeds
     result["posts_per_day"] = slots_per_day
@@ -895,7 +896,8 @@ def _to_rows(base_key, drafts):
     return rows
 
 
-def _apply(base_key, rows, start, days, store, log, locked_days=()):
+def _apply(base_key, rows, start, days, store, log, locked_days=(),
+           allow_reshape=False):
     """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
@@ -959,7 +961,17 @@ def _apply(base_key, rows, start, days, store, log, locked_days=()):
             existing_feeds, count_ok = _existing_feed_count(store, base_key, start, days)
         except Exception:  # noqa: BLE001 - a count failure must never block a legit build
             existing_feeds, count_ok = 0, False
-        if count_ok and existing_feeds > 0 and post_merge_feeds < existing_feeds:
+        # CADENCE RESHAPE EXCEPTION (audit 2026-08-27 MAJOR): the guard counts
+        # distinct feed DATES, so a legitimate 1x->2x flip on a gym whose media sits
+        # between days and 2x days reads as a shrink (same or more feeds, fewer
+        # dates) and was silently no-op'd — and the caller then stamped the cadence
+        # as applied, dropping the client's toggle forever. A cadence-change rebuild
+        # (allow_reshape=True, passed ONLY when the scan detected a cadence flip) is
+        # a deliberate one-time reshape: the guard is skipped for it. Every other
+        # rebuild keeps the guard exactly as before; the cadence_applied stamp
+        # (written only on a real apply) prevents repeat reshapes.
+        if (not allow_reshape and count_ok and existing_feeds > 0
+                and post_merge_feeds < existing_feeds):
             log(f"{base_key}: rebuild would SHRINK feeds {existing_feeds} -> "
                 f"{post_merge_feeds} ({new_feeds} new + {len(locked_in_span)} locked); "
                 "keeping the existing calendar (grow-only, never shrink)")

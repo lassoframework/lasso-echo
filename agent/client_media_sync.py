@@ -884,17 +884,23 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             built = build_client_month(
                 account, base, start.isoformat(), days,
                 voice=voice, library_path=lib_dir, store=store,
-                banned_words=banned, logger=log)
+                banned_words=banned, logger=log,
+                allow_reshape=cadence_changed)
             if built.get("ok"):
                 generated += 1
                 # Remember the media count this build covered, so the next scan does not
                 # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
-                # Also stamp the cadence this build APPLIED (CADENCE_SPEC.md D7): the
-                # cadence_changed trigger only fires again on the NEXT portal toggle.
+                # Stamp the cadence this build APPLIED (CADENCE_SPEC.md D7) ONLY when
+                # the store was actually written (audit 2026-08-27 MAJOR: stamping a
+                # noop_shrink/noop_empty build silently dropped the client's toggle
+                # forever — an un-applied cadence must stay pending so the next scan
+                # retries it).
+                _applied = not (built.get("noop_shrink") or built.get("noop_empty"))
                 try:
                     from . import db as _db
                     _db.kv_set(f"built_media_{base}", str(media_count))
-                    _db.kv_set(f"cadence_applied_{base}", str(ppd))
+                    if _applied:
+                        _db.kv_set(f"cadence_applied_{base}", str(ppd))
                 except Exception:  # noqa: BLE001
                     pass
                 results.append({"base": base, "status": "generated",

@@ -55,8 +55,14 @@ E3. Cadence resolution helper (single source of truth used by both planners):
 E4. agent/portal_social.py + agent/intake_web.py
     - POST /portal/<token>/cadence {"posts_per_day": 1|2} -> stamps kv, returns
       {ok, posts_per_day, replanned}: 400 on bad value. Mirrors handle_autonomy shape.
-    - Handler triggers the replan (E6) when flag armed; replanned=false when flag OFF
-      (setting saved, no behavior).
+    - REPLAN IS ASYNC BY ARCHITECTURE (amended 2026-08-27, DESCOPE #1 for Blake's
+      ruling): the cadence endpoint runs on echo-intake-web, which has NO media
+      volume and cannot build a calendar. The handler saves durably and returns
+      replanned=false + replan='next daily cycle'; the WORKER's client-media scan
+      lane (frequent, ~every interval) detects the cadence change via the
+      cadence_applied_<base> stamp and rebuilds unapproved future days. Original
+      E4 text said the handler triggers the replan inline — impossible on that
+      service without shipping the volume there.
 E5. Planners
     - client_month_run: at posts_per_day==2, each day emits TWO feed+story pairs with
       DISTINCT concept/source/image/caption (uniqueness enforced in-code, not hoped);

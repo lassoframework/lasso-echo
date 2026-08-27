@@ -1036,3 +1036,62 @@ def test_future_local_date_row_waits_even_when_et_day_has_turned(armed, monkeypa
                         now=just_past_midnight_et, approved_only=True,
                         catch_all=False, zernio_publish=lambda *a, **k: None)
     assert s["published"] == [] and "la1" in s["waiting"]
+
+
+# ---- publish-boundary caption floor + avatar rail (CADENCE_SPEC defect rider) ----
+# The Wave 5.3 recheck (AGENT_CALENDAR_GRADE) gained two HOLD-only checks
+# 2026-08-27: a FEED whose caption is empty/thin never publishes (stories are
+# exempt BY DESIGN: they publish empty-body with the caption burned on media),
+# and a caption carrying a banned-audience term (LASSO avatar rail) never
+# publishes. Both revert the row to pending; the publisher is never called.
+
+@pytest.fixture
+def graded(monkeypatch, armed):
+    monkeypatch.setenv("AGENT_CALENDAR_GRADE", "true")
+
+
+def _capture_alerts(monkeypatch):
+    from agent import ops_alerts
+    sent = []
+    monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: sent.append(m))
+    return sent
+
+
+def test_recheck_thin_feed_caption_reverts(graded, monkeypatch):
+    sent = _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("thin", caption="HYROX")])   # 5 chars, under the floor
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "thin" in summary["failed"] and summary["published"] == []
+    assert store.rows["thin"]["status"] == "pending"      # held, not lost
+    assert pub.calls == []                                 # never reached the network
+    assert any("empty/thin" in m for m in sent)
+
+
+def test_recheck_story_empty_caption_is_exempt(graded, monkeypatch):
+    _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("st", fmt="story", caption="")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "st" in summary["published"]                    # story publishes by design
+
+
+def test_recheck_avatar_term_reverts(graded, monkeypatch):
+    sent = _capture_alerts(monkeypatch)
+    caption = ("HYROX season starts soon and our coaches are ready to help you "
+               "train for it. Save your spot today.")
+    store = _FakeStore([_row("av", caption=caption)])
+    pub = _FakePublisher()
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "av" in summary["failed"] and pub.calls == []
+    assert store.rows["av"]["status"] == "pending"
+    assert any("banned-audience" in m for m in sent)
+
+
+def test_recheck_floor_and_rail_off_when_grade_flag_off(armed, monkeypatch):
+    """Flag-off no-op: without AGENT_CALENDAR_GRADE the new checks never run."""
+    _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("thin2", caption="HYROX")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "thin2" in summary["published"]                 # pre-cadence behavior

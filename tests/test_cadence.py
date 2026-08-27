@@ -351,25 +351,202 @@ def test_cadence_change_forces_rebuild_flag_on(monkeypatch, tmp_path):
     assert calls["built"] == 1
 
 
+def test_cadence_noop_build_never_stamps_applied(monkeypatch, tmp_path):
+    """Audit 2026-08-27 MAJOR regression: a rebuild the never-shrink/empty guard
+    no-ops must NOT stamp cadence_applied — the toggle stays pending and the next
+    scan retries (with allow_reshape=True threaded so the reshape can land)."""
+    from agent import client_media_sync as cms
+    monkeypatch.setenv("AGENT_CLIENT_MEDIA_SYNC", "true")
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+
+    calls = {"built": 0, "reshape_flags": []}
+
+    class _Store(_FakeStore):
+        def list_month(self, base_key, month):
+            return [{"post_date": f"2026-10-{d:02d}", "format": "feed",
+                     "account": "instagram", "status": "pending",
+                     "caption": "x", "image_url": f"u{d}"} for d in range(1, 5)]
+
+    lib = _lib(tmp_path, n=4)
+    account = _account()
+    _stock_clean(account.key)
+    monkeypatch.setattr(cms, "_client_bases", lambda clients=None: ["gritx"])
+    monkeypatch.setattr(cms, "_account_for_base", lambda b: account)
+    monkeypatch.setattr(cms, "_library_dir", lambda b, out_dir=None: lib)
+    monkeypatch.setattr(cms, "_has_approved_sources", lambda k: True)
+    monkeypatch.setattr(cms, "sync_uploads",
+                        lambda b, r2=None, out_dir=None, logger=None: {"synced": 0})
+    monkeypatch.setattr(cms, "_default_r2", lambda: None)
+
+    results = [{"ok": True, "upserted": 0, "noop_shrink": True},   # guard no-op'd
+               {"ok": True, "upserted": 8}]                        # real apply
+
+    def _fake_build(account, base, start, days, **kw):
+        calls["reshape_flags"].append(kw.get("allow_reshape"))
+        out = results[min(calls["built"], len(results) - 1)]
+        calls["built"] += 1
+        return out
+    import agent.client_month_run as _cmr
+    monkeypatch.setattr(_cmr, "build_client_month", _fake_build)
+
+    store = _Store(ppd=2)
+    cms.scan_and_generate(clients=["gritx"], store=store)
+    assert calls["built"] == 1
+    assert db.kv_get("cadence_applied_gritx") in ("", None)   # NOT stamped on a no-op
+
+    cms.scan_and_generate(clients=["gritx"], store=store)     # retries the toggle
+    assert calls["built"] == 2
+    assert calls["reshape_flags"] == [True, True]             # reshape threaded through
+    assert db.kv_get("cadence_applied_gritx") == "2"          # stamped on the real apply
+
+
+def test_apply_allow_reshape_skips_never_shrink_once(tmp_path, monkeypatch):
+    """1x->2x mid-band (media between days and 2x days): fewer covered DATES with
+    MORE feeds is a legitimate reshape — _apply must write it when allow_reshape."""
+    rows = []
+    for d in (1, 2):
+        for slot in (0, 1):
+            rows.append({"gym_id": "gritx", "post_date": f"2026-10-0{d}",
+                         "account": "instagram", "format": "feed",
+                         "caption": f"c{d}{slot}", "image_url": f"u{d}{slot}",
+                         "status": "pending", "slot_index": slot})
+
+    class _Existing(_FakeStore):
+        def list_month(self, base_key, month):
+            # 3 existing 1x feed DATES -> the date-unit guard would read 2 < 3 as shrink
+            return [{"post_date": f"2026-10-0{d}", "format": "feed",
+                     "account": "instagram", "status": "pending",
+                     "caption": "x", "image_url": f"e{d}"} for d in (1, 2, 3)]
+
+    from datetime import date
+    store = _Existing()
+    blocked = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store,
+                         lambda m: None)
+    assert blocked.get("noop_shrink") is True and store.inserted == []
+
+    store2 = _Existing()
+    applied = cmr._apply("gritx", list(rows), date(2026, 10, 1), 30, store2,
+                         lambda m: None, allow_reshape=True)
+    assert applied["ok"] and not applied.get("noop_shrink")
+    assert len(store2.inserted) == 4                          # the reshape landed
+
+
+# ---- mix-counter bug fix (D9 / A6: tally drawn concepts, correct at 1x AND 2x) ----
+
+def _insert_published_post(account_key, draft_id, category, creative, published_at):
+    """One published post + (optionally) the draft that produced it, in the
+    per-test sqlite. category=None -> legacy post with NO surviving draft."""
+    import json as _json
+    with db.connect() as conn:
+        if category is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO drafts (draft_id, account_key, status, "
+                "day_key, draft_type, data) VALUES (?,?,?,?,?,?)",
+                (draft_id, account_key, "published", published_at[:10], "feed",
+                 _json.dumps({"category": category})))
+        conn.execute(
+            "INSERT INTO posts (draft_id, account_key, platform, caption, "
+            "media_id, mode, creative_key, published_at) VALUES (?,?,?,?,?,?,?,?)",
+            (draft_id, account_key, "instagram", "cap", "M", "published",
+             creative, published_at))
+        conn.commit()
+
+
+def test_mix_tally_counts_drawn_concepts_1x():
+    from agent import monthly_report
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=2)).isoformat()
+    _insert_published_post("mixgym", "d1", "offer", "lasso_p1_x.jpg", day)
+    _insert_published_post("mixgym", "d2", "testimonial", "lasso_p1_y.jpg", day)
+    _snaps, posts = monthly_report.gather("mixgym", now=now)
+    tally = {}
+    for p_row in posts:
+        k = monthly_report.pillar_for_post(p_row)
+        tally[k] = tally.get(k, 0) + 1
+    # DRAWN concepts counted — NOT the filename family (both files are lasso_p1_*,
+    # which the old filename inference would have bucketed together as 'p1').
+    assert tally == {"offer": 1, "testimonial": 1}
+
+
+def test_mix_tally_counts_both_posts_on_a_2x_day():
+    from agent import monthly_report
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=1)).isoformat()      # SAME day, two drawn concepts
+    _insert_published_post("mixgym", "am", "offer", "a.jpg", day)
+    _insert_published_post("mixgym", "pm", "service", "b.jpg", day)
+    _snaps, posts = monthly_report.gather("mixgym", now=now)
+    tally = {}
+    for p_row in posts:
+        k = monthly_report.pillar_for_post(p_row)
+        tally[k] = tally.get(k, 0) + 1
+    assert tally == {"offer": 1, "service": 1}       # two posts, two tallies
+
+
+def test_mix_tally_legacy_post_falls_back_to_filename():
+    from agent import monthly_report
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=3)).isoformat()
+    _insert_published_post("mixgym", "old", None, "lasso_p2_hook.jpg", day)
+    _snaps, posts = monthly_report.gather("mixgym", now=now)
+    assert monthly_report.pillar_for_post(posts[0]) == "p2"   # rotation.pillar_of
+
+
+def test_grade_card_pillar_counts_use_drawn_concepts(monkeypatch):
+    from agent import grade_card
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=1)).isoformat()
+    _insert_published_post("mixgym", "g1", "offer", "same_family_1.jpg", day)
+    _insert_published_post("mixgym", "g2", "about", "same_family_2.jpg", day)
+    _report, _planned, pillar_counts, _r = grade_card._grade_inputs("mixgym", now=now)
+    assert pillar_counts == {"offer": 1, "about": 1}
+
+
+# ---- deny-volume line in the monthly rollup (D8 addition 1) ------------------------
+
+def test_retro_digest_carries_deny_line_when_counted():
+    from agent.jobs.monthly_retro import build_digest
+    findings = {"keep_doing": [], "stop_doing": [],
+                "deny_volume": "Denies this month: 4 of 15 recreate budget used"}
+    text = build_digest("gritx", "2026-08", findings, tainted=False)
+    assert "Denies this month: 4 of 15" in text
+    text2 = build_digest("gritx", "2026-08",
+                         {"keep_doing": [], "stop_doing": []}, tainted=False)
+    assert "Denies this month" not in text2               # no count -> no line, never guessed
+
+
+# ---- 2x single-distinct-concept day emits ONE pair (D5 fallback) -------------------
+
+def test_client_2x_single_concept_day_emits_one_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
+    real = client_content.build_client_draft
+
+    def _same_caption(account, day_key, voice, library_path, **kw):
+        d = real(account, day_key, voice, library_path, **kw)
+        if d is not None:
+            d.caption = ("The same single concept caption for every draft today. "
+                         "Save this post.")
+        return d
+
+    monkeypatch.setattr(cmr.client_content, "build_client_draft", _same_caption)
+    store = _FakeStore(ppd=2)
+    out = _build(tmp_path, store, days=2, n_media=8)
+    assert out["ok"]
+    ig_feeds = [r for r in store.inserted
+                if r["format"] == "feed" and r["account"] == "instagram"]
+    by_day = {}
+    for r in ig_feeds:
+        by_day.setdefault(r["post_date"], []).append(r)
+    for day, feeds in by_day.items():
+        assert len(feeds) == 1, f"{day}: dup concept must not fill slot 2"
+
+
 # ---- publish-boundary caption floor + avatar rail (Defect B) -----------------------
-
-class _RecheckStore:
-    def __init__(self, rows):
-        self._rows = rows
-        self.reverted = []
-
-    def due_rows(self, gym_id, run_date, catchup_days=0):
-        return self._rows
-
-    def claim_for_publish(self, row_id):
-        return True
-
-    def mark_publish_failed(self, row_id, revert_status="pending"):
-        self.reverted.append((row_id, revert_status))
-
-    def mark_published(self, *a, **k):
-        pass
-
+# Full publish_due boundary tests live in tests/test_calendar_autopublish.py
+# (thin feed reverts, story exempt, avatar term reverts, flag-off no-op).
 
 def test_avatar_breach_detector():
     from agent import post_quality as pq

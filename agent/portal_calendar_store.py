@@ -569,6 +569,12 @@ class SupabaseCalendarStore:
         gym_uuid = (rows[0].get("id") if rows else None)
         if not gym_uuid:
             return False
+        payload = {"gym_id": gym_uuid, "posts_per_day": posts_per_day}
+        # Only stamp the audit column when we actually know the actor: an empty
+        # actor must not clobber the portal's own cadence_updated_by (the portal
+        # writes first with the user's role; Echo's mirror write follows).
+        if (actor or "").strip():
+            payload["cadence_updated_by"] = actor.strip()[:120]
         r2 = self._client().post(
             self._rest("echo_gym_settings"),
             params={"on_conflict": "gym_id"},
@@ -576,8 +582,7 @@ class SupabaseCalendarStore:
                 "Content-Type": "application/json",
                 "Prefer": "resolution=merge-duplicates,return=representation",
             }),
-            json=[{"gym_id": gym_uuid, "posts_per_day": posts_per_day,
-                   "cadence_updated_by": (actor or "")[:120]}],
+            json=[payload],
             timeout=30,
         )
         if r2.status_code >= 400:
