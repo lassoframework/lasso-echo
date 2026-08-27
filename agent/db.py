@@ -289,6 +289,43 @@ def is_autonomous(account_key):
         return False
 
 
+# ---- per-account posting cadence (posts_per_day) ----------------------------------
+# A gym owner picks 1x or 2x per day in the portal. Stored in the shared kv table,
+# keyed per tenant BASE (gritx, eng), mirroring the autonomy flag. The kv row is the
+# LOCAL record; the shared plane (echo_gym_settings.posts_per_day via the portal
+# store) is what the worker service reads — same dual-write shape as autonomy.
+# Default (no row / bad value) = 1: today's cadence, always the safe fallback.
+
+def _cadence_key(base_key):
+    return f"portal_cadence_{base_key or ''}"
+
+
+def set_posts_per_day(base_key, n):
+    """Persist the cadence preference for one gym base. Only 1 or 2 is a valid
+    cadence; anything else is refused (returns False, writes nothing). Null-safe:
+    an empty base_key is a harmless no-op key."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return False
+    if n not in (1, 2):
+        return False
+    kv_set(_cadence_key(base_key), str(n))
+    return True
+
+
+def posts_per_day(base_key):
+    """The gym's LOCALLY stored cadence preference: 1, 2, or None when unset /
+    unreadable (caller falls back to the shared plane, then to 1)."""
+    if not base_key:
+        return None
+    try:
+        raw = str(kv_get(_cadence_key(base_key), "")).strip()
+    except Exception:
+        return None
+    return int(raw) if raw in ("1", "2") else None
+
+
 def counter_bump(name, day):
     """Increment and return the (name, day) counter. Idempotent schema, atomic."""
     with _lock, connect() as conn:

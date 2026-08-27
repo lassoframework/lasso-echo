@@ -510,6 +510,80 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
         return True
 
+    def gym_posts_per_day(self, gym_slug):
+        """The portal's per-gym posting cadence for one gym, read from Supabase:
+        gyms.slug -> echo_gym_settings.posts_per_day. Returns 1 or 2, or None when
+        the gym or its settings row is absent / carries no valid value (caller
+        treats None as 1 — today's cadence is always the safe default). Read-only,
+        gym-scoped. Mirrors gym_autonomy."""
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None
+        gym_uuid = rows[0].get("id")
+        if not gym_uuid:
+            return None
+        r2 = self._client().get(
+            self._rest("echo_gym_settings"),
+            params={"gym_id": f"eq.{gym_uuid}", "select": "posts_per_day"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        srows = r2.json() or []
+        if not srows:
+            return None
+        val = srows[0].get("posts_per_day")
+        return int(val) if val in (1, 2) else None
+
+    def set_gym_posts_per_day(self, gym_slug, posts_per_day, actor=""):
+        """UPSERT the portal's per-gym posting cadence: gyms.slug ->
+        echo_gym_settings.posts_per_day. This is the SHARED persistence plane the
+        worker's planners read (gym_posts_per_day) — the intake-web kv alone is a
+        different service's SQLite and invisible to the worker. Only 1 or 2 is a
+        valid cadence (refused otherwise: returns False, writes nothing). Returns
+        True on write, False when the gym slug is unknown. Mirrors set_gym_autonomy."""
+        try:
+            posts_per_day = int(posts_per_day)
+        except (TypeError, ValueError):
+            return False
+        if posts_per_day not in (1, 2):
+            return False
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        gym_uuid = (rows[0].get("id") if rows else None)
+        if not gym_uuid:
+            return False
+        r2 = self._client().post(
+            self._rest("echo_gym_settings"),
+            params={"on_conflict": "gym_id"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            }),
+            json=[{"gym_id": gym_uuid, "posts_per_day": posts_per_day,
+                   "cadence_updated_by": (actor or "")[:120]}],
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        return True
+
     def publishing_rows(self):
         """Every row currently stuck in status='publishing' with no published_at,
         across all gyms (read-only; feeds the stale-claim ALERT sweep). A row lives

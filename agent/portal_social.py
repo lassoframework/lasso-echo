@@ -1120,6 +1120,81 @@ def handle_autonomy(account_key, autonomous, actor_id=None, store=None, reader=N
                  "account_key": account_key, "shared_persisted": shared_persisted}
 
 
+def handle_cadence(account_key, posts_per_day, actor_id=None, reader=None):
+    """POST /portal/<token>/cadence  body {"posts_per_day": 1|2}.
+
+    Persists the gym's posting-cadence preference (CADENCE_SPEC.md). The preference
+    is SAVED regardless of ECHO_CADENCE_2X_ENABLED — the kill switch gates behavior,
+    not the client's stored choice (Blake's spec: 'even if a gym toggles 2x in the
+    portal, the feature does nothing until the env flag is armed by hand').
+
+    DUAL-WRITE, SHARED PLANE REQUIRED: the local kv row is only this service's
+    record; the worker's planners read echo_gym_settings.posts_per_day. Unlike the
+    autonomy ON path (which degrades safely), a cadence write that misses the shared
+    plane is INVISIBLE to the worker in BOTH directions — a saved 2x that never
+    doubles, or worse a saved 1x that keeps posting 2x against the client's wish.
+    So when the Supabase plane is configured, a failed shared write is a 503 and
+    the client retries; when it is not configured, the local kv IS the plane.
+
+    REPLAN: the endpoint never replans inline (this service does not render). The
+    worker's daily lane detects a cadence change (cadence_applied stamp mismatch)
+    and rebuilds UNAPPROVED FUTURE days only. Response carries replanned=false and
+    replan='next daily cycle' so the caller can set expectations honestly.
+
+    Gates: flag OFF -> disabled (404); missing account -> 400; bad value -> 400;
+    Stripe social product not ACTIVE -> 402. Never weakens approval/publish gates:
+    cadence only changes how many PAUSED pending drafts a day carries."""
+    if not config.portal_social_enabled():
+        return _disabled("cadence")
+    if not account_key:
+        return 400, {"ok": False, "error": "missing account_key"}
+    try:
+        want = int(posts_per_day)
+    except (TypeError, ValueError):
+        want = 0
+    if want not in (1, 2):
+        return 400, {"ok": False, "error": "posts_per_day must be 1 or 2",
+                     "account_key": account_key}
+    if not is_social_active(account_key, reader=reader):
+        return 402, {"ok": False, "error": "social plan is not active",
+                     "account_key": account_key}
+
+    base = account_key
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+
+    # Local record first (mirrors autonomy: the kv is the durable local choice).
+    try:
+        _db.set_posts_per_day(base, want)
+    except Exception as exc:  # noqa: BLE001
+        return 500, {"ok": False,
+                     "error": f"could not persist cadence: {type(exc).__name__}",
+                     "account_key": account_key}
+
+    # Shared plane: REQUIRED when configured (see docstring). Honest 503 on a miss.
+    shared_persisted = False
+    if config.portal_calendar_supabase_enabled():
+        try:
+            from .portal_calendar_store import SupabaseCalendarStore
+            shared_persisted = bool(SupabaseCalendarStore().set_gym_posts_per_day(
+                base, want, actor=actor_id or ""))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[portal-social] cadence shared-plane write failed for "
+                  f"{account_key}: {type(exc).__name__}")
+        if not shared_persisted:
+            return 503, {"ok": False, "posts_per_day": want,
+                         "account_key": account_key, "shared_persisted": False,
+                         "error": "could not durably save the posting cadence "
+                                  "(shared store write failed). Please try again."}
+
+    return 200, {"ok": True, "posts_per_day": want, "account_key": account_key,
+                 "shared_persisted": shared_persisted,
+                 "cadence_armed": config.cadence_2x_enabled(),
+                 "replanned": False, "replan": "next daily cycle"}
+
+
 # ==========================================================================
 # GET /portal/<token>/metrics  -> the Part D report SHAPE (null values until Part C/D)
 # ==========================================================================

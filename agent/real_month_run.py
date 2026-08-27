@@ -231,10 +231,20 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
         from . import accounts as _accts
         acct = _accts.get_account(account_key)
 
+    # 2x cadence (CADENCE_SPEC.md): the gym's effective posts/day. Flag off -> 1
+    # before any I/O, so the pre-cadence plan is byte-for-byte unchanged.
+    from .cadence import resolve_posts_per_day_live
+    _base = account_key or ""
+    for _suf in ("_ig", "_fb"):
+        if _base.endswith(_suf):
+            _base = _base[: -len(_suf)]
+            break
+    _ppd = resolve_posts_per_day_live(_base)
     plan = _rmp.plan_month(account_key, start_date, days, book_dates=book_dates,
                            summit_day_fn=summit_day_fn, welcome_dates=welcome_dates,
                            sprint_day_fn=sprint_day_fn,
-                           sprint_feed_count_fn=sprint_feed_count_fn)
+                           sprint_feed_count_fn=sprint_feed_count_fn,
+                           posts_per_day=_ppd)
     builders = real_builders_map(acct if acct is not None else account_key)
     story_builder = _real_story_builder(acct if acct is not None else account_key)
     sprint_feed, sprint_story = sprint_builders(

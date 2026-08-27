@@ -216,7 +216,7 @@ def _has_real_creative(draft):
 
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
-                         angle="", avoid_angles=()):
+                         angle="", avoid_angles=(), avoid_captions=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -244,11 +244,25 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     angle / avoid_angles (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): the SB7
     problem/entry angle this day should LEAD from and the recent angles to avoid, threaded
     to the caption generator so the underlying angle varies across the month (not just the
-    opening). STYLE-only; never a fact, never blocks a day. Empty (flag OFF) => unchanged."""
+    opening). STYLE-only; never a fact, never blocks a day. Empty (flag OFF) => unchanged.
+
+    avoid_captions (2x cadence, CADENCE_SPEC.md D5): captions already placed on THIS
+    day (the first slot's caption on a 2x day). A draft whose caption matches one is
+    treated like a banned draft — the neighbour-day walk finds a DIFFERENT approved
+    source — so the two slots of one day are never the same concept. HARD check
+    (a dup is rejected), unlike the STYLE-only opening guidance. Empty => unchanged."""
     from . import post_quality
+
+    def _norm_caption(text):
+        return " ".join((text or "").split()).strip().lower()
+
+    _avoid = {_norm_caption(c) for c in (avoid_captions or ()) if (c or "").strip()}
 
     def _accept(d):
         if d is None:
+            return False
+        # 2x uniqueness: never the same concept twice in one day (CADENCE_SPEC D5).
+        if _avoid and _norm_caption(getattr(d, "caption", "")) in _avoid:
             return False
         # A+ caption gate is enforced whenever the real-caption engine (SB7) is on —
         # the production posture. With SB7 OFF the system is in its documented
@@ -454,11 +468,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # caption is not discarded by the rebuild (Dale, 2026-08-17).
     edited_story_caps = _edited_story_captions(base_key, start, days, store, log)
 
+    # POSTING CADENCE (CADENCE_SPEC.md): 1 or 2 feed+story pairs per day. Resolved
+    # ONCE per build; ECHO_CADENCE_2X_ENABLED off -> always 1 (byte-for-byte today).
+    from .cadence import resolve_posts_per_day
+    slots_per_day = resolve_posts_per_day(base_key, store)
+
     # MEDIA-CAPPED: never build past the media the gym has. `days` is only an UPPER
-    # bound; the real number of NEW feed-days is at most the media not already locked
-    # to an approved row (one distinct creative per feed, no reuse). A 2-photo gym
-    # gets 2 feeds, never 30.
-    max_feed_days = min(days, max(0, media_count - len(used_keys)))
+    # bound on COVERED DAYS; the feed budget is days * slots_per_day (at 1x exactly
+    # the pre-cadence cap), still bounded by the media not already locked to an
+    # approved row (one distinct creative per feed, no reuse). A 2-photo gym gets
+    # 2 feeds, never 30. At 2x each day consumes two photos, so a thin library
+    # covers half the days — never padded, never reused.
+    max_feed_days = min(days * slots_per_day, max(0, media_count - len(used_keys)))
 
     drafts = []
     skipped_banned = 0
@@ -487,11 +508,12 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     _WIDE_OPENING_WINDOW = 12       # widened opening-avoid window when angle rotation is on
     recent_angles = []              # accepted angles, oldest..newest
     angle_idx = 0                   # advances only on an ACCEPTED feed (dense round-robin)
+    built_feeds = 0
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
     i = 0
-    while i < days and built_days < max_feed_days:
+    while i < days and built_feeds < max_feed_days:
         day_key = (start + timedelta(days=i)).isoformat()
         i += 1
 
@@ -501,66 +523,95 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             log(f"locked {day_key}: day already has approved/published content")
             continue
 
-        # Choose this day's angle (round-robin by the accepted-day index) + the recent
-        # angles to avoid, and widen the opening window, only when angle rotation is armed.
-        if _angle_rotation:
-            day_angle = angle_for_index(angle_idx)
-            day_avoid_angles = recent_angles[-_ANGLE_WINDOW:]
-            opening_window = _WIDE_OPENING_WINDOW
-        else:
-            day_angle, day_avoid_angles, opening_window = "", (), _OPENING_WINDOW
-        feed, feed_drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, banned_words, log,
-            exclude_keys=used_keys, avoid_openings=recent_openings[-opening_window:],
-            angle=day_angle, avoid_angles=day_avoid_angles)
-        if feed is None:
-            if feed_drop:
-                skipped_banned += 1
-                log(f"drop {day_key} feed: {feed_drop}")
+        day_captions = []          # captions placed on THIS day (2x uniqueness, D5)
+        day_built = 0
+        for slot_i in range(slots_per_day):
+            if built_feeds >= max_feed_days:
+                break
+            # Choose this slot's angle (round-robin by the accepted-feed index) + the
+            # recent angles to avoid, and widen the opening window, only when angle
+            # rotation is armed.
+            if _angle_rotation:
+                day_angle = angle_for_index(angle_idx)
+                day_avoid_angles = recent_angles[-_ANGLE_WINDOW:]
+                opening_window = _WIDE_OPENING_WINDOW
             else:
-                log(f"skip {day_key} feed: no approved source could build the day")
-            continue
-        # MEDIA-ONLY: emit a day only when it carries a REAL uploaded creative. A day
-        # with no client photo is SKIPPED (held), NEVER infographic-filled.
-        if not _has_real_creative(feed):
-            log(f"held: no client photo for the day {day_key} feed")
-            continue
-        # NO REUSE: a photo already placed on an earlier feed is never reused. Skip
-        # the day; a later day's rotated pick fills a still-unused photo.
-        feed_path = (getattr(feed, "creative_path", "") or "").strip()
-        if feed_path and feed_path in used_paths:
-            log(f"skip {day_key} feed: photo already used by an earlier feed (no reuse)")
-            continue
-        if feed_path:
-            used_paths.add(feed_path)
-            used_keys.add(os.path.basename(feed_path))
-        pub = (getattr(feed, "creative_public_url", "") or "").strip()
-        if pub:
-            used_keys.add(_url_basename(pub))
-        # PAIRED STORY on the SAME photo: N photos -> N feeds + N stories (the story
-        # reuses the feed's creative, never a second photo). All media-processing lanes
-        # (reel, poster, autofit) + the captionless-story guard live in the shared helper
-        # so the denied-slot backfill emits IDENTICAL cards.
-        story_caption_override = edited_story_caps.get(str(day_key)[:10])
-        # ACCEPTED: the feed survived every gate and is being placed. Record its photo as
-        # served NOW (not at pick time) so rotation reflects only KEPT days — never the
-        # picked-then-dropped attempts that used to poison the ledger.
-        _record_feed_served(account, feed, day_key)
-        day_drafts = _finish_feed_with_story(
-            account, feed, library_path, log, day_key=day_key,
-            story_caption_override=story_caption_override)
-        drafts.extend(day_drafts)
-        built_days += 1
-        # Record this accepted feed's opening so the NEXT day avoids leading the same
-        # way (the cross-day repetition Ryan flagged). Blank signatures are skipped.
-        sig = opening_signature(getattr(feed, "caption", "") or "")
-        if sig:
-            recent_openings.append(sig)
-        # Record this accepted feed's angle + advance the round-robin so the NEXT accepted
-        # day gets a DISTINCT angle (angle rotation ON only; OFF leaves both untouched).
-        if _angle_rotation:
-            recent_angles.append(day_angle)
-            angle_idx += 1
+                day_angle, day_avoid_angles, opening_window = "", (), _OPENING_WINDOW
+            feed, feed_drop = _clean_draft_for_day(
+                account, day_key, voice, library_path, banned_words, log,
+                exclude_keys=used_keys,
+                avoid_openings=recent_openings[-opening_window:],
+                angle=day_angle, avoid_angles=day_avoid_angles,
+                avoid_captions=tuple(day_captions))
+            if feed is None:
+                if feed_drop:
+                    skipped_banned += 1
+                    log(f"drop {day_key} feed slot {slot_i + 1}: {feed_drop}")
+                elif slot_i == 0:
+                    log(f"skip {day_key} feed: no approved source could build the day")
+                else:
+                    # NEVER the same concept twice in one day: a 2x day that can only
+                    # produce one distinct concept emits ONE pair (honest, logged).
+                    log(f"{day_key}: only one distinct concept available; "
+                        "single post on a 2x day")
+                continue
+            # MEDIA-ONLY: emit a slot only when it carries a REAL uploaded creative.
+            # A slot with no client photo is SKIPPED (held), NEVER infographic-filled.
+            if not _has_real_creative(feed):
+                log(f"held: no client photo for the day {day_key} feed")
+                continue
+            # NO REUSE: a photo already placed on an earlier feed is never reused.
+            # Skip the slot; a later pick fills a still-unused photo.
+            feed_path = (getattr(feed, "creative_path", "") or "").strip()
+            if feed_path and feed_path in used_paths:
+                log(f"skip {day_key} feed: photo already used by an earlier feed "
+                    "(no reuse)")
+                continue
+            if feed_path:
+                used_paths.add(feed_path)
+                used_keys.add(os.path.basename(feed_path))
+            pub = (getattr(feed, "creative_public_url", "") or "").strip()
+            if pub:
+                used_keys.add(_url_basename(pub))
+            # PAIRED STORY on the SAME photo: N photos -> N feeds + N stories (the
+            # story reuses the feed's creative, never a second photo). All media
+            # lanes + the captionless-story guard live in the shared helper so the
+            # denied-slot backfill emits IDENTICAL cards. A client-edited story
+            # caption belongs to the day's FIRST (pre-existing) story only.
+            story_caption_override = (edited_story_caps.get(str(day_key)[:10])
+                                      if slot_i == 0 else None)
+            # ACCEPTED: the feed survived every gate and is being placed. Record its
+            # photo as served NOW (not at pick time) so rotation reflects only KEPT
+            # days — never the picked-then-dropped attempts.
+            _record_feed_served(account, feed, day_key)
+            day_drafts = _finish_feed_with_story(
+                account, feed, library_path, log, day_key=day_key,
+                story_caption_override=story_caption_override)
+            # 2x rows carry their slot ordinal so publish-time slot times are
+            # deterministic (07:30 / 18:30, config.cadence_slot_times). 1x days carry
+            # NO ordinal: the row shape (and publish hashing) stays byte-for-byte.
+            if slots_per_day == 2:
+                for d in day_drafts:
+                    try:
+                        d.cadence_slot_index = slot_i
+                    except Exception:  # noqa: BLE001 - a frozen draft never blocks
+                        pass
+            drafts.extend(day_drafts)
+            built_feeds += 1
+            day_built += 1
+            day_captions.append(getattr(feed, "caption", "") or "")
+            # Record this accepted feed's opening so the NEXT slot/day avoids leading
+            # the same way (the cross-day repetition Ryan flagged).
+            sig = opening_signature(getattr(feed, "caption", "") or "")
+            if sig:
+                recent_openings.append(sig)
+            # Record this accepted feed's angle + advance the round-robin so the NEXT
+            # accepted slot gets a DISTINCT angle (angle rotation ON only).
+            if _angle_rotation:
+                recent_angles.append(day_angle)
+                angle_idx += 1
+        if day_built:
+            built_days += 1
 
     # §4 weak_match: no image cleared the content-score floor for these slots — the best
     # available was planned and must reach the coach (never silent). One summary staff alert
@@ -592,6 +643,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     result = _apply(base_key, rows, start, days, store, log,
                     locked_days=locked_feed_days)
     result["days"] = built_days
+    result["feeds"] = built_feeds
+    result["posts_per_day"] = slots_per_day
     result["skipped_banned"] = skipped_banned
     result["media_count"] = media_count
     return result

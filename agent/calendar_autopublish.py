@@ -76,7 +76,18 @@ def slot_index_for_row(row, n=None):
 
 
 def slot_time_for_row(row, n=None):
-    """The STABLE "HH:MM" slot time for one row (see slot_index_for_row)."""
+    """The STABLE "HH:MM" slot time for one row (see slot_index_for_row).
+
+    2x CADENCE (CADENCE_SPEC.md D6): a FEED row stamped with a cadence slot_index
+    (0 or 1 — written only by a 2x plan) gets the DETERMINISTIC pair from
+    config.cadence_slot_times() (default 07:30 / 18:30) instead of the id-hash,
+    which could collide both of a day's feeds onto one slot. Applies only while
+    ECHO_CADENCE_2X_ENABLED is armed; flag off (or no slot_index on the row) is
+    the pre-cadence hash path, byte-for-byte. Stories keep their midday slot."""
+    fmt = (row.get("format") or "feed").strip().lower()
+    si = row.get("slot_index")
+    if (fmt == "feed" and si in (0, 1) and config.cadence_2x_enabled()):
+        return config.cadence_slot_times()[int(si)]
     if n is None:
         n = len(SPRINT_SLOT_TIMES)
     if not SPRINT_SLOT_TIMES:
@@ -611,6 +622,42 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 _oa.alert(
                     f"publish recheck: row {row_id} caption on cooldown, "
                     f"reverted to pending"
+                )
+                failed.append(row_id)
+                continue
+            # CAPTION FLOOR AT THE PUBLISH BOUNDARY (Blake's audit 2026-08-27):
+            # a FEED row whose caption is empty or under the A+ floor is never
+            # sent — reverted to pending with one alert. STORIES are exempt BY
+            # DESIGN: a story publishes empty-body (contentType='story', caption
+            # burned onto the media by story_image; see zernio_publisher). The
+            # 'HYROX'-only captions of 2026-08-13 predate the armed A+ gate;
+            # this is the belt-and-suspenders net at the last boundary.
+            from agent import post_quality as _pq
+            _fmt = (row.get("format") or "feed").strip().lower()
+            if _fmt != "story" and len(_cap.strip()) < _pq.MIN_CAPTION_CHARS:
+                try:
+                    store.mark_publish_failed(row_id, revert_status="pending")
+                except Exception:
+                    pass
+                _oa.alert(
+                    f"publish recheck: row {row_id} caption is empty/thin "
+                    f"({len(_cap.strip())} chars, floor {_pq.MIN_CAPTION_CHARS}), "
+                    f"reverted to pending"
+                )
+                failed.append(row_id)
+                continue
+            # AVATAR RAIL AT THE PUBLISH BOUNDARY (org rule; Defect B): a caption
+            # carrying a banned-audience term (HYROX, competitive CrossFit,
+            # strength/serious athletes) is never sent to a live audience.
+            _breach = _pq.avatar_breach(_cap)
+            if _breach:
+                try:
+                    store.mark_publish_failed(row_id, revert_status="pending")
+                except Exception:
+                    pass
+                _oa.alert(
+                    f"publish recheck: row {row_id} caption carries banned-audience "
+                    f"term ('{_breach}'), reverted to pending (LASSO avatar rail)"
                 )
                 failed.append(row_id)
                 continue

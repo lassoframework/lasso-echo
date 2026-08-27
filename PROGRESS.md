@@ -10,6 +10,61 @@ Last updated: 2026-08-27
 
 ---
 
+## 2x posting cadence + portal toggle (2026-08-27, ECHO_CADENCE_2X_ENABLED)
+
+Blake's big build (spec: CADENCE_SPEC.md — 11 approved decisions + 3 additions).
+Flag defaults OFF: byte-for-byte unchanged until armed by hand. The portal toggle
+SAVES the preference while dark; behavior follows only after the env flip.
+
+### [~] Echo side (built, suite green 3289, UNARMED)
+  - config.cadence_2x_enabled (ECHO_CADENCE_2X_ENABLED) + cadence_slot_times
+    (AGENT_CADENCE_SLOT_TIMES, default 07:30/18:30); flags printout updated
+  - db.set_posts_per_day / posts_per_day (kv portal_cadence_<base>, 1|2 only)
+  - agent/cadence.py resolve_posts_per_day: flag OFF -> 1; kv -> shared plane -> 1
+  - POST /portal/<token>/cadence (intake_web + portal_social.handle_cadence):
+    saves while dark; shared-plane write REQUIRED when Supabase configured (503 on
+    miss, both directions — the worker only reads the shared plane)
+  - portal_calendar_store gym_posts_per_day / set_gym_posts_per_day (echo_gym_settings)
+  - client_month_run: 2 distinct feed+story pairs/day at 2x (avoid_captions hard
+    check; photo no-reuse; slot_index 0/1 stamped; feed budget days*ppd); single
+    distinct concept -> one pair, logged, never a dup
+  - real_month_planner: posts_per_day param; 2nd pair = next _FALLBACK_ORDER pillar;
+    cap re-point preserves cadence_slot; _dedup_cadence_categories guard
+  - calendar_autopublish slot_time_for_row: slot_index rows -> deterministic
+    07:30/18:30 (flag-gated); 1x rows keep the stable hash byte-for-byte
+  - Replan on toggle: client_media_sync cadence_applied_<base> stamp forces rebuild
+    on change (2x->1x shrinks, 1x->2x grows); approved/locked days never touched;
+    LASSO replan happens at its next real-month plan run
+  - Mix-counter BUG FIX: grade_card + monthly_report tally the DRAWN concept
+    (drafts.data category via monthly_report.pillar_for_post), filename inference
+    only as legacy fallback; correct at 1x and 2x
+  - Deny volume surfaced: monthly_retro digest line "Denies this month: N of 15
+    recreate budget used" (SupabaseRetroStore.deny_count, real count or no line)
+  - Migration cadence_20260827.sql APPLIED live (echo_gym_settings.posts_per_day +
+    cadence_updated_by; content_calendar.slot_index)
+  - tests/test_cadence.py: 20 tests (flag-off no-op, dual-draw uniqueness, thin
+    media, locked days, slot times, replan trigger, endpoint contract, avatar rail)
+
+### [x] Defect audit (Blake's Zernio audit 2026-08-27, docs/LASSO_IG_A_PLUS_SPEC.md)
+  - Defect A (26 captionless IG posts) INVESTIGATED: both verified ids are STORY
+    rows (topfuel/piercefitness) — empty body BY DESIGN, contentType='story',
+    caption burned on media (AGENT_STORY_FORMAT=true live). NOT a bug. Added the
+    belt-and-suspenders anyway: publish-boundary caption floor for FEED rows
+    (empty/thin -> revert pending + alert; stories exempt).
+  - Defect B (HYROX): REAL, predates the armed A+ gate (posts 2026-08-13).
+    Fixed: post_quality.avatar_breach hard-block (hyrox / competitive crossfit /
+    strength|serious athletes; 'crossfit' alone deliberately allowed — gym names)
+    at stage (post_issues) AND at the publish boundary. Both ride the already-armed
+    AGENT_CALENDAR_GRADE recheck -> live on deploy.
+
+### Backlog from Blake's 2026-08-27 delivery (docs/INBOX_2026-08-27.md)
+  - [ ] Podcast library Drive ingest Waves 1-4 (docs/PODCAST_LIBRARY_BUILD_SPEC.md);
+        Blake taps: service account + share Drive folder as Viewer
+  - [ ] _b2b_faces rail + LASSO account config (docs/LASSO_IG_A_PLUS_SPEC.md §3-4);
+        Blake decisions: LASSO into Zernio; kill the rogue ~10:10 ET publisher
+
+---
+
 ## Post A-Grade upgrades 2026-08-26/27
 
 Four upgrades, all authorized by Blake, built sequentially. New flags default OFF in code;

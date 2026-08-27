@@ -1749,6 +1749,16 @@ def build_server(port=None):
             )
             return m.group(1) if m else None
 
+        def _portal_cadence_route(self):
+            """Per-account posting-cadence toggle: POST /portal/<token>/cadence.
+            Returns the token, else None. Gated by AGENT_PORTAL_SOCIAL_ENABLED at the
+            handler; a disabled route 404s. Body is JSON {"posts_per_day": 1|2}."""
+            m = re.match(
+                r"^/portal/([A-Za-z0-9_.-]{8,})/cadence$",
+                self.path.split("?")[0],
+            )
+            return m.group(1) if m else None
+
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
@@ -2082,6 +2092,28 @@ def build_server(port=None):
                     account_key, autonomous,
                     actor_id=str(body.get("actor_id", "") or ""),
                     store=PendingStore())
+                return self._send_json(resp, status)
+
+            # Per-account posting-cadence toggle: POST /portal/<token>/cadence.
+            # Gated by AGENT_PORTAL_SOCIAL_ENABLED (handler 404s when off).
+            # Token->account; unknown/revoked token = 404. Body is JSON
+            # {"posts_per_day": 1|2}. Saves the preference; behavior stays
+            # unchanged until ECHO_CADENCE_2X_ENABLED is armed by hand.
+            cad_token = self._portal_cadence_route()
+            if cad_token is not None:
+                account_key = client_for_token(cad_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                status, resp = _ps.handle_cadence(
+                    account_key, body.get("posts_per_day"),
+                    actor_id=str(body.get("actor_id", "") or ""))
                 return self._send_json(resp, status)
 
             # Part B client-social ACTION routes: POST /portal/<token>/posts/<id>/{approve

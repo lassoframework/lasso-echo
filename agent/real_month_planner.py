@@ -166,6 +166,10 @@ class PlanSlot:
     overridden: bool = False
     slot_index: int = 0
     is_sprint: bool = False
+    # 2x cadence ordinal (CADENCE_SPEC.md): 0 = AM pair, 1 = PM pair on a 2x day;
+    # None on every 1x plan (the pre-cadence shape, byte-for-byte). Distinct from
+    # slot_index, which belongs to the SUMMIT SPRINT layout.
+    cadence_slot: int = None
 
 
 # The non-sprint platform cap: platform may own at most this fraction of the NON-sprint
@@ -330,7 +334,7 @@ def _base_summit_weekday():
 
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
                summit_day_fn=None, welcome_dates=None, sprint_day_fn=None,
-               sprint_feed_count_fn=None):
+               sprint_feed_count_fn=None, posts_per_day=1):
     """A deterministic month plan: for each of `days` consecutive dates from start_date,
     the resolved category (weekly rotation + sprint/book/summit/welcome overrides) and its
     feed + paired story slots.
@@ -409,11 +413,48 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
             slots.append(PlanSlot(post_date=d, category=varied_cat, fmt=STORY,
                                   base_category=base, overridden=varied_over))
             continue
+        # 2x CADENCE (CADENCE_SPEC.md D5): posts_per_day==2 emits a SECOND
+        # feed+story pair whose category is the NEXT pillar in _FALLBACK_ORDER after
+        # the day's category — never the same pillar twice in one day. Pairs carry
+        # cadence_slot 0/1 for deterministic publish times. posts_per_day==1 (the
+        # default and the flag-off resolution) emits exactly the pre-cadence plan,
+        # byte-for-byte (cadence_slot stays None). Sprint days above are untouched:
+        # the sprint already owns its multi-post layout.
+        if int(posts_per_day or 1) == 2:
+            slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
+                                  base_category=base, overridden=overridden,
+                                  cadence_slot=0))
+            slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
+                                  base_category=base, overridden=overridden,
+                                  cadence_slot=0))
+            second = _next_fallback_category(category)
+            slots.append(PlanSlot(post_date=d, category=second, fmt=FEED,
+                                  base_category=base, overridden=True,
+                                  cadence_slot=1))
+            slots.append(PlanSlot(post_date=d, category=second, fmt=STORY,
+                                  base_category=base, overridden=True,
+                                  cadence_slot=1))
+            continue
         slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                               base_category=base, overridden=overridden))
         slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                               base_category=base, overridden=overridden))
     return _cap_platform(slots)
+
+
+def _next_fallback_category(category):
+    """The pillar a 2x day's SECOND slot draws: the next entry in _FALLBACK_ORDER
+    after `category` (wrapping), guaranteed != category. A category outside the
+    fallback order (book/welcome/summit overrides) starts from the top of the
+    order. Deterministic and pure."""
+    order = list(_FALLBACK_ORDER)
+    if category in order:
+        idx = (order.index(category) + 1) % len(order)
+    else:
+        idx = 0
+    if order[idx] == category:
+        idx = (idx + 1) % len(order)
+    return order[idx]
 
 
 def _cap_platform(slots):
@@ -446,7 +487,39 @@ def _cap_platform(slots):
             out.append(PlanSlot(post_date=s.post_date, category=newcat, fmt=s.fmt,
                                 base_category=s.base_category or s.category,
                                 overridden=True, slot_index=s.slot_index,
-                                is_sprint=False))
+                                is_sprint=False, cadence_slot=s.cadence_slot))
+        else:
+            out.append(s)
+    return _dedup_cadence_categories(out)
+
+
+def _dedup_cadence_categories(slots):
+    """2x cadence guard: after the platform cap re-points days, a 2x day's two pairs
+    could land on the SAME pillar (the re-point does not know about siblings). Never
+    the same concept twice in one day (CADENCE_SPEC.md D5): when a date's cadence
+    pair categories collide, the PM pair (cadence_slot 1) is re-pointed to the next
+    fallback pillar that differs from its sibling AND is not platform (so the cap
+    stays honored). 1x plans have no cadence slots and pass through unchanged."""
+    by_date = {}
+    for s in slots:
+        if s.cadence_slot is not None and s.fmt == FEED and not s.is_sprint:
+            by_date.setdefault(s.post_date, {})[s.cadence_slot] = s.category
+    fix = {}
+    for d, pair in by_date.items():
+        if len(pair) == 2 and pair.get(0) == pair.get(1):
+            alt = [c for c in _FALLBACK_ORDER
+                   if c != pair[0] and c != "platform"]
+            if alt:
+                fix[d] = alt[date.fromisoformat(d).toordinal() % len(alt)]
+    if not fix:
+        return slots
+    out = []
+    for s in slots:
+        if (s.post_date in fix and s.cadence_slot == 1 and not s.is_sprint):
+            out.append(PlanSlot(post_date=s.post_date, category=fix[s.post_date],
+                                fmt=s.fmt, base_category=s.base_category,
+                                overridden=True, slot_index=s.slot_index,
+                                is_sprint=False, cadence_slot=1))
         else:
             out.append(s)
     return out
@@ -772,6 +845,10 @@ def _stamp(draft, slot, fmt):
     try:
         draft.category = draft.category or slot.category
         draft.day_key = draft.day_key or slot.post_date
+        # 2x cadence: carry the plan's slot ordinal onto the draft so _real_row emits
+        # slot_index (deterministic AM/PM publish times). None on 1x plans (omitted).
+        if getattr(slot, "cadence_slot", None) is not None:
+            draft.cadence_slot_index = slot.cadence_slot
         if fmt == STORY:
             draft.is_story = True
             draft.draft_type = "story"

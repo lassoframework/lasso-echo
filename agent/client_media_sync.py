@@ -765,15 +765,31 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: calendar read failed; left as-is (no rebuild)")
                 continue
-            build_target = min(days, media_count)
+            # POSTING CADENCE (CADENCE_SPEC.md): the gym's effective posts/day
+            # scales the feed budget (days is a DAY bound; the target is feeds).
+            # Flag off -> ppd == 1 and every formula below is byte-for-byte today.
+            # A cadence CHANGE (portal toggle since the last build) forces a rebuild
+            # even when the feed count looks built-out — a 2x->1x flip must shrink
+            # the plan, and a 1x->2x flip must grow it (D7: the rebuild itself
+            # preserves approved/published rows via the locked-day guards).
+            from .cadence import resolve_posts_per_day
+            ppd = resolve_posts_per_day(base, store)
+            try:
+                from . import db as _cdb
+                _cadence_applied = str(_cdb.kv_get(f"cadence_applied_{base}", "") or "1")
+            except Exception:  # noqa: BLE001
+                _cadence_applied = "1"
+            cadence_changed = str(ppd) != _cadence_applied
+            feed_budget = days * ppd
+            build_target = min(feed_budget, media_count)
             # THIN-CREATIVE SURFACE (Ryan's own hypothesis, made definitive): when the
-            # gym has FEWER usable media than a full `days` month, the calendar is
+            # gym has FEWER usable media than the month's feed budget, the calendar is
             # necessarily short and Echo is recycling what little it has. Say so, once,
             # to the coach — so the answer to "is this just not enough creative?" is a
             # clear signal, never a silent short calendar. Deduped per gym+count so a
             # frequent scan never storms the channel; re-fires only if the count moves.
-            if 0 < media_count < days:
-                _alert_thin_creative(base, media_count, days, log)
+            if 0 < media_count < feed_budget:
+                _alert_thin_creative(base, media_count, feed_budget, log)
             # ANTI-CHURN (TopFuel, 2026-08-25): rebuild ONLY when there is a real reason.
             # A gym whose build_target counts un-plannable photo clusters can NEVER reach
             # build_target (existing_feeds stays below it forever), so without this it rebuilt
@@ -787,7 +803,8 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             except Exception:  # noqa: BLE001
                 _built_marker = 0
             _already_built_for_media = existing_feeds > 0 and media_count <= _built_marker
-            if existing_feeds >= build_target or _already_built_for_media:
+            if not cadence_changed and (existing_feeds >= build_target
+                                        or _already_built_for_media):
                 # Already built out to the media the gym supports (capped at `days`):
                 # idempotent. An unchanged library never rebuilds again. Remember the media
                 # count we are built for, so a gym that never reaches build_target (some
@@ -800,7 +817,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # rebuild until the library exceeds 50. For days-capped gyms the
                 # existing_feeds >= build_target check alone is the idempotence guard,
                 # and when the month window slides (feeds drop) the rebuild fires again.
-                if media_count <= days:
+                if media_count <= feed_budget:
                     try:
                         from . import db as _db
                         _db.kv_set(f"built_media_{base}", str(media_count))
@@ -872,9 +889,12 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 generated += 1
                 # Remember the media count this build covered, so the next scan does not
                 # rebuild until NEW media arrives (anti-churn; pairs with never-shrink).
+                # Also stamp the cadence this build APPLIED (CADENCE_SPEC.md D7): the
+                # cadence_changed trigger only fires again on the NEXT portal toggle.
                 try:
                     from . import db as _db
                     _db.kv_set(f"built_media_{base}", str(media_count))
+                    _db.kv_set(f"cadence_applied_{base}", str(ppd))
                 except Exception:  # noqa: BLE001
                     pass
                 results.append({"base": base, "status": "generated",

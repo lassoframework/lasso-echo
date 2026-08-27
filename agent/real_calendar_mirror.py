@@ -114,6 +114,13 @@ def _real_row(account_key, draft):
     src_media = getattr(draft, "source_media_url", "") or ""
     if src_media:
         row["source_media_url"] = src_media
+    # 2x cadence (CADENCE_SPEC.md D6): a draft built on a 2x day carries its slot
+    # ordinal (0 = AM, 1 = PM) so publish-time slot times are deterministic. Stamped
+    # ONLY by a 2x build (cadence_slot_index attribute); every 1x draft omits the key,
+    # keeping the pre-cadence row shape byte-for-byte.
+    slot_i = getattr(draft, "cadence_slot_index", None)
+    if slot_i is not None:
+        row["slot_index"] = int(slot_i)
     return row
 
 

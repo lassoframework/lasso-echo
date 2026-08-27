@@ -350,6 +350,11 @@ def build_digest(gym_id, month, findings, tainted):
     demo = findings.get("demographics")
     if demo:
         lines.append(demo)
+    # Deny volume (recreate-budget usage): present ONLY when a real count was
+    # read from content_calendar — never guessed (2x-cadence watch item, D8).
+    deny = findings.get("deny_volume")
+    if deny:
+        lines.append(deny)
     adopted = findings.get("adopted") or []
     if adopted:
         for a in adopted:
@@ -418,6 +423,31 @@ class SupabaseRetroStore:
                 "follower_spike_pct": None,
                 "paid_boosts": None,
                 "unchecked": ["follower_spike_pct", "paid_boosts"]}
+
+    def deny_count(self, gym_id, month):
+        """COUNT of this gym's DENIED content_calendar rows dated in `month`
+        (YYYY-MM): the real recreate-budget usage number the digest cites.
+        Read-only; returns None on any failure (the digest then omits the line,
+        never guesses)."""
+        try:
+            from calendar import monthrange as _mr
+            last = _mr(int(month[:4]), int(month[5:7]))[1]
+            r = self._client().get(
+                f"{self._url}/rest/v1/content_calendar",
+                params={"gym_id": f"eq.{gym_id}", "status": "eq.denied",
+                        "post_date": [f"gte.{month}-01", f"lte.{month}-{last:02d}"],
+                        "select": "id"},
+                headers=self._headers({"Prefer": "count=exact",
+                                       "Range": "0-0"}),
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                return None
+            cr = r.headers.get("content-range") or r.headers.get("Content-Range") or ""
+            total = cr.rsplit("/", 1)[-1]
+            return int(total) if total.isdigit() else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def insert_retro(self, row):
         r = self._client().post(
@@ -512,10 +542,28 @@ def retro_for_gym(gym_id, month, store, now, notifier):
             print(f"[monthly-retro] demographics read failed for {gym_id}: "
                   f"{type(exc).__name__}")
 
+    # DENY VOLUME (CADENCE_SPEC.md D8 addition, Blake 2026-08-27): surface the
+    # gym's recreate-budget usage so the 2x-cadence watch item has a real number.
+    # Read-only count of denied content_calendar rows in the month; a store
+    # without the reader (test fakes, legacy) or a failed read -> no line, never
+    # a guessed number, never a failed retro.
+    deny_line = None
+    try:
+        if hasattr(store, "deny_count"):
+            _denies = store.deny_count(gym_id, month)
+            if _denies is not None:
+                from agent.portal_social import MONTHLY_RECREATE_BUDGET as _BUDGET
+                deny_line = (f"Denies this month: {int(_denies)} of {_BUDGET} "
+                             "recreate budget used")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[monthly-retro] deny-count read failed for {gym_id}: "
+              f"{type(exc).__name__}")
+
     findings = {
         "keep_doing": keep,
         "stop_doing": stop,
         "demographics": demographics_line,
+        "deny_volume": deny_line,
         "experiment": exp,
         "next_experiment": pb_mod.experiment_lever_for(gym_id, next_month(month)),
         "adopted": adopted,

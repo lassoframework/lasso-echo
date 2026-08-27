@@ -25,6 +25,22 @@ import re
 MIN_CAPTION_CHARS = 40
 MIN_CONTENT_WORDS = 12
 
+# LASSO AVATAR RAIL (org rule; Blake's Defect B ruling 2026-08-27): LASSO does not
+# market to serious athletes, competitive CrossFit, HYROX, or strength-athlete
+# audiences. A caption carrying one of these terms is HARD-BLOCKED at stage (here)
+# and at the publish boundary (calendar_autopublish recheck). Phrase-level match:
+# 'crossfit' alone is deliberately NOT blocked (client gym NAMES carry it); only
+# the explicit banned-audience phrases are.
+AVATAR_BLOCK_RE = re.compile(
+    r"\b(hyrox|competitive\s+crossfit|strength\s+athletes?|serious\s+athletes?)\b",
+    re.IGNORECASE)
+
+
+def avatar_breach(caption):
+    """The banned-audience term this caption carries, or '' when clean."""
+    m = AVATAR_BLOCK_RE.search(caption or "")
+    return m.group(0) if m else ""
+
 # Any real dash: the copy_gate banned set (em/en/figure/horizontal-bar/minus), or a
 # hyphen used AS a dash (surrounded by spaces, or a double hyphen). A hyphen inside a
 # word (co-op) is fine. The unicode dash class lives ONLY in copy_gate (Wave 1 law);
@@ -101,6 +117,9 @@ def caption_issues(caption, banned_words=()):
 def post_issues(draft, banned_words=()):
     """Every reason this DRAFT is not A+ (caption issues + media + grounding). Empty == A+."""
     issues = caption_issues(getattr(draft, "caption", "") or "", banned_words)
+    breach = avatar_breach(getattr(draft, "caption", "") or "")
+    if breach:
+        issues.append(f"banned-audience term ('{breach}') violates the LASSO avatar rail")
     if not (getattr(draft, "creative_public_url", "") or "").strip():
         issues.append("no media (empty creative url)")
     # ECHO VISION §5/§7: a caption that CONTRADICTS the crop-verified image is not A+. The

@@ -2400,3 +2400,38 @@ def calendar_grade_enabled_for(gym_id: str) -> bool:
     if gym_val is not None:
         return _truthy(gym_val)
     return calendar_grade_enabled()
+
+
+def cadence_2x_enabled() -> bool:
+    """
+    Global kill switch for the 2x/day posting cadence (ECHO_CADENCE_2X_ENABLED,
+    default OFF). OFF means the system is byte-for-byte unchanged: every planner
+    builds one feed + one paired story per day, and a gym's stored posts_per_day
+    preference is SAVED but ignored. ON, a gym whose posts_per_day setting is 2
+    (portal toggle or kv) gets two distinct feed+story pairs per day. Blake's
+    exact env var name (deviates from the AGENT_* convention on his spec).
+    Arm by hand: ECHO_CADENCE_2X_ENABLED=true.
+    """
+    return _truthy(os.environ.get("ECHO_CADENCE_2X_ENABLED", "false"))
+
+
+def cadence_slot_times() -> tuple:
+    """
+    The two wall-clock publish slots for a 2x day: (slot 1, slot 2), default
+    ("07:30", "18:30"). Override with AGENT_CADENCE_SLOT_TIMES="HH:MM,HH:MM".
+    An invalid or partial value falls back to the default pair (never raises,
+    never yields fewer than two slots). Stories keep their midday slot; this
+    only governs FEED rows that carry a cadence slot_index.
+    """
+    default = ("07:30", "18:30")
+    raw = (os.environ.get("AGENT_CADENCE_SLOT_TIMES", "") or "").strip()
+    if not raw:
+        return default
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 2:
+        return default
+    import re as _re
+    for p in parts:
+        if not _re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", p):
+            return default
+    return (parts[0], parts[1])

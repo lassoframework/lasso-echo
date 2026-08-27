@@ -47,7 +47,40 @@ def gather(account_key, now=None):
         posts = [dict(r) for r in conn.execute(
             "SELECT * FROM posts WHERE account_key=? AND published_at >= ? "
             "ORDER BY published_at", (account_key, since)).fetchall()]
+        # DRAWN-CONCEPT PILLAR (mix-counter bug fix, CADENCE_SPEC.md D9): enrich each
+        # post with the pillar of the concept that was actually DRAWN for it — the
+        # draft's own category — instead of leaving every consumer to re-infer it from
+        # the creative FILENAME (rotation.pillar_of), which buckets hosted/client media
+        # into 'misc' and reflects naming families, not what was planned. Correct at
+        # 1x and 2x alike (two posts on one day are two drafts -> two tallies). A post
+        # with no surviving draft (legacy rows) gets no key; consumers fall back.
+        for p_row in posts:
+            did = p_row.get("draft_id") or ""
+            if not did:
+                continue
+            try:
+                r = conn.execute("SELECT data FROM drafts WHERE draft_id=?",
+                                 (did,)).fetchone()
+                cat = (json.loads(r["data"] or "{}").get("category") or "").strip() \
+                    if r else ""
+                if cat:
+                    p_row["pillar_drawn"] = cat.lower()
+            except Exception:
+                continue
     return snaps, posts
+
+
+def pillar_for_post(post):
+    """The pillar to TALLY for one published post: the drawn concept's category
+    (pillar_drawn, set by gather() from the draft that produced the post) when
+    known, else the legacy filename inference (rotation.pillar_of). This is the
+    single tally rule for the mix subscore and the refresh section — count what
+    was drawn, never what the weekday slot or the filename family implies."""
+    drawn = (post.get("pillar_drawn") or "").strip().lower()
+    if drawn:
+        return drawn
+    from . import rotation
+    return rotation.pillar_of(post.get("creative_key") or "")
 
 
 def assemble(account_key, snaps, posts, baseline_month=None, base_dir=None):
@@ -132,7 +165,7 @@ def refresh_section(account_key, posts):
         if not eng_parts:
             continue
         eng = sum(eng_parts)
-        pillar = rotation.pillar_of(p.get("creative_key") or "")
+        pillar = pillar_for_post(p)
         for dim, val in (("pillar", pillar),
                          ("archetype", p.get("archetype") or "unknown"),
                          ("set", p.get("set_name") or "unknown")):

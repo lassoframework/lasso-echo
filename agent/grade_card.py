@@ -15,7 +15,7 @@ nothing, publishes nothing.
 import os
 from datetime import datetime, timezone
 
-from . import config, monthly_report, reporting, rotation
+from . import config, monthly_report, reporting
 from .accounts import active_accounts
 from .pdf_report import brand_for, build_pdf
 
@@ -27,7 +27,10 @@ def _grade_inputs(account_key, now=None):
     published = [p for p in posts if p.get("mode") == "published"]
     pillar_counts = {}
     for p in published:
-        pillar = rotation.pillar_of(p.get("creative_key") or "")
+        # Mix-counter bug fix (CADENCE_SPEC.md D9): tally the DRAWN concept's pillar
+        # (monthly_report.pillar_for_post), not the filename family. One tally per
+        # published post, so a 2x day correctly counts both of its posts.
+        pillar = monthly_report.pillar_for_post(p)
         pillar_counts[pillar] = pillar_counts.get(pillar, 0) + 1
     posting_days = 30 - (30 // 7) * len(config.POSTING_SKIP_DAYS)
     report_for_grade = {
