@@ -6,7 +6,7 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-26
+Last updated: 2026-08-27
 
 ---
 
@@ -15,7 +15,7 @@ Last updated: 2026-08-26
 Four upgrades, all authorized by Blake, built sequentially. New flags default OFF in code;
 Blake's session arms them after audit. Suite green before each commit.
 
-### [~] Reply-needed coach alerts — agent/inbox_alerts.py (AGENT_INBOX_ALERTS, default OFF — UNARMED)
+### [x] Reply-needed coach alerts — agent/inbox_alerts.py (AGENT_INBOX_ALERTS=true, ARMED + VERIFIED LIVE 2026-08-27: "[inbox-alerts] 2 card(s) sent" in worker logs)
   - Daily READ-ONLY sweep per gym (client gyms + lasso): unhandled post comments
     (GET /v1/inbox/comments + per-post threads), mentions, reviews (FB + Google Business) from Zernio
   - Classifier: member_comment / spam / neutral; homoglyph-normalized (the live topfuel spam
@@ -26,14 +26,14 @@ Blake's session arms them after audit. Suite green before each commit.
   - NEVER replies/hides/deletes; per-gym AND per-source error isolation; wired in runner daily section
   - DRY run against live topfuel data proven (4 member comments + 1 homoglyph spam caught; no Slack sent)
 
-### [~] Hook-quality metric fields — metrics_sync (rides AGENT_METRICS_SYNC, ALREADY ARMED -> live next nightly run)
+### [x] Hook-quality metric fields — metrics_sync (rides AGENT_METRICS_SYNC; VERIFIED LIVE 2026-08-27: 28 post_metrics rows with engagement_rate populated, is_ad false across the board)
   - post_metrics + reels_skip_rate, watch_total_ms (igReelsVideoViewTotalTime), engagement_rate,
     is_ad (not null default false); migration applied: post_metrics_hook_fields_20260827
   - is_ad rows are observed only, NEVER train the playbook (same treatment as external) —
     excluded in monthly_retro lever_stats + experiment_verdict, still inform the baseline
   - learning_score: reel_skip_rate + reel_watch_ratio (direct avg first, watch_total_ms/views fallback)
 
-### [~] Engaged-audience demographics — agent/jobs/demographics_sync.py (AGENT_AUDIENCE_DEMOGRAPHICS, default OFF — UNARMED)
+### [x] Engaged-audience demographics — agent/jobs/demographics_sync.py (AGENT_AUDIENCE_DEMOGRAPHICS=true, ARMED + VERIFIED LIVE 2026-08-27: 7 rows in gym_audience_demographics — eng/gritx/topfuel engaged+followers, piercefitness followers only, lasso none; see open check below)
   - Weekly per gym (7-day kv gate, zernio_link_ts pattern): IG follower AND engaged-audience
     breakdowns by age/city/country/gender -> gym_audience_demographics (verbatim jsonb, never reshaped)
   - Migration applied: gym_audience_demographics_20260827; run(gyms=None) callable standalone
@@ -48,9 +48,15 @@ Blake's session arms them after audit. Suite green before each commit.
     tests/test_upload_confirmation.py: mid-batch storage failure -> 503, never a fake success)
   - Honest failure copy ("not sent, tap Send to retry"); sent items never re-post on a later Send
 
-Arming status: AGENT_INBOX_ALERTS unarmed, AGENT_AUDIENCE_DEMOGRAPHICS unarmed (both need
-Blake's Railway env flip + audit). Hook fields ride the already-armed AGENT_METRICS_SYNC.
-Upload confirmation is live-on-deploy (no flag; echo-intake-web service redeploy required).
+Arming status (verified 2026-08-27 from live Railway env + Supabase + worker logs):
+ALL FOUR LIVE. AGENT_INBOX_ALERTS=true (2 cards sent), AGENT_AUDIENCE_DEMOGRAPHICS=true
+(7 rows written), hook fields riding AGENT_METRICS_SYNC (28 populated rows), upload
+confirmation deployed (echo-intake-web SUCCESS 2026-08-26 18:30, after the 18:22 commit).
+
+Open check from the first demographics run: piercefitness stored followers but no engaged
+row, and lasso stored nothing. Likely IG API minimums (engaged-audience needs enough
+recent engagers) or a missing IG connection for lasso — worth one look, not a defect
+until confirmed.
 
 ---
 
