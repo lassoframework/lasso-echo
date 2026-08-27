@@ -33,6 +33,34 @@ STATUS_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
 
 
+def match_profile_id(profiles, name):
+    """The `_id` of the profile in `profiles` whose name matches `name`, or None.
+
+    Pure: exact match wins, then a case-insensitive fallback (Zernio names are user-set). Kept a
+    module function so both find_profile_id and find_profile_id_any share one matcher and it stays
+    unit-testable over a plain list.
+    """
+    if not name:
+        return None
+    want = str(name).strip()
+    if not want:
+        return None
+    want_lower = want.lower()
+    fallback = None
+    for p in profiles or []:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("_id") or p.get("id")
+        pname = p.get("name")
+        if not pid or not pname:
+            continue
+        if str(pname) == want:
+            return str(pid)
+        if fallback is None and str(pname).strip().lower() == want_lower:
+            fallback = str(pid)
+    return fallback
+
+
 def _media_type(url):
     """The Zernio MediaItem `type` for a media URL: video/gif by extension, else image."""
     path = (url or "").split("?", 1)[0].lower()
@@ -161,24 +189,26 @@ class ZernioClient:
         Match is exact first, then case-insensitive (Zernio names are user-set, e.g. "lasso").
         Pure over the list response so it stays testable with a fake http client.
         """
-        if not name:
-            return None
+        return match_profile_id((self.list_profiles() or {}).get("profiles") or [], name)
+
+    def find_profile_id_any(self, *names):
+        """The `_id` of the first existing Zernio profile matching ANY of `names`, or None.
+
+        WHY (Zanshin/Pete, 2026-08-27): a gym's Zernio profile is often pre-created by ops under a
+        HUMAN name ("Zanshin Fitness"), but Echo's connect path looked it up by the account_key only
+        ("zanshinfitness630e22"). No match -> Echo CREATED a second, empty profile under the account_key
+        name, and social connections could strand on the wrong profile (the portal shows not-connected
+        while Zernio is healthy under the other one). Trying every known alias (account_key, the gym's
+        display name, its gym name) finds the real, populated profile FIRST, so no duplicate is ever
+        created. One `/v1/profiles` read serves all the candidates. Exact match wins over a
+        case-insensitive one, and earlier candidates win over later ones.
+        """
         profiles = (self.list_profiles() or {}).get("profiles") or []
-        want = str(name).strip()
-        want_lower = want.lower()
-        fallback = None
-        for p in profiles:
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("_id") or p.get("id")
-            pname = p.get("name")
-            if not pid or not pname:
-                continue
-            if str(pname) == want:
-                return str(pid)
-            if fallback is None and str(pname).strip().lower() == want_lower:
-                fallback = str(pid)
-        return fallback
+        for n in names:
+            pid = match_profile_id(profiles, n)
+            if pid:
+                return pid
+        return None
 
     def list_facebook_pages(self, account_id):
         """GET /v1/accounts/{id}/facebook-page -> {pages:[{_id,name}]}."""

@@ -142,6 +142,40 @@ def test_find_profile_id_case_insensitive_and_missing():
     assert c.find_profile_id("nope") is None
 
 
+def test_match_profile_id_pure():
+    profiles = [
+        {"_id": "id_human", "name": "Zanshin Fitness"},
+        {"_id": "id_key", "name": "zanshinfitness630e22"},
+    ]
+    assert z.match_profile_id(profiles, "Zanshin Fitness") == "id_human"
+    assert z.match_profile_id(profiles, "zanshin fitness") == "id_human"   # case-insensitive
+    assert z.match_profile_id(profiles, "zanshinfitness630e22") == "id_key"
+    assert z.match_profile_id(profiles, "nope") is None
+    assert z.match_profile_id(profiles, "") is None
+    assert z.match_profile_id([], "x") is None
+
+
+def test_find_profile_id_any_prefers_earlier_alias_and_falls_back():
+    # Two profiles exist; the account_key does NOT match, but the display name does. Trying aliases in
+    # order (account_key, display_name, ...) must find the human-named profile rather than miss.
+    http = _FakeHttp([
+        {"_id": "id_human", "name": "Zanshin Fitness"},
+        {"_id": "id_other", "name": "Some Other Gym"},
+    ])
+    c = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http)
+    # account_key misses, display_name hits -> returns the real profile
+    assert c.find_profile_id_any("zanshinfitness630e22", "Zanshin Fitness") == "id_human"
+    # earlier exact alias wins when both match
+    http2 = _FakeHttp([
+        {"_id": "id_key", "name": "zanshinfitness630e22"},
+        {"_id": "id_human", "name": "Zanshin Fitness"},
+    ])
+    c2 = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http2)
+    assert c2.find_profile_id_any("zanshinfitness630e22", "Zanshin Fitness") == "id_key"
+    # no alias matches -> None (so the caller creates a fresh profile)
+    assert c.find_profile_id_any("nope", "also_nope", "") is None
+
+
 # =============================================================================
 # HANDLERS
 # =============================================================================
@@ -175,6 +209,10 @@ class _FakeClient:
     def find_profile_id(self, name):
         # Delegate to the real client's pure matcher over our fake list response.
         return z.ZernioClient.find_profile_id(self, name)
+
+    def find_profile_id_any(self, *names):
+        # Delegate to the real multi-alias matcher over our fake list response.
+        return z.ZernioClient.find_profile_id_any(self, *names)
 
     def create_profile(self, name):
         self.calls.append(("create", name))
@@ -348,6 +386,40 @@ def test_connect_create_409_falls_back_to_find(db_env):
     assert ("create", "gymB") in fake.calls
     assert fake.calls.count(("list_profiles",)) >= 2
     assert (_db.gym_get("gymB") or {}).get("zernio_profile_id") == "found_after_409"
+
+
+def test_connect_reuses_profile_named_by_human_name_not_account_key(db_env):
+    # ZANSHIN / PETE 2026-08-27: the gym's Zernio profile was pre-created by ops under a HUMAN name
+    # ("Zanshin Fitness") while the account_key is "zanshinfitness630e22". Echo used to look up ONLY by
+    # account_key, miss, and CREATE a duplicate empty profile — connections then strand on the wrong
+    # one. Now find_profile_id_any tries the display_name too and REUSES the real (populated) profile.
+    _db.gym_upsert("zanshinfitness630e22", display_name="Zanshin Fitness")
+    fake = _FakeClient(
+        connect={"authUrl": "https://www.facebook.com/v24.0/dialog/oauth?x=1"},
+        existing_profiles=[{"_id": "zanshin_real_pid_24char", "name": "Zanshin Fitness"}],
+    )
+    status, body = zr.handle_social_connect("zanshinfitness630e22", "facebook", client=fake)
+    assert status == 200
+    # matched by display_name, reused the real _id, and NEVER created a duplicate under the account_key
+    assert not any(c[0] == "create" for c in fake.calls)
+    assert any(c[:3] == ("connect", "zanshin_real_pid_24char", "facebook") for c in fake.calls)
+    assert (_db.gym_get("zanshinfitness630e22") or {}).get("zernio_profile_id") == "zanshin_real_pid_24char"
+
+
+def test_connect_still_creates_when_no_alias_matches(db_env):
+    # No profile matches ANY alias (account_key, display_name, gym_name) -> create one, named by the
+    # first non-empty of gym_name/display_name/account_key. Guards against find_profile_id_any never
+    # creating (which would strand a genuinely new gym).
+    _db.gym_upsert("brandnewgym", display_name="Brand New Gym")
+    fake = _FakeClient(
+        connect={"authUrl": "https://www.instagram.com/oauth/authorize?x=1"},
+        existing_profiles=[{"_id": "someone_else_pid", "name": "A Different Gym"}],
+    )
+    status, body = zr.handle_social_connect("brandnewgym", "instagram", client=fake)
+    assert status == 200
+    # created under the display name (first non-empty name), reused nothing foreign
+    assert ("create", "Brand New Gym") in fake.calls
+    assert (_db.gym_get("brandnewgym") or {}).get("zernio_profile_id") == "new_profile"
 
 
 def test_status_not_provisioned_is_all_not_connected_no_client_call(db_env):
