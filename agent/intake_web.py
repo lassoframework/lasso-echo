@@ -41,6 +41,7 @@ import time
 from datetime import datetime, timezone
 
 from . import config, ghl_intake, intake_tokens, whatsapp_intake
+from . import gym_media_routes as _gm
 from . import portal_routes as _pr
 from . import portal_social as _ps
 from . import zernio_routes as _zr
@@ -1785,6 +1786,41 @@ def build_server(port=None):
                 return m.group(1), m.group(2), m.group(3)
             return None, None, None
 
+        def _media_route(self):
+            """Connect Google Drive (gym_media_drive §8). Token-scoped so a gym only
+            ever sees its own media; intake_web resolves the token -> account_key and
+            gym_media_routes re-asserts the gym on every read.
+
+            Returns (token, kind, arg) for /portal/<token>/media/... , else
+            (None, None, None). kind is one of:
+              check-connection | sources | sources-disconnect | assets |
+              asset-hide | asset-unhide | thumb
+            arg carries the source_id / asset_id where the route needs one."""
+            path = self.path.split("?")[0]
+            pat = r"^/portal/([A-Za-z0-9_.-]{8,})/media/"
+            m = re.match(pat + r"check-connection$", path)
+            if m:
+                return m.group(1), "check-connection", None
+            m = re.match(pat + r"sources$", path)
+            if m:
+                return m.group(1), "sources", None
+            m = re.match(pat + r"sources/([A-Za-z0-9_-]+)/disconnect$", path)
+            if m:
+                return m.group(1), "sources-disconnect", m.group(2)
+            m = re.match(pat + r"assets$", path)
+            if m:
+                return m.group(1), "assets", None
+            m = re.match(pat + r"assets/([A-Za-z0-9_-]+)/hide$", path)
+            if m:
+                return m.group(1), "asset-hide", m.group(2)
+            m = re.match(pat + r"assets/([A-Za-z0-9_-]+)/unhide$", path)
+            if m:
+                return m.group(1), "asset-unhide", m.group(2)
+            m = re.match(pat + r"thumb/([A-Za-z0-9_-]+)$", path)
+            if m:
+                return m.group(1), "thumb", m.group(2)
+            return None, None, None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -1810,6 +1846,35 @@ def build_server(port=None):
                     return self._send_json({"error": "unauthorized"}, 401)
                 status, body = handle_portal_gym_status(portal_key)
                 return self._send_json(body, status)
+
+            # Connect Google Drive READ routes (gym_media_drive §8): GET
+            # /portal/<token>/media/{sources,assets} and the thumbnail proxy
+            # /portal/<token>/media/thumb/<asset_id>. Token->account_key; revoked =
+            # 404. gym_media_routes re-asserts the gym on every read, so a gym can
+            # never see another gym's media. The lane is gated per-gym (403 when the
+            # Connect flag/allowlist is off for this gym).
+            mt_token, mt_kind, mt_arg = self._media_route()
+            if mt_token is not None and mt_kind in ("sources", "assets", "thumb"):
+                account_key = client_for_token(mt_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                if mt_kind == "sources":
+                    status, body = _gm.handle_list_sources(account_key)
+                    return self._send_json(body, status)
+                if mt_kind == "assets":
+                    status, body = _gm.handle_list_assets(account_key)
+                    return self._send_json(body, status)
+                # thumb: a gym-scoped image proxy (status, content_type, bytes).
+                status, ctype, data = _gm.handle_thumbnail(account_key, mt_arg)
+                if status != 200:
+                    return self._deny(status, "not found" if status == 404 else "error")
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                return self.wfile.write(data)
 
             # Portal token routes: /portal/<token>/calendar and /portal/<token>/library.
             # Token resolves to account_key; unknown/revoked token = 404 (indistinguishable).
@@ -1997,6 +2062,42 @@ def build_server(port=None):
                 except Exception:
                     return self._send_json({"error": "invalid JSON"}, 400)
                 status, resp = handle_portal_onboard(body)
+                return self._send_json(resp, status)
+
+            # Connect Google Drive WRITE routes (gym_media_drive §8):
+            #   POST /portal/<token>/media/check-connection {folder_url}
+            #   POST /portal/<token>/media/sources          {folder_url, actor_id?}
+            #   POST /portal/<token>/media/sources/<id>/disconnect
+            #   POST /portal/<token>/media/assets/<id>/{hide,unhide}
+            # Token->account_key; revoked = 404. Body is JSON. The lane is gated
+            # per-gym inside gym_media_routes (403 when off for this gym).
+            mt_token, mt_kind, mt_arg = self._media_route()
+            if mt_token is not None and mt_kind in (
+                    "check-connection", "sources", "sources-disconnect",
+                    "asset-hide", "asset-unhide"):
+                account_key = client_for_token(mt_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                if mt_kind == "check-connection":
+                    status, resp = _gm.handle_check_connection(
+                        account_key, body.get("folder_url", ""))
+                elif mt_kind == "sources":
+                    status, resp = _gm.handle_bind_source(
+                        account_key, body.get("folder_url", ""),
+                        actor_id=body.get("actor_id", ""))
+                elif mt_kind == "sources-disconnect":
+                    status, resp = _gm.handle_disconnect_source(account_key, mt_arg)
+                else:  # asset-hide / asset-unhide
+                    status, resp = _gm.handle_hide_asset(
+                        account_key, mt_arg, hide=(mt_kind == "asset-hide"))
                 return self._send_json(resp, status)
 
             # Portal draft actions: /portal/<token>/{approve|edit|deny|kill}

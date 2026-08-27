@@ -172,6 +172,14 @@ def handle_action(action, draft, actor_slack_id, note="",
             podcast_selector.on_draft_denied(draft)
         except Exception:
             pass
+        # Gym media Drive (gym_media_drive §6): a denied gym-media draft returns its
+        # asset to the pool — used_count/last_used_at rolled back. draft_type-gated
+        # inside the hook; never blocks the deny.
+        try:
+            from . import gym_media_selector
+            gym_media_selector.on_draft_denied(draft)
+        except Exception:
+            pass
         return ActionResult(ok=True, action="deny", draft_id=draft.draft_id,
                             detail="Draft denied. Recreate queued.")
 

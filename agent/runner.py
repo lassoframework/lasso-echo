@@ -794,6 +794,24 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"podcast library index failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # GYM MEDIA DRIVE SYNC (gym_media_drive): nightly walk of each connected gym's
+    # shared Drive folder into media_asset — MIME filter, content_hash dedupe,
+    # eligibility gate, budgeted ffprobe, removed/revoked handling, deny sweep, a
+    # per-gym digest. Gated per gym by GYM_DRIVE_CONNECT (or the pilot allowlist,
+    # Pierce first). POSTS NOTHING to social; STAGE governs the planner pull. Inert
+    # without a GOOGLE_DRIVE_SA_JSON key + Supabase creds. Isolated: a sync failure
+    # never blocks the draft run.
+    if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
+        try:
+            from .jobs.sync_gym_media import run as _gym_media_sync_run
+            _gmsum = _gym_media_sync_run()
+            if not _gmsum.get("ok"):
+                print(f"[gym-media] skipped: {_gmsum.get('reason', '')}")
+        except Exception as e:
+            print(f"[gym-media] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # INBOX ALERTS (flag AGENT_INBOX_ALERTS, default OFF -> no-op): daily
     # READ-ONLY sweep of unhandled comments/mentions/reviews per gym, one
     # coach-channel card per gym per day max (kv-stamped). Never replies,

@@ -463,6 +463,75 @@ def podcast_library_folder_id() -> str:
                           "1hfkXefD7kwOWkNIHSc0jOHLkUFbrh-C6")
 
 
+# ---- Gym media Drive (gym_media_drive) ---------------------------------------
+# Connect Google Drive: pull a gym's weekly team photos/videos from a shared
+# Drive folder into the media_source/media_asset tables and (behind STAGE) the
+# planner pool. REUSES the podcast Drive infra (drive_client, the SA key,
+# index-probe-select). Two flags, both defaulting SAFE.
+def gym_drive_connect_enabled() -> bool:
+    """
+    GYM_DRIVE_CONNECT: the portal Connect Google Drive UI + the nightly sync job
+    (walk each active source, index into media_asset, convert HEIC/HEVC, digest).
+    Default reads GYM_DRIVE_CONNECT; the pilot ships this ON for Pierce only via a
+    per-gym allowlist (gym_drive_connect_gyms). NOTHING here stages or publishes;
+    the STAGE flag governs the planner pull. Inert without a GOOGLE_DRIVE_SA_JSON
+    key and Supabase creds (the job no-ops with one log line).
+    """
+    return _truthy(os.environ.get("GYM_DRIVE_CONNECT", "false"))
+
+
+def gym_drive_connect_gyms() -> set:
+    """Pilot allowlist of base gym keys the Connect Google Drive lane is armed for
+    (GYM_DRIVE_CONNECT_GYMS, comma list, e.g. 'pierce'). When GYM_DRIVE_CONNECT is
+    OFF but this set is non-empty, the lane runs for ONLY these gyms (Pierce first).
+    When GYM_DRIVE_CONNECT is ON, every gym is eligible and this set is ignored.
+    Empty + flag OFF => the whole lane is inert."""
+    raw = os.environ.get("GYM_DRIVE_CONNECT_GYMS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def gym_drive_connect_active_for(gym_id) -> bool:
+    """True when the Connect Google Drive lane is armed for THIS gym: either the
+    global GYM_DRIVE_CONNECT flag is ON, or the gym's base key is in the pilot
+    allowlist. The single gate the sync job + routes consult per gym."""
+    if gym_drive_connect_enabled():
+        return True
+    base = str(gym_id or "").strip().lower()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+    return bool(base) and base in gym_drive_connect_gyms()
+
+
+def gym_drive_stage_enabled() -> bool:
+    """
+    GYM_DRIVE_STAGE: the planner pulls Drive-sourced media into faces/community/
+    results slots (pick_media -> download -> ffprobe -> ECHO_VISION -> grounded
+    caption -> PENDING row). Default OFF; flip only after a week of clean sync
+    digests. Everything staged still lands PENDING; the human tap is untouched.
+    Layered UNDER GYM_DRIVE_CONNECT: a source must be connected + indexed first.
+    """
+    return _truthy(os.environ.get("GYM_DRIVE_STAGE", "false"))
+
+
+def gym_drive_sync_max_depth() -> int:
+    """Recursion depth cap for one gym-drive folder walk (spec §4: depth<=4).
+    Env GYM_DRIVE_SYNC_MAX_DEPTH, default 4."""
+    try:
+        return max(1, int(os.environ.get("GYM_DRIVE_SYNC_MAX_DEPTH", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def gym_drive_probe_max_per_run() -> int:
+    """Budget of unprobed videos ffprobed per sync run per source (spec §4).
+    Env GYM_DRIVE_PROBE_MAX_PER_RUN, default 20 (converges across nights)."""
+    try:
+        return max(0, int(os.environ.get("GYM_DRIVE_PROBE_MAX_PER_RUN", "20")))
+    except (TypeError, ValueError):
+        return 20
+
+
 def content_brain_enabled() -> bool:
     """
     Daily content brain switch. OFF by default. When OFF (or for a non-LASSO
