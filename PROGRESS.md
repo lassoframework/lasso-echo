@@ -47,6 +47,60 @@ Three items, one branch (Blake's WIRING.md spec + the live LASSO IG duplicates).
 
 ---
 
+## 2026-08-27 afternoon waves (post-cadence): audit fixes + notification storm + publish hardening
+
+### [x] Cadence audit fix wave (506210e) — A+ loop closed
+  - E6/A4 MAJOR: allow_reshape (cadence flip skips never-shrink date guard once);
+    cadence_applied stamped ONLY on real apply; regression tests
+  - A6/E8 MAJOR: mix-tally tests added (drawn concepts, 1x AND 2x, legacy fallback)
+  - E4 MAJOR -> DESCOPE #1: replan is async by architecture (spec amended)
+  - Portal: PR #468 merged (9f277411) — 23 cadence tests in CI, actor passthrough;
+    9 stale-red suites verified green (fixed on main by PR #461)
+### [x] Notification storm killed (Blake's 300 alerts, all classes)
+  - Test-leak class: conftest quarantines — credentials (a502cd3), /data paths
+    (5c264cc), POST_LOG_PATH + LIBRARY_PATH + SLACK_CHANNEL_ID import-time bakes
+    (9de7082, bf5adcf). Root cause of the gritx Oct storm + gritx posts_per_day=2
+    live write (reverted) was OUR OWN container suite runs against live env.
+    /data cleaned: 10 test post_log rows, 40 fake gritx library photos.
+  - needs-media: durable-or-silent dedup + preview opt-out (kv_is_durable)
+  - infographic fill NameError (never ran since armed) + district_h
+    UnboundLocalError + topfuel_fb publish-failure alert dedup — all fixed
+  - welcome queue: status filter (onboarding/inactive/archived leads excluded),
+    one-summary-line policy, prune CLI, 90-day freshness window (Blake's rule:
+    only new clients at 90 days or newer get welcomes; stale queued entries expire)
+### [x] Grade F self-fix (2b22bfe, AGENT_GRADE_SELF_FIX=true ARMED 2026-08-27)
+  - GYM rubric drops _visual_match (clients upload their own media — Blake's
+    ruling); renormalized x100/85; A achievable on caption+mix+consistency+
+    audience+ask alone
+  - Forward book below A: dup captions regenerated fresh on same photo (pending
+    rows only), over-cap days re-pillared, gaps refilled via existing lanes,
+    then REGRADED; trailing_30 never alerts; held alerts deduped (state-change +
+    1/gym/day); one sweep summary line
+  - DESCOPE #2: dup captions now counted across DISTINCT post_dates (same-date
+    IG/FB/story mirrors share captions BY DESIGN; old counting made A impossible)
+### [x] Publish guard + exactly-once (bf45564, per Blake's WIRING.md)
+  - publish_guard.check at the boundary: visible_len (alnum only), copy gate,
+    proof/results MUST @mention (allowlist), one-ask rail, avatar rail; stories
+    exempt from caption rails BY DESIGN (26 'captionless' posts were stories —
+    verified via late_post_id); caption_trace CAPTION LOST detection;
+    lasso_tag_seed nightly behind AGENT_MENTIONS
+  - Duplicate-post root causes (Pipeboard-verified): meta-direct approve path
+    double-fire (no claim) -> socialapi_claims wrapper + 24h caption-hash dedup
+    in meta_publisher; daily-draw refire on mid-deploy restart -> day stamped
+    BEFORE the draw + interrupted-draw alert (never blind-refires)
+  - Welcome burst: once-ever per gym gate + durable fleet-wide daily cap
+    (an out-of-band volume-less process had re-welcomed 5 gyms in 15 min)
+### [x] Container done-criterion: suite green IN the Railway container
+  (3424 passed 0 failed) via four quarantine layers in tests/conftest.py
+### Blake taps still open
+  - [ ] Kill the EP124 podcast-promo loop (Meta Business Suite Planner first,
+    then Zapier/Make/Buffer/Later) — BLOCKS the podcast library build
+  - [ ] Pick topfuel's Facebook page (row 8151a344 retries until then)
+  - [ ] Rule on descopes #1-#2 above + arm ECHO_CADENCE_2X_ENABLED +
+    PORTAL_CADENCE_TOGGLE_ENABLED when ready to launch 2x
+
+---
+
 ## 2x posting cadence + portal toggle (2026-08-27, ECHO_CADENCE_2X_ENABLED)
 
 Blake's big build (spec: CADENCE_SPEC.md — 11 approved decisions + 3 additions).
