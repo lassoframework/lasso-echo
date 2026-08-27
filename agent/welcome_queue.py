@@ -381,6 +381,117 @@ def create_from_manifest():
     return created
 
 
+# ---- durable pacing + once-ever dedup (the 2026-08-27 welcome burst) --------------------
+# Five welcomes fired in 15 minutes (Sycamore, Pierce x2, Westwood, Project Evolve):
+# mid-draw deploys refired the daily draw, next_for_day re-served the SAME gym to the
+# refired run (Pierce twice) and publish_extra_welcomes popped NEW gyms on every
+# refire (the burst). The queue's serving state alone is not a publish rail, so the
+# rail now lives in the durable kv and is checked BEFORE the publish call:
+#   * once-ever: a (gym, account, kind) welcome publishes at most once, EVER;
+#   * fleet-wide pacing: at most AGENT_WELCOME_PER_DAY distinct gyms are welcomed
+#     per calendar day (the intended cadence: the drip's one/day plus the extras
+#     lane), durable across restarts.
+
+def welcome_gym_key_for(draft):
+    """The queue gym_key a welcome draft was built from: the explicit attribute
+    the builders stamp, else parsed from the creative_path
+    (welcome_<gym_key>[_story].png). '' when unidentifiable."""
+    key = getattr(draft, "welcome_gym_key", "") or ""
+    if key:
+        return key
+    path = getattr(draft, "creative_path", "") or ""
+    name = os.path.basename(path)
+    if not name.startswith("welcome_") or not name.endswith(".png"):
+        return ""
+    name = name[len("welcome_"):-len(".png")]
+    if name.endswith("_story"):
+        name = name[: -len("_story")]
+    return name
+
+
+def _once_key(gym_key, account_key, kind):
+    # NOTE: distinct from welcome_posts.LEDGER_PREFIX ('welcome_posted_'), which
+    # stamps ENQUEUE (the gym entered the queue); this stamps a real PUBLISH.
+    return f"welcome_pub_once_{gym_key}_{account_key}_{kind}"
+
+
+def _day_gyms_key(day_key):
+    return f"welcome_pub_gyms_{day_key}"
+
+
+def welcome_gyms_today(day_key):
+    """The distinct gym_keys already WELCOMED (published) on day_key (durable kv)."""
+    try:
+        return json.loads(db.kv_get(_day_gyms_key(day_key)) or "[]")
+    except Exception:
+        return []
+
+
+def welcome_publish_gate(draft, day_key=None):
+    """(allowed, reason) for publishing this welcome draft NOW. Checked BEFORE
+    the publish call (never after). Fail closed: an unidentifiable gym is never
+    published (a welcome we cannot dedup is a welcome we cannot trust)."""
+    gym_key = welcome_gym_key_for(draft)
+    if not gym_key:
+        return False, "unidentifiable gym_key (cannot dedup; failing closed)"
+    # OUT-OF-BAND PROCESS RAIL (the /data-less Echo process class, see
+    # db.kv_is_durable): a process whose kv is a throwaway sqlite cannot see or
+    # write the durable once-ever stamps, so it can never prove a welcome has
+    # not already gone out. Such a process NEVER publishes a welcome.
+    if not db.kv_is_durable():
+        return False, ("kv is not durable (no /data volume, no AGENT_DB_PATH): "
+                       "an out-of-band process cannot dedup; failing closed")
+    kind = "story" if getattr(draft, "is_story", False) else "feed"
+    account_key = getattr(draft, "account_key", "") or ""
+    if db.kv_get(_once_key(gym_key, account_key, kind)):
+        return False, (f"once-ever: {gym_key} already had its {kind} welcome on "
+                       f"{account_key}; a welcome never repeats")
+    day = day_key or getattr(draft, "day_key", "") or ""
+    gyms = welcome_gyms_today(day)
+    if gym_key not in gyms and len(gyms) >= config.welcome_per_day():
+        return False, (f"daily welcome cap reached ({len(gyms)}/"
+                       f"{config.welcome_per_day()} gyms on {day})")
+    return True, ""
+
+
+def record_welcome_published(draft, day_key=None):
+    """Stamp a REAL welcome publish: the once-ever (gym, account, kind) key and
+    the day's distinct-gym list. Durable kv; best effort, never raises."""
+    try:
+        gym_key = welcome_gym_key_for(draft)
+        if not gym_key:
+            return
+        kind = "story" if getattr(draft, "is_story", False) else "feed"
+        account_key = getattr(draft, "account_key", "") or ""
+        from datetime import datetime, timezone
+        db.kv_set(_once_key(gym_key, account_key, kind),
+                  datetime.now(timezone.utc).isoformat())
+        day = day_key or getattr(draft, "day_key", "") or ""
+        gyms = welcome_gyms_today(day)
+        if gym_key not in gyms:
+            gyms.append(gym_key)
+            db.kv_set(_day_gyms_key(day), json.dumps(gyms))
+    except Exception:
+        pass
+
+
+def requeue(gym_key):
+    """Put a served-but-not-published welcome back in the drip (status 'queued',
+    served_day cleared) so a later day serves it — used when the daily cap
+    blocked a publish AFTER the queue had already marked the gym served. A gym
+    with a once-ever publish stamp is never requeued this way (the gate blocks
+    it as a duplicate, not a cap miss). Best effort; never raises."""
+    if not gym_key:
+        return
+    try:
+        with db._lock, _conn() as conn:
+            conn.execute("UPDATE welcome_queue SET status='queued', served_day='' "
+                         "WHERE gym_key=? AND status='served'", (gym_key,))
+            conn.commit()
+    except Exception:
+        pass
+
+
 # ---- runner hooks ----------------------------------------------------------------------
 
 def build_welcome_queue_draft(account, day_key):
@@ -395,7 +506,7 @@ def build_welcome_queue_draft(account, day_key):
     if item is None:
         return None
     platform = getattr(account, "platform", account.key)
-    return Draft(
+    draft = Draft(
         draft_id=_draft_id(account.key, item["gym_key"], "feed"),
         account_key=account.key,
         platform=platform,
@@ -409,6 +520,8 @@ def build_welcome_queue_draft(account, day_key):
         draft_type="feed",
         topic_type="WELCOME",   # lets the runner auto-publish welcomes specifically
     )
+    draft.welcome_gym_key = item["gym_key"]   # the publish gate's dedup identity
+    return draft
 
 
 def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=None):
@@ -455,7 +568,7 @@ def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=Non
             )
             return None
     platform = getattr(account, "platform", account.key)
-    return Draft(
+    draft = Draft(
         draft_id=_draft_id(account.key, item["gym_key"], "story"),
         account_key=account.key,
         platform=platform,
@@ -470,6 +583,8 @@ def build_welcome_story_draft(account, day_key, feed_draft=None, verify_dims=Non
         is_story=True,
         topic_type="WELCOME",
     )
+    draft.welcome_gym_key = item["gym_key"]   # the publish gate's dedup identity
+    return draft
 
 
 # ---- extra welcomes per day (catch-up lane) --------------------------------------------
@@ -496,7 +611,7 @@ def serve_one_more(day_key):
 
 
 def _feed_draft_for(account, item, day_key):
-    return Draft(
+    draft = Draft(
         draft_id=_draft_id(account.key, item["gym_key"], "feed"),
         account_key=account.key,
         platform=getattr(account, "platform", account.key),
@@ -506,12 +621,14 @@ def _feed_draft_for(account, item, day_key):
         scheduled_for=schedule.scheduled_for(day_key),
         status=DraftStatus.PENDING, day_key=day_key, draft_type="feed",
         topic_type="WELCOME")
+    draft.welcome_gym_key = item["gym_key"]
+    return draft
 
 
 def _story_draft_for(account, item, day_key):
     if not item.get("story_url"):
         return None
-    return Draft(
+    draft = Draft(
         draft_id=_draft_id(account.key, item["gym_key"], "story"),
         account_key=account.key,
         platform=getattr(account, "platform", account.key),
@@ -521,6 +638,8 @@ def _story_draft_for(account, item, day_key):
         scheduled_for=schedule.scheduled_for(day_key),
         status=DraftStatus.PENDING, day_key=day_key, draft_type="story",
         is_story=True, topic_type="WELCOME")
+    draft.welcome_gym_key = item["gym_key"]
+    return draft
 
 
 def publish_extra_welcomes(day_key, poster=None, store=None, per_day=None,
@@ -549,6 +668,14 @@ def publish_extra_welcomes(day_key, poster=None, store=None, per_day=None,
 
     posted = []
     for _ in range(extra):
+        # DURABLE PACING (the 2026-08-27 burst): a refired draw calling this lane
+        # again must NOT pop more gyms once the fleet-wide daily cap is met. The
+        # kv publish record (welcome_gyms_today) survives restarts; the in-memory
+        # loop bound alone did not.
+        if len(welcome_gyms_today(day_key)) >= int(per_day):
+            print(f"[welcome-extra] daily welcome cap ({per_day}) already met "
+                  f"for {day_key}; not serving more")
+            break
         item = serve_one_more(day_key)
         if item is None:
             break

@@ -10,6 +10,43 @@ Last updated: 2026-08-27
 
 ---
 
+## Publish-path hardening (2026-08-27, feat/publish-guard-idempotency)
+
+Three items, one branch (Blake's WIRING.md spec + the live LASSO IG duplicates).
+
+### [~] Item 1 — publish guard wired (branch built, suite green, not pushed)
+  - agent/publish_guard.py: ONE rail implementation (empty/thin caption,
+    copy_gate, proof/results mention, multi-ask, avatar rail, media_ready);
+    visible_len = alphanumerics only; STORY caption rails exempt BY DESIGN
+    (the audit's 26 empty IG captions were story rows, verified 2026-08-27
+    via late_post_id)
+  - agent/mentions.py allowlisted_handles (gym_tag_allowlist, member needs consent)
+  - agent/caption_trace.py trace_publish (pure logging, CAPTION LOST detection)
+  - agent/lasso_tag_seed.py (+ nightly hook in run_daily behind AGENT_MENTIONS)
+  - calendar_autopublish recheck CONSOLIDATED onto publish_guard.check (same
+    AGENT_CALENDAR_GRADE gating); revert-to-pending now writes reject_reason;
+    deduped alert kv publish_blocked:<gym>:<code>
+  - zernio_publisher: ValueError on a FEED body with visible_len 0 (stories exempt)
+
+### [~] Item 2 — exactly-once on the meta-direct lane (LASSO IG triple-publish)
+  - listener: the day is CLAIMED before the draw fires (+ deploy-overlap re-read,
+    + alert_interrupted_draw fail-closed instead of blind refire)
+  - runner._claimed_meta_publish: socialapi_claims BEFORE the external call;
+    in-flight claims VERIFY against the post log (caption-hash 24h) or HOLD
+    with one alert; non-durable-kv processes never auto-publish
+  - meta_publisher: 24h (account, caption-hash, media) dedup; release_dedup is
+    the explicit human override
+
+### [~] Item 3 — welcome pacing + once-ever (the 5-in-15-minutes burst)
+  - welcome_queue.welcome_publish_gate: durable kv once-ever per (gym, account,
+    kind) + fleet-wide AGENT_WELCOME_PER_DAY distinct-gym daily cap, checked
+    BEFORE publish; cap-blocked gyms requeue; out-of-band (non-durable kv)
+    processes fail closed
+  - conftest: POST_LOG_PATH quarantined per test (test rows had leaked into the
+    real /data/post_log.jsonl on in-container suite runs)
+
+---
+
 ## 2x posting cadence + portal toggle (2026-08-27, ECHO_CADENCE_2X_ENABLED)
 
 Blake's big build (spec: CADENCE_SPEC.md — 11 approved decisions + 3 additions).

@@ -1065,7 +1065,8 @@ def test_recheck_thin_feed_caption_reverts(graded, monkeypatch):
     assert "thin" in summary["failed"] and summary["published"] == []
     assert store.rows["thin"]["status"] == "pending"      # held, not lost
     assert pub.calls == []                                 # never reached the network
-    assert any("empty/thin" in m for m in sent)
+    # consolidated path: publish_guard names the violation code in the alert
+    assert any("thin_caption" in m for m in sent)
 
 
 def test_recheck_story_empty_caption_is_exempt(graded, monkeypatch):
@@ -1085,7 +1086,8 @@ def test_recheck_avatar_term_reverts(graded, monkeypatch):
     summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert "av" in summary["failed"] and pub.calls == []
     assert store.rows["av"]["status"] == "pending"
-    assert any("banned-audience" in m for m in sent)
+    # consolidated path: publish_guard names the violation code in the alert
+    assert any("avatar_block" in m for m in sent)
 
 
 def test_recheck_floor_and_rail_off_when_grade_flag_off(armed, monkeypatch):

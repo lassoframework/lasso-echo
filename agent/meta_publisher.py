@@ -65,11 +65,77 @@ def _requests():
     return requests
 
 
+# ---- content-hash dedup at the Meta boundary (LASSO IG triple-publish 2026-08-27) --
+# The same (account, caption-hash, media) is NEVER sent to Meta twice within 24h
+# without an explicit human release. Root cause it guards: the daily draw refired
+# after mid-draw deploys and re-sent identical posts ('Honest numbers or no
+# numbers' x3, the Pierce welcome x2). This is an exactly-once correctness rail
+# (like the calendar lane's atomic claim), not a new capability, so it is not
+# flag-gated. The stamp lives in the durable kv (/data), written only AFTER a
+# REAL publish; would_publish never stamps.
+
+DEDUP_WINDOW_HOURS = 24
+
+
+def _dedup_key(account_key, draft):
+    import hashlib
+    from .caption_ledger import caption_hash
+    cap_h = caption_hash(getattr(draft, "caption", "") or "")
+    media = (getattr(draft, "creative_public_url", "") or "")
+    media_h = hashlib.sha1(media.encode("utf-8", "replace")).hexdigest()[:10]
+    return f"metapub_{account_key}_{cap_h}_{media_h}"
+
+
+def _recent_duplicate(account_key, draft):
+    """The prior media_id when this exact (account, caption, media) already
+    published within DEDUP_WINDOW_HOURS, else None. Best effort: an unreadable
+    stamp reads as no-duplicate (never blocks a legit publish on a kv hiccup)."""
+    import json as _json
+    from datetime import datetime, timezone
+    try:
+        from . import db
+        raw = db.kv_get(_dedup_key(account_key, draft), "")
+        if not raw:
+            return None
+        rec = _json.loads(raw)
+        ts = datetime.fromisoformat(rec.get("ts", ""))
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        if age < DEDUP_WINDOW_HOURS * 3600:
+            return rec.get("media_id", "") or "dedup"
+    except Exception:
+        return None
+    return None
+
+
+def _stamp_published(account_key, draft, media_id):
+    """Record a REAL publish for the 24h dedup window. Best effort."""
+    import json as _json
+    from datetime import datetime, timezone
+    try:
+        from . import db
+        db.kv_set(_dedup_key(account_key, draft), _json.dumps(
+            {"ts": datetime.now(timezone.utc).isoformat(),
+             "media_id": media_id or ""}))
+    except Exception:
+        pass
+
+
+def release_dedup(account_key, draft):
+    """EXPLICIT HUMAN RELEASE: clear the 24h dedup stamp so this exact content
+    may be deliberately re-published (e.g. a human deleted the live post and
+    wants it re-sent). Never called by any automated lane."""
+    from . import db
+    db.kv_set(_dedup_key(account_key, draft), "")
+
+
 def publish(draft, account, http=None):
     """
     Publish a draft to the right Meta surface. Returns a PublishResult.
 
     Draft-only short-circuit: if publishing is not armed, we do NOT touch Meta.
+    Content-hash dedup: an identical (account, caption, media) already published
+    within 24h is NOT re-sent — the prior media_id is returned with a 'dedup'
+    detail (same posture as the zernio 409 handling).
     """
     if not config.publish_enabled():
         return PublishResult(ok=True, mode="would_publish",
@@ -81,6 +147,22 @@ def publish(draft, account, http=None):
         return PublishResult(ok=True, mode="would_publish",
                              detail="stories flag OFF (draft only)")
 
+    prior = _recent_duplicate(account.key, draft)
+    if prior is not None:
+        return PublishResult(
+            ok=True, mode="published", media_id="" if prior == "dedup" else prior,
+            detail="meta dedup: identical (account, caption, media) published "
+                   "within 24h; NOT re-sent (release_dedup() is the explicit "
+                   "human override)")
+
+    result = _publish_gated(draft, account, http)
+    if result.ok and result.mode == "published":
+        _stamp_published(account.key, draft, result.media_id)
+    return result
+
+
+def _publish_gated(draft, account, http=None):
+    """The real publish dispatch (post-gates, post-dedup)."""
     token = account.get_token()
     if not token:
         raise MissingToken(f"No token set for account '{account.key}'.")

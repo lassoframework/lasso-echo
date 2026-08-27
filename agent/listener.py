@@ -91,6 +91,47 @@ def _write_last_run_date(day):
     _write_state(d)
 
 
+def _mark_draw_started(day):
+    d = _read_state()
+    d["draw_started"] = day
+    _write_state(d)
+
+
+def _mark_draw_finished(day):
+    d = _read_state()
+    d["draw_finished"] = day
+    _write_state(d)
+
+
+def alert_interrupted_draw():
+    """One deduped ops alert when the last daily draw STARTED but never FINISHED
+    (a deploy/restart killed the worker mid-draw). The draw is NOT auto-refired —
+    refiring the whole draw on restart is exactly what triple-published LASSO IG
+    and burst five welcomes on 2026-08-27. Fail closed: a human decides whether
+    to run `python -m agent run-daily` by hand. Called once at scheduler start;
+    best effort, never raises."""
+    try:
+        d = _read_state()
+        started = d.get("draw_started")
+        if not started or d.get("draw_finished") == started:
+            return False
+        from . import db
+        key = f"draw_interrupted_alerted_{started}"
+        if db.kv_get(key):
+            return False
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"the daily draw for {started} was INTERRUPTED mid-run (deploy or "
+            "restart). It is NOT auto-refired (fail closed: a blind refire is "
+            "what triple-published LASSO IG on 2026-08-27; per-draft claims + "
+            "the 24h meta dedup also guard it). Check #echoclaude for missing "
+            "cards; run `python -m agent run-daily` by hand if the day is short.")
+        return True
+    except Exception as e:
+        print(f"[scheduler] interrupted-draw check failed: {type(e).__name__}: {e}")
+        return False
+
+
 def _read_podcast_auto_date():
     """The persisted date the weekly podcast auto-ingest last fired, or None."""
     return _read_state().get("podcast_auto_last_date")
@@ -289,6 +330,8 @@ def _daily_scheduler(store):
     Railway cron service instead and disable this with AGENT_SCHEDULER_ENABLED=false.
     """
     _print_scheduled_lanes()
+    # An interrupted prior draw is surfaced ONCE at startup (never auto-refired).
+    alert_interrupted_draw()
     target_hour = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "14"))  # ~10am ET
     ingest_every = max(1, int(os.environ.get("AGENT_INTAKE_POLL_MINUTES", "5"))) * 60
     intake_sync_every = max(1, int(os.environ.get("AGENT_SOCIAL_INTAKE_SYNC_MINUTES", "15"))) * 60
@@ -315,7 +358,24 @@ def _daily_scheduler(store):
             check_late_draw(now, last_run_date, target_hour)
         except Exception as e:
             print(f"[scheduler] late-draw check failed: {type(e).__name__}: {e}")
-        if now.hour >= target_hour and last_run_date != today:
+        # DEPLOY-OVERLAP GUARD: last_run_date is read from /data once at boot,
+        # so during a Railway deploy overlap TWO listener processes can both
+        # believe today has not fired. Re-read the durable stamp at fire time —
+        # the first process claims the day below; the second sees it on disk.
+        if (now.hour >= target_hour and last_run_date != today
+                and _read_last_run_date() != today):
+            # CLAIM THE DAY BEFORE FIRING (LASSO IG triple-publish 2026-08-27):
+            # the stamp used to be written AFTER the full draw + the extra-
+            # welcomes lane, so a deploy that killed the worker mid-draw refired
+            # the WHOLE draw on restart and re-published everything the first
+            # pass had already sent (3x 'Honest numbers or no numbers', the
+            # welcome burst). Stamping FIRST means the draw fires at most once
+            # per day across restarts; an interrupted draw is surfaced by
+            # alert_interrupted_draw (fail closed, human decides), and the
+            # per-draft socialapi claims + 24h meta dedup are the belt beneath.
+            last_run_date = today
+            _write_last_run_date(today)
+            _mark_draw_started(today)
             _fire_daily(store, today)
             # EXTRA welcomes for the day (catch-up): the daily draw posted welcome #1;
             # post (AGENT_WELCOME_PER_DAY - 1) more so the backlog clears. No-op unless
@@ -329,8 +389,7 @@ def _daily_scheduler(store):
                           + ", ".join(extra))
             except Exception as e:
                 print(f"[welcome-extra] failed: {type(e).__name__}: {e}")
-            last_run_date = today
-            _write_last_run_date(today)
+            _mark_draw_finished(today)
             # Daily metrics snapshot AFTER the daily draft: READ-ONLY Graph pulls
             # (views, never impressions), dormant unless AGENT_REPORTING_ENABLED.
             # Failures alert inside snapshot_all; nothing here crashes the loop.

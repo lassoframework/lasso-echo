@@ -192,6 +192,108 @@ def _autonomous_publish(draft, store, poster):
     return True
 
 
+def _verify_published_24h(account_key, caption):
+    """The media_id of a REAL publish of this exact caption (caption_ledger hash)
+    on this account within the last 24h, from the posts log — or None. This is
+    the restart-recovery verification: an in-flight claim is never blind-
+    re-published; the log is the evidence a prior attempt actually landed."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from . import db
+        from .caption_ledger import caption_hash
+        target = caption_hash(caption or "")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT caption, media_id, published_at FROM posts "
+                "WHERE account_key=? AND mode='published' AND published_at >= ? "
+                "ORDER BY id DESC LIMIT 200", (account_key, cutoff)).fetchall()
+        for r in rows:
+            if caption_hash(r["caption"] or "") == target:
+                return r["media_id"] or "verified"
+    except Exception:
+        return None                     # unverifiable reads as NOT verified
+    return None
+
+
+def _claimed_meta_publish(draft, acct):
+    """EXACTLY-ONCE wrapper for the autopublish lanes' meta_publisher.publish call
+    (LASSO IG triple-publish, 2026-08-27). The socialapi_claims table (db.py) was
+    built for exactly this but only the SocialAPI lane ever called it — the
+    meta-direct auto-approve lane published with NO claim, so a refired daily
+    draw re-sent the same drafts. Now:
+
+      * the claim is taken BEFORE the external call (draft ids are deterministic,
+        so a refired draw maps to the same claim row and loses);
+      * a restart that finds an IN-FLIGHT claim never blind-republishes: it
+        VERIFIES against the post log (caption-hash within 24h). Verified ->
+        marked done, nothing re-sent. Unverifiable -> HOLD with ONE deduped
+        alert (fail closed; a human reconciles);
+      * a pre-network failure releases the claim (safe retry); an AMBIGUOUS
+        mid-call failure keeps the claim in-flight so the next attempt verifies
+        instead of resending.
+
+    Returns ('published', result) on a fresh publish/would_publish,
+    ('already', None) when a prior attempt already landed, ('held', None) when
+    the claim is unverifiable and the draft must wait for a human."""
+    from . import db, ops_alerts
+    from .meta_publisher import (MediaNotReady, MissingToken, NotSupported,
+                                 publish)
+    # OUT-OF-BAND PROCESS RAIL (2026-08-27 welcome burst: /data shows NO trace
+    # of the five welcome publishes — they came from an Echo process without the
+    # volume, whose throwaway sqlite made every claim/dedup stamp meaningless).
+    # A process whose kv is not durable cannot prove exactly-once, so its AUTO
+    # lanes never publish: hold with one honest line (the human lanes and the
+    # would_publish draft path are untouched).
+    if not db.kv_is_durable():
+        print(f"[claim] {draft.draft_id} ({acct.key}) HELD: kv is not durable "
+              "(no /data volume, no AGENT_DB_PATH) — an out-of-band process "
+              "cannot guarantee exactly-once, so the auto lane never publishes.")
+        return ("held", None)
+    state, pid = db.socialapi_claim(draft.draft_id, acct.key)
+    if state == "done":
+        print(f"[claim] {draft.draft_id} ({acct.key}) already published "
+              f"({pid or 'no id'}); not re-sending")
+        return ("already", None)
+    if state == "in_flight":
+        verified = _verify_published_24h(acct.key, draft.caption)
+        if verified:
+            db.socialapi_claim_done(draft.draft_id, acct.key,
+                                    "" if verified == "verified" else verified)
+            print(f"[claim] {draft.draft_id} ({acct.key}) in-flight claim "
+                  "verified against the post log; marked done, not re-sent")
+            return ("already", None)
+        hold_key = f"claim_hold_alerted_{draft.draft_id}_{acct.key}"
+        if not db.kv_get(hold_key):
+            db.kv_set(hold_key, "1")
+            ops_alerts.alert(
+                f"draft {draft.draft_id} ({acct.key}) has an IN-FLIGHT publish "
+                "claim from a prior run that cannot be verified against the post "
+                "log. HELD, not re-sent (fail closed: blind re-publish is what "
+                "triple-posted LASSO IG on 2026-08-27). Check the live feed: if "
+                "the post is up, nothing to do; if not, release the claim "
+                "(db.socialapi_claim_release) and re-run.")
+        return ("held", None)
+    try:
+        result = publish(draft, acct)
+    except (MissingToken, NotSupported, MediaNotReady):
+        # Definitely nothing published (pre-network / container-never-finished):
+        # release so a genuine retry can proceed.
+        db.socialapi_claim_release(draft.draft_id, acct.key)
+        raise
+    except Exception:
+        # AMBIGUOUS: the call may or may not have reached Meta. Keep the claim
+        # in-flight (fail closed); the next attempt verifies before resending.
+        raise
+    if getattr(result, "ok", True) and getattr(result, "mode", "") == "published":
+        db.socialapi_claim_done(draft.draft_id, acct.key,
+                                getattr(result, "media_id", "") or "")
+    else:
+        # would_publish: no network call happened; release so an armed run can send.
+        db.socialapi_claim_release(draft.draft_id, acct.key)
+    return ("published", result)
+
+
 def _post_and_save(draft, store, poster, idempotent):
     """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
@@ -208,15 +310,45 @@ def _post_and_save(draft, store, poster, idempotent):
                  or (_is_welcome and config.welcome_autopublish_enabled()))):
         from . import db, postlog
         from .accounts import get_account
-        from .meta_publisher import publish
         acct = get_account(draft.account_key)
         if acct:
-            result = publish(draft, acct)
+            # WELCOME PACING + ONCE-EVER (the 5-welcomes-in-15-minutes burst,
+            # 2026-08-27): a welcome that already went out for this (gym,
+            # account, kind) is NEVER re-published, and at most
+            # AGENT_WELCOME_PER_DAY distinct gyms are welcomed per calendar day
+            # fleet-wide — both durable in kv, checked BEFORE the publish call.
+            if _is_welcome:
+                from . import welcome_queue as _wq
+                allowed, why = _wq.welcome_publish_gate(draft)
+                if not allowed:
+                    if "cap" in why:
+                        # Not a duplicate — just today is full. Put the gym back
+                        # in the queue so a later day's drip serves it.
+                        _wq.requeue(_wq.welcome_gym_key_for(draft))
+                    draft.status = DraftStatus.BLOCKED
+                    draft.blocked_reason = f"welcome gate: {why}"
+                    print(f"[welcome-gate] {draft.draft_id} ({draft.account_key}) "
+                          f"blocked: {why}")
+                    store.put(draft)
+                    return
+            outcome, result = _claimed_meta_publish(draft, acct)
+            if outcome == "already":
+                # A prior run already published this exact draft: record the
+                # truthful state, never re-log or re-notify.
+                draft.status = DraftStatus.APPROVED
+                store.put(draft)
+                return
+            if outcome == "held":
+                store.put(draft)        # PENDING: a human owns the reconcile
+                return
             draft.status = DraftStatus.APPROVED
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
                              media_id=getattr(result, "media_id", ""),
                              mode=result.mode, draft_id=draft.draft_id)
+            if _is_welcome and result.mode == "published":
+                from . import welcome_queue as _wq
+                _wq.record_welcome_published(draft)
             db.audit("auto_approve", draft.draft_id, "AGENT_AUTO_APPROVE_ENABLED",
                      draft.account_key, draft.day_key)
             preview = (draft.caption or "")[:80].replace("\n", " ")
@@ -237,9 +369,15 @@ def _post_and_save(draft, store, poster, idempotent):
             # GATED AUTOPUBLISH: calendar-routine only, level 1+, never a first
             # post, never book/comments/stories. The publisher's own draft-only
             # guard (AGENT_PUBLISH_ENABLED) still applies inside publish().
+            # Exactly-once: same claim wrapper as the auto-approve lane, so a
+            # refired draw can never re-send a trust-published draft.
             from . import postlog
-            from .meta_publisher import publish
-            result = publish(draft, acct)
+            outcome, result = _claimed_meta_publish(draft, acct)
+            if outcome in ("already", "held"):
+                draft.status = (DraftStatus.APPROVED if outcome == "already"
+                                else draft.status)
+                store.put(draft)
+                return
             draft.status = DraftStatus.APPROVED
             postlog.log_post(account_key=draft.account_key, platform=draft.platform,
                              caption=draft.caption,
@@ -568,6 +706,22 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             print(f"[zernio-profile-link] link failed: {type(e).__name__}: {e}")
             ops_alerts.alert(f"Zernio profile link failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
+
+    # LASSO TAG ALLOWLIST REFRESH (AGENT_MENTIONS, OFF by default): once per day
+    # (kv-stamped inside run_nightly), upsert LASSO's gym_tag_allowlist rows from
+    # the LIVE Zernio client roster (own + partner handles) so the publish_guard
+    # mention rail and the caption @mention appender always see the current
+    # partner set. Upsert-only (never deletes); isolated: a seed failure never
+    # takes the draft run down.
+    if config.mentions_enabled():
+        try:
+            from .lasso_tag_seed import run_nightly as _tag_seed_nightly
+            _tsum = _tag_seed_nightly()
+            if _tsum.get("ok") and _tsum.get("seeded"):
+                print(f"[lasso-tag-seed] refreshed {_tsum['seeded']} handle(s): "
+                      + ", ".join(_tsum.get("handles", [])))
+        except Exception as e:
+            print(f"[lasso-tag-seed] failed: {type(e).__name__}: {e}")
 
     # CALENDAR GRADE SWEEP (Wave 6 rollout, 2026-08-26): nightly grades for every
     # gym whose AGENT_CALENDAR_GRADE_{GYM} (or the global flag) is on. The sweep

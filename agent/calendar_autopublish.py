@@ -373,6 +373,56 @@ def _alert_story_needs_render(row_id, gym_id):
         pass  # an alert failure must never block the publish lane
 
 
+def _planned_mentions(caption, gym_id, category):
+    """Every @handle the OUTBOUND caption will carry: the @handles already in the
+    caption text PLUS the allowlisted handles the zernio publisher appends for
+    this category when AGENT_MENTIONS is armed (zernio_publisher.publish). Used
+    by the publish_guard mention rail. Best effort: a read failure returns only
+    the in-caption handles (the rail then fails closed on proof/results)."""
+    import re as _re
+    handles = _re.findall(r"@([A-Za-z0-9_.]+)", str(caption or ""))
+    if config.mentions_enabled() and (category or "").strip():
+        try:
+            from .tag_allowlist import handles_for_category
+            for h in handles_for_category(gym_id, (category or "").strip().lower()):
+                if h not in handles:
+                    handles.append(h)
+        except Exception:
+            pass
+    return handles
+
+
+def _alert_publish_blocked(gym_id, row_id, code):
+    """ONE deduped ops alert per (gym, violation code): kv key
+    publish_blocked:<gym>:<code> fires once and stays quiet until the state
+    changes (_clear_publish_blocked re-arms it when a row for the gym passes
+    the guard). Best effort; never raises into the lane."""
+    try:
+        from . import db, ops_alerts
+        key = f"publish_blocked:{gym_id}:{code}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, str(row_id or "1"))
+        ops_alerts.alert(
+            f"publish guard: row {row_id} (gym {gym_id}) blocked at the publish "
+            f"boundary ({code}); reverted to pending with reject_reason. Further "
+            f"'{code}' blocks for this gym stay quiet until a post publishes clean.")
+    except Exception:
+        pass
+
+
+def _clear_publish_blocked(gym_id):
+    """Re-arm the deduped publish-blocked alerts for a gym (called when a row
+    passes the guard: the state changed). Best effort; never raises."""
+    try:
+        from . import db, publish_guard
+        for code in publish_guard.ALL_CODES:
+            if db.kv_get(f"publish_blocked:{gym_id}:{code}"):
+                db.kv_set(f"publish_blocked:{gym_id}:{code}", "")
+    except Exception:
+        pass
+
+
 def _draft_for(row):
     """Build a PENDING Draft from a content_calendar row for meta_publisher.publish."""
     fmt = (row.get("format") or "feed").strip().lower()
@@ -592,26 +642,20 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         draft.platform = account.platform
 
         # PUBLISH-TIME RECHECK (AGENT_CALENDAR_GRADE, default OFF)
-        # Re-validates copy_gate + caption_ledger immediately before the network
-        # call. A row that passes the gate at planning time but was edited after
-        # staging (e.g. a dash snuck into the caption) is caught here, reverted
-        # to pending, and never sent to a live audience.
+        # Re-validates the OUTBOUND caption immediately before the network call.
+        # CONSOLIDATED (Blake's WIRING.md, 2026-08-27): the former inline
+        # thin-caption floor + avatar rail now live in publish_guard.check —
+        # ONE rail implementation for empty/thin captions, copy violations,
+        # proof-without-mention, multi-ask, the avatar rail, and media_ready.
+        # Stories stay exempt from the caption rails (empty-body BY DESIGN; the
+        # '26 empty IG captions' in the 2026-08-27 audit were story rows —
+        # verified against content_calendar via late_post_id). A violation
+        # reverts the row to pending with a reject_reason and ONE deduped alert
+        # per (gym, code); the caption_ledger cooldown recheck is unchanged.
         if config.calendar_grade_enabled():
-            from agent import copy_gate as _cg, caption_ledger as _cl, ops_alerts as _oa
-            _cap = row.get("caption") or ""
-            _viols = _cg.violations(_cap)
-            if _viols:
-                try:
-                    store.mark_publish_failed(
-                        row_id, revert_status="pending")
-                except Exception:
-                    pass
-                _oa.alert(
-                    f"publish recheck: row {row_id} has copy violations {_viols}, "
-                    f"reverted to pending"
-                )
-                failed.append(row_id)
-                continue
+            from agent import caption_ledger as _cl, ops_alerts as _oa
+            from agent import publish_guard as _pg
+            _cap = draft.caption or ""
             if _cl.is_on_cooldown(gym_id, _cap, row.get("post_date", ""),
                                   db=None):
                 try:
@@ -625,80 +669,83 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 )
                 failed.append(row_id)
                 continue
-            # CAPTION FLOOR AT THE PUBLISH BOUNDARY (Blake's audit 2026-08-27):
-            # a FEED row whose caption is empty or under the A+ floor is never
-            # sent — reverted to pending with one alert. STORIES are exempt BY
-            # DESIGN: a story publishes empty-body (contentType='story', caption
-            # burned onto the media by story_image; see zernio_publisher). The
-            # 'HYROX'-only captions of 2026-08-13 predate the armed A+ gate;
-            # this is the belt-and-suspenders net at the last boundary.
-            from agent import post_quality as _pq
-            _fmt = (row.get("format") or "feed").strip().lower()
-            if _fmt != "story" and len(_cap.strip()) < _pq.MIN_CAPTION_CHARS:
+            _payload = _pg.PublishPayload(
+                row_id=str(row_id), gym_id=gym_id, platform=draft.platform,
+                caption=_cap, category=(row.get("category") or ""),
+                mentions=_planned_mentions(_cap, gym_id, row.get("category")),
+                media_ready=bool((row.get("image_url") or "").strip()),
+                is_story=_is_story_row(row))
+            _viols = _pg.check(_payload)
+            if _viols:
+                _reason = "publish_guard: " + ", ".join(_viols)
                 try:
-                    store.mark_publish_failed(row_id, revert_status="pending")
+                    store.mark_publish_failed(row_id, revert_status="pending",
+                                              reject_reason=_reason)
+                except TypeError:
+                    # older store/test fakes without the reject_reason kwarg
+                    try:
+                        store.mark_publish_failed(row_id, revert_status="pending")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-                _oa.alert(
-                    f"publish recheck: row {row_id} caption is empty/thin "
-                    f"({len(_cap.strip())} chars, floor {_pq.MIN_CAPTION_CHARS}), "
-                    f"reverted to pending"
-                )
+                for _code in _viols:
+                    _alert_publish_blocked(gym_id, row_id, _code)
                 failed.append(row_id)
                 continue
-            # AVATAR RAIL AT THE PUBLISH BOUNDARY (org rule; Defect B): a caption
-            # carrying a banned-audience term (HYROX, competitive CrossFit,
-            # strength/serious athletes) is never sent to a live audience.
-            _breach = _pq.avatar_breach(_cap)
-            if _breach:
-                try:
-                    store.mark_publish_failed(row_id, revert_status="pending")
-                except Exception:
-                    pass
-                _oa.alert(
-                    f"publish recheck: row {row_id} caption carries banned-audience "
-                    f"term ('{_breach}'), reverted to pending (LASSO avatar rail)"
-                )
-                failed.append(row_id)
-                continue
+            # Guard passed: the block state changed, so re-arm the deduped
+            # alerts for this gym (a future violation alerts again).
+            _clear_publish_blocked(gym_id)
 
-        try:
-            # ROUTE BY GYM: LASSO publishes via the Meta-direct lane (unchanged). A
-            # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio. The zernio
-            # publisher self-gates on AGENT_ZERNIO_PUBLISH + AGENT_PUBLISH_ENABLED
-            # (returns would_publish when off), so a client row is never sent live
-            # unless both are armed.
-            #
-            # CLIENT LANE = PUBLISH NOW, ALWAYS (audit 2026-08-25 CRITICAL). The lane
-            # only reaches here once the row's own slot has ARRIVED (the slot gate above;
-            # publish_client_gyms no longer bypasses it with catch_all), so firing
-            # immediately IS firing at the slot time — for manual approvals AND
-            # autonomous gyms alike. Handing Zernio a FUTURE scheduledFor is what broke
-            # trust twice: (a) pre-approved posts swept at the day's first tick fired at
-            # ~midnight instead of their slot (Dale: "the times ECHO lists as publish
-            # time are not accurate"), and (b) a scheduled hand-off was immediately
-            # marked 'published' with a published_at that was a lie, hours before the
-            # post existed on the feed, with no reconcile if Zernio dropped it. Publish
-            # now at slot time makes published_at truthful and needs no reconcile.
-            if account.key.startswith("lasso"):
-                result = publisher(draft, account)
-            else:
-                result = zernio_publish(draft, account, scheduled_for=None)
-        except Exception as e:
-            # A real publish error: revert the claim so it retries next run. A CLIENT
-            # row (approved_only) reverts to 'approved' so a transient failure never
-            # forces the client to re-approve; LASSO reverts to 'pending' (unchanged).
+        # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
+        # visible-length for the outbound caption, so a caption that goes
+        # missing between the row and the API call is grep-able as
+        # "CAPTION LOST <stage>". A STORY's caption travels ON its media
+        # (the API body is empty by design), so its traced value is the burned
+        # caption — never a false LOST.
+        from .caption_trace import trace_publish as _trace_publish
+        with _trace_publish(row_id, getattr(account, "platform", "")) as _tr:
+            _tr.t("row_loaded", row.get("caption") or "")
+            _tr.t("caption_resolved", draft.caption or "")
+            _tr.t("platform_payload_built", draft.caption or "")
             try:
-                store.mark_publish_failed(
-                    row_id, revert_status="approved" if approved_only else "pending")
-            except Exception as re:
-                print(f"[calendar-autopublish] revert failed for row {row_id}: "
-                      f"{type(re).__name__}: {re}")
-            failed.append(row_id)
-            print(f"[calendar-autopublish] publish failed for row {row_id}: "
-                  f"{type(e).__name__}: {e}")
-            _note_repeat_failure(row_id, gym_id, e)
-            continue
+                # ROUTE BY GYM: LASSO publishes via the Meta-direct lane (unchanged). A
+                # CLIENT gym publishes to ITS OWN connected IG/FB via Zernio. The zernio
+                # publisher self-gates on AGENT_ZERNIO_PUBLISH + AGENT_PUBLISH_ENABLED
+                # (returns would_publish when off), so a client row is never sent live
+                # unless both are armed.
+                #
+                # CLIENT LANE = PUBLISH NOW, ALWAYS (audit 2026-08-25 CRITICAL). The lane
+                # only reaches here once the row's own slot has ARRIVED (the slot gate above;
+                # publish_client_gyms no longer bypasses it with catch_all), so firing
+                # immediately IS firing at the slot time — for manual approvals AND
+                # autonomous gyms alike. Handing Zernio a FUTURE scheduledFor is what broke
+                # trust twice: (a) pre-approved posts swept at the day's first tick fired at
+                # ~midnight instead of their slot (Dale: "the times ECHO lists as publish
+                # time are not accurate"), and (b) a scheduled hand-off was immediately
+                # marked 'published' with a published_at that was a lie, hours before the
+                # post existed on the feed, with no reconcile if Zernio dropped it. Publish
+                # now at slot time makes published_at truthful and needs no reconcile.
+                _tr.t("api_request", draft.caption or "")
+                if account.key.startswith("lasso"):
+                    result = publisher(draft, account)
+                else:
+                    result = zernio_publish(draft, account, scheduled_for=None)
+            except Exception as e:
+                # A real publish error: revert the claim so it retries next run. A CLIENT
+                # row (approved_only) reverts to 'approved' so a transient failure never
+                # forces the client to re-approve; LASSO reverts to 'pending' (unchanged).
+                try:
+                    store.mark_publish_failed(
+                        row_id, revert_status="approved" if approved_only else "pending")
+                except Exception as re:
+                    print(f"[calendar-autopublish] revert failed for row {row_id}: "
+                          f"{type(re).__name__}: {re}")
+                failed.append(row_id)
+                print(f"[calendar-autopublish] publish failed for row {row_id}: "
+                      f"{type(e).__name__}: {e}")
+                _note_repeat_failure(row_id, gym_id, e)
+                continue
 
         ok = getattr(result, "ok", False)
         mode = getattr(result, "mode", "")

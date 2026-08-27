@@ -140,6 +140,20 @@ def publish(draft, account, client=None, scheduled_for=None,
     # NEVER created while Echo marked it published (Dale's missing IG story, 2026-08-13).
     body = "" if story else (getattr(draft, "caption", "") or "")
 
+    # BELT AND BRACES (publish_guard wiring, 2026-08-27): a FEED payload with an
+    # empty/invisible body must never reach the API — an emoji-only or '...'
+    # caption is not a caption (publish_guard.visible_len counts alphanumerics
+    # only). Raising (not returning would_publish) makes the caller's revert +
+    # alert path own it. STORIES deliberately send body="" (see the STORIES
+    # CARRY NO CAPTION note above) and are exempt.
+    if not story:
+        from .publish_guard import visible_len
+        if visible_len(body) == 0:
+            raise ValueError(
+                f"{account.key}: refusing to publish a FEED post with an empty "
+                "(zero visible characters) body; stories send an empty body by "
+                "design, a feed caption must carry real words.")
+
     # AGENT_MENTIONS: append validated @handle mentions (newline-separated) to the
     # caption when the flag is ON. @handles in caption text are rendered by Zernio
     # as live mentions. Stories carry no caption, so mentions are skipped for stories.

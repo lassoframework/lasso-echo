@@ -43,3 +43,14 @@ def _isolated_db(tmp_path, monkeypatch):
     # could write beside real files. Point the data root at an EMPTY per-test dir
     # (deliberately not created — matching a dev machine with no volume).
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path / "data"))
+    # POST LOG QUARANTINE (2026-08-27, found during the publish-guard audit):
+    # config.POST_LOG_PATH is bound at IMPORT time from AGENT_POST_LOG_PATH, so
+    # stripping the env above does NOT retarget it — a suite run inside the
+    # production container wrote test rows ('gymA', 'Iron Gym') into the REAL
+    # /data/post_log.jsonl. Rebind the already-imported constant per test.
+    try:
+        from agent import config as _config
+        monkeypatch.setattr(_config, "POST_LOG_PATH",
+                            str(tmp_path / "post_log_test.jsonl"), raising=False)
+    except Exception:
+        pass

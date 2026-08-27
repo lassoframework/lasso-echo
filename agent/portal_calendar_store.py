@@ -662,7 +662,8 @@ class SupabaseCalendarStore:
                 pass  # ledger stamp failure is never fatal
         return rows[0]
 
-    def mark_publish_failed(self, row_id, revert_status="pending"):
+    def mark_publish_failed(self, row_id, revert_status="pending",
+                            reject_reason=None):
         """
         REVERT a claim after a publish failure (or a would_publish result): status
         back to `revert_status` so the row is retried on the next run. LASSO rows
@@ -671,9 +672,17 @@ class SupabaseCalendarStore:
         forces the client to re-approve. Records NOTHING else (no media id, no
         published_at), so a failed attempt never looks published. Filtered by id
         only. Returns the updated row or None.
+
+        reject_reason (publish_guard wiring, 2026-08-27): when the publish guard
+        blocks a row, its violation codes land on the row so the portal/human can
+        see WHY it went back to pending. None (the default) leaves the column
+        untouched — a transient network failure never overwrites a guard reason.
         """
         if revert_status not in ("pending", "approved"):
             revert_status = "pending"
+        body = {"status": revert_status}
+        if reject_reason is not None:
+            body["reject_reason"] = str(reject_reason)[:500]
         params = {"id": f"eq.{row_id}"}
         r = self._client().patch(
             self._rest(_TABLE),
@@ -682,7 +691,7 @@ class SupabaseCalendarStore:
                 "Content-Type": "application/json",
                 "Prefer": "return=representation",
             }),
-            json={"status": revert_status},
+            json=body,
             timeout=30,
         )
         if r.status_code >= 400:
