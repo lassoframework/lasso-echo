@@ -61,34 +61,39 @@ def _parse_banned(words_to_never_use):
 
 def map_answers(answers):
     """PURE. Map a submitted social-intake `answers` dict to the pieces onboarding
-    needs. Returns {bundle, bible_text, proof_text, approver, gym, banned_words}.
+    needs. Returns {bundle, bible_text, proof_text, approver, approver_contact,
+    gym, banned_words}.
 
-    answers schema (nested dicts, every field optional):
-      gym{name, website, ig_handle, fb_page}
-      proof{wins, verifiable_numbers}
-      voice{vibe, words_to_use, words_to_never_use}
-      offers{services, front_door_offer, exact_price}
-      audience{ideal_member}
-      media_notes (str)
-      approver (str)
+    ONE PARSER, ZERO DRIFT: all field parsing is delegated to
+    intake_web.normalize_portal_intake, the same parser the portal's JSON intake
+    endpoint uses. It accepts BOTH shapes this bridge sees:
+      v1 legacy: gym{name,website,ig_handle,fb_page}, voice{vibe,words_to_use,
+        words_to_never_use}, offers{services,front_door_offer,exact_price},
+        audience{ideal_member}, media_notes (str), approver (str)
+      v2 (form 2026-08-26): adds gym.about/gym_type/google_business/locations,
+        voice.content_goal/hashtags/sample_post_links, offers.upcoming_promos +
+        exact_pricing_wording, audience.age_range/prior_struggles, structured
+        media{has_media,hero_shots,off_limits,notes}, approver{name,contact,
+        best_time,upload_contact} (dict).
 
-    bundle (client_sources.CLIENT_CATEGORIES): only NON-EMPTY categories are emitted,
-    each item a (text, citation) pair with citation "client social intake":
-      offer        <- offers.front_door_offer (with exact_price appended if present)
-      service      <- each non-empty line of offers.services
-      about        <- "Who we help: " + audience.ideal_member
-      testimonial  <- proof.wins and/or proof.verifiable_numbers, ONLY if non-empty
-                      (empty proof is SKIPPED: no fabrication)
+    bundle (client_sources.CLIENT_CATEGORIES): only NON-EMPTY categories are
+    emitted, each item a (text, citation) pair with citation "client social
+    intake". Fact fields map to categories via intake_ingest._FORM_SOURCE_SECTIONS
+    (the portal ingest's own field->category table), plus:
+      about        <- also "Who we help: " + audience.ideal_member (v1 behavior kept)
+      testimonial  <- ONLY real proof lines (empty proof is SKIPPED: no fabrication)
       faq / promo  <- only if the intake carries them (answers['faq'] / answers['promo'])
 
     bible_text/proof_text come from bible_drafter.draft_bible fed an intake text
-    assembled from the answers; the bible ALWAYS contains the words_to_never_use list.
+    assembled from the normalized answers; the bible ALWAYS contains the
+    words_to_never_use list.
     """
     answers = answers or {}
+    from . import intake_web  # lazy: avoids any import cycle with the web module
+    from .intake_ingest import _FORM_SOURCE_SECTIONS
+    flat = intake_web.normalize_portal_intake(answers)
     gym = dict(answers.get("gym") or {})
-    proof = dict(answers.get("proof") or {})
     voice = dict(answers.get("voice") or {})
-    offers = dict(answers.get("offers") or {})
     audience = dict(answers.get("audience") or {})
 
     cite = "client social intake"
@@ -100,27 +105,18 @@ def map_answers(answers):
             return
         bundle.setdefault(category, []).append((text, cite))
 
-    # offer: the front-door offer, with the exact price folded in when it is given.
-    front_door = _clean(offers.get("front_door_offer"))
-    exact_price = _clean(offers.get("exact_price"))
-    if front_door:
-        offer_text = f"{front_door} ({exact_price})" if exact_price else front_door
-        _add("offer", offer_text)
+    # Fact fields -> categories, exactly the portal ingest's own table, so a fact
+    # lands in the same category no matter which door the intake came through:
+    #   offers -> offer, pricing_rule -> offer, services -> service,
+    #   proof -> testimonial (only if non-empty: no fabrication), about -> about.
+    for field, category, _citation in _FORM_SOURCE_SECTIONS:
+        for line in _nonempty_lines(flat.get(field)):
+            _add(category, line)
 
-    # service: one source per non-empty services line.
-    for line in _nonempty_lines(offers.get("services")):
-        _add("service", line)
-
-    # about: who the gym helps.
+    # about: who the gym helps (kept from v1; v2's gym.about landed above too).
     ideal = _clean(audience.get("ideal_member"))
     if ideal:
         _add("about", f"Who we help: {ideal}")
-
-    # testimonial: ONLY from real proof. Empty proof -> no testimonial (no fabrication).
-    for line in _nonempty_lines(proof.get("wins")):
-        _add("testimonial", line)
-    for line in _nonempty_lines(proof.get("verifiable_numbers")):
-        _add("testimonial", line)
 
     # faq / promo: only when the intake actually carries them.
     for line in _nonempty_lines(answers.get("faq")):
@@ -130,7 +126,7 @@ def map_answers(answers):
 
     banned_words = _parse_banned(voice.get("words_to_never_use"))
 
-    intake_text = _build_intake_text(gym, voice, audience, answers, banned_words)
+    intake_text = _build_intake_text(flat, banned_words)
     base_key = _clean(answers.get("base_key")) or _slug(gym.get("name")) or "client"
     bible_text, proof_text = bible_drafter.draft_bible(base_key, intake_text)
 
@@ -138,7 +134,8 @@ def map_answers(answers):
         "bundle": bundle,
         "bible_text": bible_text,
         "proof_text": proof_text,
-        "approver": _clean(answers.get("approver")),
+        "approver": _clean(flat.get("approver_name")),
+        "approver_contact": _clean(flat.get("approver_contact")),
         "gym": gym,
         "banned_words": banned_words,
     }
@@ -150,50 +147,54 @@ def _slug(name):
     return "_".join(p for p in s.split("_") if p)
 
 
-def _build_intake_text(gym, voice, audience, answers, banned_words):
-    """Assemble the numbered `## N.` intake bible_drafter.parse_intake expects, from the
-    answers. Section 3 (voice + tone) ALWAYS lists the words_to_never_use so the drafted
-    bible carries the banned list verbatim. Only intake facts are used: nothing invented.
-    A missing section is left blank (bible_drafter renders its own TODO)."""
-    name = _clean(gym.get("name")) or "the gym"
-    website = _clean(gym.get("website"))
-    ig = _clean(gym.get("ig_handle"))
-    fb = _clean(gym.get("fb_page"))
-    vibe = _clean(voice.get("vibe"))
-    words_use = _clean(voice.get("words_to_use"))
-    ideal = _clean(audience.get("ideal_member"))
-    media_notes = _clean(answers.get("media_notes"))
+def _build_intake_text(flat, banned_words):
+    """Assemble the numbered `## N.` intake bible_drafter.parse_intake expects, from
+    the ONE-parser flat dict (intake_web.normalize_portal_intake output). Section 3
+    (voice + tone) ALWAYS lists the words_to_never_use so the drafted bible carries
+    the banned list verbatim. Only intake facts are used: nothing invented. A
+    missing section is left blank (bible_drafter renders its own TODO)."""
+    def _f(key):
+        return _clean(flat.get(key))
 
-    socials = []
-    if website:
-        socials.append(f"Website: {website}")
-    if ig:
-        socials.append(f"Instagram: {ig}")
-    if fb:
-        socials.append(f"Facebook: {fb}")
-
+    name = _f("gym_name") or "the gym"
     never_line = ", ".join(banned_words) if banned_words \
         else "(none provided in the intake)"
 
+    who = [name]
+    if _f("about"):
+        who.append(_f("about"))                    # v2: gym_type + story
+    if _f("city"):
+        who.append(f"Locations: {_f('city')}")     # v2: gym.locations
+    if _f("website"):
+        who.append(f"Website: {_f('website')}")
+    if _f("ig_handle"):
+        who.append(f"Instagram: @{_f('ig_handle')}")
+    if _f("fb_page"):
+        who.append(f"Facebook: {_f('fb_page')}")
+    if _f("google_business"):
+        who.append(f"Google Business: {_f('google_business')}")  # v2
+
     lines = []
     lines.append("## 1. Who this gym is")
-    who = [name]
-    who.extend(socials)
     lines.append("\n".join(who))
     lines.append("")
     lines.append("## 2. Who we talk TO (the avatar)")
-    lines.append(ideal)
+    # v2 carries age_range + ideal_member + prior_struggles; v1 just ideal_member.
+    lines.append(_f("audience"))
     lines.append("")
     lines.append("## 3. Voice and tone")
-    lines.append(f"Vibe: {vibe}" if vibe else "")
-    if words_use:
-        lines.append(f"Words to use: {words_use}")
+    # The flat voice block already carries Vibe / Content goal / Words to use /
+    # Words to never use / Hashtags / Sample posts (whichever the intake gave).
+    if _f("voice"):
+        lines.append(_f("voice"))
     lines.append(f"Words to NEVER use: {never_line}")
     lines.append("")
     lines.append("## 4. Hard guardrails (never violate)")
     lines.append(f"Never use these words: {never_line}")
-    if media_notes:
-        lines.append(f"Media notes: {media_notes}")
+    if _f("pricing_rule"):
+        lines.append(f"Exact pricing wording (use verbatim): {_f('pricing_rule')}")
+    if _f("media_notes"):
+        lines.append(f"Media notes: {_f('media_notes')}")
     return "\n".join(lines)
 
 
@@ -369,7 +370,9 @@ def _default_lister():
 
 
 def _default_marker(base_key, account_key):
-    """Live: mark every echo_social_intake row for base_key as forwarded to Echo.
+    """Live: mark every echo_social_intake row for base_key (the row's raw
+    client_key) as forwarded to Echo, recording account_key (the RESOLVED Echo
+    account it was routed into; equals base_key when no resolution happened).
     Best effort; a failed mark never loses the (already landed) onboarding work.
     Reads creds lazily; NEVER logs the key."""
     from . import config
@@ -381,25 +384,73 @@ def _default_marker(base_key, account_key):
     headers = {"apikey": key, "Authorization": f"Bearer {key}",
                "Content-Type": "application/json", "Prefer": "return=minimal"}
     body = {"echo_forwarded": True, "echo_status": "account_forwarded",
-            "echo_account_key": base_key}
+            "echo_account_key": account_key}
     r = requests.patch(f"{url}/rest/v1/echo_social_intake",
                        params={"client_key": f"eq.{base_key}"},
                        headers=headers, json=body, timeout=30)
     return r.status_code < 400
 
 
+def _default_token_resolver(client_key):
+    """Live: the EXISTING echo_account_key the portal minted for this intake row,
+    from the portal's echo_intake_tokens table, or None.
+
+    Self-serve rows carry the portal gym UUID as echo_social_intake.client_key;
+    provisioning a tenant straight from that raw key would mint a second,
+    UUID-named account DIVERGING from the name-slug account portal onboarding
+    already created. The token row (gym_id -> echo_account_key) maps the raw key
+    back to that existing account. Tries gym_id first (the UUID case), then
+    echo_account_key (the already-a-slug case; a match there is a no-op resolve).
+    A 400 on one column (e.g. a slug against a uuid-typed gym_id) just moves to
+    the next; ANY failure returns None so the caller falls back to the raw key.
+    Reads creds lazily; NEVER logs the key."""
+    from . import config
+    client_key = _clean(client_key)
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key or not client_key:
+        return None
+    import requests  # lazy, matches the repo pattern
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Accept": "application/json"}
+    for column in ("gym_id", "echo_account_key"):
+        try:
+            r = requests.get(f"{url}/rest/v1/echo_intake_tokens",
+                             params={"select": "echo_account_key",
+                                     column: f"eq.{client_key}",
+                                     "limit": "1"},
+                             headers=headers, timeout=8)
+            if r.status_code >= 400:
+                continue
+            rows = r.json() or []
+            if rows:
+                acct = _clean(rows[0].get("echo_account_key"))
+                if acct:
+                    return acct
+        except Exception:
+            return None
+    return None
+
+
 def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
-                  approve=False):
+                  resolver=None, approve=False):
     """Map EVERY un-routed social intake into Echo. Returns a per-base summary list.
 
-    For each un-routed base:
+    For each un-routed row (keyed by its raw client_key):
+      - resolve the raw client_key against the portal's echo_intake_tokens FIRST:
+        a self-serve row carries the portal gym UUID, and provisioning straight
+        from it would mint a second, UUID-named tenant diverging from the
+        name-slug account portal onboarding already created. An existing token
+        row's echo_account_key WINS; only a key with NO token row keeps its raw
+        value (and may then provision fresh),
       - resolve the generation account (<base>_ig); when AGENT_DYNAMIC_ACCOUNTS is
         armed, a base with no account is AUTO-PROVISIONED (an inactive Account record
         built from the intake's gym info) so onboarding is zero-touch and scales to
         100+ gyms without hand-editing accounts.py. When dynamic accounts are OFF, a
         base with no account is SKIPPED with one ops alert (never fabricate an account),
       - run onboard_from_social (writes voice/proof docs if absent, lands client_sources),
-      - mark the row routed so it is never re-processed.
+      - mark the row routed (by its RAW client_key, recording the resolved account)
+        so it is never re-processed.
 
     approve defaults FALSE: intake-derived client_sources land PENDING for one human
     review, matching client_sources.submit_intake's own contract ("client input is
@@ -413,14 +464,19 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
     reader = reader or _default_reader
     marker = marker or _default_marker
     onboard = onboard or onboard_from_social
+    resolver = resolver or _default_token_resolver
 
     results = []
-    for base in lister():
-        base = _clean(base)
-        if not base:
+    for raw_key in lister():
+        raw_key = _clean(raw_key)
+        if not raw_key:
             continue
+        # Token-row resolution BEFORE any provisioning (see docstring). The
+        # intake row itself is still read and marked by its RAW client_key.
+        resolved = _clean(resolver(raw_key) or "")
+        base = resolved or raw_key
         account_key = f"{base}_ig"
-        answers = read_social_intake(base, reader=reader)
+        answers = read_social_intake(raw_key, reader=reader)
         have_account = (_accounts.get_account(account_key) is not None
                         or _accounts.get_account(base) is not None)
 
@@ -442,26 +498,30 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
 
         if not have_account:
             ops_alerts.alert(
-                f"social-intake-sync: '{base}' submitted a social intake but has no "
+                f"social-intake-sync: '{raw_key}' submitted a social intake but has no "
                 f"registry account ('{account_key}' / '{base}'). Add the Account "
                 "entry (or arm AGENT_DYNAMIC_ACCOUNTS), then re-run. The intake is "
                 "safe and left un-routed.")
-            results.append({"base": base, "ok": False, "reason": "no account"})
+            results.append({"base": raw_key, "ok": False, "reason": "no account"})
             continue
         gen_key = account_key if _accounts.get_account(account_key) is not None else base
         if answers is None:
-            results.append({"base": base, "ok": False, "reason": "no answers"})
+            results.append({"base": raw_key, "ok": False, "reason": "no answers"})
             continue
         try:
             out = onboard(gen_key, answers, approve=approve)
-            marked = marker(base, base)
-            results.append({"base": base, "ok": True,
-                            "account": gen_key,
-                            "sources_created": out.get("sources_created", 0),
-                            "marked_routed": bool(marked)})
+            # Mark the RAW row routed, recording the RESOLVED account it went to.
+            marked = marker(raw_key, base)
+            result = {"base": raw_key, "ok": True,
+                      "account": gen_key,
+                      "sources_created": out.get("sources_created", 0),
+                      "marked_routed": bool(marked)}
+            if resolved and resolved != raw_key:
+                result["resolved"] = resolved
+            results.append(result)
         except Exception as e:
-            ops_alerts.alert(f"social-intake-sync: onboarding '{base}' failed: "
+            ops_alerts.alert(f"social-intake-sync: onboarding '{raw_key}' failed: "
                              f"{type(e).__name__}: {e}. Intake left un-routed.")
-            results.append({"base": base, "ok": False,
+            results.append({"base": raw_key, "ok": False,
                             "reason": f"{type(e).__name__}"})
     return results

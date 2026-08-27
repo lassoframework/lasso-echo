@@ -148,3 +148,129 @@ def test_scale_100_gyms_one_bad_never_blocks_the_rest(monkeypatch):
     assert len(ok) == 99 and len(bad) == 1
     assert bad[0]["base"] == "ghostgym" and bad[0]["reason"] == "no account"
     assert calls["onboard"] == 99 and calls["mark"] == 99
+
+
+# ---- GAP 8: token-row resolution before provisioning ------------------------------
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_live_supabase(monkeypatch):
+    """The default resolver/marker read SUPABASE_* lazily; scrub them so every
+    test in this file stays fully offline no matter the host env."""
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+
+def test_uuid_client_key_resolves_to_existing_account(monkeypatch, tmp_path):
+    """A self-serve row carries a portal gym UUID as client_key. The token row
+    maps it to the name-slug account portal onboarding minted; sync must use
+    THAT account and never provision a UUID-named tenant beside it."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")   # provisioning armed...
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    uuid_key = "3f2b8a9e-1111-2222-3333-444455556666"
+    resolved_calls, onboarded, marked = [], [], []
+
+    def resolver(k):
+        resolved_calls.append(k)
+        return "eng"                                       # the minted slug account
+
+    out = sir.sync_unrouted(
+        lister=lambda: [uuid_key],
+        reader=lambda b: _answers("CrossFit ENG"),
+        marker=lambda b, a: marked.append((b, a)) or True,
+        onboard=lambda ak, ans, approve=False: onboarded.append(ak) or {"sources_created": 2},
+        resolver=resolver)
+
+    assert resolved_calls == [uuid_key]
+    assert out[0]["ok"] is True
+    assert out[0]["base"] == uuid_key                      # the row is reported by its raw key
+    assert out[0]["account"] == "eng_ig"                   # ...but routed to the EXISTING account
+    assert out[0]["resolved"] == "eng"
+    assert onboarded == ["eng_ig"]
+    # the RAW row is marked, recording the resolved account
+    assert marked == [(uuid_key, "eng")]
+    # ...and NO UUID-named account was provisioned, even with dynamic accounts armed
+    assert accounts.get_account(f"{uuid_key}_ig") is None
+    assert accounts.get_account(uuid_key) is None
+    accounts._dynamic_cache = None
+
+
+def test_no_token_row_falls_back_to_raw_key_and_provisions(monkeypatch, tmp_path):
+    """No token row (resolver -> None): current behavior is preserved -- the raw
+    key stands and dynamic provisioning creates the fresh account."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    marked = []
+
+    out = sir.sync_unrouted(
+        lister=lambda: ["freshbox"],
+        reader=lambda b: {"gym": {"name": "Fresh Box"}},
+        marker=lambda b, a: marked.append((b, a)) or True,
+        onboard=lambda ak, ans, approve=False: {"sources_created": 1},
+        resolver=lambda k: None)
+
+    assert out[0]["ok"] is True and out[0]["account"] == "freshbox_ig"
+    assert "resolved" not in out[0]
+    assert marked == [("freshbox", "freshbox")]
+    assert accounts.get_account("freshbox_ig") is not None
+    accounts._dynamic_cache = None
+
+
+def test_default_resolver_without_creds_is_none():
+    assert sir._default_token_resolver("3f2b8a9e-1111-2222-3333-444455556666") is None
+    assert sir._default_token_resolver("") is None
+
+
+def test_default_resolver_reads_token_row(monkeypatch):
+    """Offline: fake requests. gym_id lookup returns the minted account key."""
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{"echo_account_key": "eng"}]
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, params=None, headers=None, timeout=None):
+            calls.append((url, dict(params or {})))
+            return _Resp()
+
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+    assert sir._default_token_resolver("uuid-123") == "eng"
+    assert calls[0][0].endswith("/rest/v1/echo_intake_tokens")
+    assert calls[0][1]["gym_id"] == "eq.uuid-123"
+
+
+def test_default_marker_records_resolved_account(monkeypatch):
+    """The mark PATCHes the RAW client_key rows but records the RESOLVED
+    echo_account_key (previously it wrote the raw key as the account)."""
+    calls = {}
+
+    class _Resp:
+        status_code = 204
+
+    class _FakeRequests:
+        @staticmethod
+        def patch(url, params=None, headers=None, json=None, timeout=None):
+            calls["url"] = url
+            calls["params"] = dict(params or {})
+            calls["body"] = dict(json or {})
+            return _Resp()
+
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+    assert sir._default_marker("uuid-123", "eng") is True
+    assert calls["params"] == {"client_key": "eq.uuid-123"}
+    assert calls["body"]["echo_account_key"] == "eng"
+    assert calls["body"]["echo_forwarded"] is True

@@ -131,3 +131,113 @@ def test_read_social_intake_injectable():
     assert out["approver"] == "Ryan Parr"
     # blank base -> None, no reader call
     assert sir.read_social_intake("", reader=_fake_reader) is None
+
+
+# ---- 5. FORM V2: every v2 field lands (one parser with intake_web, zero drift) ----
+def _v2_answers():
+    """A FULL v2 payload, the shape the portal form sends since 2026-08-26."""
+    return {
+        "base_key": "gritx",
+        "gym": {"name": "GritX", "website": "gritx.com", "ig_handle": "@gritx",
+                "fb_page": "GritX",
+                "about": "Founded in 2019 by two coaches who hated big box gyms.",
+                "gym_type": "Boutique group training",
+                "google_business": "GritX Fitness Carmel",
+                "locations": ["Carmel IN", "Westfield IN"]},
+        "voice": {"vibe": "warm, encouraging, real",
+                  "words_to_use": "strong, consistent, community",
+                  "words_to_never_use": "CrossFit, Bootcamp",
+                  "content_goal": "book more intro sessions",
+                  "hashtags": ["#gritx", "#carmelfitness"],
+                  "sample_post_links": ["https://instagram.com/p/abc123"]},
+        "offers": {"services": "Small group training\nPersonal coaching",
+                   "front_door_offer": "21 day kickstart",
+                   "exact_pricing_wording": "just $97 to start",
+                   "upcoming_promos": "Fall 6 week challenge"},
+        "audience": {"ideal_member": "busy parents in their 40s",
+                     "age_range": "35 to 55",
+                     "prior_struggles": "no time, gym intimidation"},
+        "proof": {"wins": "Sarah lost 20 lbs in 12 weeks",
+                  "verifiable_numbers": "150 five star Google reviews"},
+        "media": {"has_media": "yes", "hero_shots": "coach high fives at the door",
+                  "off_limits": "no member faces without consent",
+                  "notes": "new photos uploaded monthly"},
+        "approver": {"name": "Ryan Parr", "role": "Owner", "cell": "555 0100",
+                     "email": "ryan@gritx.com", "best_time": "mornings",
+                     "upload_contact": "Ryan"},
+    }
+
+
+def test_map_answers_v2_every_field_lands():
+    m = sir.map_answers(_v2_answers())
+    b = m["bundle"]
+
+    # offer: front door + exact pricing wording + upcoming promos all land
+    offer_texts = [t for t, _ in b["offer"]]
+    assert any("21 day kickstart" in t for t in offer_texts)
+    assert any("just $97 to start" in t for t in offer_texts)
+    assert any("Fall 6 week challenge" in t for t in offer_texts)
+    # service: both lines
+    assert len(b["service"]) == 2
+    # about: gym story, gym_type, and who-we-help all land
+    about_texts = [t for t, _ in b["about"]]
+    assert any("Founded in 2019" in t for t in about_texts)
+    assert any("Boutique group training" in t for t in about_texts)
+    assert any(t == "Who we help: busy parents in their 40s" for t in about_texts)
+    # testimonial: BOTH real proof lines (and only those)
+    testi = [t for t, _ in b["testimonial"]]
+    assert any("Sarah lost 20 lbs" in t for t in testi)
+    assert any("150 five star" in t for t in testi)
+    assert len(testi) == 2
+
+    # approver: parsed via the ONE parser -- the dict-repr bug is dead
+    assert m["approver"] == "Ryan Parr (Owner)"
+    assert "{" not in m["approver"] and "'" not in m["approver"]
+    assert "best time: mornings" in m["approver_contact"]
+    assert "uploads: Ryan" in m["approver_contact"]
+
+    # banned words parsed and in the bible
+    assert m["banned_words"] == ["crossfit", "bootcamp"]
+    low = m["bible_text"].lower()
+    for w in m["banned_words"]:
+        assert w in low
+
+    # every remaining v2 voice/audience/media field lands in the drafted bible
+    bible = m["bible_text"]
+    for needle in ("book more intro sessions",        # voice.content_goal
+                   "#gritx",                          # voice.hashtags
+                   "https://instagram.com/p/abc123",  # voice.sample_post_links
+                   "35 to 55",                        # audience.age_range
+                   "busy parents in their 40s",       # audience.ideal_member
+                   "no time, gym intimidation",       # audience.prior_struggles
+                   "coach high fives at the door",    # media.hero_shots
+                   "no member faces without consent", # media.off_limits
+                   "new photos uploaded monthly",     # media.notes
+                   "Carmel IN",                       # gym.locations
+                   "GritX Fitness Carmel",            # gym.google_business
+                   "just $97 to start"):              # offers.exact_pricing_wording
+        assert needle in bible, f"v2 field content {needle!r} missing from bible"
+
+
+# ---- 6. V1 legacy payloads still parse (backward compat through the one parser) ---
+def test_map_answers_v1_legacy_backward_compat():
+    m = sir.map_answers(_gritx_answers())
+    b = m["bundle"]
+    # exact_price (the v1 name) still lands as offer material
+    assert any("$97" in t for t, _ in b["offer"])
+    # the v1 string approver parses to a plain name, never a dict repr
+    assert m["approver"] == "Ryan Parr"
+    # the v1 media_notes STRING still reaches the bible
+    assert "no photos yet, house infographics only" in m["bible_text"]
+    # empty v1 proof still fabricates nothing
+    assert "testimonial" not in b
+
+
+# ---- 7. onboard on a v2 payload: sources land, no repr garbage anywhere ----------
+def test_onboard_v2_payload_lands_clean_sources():
+    rep = sir.onboard_from_social("gritx_ig", _v2_answers(), approve=True)
+    assert rep["base"] == "gritx"
+    assert rep["approver"] == "Ryan Parr (Owner)"
+    assert rep["sources_created"] > 0
+    for s in cs.approved_sources("gritx_ig"):
+        assert not s.text.startswith("{"), f"dict repr leaked into source: {s.text!r}"

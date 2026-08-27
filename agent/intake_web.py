@@ -496,6 +496,12 @@ def normalize_portal_intake(body):
       media (object)       -> structured media_notes (has_media / hero_shots / off_limits / notes)
       approver.best_time   -> appended to approver_contact
       approver.upload_contact -> appended to approver_contact
+
+    This is the ONE portal-intake parser: the unrouted-intake bridge
+    (social_intake_reader.map_answers) delegates here too, so it also tolerates
+    the v1 legacy shape those echo_social_intake rows carry: offers.exact_price
+    (v1 name for exact_pricing_wording), a plain-string approver, and the
+    legacy top-level media_notes string (already handled below).
     """
     body = body or {}
     gym = body.get("gym") or {}
@@ -504,7 +510,11 @@ def normalize_portal_intake(body):
     audience = body.get("audience") or {}
     proof = body.get("proof") or {}
     media = body.get("media") or {}
+    if not isinstance(media, dict):          # tolerate a legacy plain string
+        media = {"notes": media}
     approver = body.get("approver") or {}
+    if not isinstance(approver, dict):       # v1 legacy: approver is a bare name
+        approver = {"name": approver}
 
     # -- Voice --
     voice_parts = [
@@ -565,6 +575,7 @@ def normalize_portal_intake(body):
     contact_parts = [
         str(approver.get("cell", "")).strip(),
         str(approver.get("email", "")).strip(),
+        str(approver.get("contact", "")).strip(),   # generic contact field, any form rev
     ]
     if approver.get("best_time"):
         contact_parts.append(f"best time: {str(approver.get('best_time', '')).strip()}")
@@ -583,7 +594,8 @@ def normalize_portal_intake(body):
         "voice": "\n".join(p for p in voice_parts if p),
         "offers": offers_text,
         "services": _lines(offers.get("services")),
-        "pricing_rule": _lines(offers.get("exact_pricing_wording")),
+        "pricing_rule": (_lines(offers.get("exact_pricing_wording"))
+                         or _lines(offers.get("exact_price"))),   # v1 legacy name
         "audience": "\n".join(p for p in audience_parts if p),
         "proof": "\n".join(v for v in (_lines(proof.get("wins")),
                                        _lines(proof.get("verifiable_numbers"))) if v),
