@@ -30,7 +30,7 @@ from . import config, podcast_caption as _cap, podcast_index as _idx
 from . import podcast_selector as _sel
 from .drafter import Draft, DraftStatus
 
-_MAX_CLIP_ATTEMPTS = 3  # validation failures try the next clip, bounded
+_MAX_CLIP_ATTEMPTS = 12  # walk past thin/un-groundable episodes to a caption-able clip (each failure excludes the whole episode, so this converges fast)
 
 
 def _episode_asset_ids(store, episode):
@@ -168,9 +168,15 @@ def build_podcast_clip_draft(account, day_key, *, store=None, drive=None,
         caption, meta = _cap.draft_caption(episode, notes_text, feed_text=feed_text,
                                            gym_id=gym_base, allowlist_fn=allowlist_fn)
         if not caption:
+            # GROUNDABLE-BUT-THIN (2026-08-27 proof): the episode HAS grounding text
+            # (feed and/or Doc) but it yielded no usable caption (e.g. a vague/thin
+            # Doc -> no_concrete_claims). Do NOT sink the slot: exclude this episode
+            # and try the NEXT groundable clip, exactly like the no-text branch.
+            # Only a truly exhausted pool (pick_clip -> None) ends the loop.
             print(f"[podcast-builder] ep {episode}: caption could not ground "
-                  f"({(meta or {}).get('reason')}); slot not staged")
-            return None
+                  f"({(meta or {}).get('reason')}); trying the next groundable clip")
+            tried.extend(_episode_asset_ids(store, episode))
+            continue
 
         # Download + probe + validate. Probe data is written back either way so
         # the index converges; a clip failing the gate is rejected and the next
