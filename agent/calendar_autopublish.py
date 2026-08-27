@@ -431,58 +431,22 @@ def _clear_publish_blocked(gym_id):
 # as the client gyms (publish_client_gyms below) and every Meta-direct lasso lane
 # stands down. Flag OFF (the default) is byte-for-byte today's routing.
 
-_LASSO_ZERNIO_HOLD_KEY = "lasso_zernio_hold_alerted"
+# The hold/missing/alert helpers now live in the SHARED choke point
+# (agent/lasso_zernio_route.py) so EVERY LASSO publish lane holds identically and
+# speaks with ONE deduped alert. These thin aliases keep this module's internal
+# callers (and any test that patches them here) byte-for-byte unchanged.
+from . import lasso_zernio_route as _lzr
 
-
-def _lasso_zernio_missing():
-    """The setup pieces the LASSO-via-Zernio lane still needs on the 'lasso' gyms
-    row ([] when ready): gyms.zernio_profile_id and gyms.zernio_default_fb_page_id,
-    both stamped by `python -m agent lasso-zernio-setup`. Fail-OPEN on a read error
-    (returns []): the zernio publisher's own resolvers are the hard backstop — a
-    genuinely missing profile/page raises there, the row reverts and retries, and
-    nothing is ever dropped or sent Meta-direct."""
-    try:
-        from . import db
-        row = db.gym_get("lasso") or {}
-        missing = []
-        if not str(row.get("zernio_profile_id") or "").strip():
-            missing.append("gyms.zernio_profile_id")
-        if not str(row.get("zernio_default_fb_page_id") or "").strip():
-            missing.append("gyms.zernio_default_fb_page_id")
-        return missing
-    except Exception:
-        return []
+_LASSO_ZERNIO_HOLD_KEY = _lzr.HOLD_KEY
+_lasso_zernio_missing = _lzr.missing
 
 
 def _alert_lasso_zernio_hold(missing):
-    """ONE deduped ops alert while the armed LASSO-via-Zernio lane is HELD on
-    incomplete setup (kv-deduped; re-armed by _clear_lasso_zernio_hold once the
-    setup completes, so a future regression alerts again). Best effort; never
-    raises into the lane."""
-    try:
-        from . import db, ops_alerts
-        if db.kv_get(_LASSO_ZERNIO_HOLD_KEY):
-            return
-        db.kv_set(_LASSO_ZERNIO_HOLD_KEY, "1")
-        ops_alerts.alert(
-            "AGENT_LASSO_VIA_ZERNIO is armed but LASSO's Zernio setup is incomplete "
-            f"(missing: {', '.join(missing)}). LASSO calendar rows are HELD — nothing "
-            "is dropped and nothing falls back to Meta-direct (a fallback would "
-            "recreate the second-publisher taint in Zernio analytics). Run: "
-            "python -m agent lasso-zernio-setup")
-    except Exception:
-        pass
+    return _lzr.alert_hold(missing)
 
 
 def _clear_lasso_zernio_hold():
-    """Re-arm the deduped setup-hold alert once LASSO's Zernio setup is complete
-    (the state changed). Best effort; never raises."""
-    try:
-        from . import db
-        if db.kv_get(_LASSO_ZERNIO_HOLD_KEY):
-            db.kv_set(_LASSO_ZERNIO_HOLD_KEY, "")
-    except Exception:
-        pass
+    return _lzr.clear_hold()
 
 
 def _draft_for(row):

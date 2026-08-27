@@ -338,10 +338,26 @@ def _real_publish_fn():
         if draft is None:
             return {"error": "nothing staged to publish"}
         acct = get_account(account_key)
+        # LASSO-VIA-ZERNIO (AGENT_LASSO_VIA_ZERNIO): armed, an approve-in-chat for a
+        # LASSO account publishes through the SAME Zernio client lane, never
+        # Meta-direct (which reads as a second publisher in Zernio analytics). If the
+        # setup is incomplete, HOLD with the ONE deduped alert — no Meta-direct
+        # fallback (that would recreate the taint).
+        from . import lasso_zernio_route as _lzr
+        _via_zernio = _lzr.should_route(account_key)
+        if _via_zernio:
+            held = _lzr.held(account_key)
+            if held:
+                return {"error": "LASSO-via-Zernio setup incomplete (missing: "
+                        + ", ".join(held) + "); held, not sent Meta-direct."}
         try:
-            result = meta_publisher.publish(draft, acct)
+            if _via_zernio:
+                result = _lzr.publish(draft, acct)
+            else:
+                result = meta_publisher.publish(draft, acct)
         except Exception as e:
-            # e.g. a personal profile the Graph API cannot post to
+            # e.g. a personal profile the Graph API cannot post to, or a Zernio
+            # setup/resolver failure
             return {"error": str(e)}
         permalink = ""
         media_ids = []

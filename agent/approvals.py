@@ -21,20 +21,50 @@ from .drafter import Draft, DraftStatus
 _streak_counters: dict = {}
 
 
+class _LassoZernioPublisher:
+    """Publisher shim that routes a LASSO Slack-Approve through the SAME Zernio
+    client lane (AGENT_LASSO_VIA_ZERNIO armed) instead of meta_publisher, so a human
+    Approve on a LASSO card never sends the post Meta-direct (which would read as a
+    second publisher in Zernio analytics). Exposes the meta_publisher interface
+    handle_action relies on: .publish and .MediaNotReady.
+
+    When LASSO's Zernio setup is incomplete the lane HOLDS: fire the ONE deduped
+    alert and raise MediaNotReady, which handle_action already treats as a retryable
+    hold (card stays PENDING, "Approve again in a minute"). It NEVER falls back to
+    Meta-direct (that would recreate the taint)."""
+
+    MediaNotReady = meta_publisher.MediaNotReady
+
+    def publish(self, draft, account):
+        from . import lasso_zernio_route as _lzr
+        held = _lzr.held(account.key)
+        if held:
+            raise meta_publisher.MediaNotReady(
+                "LASSO-via-Zernio setup incomplete (missing: "
+                + ", ".join(held) + "); held, not sent Meta-direct.")
+        return _lzr.publish(draft, account)
+
+
 def _publisher_for(account):
     """Route the publish step.
 
       - Google Business Profile           -> gbp_publisher
+      - LASSO + AGENT_LASSO_VIA_ZERNIO ON -> Zernio client lane (no Meta-direct)
       - publish_route == "socialapi"      -> socialapi_publisher  (ONLY when
                                              AGENT_SOCIALAPI_ENABLED is armed)
       - everything else (IG, FB)          -> meta_publisher       (unchanged)
 
     The route flips the publish step ONLY. Drafting, approvals, gates, trust
     ladder, and calendar are identical on either lane. LASSO's accounts default
-    to meta_direct, so they never change. When the SocialAPI flag is OFF, even a
-    socialapi-routed account falls back to meta_direct."""
+    to meta_direct, so they never change UNLESS AGENT_LASSO_VIA_ZERNIO is armed,
+    which routes every LASSO publish through Zernio. When the SocialAPI flag is
+    OFF, even a socialapi-routed account falls back to meta_direct."""
     if account is not None and getattr(account, "platform", "") == Platform.GOOGLE_BUSINESS:
         return gbp_publisher
+    if account is not None:
+        from . import lasso_zernio_route as _lzr
+        if _lzr.should_route(getattr(account, "key", "")):
+            return _LassoZernioPublisher()
     if (account is not None
             and getattr(account, "publish_route", "meta_direct") == "socialapi"
             and config.socialapi_enabled()):

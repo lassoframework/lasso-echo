@@ -239,6 +239,10 @@ def _claimed_meta_publish(draft, acct):
     from . import db, ops_alerts
     from .meta_publisher import (MediaNotReady, MissingToken, NotSupported,
                                  publish)
+    # A Zernio setup/resolver failure (missing profile / connected account / FB page)
+    # raises BEFORE any network POST, so like MissingToken it means nothing published:
+    # release the claim for a clean retry rather than holding it in-flight.
+    from .zernio_publisher import ZernioPublishError
     # OUT-OF-BAND PROCESS RAIL (2026-08-27 welcome burst: /data shows NO trace
     # of the five welcome publishes — they came from an Echo process without the
     # volume, whose throwaway sqlite made every claim/dedup stamp meaningless).
@@ -249,6 +253,17 @@ def _claimed_meta_publish(draft, acct):
         print(f"[claim] {draft.draft_id} ({acct.key}) HELD: kv is not durable "
               "(no /data volume, no AGENT_DB_PATH) — an out-of-band process "
               "cannot guarantee exactly-once, so the auto lane never publishes.")
+        return ("held", None)
+    # LASSO-VIA-ZERNIO (AGENT_LASSO_VIA_ZERNIO): when armed, EVERY LASSO auto lane
+    # (auto-approve, welcome-autopublish, trust-autopublish — feeding the book,
+    # welcome, and demo draft queues) publishes through the SAME Zernio client lane
+    # instead of meta_publisher, so no LASSO post is ever Meta-direct (which reads as
+    # a second publisher in Zernio analytics and taints metrics_sync). If LASSO's
+    # Zernio setup is incomplete the lane HOLDS here with ONE deduped alert BEFORE any
+    # claim is taken — never a Meta-direct fallback (that would recreate the taint).
+    from . import lasso_zernio_route as _lzr
+    _route_via_zernio = _lzr.should_route(acct.key)
+    if _route_via_zernio and _lzr.held(acct.key):
         return ("held", None)
     state, pid = db.socialapi_claim(draft.draft_id, acct.key)
     if state == "done":
@@ -275,10 +290,18 @@ def _claimed_meta_publish(draft, acct):
                 "(db.socialapi_claim_release) and re-run.")
         return ("held", None)
     try:
-        result = publish(draft, acct)
-    except (MissingToken, NotSupported, MediaNotReady):
-        # Definitely nothing published (pre-network / container-never-finished):
-        # release so a genuine retry can proceed.
+        # Flag ON + LASSO -> the Zernio client lane; else the Meta-direct publisher,
+        # byte-for-byte today. Exactly-once is unchanged: the socialapi_claim above
+        # still guards the send, and Zernio's own 24h content-hash dedup (409 ->
+        # mode="published") is a second belt so a claim that survives a crash can
+        # never double-post on the Zernio side either.
+        if _route_via_zernio:
+            result = _lzr.publish(draft, acct)
+        else:
+            result = publish(draft, acct)
+    except (MissingToken, NotSupported, MediaNotReady, ZernioPublishError):
+        # Definitely nothing published (pre-network / container-never-finished /
+        # Zernio setup unresolvable): release so a genuine retry can proceed.
         db.socialapi_claim_release(draft.draft_id, acct.key)
         raise
     except Exception:
