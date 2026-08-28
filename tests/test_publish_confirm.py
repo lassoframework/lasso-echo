@@ -318,3 +318,91 @@ def test_real_publish_failure_still_alerts_loudly(monkeypatch):
     loud = [n for n in alerts.notices if "publish attempt failed" in n]
     assert len(loud) == 1                             # the REAL alarm, unchanged
     assert "post itself is live" not in loud[0]       # never the soft wording
+
+
+# ===========================================================================
+# LASSO-VIA-ZERNIO lane: verify on the lane that published (2026-08-28 false alarm)
+# ===========================================================================
+class _ZResult(Result):
+    def __init__(self, media_id="6a91b873230f019b69728f59", permalink=""):
+        super().__init__(mode="published", media_id=media_id)
+        self.permalink = permalink
+
+
+class FakeZernioClient:
+    """Recording Zernio read fake; any write attempt fails the test."""
+    payload = {"post": {"status": "published", "postUrls": {}}}
+    raises = None
+    calls = []
+
+    def __init__(self):
+        pass
+
+    def get_post(self, post_id):
+        FakeZernioClient.calls.append(post_id)
+        if FakeZernioClient.raises:
+            raise FakeZernioClient.raises
+        return FakeZernioClient.payload
+
+
+def _arm_zernio(monkeypatch, payload=None, raises=None):
+    _arm(monkeypatch)
+    from agent import lasso_zernio_route as _lzr
+    from agent import zernio as _z
+    monkeypatch.setattr(_lzr, "should_route", lambda key: True)
+    FakeZernioClient.payload = payload if payload is not None else {
+        "post": {"status": "published", "postUrls": {}}}
+    FakeZernioClient.raises = raises
+    FakeZernioClient.calls = []
+    monkeypatch.setattr(_z, "ZernioClient", FakeZernioClient)
+
+
+def test_zernio_lane_verifies_via_zernio_never_graph(monkeypatch):
+    """A Zernio-lane publish returns a ZERNIO id; reading it from the Graph 4xxs
+    while the post is live (the lasso_fb false alarm). The confirm must read
+    Zernio instead and NEVER touch the Graph."""
+    _arm_zernio(monkeypatch)
+    _kv_delete("verify_noted_d1")
+    poster = RecordingPoster()
+    out = publish_confirm.confirm_publish(
+        _draft(), _acct(Platform.FACEBOOK_PAGE, key="lasso_fb"), _ZResult(),
+        http=ExplodingHTTP(), poster=poster)  # Graph call would explode
+    assert out["verified"] is True
+    assert FakeZernioClient.calls == ["6a91b873230f019b69728f59"]
+    assert any("LIVE" in t for (_, _, t) in poster.replies)
+    assert not any("could not confirm" in t for (_, _, t) in poster.replies)
+
+
+def test_zernio_lane_uses_result_permalink_when_present(monkeypatch):
+    _arm_zernio(monkeypatch)
+    _kv_delete("verify_noted_d1")
+    poster = RecordingPoster()
+    out = publish_confirm.confirm_publish(
+        _draft(), _acct(Platform.FACEBOOK_PAGE, key="lasso_fb"),
+        _ZResult(permalink="https://facebook.com/lasso/posts/123"),
+        http=ExplodingHTTP(), poster=poster)
+    assert out == {"verified": True, "permalink": "https://facebook.com/lasso/posts/123"}
+    assert any(t == "LIVE: https://facebook.com/lasso/posts/123"
+               for (_, _, t) in poster.replies)
+
+
+def test_zernio_lane_pending_status_is_soft_unconfirmed(monkeypatch):
+    _arm_zernio(monkeypatch, payload={"post": {"status": "pending"}})
+    _kv_delete("verify_noted_d1")
+    poster = RecordingPoster()
+    out = publish_confirm.confirm_publish(
+        _draft(), _acct(Platform.FACEBOOK_PAGE, key="lasso_fb"), _ZResult(),
+        http=ExplodingHTTP(), poster=poster)
+    assert out["verified"] is False
+    assert any("could not confirm" in t for (_, _, t) in poster.replies)
+
+
+def test_zernio_lane_read_error_is_soft_unconfirmed(monkeypatch):
+    _arm_zernio(monkeypatch, raises=RuntimeError("boom"))
+    _kv_delete("verify_noted_d1")
+    poster = RecordingPoster()
+    out = publish_confirm.confirm_publish(
+        _draft(), _acct(Platform.FACEBOOK_PAGE, key="lasso_fb"), _ZResult(),
+        http=ExplodingHTTP(), poster=poster)
+    assert out["verified"] is False
+    assert any("could not confirm" in t for (_, _, t) in poster.replies)

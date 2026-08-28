@@ -86,6 +86,20 @@ def confirm_publish(draft, account, result, http=None, poster=None):
     if not media_id:
         return _unconfirmed(poster, draft, account, "publish returned no media id")
 
+    # LASSO-VIA-ZERNIO: a Zernio-lane publish returns a ZERNIO post id, not a Meta
+    # node id — reading it back from the Graph API 4xxs on EVERY publish while the
+    # post is perfectly live (the 2026-08-28 lasso_fb false alarm). Verify on the
+    # lane that published: read the post back from Zernio; status 'published' is
+    # the existence proof. Same guarantees: one read-only GET, soft note on any
+    # failure, never re-publish.
+    try:
+        from . import lasso_zernio_route as _lzr
+        _zernio_lane = _lzr.should_route(getattr(account, "key", ""))
+    except Exception:
+        _zernio_lane = False
+    if _zernio_lane:
+        return _confirm_via_zernio(poster, draft, account, result, media_id)
+
     token = account.get_token()
     if not token:
         return _unconfirmed(poster, draft, account,
@@ -129,4 +143,40 @@ def confirm_publish(draft, account, result, http=None, poster=None):
         _reply(poster, draft,
                f"LIVE on {account.key}: post verified (id {media_id}).")
     _audit("verified live", draft, permalink or f"id {media_id}")
+    return {"verified": True, "permalink": permalink}
+
+
+def _confirm_via_zernio(poster, draft, account, result, media_id, client=None):
+    """Zernio-lane verification: GET /v1/posts/{id} (read-only) and treat
+    status == 'published' as the existence proof. The permalink comes from the
+    publish result when Zernio returned one, else the post's postUrls when
+    present (often empty right after publish — the honest no-permalink reply is
+    used then). Any read failure is the same soft _unconfirmed note; never a
+    re-publish, never an ops alarm."""
+    try:
+        if client is None:
+            from . import zernio as _z
+            client = _z.ZernioClient()
+        post = (client.get_post(media_id) or {}).get("post") or {}
+    except Exception as e:
+        return _unconfirmed(poster, draft, account,
+                            f"zernio read back errored: {type(e).__name__}")
+    status = str(post.get("status") or "").lower()
+    if not post or not status:
+        return _unconfirmed(poster, draft, account,
+                            "zernio read back returned no post")
+    if status not in ("published", "posted"):
+        return _unconfirmed(poster, draft, account,
+                            f"zernio post status is '{status}'")
+    permalink = (getattr(result, "permalink", "") or "").strip()
+    if not permalink:
+        urls = post.get("postUrls") or {}
+        if isinstance(urls, dict):
+            permalink = next((str(v) for v in urls.values() if v), "")
+    if permalink:
+        _reply(poster, draft, f"LIVE: {permalink}")
+    else:
+        _reply(poster, draft,
+               f"LIVE on {account.key}: post verified via Zernio (id {media_id}).")
+    _audit("verified live (zernio)", draft, permalink or f"id {media_id}")
     return {"verified": True, "permalink": permalink}
