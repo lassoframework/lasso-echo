@@ -6,7 +6,64 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+---
+
+## Story Studio: raw footage -> finished stories (2026-08-28, feat/story-studio)
+
+Spec: ECHO_STORY_STUDIO_BUILD.md (scratchpad). Builds the four missing pieces on
+top of what exists (clipping via opus_factory/clipper_render stays DISARMED after
+EP124; story formatting AGENT_STORY_FORMAT stays live). Everything staged lands
+PENDING; the human tap is untouched. Suite green (104 story+sync tests; full suite
+3835 passed, 1 pre-existing env-only failure in test_clipper_phase0 unrelated to
+this work). NOT armed, NOT pushed.
+
+### [~] Classifier + "Sort these" queue + re-ingest guard (STORY_CLASSIFIER, default ON)
+  - agent/story_classifier.py: raw/finished/ambiguous, intent-beats-inference
+    (declared lane wins), signals (OCR burned text, 9:16 3-60s, 16:9/>90s,
+    camera-native filename, cut density), re-ingest guard overrides all.
+  - agent/story_ledger.py: render_ledger (Supabase + kv fallback), idempotent,
+    is_echo_render membership test. Wired into agent/jobs/sync_gym_media.py
+    (_drop_reingested drops Echo's own renders before insert).
+  - agent/story_sort_queue.py: ambiguous never auto-staged -> queue + coach digest
+    (fires only when non-empty). Classifier wired into the sync path (_sort_ambiguous
+    over post-probe rows) so ambiguous media reaches a human, zero silent guesses.
+
+### [~] Roxx overlay standard (extends AGENT_STORY_FORMAT)
+  - agent/story_overlay.py: ALL-CAPS, <=8 words/line + <=2 lines/frame (3rd -> next
+    frame), safe zones (top 250 / bottom 310 of 1080x1920), ~4.5:1 contrast scrim,
+    identity anchor, stat/event cards, copy_gate + avatar rail on overlay copy,
+    EXACTLY ONE ask frame enforced (assert_one_ask_frame; body carries zero asks).
+  - agent/post_quality.py: avatar_breach now per-gym (config.story_hyrox_avatar_gyms
+    allowlists a hyrox-avatar client; no gym arg = original all-gyms behavior).
+
+### [~] Music bed + multi-clip composer
+  - agent/story_music.py: LICENSED chart-STYLE bed burned in (NOT trending IG audio,
+    stated on the card). Default HIGH ENERGY hype; never defaults to chill; 'none'
+    carries neither track_id nor license_ref; empty shelf HOLDS (never silent).
+  - agent/story_composer.py: input caps (<=5min AND <=900MB else route to Opus),
+    2-6 segments 3-15s each total 15-60s, tenant assertion on EVERY segment, all
+    heavy ffmpeg steps injectable (HOLDS on a missing renderer, never crashes).
+  - agent/story_templates.py: five templates (athlete_stat, member_win, event,
+    class_promo, hype_montage); vision picks default, lane/brief overrides.
+
+### [~] Portal "Create a Story" lane (STORY_STUDIO_RENDER, default OFF; pilot allowlist)
+  - agent/story_studio.py: create_story orchestrator -> PENDING draft or honest
+    HOLD; deny returns segments to the pool + logs. story_studio_store.py mirrors
+    the media store (PostgREST, offline-testable).
+  - agent/story_studio_routes.py: (status, body) handlers — create / deny / list
+    sort queue / resolve. Footage picker REUSES gym_media_routes.handle_list_assets.
+  - migrations/story_studio_20260828.sql: story_request + story_render +
+    render_ledger + story_sort_queue. ARMING STEP: apply BY HAND (not auto-run).
+
+Deferred / flagged (unanswered = GAP): (1) .env.example flag docs not added
+(permission-blocked file; flags fully documented in config.py docstrings). (2) the
+composer's ffmpeg render primitives (loudness/color normalize, concat, brand
+end-frame burn of the ask_frame) bind clipper_render lazily and HOLD offline —
+real-render parity needs an armed-env pass. (3) route handlers exist but are not
+yet mounted in the intake_web HTTP router (surface built, not exposed) — needs a
+Blake ruling before mounting since the lane is a pilot.
 
 ---
 

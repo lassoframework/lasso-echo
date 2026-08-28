@@ -47,6 +47,65 @@ _OWNED_FIELDS = ("kind", "title", "mime_type", "size_bytes", "content_hash",
 _STAGGER_SEC = 30.0
 
 
+def _drop_reingested(rows, gym_id, log):
+    """Split (kept, skipped_titles): drop any row whose content_hash is one of Echo's
+    own past Story renders (the re-ingest guard). Never raises: a ledger failure keeps
+    the row (fail open on the guard is safe — the worst case is the file is treated as
+    normal media, never a silent repost, because staging still runs every A+ gate)."""
+    try:
+        from .. import story_ledger
+    except Exception:  # noqa: BLE001
+        return rows, []
+    kept, skipped_titles = [], []
+    for r in rows:
+        ch = r.get("content_hash")
+        try:
+            is_echo = bool(ch) and story_ledger.is_echo_render(ch)
+        except Exception as e:  # noqa: BLE001
+            log(f"re-ingest guard lookup failed for {r.get('title')!r}: "
+                f"{type(e).__name__}: {e}")
+            is_echo = False
+        if is_echo:
+            skipped_titles.append(r.get("title") or r.get("id") or "")
+            log(f"re-ingest guard: skipping {r.get('title')!r} for {gym_id} "
+                f"(content_hash matches an Echo Story render; never re-ingested)")
+        else:
+            kept.append(r)
+    return kept, skipped_titles
+
+
+def _sort_ambiguous(assets, gym_id, log):
+    """STORY_CLASSIFIER pass (default ON, spec §0): classify every freshly-indexed
+    asset raw / finished / ambiguous and enqueue the AMBIGUOUS ones into the
+    "Sort these" queue for a human (never auto-decided). Returns the count enqueued.
+
+    It ONLY sorts — it posts nothing, stages nothing, composes nothing. A declared
+    upload lane / Drive folder mapping would override the classifier (intent beats
+    inference), but the nightly Drive walk has no per-file declaration, so unmapped
+    files run the inference path here. Signals come from row metadata alone
+    (title/aspect/duration/content_hash), offline-safe: an unprobed video with no
+    strong signal correctly lands AMBIGUOUS (fail toward the human), never a wrong
+    guess. Best effort: a classifier / queue failure never sinks the sync."""
+    if not config.story_classifier_enabled():
+        return 0
+    try:
+        from .. import story_classifier as _sc, story_sort_queue as _q
+    except Exception:  # noqa: BLE001
+        return 0
+    enqueued = 0
+    for a in assets:
+        try:
+            sig = _sc.gather_signals(a)                 # metadata only (no OCR/probe here)
+            verdict = _sc.classify(sig)                 # ledger guard runs inside classify
+            if verdict.verdict == _sc.AMBIGUOUS:
+                if _q.enqueue(gym_id, a.get("id") or "", reasons=verdict.reasons):
+                    enqueued += 1
+        except Exception as e:  # noqa: BLE001 - one bad file never sinks the sort
+            log(f"classifier sort failed for {a.get('title')!r}: "
+                f"{type(e).__name__}: {e}")
+    return enqueued
+
+
 def _post_digest(text, channel=None, poster=None):
     """Best-effort one-liner to the gym's coach channel (or #ops when none)."""
     try:
@@ -149,6 +208,16 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     # 2. classify + dedupe
     rows, skipped = _idx.build_rows(files, source_id, gym_id, now_iso=now_iso, log=log)
 
+    # 2b. RE-INGEST GUARD (Story Studio §0 / the EP124 lesson): a file whose
+    # content_hash matches one of Echo's OWN past Story renders was saved back into
+    # the client's Drive by the coach. It must NEVER be re-indexed as raw media (or
+    # Echo would eat its own output and repost it). Drop those rows here, before
+    # insert, and log the skip. Uses the shared render_ledger (Supabase, kv
+    # fallback); a not-configured ledger returns False (no skip), so this is inert
+    # until the first Story render is recorded.
+    rows, reingest_skipped = _drop_reingested(rows, gym_id, log)
+    skipped += [(t, "echo_render_reingest_skipped") for t in reingest_skipped]
+
     existing = {a["id"]: a for a in store.list_assets(gym_id, source_id=source_id)}
     seen_ids = {r["id"] for r in rows}
 
@@ -221,10 +290,14 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         el, reason, label = _idx.video_eligibility(
             asset.get("size_bytes"), info["duration_sec"], info["width"],
             info["height"])
-        store.update_asset(asset["id"], {
+        probe_fields = {
             "duration_sec": info["duration_sec"], "width": info["width"],
             "height": info["height"], "aspect": label,
-            "eligible": el, "reject_reason": reason, "indexed_at": now_iso})
+            "eligible": el, "reject_reason": reason, "indexed_at": now_iso}
+        store.update_asset(asset["id"], probe_fields)
+        # reflect the probe back onto the local merged view so the classifier sort
+        # (6b) sees real aspect + duration, not the pre-probe NULLs.
+        asset.update(probe_fields)
         probed += 1
         if el:
             newly_eligible += 1
@@ -235,6 +308,14 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         if r.get("eligible") is False and r.get("reject_reason"):
             reject_counts[r["reject_reason"]] += 1
 
+    # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
+    # finished / ambiguous and queue the ambiguous ones for a human. Uses the
+    # post-probe view (merged) so a probed video classifies on real aspect/duration.
+    # Only NEW rows are sorted (a re-sync never re-queues a file a coach already
+    # resolved). Sorts only; posts/stages/composes nothing.
+    to_sort = [merged.get(r["id"], r) for r in new_rows]
+    queued_ambiguous = _sort_ambiguous(to_sort, gym_id, log)
+
     photos = sum(1 for r in rows if r["kind"] == _idx.KIND_PHOTO)
     videos = sum(1 for r in rows if r["kind"] == _idx.KIND_VIDEO)
     summary = {
@@ -242,7 +323,8 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         "photos": photos, "videos": videos, "inserted": inserted,
         "updated": updated, "probed": probed, "newly_eligible": newly_eligible,
         "removed": removed, "skipped": len(skipped),
-        "rejected": dict(reject_counts), "new_rows": len(new_rows)}
+        "rejected": dict(reject_counts), "new_rows": len(new_rows),
+        "queued_ambiguous": queued_ambiguous}
     # 7. per-gym new-asset digest (only when something new arrived)
     if inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \
@@ -253,6 +335,15 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             f"ready to use, rejected: {rejected_txt}. Review or hide any in the "
             f"portal media tab.",
             channel=_coach_channel(gym_id))
+    # "Sort these" coach digest (spec §0.3): fires ONLY when the queue is non-empty.
+    # story_sort_queue.post_digest is a no-op on an empty queue, so this never
+    # storms the channel. Best effort: a digest failure never sinks the sync.
+    if config.story_classifier_enabled():
+        try:
+            from .. import story_sort_queue as _q
+            _q.post_digest(gym_id, channel=_coach_channel(gym_id))
+        except Exception as e:  # noqa: BLE001
+            log(f"sort-queue digest skipped for {gym_id}: {type(e).__name__}: {e}")
     return summary
 
 
