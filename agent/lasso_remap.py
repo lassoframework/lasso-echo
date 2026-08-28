@@ -69,6 +69,19 @@ def remap(gym_id="lasso", *, month=None, write=False, store=None, logger=None) -
 
     start = _month_start(month)
     days = _days_for(start, month)
+    # HARD PLANNING HORIZON (Blake, 2026-08-28): a remap may not build past one month
+    # out — the monthly relearn rebuilds it anyway. Clamped HERE (not only inside
+    # plan_and_build) so the delete/reconcile span (plan_span_months below) matches
+    # the clamped build span and a far month's existing rows are never touched. A
+    # --month entirely beyond the horizon is refused honestly.
+    from .plan_horizon import horizon_clamp
+    days = horizon_clamp(start, days, logger=log, label=f"{gym_id} remap")
+    if days <= 0:
+        log("the requested month is entirely beyond the planning horizon; nothing "
+            "remapped (Echo builds at most one month out)")
+        return {"ok": False, "reason": "requested month is beyond the plan horizon",
+                "video_mix": config.lasso_video_mix_enabled(),
+                "built": 0, "upserted": 0, "deleted": 0}
     acct_key = gym_id if str(gym_id).endswith(("_ig", "_fb")) else f"{gym_id}_ig"
 
     drafts = _rmr.plan_and_build(acct_key, start, days)

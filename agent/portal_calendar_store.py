@@ -997,6 +997,17 @@ class SupabaseCalendarStore:
         # (never silently shipped); the slot refills on the next plan pass (the
         # planner re-drafts under the same rule, so cadence never gaps). STORY
         # rows are exempt from both (empty body / shared caption by design).
+        # HARD PLANNING HORIZON BELT (Blake, 2026-08-28; default ON — it PREVENTS
+        # spend): no lane may STAGE a row more than one month past today, because
+        # Echo's monthly relearn rebuilds it before it ever posts (pure token waste).
+        # Runs even when a caller forgot the span clamp. Dated real-world rows are
+        # EXEMPT (event_id set, or the LASSO summit/book/welcome dated lanes — narrow
+        # by design). Dropped rows get ONE summary log/alert line per batch (digest
+        # pattern), never per-row spam, never silent. Existing rows are untouched:
+        # this filters the incoming batch only, it never deletes anything.
+        # AGENT_PLAN_HORIZON_DAYS=0 disables (emergency escape hatch).
+        from .plan_horizon import belt_filter as _horizon_belt
+        payload, _ = _horizon_belt(account_key, payload)
         payload = _stage_belts(account_key, payload)
         if not payload:
             return []

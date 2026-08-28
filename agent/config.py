@@ -2950,6 +2950,25 @@ def story_hyrox_avatar_gyms() -> set:
     return {p.strip().lower() for p in raw.split(",") if p.strip()}
 
 
+def plan_horizon_days() -> int:
+    """The HARD planning-horizon cap in days (Blake, 2026-08-28): no plan / backfill /
+    remap path may BUILD or STAGE a content_calendar row more than this many days past
+    today. Echo's monthly retro relearns and rebuilds every forward plan, so anything
+    drafted further out is recreated before it ever posts — pure token waste.
+
+    Default 31 (one full month). Override with AGENT_PLAN_HORIZON_DAYS to raise or
+    lower the NUMBER; 0 disables the cap entirely (emergency escape hatch only — the
+    flag exists to tune the horizon, not to abandon the principle). Dated real-world
+    rows (event arcs, the LASSO summit/book/welcome dated lanes) are exempt at the
+    insert belt (agent/plan_horizon.py), not here. Approved/published rows are never
+    touched by the cap: it governs what gets built, never a retroactive sweep."""
+    try:
+        val = int(os.environ.get("AGENT_PLAN_HORIZON_DAYS", "31"))
+    except (TypeError, ValueError):
+        val = 31
+    return max(0, val)
+
+
 def story_studio_music_shelf() -> str:
     """The DEFAULT music shelf for a Story render when a template does not name one
     (STORY_STUDIO_MUSIC_SHELF, default 'hype'). Blake's rule: the default is HIGH

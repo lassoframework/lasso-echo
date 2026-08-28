@@ -252,6 +252,17 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
     real_month_planner.apply_month_plan (same flag)."""
     if not config.real_month_plan_enabled():
         return []
+    # HARD PLANNING HORIZON (Blake, 2026-08-28): the LASSO month builds at most one
+    # month past today, like every other lane — the monthly relearn rebuilds anything
+    # further out. Dated summit/book/welcome rows INSIDE the clamped span still plan
+    # normally; the sprint days beyond it are picked up by the next month's build
+    # when their window arrives (and the dated-lane belt exemption in
+    # portal_calendar_store lets the dated queues stage past the horizon when they
+    # legitimately do). One log line on clamp; AGENT_PLAN_HORIZON_DAYS=0 disables.
+    from .plan_horizon import horizon_clamp
+    days = horizon_clamp(start_date, days, logger=logger, label=account_key)
+    if days <= 0:
+        return []
     acct = account
     if acct is None:
         from . import accounts as _accts
