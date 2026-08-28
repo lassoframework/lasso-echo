@@ -510,6 +510,29 @@ def gym_get(account_key, conn=None):
         return _get(c)
 
 
+def gym_key_for_zernio_profile(zernio_profile_id, conn=None):
+    """The account_key currently bound to `zernio_profile_id`, or None. Used by the
+    cross-tenant bind guard (account_key_guard) to detect a profile already owned by a
+    DIFFERENT gym before a second bind wires one gym's posts onto another gym's socials.
+    When more than one row somehow holds the same id, returns the lowest account_key
+    (deterministic). Read-only; accepts an optional open connection."""
+    pid = (str(zernio_profile_id) if zernio_profile_id is not None else "").strip()
+    if not pid:
+        return None
+
+    def _get(c):
+        row = c.execute(
+            "SELECT account_key FROM gyms WHERE zernio_profile_id = ? "
+            "ORDER BY account_key LIMIT 1", (pid,)
+        ).fetchone()
+        return (dict(row)["account_key"] if row else None)
+
+    if conn is not None:
+        return _get(conn)
+    with connect() as c:
+        return _get(c)
+
+
 def gym_list(conn=None):
     """Returns all gyms rows as list of dicts, ordered by account_key.
     Accepts an optional open connection."""

@@ -193,6 +193,8 @@ def _status():
     print(f"  draft_on_upload: {config.draft_on_upload_enabled()}  (env AGENT_DRAFT_ON_UPLOAD)")
     print(f"  intake_sync    : {config.social_intake_sync_enabled()}  (env AGENT_SOCIAL_INTAKE_SYNC)")
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
+    print(f"  acctkey_guard  : {config.account_key_guard_enabled()}  (env AGENT_ACCOUNT_KEY_GUARD; refuse a cross-tenant account_key -> Zernio profile rebind at _persist_profile_id + fire one ops alert; OFF => today's bind behaviour unchanged)")
+    print(f"  acctkey_reconc : {config.account_key_reconcile_enabled()}  (env AGENT_ACCOUNT_KEY_RECONCILE; gates the account-key reconciler's --apply WRITE only; OFF => even --apply is a dry-run; the plan always reads)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
@@ -858,6 +860,7 @@ _COMMANDS = {
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
         ("zernio-reverify", "read a gym's TRUE Zernio state and overwrite the poisoned portal cache, repairing ever_connected (--account <key> | --all)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
+        ("account-key-reconcile", "find gyms with the social product but a missing/duplicate/collided account_key; print a canonical-key PLAN (dry-run) — (--gym <gym_id> | --all) [--apply]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
@@ -2776,6 +2779,15 @@ def main(argv=None):
                 raise SystemExit(1)
         else:
             print("usage: python -m agent zernio-reverify (--account <key> | --all)")
+    elif cmd == "account-key-reconcile":
+        # ACCOUNT-KEY RECONCILER: find gyms with the social product but a missing/duplicate/
+        # collided account_key, compute the CANONICAL key, and print a PLAN. Dry-run by
+        # default; --apply writes (and even then only when AGENT_ACCOUNT_KEY_RECONCILE is armed).
+        # Never merges two gyms, never deletes a Zernio profile, idempotent. Run on the worker
+        # (Supabase creds live there):
+        #   railway run /opt/venv/bin/python -m agent account-key-reconcile --all
+        from . import account_key_reconcile as _akr
+        _akr.cli(argv[1:])
     elif cmd == "lasso-zernio-setup":
         # LASSO-via-Zernio setup (AGENT_LASSO_VIA_ZERNIO): stamp the 'lasso' gyms row
         # with its Zernio profile id + Facebook page (auto-pick, or --page <id> when

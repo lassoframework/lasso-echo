@@ -986,6 +986,23 @@ def zernio_enabled() -> bool:
     return bool((os.environ.get(ZERNIO_API_KEY_ENV) or "").strip())
 
 
+def account_key_guard_enabled() -> bool:
+    """Cross-tenant account_key -> Zernio profile bind guard (account_key_guard.py).
+    OFF by default: ships dark so it is armed by hand once its refusals are trusted.
+    When OFF, check_bind always ALLOWS and today's bind behaviour is unchanged. When ON,
+    a bind that would rebind a key across tenants (repoint a key to a new profile, or bind
+    a profile already owned by a different gym) is BLOCKED and one loud ops alert fires."""
+    return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_GUARD", "false"))
+
+
+def account_key_reconcile_enabled() -> bool:
+    """The account-key reconciler's WRITE path (account_key_reconcile.py --apply).
+    OFF by default: even `--apply` is a no-op with the flag dark, so the sweep ships as a
+    dry-run-only tool until Blake arms the writer by hand. The DRY-RUN plan always runs
+    (reads only); only the write is gated."""
+    return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_RECONCILE", "false"))
+
+
 def portal_public_base_url() -> str:
     """The LASSO portal's public origin, used as the post-OAuth return target for a
     social CONNECT so the gym owner lands back in the portal (never on the Zernio

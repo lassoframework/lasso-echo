@@ -606,21 +606,83 @@ class SupabaseCalendarStore:
     # time; read first in _resolve_profile_id, so status no longer depends on the ephemeral
     # web volume. Mirrors gym_autonomy exactly (gyms.slug -> id -> echo_gym_settings).
 
+    def resolve_gym_uuid(self, base):
+        """The gyms.id UUID for an account-registry BASE, or None. THE base != slug bug
+        (topfuel/district_h/hillcountry, live 2026-08-28): the account registry keys by a
+        base STRING (topfuel), but gyms.slug is a hyphenated human slug (top-fuel), so the
+        old `gyms?slug=eq.<base>` string-identity lookup silently missed and every
+        base->settings/snapshot op no-op'd. This is the ONE canonical base->uuid resolver
+        every shared-plane path (status resolve, profile-id writer, reverify) shares.
+
+        Match order (first hit wins):
+          1. exact slug == base (eng/gritx, where base == slug by luck);
+          2. NORMALISED slug == normalised base (strip hyphens/underscores, lowercase):
+             'topfuel' matches 'top-fuel', 'district_h' matches 'district-h', 'hillcountry'
+             matches 'hill-country';
+          3. exact id == base (a base that is already a UUID).
+        ARCHIVED / DUP rows are NEVER returned: any gym whose slug ends '-archived-dup' or
+        whose name notes 'archived'/'do not use' is skipped, so a bind can never land on the
+        district-h-archived-dup ghost. Returns None (never guesses) when nothing clean matches.
+        Read-only. Never raises out (a lookup failure is an honest None)."""
+        base = (str(base) if base is not None else "").strip()
+        if not base:
+            return None
+
+        def _norm(s):
+            return "".join(c for c in (s or "").lower() if c.isalnum())
+
+        def _is_archived(row):
+            slug = (row.get("slug") or "").lower()
+            name = (row.get("name") or "").lower()
+            return ("archived" in slug or "-dup" in slug or "archived" in name
+                    or "do not use" in name)
+
+        try:
+            # exact slug, then exact id — cheap direct hits.
+            for column in ("slug", "id"):
+                r = self._client().get(
+                    self._rest("gyms"),
+                    params={column: f"eq.{base}", "select": "id,slug,name"},
+                    headers=self._headers(), timeout=30)
+                if r.status_code >= 400:
+                    continue
+                rows = [x for x in (r.json() or []) if not _is_archived(x)]
+                if rows and rows[0].get("id"):
+                    return rows[0]["id"]
+            # normalised slug match: pull the (small) gyms list and compare normalised.
+            r = self._client().get(
+                self._rest("gyms"),
+                params={"select": "id,slug,name"},
+                headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                return None
+            target = _norm(base)
+            clean = [x for x in (r.json() or []) if not _is_archived(x) and x.get("id")]
+            # tier 2a: EXACT normalised slug match ('topfuel' == norm('top-fuel')).
+            exact = [x for x in clean if _norm(x.get("slug")) == target]
+            if len(exact) == 1:
+                return exact[0]["id"]
+            if len(exact) > 1:
+                return None  # ambiguous -> refuse to guess
+            # tier 2b: PREFIX/containment ('district_h' -> 'district-h-strength-fitness',
+            # 'birddog' -> 'bird-dog-crossfit'). Only when EXACTLY ONE clean gym's normalised
+            # slug starts with the normalised base (or the base starts with the slug). A
+            # unique containment is a confident map; anything else is left None (never a guess).
+            if target:
+                contain = [x for x in clean
+                           if _norm(x.get("slug")).startswith(target)
+                           or target.startswith(_norm(x.get("slug")))]
+                if len(contain) == 1:
+                    return contain[0]["id"]
+            return None
+        except Exception:  # noqa: BLE001 - a resolver failure is an honest None, never a crash
+            return None
+
     def gym_zernio_profile_id(self, gym_slug):
         """The gym's stored zernio_profile_id from the shared plane, or None when the
-        gym or its settings row is absent / carries no id. Read-only, gym-scoped."""
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        if not rows:
-            return None
-        gym_uuid = rows[0].get("id")
+        gym or its settings row is absent / carries no id. Read-only, gym-scoped.
+        Resolves the base->uuid via resolve_gym_uuid so base != slug gyms are found."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return None
         r2 = self._client().get(
@@ -649,16 +711,7 @@ class SupabaseCalendarStore:
         pid = str(zernio_profile_id or "").strip()
         if not pid:
             return False
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        gym_uuid = (rows[0].get("id") if rows else None)
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return False
         payload = {"gym_id": gym_uuid, "zernio_profile_id": pid}
@@ -685,18 +738,12 @@ class SupabaseCalendarStore:
         gym's platform to the TRUE Zernio state, overwriting the poisoned not_connected
         the 6h cron wrote. When a platform is genuinely connected now, mark_ever_connected
         repairs ever_connected=true so the portal's reconcileWithPriorConnection rescue
-        works again. No-op (returns None) when the gym/row is absent. Gym-scoped."""
-        g = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(), timeout=30,
-        )
-        if g.status_code >= 400:
-            raise PortalStoreError(g.status_code, _scrub((g.text or "")[:200]))
-        grows = g.json() or []
-        if not grows or not grows[0].get("id"):
+        works again. No-op (returns None) when the gym/row is absent. Gym-scoped.
+        Resolves base->uuid via resolve_gym_uuid so base != slug gyms (topfuel, district_h,
+        hillcountry) actually resolve instead of silently missing on the string-identity lookup."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
+        if not gym_uuid:
             return None
-        gym_uuid = grows[0]["id"]
         body = {"state": state, "handle": handle}
         if mark_ever_connected:
             body["ever_connected"] = True
