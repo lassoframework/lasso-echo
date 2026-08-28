@@ -26,6 +26,7 @@ content_calendar row + story_render row.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 # Input caps (spec §3): what may enter the STORY lane vs route to the Opus reel lane.
@@ -219,6 +220,11 @@ def render_compose(plan, *, output_dir, ask_frame_text="",
         normalize_fn = normalize_fn or _default_normalize
         assemble_fn = assemble_fn or _default_assemble
         end_frame_fn = end_frame_fn or _default_end_frame
+        # A licensed bed defaults to the real ffmpeg burn (amix under the video
+        # audio). An injected music_burn_fn still overrides; music_path='' (a 'none'
+        # selection) skips the burn entirely.
+        if music_path and music_burn_fn is None:
+            music_burn_fn = _default_music_burn
 
         reframed = [reframe_fn(seg, output_dir) for seg in plan.segments]
         normalized = normalize_fn(reframed)
@@ -248,18 +254,50 @@ def _default_reframe(segment, out_dir):
 
 
 def _default_normalize(paths):
-    """Loudness + color normalize across segments (different phones). Deferred to the
-    real ffmpeg lane; offline it is a no-op pass-through of the paths (the render is
-    only genuinely correct with ffmpeg present, which is why the default path raises
-    inside reframe first when ffmpeg is absent)."""
-    return list(paths)
+    """Loudness (EBU R128) + color normalize per segment across phones (spec §3).
+    Real ffmpeg: loudnorm=I=-16:TP=-1.5:LRA=11 + a color normalize, re-encoded
+    H.264/AAC so every segment shares one loudness + codec profile before concat.
+    Reuses clipper_render's ffmpeg guard (raises when the render flag is OFF or
+    ffmpeg is absent -> the compose HOLDS honestly, never a silent bad render)."""
+    from . import clipper_render
+    clipper_render._require_render()
+    out = []
+    for p in paths:
+        root, ext = os.path.splitext(p)
+        dst = f"{root}_norm{ext or '.mp4'}"
+        clipper_render._run([
+            clipper_render._ffmpeg(), "-y", "-i", p,
+            "-vf", "normalize=blackpt=black:whitept=white",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-c:v", "libx264", "-crf", "22", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "128k",
+            dst,
+        ], "story_normalize")
+        out.append(dst)
+    return out
 
 
 def _default_assemble(paths, out_dir):
-    from . import clipper_render  # noqa: F401 - ensures ffmpeg guard is consistent
-    # A real concat is built by the ffmpeg lane; the default binds the same guard so
-    # an ffmpeg-absent env HOLDS at reframe before reaching here.
-    return f"{out_dir}/story_assembled.mp4"
+    """Concat the normalized 9:16 segments into one montage (real ffmpeg concat
+    demuxer; the segments share a codec + size profile after _default_normalize).
+    Reuses clipper_render's ffmpeg guard so an ffmpeg-absent env HOLDS."""
+    from . import clipper_render
+    clipper_render._require_render()
+    os.makedirs(out_dir, exist_ok=True)
+    listfile = os.path.join(out_dir, "story_concat.txt")
+    with open(listfile, "w", encoding="utf-8") as fh:
+        for p in paths:
+            # single-quote escaping per the concat demuxer's syntax.
+            safe = os.path.abspath(p).replace("'", "'\\''")
+            fh.write(f"file '{safe}'\n")
+    dst = os.path.join(out_dir, "story_assembled.mp4")
+    clipper_render._run([
+        clipper_render._ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+        "-c:v", "libx264", "-crf", "22", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k",
+        dst,
+    ], "story_assemble")
+    return dst
 
 
 def _default_end_frame(path, out_dir, ask_text):
@@ -267,6 +305,25 @@ def _default_end_frame(path, out_dir, ask_text):
     out = f"{out_dir}/story_final.mp4"
     clipper_render.add_brand_frame(path, out)
     return out
+
+
+def _default_music_burn(path, music_path, out_dir):
+    """Burn the licensed music bed UNDER the video's own audio (real ffmpeg amix,
+    shortest duration). Only ever called with a non-empty music_path (a 'none'
+    selection skips the burn). Reuses clipper_render's ffmpeg guard."""
+    from . import clipper_render
+    clipper_render._require_render()
+    os.makedirs(out_dir, exist_ok=True)
+    dst = os.path.join(out_dir, "story_music.mp4")
+    clipper_render._run([
+        clipper_render._ffmpeg(), "-y", "-i", path, "-i", music_path,
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=shortest[a]",
+        "-map", "0:v", "-map", "[a]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        dst,
+    ], "story_music_burn")
+    return dst
 
 
 def _num(v):

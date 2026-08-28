@@ -46,6 +46,7 @@ from . import portal_routes as _pr
 from . import portal_social as _ps
 from . import portal_events as _pe
 from . import zernio_routes as _zr
+from . import story_studio_routes as _ss
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
 _TRACKER_TOKEN_ENV = "AGENT_TRACKER_TOKEN"   # name only; value is set by hand
@@ -1906,6 +1907,36 @@ def build_server(port=None):
                 return m.group(1), "thumb", m.group(2)
             return None, None, None
 
+        def _studio_route(self):
+            """Story Studio "Create a Story" (ECHO_STORY_STUDIO_BUILD §4). Token-scoped
+            so a gym only ever touches its own media; intake_web resolves the token ->
+            account_key and story_studio_routes gates the lane per gym.
+
+            Returns (token, kind, arg) for /portal/<token>/studio/... , else
+            (None, None, None). kind is one of:
+              create-story        POST /portal/<token>/studio/story
+              deny-story          POST /portal/<token>/studio/story/<id>/deny  (arg=id)
+              sort-queue          GET  /portal/<token>/studio/sort-queue
+              resolve-sort-item   POST /portal/<token>/studio/sort-queue/<asset_id>/resolve (arg=asset_id)
+            The render lane (create/deny) is gated per gym by
+            story_studio_render_active_for (default OFF, pilot allowlist) INSIDE the
+            handler; the sort queue (list/resolve) by STORY_CLASSIFIER (default ON)."""
+            path = self.path.split("?")[0]
+            pat = r"^/portal/([A-Za-z0-9_.-]{8,})/studio/"
+            m = re.match(pat + r"sort-queue$", path)
+            if m:
+                return m.group(1), "sort-queue", None
+            m = re.match(pat + r"sort-queue/([A-Za-z0-9_-]+)/resolve$", path)
+            if m:
+                return m.group(1), "resolve-sort-item", m.group(2)
+            m = re.match(pat + r"story/([A-Za-z0-9_.-]+)/deny$", path)
+            if m:
+                return m.group(1), "deny-story", m.group(2)
+            m = re.match(pat + r"story$", path)
+            if m:
+                return m.group(1), "create-story", None
+            return None, None, None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -1989,6 +2020,18 @@ def build_server(port=None):
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 status, body = _pe.handle_list_events(account_key)
+                return self._send_json(body, status)
+
+            # Story Studio "Sort these" queue: GET /portal/<token>/studio/sort-queue
+            # (ECHO_STORY_STUDIO_BUILD §4). Token->account_key; revoked = 404. The
+            # handler gates on STORY_CLASSIFIER (default ON) and only READS the gym's
+            # own ambiguous-media queue (story_studio_routes re-asserts the gym).
+            ss_token, ss_kind, _ss_arg = self._studio_route()
+            if ss_token is not None and ss_kind == "sort-queue":
+                account_key = client_for_token(ss_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                status, body = _ss.handle_list_sort_queue(account_key)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;
@@ -2291,6 +2334,47 @@ def build_server(port=None):
                 else:  # recur
                     status, resp = _pe.handle_recur_event(
                         account_key, str((body or {}).get("event_id") or ""))
+                return self._send_json(resp, status)
+
+            # Story Studio "Create a Story" WRITE routes (ECHO_STORY_STUDIO_BUILD §4):
+            #   POST /portal/<token>/studio/story                        {asset_ids,...}
+            #   POST /portal/<token>/studio/story/<id>/deny              {reason?}
+            #   POST /portal/<token>/studio/sort-queue/<asset_id>/resolve {lane}
+            # Token->account_key; revoked = 404. Cross-origin only from the portal
+            # origin. Per-token rate limited. The render lane (create/deny) is gated
+            # per-gym inside story_studio_routes by story_studio_render_active_for
+            # (default OFF, pilot allowlist -> 403); resolve is gated by STORY_CLASSIFIER
+            # (default ON). Every create stages PENDING or HOLDS; nothing publishes.
+            ss_token, ss_kind, ss_arg = self._studio_route()
+            if ss_token is not None and ss_kind in (
+                    "create-story", "deny-story", "resolve-sort-item"):
+                allowed, _origin = self._origin_ok()
+                if not allowed:
+                    return self._deny(403, "forbidden")
+                if not allow_token_request(_token_hash_prefix(ss_token)):
+                    return self._deny(429, "rate limited")
+                account_key = client_for_token(ss_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                actor_id = str((body or {}).get("actor_id") or "")
+                if ss_kind == "create-story":
+                    status, resp = _ss.handle_create_story(
+                        account_key, body, actor_id=actor_id)
+                elif ss_kind == "deny-story":
+                    status, resp = _ss.handle_deny_story(
+                        account_key, ss_arg, reason=str((body or {}).get("reason") or ""))
+                else:  # resolve-sort-item
+                    status, resp = _ss.handle_resolve_sort_item(
+                        account_key, ss_arg, str((body or {}).get("lane") or ""),
+                        actor_id=actor_id)
                 return self._send_json(resp, status)
 
             # Portal draft actions: /portal/<token>/{approve|edit|deny|kill}
