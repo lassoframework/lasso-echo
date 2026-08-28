@@ -86,3 +86,37 @@ def test_list_children_uses_all_drives_flags():
     client = dc.DriveClient(transport=t)
     kids = client.list_children("root")
     assert [k.id for k in kids] == ["p1"]
+
+
+# ---- audit #7: thumbnail() delegates to the transport, degrades to None ----------
+class _ThumbTransport:
+    def __init__(self, result=None, raises=False):
+        self._result = result
+        self._raises = raises
+        self.calls = 0
+
+    def get_thumbnail(self, file_id):
+        self.calls += 1
+        if self._raises:
+            raise RuntimeError("thumbnail fetch blew up")
+        return self._result
+
+
+def test_thumbnail_returns_transport_bytes():
+    t = _ThumbTransport(result=(b"SMALLJPEG", "image/jpeg"))
+    client = dc.DriveClient(transport=t)
+    got = client.thumbnail("file1")
+    assert got == (b"SMALLJPEG", "image/jpeg")
+    assert t.calls == 1
+
+
+def test_thumbnail_none_when_no_thumbnail():
+    t = _ThumbTransport(result=None)
+    client = dc.DriveClient(transport=t)
+    assert client.thumbnail("file1") is None
+
+
+def test_thumbnail_degrades_to_none_on_error():
+    t = _ThumbTransport(raises=True)
+    client = dc.DriveClient(transport=t)
+    assert client.thumbnail("file1") is None       # never raises out to the caller

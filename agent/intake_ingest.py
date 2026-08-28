@@ -252,7 +252,18 @@ def process_all(r2=None, poster=None, converter=None, phash=None, moderator=None
 
     results = {}
     for client in _clients_with_incoming(r2):
-        results[client] = _process_client(client, r2, poster, converter, phash, moderator)
+        # PER-CLIENT ISOLATION: one gym's R2 list/read failure (or any unhandled
+        # error inside its pass) must NEVER abort ingest for every other gym. A gym
+        # that blows up is recorded as an error result + a loud ops alert, and the
+        # loop moves on to the next gym.
+        try:
+            results[client] = _process_client(
+                client, r2, poster, converter, phash, moderator)
+        except Exception as e:  # noqa: BLE001 - one gym never sinks the whole pass
+            results[client] = {"error": f"{type(e).__name__}: {e}"}
+            ops_alerts.alert(
+                f"intake ingest ABORTED for {client} (other gyms unaffected): "
+                f"{type(e).__name__}: {e}")
     return results
 
 
@@ -468,6 +479,12 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 if poster is not None:
                     poster.post_notice(f"Intake: {client} file {name} sent to review "
                                        f"({reason}); nothing filed to the library.")
+                # A moderation reject can be a FALSE POSITIVE that silently buries a
+                # legit gym photo in review/. Raise an ops alert so a human can eyeball
+                # it and release it, rather than the photo just vanishing (audit #4).
+                ops_alerts.alert(
+                    f"intake moderation sent {client}/{name} to review ({reason}); "
+                    "verify — a false positive strands a legit photo in review/")
                 continue
 
             # ORIGINALS KEPT: a conversion (name changed: HEIC->JPG, MOV->MP4)
@@ -603,6 +620,21 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             manifest["processed"].append(key)
             ops_alerts.alert(f"intake ingest dead-lettered {client}/{os.path.basename(key)}: "
                              f"{type(e).__name__}: {e}")
+
+    # WHOLE-BATCH DEAD-LETTER ESCALATION (audit #3): when a pass tried several media
+    # files and EVERY one dead-lettered (nothing accepted, nothing merely deduped),
+    # that is not a bad file — it is a systemic decoder/converter failure (e.g.
+    # pillow-heif or ffmpeg missing from the image so every HEIC/HEVC upload fails).
+    # The per-file alerts alone read as noise; this fires ONE loud, unmistakable ops
+    # alert so the batch failure is visible and actionable, not buried.
+    if stats["deadlettered"] >= 3 and stats["accepted"] == 0 \
+            and stats["duplicates"] == 0:
+        ops_alerts.alert(
+            f"intake BATCH FAILURE for {client}: {stats['deadlettered']} media file(s) "
+            "dead-lettered this pass and NONE were filed. This is usually a missing "
+            "decoder/converter in the deployed image (pillow-heif for HEIC, ffmpeg for "
+            "HEVC/MOV). Check the worker image before more uploads are lost.",
+            force=True)
 
     _save_manifest(r2, client, manifest)
 

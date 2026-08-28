@@ -390,11 +390,24 @@ def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
     if asset is None or str(asset.get("gym_id") or "") != gym:
         return 404, "text/plain", b"not found"
 
-    # Cache by content_hash under the gym's prefix. A cached rendition thumbnail is
-    # served straight from the bucket; otherwise fetch a small thumbnail via the SA.
     drive = drive or _drive()
     if not drive.available():
         return 404, "text/plain", b"not found"
+
+    # Prefer Drive's server-side thumbnail: a small, downsized JPEG rendition Google
+    # generates for images AND video frames. Serving THAT (correctly typed image/jpeg)
+    # avoids streaming the full multi-MB original with a mislabeled content-type — the
+    # thumbnail proxy is a preview, not the asset download path (audit #7).
+    try:
+        thumb = drive.thumbnail(asset_id)
+    except Exception:  # noqa: BLE001
+        thumb = None
+    if thumb:
+        data, ctype = thumb
+        return 200, ctype, data
+
+    # Fallback: Drive made no thumbnail (rare). Stream the original, but label it with
+    # the asset's OWN mime type so the bytes are never mislabeled as something else.
     try:
         import tempfile
         import os as _os

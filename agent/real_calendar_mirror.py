@@ -114,6 +114,14 @@ def _real_row(account_key, draft):
     src_media = getattr(draft, "source_media_url", "") or ""
     if src_media:
         row["source_media_url"] = src_media
+    # gym_media_drive (GYM_DRIVE_STAGE): a Drive-sourced draft carries the media_asset
+    # id it was staged from so the portal hide + the removed-from-Drive sweep can flip
+    # this PENDING row back to needs_media. Set ONLY when present (the column exists
+    # after the content_calendar_media_not_ready migration is applied); omitted
+    # otherwise so a pre-migration insert never carries an unknown column.
+    src_asset = getattr(draft, "source_media_asset_id", "") or ""
+    if src_asset:
+        row["source_media_asset_id"] = src_asset
     # 2x cadence (CADENCE_SPEC.md D6): a draft built on a 2x day carries its slot
     # ordinal (0 = AM, 1 = PM) so publish-time slot times are deterministic. Stamped
     # ONLY by a 2x build (cadence_slot_index attribute); every 1x draft omits the key,

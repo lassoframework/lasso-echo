@@ -396,6 +396,102 @@ def _is_first_month(base_key, store, log):
         return False
 
 
+# The gym-drive lane fills these people-forward slots (spec §7). Kept in the order
+# a month rotates through them so consecutive Drive days do not repeat one pillar.
+_GYM_DRIVE_PILLARS = ("faces", "community", "results")
+
+
+def _gym_drive_source_for(account_key, day_key):
+    """One APPROVED source (the day's verbatim fact) to hand the gym-media builder so
+    the Drive caption's CLAIMS still come only from approved material — the frame only
+    shapes the SCENE. Resolved against the GENERATION account key (client_sources is
+    keyed by account, exactly like build_client_draft), NOT the tenant base. Returns
+    None when the gym has no approved source at all (the builder is then skipped: a
+    Drive photo never posts without an approved fact behind the copy). Best effort; any
+    resolution error yields None (lane skipped, never a fabricated post)."""
+    try:
+        from . import client_sources
+        present = client_content._pillars_for(account_key)  # noqa: SLF001
+        if not present:
+            return None
+        # Prefer a source in the day's rotated client category; fall back to any one
+        # approved source so a Drive photo day is never starved when the pillar has
+        # none. The fact is always an approved source — never invented.
+        category = client_content.category_for_day(account_key, day_key, present)
+        src = None
+        if category:
+            src = client_content._source_for_day(  # noqa: SLF001
+                account_key, day_key, category, present)
+        if src is None:
+            for cat in present:
+                items = client_sources.approved_sources(account_key, category=cat)
+                if items:
+                    src = items[0]
+                    break
+        return src
+    except Exception:  # noqa: BLE001 - no approved source resolvable -> skip the lane
+        return None
+
+
+def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
+                            covered_days, drive=None, store=None):
+    """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
+    (gym_media_drive spec §7). This is the production caller of
+    gym_media_builder.build_gym_media_draft: for each day in the span that the
+    uploaded-media path did NOT already fill, try to stage ONE Drive-sourced
+    faces/community/results post (grounded caption, A+ gates, cooldowns, tenant
+    isolation all enforced inside the builder). Every staged draft lands PENDING and
+    carries source_media_asset_id so hide / removed-from-Drive flips it back.
+
+    Layered under two flags (both default OFF, both checked by the CALLER before this
+    runs): GYM_DRIVE_STAGE (the lane exists) AND the per-gym GYM_DRIVE_CONNECT arming.
+    Returns the list of extra drafts to append (possibly empty). Never raises: the
+    Drive lane must never sink a client's uploaded-media month.
+
+    covered_days: the day_keys the uploaded-media loop already placed a feed on, so the
+    Drive lane FILLS THE GAPS instead of doubling up a day."""
+    from datetime import timedelta
+    from . import gym_media_builder
+    extra = []
+    covered = {str(d)[:10] for d in (covered_days or ())}
+    platform = getattr(account, "platform", None) or ""
+    account_key = getattr(account, "key", "") or base_key
+    pillar_i = 0
+    for i in range(days):
+        day_key = (start + timedelta(days=i)).isoformat()
+        if day_key in covered:
+            continue
+        pillar = _GYM_DRIVE_PILLARS[pillar_i % len(_GYM_DRIVE_PILLARS)]
+        source = _gym_drive_source_for(account_key, day_key)
+        if source is None:
+            # No approved fact for the copy: a Drive photo never posts on imagination.
+            continue
+        try:
+            draft = gym_media_builder.build_gym_media_draft(
+                account, day_key, pillar, voice, source, store=store, drive=drive)
+        except Exception as e:  # noqa: BLE001 - the lane never sinks the month
+            log(f"[gym-drive] builder failed for {base_key} {day_key}: "
+                f"{type(e).__name__}: {e}")
+            draft = None
+        if draft is None:
+            continue  # empty pool / gate miss: the builder already alerted if needed
+        # Cross-post platform parity with the uploaded-media feed (the FB mirror in
+        # _to_rows keys off an ig/empty account); leave the platform as the account's.
+        if not (getattr(draft, "platform", "") or "").strip():
+            try:
+                draft.platform = platform
+            except Exception:  # noqa: BLE001 - a frozen draft never blocks the build
+                pass
+        draft.day_key = day_key
+        _mark_feed(draft)
+        extra.append(draft)
+        covered.add(day_key)
+        pillar_i += 1
+        log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} post from the "
+            f"connected Drive pool (asset {draft.source_media_asset_id}), PENDING")
+    return extra
+
+
 def build_client_month(account, base_key, start_date, days=30, *, voice,
                        library_path=None, store, banned_words=(), logger=None,
                        allow_reshape=False):
@@ -510,6 +606,9 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     recent_angles = []              # accepted angles, oldest..newest
     angle_idx = 0                   # advances only on an ACCEPTED feed (dense round-robin)
     built_feeds = 0
+    # Days the uploaded-media path placed a feed on. The gym-drive lane (below) fills
+    # only the GAPS, so a Drive post never doubles up a day that already has a photo.
+    covered_days = set(locked_feed_days)
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -600,6 +699,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             drafts.extend(day_drafts)
             built_feeds += 1
             day_built += 1
+            covered_days.add(day_key)   # the gym-drive lane skips days already filled
             day_captions.append(getattr(feed, "caption", "") or "")
             # Record this accepted feed's opening so the NEXT slot/day avoids leading
             # the same way (the cross-day repetition Ryan flagged).
@@ -627,6 +727,27 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         except Exception:  # noqa: BLE001
             pass
         log(f"{base_key}: {weak} weak_match pick(s) flagged for the coach")
+
+    # GYM-DRIVE LANE (GYM_DRIVE_STAGE, default OFF): a gym that connected Google Drive
+    # gets PENDING posts built from its synced photo pool for the days the uploaded-
+    # media path did not fill (spec §7). Layered UNDER the per-gym GYM_DRIVE_CONNECT
+    # arming, so a gym must be connected + indexed first. Both flags OFF => this block
+    # is inert and the uploaded-media month is byte-for-byte unchanged. Every Drive
+    # draft lands PENDING (the human tap is untouched) and carries source_media_asset_id
+    # so hide / removed-from-Drive flips it back to needs_media. Never raises out here:
+    # the Drive lane must never sink the client's real uploaded-media calendar.
+    if (config.gym_drive_stage_enabled()
+            and config.gym_drive_connect_active_for(base_key)):
+        try:
+            drive_extra = append_gym_drive_drafts(
+                account, base_key, start, days, voice, log=log,
+                covered_days=covered_days)
+            if drive_extra:
+                drafts.extend(drive_extra)
+                log(f"{base_key}: +{len(drive_extra)} post(s) from the connected "
+                    "Drive pool (PENDING, gap-fill)")
+        except Exception as e:  # noqa: BLE001 - the lane never sinks the month
+            log(f"{base_key}: gym-drive lane skipped ({type(e).__name__}: {e})")
 
     rows = _to_rows(base_key, drafts)
     # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on

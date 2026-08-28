@@ -143,6 +143,7 @@ class GoogleDriveTransport:
     def __init__(self, sa_json=None):
         self._sa = sa_json
         self._svc = None
+        self._creds = None   # kept so an AuthorizedSession can fetch thumbnailLinks
 
     def _service(self):
         if self._svc is None:
@@ -156,9 +157,9 @@ class GoogleDriveTransport:
                 raise DriveUnavailable(
                     f"google drive libs unavailable: {type(e).__name__}") from e
             info = json.loads(sa) if sa.strip().startswith("{") else json.load(open(sa))
-            creds = service_account.Credentials.from_service_account_info(
+            self._creds = service_account.Credentials.from_service_account_info(
                 info, scopes=[SCOPE])
-            self._svc = build("drive", "v3", credentials=creds,
+            self._svc = build("drive", "v3", credentials=self._creds,
                               cache_discovery=False)
         return self._svc
 
@@ -194,6 +195,31 @@ class GoogleDriveTransport:
             fileId=file_id,
             fields="id, name, mimeType, owners(emailAddress), driveId",
             supportsAllDrives=True).execute()
+
+    def get_thumbnail(self, file_id):
+        """(thumb_bytes, 'image/jpeg') for a Drive file's server-side thumbnail, or
+        None when Drive did not generate one. Drive's thumbnailLink is a downsized
+        JPEG rendition Google makes for images AND video frames, so the proxy can
+        serve a SMALL correctly-typed image instead of streaming the full original.
+        The link needs the SA's bearer token, so it is fetched through the authorized
+        session (never a bare requests.get). Never raises: any failure returns None so
+        the caller can fall back."""
+        meta = self._service().files().get(
+            fileId=file_id, fields="thumbnailLink",
+            supportsAllDrives=True).execute()
+        link = (meta or {}).get("thumbnailLink") or ""
+        if not link:
+            return None
+        try:
+            # AuthorizedSession attaches the SA credentials so the thumbnailLink,
+            # which is access-controlled, actually returns the bytes.
+            from google.auth.transport.requests import AuthorizedSession
+            resp = AuthorizedSession(self._creds).get(link, timeout=30)
+            if resp.status_code >= 400 or not resp.content:
+                return None
+            return resp.content, "image/jpeg"
+        except Exception:  # noqa: BLE001 - no thumbnail is a fallback, not a crash
+            return None
 
 
 def _http_status(exc):
@@ -333,6 +359,15 @@ class DriveClient:
                 except OSError:
                     pass
         return dest
+
+    def thumbnail(self, file_id: str):
+        """(thumb_bytes, 'image/jpeg') for a Drive file's server-side thumbnail, or
+        None when Drive did not make one. A small correctly-typed JPEG the media
+        thumbnail proxy serves instead of streaming the full original."""
+        try:
+            return self._t().get_thumbnail(file_id)
+        except Exception:  # noqa: BLE001 - fall back to no thumbnail, never crash
+            return None
 
     def export_doc_text(self, file_id: str) -> str:
         """A Google Doc's plain-text export ('' when the doc exports empty)."""

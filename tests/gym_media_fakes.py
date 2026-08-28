@@ -122,16 +122,24 @@ def _raw(f):
 class FakeDrive:
     """DriveClient stand-in for the sync/builder paths."""
 
-    def __init__(self, files=(), blobs=None, up=True, meta=None, walk_raises=None):
+    def __init__(self, files=(), blobs=None, up=True, meta=None, walk_raises=None,
+                 thumbs=None):
         self._files = list(files)
         self._blobs = dict(blobs or {})
         self._up = up
         self._meta = meta or {}
         self._walk_raises = walk_raises
+        self._thumbs = dict(thumbs or {})   # file_id -> thumb_bytes (None -> no thumb)
         self.downloads = []
 
     def available(self):
         return self._up
+
+    def thumbnail(self, file_id):
+        """(thumb_bytes, 'image/jpeg') when a thumbnail was seeded for this id, else
+        None (Drive made none)."""
+        data = self._thumbs.get(file_id)
+        return (data, "image/jpeg") if data else None
 
     def walk(self, folder_id, max_depth=4, use_cache=True):
         if self._walk_raises is not None:

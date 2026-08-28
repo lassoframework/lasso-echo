@@ -78,6 +78,11 @@ class Draft:
     # day with no image yet. PENDING and held; a human adds a photo before it can
     # publish. NOT blocked. False for every other draft.
     needs_media: bool = False
+    # gym_media_drive (GYM_DRIVE_STAGE, default OFF): the media_asset id (Drive file
+    # id) a Drive-sourced draft was staged from. Written onto content_calendar so the
+    # portal hide + the removed-from-Drive sweep can flip this PENDING row back to
+    # needs_media. Empty for every draft NOT built from the Drive pool.
+    source_media_asset_id: str = ""
     # Force the approval card even when AGENT_AUTO_APPROVE_ENABLED is armed: this
     # draft ALWAYS waits for a human to approve, deny, or edit it, and never
     # auto-publishes. Used by the demo calendar so Blake experiences the review
