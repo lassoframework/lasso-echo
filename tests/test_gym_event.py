@@ -211,3 +211,55 @@ def test_recap_unblocked_with_real_media():
     rows = ge.draft_arc(ev, ge.plan_arc(ev, today=date(2026, 9, 1)))
     recap = [r for r in rows if r["arc_kind"] == ge.RECAP]
     assert recap and recap[0]["recap_blocked"] is False
+
+
+# ---- event -> Story Studio one-tap hook (real entry point, correct shape) -------
+
+def test_event_story_request_maps_to_create_story_shape():
+    """story_studio_create_request must produce EXACTLY the keys story_studio.create_story
+    consumes (gym_id, account_key, asset_ids, brief, ...), grounded only in event facts."""
+    ev = _event(media_ids=("clip_a", "clip_b"))
+    req = ge.story_studio_create_request(ev, account_key="pete_ig", requested_by="U1")
+    # the real create_story request keys are present and correctly mapped.
+    assert req["gym_id"] == "pete"
+    assert req["account_key"] == "pete_ig"
+    assert req["asset_ids"] == ["clip_a", "clip_b"]   # media_ids -> asset_ids
+    assert req["requested_by"] == "U1"
+    # brief grounded ONLY in event facts (name, dates, offer), never fabricated.
+    assert ev.name in req["brief"]
+    assert ev.offer_text in req["brief"]
+    assert req["event_id"] == ev.id
+
+
+def test_render_event_story_reaches_real_create_story_entry():
+    """render_event_story must resolve the REAL Story Studio entry (create_story), not the
+    dead 'render_from_request' name, and hand it a proper create_story request shape."""
+    import agent.story_studio as _ss
+    # 1. the live-path name the hook resolves actually exists on story_studio.
+    assert callable(getattr(_ss, "create_story", None))
+    assert getattr(_ss, "render_from_request", None) is None  # the dead name stays gone
+
+    # 2. a GymEvent handed to render_event_story reaches create_story with the real shape.
+    ev = _event(media_ids=("clip_a",))
+    captured = {}
+
+    def _fake_create_story(request):
+        captured.update(request)
+        return {"status": "off", "reason": "not armed"}   # mimic the OFF-gate default
+
+    out = ge.render_event_story(ev, renderer=_fake_create_story, account_key="pete_ig")
+    assert captured.get("gym_id") == "pete"
+    assert captured.get("asset_ids") == ["clip_a"]
+    assert "brief" in captured and ev.name in captured["brief"]
+    assert out == {"status": "off", "reason": "not armed"}
+
+
+def test_render_event_story_honest_stub_on_renderer_exception():
+    """The honest-stub rail: a renderer that raises returns None (offer only), never a
+    fabricated/broken render leaking to the caller."""
+    ev = _event(media_ids=("clip_a",))
+
+    def _boom(_req):
+        raise RuntimeError("renderer blew up")
+
+    assert ge.render_event_story(ev, renderer=_boom) is None

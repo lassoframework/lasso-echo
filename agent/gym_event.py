@@ -326,19 +326,54 @@ def story_studio_request(event: GymEvent):
     }
 
 
-def render_event_story(request, *, renderer=None):
+def story_studio_create_request(event: GymEvent, *, account_key=None, requested_by=""):
+    """Translate the event one-tap offer (story_studio_request) into the shape Story
+    Studio's real entry point (story_studio.create_story) consumes:
+      {gym_id, account_key, asset_ids, brief, template, music_mood, requested_by}
+    The brief is grounded ONLY in the event's own facts (name, dates, offer_text) — the
+    same facts the arc copy uses — so no story text is fabricated. media_ids become the
+    asset_ids Story Studio picks segments from; a story is only offered when the event
+    has real media (has_recap_media()), so asset_ids is non-empty here."""
+    offer = story_studio_request(event)
+    brief_parts = [p for p in (offer.get("headline"), offer.get("sub"),
+                               offer.get("offer_text")) if p]
+    return {
+        "gym_id": offer.get("gym_id"),
+        "account_key": account_key or offer.get("gym_id"),
+        "asset_ids": list(offer.get("media_ids") or ()),
+        "brief": " ".join(brief_parts).strip(),
+        "template": None,
+        "music_mood": None,
+        "requested_by": requested_by or "",
+        # provenance so the render ledger / audit ties this back to the event.
+        "event_id": offer.get("event_id"),
+        "kind": "event",
+    }
+
+
+def render_event_story(request, *, renderer=None, account_key=None, requested_by=""):
     """Render an event story via the Story Studio pipeline when it is available, else
     return None (the hook is offered but no render is forced). `renderer` is injectable
     (the Story Studio entry point) so this is testable without that pipeline; the live
-    path resolves it loosely and returns None if the module is not merged yet.
+    path resolves the REAL entry point (story_studio.create_story) and returns None if
+    the module is not merged / not armed for this gym.
+
+    `request` may be a GymEvent (the caller hands the record) OR an already-built
+    create_story request dict. A GymEvent is translated via story_studio_create_request
+    so the render request always reaches create_story's real shape.
 
     HONEST STUB: this NEVER fabricates a story image. It either delegates to the real
     Story Studio renderer or returns None so the caller shows the one-tap offer without
-    a broken/placeholder render."""
+    a broken/placeholder render. The render lane is gated OFF by default inside
+    create_story (story_studio_render_active_for), so this returns None (offer only)
+    until Blake arms STORY_STUDIO_RENDER for the gym."""
+    if isinstance(request, GymEvent):
+        request = story_studio_create_request(
+            request, account_key=account_key, requested_by=requested_by)
     if renderer is None:
         try:
-            from . import story_studio as _ss  # feat/story-studio, may not be merged
-            renderer = getattr(_ss, "render_from_request", None)
+            from . import story_studio as _ss
+            renderer = getattr(_ss, "create_story", None)
         except Exception:
             renderer = None
     if renderer is None:
