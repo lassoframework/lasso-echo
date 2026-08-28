@@ -129,6 +129,15 @@ def _real_row(account_key, draft):
     slot_i = getattr(draft, "cadence_slot_index", None)
     if slot_i is not None:
         row["slot_index"] = int(slot_i)
+    # Event Campaigns (EVENT_CAMPAIGNS_BUILD.md §3): an arc post carries its
+    # gym_event id so the status job / cancel-ended sweep / dead-link guard / overlap
+    # cap can find exactly the rows an event owns. Stamped ONLY by the event arc
+    # builder (event_id attribute set); every other draft omits the key so the
+    # pre-event row shape is byte-for-byte unchanged and pre-migration inserts never
+    # carry the unknown column.
+    ev_id = getattr(draft, "event_id", "") or ""
+    if ev_id:
+        row["event_id"] = ev_id
     return row
 
 

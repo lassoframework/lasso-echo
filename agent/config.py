@@ -383,6 +383,39 @@ def portal_social_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_SOCIAL_ENABLED", "false"))
 
 
+def event_campaigns_enabled_for(gym_id: str) -> bool:
+    """Self-serve Events & Promos (EVENT_CAMPAIGNS_BUILD.md) per-gym switch. Checks
+    AGENT_EVENT_CAMPAIGNS_{GYM_ID.upper()} first, then falls back to the global
+    AGENT_EVENT_CAMPAIGNS. Default OFF for every gym.
+
+    Rollout: PILOT Pete's gym first (a real Bring-a-Friend Week before Sept 22),
+    then widen. HUMAN TAP REQUIRED to flip each gym's flag on Railway, and the
+    gym_event + content_calendar.event_id migrations MUST be applied first (the
+    arc insert writes event_id; without the column the insert 400s).
+
+    Examples:
+      AGENT_EVENT_CAMPAIGNS_PETE=true   -> Pete's gym pilot
+      AGENT_EVENT_CAMPAIGNS=true        -> global default ON (later rollout)
+
+    When ON the portal exposes "Add an Event or Promo" and the arc planner drafts
+    a dated arc of PENDING content_calendar rows against a gym_event. OFF -> the
+    portal button/route 404s and the planner never runs; byte-for-byte today.
+    """
+    gym_env = f"AGENT_EVENT_CAMPAIGNS_{gym_id.upper().replace('-', '_')}" if gym_id else ""
+    if gym_env:
+        gym_val = os.environ.get(gym_env)
+        if gym_val is not None:
+            return _truthy(gym_val)
+    return event_campaigns_enabled()
+
+
+def event_campaigns_enabled() -> bool:
+    """Global EVENT_CAMPAIGNS switch (the fallback for event_campaigns_enabled_for).
+    Default OFF: the portal event form/route 404s and the arc planner never runs, so
+    today is byte-for-byte unchanged. Arm per-gym (pilot Pete) or globally by hand."""
+    return _truthy(os.environ.get("AGENT_EVENT_CAMPAIGNS", "false"))
+
+
 # The Stripe secret is read lazily BY NAME (never stored, never logged), same
 # pattern as every other token. Set STRIPE_API_KEY in Railway (a RESTRICTED,
 # read-only key: Customers, Subscriptions, Products, Prices). Empty => the welcome

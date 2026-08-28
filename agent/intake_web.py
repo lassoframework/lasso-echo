@@ -44,6 +44,7 @@ from . import config, ghl_intake, intake_tokens, whatsapp_intake
 from . import gym_media_routes as _gm
 from . import portal_routes as _pr
 from . import portal_social as _ps
+from . import portal_events as _pe
 from . import zernio_routes as _zr
 
 _TOKEN_ENV_PREFIX = "AGENT_INTAKE_TOKEN_"
@@ -1841,6 +1842,35 @@ def build_server(port=None):
                 return m.group(1), m.group(2), m.group(3)
             return None, None, None
 
+        def _portal_event_route(self):
+            """Self-serve Events & Promos (EVENT_CAMPAIGNS_BUILD.md §6). Token-scoped.
+            Returns (token, kind, arg) for /portal/<token>/event routes, else
+            (None, None, None). kind is one of:
+              create    POST /portal/<token>/event
+              list      GET  /portal/<token>/events
+              edit      POST /portal/<token>/event/<id>/edit      (arg=event_id)
+              cancel    POST /portal/<token>/event/<id>/cancel    (arg=event_id)
+              recur     POST /portal/<token>/event/recur
+            Gated by AGENT_EVENT_CAMPAIGNS at the handler; a disabled gym 404s."""
+            path = self.path.split("?")[0]
+            pat = r"^/portal/([A-Za-z0-9_.-]{8,})/"
+            m = re.match(pat + r"events$", path)
+            if m:
+                return m.group(1), "list", None
+            m = re.match(pat + r"event/recur$", path)
+            if m:
+                return m.group(1), "recur", None
+            m = re.match(pat + r"event/([A-Za-z0-9_.-]+)/edit$", path)
+            if m:
+                return m.group(1), "edit", m.group(2)
+            m = re.match(pat + r"event/([A-Za-z0-9_.-]+)/cancel$", path)
+            if m:
+                return m.group(1), "cancel", m.group(2)
+            m = re.match(pat + r"event$", path)
+            if m:
+                return m.group(1), "create", None
+            return None, None, None
+
         def _media_route(self):
             """Connect Google Drive (gym_media_drive §8). Token-scoped so a gym only
             ever sees its own media; intake_web resolves the token -> account_key and
@@ -1948,6 +1978,17 @@ def build_server(port=None):
                     status, body = _pr.handle_portal_report(account_key, days)
                 else:
                     status, body = _pr.handle_portal_library(account_key)
+                return self._send_json(body, status)
+
+            # Self-serve Events & Promos LIST: GET /portal/<token>/events.
+            # Token->account_key; revoked = 404. Gated per-gym inside portal_events
+            # (404 when AGENT_EVENT_CAMPAIGNS is off for this gym).
+            ev_token, ev_kind, _ev_arg = self._portal_event_route()
+            if ev_token is not None and ev_kind == "list":
+                account_key = client_for_token(ev_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                status, body = _pe.handle_list_events(account_key)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;
@@ -2213,6 +2254,43 @@ def build_server(port=None):
                 else:  # asset-hide / asset-unhide
                     status, resp = _gm.handle_hide_asset(
                         account_key, mt_arg, hide=(mt_kind == "asset-hide"))
+                return self._send_json(resp, status)
+
+            # Self-serve Events & Promos (EVENT_CAMPAIGNS_BUILD.md §6):
+            #   POST /portal/<token>/event                 {name,type,starts_on,...}
+            #   POST /portal/<token>/event/<id>/edit       {starts_on,ends_on,...}
+            #   POST /portal/<token>/event/<id>/cancel     {actor_id?}
+            #   POST /portal/<token>/event/recur           {event_id}
+            # Token->account_key; revoked = 404. Cross-origin only from the portal
+            # origin. Per-token rate limited. Gated per-gym inside portal_events (404
+            # when AGENT_EVENT_CAMPAIGNS is off for this gym). Nothing publishes.
+            ev_token, ev_kind, ev_arg = self._portal_event_route()
+            if ev_token is not None and ev_kind in ("create", "edit", "cancel", "recur"):
+                allowed, _origin = self._origin_ok()
+                if not allowed:
+                    return self._deny(403, "forbidden")
+                if not allow_token_request(_token_hash_prefix(ev_token)):
+                    return self._deny(429, "rate limited")
+                account_key = client_for_token(ev_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                if ev_kind == "create":
+                    status, resp = _pe.handle_create_event(account_key, body)
+                elif ev_kind == "edit":
+                    status, resp = _pe.handle_edit_event(account_key, ev_arg, body)
+                elif ev_kind == "cancel":
+                    status, resp = _pe.handle_cancel_event(account_key, ev_arg, body)
+                else:  # recur
+                    status, resp = _pe.handle_recur_event(
+                        account_key, str((body or {}).get("event_id") or ""))
                 return self._send_json(resp, status)
 
             # Portal draft actions: /portal/<token>/{approve|edit|deny|kill}

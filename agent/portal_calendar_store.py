@@ -1126,6 +1126,27 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def list_event_rows(self, account_key, event_id):
+        """Every content_calendar row carrying this event_id for the gym (the event's
+        whole arc). Gym-scoped by gym_id=eq so another gym's rows are never returned.
+        Used by the cancel/ended sweep, the status job's publish gate, and the dead-link
+        guard (all event-scoped). Returns a list of dicts (empty when none)."""
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "event_id": f"eq.{event_id}",
+            "order": "post_date",
+            "limit": "1000",
+        }
+        r = self._client().get(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def delete_row(self, account_key, row_id):
         """DELETE one content_calendar row, filtered by BOTH id AND gym_id so a row that
         belongs to another gym can never be deleted through this account_key. Returns the
