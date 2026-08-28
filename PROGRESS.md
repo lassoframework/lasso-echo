@@ -57,13 +57,39 @@ this work). NOT armed, NOT pushed.
   - migrations/story_studio_20260828.sql: story_request + story_render +
     render_ledger + story_sort_queue. ARMING STEP: apply BY HAND (not auto-run).
 
+### [~] Render-lane ARM: routes mounted + real render proven (2026-08-28, feat/story-render-arm)
+  - agent/intake_web.py: the four handlers are now MOUNTED on the HTTP router,
+    same pattern as the media/events routes (_studio_route helper; token->
+    account_key; revoked/unknown = 404; _origin_ok + per-token rate limit on all
+    writes; per-gym render gate lives inside the handlers). Paths:
+      POST /portal/<token>/studio/story                        (create-story)
+      POST /portal/<token>/studio/story/<id>/deny              (deny-story)
+      GET  /portal/<token>/studio/sort-queue                   (sort-queue)
+      POST /portal/<token>/studio/sort-queue/<asset_id>/resolve (resolve-sort-item)
+    Tests: tests/test_intake_web_studio.py (9 router-guard tests, mirrors
+    test_intake_web_media_guard.py).
+  - agent/story_composer.py: the DEFAULT render primitives are now the REAL ffmpeg
+    lane (were stubs that would HOLD every armed render): _default_normalize =
+    loudnorm(-16 LUFS) + color normalize per segment; _default_assemble = real
+    concat demuxer; _default_music_burn (new) = amix the licensed bed under the
+    video audio (auto-bound when a bed is selected). All reuse clipper_render's
+    ffmpeg guard, so an ffmpeg-absent / flag-off env still HOLDS honestly.
+  - REAL render PROVEN end-to-end (ffmpeg 8.1.2 present): 3 synthetic multi-segment
+    source clips -> cut -> 9:16 reframe -> loudnorm+color normalize -> concat ->
+    brand end-frame -> licensed music burn -> a real 1080x1920 H.264 mp4 (21.2s).
+    Lands PENDING; content_hash in render_ledger; overlay clean (copy_gate, no
+    hyrox); music carries track_id+license_ref. Committed as
+    tests/test_story_render_real.py (skips when ffmpeg absent; exercises the
+    PRODUCTION default primitives, not test-only fns).
+
 Deferred / flagged (unanswered = GAP): (1) .env.example flag docs not added
-(permission-blocked file; flags fully documented in config.py docstrings). (2) the
-composer's ffmpeg render primitives (loudness/color normalize, concat, brand
-end-frame burn of the ask_frame) bind clipper_render lazily and HOLD offline —
-real-render parity needs an armed-env pass. (3) route handlers exist but are not
-yet mounted in the intake_web HTTP router (surface built, not exposed) — needs a
-Blake ruling before mounting since the lane is a pilot.
+(permission-blocked file; flags fully documented in config.py docstrings).
+ARMING (Blake's tap): set STORY_STUDIO_RENDER_GYMS=pierce (pilot allowlist, keep
+STORY_STUDIO_RENDER=false) AND AGENT_CLIPPER_RENDER_ENABLED=true on BOTH the
+worker (echo) and web (echo-intake-web, which serves the portal routes). Apply
+migrations/story_studio_20260828.sql by hand first. Live smoke: POST
+/portal/<pierce-token>/studio/story {asset_ids:[...]} -> 200 staged (or 200 held
+with an honest reason); confirm a PENDING card in the approval queue.
 
 ---
 
