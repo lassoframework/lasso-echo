@@ -121,9 +121,26 @@ def _persist_profile_id(account_key, pid, fb_page_id=None):
     """Persist a resolved gym -> zernio_profile_id to BOTH planes: the local db AND the
     shared echo_gym_settings row (so the volume-less status service reads it). Called at
     connect/finalize time. Best effort on the shared plane (creds may be absent); never
-    raises out of the connect path."""
+    raises out of the connect path.
+
+    CROSS-TENANT BIND GUARD (Bird Dog CrossFit / Bolton Club, live): before ANY write, ask
+    account_key_guard whether this bind would cross tenants — repoint this key to a new
+    profile, or bind a profile already owned by a DIFFERENT gym. A refused bind fires one
+    loud ops alert and returns WITHOUT writing either plane, so a collision can never wire
+    one gym's posts onto another gym's socials. Behind AGENT_ACCOUNT_KEY_GUARD (default OFF):
+    dark until armed, so this never changes today's behaviour unless the flag is on."""
     pid = str(pid or "").strip()
     if not account_key or not pid:
+        return
+    from . import account_key_guard as _akg
+    decision = _akg.check_bind(
+        account_key, pid,
+        existing_profile_for=lambda k: (_db.gym_get(k) or {}).get("zernio_profile_id"),
+        key_for_profile=_db.gym_key_for_zernio_profile,
+    )
+    if not decision:
+        # Loud already (the guard alerted); log the refusal and do NOT write either plane.
+        print(f"[zernio] BIND BLOCKED for {account_key} -> {pid}: {decision.reason}")
         return
     try:
         row = _db.gym_get(account_key) or {}
