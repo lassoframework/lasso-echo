@@ -36,10 +36,41 @@ AVATAR_BLOCK_RE = re.compile(
     re.IGNORECASE)
 
 
-def avatar_breach(caption):
-    """The banned-audience term this caption carries, or '' when clean."""
+def avatar_breach(caption, gym=None):
+    """The banned-audience term this caption carries, or '' when clean.
+
+    PER-GYM avatar rail (Story Studio): the standard LASSO rail blocks HYROX (and the
+    other banned-audience phrases) for EVERY gym. A gym whose actual avatar IS hyrox
+    can be allowlisted (config.story_hyrox_avatar_gyms) so 'hyrox' no longer breaches
+    for THAT gym only — the profile is per-gym config, never a hardcode. Passing no
+    `gym` keeps the original all-gyms behavior (every existing caller is unchanged).
+    The other banned phrases (competitive crossfit, strength/serious athletes) are
+    NOT covered by the hyrox allowlist and always breach."""
     m = AVATAR_BLOCK_RE.search(caption or "")
-    return m.group(0) if m else ""
+    if not m:
+        return ""
+    term = m.group(0)
+    if term.strip().lower() == "hyrox" and _hyrox_allowed_for(gym):
+        # This gym's avatar IS hyrox: 'hyrox' does not breach. Re-scan the rest of the
+        # caption for any OTHER banned-audience term (which still breaches).
+        rest = AVATAR_BLOCK_RE.sub(
+            lambda mm: "" if mm.group(0).strip().lower() == "hyrox" else mm.group(0),
+            caption or "")
+        m2 = AVATAR_BLOCK_RE.search(rest)
+        return m2.group(0) if m2 else ""
+    return term
+
+
+def _hyrox_allowed_for(gym):
+    """True when THIS gym is allowlisted as a hyrox-avatar client (per-gym config)."""
+    if not gym:
+        return False
+    from . import config
+    base = str(gym or "").strip().lower()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+    return bool(base) and base in config.story_hyrox_avatar_gyms()
 
 # Any real dash: the copy_gate banned set (em/en/figure/horizontal-bar/minus), or a
 # hyphen used AS a dash (surrounded by spaces, or a double hyphen). A hyphen inside a

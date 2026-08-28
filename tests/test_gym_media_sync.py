@@ -80,6 +80,56 @@ def test_sync_unprobed_video_stays_ineligible(monkeypatch):
     assert store.assets["v1"]["eligible"] is None      # fail closed
 
 
+def test_sync_queues_ambiguous_video_for_a_human(monkeypatch):
+    # STORY_CLASSIFIER (default ON): an unprobed, neutral-named 9:16-unknown video
+    # has no confident signal -> AMBIGUOUS -> enqueued to the "Sort these" queue,
+    # never auto-decided. The sync summary reports it.
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    monkeypatch.setattr("agent.config.supabase_url", lambda: "")
+    monkeypatch.setattr("agent.config.supabase_service_key", lambda: "")
+    enq = []
+    monkeypatch.setattr("agent.story_sort_queue.enqueue",
+                        lambda gym, aid, **k: (enq.append(aid) or True))
+    drive = FakeDrive(files=[video("amb1", title="movie.mp4")])
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(), drive=drive, store=store, probe_fn=lambda p: None)
+    assert res["queued_ambiguous"] == 1
+    assert "amb1" in enq
+
+
+def test_sync_classifier_off_queues_nothing(monkeypatch):
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    monkeypatch.setenv("STORY_CLASSIFIER", "false")
+    calls = []
+    monkeypatch.setattr("agent.story_sort_queue.enqueue",
+                        lambda *a, **k: calls.append(1) or True)
+    drive = FakeDrive(files=[video("amb2", title="movie.mp4")])
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(), drive=drive, store=store, probe_fn=lambda p: None)
+    assert res["queued_ambiguous"] == 0
+    assert calls == []
+
+
+def test_sync_camera_native_video_is_not_queued(monkeypatch):
+    # A camera-native filename classifies RAW (a confident non-ambiguous verdict), so
+    # it is NOT queued for sorting — it just enters the raw pool.
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest", lambda *a, **k: None)
+    monkeypatch.setattr("agent.config.supabase_url", lambda: "")
+    monkeypatch.setattr("agent.config.supabase_service_key", lambda: "")
+    enq = []
+    monkeypatch.setattr("agent.story_sort_queue.enqueue",
+                        lambda gym, aid, **k: (enq.append(aid) or True))
+
+    def probe_landscape(path):
+        return {"duration_sec": 180.0, "width": 1920, "height": 1080, "codec": "h264"}
+
+    drive = FakeDrive(files=[video("raw1", title="IMG_4021.MOV")])
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(), drive=drive, store=store, probe_fn=probe_landscape)
+    assert res["queued_ambiguous"] == 0
+    assert enq == []
+
+
 def test_run_stagger_and_deny_sweep(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)

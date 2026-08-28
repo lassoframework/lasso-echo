@@ -2639,3 +2639,73 @@ def cadence_slot_times() -> tuple:
         if not _re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", p):
             return default
     return (parts[0], parts[1])
+
+
+# ---- Story Studio (raw footage -> finished stories; ECHO_STORY_STUDIO_BUILD) --
+def story_classifier_enabled() -> bool:
+    """
+    STORY_CLASSIFIER: sort a gym's unmapped raw pool into raw / finished /
+    ambiguous, queue ambiguous files for a human, and enforce the re-ingest guard.
+    Default ON (STORY_CLASSIFIER, default 'true') because it ONLY sorts and queues
+    — it posts nothing, stages nothing, and every ambiguous file waits on a human
+    tap. A declared upload lane / Drive folder mapping OVERRIDES the classifier
+    (intent beats inference), so this flag governs only the inference path.
+    """
+    return _truthy(os.environ.get("STORY_CLASSIFIER", "true"))
+
+
+def story_studio_render_enabled() -> bool:
+    """
+    STORY_STUDIO_RENDER: the portal "Create a Story" lane + the multi-clip
+    composer + music bed + overlay burn + 1080x1920 render + the PENDING
+    content_calendar row. Default OFF (STORY_STUDIO_RENDER, default 'false');
+    Pierce + one more pilot first, then all. Everything staged still lands
+    status=PENDING; the human approval tap is untouched. Layered ON TOP of the
+    classifier (a raw pool must be sorted before a Story is composed from it).
+    """
+    return _truthy(os.environ.get("STORY_STUDIO_RENDER", "false"))
+
+
+def story_studio_render_gyms() -> set:
+    """Pilot allowlist of base gym keys the render lane is armed for
+    (STORY_STUDIO_RENDER_GYMS, comma list, e.g. 'pierce'). When
+    STORY_STUDIO_RENDER is OFF but this set is non-empty, the lane runs for ONLY
+    these gyms. When STORY_STUDIO_RENDER is ON, every gym is eligible and this set
+    is ignored. Empty + flag OFF => the render lane is inert."""
+    raw = os.environ.get("STORY_STUDIO_RENDER_GYMS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def story_studio_render_active_for(gym_id) -> bool:
+    """True when the render lane is armed for THIS gym: either the global
+    STORY_STUDIO_RENDER flag is ON, or the gym's base key is in the pilot
+    allowlist. The single gate the portal lane consults per gym."""
+    if story_studio_render_enabled():
+        return True
+    base = str(gym_id or "").strip().lower()
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+    return bool(base) and base in story_studio_render_gyms()
+
+
+def story_hyrox_avatar_gyms() -> set:
+    """Per-gym HYROX-avatar allowlist (STORY_HYROX_AVATAR_GYMS, comma list). The
+    avatar rail HARD-BLOCKS 'hyrox' on overlay copy for EVERY gym EXCEPT the base
+    gym keys in this set (a gym whose actual avatar IS hyrox — e.g. a dedicated
+    hyrox affiliate). This is per-gym CONFIG, never a hardcode: an empty set (the
+    default) means the standard LASSO avatar rail applies to all gyms, exactly as
+    post_quality.avatar_breach does today. Keys are base gym keys ('birmingham'),
+    matched after stripping the _ig/_fb suffix."""
+    raw = os.environ.get("STORY_HYROX_AVATAR_GYMS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def story_studio_music_shelf() -> str:
+    """The DEFAULT music shelf for a Story render when a template does not name one
+    (STORY_STUDIO_MUSIC_SHELF, default 'hype'). Blake's rule: the default is HIGH
+    ENERGY (hype). This can be set to 'hype' or 'none' but NEVER 'chill' — chill is
+    an explicit per-render opt-out a coach picks on the card, never a default. A
+    value of 'chill' here is coerced back to 'hype' (the no-chill-default rail)."""
+    val = (os.environ.get("STORY_STUDIO_MUSIC_SHELF", "hype") or "hype").strip().lower()
+    return "none" if val == "none" else "hype"  # never default to chill
