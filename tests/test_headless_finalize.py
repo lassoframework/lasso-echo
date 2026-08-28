@@ -436,3 +436,132 @@ def test_connect_return_route_registered_in_get_handler():
     # it drives the SAME finalize the connect page JS uses, then bounces to the portal.
     assert "handle_connect_finalize" in src
     assert "_send_redirect" in src
+
+
+# =============================================================================
+# 14. IDEMPOTENCY: a burnt tempToken on an ALREADY connected gym is not "expired"
+#
+# A tempToken is single use, so the second finalize for a connection that already
+# succeeded raises the same Zernio 4xx as a genuinely expired link. Reporting that
+# as "expired, connect again" tells a CONNECTED gym its connection failed and sends
+# it back through OAuth. Double fire is easy to reach: a reload while the first POST
+# is in flight, a double tap, or any client retry.
+# =============================================================================
+def _connected_fake(platform, **kw):
+    """A fake whose profile ALREADY holds `platform`, and whose token is burnt."""
+    fake = FakeZernio(accounts_after={"accounts": [{"platform": platform,
+                                                    "_id": f"acct_{platform}"}]},
+                      **kw)
+    fake._selected = True          # the FIRST finalize already did the work
+    return fake
+
+
+def test_second_finalize_on_a_connected_gym_reports_connected_not_expired(hc_env):
+    fake = _connected_fake("facebook",
+                           list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 200, "a connected gym must never be told the link expired"
+    assert body["finalized"] is True
+    assert body["platform"] == "facebook"
+    assert body.get("already_connected") is True
+    # It must NOT re-select: the work is already done.
+    assert not any(c[0] == "fb_select" for c in fake.calls)
+
+
+def test_second_finalize_is_idempotent_for_google_business(hc_env):
+    fake = _connected_fake("googlebusiness",
+                           list_error=z.ZernioError(401, "pending token expired"))
+    status, body = zr.handle_connect_finalize("hillcountry", _gbp_body(), client=fake)
+    assert status == 200
+    assert body["finalized"] is True and body["platform"] == "googlebusiness"
+    assert body.get("already_connected") is True
+
+
+def test_burnt_token_with_NO_account_is_still_honestly_expired(hc_env):
+    # The probe must not turn a real expiry into a fake success: nothing connected
+    # -> the owner still gets the honest, retryable "expired".
+    fake = FakeZernio(list_error=z.ZernioError(400, "temp token already used"),
+                      accounts_after={"accounts": []})
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 400 and body.get("expired") is True
+
+
+def test_idempotency_probe_never_masks_a_zernio_outage(hc_env):
+    # A 5xx is NOT a burnt token. It must stay a 502 even for a connected gym, so a
+    # real outage is never laundered into a success.
+    fake = _connected_fake("facebook", list_error=z.ZernioError(503, "upstream down"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 502
+    assert "expired" not in body and body.get("finalized") is None
+
+
+def test_idempotency_probe_failing_falls_back_to_expired(hc_env):
+    # If the probe itself cannot reach Zernio we must not crash and must not invent a
+    # connection: fall back to the honest expired answer.
+    class _ProbeBlows(FakeZernio):
+        def list_accounts(self, pid):
+            raise RuntimeError("network gone")
+
+    fake = _ProbeBlows(list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 400 and body.get("expired") is True
+
+
+# =============================================================================
+# 15. The idempotency probe must not launder a failed RECONNECT into success
+#
+# _account_row_id ignores status on purpose (a just-created account counts even
+# while Zernio omits its fields). Reusing it for the probe would mean an EXPIRED
+# account row — still a row with an _id — reads as "connected", so every failed
+# reconnect returns 200 finalized:true while /my shows "Reconnect needed".
+# =============================================================================
+def _fake_with_accounts(accounts, **kw):
+    fake = FakeZernio(accounts_after={"accounts": accounts}, **kw)
+    fake._selected = True
+    return fake
+
+
+def test_an_EXPIRED_account_is_not_treated_as_already_connected(hc_env):
+    expired = [{"platform": "facebook", "_id": "acct_fb",
+                "intentionalDisconnectAt": "2026-08-01T00:00:00Z"}]
+    fake = _fake_with_accounts(expired,
+                               list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 400, "a failed reconnect must stay honestly expired"
+    assert body.get("expired") is True
+    assert body.get("finalized") is not True
+
+
+def test_a_token_expired_account_is_not_treated_as_already_connected(hc_env):
+    # connectedAt + expires_in in the past is the other expiry shape account_state reads.
+    stale = [{"platform": "facebook", "_id": "acct_fb",
+              "connectedAt": "2020-01-01T00:00:00Z",
+              "metadata": {"expires_in": 60}}]
+    fake = _fake_with_accounts(stale,
+                               list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 400 and body.get("expired") is True
+
+
+def test_already_connected_names_the_live_account_and_flags_it_for_checking(hc_env):
+    # A gym reconnecting to a DIFFERENT page must not be told a bare "connected" while
+    # still pointing at the old one: say which account is live and ask them to verify.
+    live = [{"platform": "facebook", "_id": "acct_fb",
+             "metadata": {"profileData": {"username": "Hill Country MVMT"}}}]
+    fake = _fake_with_accounts(live,
+                               list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 200 and body["finalized"] is True
+    assert body.get("verify_selection") is True
+    assert body["selected"]["name"] == "Hill Country MVMT"
+
+
+def test_already_connected_keeps_the_unstored_page_binding_warning(hc_env):
+    # If the first finalize connected but failed to store the page id, a retry must NOT
+    # replace that warning with a clean success and strand the gym connected-but-unbound.
+    live = [{"platform": "facebook", "_id": "acct_fb", "displayName": "HC"}]
+    fake = _fake_with_accounts(live,
+                               list_error=z.ZernioError(400, "temp token already used"))
+    status, body = zr.handle_connect_finalize("hillcountry", _fb_body(), client=fake)
+    assert status == 200
+    assert "binding" in (body.get("warning") or ""), body

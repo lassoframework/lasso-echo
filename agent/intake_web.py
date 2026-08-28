@@ -681,17 +681,31 @@ def handle_portal_intake(token, body, r2=None, now=None):
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "timestamp": stamp,
     }
-    if r2 is not None:
+    # R2 IS the durable capture: the listener ingests this object to land sources and the
+    # brand docs, so without a successful write the intake does not exist. Say so with a 503
+    # instead of "received" — the portal keeps echo_forwarded=false and re-forwards, which is
+    # exactly the self-healing behaviour capture-first is for.
+    #
+    # This used to log the field NAMES ("so nothing is lost") and return 200. The portal read
+    # 2xx as delivered, stamped echo_forwarded=true, and decideReforward then skipped the row
+    # forever as already_forwarded. The gym was told "Intake submitted" and its answers were
+    # gone, unrecoverably. The urlencoded sibling handler has always returned 503 here; this is
+    # the JSON path catching up. The put is wrapped for the same reason: an R2 timeout used to
+    # raise straight out of do_POST, killing the socket, and the access log records only
+    # "POST -> done" so a crashed intake looked identical to a delivered one.
+    if r2 is None:
+        return 503, {"error": "storage unavailable"}
+    try:
         r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
                      json.dumps(payload).encode("utf-8"),
                      content_type="application/json")
-    else:
-        # R2 not yet configured — log the payload locally so nothing is lost.
+    except Exception as exc:  # noqa: BLE001 - never claim receipt we cannot back up
         import logging
-        logging.getLogger(__name__).warning(
-            "R2 unavailable; intake payload not archived: client=%s stamp=%s answers_keys=%s",
-            client, stamp, list(answers.keys()),
+        logging.getLogger(__name__).error(
+            "intake archive FAILED, returning 503: client=%s stamp=%s err=%s",
+            client, stamp, type(exc).__name__,
         )
+        return 503, {"error": "storage unavailable"}
 
     base = _upload_base_url()
     resp = {

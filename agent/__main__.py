@@ -856,6 +856,7 @@ _COMMANDS = {
         ("audit / fleet-status", "cross-account state"),
         ("gbp-check", "Google Business Profile check"),
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
+        ("zernio-reverify", "read a gym's TRUE Zernio state and overwrite the poisoned portal cache, repairing ever_connected (--account <key> | --all)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
@@ -2739,6 +2740,42 @@ def main(argv=None):
                 print("The gym can now connect Google Business Profile / GBM in Zernio.")
             else:
                 print(f"provision FAILED for {account_key}: {info}")
+    elif cmd == "zernio-reverify":
+        # RE-VERIFY SWEEP: read a gym's TRUE Zernio state and overwrite the poisoned portal
+        # cache (echo_social_connections), repairing ever_connected where a platform is
+        # genuinely connected now. Run on the worker (ZERNIO_API_KEY + Supabase creds live
+        # there): railway run /opt/venv/bin/python -m agent zernio-reverify --account gritx
+        #   or --all for every client gym base.
+        account_key = ""
+        do_all = False
+        args_rest = argv[1:]
+        i = 0
+        while i < len(args_rest):
+            if args_rest[i] in ("--account", "--gym", "--base") and i + 1 < len(args_rest):
+                account_key = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--all":
+                do_all = True; i += 1; continue
+            i += 1
+        from . import zernio_reverify as _rv
+        if do_all:
+            out = _rv.reverify_bases()
+            print(f"reverified {out.get('count', 0)} gym(s): ok={out.get('ok')}")
+            for g in out.get("gyms") or []:
+                print(f"  {g.get('base')}: profile={g.get('profile_id')} "
+                      f"{[ (r.get('platform'), r.get('state', r.get('error'))) for r in (g.get('results') or []) ]}")
+        elif account_key:
+            # Accept an account_key or a base; reverify_gym strips _ig/_fb via the resolver's base.
+            base = _rv._zr._base_from_account(account_key)
+            out = _rv.reverify_gym(base)
+            print(f"reverified {base}: ok={out.get('ok')} profile={out.get('profile_id')} "
+                  f"reason={out.get('reason', '')}")
+            for r in out.get("results") or []:
+                print(f"  {r.get('platform')}: {r.get('state', r.get('error'))} "
+                      f"handle={r.get('handle', '')} ever_repaired={r.get('ever_connected_repaired', False)}")
+            if not out.get("ok"):
+                raise SystemExit(1)
+        else:
+            print("usage: python -m agent zernio-reverify (--account <key> | --all)")
     elif cmd == "lasso-zernio-setup":
         # LASSO-via-Zernio setup (AGENT_LASSO_VIA_ZERNIO): stamp the 'lasso' gyms row
         # with its Zernio profile id + Facebook page (auto-pick, or --page <id> when

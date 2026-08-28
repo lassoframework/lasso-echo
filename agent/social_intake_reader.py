@@ -266,6 +266,36 @@ def _write_doc(path, text):
     return True
 
 
+def write_brand_docs(account_key, answers, *, mapped=None):
+    """Write THIS gym's durable brand bible + social_proof from its intake answers.
+
+    Split out of onboard_from_social so BOTH ingest lanes can produce a bible from the
+    same code. Only one lane used to: a successful portal forward stamps
+    echo_forwarded=true, and the sweeper that called onboard_from_social lists only
+    echo_forwarded=false rows, so a gym got a brand bible exactly when its forward
+    FAILED. Every gym whose intake arrived cleanly had no voice doc at all, and the
+    drafter then wrote captions with no avatar, no pillars and no CTAs.
+
+    Idempotent and non-destructive: _write_doc never clobbers a file that already
+    exists, so a reviewed bible survives every re-run. Returns
+    {"note", "base", "bible_path", "wrote"}.
+    """
+    mapped = mapped if mapped is not None else map_answers(answers)
+    base = _base_from_account(account_key)
+    voice_dir = os.path.join(config.client_voice_dir(), base)
+    bible_path = os.path.join(voice_dir, "lasso_voice.md")
+    proof_path = os.path.join(voice_dir, "social_proof.md")
+    wrote_bible = _write_doc(bible_path, mapped["bible_text"])
+    _write_doc(proof_path, mapped["proof_text"])
+    return {
+        "note": (f"drafted, held for approval ({bible_path})" if wrote_bible
+                 else f"exists, not overwritten ({bible_path})"),
+        "base": base,
+        "bible_path": bible_path,
+        "wrote": wrote_bible,
+    }
+
+
 def onboard_from_social(account_key, answers, *, approve=True):
     """Onboard a client from its submitted social intake.
 
@@ -286,14 +316,7 @@ def onboard_from_social(account_key, answers, *, approve=True):
     """
     mapped = map_answers(answers)
     base = _base_from_account(account_key)
-
-    voice_dir = os.path.join(config.client_voice_dir(), base)
-    bible_path = os.path.join(voice_dir, "lasso_voice.md")
-    proof_path = os.path.join(voice_dir, "social_proof.md")
-    wrote_bible = _write_doc(bible_path, mapped["bible_text"])
-    _write_doc(proof_path, mapped["proof_text"])
-    bible_note = (f"drafted, held for approval ({bible_path})" if wrote_bible
-                  else f"exists, not overwritten ({bible_path})")
+    bible_note = write_brand_docs(account_key, answers, mapped=mapped)["note"]
 
     # Dedup vs everything already stored for the account (any status), exactly like
     # intake_onboard._step_sources, so a re-run adds nothing twice.

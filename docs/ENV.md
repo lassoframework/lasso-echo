@@ -88,7 +88,11 @@ before this file existed.
 | AGENT_STORIES_ENABLED | false | BLAKE | Second gate under publish for Stories. |
 | AGENT_STORY_PREMADE_ENABLED | false | BLAKE | |
 | AGENT_TRUST_LADDER_ENABLED / AGENT_TRUST_DRYRUN / AGENT_TRUST_AUTOPUBLISH | false | BLAKE | Trust wiring; first post never automated regardless. |
-| AGENT_TENANT_BRAIN_ENABLED | false | BLAKE | Per-gym learning notes. |
+| AGENT_TENANT_BRAIN_ENABLED | false | BLAKE | Per-gym learning notes. OFF means every approve, edit and deny is recorded nowhere and the drafter gets no learned guidance, so "it learns your voice" is inert and silent. Needs AGENT_SB7_ENABLED on too. |
+| AGENT_SB7_ENABLED | false | BLAKE | Selects the SB7 generator. OFF falls back to TemplateGenerator, which ignores the account entirely and never reads the gym's brain, so learned preferences cannot reach a caption even with AGENT_TENANT_BRAIN_ENABLED on. |
+| AGENT_SOCIAL_INTAKE_SYNC | false | BLAKE | Sweeper that routes captured-but-unforwarded portal intakes into Echo. OFF means a cold Stripe buyer's intake sits in Supabase indefinitely with no alert. |
+| AGENT_CONNECTION_WATCH | false | BLAKE | Alerts on a gym whose social connections are partly missing. OFF means nobody is told a connect silently failed. Skips 0-of-3 by design, so a gym that connected nothing never alerts either way. |
+| AGENT_DYNAMIC_ACCOUNTS | false | BLAKE | Auto-provisions the Account record for a newly onboarded gym. OFF means a new gym needs its record added by hand before anything drafts. |
 
 ## Creative studio (Gemini)
 
