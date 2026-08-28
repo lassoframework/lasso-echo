@@ -702,27 +702,34 @@ class SupabaseCalendarStore:
             return None
         gym_uuid = grows[0]["id"]
         now_iso = datetime.now(timezone.utc).isoformat()
-        body = {"state": state, "handle": handle, "last_verified_at": now_iso}
-        if mark_ever_connected:
-            # Preserve the first-ever connect time: only stamp first_connected_at when the
-            # row does not already carry one. Read the current value to decide.
-            cur = self._client().get(
-                self._rest("echo_social_connections"),
-                params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}",
-                        "select": "first_connected_at"},
-                headers=self._headers(), timeout=30,
-            )
-            if cur.status_code >= 400:
-                raise PortalStoreError(cur.status_code, _scrub((cur.text or "")[:200]))
-            crows = cur.json() or []
-            if not crows or not (crows[0] or {}).get("first_connected_at"):
-                body["first_connected_at"] = now_iso
-        r = self._client().patch(
+        # Read the current row (if any) so we (a) preserve the ORIGINAL first_connected_at
+        # and (b) know whether a row exists at all. A PATCH-only writer silently no-oped for
+        # gyms that were never seeded a connection row (topfuel), leaving a genuinely
+        # connected gym reading not_connected — so this is an UPSERT keyed on the table's
+        # UNIQUE (gym_id, platform).
+        cur = self._client().get(
             self._rest("echo_social_connections"),
-            params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}"},
+            params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}",
+                    "select": "first_connected_at"},
+            headers=self._headers(), timeout=30,
+        )
+        if cur.status_code >= 400:
+            raise PortalStoreError(cur.status_code, _scrub((cur.text or "")[:200]))
+        crows = cur.json() or []
+        had_first = bool(crows and (crows[0] or {}).get("first_connected_at"))
+        body = {"gym_id": gym_uuid, "platform": platform, "state": state,
+                "handle": handle, "last_verified_at": now_iso}
+        # Stamp first_connected_at only for a genuinely-connected platform that has none yet;
+        # never overwrite an existing original connect time (omitted -> merge-duplicates
+        # leaves it untouched).
+        if mark_ever_connected and not had_first:
+            body["first_connected_at"] = now_iso
+        r = self._client().post(
+            self._rest("echo_social_connections"),
+            params={"on_conflict": "gym_id,platform"},
             headers=self._headers({
                 "Content-Type": "application/json",
-                "Prefer": "return=representation",
+                "Prefer": "resolution=merge-duplicates,return=representation",
             }),
             json=body,
             timeout=30,

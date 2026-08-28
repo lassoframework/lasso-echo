@@ -195,6 +195,21 @@ class _RoutingHttp:
                 cur = dict(self.settings.get(uuid) or {})
                 cur.update({k: v for k, v in r.items() if k != "gym_id"})
                 self.settings[uuid] = cur
+        if t == "echo_social_connections":
+            # UPSERT (Prefer: resolution=merge-duplicates on gym_id,platform).
+            body = json if isinstance(json, dict) else (json or [{}])[0]
+            unknown = set(body) - _ESC_COLS
+            if unknown:
+                col = sorted(unknown)[0]
+                return _Resp(400, {"message": f"column \"{col}\" of relation "
+                                              f"\"echo_social_connections\" does not exist"})
+            uuid = body.get("gym_id")
+            plat = body.get("platform")
+            row = dict(self.conns.get((uuid, plat)) or {})
+            # merge-duplicates only SETs the columns present in the payload.
+            row.update({k: v for k, v in body.items()})
+            self.conns[(uuid, plat)] = row
+            return _Resp(201, [row])
         return _Resp(201, json or [])
 
     def patch(self, url, params=None, headers=None, json=None, timeout=None):
@@ -318,6 +333,28 @@ def test_reverify_overwrites_poisoned_row_and_repairs_first_connected_at(shared_
     assert row.get("first_connected_at")  # truthy timestamp, repaired
     assert row.get("last_verified_at")    # verification bumped
     assert row["handle"] == "Gritx Gym"
+
+
+def test_reverify_inserts_row_for_unseeded_connected_gym(shared_env, monkeypatch):
+    # topfuel gap: gym exists, NO echo_social_connections row seeded, but Zernio says
+    # connected. A PATCH-only writer no-oped and left the gym reading not_connected;
+    # the upsert must INSERT a connected row with first_connected_at.
+    http = _RoutingHttp(
+        gyms={"topfuel": "uuid-topfuel"},
+        settings={"uuid-topfuel": {"zernio_profile_id": GRITX_PROFILE}},
+        conns={},  # nothing seeded
+    )
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc-secret", http=http)
+    monkeypatch.setattr(zr, "_shared_store", lambda: store)
+    fake = FakeZernio(accounts={"accounts": [{"platform": "instagram", "_id": "ig1",
+                                              "displayName": "Top Fuel"}]})
+    out = rv.reverify_gym("topfuel", client=fake, store=store)
+    assert out["ok"] is True
+    row = http.conns[("uuid-topfuel", "instagram")]
+    assert row["state"] == "connected"
+    assert row["handle"] == "Top Fuel"
+    assert row.get("first_connected_at")  # stamped on the fresh insert
 
 
 def test_reverify_preserves_original_first_connected_at(shared_env, monkeypatch):
