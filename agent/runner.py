@@ -1298,4 +1298,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"calendar auto-publisher failed for {day_key}: "
                              f"{type(e).__name__}: {e}. The draft run is unaffected.")
 
+    # END-OF-PASS needs-media digest safety net: any needs-media days buffered by
+    # this run's per-day drafts (build_client_draft) flush as ONE digest per
+    # account, never one Slack alert per day (the eng 18-alert storm, 2026-08-28).
+    try:
+        from .client_content import flush_needs_media_alerts
+        flush_needs_media_alerts()
+    except Exception as e:
+        print(f"[client-content] needs-media digest flush failed: {type(e).__name__}: {e}")
+
     return {"status": "drafted", "drafts": results}

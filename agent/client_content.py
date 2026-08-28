@@ -367,9 +367,19 @@ class _CtaKey:
         self.path = stem
 
 
+# Per-run buffer for needs-media day alerts, keyed by account. A month build over
+# an empty library used to fire ONE SLACK ALERT PER DAY-SLOT (18 in a row for eng,
+# 2026-08-28) even though the condition is singular: "this gym has no photos".
+# _alert_needs_media now stamps + buffers; flush_needs_media_alerts posts ONE
+# digest per account per run. The per-day kv stamps are unchanged, so cross-run
+# dedup (the gritx-storm rule) behaves exactly as before.
+_NEEDS_MEDIA_BUFFER = {}
+
+
 def _alert_needs_media(account_key, day_key, category, enabled=True):
-    """One ops alert per account per day when a caption is ready but no image is
-    available. Deduped so a re-run never storms the channel.
+    """Stamp + BUFFER one needs-media day (caption ready, no image). The Slack
+    message is emitted by flush_needs_media_alerts as a single per-account digest,
+    never per day. Deduped per (account, day) in kv so a re-run never re-buffers.
 
     DURABLE-OR-SILENT (gritx storm, 2026-08-27): the dedup lives in the kv store,
     so the alert may fire ONLY where that stamp actually persists across runs
@@ -382,7 +392,7 @@ def _alert_needs_media(account_key, day_key, category, enabled=True):
     enabled=False is the explicit PREVIEW opt-out for callers building drafts as
     a preview/plan exercise: a preview is not an operational event, so it never
     alerts (and never stamps the day, so the real worker still alerts later)."""
-    from . import db, ops_alerts
+    from . import db
     key = f"needs_media_alerted_{account_key}_{day_key}"
     if db.kv_get(key):
         return
@@ -397,11 +407,32 @@ def _alert_needs_media(account_key, day_key, category, enabled=True):
               "would storm on every run")
         return
     db.kv_set(key, "1")
-    ops_alerts.alert(
-        f"{account_key} {day_key}: caption ready ({category}) but the library has "
-        "no image. Held as needs-media; add a photo to publish. Not blocked.")
+    _NEEDS_MEDIA_BUFFER.setdefault(account_key, []).append(day_key)
     db.audit("client_needs_media", account_key,
              f"{category}: caption ready, no image", account_key, day_key)
+
+
+def flush_needs_media_alerts(account_key=None):
+    """Post ONE digest ops alert per account for the needs-media days buffered
+    this run, then clear the buffer. account_key=None flushes every account
+    (the runner's end-of-pass safety net). A run that buffered nothing posts
+    nothing. Never raises out — an alert failure must not break a plan run."""
+    from . import ops_alerts
+    keys = [account_key] if account_key else list(_NEEDS_MEDIA_BUFFER.keys())
+    for acct in keys:
+        days = sorted(set(_NEEDS_MEDIA_BUFFER.pop(acct, []) or []))
+        if not days:
+            continue
+        span = days[0] if len(days) == 1 else f"{days[0]} to {days[-1]}"
+        try:
+            ops_alerts.alert(
+                f"{acct}: {len(days)} day(s) held as needs-media ({span}). "
+                "Captions are ready but the library has no image. Add photos "
+                "(connect the gym's Drive folder or upload in the portal) to "
+                "publish. Not blocked; slots fill as media arrives.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[client-content] needs-media digest failed for {acct}: "
+                  f"{type(exc).__name__}")
 
 
 def classify(draft):

@@ -769,6 +769,9 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     result["posts_per_day"] = slots_per_day
     result["skipped_banned"] = skipped_banned
     result["media_count"] = media_count
+    # ONE needs-media digest for the whole month build, never per day (the eng
+    # 18-alert storm, 2026-08-28). No-op when nothing was buffered this run.
+    client_content.flush_needs_media_alerts(account.key)
     return result
 
 

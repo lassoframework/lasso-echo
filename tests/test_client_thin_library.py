@@ -52,6 +52,18 @@ def _wire_alerts(monkeypatch):
 
 
 # ---- 1. sources but NO photos -> caption-ready needs-media, not blocked --------
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_needs_media_buffer():
+    """The needs-media digest buffer is module state; without a reset, one test's
+    unflushed days leak into the next test's flush (2026-08-28 digest change)."""
+    client_content._NEEDS_MEDIA_BUFFER.clear()
+    yield
+    client_content._NEEDS_MEDIA_BUFFER.clear()
+
+
 def test_sources_no_photos_is_needs_media(tmp_path, monkeypatch):
     fired = _wire_alerts(monkeypatch)
     acct = _client()
@@ -64,7 +76,10 @@ def test_sources_no_photos_is_needs_media(tmp_path, monkeypatch):
     assert client_content.classify(d) == "needs-media"
     assert d.caption.strip()                        # caption is ready
     assert d.creative_public_url == "" and d.creative_path == ""
-    # exactly one ops alert names the account and the fix
+    # DIGEST contract (2026-08-28 eng storm fix): per-day alerts are buffered and
+    # flush as ONE digest per account naming the account and the fix.
+    assert fired == []
+    client_content.flush_needs_media_alerts(acct.key)
     assert len(fired) == 1
     assert "needs-media" in fired[0] and "gym_alpha_ig" in fired[0]
     assert "Not blocked" in fired[0]
@@ -77,8 +92,10 @@ def test_needs_media_alert_deduped(tmp_path, monkeypatch):
     cs.add_source(acct.key, "offer", "Free intro session", "website /start")
     lib = _empty_lib(tmp_path)
     client_content.build_client_draft(acct, "2026-07-01", _voice(), lib)
+    client_content.flush_needs_media_alerts(acct.key)
     client_content.build_client_draft(acct, "2026-07-01", _voice(), lib)  # re-run
-    assert len(fired) == 1                           # one alert for the day, not two
+    client_content.flush_needs_media_alerts(acct.key)
+    assert len(fired) == 1                           # one digest for the day, not two
 
 
 # ---- 3. a source-backed template card fills the slot when available -----------
@@ -159,7 +176,11 @@ def test_needs_media_storm_regression_three_runs_durable(tmp_path, monkeypatch):
     for _run in range(3):
         for day in days:
             client_content.build_client_draft(acct, day, _voice(), lib)
-    assert len(fired) == 11
+        client_content.flush_needs_media_alerts(acct.key)
+    # DIGEST contract: run 1 buffers all 11 days -> ONE digest; runs 2-3 are fully
+    # kv-deduped and buffer nothing. 33 slot-builds -> 1 Slack message, ever.
+    assert len(fired) == 1
+    assert "11 day(s)" in fired[0]
 
 
 def test_needs_media_storm_zero_alerts_from_ephemeral_process(tmp_path, monkeypatch):
@@ -189,4 +210,5 @@ def test_preview_build_never_alerts_and_never_stamps(tmp_path, monkeypatch):
     assert d is not None and d.needs_media is True
     assert fired == []                               # preview: silent
     client_content.build_client_draft(acct, "2026-10-01", _voice(), lib)
+    client_content.flush_needs_media_alerts(acct.key)
     assert len(fired) == 1                           # the real build still alerts once
