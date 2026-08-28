@@ -268,6 +268,20 @@ _FORM_SOURCE_SECTIONS = (
 )
 
 
+#: The nested sections normalize_portal_intake reads. A payload is bible-drafting material
+#: only when at least one of these is a dict; the flat texted-link answers dict has none.
+_SECTION_KEYS = ("gym", "voice", "offers", "audience", "proof", "media", "approver")
+
+
+def _is_section_shaped(payload):
+    """True when `payload` is the portal's nested 7 section body, the ONLY shape
+    social_intake_reader.map_answers can parse. Guards against feeding it the flat
+    answers dict, which raises rather than degrading."""
+    if not isinstance(payload, dict) or not payload:
+        return False
+    return any(isinstance(payload.get(k), dict) for k in _SECTION_KEYS)
+
+
 def _land_intake_form(client, payload, r2, key, manifest):
     """Route one submitted intake form through the client-sources path: fact
     sections land as PENDING sources (never auto approved, deduped so a second
@@ -299,6 +313,42 @@ def _land_intake_form(client, payload, r2, key, manifest):
         db.audit("account_proposal", client,
                  "intake form proposal held (gym basics + approver); apply to "
                  "the Account record by hand", client)
+
+    # WRITE THE BRAND BIBLE. This is the lane a healthy intake takes, and it used to only
+    # archive the payload "for the bible draft" while nothing ever drafted it: the one
+    # automatic writer (onboard_from_social) runs from the unrouted sweeper, whose lister
+    # filters echo_forwarded=false. A successful forward sets that true, so a gym got a
+    # bible exactly when its delivery FAILED, and every gym that onboarded cleanly had no
+    # voice doc — the drafter then produced captions with no avatar, no pillars, no CTAs.
+    #
+    # Needs the raw 7-SECTION body the portal forwarded (payload["portal"]) — map_answers
+    # delegates to normalize_portal_intake, which reads body["gym"], body["voice"] and so on.
+    # The texted-link lane (handle_intake_form) archives a FLAT answers dict with no "portal"
+    # key, and feeding that in does NOT degrade gracefully: normalize_portal_intake calls
+    # .get() on what are plain strings and raises, and even if it did not, every section would
+    # come back empty and _write_doc would lay down an unclobberable bible for "the gym" keyed
+    # "client" — worse than no bible, because a hollow one looks like a satisfied precondition
+    # and blocks the real one forever. So: write only from the shape the mapper accepts.
+    sections = payload.get("portal")
+    if _is_section_shaped(sections):
+        try:
+            from .social_intake_reader import write_brand_docs
+            wrote = write_brand_docs(client, sections)
+            if wrote["wrote"]:
+                db.audit("brand_bible", client,
+                         f"drafted from intake ({wrote['bible_path']})", client)
+        except Exception as exc:  # noqa: BLE001 - never lose a landed intake over the bible
+            ops_alerts.alert(
+                f"intake landed for {client} but the brand bible could NOT be written "
+                f"({type(exc).__name__}). The gym has sources but no voice doc, so its "
+                "captions will have no avatar, pillars or CTAs until this is fixed.")
+    else:
+        # Not an alert: the sources and proposal DID land, and this lane never produced a
+        # bible before either. Loud enough to find, quiet enough not to cry wolf on every
+        # texted-link submission.
+        print(f"[intake-ingest] {client}: no 7 section payload on this intake, so no brand "
+              f"bible was drafted (source lane: {payload.get('source') or 'form'}). "
+              "Draft it with `python -m agent draft-bible --from-form`.")
 
     # archive the FULL payload (voice/audience/media notes included) for the
     # bible draft, then consume the incoming object

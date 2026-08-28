@@ -174,14 +174,68 @@ class ZernioClient:
         """GET /v1/accounts?profileId=... -> {accounts:[...]}."""
         return self._get("/v1/accounts", {"profileId": profile_id})
 
+    #: Zernio's page size for /v1/profiles.
+    _PROFILE_PAGE = 100
+    #: Hard stop. Bounded by REQUESTS, not by a server-supplied count, because the stop
+    #: condition must never depend on a field the API may not send. 50 pages = 5000
+    #: profiles, far past any real LASSO org, and at worst 50 x 30s rather than a hang.
+    _PROFILE_MAX_PAGES = 50
+
     def list_profiles(self):
-        """GET /v1/profiles -> {profiles:[{_id,name,...}], total, skip, limit}.
+        """GET /v1/profiles -> {profiles:[{_id,name,...}], total, skip, limit}, ALL pages.
 
         LASSO is already provisioned in Zernio, so profiles pre-exist; the connect path must
         REUSE an existing profile, never re-create it (Zernio 409s on a duplicate name). Verified
         live 2026-08-06 against api.zernio.com: `{"profiles":[{"_id"(24 char),"name",...}]}`.
+
+        PAGINATED (2026-08-28): this used to send a bare {"limit": 100} and read one page. Every
+        alias lookup runs through here, so the moment the org passed 100 profiles every gym whose
+        profile sorted past the first page would silently miss and get a duplicate created under
+        its account_key — the Zanshin bug, re-opened for the whole roster at once.
+
+        The stop condition is A SHORT PAGE, never `total`. The live 2026-08-06 response recorded
+        above carries no `total` field, so a total-driven loop would read one page and quietly do
+        nothing — an inert fix that still looks correct. A full page means "there may be more",
+        a short or empty page means "that was the end", and that holds whether or not the server
+        sends a count. `total` is used ONLY as an early exit once we already have that many rows.
+
+        Also guards a server that ignores `skip`: if a page repeats ids we have already seen, we
+        stop rather than looping to the page cap collecting duplicates. Same return shape.
         """
-        return self._get("/v1/profiles", {"limit": 100})
+        first = self._get("/v1/profiles", {"limit": self._PROFILE_PAGE}) or {}
+        rows = list(first.get("profiles") or [])
+        try:
+            total = int(first.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+
+        def _ids(items):
+            return {str(p.get("_id")) for p in items
+                    if isinstance(p, dict) and p.get("_id")}
+
+        seen = _ids(rows)
+        pages = 1
+        # A FULL page is the only reason to ask for another one.
+        while len(rows) >= self._PROFILE_PAGE * pages and pages < self._PROFILE_MAX_PAGES:
+            if total and len(rows) >= total:
+                break
+            nxt = self._get("/v1/profiles", {"limit": self._PROFILE_PAGE,
+                                             "skip": len(rows)}) or {}
+            page = nxt.get("profiles") or []
+            fresh = [p for p in page
+                     if not (isinstance(p, dict) and str(p.get("_id")) in seen)]
+            if not fresh:
+                # Empty page, or a server ignoring `skip` and replaying page one.
+                break
+            seen |= _ids(fresh)
+            rows.extend(fresh)
+            pages += 1
+        if pages >= self._PROFILE_MAX_PAGES:
+            print(f"[zernio] list_profiles hit the {self._PROFILE_MAX_PAGES} page cap at "
+                  f"{len(rows)} profiles; alias lookups may be matching an incomplete set.")
+        out = dict(first)
+        out["profiles"] = rows
+        return out
 
     def find_profile_id(self, name):
         """The `_id` of the existing Zernio profile whose name matches `name`, or None.
@@ -626,10 +680,37 @@ def account_state(acct, now=None):
     return "connected"
 
 
+#: Key spellings Zernio has been seen to use for a Google Business listing name. The live
+#: googlebusiness payload has never been captured, and six different spellings are guessed
+#: across this module, zernio_routes and the portal, so read them all rather than pick one.
+_GBP_NAME_KEYS = ("selectedLocationName", "locationName", "location_name", "title")
+
+
 def _handle_of(acct):
+    """The human label for a connected account, or None.
+
+    IG and FB label with the @username. GOOGLE BUSINESS HAS NO USERNAME — its label is the
+    listing name. Returning None for it is not "honest", it is fatal: the portal's
+    withoutPhantomConnections downgrades any connected row with a null handle to
+    not_connected, so a real, working Google connection renders as "Not connected yet"
+    forever and the owner reconnects on a loop. That is the single reason Google never shows
+    as connected in the portal.
+
+    Falls back to the location id, which is real data we hold, never a fabricated name.
+    """
     md = acct.get("metadata") or {}
     pd = md.get("profileData") or {}
-    h = pd.get("username") or acct.get("displayName")
+    if (acct.get("platform") or "").lower() == "googlebusiness":
+        for k in _GBP_NAME_KEYS:
+            v = md.get(k) or pd.get(k)
+            if v:
+                return str(v)
+        for v in (acct.get("displayName"), acct.get("name"),
+                  md.get("selectedLocationId"), md.get("locationId")):
+            if v:
+                return str(v)
+        return None
+    h = pd.get("username") or acct.get("displayName") or acct.get("name")
     return str(h) if h else None
 
 

@@ -273,8 +273,14 @@ def handle_social_disconnect(account_key, platform, client=None,
         return _disabled("social-disconnect")
     if not account_key:
         return 400, {"error": "missing account_key"}
-    if platform not in _z.PLATFORMS:
-        return 400, {"error": "platform must be instagram or facebook"}
+    # CONNECT_PLATFORMS, not PLATFORMS. PLATFORMS is the POSTING set (IG/FB only); using it here
+    # 400'd every Google Business disconnect while the portal rendered the button anyway and
+    # reported success, so an owner who linked the wrong listing could never unlink it and LASSO
+    # kept posting to it. The connect path already uses CONNECT_PLATFORMS; disconnect was simply
+    # never updated when Google Business was added.
+    if platform not in _z.CONNECT_PLATFORMS:
+        return 400, {"error": "platform must be one of "
+                              + ", ".join(_z.CONNECT_PLATFORMS)}
     pid = _resolve_profile_id(account_key) or _client(client).find_profile_id(account_key)
     if not pid:
         return 200, {"ok": True, "disconnected": 0, "detail": "nothing connected"}
@@ -478,6 +484,76 @@ def _finalize_googlebusiness(account_key, pid, loc, params, c):
                  "selected": {"id": loc["id"], "name": loc.get("name") or ""}}
 
 
+def _already_connected(account_key, pid, step, c):
+    """(200, payload) when the platform for `step` is ALREADY connected on this profile,
+    else None. The idempotency probe behind a burnt tempToken: a single use token that
+    Zernio rejects means either the link expired OR it already did its job, and only the
+    account list can tell those apart. Never raises — if the probe itself fails we fall
+    back to the honest expired answer.
+
+    IT CANNOT PROVE *THIS* ATTEMPT SUCCEEDED, only that the platform is connected now, so
+    it never claims more than that. A gym already connected to Page A, reconnecting to
+    Page B with a token that genuinely expired, would otherwise be told "connected" while
+    still pointing at Page A and posting to the wrong place. So the payload carries the
+    handle we actually found and `verify_selection`, and the caller shows the owner WHICH
+    account is live rather than a bare success.
+
+    For Facebook it also re-checks the stored page binding. `_finalize_facebook` warns when
+    that write fails; without the same check here, a retry after a failed binding would
+    replace that warning with a clean success and strand the gym connected-but-unbound.
+    """
+    platform = "facebook" if step == "select_page" else "googlebusiness"
+    try:
+        accounts = c.list_accounts(pid)
+        # A LIVE row only. _account_row_id deliberately ignores status (a just-created account
+        # counts even while Zernio omits its fields), which is right for confirming a fresh
+        # select but wrong here: an EXPIRED account is still a row with an _id, so reusing that
+        # test would turn every failed RECONNECT into "connected" while /my simultaneously shows
+        # "Reconnect needed" — the reconnect path is exactly where a burnt token is most likely.
+        if not _live_account_row(accounts, platform):
+            return None
+        handle = _connected_handle(accounts, platform)
+    except Exception:  # noqa: BLE001 - probe only; the caller has an honest fallback
+        return None
+    out = {"ok": True, "finalized": True, "platform": platform,
+           "already_connected": True, "verify_selection": True}
+    if handle:
+        out["selected"] = {"id": "", "name": handle}
+    if platform == "facebook":
+        try:
+            row = _db.gym_get(account_key) or {}
+            if not (row.get("zernio_default_fb_page_id") or ""):
+                out["warning"] = ("connected, but the page binding could not be "
+                                  "confirmed")
+        except Exception:  # noqa: BLE001 - a warning we cannot compute is not an error
+            pass
+    return 200, out
+
+
+def _live_account_row(accounts_json, platform):
+    """The _id of a CONNECTED (not expired, not disconnected) `platform` account under this
+    profile, else ''. Uses the same account_state reducer the status badge reads, so the
+    finalize answer and the dashboard can never disagree about whether a gym is connected."""
+    for a in (accounts_json or {}).get("accounts") or []:
+        if isinstance(a, dict) and (a.get("platform") or "").lower() == platform \
+                and a.get("_id") and _z.account_state(a) == "connected":
+            return str(a["_id"])
+    return ""
+
+
+def _connected_handle(accounts_json, platform):
+    """The human name of the connected `platform` account ('' if none), so a
+    already-connected answer can say WHICH account is live instead of just 'connected'."""
+    for a in (accounts_json or {}).get("accounts") or []:
+        if isinstance(a, dict) and (a.get("platform") or "").lower() == platform:
+            md = a.get("metadata") or {}
+            pd = md.get("profileData") or {}
+            name = pd.get("username") or a.get("displayName") or a.get("name")
+            if name:
+                return str(name)
+    return ""
+
+
 def handle_connect_finalize(account_key, body, client=None):
     """POST /portal/<token>/connect/finalize — the headless OAuth RETURN leg.
 
@@ -553,7 +629,15 @@ def handle_connect_finalize(account_key, body, client=None):
                      "options": options}
     except _z.ZernioError as exc:
         if 400 <= exc.status < 500:
-            # Expired/used tempToken or a rejected selection: honest, retryable.
+            # A tempToken is SINGLE USE, so a second finalize for a connection that already
+            # succeeded lands here too — identical to a genuinely expired link. Telling a
+            # connected gym "that link expired, connect again" is the worse error of the two,
+            # so ask Zernio who is actually connected before calling it a failure. Double fire
+            # is easy to hit: a reload while the first POST is in flight, a double tap, or a
+            # client that retries. IDEMPOTENT: same answer as the call that did the work.
+            already = _already_connected(account_key, pid, step, c)
+            if already is not None:
+                return already
             return 400, {"error": f"zernio {exc.status}", "expired": True,
                          "detail": exc.detail}
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}

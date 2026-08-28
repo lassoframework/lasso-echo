@@ -76,6 +76,10 @@ _EXPECTED_FACTS = 6
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # Ingest writes the gym's brand bible now, and config.data_dir() silently falls back
+    # to "." when its dir is absent, which would drop test bibles into the repo's
+    # brand_voice/. Pin the documented override for every test in this file.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "brand_voice"))
     monkeypatch.setenv(config.INTAKE_SIGNING_SECRET_ENV, SECRET)
     monkeypatch.delenv("AGENT_INTAKE_TOKEN_GYM_ALPHA_IG", raising=False)
     monkeypatch.delenv("AGENT_INTAKE_PORTAL_ORIGIN", raising=False)
@@ -307,3 +311,131 @@ def test_bad_bodies_are_400(monkeypatch):
     assert handle_portal_intake(TOKEN, {}, r2=r2)[0] == 400          # empty
     assert handle_portal_intake(TOKEN, {"gym": {"name": "X"}}, r2=r2)[0] == 400
     assert handle_portal_intake(TOKEN, ["not", "a", "dict"], r2=r2)[0] == 400
+
+
+# ---------------------------------------------------------------------------
+# Storage failures must be HONEST 503s, never "received".
+#
+# R2 IS the durable capture: the listener ingests that object to land sources and
+# the brand docs, so with no successful write the intake does not exist. This used
+# to log the field NAMES and return 200 {"status": "received"}. The portal read 2xx
+# as delivered, stamped echo_forwarded=true, and decideReforward then skipped the
+# row forever as already_forwarded — the gym saw "Intake submitted" and its answers
+# were gone for good. A 503 leaves echo_forwarded=false so the portal re-forwards.
+# ---------------------------------------------------------------------------
+class _BlowingR2(FakeR2):
+    def put_bytes(self, key, data, content_type="application/octet-stream"):
+        raise RuntimeError("r2 timeout")
+
+
+def test_no_storage_returns_503_not_received(monkeypatch):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    status, resp = handle_portal_intake(TOKEN, _BODY, r2=None)
+    assert status == 503, "an unarchived intake must never report success"
+    assert resp.get("status") != "received"
+    assert resp.get("error") == "storage unavailable"
+
+
+def test_r2_write_failure_returns_503_and_does_not_raise(monkeypatch):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    # An R2 timeout used to raise straight out of do_POST, killing the socket, and the
+    # access log prints only "POST -> done" so a crash looked identical to a delivery.
+    status, resp = handle_portal_intake(TOKEN, _BODY, r2=_BlowingR2())
+    assert status == 503
+    assert resp.get("status") != "received"
+
+
+def test_a_healthy_write_still_reports_received(monkeypatch):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    r2 = FakeR2()
+    status, resp = handle_portal_intake(TOKEN, _BODY, r2=r2)
+    assert status == 200 and resp["status"] == "received"
+    assert any(k.endswith("_intake.json") for k in r2.objects)
+
+
+# ---------------------------------------------------------------------------
+# The healthy lane must produce a BRAND BIBLE.
+#
+# The one automatic bible writer (onboard_from_social) runs from the unrouted
+# sweeper, whose lister filters echo_forwarded=false. A successful portal forward
+# sets that true, so a gym got a bible exactly when its delivery FAILED. Every gym
+# that onboarded cleanly had no voice doc, and the drafter then wrote captions with
+# no avatar, no pillars and no CTAs. Ingest now writes the docs on the healthy path.
+# ---------------------------------------------------------------------------
+def test_landed_intake_writes_the_brand_bible(server, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    r2 = FakeR2()
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: r2)
+    assert _post_json(server, f"/intake/{TOKEN}", _BODY)[0] == 200
+    _ingest(r2, monkeypatch)
+
+    bible = os.path.join(config.client_voice_dir(), "gym_alpha", "lasso_voice.md")
+    assert os.path.exists(bible), "a cleanly delivered intake must still get a bible"
+    text = open(bible, encoding="utf-8").read()
+    assert "Gym Alpha" in text
+    # the gym's OWN words reached the doc, not a generic template
+    assert "Warm and direct" in text
+    assert os.path.exists(
+        os.path.join(config.client_voice_dir(), "gym_alpha", "social_proof.md"))
+
+
+def test_bible_write_is_idempotent_and_never_clobbers_a_reviewed_doc(server, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    r2 = FakeR2()
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: r2)
+    assert _post_json(server, f"/intake/{TOKEN}", _BODY)[0] == 200
+    _ingest(r2, monkeypatch)
+
+    bible = os.path.join(config.client_voice_dir(), "gym_alpha", "lasso_voice.md")
+    with open(bible, "w", encoding="utf-8") as fh:
+        fh.write("REVIEWED BY A HUMAN, DO NOT OVERWRITE")
+
+    # a second submission must land its sources but leave the reviewed doc alone
+    assert _post_json(server, f"/intake/{TOKEN}", _BODY)[0] == 200
+    _ingest(r2, monkeypatch)
+    assert open(bible, encoding="utf-8").read() == "REVIEWED BY A HUMAN, DO NOT OVERWRITE"
+
+
+def test_a_failing_bible_write_never_loses_the_landed_intake(server, monkeypatch, tmp_path):
+    # Sources and the held proposal are committed before the doc write, so a bible
+    # failure must not dead-letter the form or undo them.
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    from agent import social_intake_reader as sir
+
+    def _blow(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(sir, "write_brand_docs", _blow)
+    r2 = FakeR2()
+    monkeypatch.setattr(intake_web, "_default_r2", lambda: r2)
+    assert _post_json(server, f"/intake/{TOKEN}", _BODY)[0] == 200
+    out = _ingest(r2, monkeypatch)
+    assert out["gym_alpha_ig"]["intake_forms"] == 1
+    assert len(cs.pending_sources("gym_alpha_ig")) == _EXPECTED_FACTS
+
+
+def test_texted_link_lane_gets_no_bible_and_no_false_alarm(monkeypatch, tmp_path):
+    # handle_intake_form (the urlencoded /f/<token> lane) archives a FLAT answers dict with
+    # no "portal" key. Feeding that to the mapper raises (it calls .get() on strings) and,
+    # if it did not, would lay down an unclobberable bible for "the gym" — worse than none,
+    # because a hollow bible looks like a satisfied precondition and blocks the real one.
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    from agent import intake_ingest as ii
+
+    flat = {"kind": "intake_form", "client": "gym_alpha_ig", "timestamp": "20260828T000000Z",
+            "answers": {"gym_name": "Gym Alpha", "voice": "warm", "offers": "6 week challenge"}}
+    assert ii._is_section_shaped(flat.get("portal")) is False
+    assert ii._is_section_shaped(flat["answers"]) is False, "flat answers must not qualify"
+
+    nested = {"gym": {"name": "Gym Alpha"}, "voice": {"vibe": "warm"}}
+    assert ii._is_section_shaped(nested) is True
+
+    alerts = []
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: alerts.append(m))
+    r2 = FakeR2()
+    ii._land_intake_form("gym_alpha_ig", flat, r2, "intake/gym_alpha_ig/incoming/x_intake.json",
+                         {"processed": []})
+    assert not any("brand bible could NOT" in m for m in alerts), \
+        "the texted-link lane must not cry wolf on every submission"
+    bible = os.path.join(config.client_voice_dir(), "gym_alpha", "lasso_voice.md")
+    assert not os.path.exists(bible), "must not write a hollow, unclobberable bible"
