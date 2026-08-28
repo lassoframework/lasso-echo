@@ -92,6 +92,15 @@ def real_builders_map(account):
     def _welcome(_target, day_key):
         return welcome_queue.build_welcome_queue_draft(acct, day_key)
 
+    def _testimonial(_target, day_key):
+        # OWNER-VOICE PROOF (AGENT_LASSO_TESTIMONIAL_PILLAR, default OFF):
+        # drafts ONLY from the approved social-proof doc (Permission: yes +
+        # Verified date). Flag off / nothing approved / studio dark -> None and
+        # the planner fills the day from a REAL fallback pillar — a quote or
+        # number is NEVER invented.
+        from . import testimonial_pillar
+        return testimonial_pillar.build_testimonial_draft(acct, day_key)
+
     return {
         "podcast": _podcast,
         "platform": _platform,
@@ -100,6 +109,7 @@ def real_builders_map(account):
         "summit": _summit,
         "book": _book,
         "welcome": _welcome,
+        "testimonial": _testimonial,
     }
 
 

@@ -158,6 +158,26 @@ def publish(draft, account, http=None):
     result = _publish_gated(draft, account, http)
     if result.ok and result.mode == "published":
         _stamp_published(account.key, draft, result.media_id)
+        # CAPTION LEDGER (AGENT_CAPTION_COOLDOWN, default OFF): a real publish
+        # through ANY lane enters the 180-day verbatim ledger. Best effort,
+        # never fatal (the post is already live; calendar-lane rows are also
+        # stamped by the store's mark_published, where the upsert is idempotent).
+        if config.caption_cooldown_enabled() and not getattr(draft, "is_story", False):
+            try:
+                from .caption_ledger import record_published
+                from datetime import date as _date
+                gym = account.key
+                for _suf in ("_ig", "_fb"):
+                    if gym.endswith(_suf):
+                        gym = gym[: -len(_suf)]
+                        break
+                cap = getattr(draft, "caption", "") or ""
+                day = (getattr(draft, "day_key", "") or "")[:10] or \
+                    _date.today().isoformat()
+                if cap.strip():
+                    record_published(gym, cap, day)
+            except Exception:
+                pass
     return result
 
 
@@ -169,6 +189,48 @@ def _publish_gated(draft, account, http=None):
 
     full_caption = _compose_caption(draft)
     client = http or _requests()
+
+    # BELT AND BRACES (report-card build 2026-08-28, parity with
+    # zernio_publisher's identical rail): a FEED payload with an empty /
+    # invisible body must never reach the Graph API — an emoji-only or '...'
+    # caption is not a caption. Raising (not would_publish) makes the caller's
+    # revert + alert path own it. Stories are exempt (empty body by design;
+    # their caption is burned on the media). This is an exactly-once
+    # correctness rail like the 24h dedup above, not a new capability, so it
+    # is not flag-gated.
+    if not getattr(draft, "is_story", False):
+        from .publish_guard import visible_len
+        if visible_len(full_caption) == 0:
+            raise ValueError(
+                f"{account.key}: refusing to publish a FEED post with an empty "
+                "(zero visible characters) caption; a feed caption must carry "
+                "real words.")
+        # VERBATIM DEDUP BELT (AGENT_CAPTION_COOLDOWN, default OFF): a FEED
+        # caption already used for this gym on a DIFFERENT date within 180 days
+        # never ships twice, no matter which lane reached this publisher.
+        # Same-date records (the row's own staging stamp, the FB cross-post,
+        # the paired story) never block. Fail-open on ledger errors.
+        if config.caption_cooldown_enabled():
+            try:
+                from .caption_ledger import is_verbatim_blocked, VERBATIM_BLOCK_DAYS
+                from datetime import date as _date
+                gym = account.key
+                for _suf in ("_ig", "_fb"):
+                    if gym.endswith(_suf):
+                        gym = gym[: -len(_suf)]
+                        break
+                day = (getattr(draft, "day_key", "") or "")[:10] or \
+                    _date.today().isoformat()
+                cap = getattr(draft, "caption", "") or ""
+                blocked = bool(cap.strip()) and is_verbatim_blocked(gym, cap, day)
+            except Exception:
+                blocked = False  # a kv hiccup never blocks a legit publish
+            if blocked:
+                raise ValueError(
+                    f"{account.key}: refusing to publish a FEED post whose "
+                    f"caption already ran within {VERBATIM_BLOCK_DAYS} days "
+                    "(verbatim duplicate); redraft it, a caption never ships "
+                    "twice.")
 
     if getattr(draft, "is_story", False):
         if account.platform == Platform.INSTAGRAM:

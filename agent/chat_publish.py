@@ -305,13 +305,66 @@ def _latest_pending(store, account_key):
     return sorted(pend, key=lambda d: (d.day_key or "", d.draft_id))[-1]
 
 
+def _gym_id_for_draft(draft):
+    """The gym id a draft belongs to, from its account_key (lasso_ig -> lasso),
+    matching zernio_publisher's suffix convention."""
+    gid = str(getattr(draft, "account_key", "") or "")
+    for suf in ("_ig", "_fb"):
+        if gid.endswith(suf):
+            return gid[: -len(suf)]
+    return gid
+
+
+def caption_belts(draft):
+    """The stage/publish caption belts, applied to a chat publish exactly as the
+    calendar lane gets them (report-card build, 2026-08-28). Returns a block
+    reason string, or None when clear. Stories are exempt from both (empty body
+    / shared caption by design).
+
+      * EMPTY CAPTION (always on — the same rail zernio_publisher and
+        meta_publisher enforce at the wire): a feed post with zero visible
+        (alphanumeric) characters never publishes.
+      * VERBATIM DEDUP (AGENT_CAPTION_COOLDOWN, default OFF): a caption already
+        used for this gym on a different date within the last 180 days
+        (caption_ledger.is_verbatim_blocked) never publishes; Echo says so
+        honestly and Blake regenerates. Ledger errors fail open (never block a
+        legit publish on a kv hiccup).
+    """
+    if draft is None or getattr(draft, "is_story", False):
+        return None
+    cap = getattr(draft, "caption", "") or ""
+    from .publish_guard import visible_len
+    if visible_len(cap) == 0:
+        return ("empty caption: a feed post never ships without real words. "
+                "Give me a caption (or ask me to draft one) and say post it again.")
+    if config.caption_cooldown_enabled():
+        try:
+            from . import caption_ledger as _cl
+            from datetime import date as _date
+            day = (getattr(draft, "day_key", "") or "")[:10] or _date.today().isoformat()
+            if _cl.is_verbatim_blocked(_gym_id_for_draft(draft), cap, day):
+                return (f"duplicate caption: this exact caption already ran within "
+                        f"the last {_cl.VERBATIM_BLOCK_DAYS} days, so it never ships "
+                        "twice. Ask me for a fresh take and I will redraft it.")
+        except Exception:
+            pass  # fail open: the ledger is best-effort, the rail is the calendar lane's
+    return None
+
+
 def _real_gate_fn(store):
     """The SAME gate scheduled posts get, applied before a chat publish: the
-    fabrication scan (unverified stats / claims) plus the dash + 'vendor' scan on the
-    caption. Speed never bypasses quality."""
+    caption belts (empty caption + verbatim dedup), the fabrication scan
+    (unverified stats / claims), plus the dash + 'vendor' scan on the caption.
+    Speed never bypasses quality."""
     def gate(draft):
         if draft is None:
             return {"ok": False, "reason": "nothing staged to publish"}
+        # empty-caption + verbatim-dedup belts (chat lane parity with the
+        # calendar lane's publish_guard; run FIRST so a blocked caption never
+        # needs the store-backed fabrication scan)
+        belt = caption_belts(draft)
+        if belt:
+            return {"ok": False, "reason": belt}
         # fabrication: reuse the canonical scan, no auto-block, just read the verdict
         try:
             from . import fabrication_scan
@@ -367,6 +420,21 @@ def _real_publish_fn():
                 permalink = publish_confirm.confirm_publish(draft, acct, result) or ""
             except Exception:
                 permalink = ""
+        # CAPTION LEDGER (AGENT_CAPTION_COOLDOWN, default OFF): a REAL chat
+        # publish enters the ledger so the 180-day verbatim rule sees it on
+        # every lane. Best effort, never fatal (the post is already live).
+        if getattr(result, "mode", "") == "published" and \
+                config.caption_cooldown_enabled():
+            try:
+                from . import caption_ledger as _cl
+                from datetime import date as _date
+                cap = getattr(draft, "caption", "") or ""
+                day = (getattr(draft, "day_key", "") or "")[:10] or \
+                    _date.today().isoformat()
+                if cap.strip():
+                    _cl.record_published(_gym_id_for_draft(draft), cap, day)
+            except Exception:
+                pass
         return {"permalink": permalink, "media_ids": media_ids, "cost": None,
                 "mode": getattr(result, "mode", "")}
     return publish
