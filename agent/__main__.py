@@ -204,6 +204,7 @@ def _status():
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
+    print(f"  social_baseline: {config.social_baseline_enabled()}  (env AGENT_SOCIAL_BASELINE; BEFORE/AFTER social metrics from the PUBLIC Instagram feed via Apify — once-only immutable pre-Echo baseline + fresh last-90 after-pull, the social-before-after CLI, and the SINCE ECHO STARTED block in the monthly retro digest; needs APIFY_TOKEN (inert without it, clear reason, never a crash); read-only, nothing publishes; Apify is pay-per-result ~$1.50-2.70/1000 items, a 90-day gym pull is cents)")
     print(f"  catchup_report : {config.catchup_report_enabled()}  (env AGENT_CATCHUP_REPORT)")
     print(f"  welcome_digest : {config.welcome_digest_enabled()}  (env AGENT_WELCOME_DIGEST)")
     print(f"  welcome_autopub: {config.welcome_autopublish_enabled()}  (env AGENT_WELCOME_AUTOPUBLISH)")
@@ -870,6 +871,7 @@ _COMMANDS = {
         ("zernio-provision", "find-or-create a gym's Zernio profile so it can connect GBP/GBM (--account <key>)"),
         ("zernio-reverify", "read a gym's TRUE Zernio state and overwrite the poisoned portal cache, repairing ever_connected (--account <key> | --all)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
+        ("social-before-after", "BEFORE/AFTER social metrics: the gym's public Instagram feed before Echo started vs the last 90 days, same rubric via Apify (AGENT_SOCIAL_BASELINE + APIFY_TOKEN) — (--gym <base> | --all) [--capture]"),
         ("account-key-reconcile", "find gyms with the social product but a missing/duplicate/collided account_key; print a canonical-key PLAN (dry-run) — (--gym <gym_id> | --all) [--apply]"),
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
@@ -2790,6 +2792,21 @@ def main(argv=None):
                 raise SystemExit(1)
         else:
             print("usage: python -m agent zernio-reverify (--account <key> | --all)")
+    elif cmd == "social-before-after":
+        # BEFORE/AFTER social metrics (AGENT_SOCIAL_BASELINE, default OFF): the gym's
+        # PUBLIC Instagram feed BEFORE Echo started posting vs AFTER, same rubric
+        # (Report Card measures), both windows via Apify so it's apples-to-apples.
+        # Default is READ/report (stored immutable baseline + fresh last-90 pull);
+        # --capture stores MISSING baselines once (existing ones never touched).
+        # Read-only against Instagram/Apify; nothing publishes. Run on the worker
+        # (APIFY_TOKEN + Supabase creds live there):
+        #   railway ssh --service echo /opt/venv/bin/python -m agent \
+        #     social-before-after --gym eng            # report one gym
+        #   ... social-before-after --all --capture    # capture missing + report all
+        from .social_baseline import cli as _sba_cli
+        rc = _sba_cli(argv[1:])
+        if rc:
+            raise SystemExit(rc)
     elif cmd == "account-key-reconcile":
         # ACCOUNT-KEY RECONCILER: find gyms with the social product but a missing/duplicate/
         # collided account_key, compute the CANONICAL key, and print a PLAN. Dry-run by

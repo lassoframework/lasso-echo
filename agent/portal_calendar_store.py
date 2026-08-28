@@ -748,6 +748,52 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
         return True
 
+    def first_calendar_date(self, account_key, status=None):
+        """READ-ONLY (social before/after): the gym's earliest content_calendar
+        post_date, optionally filtered to one status ('published' finds the true
+        Echo start; no filter finds the first planned row as the honest
+        fallback). Returns 'YYYY-MM-DD' or None — never guessed. Gym-scoped by
+        the gym_id filter."""
+        params = {
+            "gym_id": f"eq.{account_key}",
+            "select": "post_date",
+            "order": "post_date.asc",
+            "limit": "1",
+        }
+        if status:
+            params["status"] = f"eq.{status}"
+        r = self._client().get(
+            self._rest(_TABLE), params=params, headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None
+        d = str((rows[0] or {}).get("post_date") or "")[:10]
+        return d or None
+
+    def social_connection_handle(self, gym_slug, platform="instagram"):
+        """READ-ONLY: the gym's stamped handle from echo_social_connections for
+        one platform — the live truth the reverify sweep writes. Resolves
+        base->uuid via resolve_gym_uuid (base != slug gyms included). Returns
+        the handle string or None; NEVER guessed. Gym-scoped."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
+        if not gym_uuid:
+            return None
+        r = self._client().get(
+            self._rest("echo_social_connections"),
+            params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}",
+                    "select": "handle", "limit": "1"},
+            headers=self._headers(), timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None
+        h = str((rows[0] or {}).get("handle") or "").strip()
+        return h or None
+
     def rewrite_social_connection(self, gym_slug, platform, state, handle=None,
                                   mark_ever_connected=False):
         """RE-VERIFY SWEEP writer: set echo_social_connections.state (+ handle) for a

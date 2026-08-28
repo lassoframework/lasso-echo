@@ -141,6 +141,25 @@ def publish_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PUBLISH_ENABLED", "false"))
 
 
+def social_baseline_enabled() -> bool:
+    """
+    BEFORE/AFTER social metrics (AGENT_SOCIAL_BASELINE, default OFF).
+
+    Gates agent/social_baseline.py: the once-only pre-Echo Instagram baseline
+    capture, the fresh last-90-days after-pull, the social-before-after CLI,
+    and the SINCE ECHO STARTED block in the monthly retro digest. Everything
+    reads the PUBLIC feed via Apify (apify/instagram-post-scraper) — read-only,
+    nothing publishes. Also needs APIFY_TOKEN in env; without it the module is
+    inert with a clear reason, never a crash.
+
+    COST NOTE: Apify is pay-per-result, roughly $1.50–$2.70 per 1,000 items.
+    A 90-day pull on a boutique gym is a couple hundred posts at most, so a
+    capture or an after-pull is cents per gym; the monthly digest adds one
+    after-pull per gym per month.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIAL_BASELINE", "false"))
+
+
 def socialapi_enabled() -> bool:
     """
     SocialAPI.ai publish-lane master switch. OFF by default. When OFF, EVERY

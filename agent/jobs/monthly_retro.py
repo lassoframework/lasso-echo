@@ -362,6 +362,12 @@ def build_digest(gym_id, month, findings, tainted):
                          f"{a['winner']} over {a['alternative']} ({a['format']})")
     else:
         lines.append("Playbook unchanged this month (guards held).")
+    # SINCE ECHO STARTED (20260828, flag AGENT_SOCIAL_BASELINE): the before vs
+    # after block from the PUBLIC Instagram feed via Apify — present ONLY when
+    # a stored immutable baseline and a fresh after-pull back every number.
+    since_echo = findings.get("since_echo")
+    if since_echo:
+        lines.extend(since_echo)
     text = "\n".join(lines)
     try:
         from agent.copy_gate import scrub
@@ -559,11 +565,30 @@ def retro_for_gym(gym_id, month, store, now, notifier):
         print(f"[monthly-retro] deny-count read failed for {gym_id}: "
               f"{type(exc).__name__}")
 
+    # SINCE ECHO STARTED (20260828, flag AGENT_SOCIAL_BASELINE): before vs after
+    # on the public Instagram feed via Apify — the stored immutable pre-Echo
+    # baseline against a fresh last-90 pull, same rubric. Flag OFF, no APIFY_TOKEN,
+    # no baseline, or no handle -> no block, never a guessed number, never a
+    # failed retro. Injectable: a store carrying since_echo_block (test fakes)
+    # is used instead of the live module.
+    since_echo_lines = None
+    if config.social_baseline_enabled():
+        try:
+            if hasattr(store, "since_echo_block"):
+                since_echo_lines = store.since_echo_block(gym_id)
+            else:
+                from agent import social_baseline as _sb
+                since_echo_lines = _sb.since_echo_lines(gym_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[monthly-retro] since-echo read failed for {gym_id}: "
+                  f"{type(exc).__name__}")
+
     findings = {
         "keep_doing": keep,
         "stop_doing": stop,
         "demographics": demographics_line,
         "deny_volume": deny_line,
+        "since_echo": since_echo_lines,
         "experiment": exp,
         "next_experiment": pb_mod.experiment_lever_for(gym_id, next_month(month)),
         "adopted": adopted,

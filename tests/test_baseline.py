@@ -133,9 +133,15 @@ def test_token_never_in_json_or_output(monkeypatch, tmp_path, capsys):
 
 
 # ---- 4. manual-only: NOTHING in the agent schedules or imports baseline ------------
+# social_baseline.py (the Apify BEFORE/AFTER module, 20260828) defines its OWN
+# capture_baseline with the same manual-only rail (CLI --capture is the only
+# capture path; the monthly retro only READS the stored row), so it is exempt
+# from the string match here — every other file is still forbidden to call
+# EITHER module's capture.
 def test_nothing_in_the_agent_schedules_baseline():
     for name in sorted(os.listdir(AGENT_DIR)):
-        if not name.endswith(".py") or name in ("baseline.py", "__main__.py"):
+        if not name.endswith(".py") or name in (
+                "baseline.py", "social_baseline.py", "__main__.py"):
             continue
         src = open(os.path.join(AGENT_DIR, name), encoding="utf-8").read()
         assert "capture_baseline" not in src, f"{name} calls capture_baseline"

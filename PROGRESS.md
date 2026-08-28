@@ -3650,3 +3650,16 @@ Diagnosis: the account is high-output, low-reach (1,308 posts, ~1,169 followers)
 and follow-through, not volume. Plan biases to Reels + carousels with save/send CTAs and caption
 SEO, one post/day rotating the 5 pillars. Full plan: `lasso_ig_30day_plan.md`. Refine with real
 per-post data once Stage 3 reporting is live.
+
+## Social BEFORE/AFTER (Blake 2026-08-28, branch feat/social-before-after)
+- [~] agent/social_baseline.py — Report Card rubric over the PUBLIC IG feed via Apify
+  (posts, posts/week, longest gap, reel share, plays=videoPlayCount reels-only, medians,
+  asks, duplicate captions); once-only IMMUTABLE pre-Echo baseline (90 days ending at the
+  gym's first published calendar row) vs a fresh last-90 pull; deltas with honest nulls.
+- [~] migrations/social_baseline_20260828.sql — social_baseline table (PK gym_id), NOT yet
+  applied to Supabase.
+- [~] CLI `python -m agent social-before-after (--gym <base> | --all) [--capture]`.
+- [~] SINCE ECHO STARTED block in the monthly retro coach digest (additive, flag-gated).
+- Arming (all by hand): apply the migration; set APIFY_TOKEN + AGENT_SOCIAL_BASELINE=true on
+  the worker; run `social-before-after --all --capture` ONCE per gym before more Echo posting
+  drifts the pre-start feed out of Apify's reach. Inert without the token; default OFF.
