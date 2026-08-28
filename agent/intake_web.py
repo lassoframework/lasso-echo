@@ -2163,9 +2163,22 @@ def build_server(port=None):
             if mt_token is not None and mt_kind in (
                     "check-connection", "sources", "sources-disconnect",
                     "asset-hide", "asset-unhide"):
+                # CSRF/Origin rail: mirror every other portal write route. A cross-origin
+                # POST is refused unless it is the allowed portal origin (server-to-server
+                # and same-origin still pass). Without this the media writes were the only
+                # write branch a foreign page could drive with the gym's token.
+                allowed, _origin = self._origin_ok()
+                if not allowed:
+                    return self._deny(403, "origin not allowed")
                 account_key = client_for_token(mt_token)
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
+                # Per-token rate limit (same limiter the intake/draft routes use), keyed
+                # by the token's hash prefix — never the raw token. check-connection hits
+                # Google Drive on every call, so an unthrottled loop could hammer Drive;
+                # cap it like the rest.
+                if not allow_token_request(_token_hash_prefix(mt_token)):
+                    return self._deny(429, "slow down")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > 64 * 1024:
                     return self._deny(413, "too large")

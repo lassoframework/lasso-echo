@@ -229,3 +229,66 @@ def test_idempotent_rerun(monkeypatch, tmp_path):
     assert accepted_again == 0
     lib = tmp_path / "library" / "gyma"
     assert len([p for p in os.listdir(lib) if p.endswith(".jpg")]) == 1
+
+
+# ---- audit #4: a moderation reject raises an ops alert (false-positive visibility) -
+def test_moderation_reject_raises_ops_alert(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
+    rec = RecordingPoster()
+    monkeypatch.setattr(ops_alerts, "_default_poster", lambda: rec)
+    r2 = FakeR2()
+    _seed(r2)
+    poster = RecordingPoster()
+    out = _run(r2, poster=poster,
+               moderator=lambda d, n: (False, "possible face without consent"))
+    assert out["gyma"]["flagged"] == 1
+    # the client-facing notice is still posted AND an ops alert now fires so a false
+    # positive is visible instead of the photo silently vanishing into review/.
+    assert any("review" in a.lower() and "false positive" in a.lower()
+               for a in rec.notices)
+
+
+# ---- audit #5: one gym's failure never aborts ingest for the others ---------------
+def test_one_gym_failure_does_not_abort_others(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
+    rec = RecordingPoster()
+    monkeypatch.setattr(ops_alerts, "_default_poster", lambda: rec)
+
+    class ExplodingListR2(FakeR2):
+        def list_keys(self, prefix):
+            # gymbad's per-client pass blows up on its incoming list; every other
+            # gym must still be processed.
+            if prefix == "intake/gymbad/incoming/":
+                raise RuntimeError("R2 list failed for gymbad")
+            return super().list_keys(prefix)
+
+    r2 = ExplodingListR2()
+    _seed(r2, client="gymbad", name="20260702T100000Z_x.jpg")
+    _seed(r2, client="gymgood", name="20260702T100001Z_y.jpg")
+    out = _run(r2)
+    # gymgood still landed its photo; gymbad recorded an error, did not sink the pass.
+    assert out["gymgood"]["accepted"] == 1
+    assert "error" in out["gymbad"]
+    assert any("ABORTED for gymbad" in a for a in rec.notices)
+
+
+# ---- audit #3: a whole-batch dead-letter fires ONE loud escalation alert ----------
+def test_whole_batch_deadletter_escalates(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
+    rec = RecordingPoster()
+    monkeypatch.setattr(ops_alerts, "_default_poster", lambda: rec)
+
+    def always_explodes(data, name):
+        raise ValueError("no decoder in image")  # the pillow-heif/ffmpeg-missing symptom
+
+    r2 = FakeR2()
+    for i in range(3):
+        _seed(r2, name=f"20260702T10000{i}Z_p.heic", data=b"HEICBYTES%d" % i)
+    out = intake_ingest.process_all(r2=r2, converter=always_explodes,
+                                    phash=_fake_phash, moderator=_pass_all)
+    assert out["gyma"]["deadlettered"] == 3 and out["gyma"]["accepted"] == 0
+    # exactly one loud BATCH FAILURE escalation (distinct from the per-file alerts)
+    assert len([a for a in rec.notices if "BATCH FAILURE" in a]) == 1

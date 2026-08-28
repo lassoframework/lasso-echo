@@ -1,7 +1,11 @@
 # System libraries the Python image needs beyond the auto-detected defaults.
 # cairo + pango + gdk-pixbuf back cairosvg (cairocffi), which rasterizes SVG gym
-# logos in the welcome pipeline (agent/website_scan.py). aptPkgs are ADDITIVE, so
-# this does not disturb the Nixpacks-detected Python toolchain.
+# logos in the welcome pipeline (agent/website_scan.py). ffmpeg backs the HEVC->H.264
+# transcode + video probe in the gym-media pipeline (agent/gym_media_index.py
+# hevc_to_h264 / probe_video) and the MOV->MP4 intake remux; without it an iPhone
+# HEVC clip is marked conversion_unavailable and never staged. aptPkgs are ADDITIVE,
+# so this does not disturb the Nixpacks-detected Python toolchain. (pillow-heif, which
+# decodes HEIC photos, is a Python dep in requirements.txt.)
 [phases.setup]
 aptPkgs = [
   "libcairo2",
@@ -9,4 +13,5 @@ aptPkgs = [
   "libpangocairo-1.0-0",
   "libgdk-pixbuf-2.0-0",
   "libffi-dev",
+  "ffmpeg",
 ]

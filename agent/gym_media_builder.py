@@ -202,6 +202,10 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             category=str(pillar or ""),
             source_fragments=[f"drive_media:{asset['id']}",
                               f"gym:{gym_base}"],
+            # Stamp the media_asset id onto the row (content_calendar
+            # .source_media_asset_id) so the portal hide + the removed-from-Drive
+            # sweep can flip this PENDING post back to needs_media (§4, §8).
+            source_media_asset_id=str(asset["id"]),
         )
         try:
             _sel.stamp_use(asset, gym_base, day_key, store=store, now=now)

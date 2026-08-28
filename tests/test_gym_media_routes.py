@@ -197,3 +197,30 @@ def test_thumbnail_serves_own_gym():
     status, ctype, data = gm.handle_thumbnail("pierce", "a1", store=store,
                                               drive=drive)
     assert status == 200 and ctype == "image/jpeg" and data
+
+
+# ---- audit #7: prefer Drive's real thumbnail (small, correctly-typed image) -------
+def test_thumbnail_prefers_drive_thumbnail():
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="pierce",
+                                             mime="video/mp4")])
+    # A video asset: the FULL asset would be a huge mislabeled stream. With a real
+    # Drive thumbnail seeded, the proxy serves THAT small image/jpeg instead.
+    drive = FakeDrive(files=[], thumbs={"a1": b"SMALLJPEGTHUMB"})
+    status, ctype, data = gm.handle_thumbnail("pierce", "a1", store=store,
+                                              drive=drive)
+    assert status == 200
+    assert ctype == "image/jpeg"                     # correctly typed, not video/mp4
+    assert data == b"SMALLJPEGTHUMB"                 # the small rendition, not the full file
+    assert "a1" not in drive.downloads               # never streamed the full original
+
+
+def test_thumbnail_fallback_labels_with_asset_mime():
+    # Drive made no thumbnail (thumbnail() returns None): fall back to streaming the
+    # original, but labeled with the asset's OWN mime, never a mislabel.
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="pierce",
+                                             mime="image/png")])
+    drive = FakeDrive(files=[], thumbs={})           # no thumbnail available
+    status, ctype, data = gm.handle_thumbnail("pierce", "a1", store=store,
+                                              drive=drive)
+    assert status == 200 and ctype == "image/png" and data
+    assert "a1" in drive.downloads                   # fell back to the original stream
