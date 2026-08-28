@@ -49,13 +49,25 @@ ALERT_THROTTLE_SECONDS = 24 * 3600
 
 # ---- default injectable readers (live; all read-only) ------------------------------
 
+# Internal / non-client bases that legitimately have no portal gyms row or Zernio profile
+# (a personal test account, the LASSO house account which runs its own Meta-direct lane).
+# They are NOT client social-product gyms, so a missing gym/profile for them is expected,
+# not a stranding risk — excluding them keeps the nightly alert to REAL client stranding.
+_INTERNAL_BASES = {"blake_personal", "lasso"}
+
+
+def _is_internal_base(base):
+    b = (str(base) if base is not None else "").strip().lower()
+    return b in _INTERNAL_BASES or b.endswith("_personal")
+
+
 def _default_bases():
-    """The social-product gym bases: the client-gym tenant bases from the account registry.
-    Mirrors zernio_reverify.reverify_bases' default source. A failure yields [] so the
-    doctor reports 'no data' rather than guessing."""
+    """The social-product CLIENT gym bases from the account registry (internal/personal
+    bases excluded — see _is_internal_base). Mirrors zernio_reverify.reverify_bases' source.
+    A failure yields [] so the doctor reports 'no data' rather than guessing."""
     try:
         from .calendar_autopublish import client_gym_bases
-        return client_gym_bases() or []
+        return [b for b in (client_gym_bases() or []) if not _is_internal_base(b)]
     except Exception:  # noqa: BLE001
         return []
 

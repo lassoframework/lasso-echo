@@ -283,3 +283,26 @@ def test_alert_clean_summary_fires_nothing(monkeypatch):
     fired = []
     out = doc.fire_alerts(summary, alert=lambda m: fired.append(m), kv=_FakeKV(), now=1.0)
     assert out == [] and fired == []
+
+
+def test_doctor_excludes_internal_personal_bases():
+    """The nightly doctor must not flag internal/personal bases (blake_personal, the LASSO
+    house account, *_personal) as stranding risks — they legitimately have no client gym
+    row / Zernio profile, and alerting on them is noise. Regression for the false-positive
+    the live report showed before the filter."""
+    from agent import account_key_doctor as akd
+    assert akd._is_internal_base("blake_personal") is True
+    assert akd._is_internal_base("lasso") is True
+    assert akd._is_internal_base("someone_personal") is True
+    assert akd._is_internal_base("gritx") is False
+    assert akd._is_internal_base("district_h") is False
+    # _default_bases filters them out of the live base list.
+    import agent.calendar_autopublish as ca
+    orig = ca.client_gym_bases
+    ca.client_gym_bases = lambda: ["gritx", "blake_personal", "lasso", "eng"]
+    try:
+        bases = akd._default_bases()
+    finally:
+        ca.client_gym_bases = orig
+    assert "blake_personal" not in bases and "lasso" not in bases
+    assert "gritx" in bases and "eng" in bases
