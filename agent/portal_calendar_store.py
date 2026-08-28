@@ -589,6 +589,132 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
         return True
 
+    def available(self):
+        """True iff Supabase creds are present (URL + service key), so both the
+        status resolver and the profile-id writer can go DURABLE-OR-SKIP: no creds
+        means fall back to the local db / find-by-name, never raise. Mirrors the
+        creds check config.portal_calendar_supabase_enabled uses."""
+        return bool(self._url) and bool(self._key)
+
+    # ---- Zernio profile binding (the SHARED plane the STATUS path reads) ---------
+    # THE CONNECTION-STATUS BUG (gritx/hillcountry, 2026-08-28): status runs on the
+    # echo-intake-web service, which has NO /data volume — its SQLite echo.db is empty
+    # on every deploy, so _resolve_profile_id (db-only) returned None and status came
+    # back not_connected for every platform even though Zernio held the live account.
+    # These two methods persist the authoritative gym -> zernio_profile_id (+ the chosen
+    # FB page) to echo_gym_settings, which BOTH services read. Written at connect/finalize
+    # time; read first in _resolve_profile_id, so status no longer depends on the ephemeral
+    # web volume. Mirrors gym_autonomy exactly (gyms.slug -> id -> echo_gym_settings).
+
+    def gym_zernio_profile_id(self, gym_slug):
+        """The gym's stored zernio_profile_id from the shared plane, or None when the
+        gym or its settings row is absent / carries no id. Read-only, gym-scoped."""
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None
+        gym_uuid = rows[0].get("id")
+        if not gym_uuid:
+            return None
+        r2 = self._client().get(
+            self._rest("echo_gym_settings"),
+            params={"gym_id": f"eq.{gym_uuid}", "select": "zernio_profile_id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        srows = r2.json() or []
+        if not srows:
+            return None
+        pid = srows[0].get("zernio_profile_id")
+        return str(pid) if pid else None
+
+    def set_gym_zernio_profile_id(self, gym_slug, zernio_profile_id,
+                                  zernio_default_fb_page_id=None):
+        """UPSERT the gym's authoritative zernio_profile_id (and optionally its chosen
+        default FB page) into the shared echo_gym_settings row. This is the persistence
+        both services read, so the status path resolves the profile even on the volume-
+        less web service. Never writes an empty profile id (a no-op guard). The FB page
+        is only stamped when a non-empty value is supplied (an omitted page must not blank
+        a stored one). Returns True on write, False when the gym slug is unknown / the
+        profile id is empty. Mirrors set_gym_autonomy."""
+        pid = str(zernio_profile_id or "").strip()
+        if not pid:
+            return False
+        r = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        gym_uuid = (rows[0].get("id") if rows else None)
+        if not gym_uuid:
+            return False
+        payload = {"gym_id": gym_uuid, "zernio_profile_id": pid}
+        page = str(zernio_default_fb_page_id or "").strip()
+        if page:
+            payload["zernio_default_fb_page_id"] = page
+        r2 = self._client().post(
+            self._rest("echo_gym_settings"),
+            params={"on_conflict": "gym_id"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            }),
+            json=[payload],
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise PortalStoreError(r2.status_code, _scrub((r2.text or "")[:200]))
+        return True
+
+    def rewrite_social_connection(self, gym_slug, platform, state, handle=None,
+                                  mark_ever_connected=False):
+        """RE-VERIFY SWEEP writer: set echo_social_connections.state (+ handle) for a
+        gym's platform to the TRUE Zernio state, overwriting the poisoned not_connected
+        the 6h cron wrote. When a platform is genuinely connected now, mark_ever_connected
+        repairs ever_connected=true so the portal's reconcileWithPriorConnection rescue
+        works again. No-op (returns None) when the gym/row is absent. Gym-scoped."""
+        g = self._client().get(
+            self._rest("gyms"),
+            params={"slug": f"eq.{gym_slug}", "select": "id"},
+            headers=self._headers(), timeout=30,
+        )
+        if g.status_code >= 400:
+            raise PortalStoreError(g.status_code, _scrub((g.text or "")[:200]))
+        grows = g.json() or []
+        if not grows or not grows[0].get("id"):
+            return None
+        gym_uuid = grows[0]["id"]
+        body = {"state": state, "handle": handle}
+        if mark_ever_connected:
+            body["ever_connected"] = True
+        r = self._client().patch(
+            self._rest("echo_social_connections"),
+            params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=body,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
     def publishing_rows(self):
         """Every row currently stuck in status='publishing' with no published_at,
         across all gyms (read-only; feeds the stale-claim ALERT sweep). A row lives

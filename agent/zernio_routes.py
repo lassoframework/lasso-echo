@@ -15,6 +15,7 @@ Portal contract (these return exactly what the portal expects Echo to return):
 """
 
 import json as _json
+import threading as _threading
 
 from . import config, db as _db
 from . import zernio as _z
@@ -28,14 +29,118 @@ def _client(client):
     return client if client is not None else _z.ZernioClient()
 
 
-def _resolve_profile_id(account_key):
-    """The gym's stored Zernio profile id, or None. Read-only (never provisions)."""
+# Serializes _ensure_profile_id's find-or-create so two concurrent connects for the SAME
+# gym cannot each miss the stored id, both find nothing, and both create a second profile
+# (the duplicate-profile hazard the audit flagged). Per-process; a cross-process race is
+# still guarded by Zernio's own 409 + re-find in _ensure_profile_id.
+_ensure_lock = _threading.Lock()
+
+
+def _base_from_account(account_key):
+    """The gym base (portal slug) for an account key: strip a trailing _ig / _fb.
+    'gritx_fb' -> 'gritx'. The shared echo_gym_settings row is keyed by this base."""
+    base = account_key or ""
+    for suf in ("_ig", "_fb"):
+        if base.endswith(suf):
+            return base[: -len(suf)]
+    return base
+
+
+def _shared_store():
+    """The Supabase shared plane, or None when creds are absent (so every shared-plane
+    read/write is DURABLE-OR-SKIP, never a hard dependency). Never raises."""
+    try:
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+        return store if store.available() else None
+    except Exception:  # noqa: BLE001 - the local db path must still work with no creds
+        return None
+
+
+def _shared_profile_id(account_key):
+    """The gym's zernio_profile_id from the SHARED plane (echo_gym_settings), or None.
+    This is what makes the STATUS path work on the volume-less echo-intake-web service:
+    the local SQLite is empty there, but the shared row is authoritative. Best effort."""
+    store = _shared_store()
+    if store is None:
+        return None
+    try:
+        return store.gym_zernio_profile_id(_base_from_account(account_key)) or None
+    except Exception:  # noqa: BLE001 - shared-plane hiccup never breaks status
+        return None
+
+
+def _find_profile_id_by_name(account_key, client):
+    """Find (never create) this gym's Zernio profile by any known alias — the READ-ONLY
+    last-resort resolver for status. A find-by-name mutates NOTHING in Zernio, so a passive
+    status poll stays side-effect free while still mapping a gym whose id was never persisted
+    locally (the exact gritx/hillcountry case). None when no profile matches. Never raises."""
     if not account_key:
         return None
-    row = _db.gym_get(account_key)
-    if not row:
+    try:
+        row = _db.gym_get(account_key) or {}
+        gym_name = row.get("gym_name") or ""
+        display_name = row.get("display_name") or ""
+        return client.find_profile_id_any(account_key, display_name, gym_name) or None
+    except Exception:  # noqa: BLE001 - a find failure is an honest "unresolved", not a crash
         return None
-    return row.get("zernio_profile_id") or None
+
+
+def _resolve_profile_id(account_key, client=None, allow_find=False):
+    """The gym's Zernio profile id, resolved in priority order. Read-only (never provisions):
+      1. the SHARED plane (echo_gym_settings.zernio_profile_id) — survives the ephemeral web
+         volume, so the STATUS path resolves even when the local SQLite is empty;
+      2. the local db (gyms.zernio_profile_id) — the worker's fast path;
+      3. (STATUS only, allow_find) find-by-name in Zernio — read-only, so a status poll never
+         mutates Zernio, yet a gym whose id was never persisted still maps to its live accounts.
+    A `client` is only needed for step 3. When found via the shared plane and not stored locally,
+    we backfill the local db opportunistically so the worker's fast path warms up (best effort)."""
+    if not account_key:
+        return None
+    shared = _shared_profile_id(account_key)
+    if shared:
+        # Warm the local fast path (best effort; never blocks the read).
+        try:
+            row = _db.gym_get(account_key) or {}
+            if not (row.get("zernio_profile_id") or "").strip():
+                _db.gym_upsert(account_key,
+                               display_name=row.get("display_name") or "",
+                               zernio_profile_id=str(shared))
+        except Exception:  # noqa: BLE001
+            pass
+        return shared
+    row = _db.gym_get(account_key)
+    if row and (row.get("zernio_profile_id") or ""):
+        return row["zernio_profile_id"]
+    if allow_find:
+        return _find_profile_id_by_name(account_key, _client(client))
+    return None
+
+
+def _persist_profile_id(account_key, pid, fb_page_id=None):
+    """Persist a resolved gym -> zernio_profile_id to BOTH planes: the local db AND the
+    shared echo_gym_settings row (so the volume-less status service reads it). Called at
+    connect/finalize time. Best effort on the shared plane (creds may be absent); never
+    raises out of the connect path."""
+    pid = str(pid or "").strip()
+    if not account_key or not pid:
+        return
+    try:
+        row = _db.gym_get(account_key) or {}
+        fields = {"zernio_profile_id": pid}
+        if fb_page_id:
+            fields["zernio_default_fb_page_id"] = str(fb_page_id)
+        _db.gym_upsert(account_key, display_name=row.get("display_name") or "", **fields)
+    except Exception:  # noqa: BLE001 - the shared write below is the one status depends on
+        pass
+    store = _shared_store()
+    if store is not None:
+        try:
+            store.set_gym_zernio_profile_id(_base_from_account(account_key), pid,
+                                            zernio_default_fb_page_id=fb_page_id)
+        except Exception as exc:  # noqa: BLE001 - report, never lose the connection
+            print(f"[zernio] shared profile-id persist failed for {account_key}: "
+                  f"{type(exc).__name__}")
 
 
 def _created_profile_id(created):
@@ -59,34 +164,43 @@ def _ensure_profile_id(account_key, client):
     pid = _resolve_profile_id(account_key)
     if pid:
         return pid
-    row = _db.gym_get(account_key) or {}
-    gym_name = row.get("gym_name") or ""
-    display_name = row.get("display_name") or ""
-    # The name a NEW profile would be created under (first non-empty of gym_name/display_name/key).
-    name = gym_name or display_name or account_key
+    # DEDUP GUARD (audit 2026-08-28): serialize the find-or-create so two concurrent connects
+    # for the same gym cannot both miss, both find nothing, and both create a second profile.
+    with _ensure_lock:
+        # Re-check inside the lock: the winner of the race persisted the id while we waited.
+        pid = _resolve_profile_id(account_key)
+        if pid:
+            return pid
+        row = _db.gym_get(account_key) or {}
+        gym_name = row.get("gym_name") or ""
+        display_name = row.get("display_name") or ""
+        # The name a NEW profile would be created under (first non-empty of gym_name/display_name/key).
+        name = gym_name or display_name or account_key
 
-    # 2) reuse an existing profile matching ANY known alias (Zanshin/Pete 2026-08-27): a gym's Zernio
-    #    profile is often pre-created by ops under a HUMAN name ("Zanshin Fitness") while Echo looks it
-    #    up by the account_key. Trying the account_key AND the display/gym name finds the real,
-    #    populated profile so we never create a duplicate empty one that strands connections.
-    pid = client.find_profile_id_any(account_key, display_name, gym_name)
+        # 2) reuse an existing profile matching ANY known alias (Zanshin/Pete 2026-08-27): a gym's
+        #    Zernio profile is often pre-created by ops under a HUMAN name ("Zanshin Fitness") while
+        #    Echo looks it up by the account_key. Trying the account_key AND the display/gym name finds
+        #    the real, populated profile so we never create a duplicate empty one that strands
+        #    connections.
+        pid = client.find_profile_id_any(account_key, display_name, gym_name)
 
-    # 3) none found -> create; 4) 409 -> the profile exists, re-find it (by every alias)
-    if not pid:
-        try:
-            pid = _created_profile_id(client.create_profile(name))
-        except _z.ZernioError as exc:
-            if exc.status == 409:
-                pid = client.find_profile_id_any(name, account_key, display_name, gym_name)
-            else:
-                raise
-            if not pid:
-                raise
+        # 3) none found -> create; 4) 409 -> the profile exists, re-find it (by every alias)
+        if not pid:
+            try:
+                pid = _created_profile_id(client.create_profile(name))
+            except _z.ZernioError as exc:
+                if exc.status == 409:
+                    pid = client.find_profile_id_any(name, account_key, display_name, gym_name)
+                else:
+                    raise
+                if not pid:
+                    raise
 
-    if pid:
-        # Preserve the gym's existing display_name (gym_upsert rewrites it every call).
-        _db.gym_upsert(account_key, display_name=row.get("display_name") or "", zernio_profile_id=str(pid))
-    return pid
+        if pid:
+            # Persist to BOTH the local db and the SHARED plane so the status service (no volume)
+            # resolves the id it never wrote locally. Preserves display_name (gym_upsert contract).
+            _persist_profile_id(account_key, str(pid))
+        return pid
 
 
 def provision_gym(account_key, client=None):
@@ -238,22 +352,39 @@ def handle_social_connect(account_key, platform, client=None, redirect_url=None,
 
 
 def handle_social_status(account_key, client=None):
-    """GET /portal/<token>/social-status -> {platforms:{instagram,facebook}}."""
+    """GET /portal/<token>/social-status -> {platforms:{instagram,facebook}}.
+
+    THE CONNECTION-STATUS BUG (gritx/hillcountry, 2026-08-28): this route runs on the
+    echo-intake-web service, which has NO /data volume — the local SQLite is empty on
+    every deploy, so a db-only resolver returned None and status came back not_connected
+    for EVERY platform even though Zernio held the live account. The fix is allow_find=True:
+    _resolve_profile_id now tries the SHARED plane first, then the local db, then a READ-ONLY
+    find-by-name in Zernio (reads never mutate Zernio), so status maps the real accounts for
+    any gym whose profile is findable. When we did resolve one, persist it so the next read
+    is a fast shared/local hit."""
     if not config.zernio_enabled():
         return _disabled("social-status")
     if not account_key:
         return 400, {"error": "missing account_key"}
-    pid = _resolve_profile_id(account_key)
-    if not pid:
-        # Not provisioned yet: honest not-connected, never a fabricated connection.
-        return 200, _z.map_status({})
     c = _client(client)
+    pid = _resolve_profile_id(account_key, client=c, allow_find=True)
+    if not pid:
+        # Genuinely not findable anywhere: honest not-connected, never a fabricated connection.
+        return 200, _z.map_status({})
     try:
         accounts = c.list_accounts(pid)
     except _z.ZernioError as exc:
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
     except Exception as exc:
         return 502, {"error": f"zernio call failed: {type(exc).__name__}"}
+    # Persist a find-by-name resolution so this stops costing a /v1/profiles scan every poll
+    # AND the durable plane is warmed for other services (best effort; never blocks status).
+    try:
+        row = _db.gym_get(account_key) or {}
+        if not (row.get("zernio_profile_id") or "").strip() or _shared_profile_id(account_key) is None:
+            _persist_profile_id(account_key, str(pid))
+    except Exception:  # noqa: BLE001
+        pass
     return 200, _z.map_status(accounts)
 
 
@@ -428,13 +559,26 @@ def headless_params(source):
 
 
 def _store_fb_page_id(account_key, page_id):
-    """Persist gyms.zernio_default_fb_page_id (the publisher requires it). Preserves
-    display_name per the gym_upsert contract. Returns True on success."""
+    """Persist gyms.zernio_default_fb_page_id (the publisher requires it) to BOTH the
+    local db AND the shared plane, so the volume-less status service and the worker agree
+    on the chosen page. Preserves display_name per the gym_upsert contract. Returns True
+    on the local write (the shared write is best effort)."""
     try:
         existing = _db.gym_get(account_key) or {}
         _db.gym_upsert(account_key,
                        display_name=existing.get("display_name") or "",
                        zernio_default_fb_page_id=str(page_id))
+        # Mirror the page (and the resolved profile id) to the shared plane. A finalize
+        # always ran through _persist_profile_id first, so the local row carries the id.
+        pid = (existing.get("zernio_profile_id") or "").strip()
+        if pid:
+            store = _shared_store()
+            if store is not None:
+                try:
+                    store.set_gym_zernio_profile_id(_base_from_account(account_key), pid,
+                                                    zernio_default_fb_page_id=str(page_id))
+                except Exception:  # noqa: BLE001 - local write already succeeded
+                    pass
         return True
     except Exception:  # noqa: BLE001 - the connection itself succeeded; report, don't lose it
         return False
@@ -595,13 +739,18 @@ def handle_connect_finalize(account_key, body, client=None):
         # Docs say GBP sends pendingDataToken; tolerate a tempToken-only redirect.
         params["pending_data_token"] = params["temp_token"]
 
-    pid = _resolve_profile_id(account_key)
+    c = _client(client)
+    # allow_find: on the volume-less web service the local id may be absent even though the
+    # gym IS provisioned in Zernio — resolve via the shared plane, then a read-only find-by-name,
+    # so the finalize return leg (PR #21) keeps working there. A find never mutates Zernio.
+    pid = _resolve_profile_id(account_key, client=c, allow_find=True)
     if not pid:
         return 400, {"error": "no social profile yet; start the connection again"}
+    # Warm both planes so the FB page write below and the status path have the id.
+    _persist_profile_id(account_key, str(pid))
 
     body = body if isinstance(body, dict) else {}
     choice_id = str(body.get("choice_id") or "").strip()
-    c = _client(client)
     try:
         if step == "select_page":
             listed = _z.map_pages(c.fb_pages_after_oauth(

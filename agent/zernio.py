@@ -661,6 +661,26 @@ def account_state(acct, now=None):
     if acct.get("isActive") is False or acct.get("enabled") is False:
         return "expired"
     md = acct.get("metadata") or {}
+    # A DEAD-TOKEN signal is a NEGATIVE and takes precedence over the optimistic "a row = connected"
+    # rule below (audit 2026-08-28): Zernio marks a revoked/expired grant with an explicit flag or
+    # an error string, and reading that as connected pushes posts at a token the vendor will reject.
+    # We only trip on an UNAMBIGUOUS truthy signal (never on absence), so a list that merely omits
+    # these fields still reads connected — the anti-flap rule the IG fix depends on is preserved.
+    if acct.get("tokenExpired") is True or acct.get("needsReconnect") is True \
+            or md.get("tokenExpired") is True or md.get("needsReconnect") is True:
+        return "expired"
+    _st = str(acct.get("status") or acct.get("connectionStatus")
+              or md.get("status") or "").strip().lower()
+    if _st in ("expired", "disconnected", "revoked", "error", "reconnect_required",
+               "needs_reconnect"):
+        return "expired"
+    # An ABSOLUTE expiry timestamp in the past (expires_at / expiresAt), when present, is expired.
+    exp_at = _parse_iso(acct.get("expires_at") or acct.get("expiresAt")
+                        or md.get("expires_at") or md.get("expiresAt"))
+    if exp_at is not None:
+        now = now or datetime.now(timezone.utc)
+        if exp_at < now:
+            return "expired"
     # Token expiry is a NEGATIVE and takes precedence: connectedAt + expires_in in the past -> expired.
     exp = md.get("expires_in")
     connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
@@ -710,7 +730,14 @@ def _handle_of(acct):
             if v:
                 return str(v)
         return None
-    h = pd.get("username") or acct.get("displayName") or acct.get("name")
+    # IG/FB: prefer the @username. A live connection whose list momentarily omits the username
+    # must NOT return None — the portal's withoutPhantomConnections downgrades a null-handle
+    # connected row to not_connected, the exact GBP failure extended to IG/FB (audit 2026-08-28).
+    # Fall back to any real label we hold (displayName/name), then to the account id — real data
+    # we hold, never a fabricated handle — so a working IG/FB connection never renders "Not
+    # connected" over a transient missing username.
+    h = (pd.get("username") or acct.get("displayName") or acct.get("name")
+         or acct.get("_id") or acct.get("id"))
     return str(h) if h else None
 
 

@@ -65,7 +65,18 @@ def test_instagram_and_facebook_handles_are_unchanged():
     fb = {"platform": "facebook", "_id": "a2", "displayName": "CrossFit Zanshin"}
     assert z._handle_of(ig) == "crossfit_zanshin"
     assert z._handle_of(fb) == "CrossFit Zanshin"
-    assert z._handle_of({"platform": "instagram", "_id": "a3"}) is None
+
+
+def test_ig_fb_null_username_falls_back_to_account_id_not_none():
+    """FRAGILE-ITEM FIX (2026-08-28): a live IG/FB row whose list momentarily omits the
+    username must NOT return a null handle — the portal's withoutPhantomConnections then
+    downgrades a real connection to not_connected (the GBP failure, extended to IG/FB).
+    The account id is real data we hold, never a fabricated handle, so it is the safe
+    non-null fallback that keeps a working connection showing connected."""
+    assert z._handle_of({"platform": "instagram", "_id": "a3"}) == "a3"
+    assert z._handle_of({"platform": "facebook", "_id": "a4"}) == "a4"
+    # Nothing at all (not even an id) still honestly returns None.
+    assert z._handle_of({"platform": "instagram"}) is None
 
 
 # ---- 2. disconnect -------------------------------------------------------------
