@@ -1036,6 +1036,30 @@ def account_key_reconcile_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_RECONCILE", "false"))
 
 
+def canonical_mint_enabled() -> bool:
+    """Derive a NEWLY minted intake link's account_key canonically at onboard time
+    (onboard.run -> canonical_account_key), so a fresh link can never carry an ad-hoc
+    key that later disagrees with gyms.slug / the Zernio handle (the topfuel / district_h
+    stranding class).
+
+    Defaults ON (justified): it ONLY affects links minted AFTER this ships. Already-signed
+    tokens self-decode their own key from the HMAC signature (intake_tokens.verify), so
+    canonicalising the key handed to a NEW mint changes nothing about existing tokens'
+    resolution. It never fabricates: when the portal gym uuid can't be resolved
+    (resolve_gym_uuid -> None on a dev host with no Supabase creds, or an unresolvable
+    base) the passed account_key is kept verbatim, so the mint is never blocked and no id
+    is invented. Set AGENT_CANONICAL_MINT=false to fall back to the raw passed key."""
+    return _truthy(os.environ.get("AGENT_CANONICAL_MINT", "true"))
+
+
+def account_key_doctor_alerts_enabled() -> bool:
+    """The account-key doctor's ops alert (account_key_doctor.py). OFF by default: the
+    read-only doctor CLI always runs and always reports; only the automatic Slack alert on
+    an UNRESOLVED / AMBIGUOUS / ARCHIVED-ONLY social-product gym is gated here, so the alert
+    ships dark until Blake arms it. Throttled per base via kv either way (never spammy)."""
+    return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_DOCTOR_ALERTS", "false"))
+
+
 def portal_public_base_url() -> str:
     """The LASSO portal's public origin, used as the post-OAuth return target for a
     social CONNECT so the gym owner lands back in the portal (never on the Zernio

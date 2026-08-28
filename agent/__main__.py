@@ -196,6 +196,8 @@ def _status():
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
     print(f"  acctkey_guard  : {config.account_key_guard_enabled()}  (env AGENT_ACCOUNT_KEY_GUARD; refuse a cross-tenant account_key -> Zernio profile rebind at _persist_profile_id + fire one ops alert; OFF => today's bind behaviour unchanged)")
     print(f"  acctkey_reconc : {config.account_key_reconcile_enabled()}  (env AGENT_ACCOUNT_KEY_RECONCILE; gates the account-key reconciler's --apply WRITE only; OFF => even --apply is a dry-run; the plan always reads)")
+    print(f"  canonical_mint : {config.canonical_mint_enabled()}  (env AGENT_CANONICAL_MINT; onboard.run derives a NEW intake link's account_key canonically from the portal gyms.id UUID + name so a fresh link can't carry an ad-hoc key that later disagrees with gyms.slug/the Zernio handle; DEFAULTS ON — only affects NEW links, existing signed tokens self-decode their own key so their resolution is untouched; unresolvable uuid => passed key kept verbatim, never fabricated)")
+    print(f"  acctkey_doctor : {config.account_key_doctor_alerts_enabled()}  (env AGENT_ACCOUNT_KEY_DOCTOR_ALERTS; gates ONLY the account-key doctor's ops ALERT on a social-product gym that fails to resolve — UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY — throttled per base; the read-only 'account-key-doctor' report always runs regardless)")
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
@@ -862,6 +864,7 @@ _COMMANDS = {
         ("zernio-reverify", "read a gym's TRUE Zernio state and overwrite the poisoned portal cache, repairing ever_connected (--account <key> | --all)"),
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
         ("account-key-reconcile", "find gyms with the social product but a missing/duplicate/collided account_key; print a canonical-key PLAN (dry-run) — (--gym <gym_id> | --all) [--apply]"),
+        ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
@@ -2789,6 +2792,16 @@ def main(argv=None):
         #   railway run /opt/venv/bin/python -m agent account-key-reconcile --all
         from . import account_key_reconcile as _akr
         _akr.cli(argv[1:])
+    elif cmd == "account-key-doctor":
+        # ACCOUNT-KEY DOCTOR (early-warning guard): for every social-product gym base, assert
+        # its base resolves via resolve_gym_uuid to EXACTLY ONE non-archived gyms row (and a
+        # Zernio profile where expected). Anything that does not cleanly resolve is a STRANDING
+        # RISK (UNRESOLVED / AMBIGUOUS / ARCHIVED_ONLY) surfaced LOUDLY here, not via a client
+        # complaint. READ-ONLY report; --alert additionally fires throttled ops alerts (gated by
+        # AGENT_ACCOUNT_KEY_DOCTOR_ALERTS). Run on the worker (Supabase creds live there):
+        #   railway run /opt/venv/bin/python -m agent account-key-doctor
+        from . import account_key_doctor as _akd
+        _akd.cli(argv[1:])
     elif cmd == "lasso-zernio-setup":
         # LASSO-via-Zernio setup (AGENT_LASSO_VIA_ZERNIO): stamp the 'lasso' gyms row
         # with its Zernio profile id + Facebook page (auto-pick, or --page <id> when
