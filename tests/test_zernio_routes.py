@@ -305,6 +305,61 @@ def test_connect_rejects_non_http_redirect_falls_back(db_env, monkeypatch):
     assert call[3] == "https://ops.lassoframework.com/my"
 
 
+def test_facebook_connect_uses_echo_return_url_not_portal(db_env, monkeypatch):
+    # FINALIZE FIX (Zanshin/Pete 2026-08-28): the portal's /my has no headless handshake, so
+    # Facebook/Google MUST come back through Echo's own /connect/return (which finalizes the
+    # account server-side). When intake_web supplies an echo_return_url, THAT is what Echo hands
+    # Zernio for FB/GBP — never the raw portal url that would drop the grant.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient(connect={"authUrl": "https://www.facebook.com/v24.0/dialog/oauth?x=1"})
+    echo_ret = ("https://echo.example/portal/tok123/connect/return"
+                "?dest=https%3A%2F%2Fops.lassoframework.com%2Fmy")
+    status, _body = zr.handle_social_connect(
+        "gymA", "facebook", client=fake,
+        redirect_url="https://ops.lassoframework.com/my", echo_return_url=echo_ret)
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == echo_ret     # Echo's finalize return leg, NOT the raw portal /my
+    assert "/connect/return" in call[3]
+
+
+def test_googlebusiness_connect_uses_echo_return_url(db_env, monkeypatch):
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=1"})
+    echo_ret = "https://echo.example/portal/tok123/connect/return?dest=https%3A%2F%2Fx%2Fmy"
+    status, _body = zr.handle_social_connect(
+        "gymA", "googlebusiness", client=fake,
+        redirect_url="https://ops.lassoframework.com/my", echo_return_url=echo_ret)
+    assert status == 200
+    assert _connect_call(fake)[3] == echo_ret
+
+
+def test_instagram_ignores_echo_return_url(db_env, monkeypatch):
+    # Instagram is NOT headless (no page/location select), so it lands the account directly and
+    # keeps the portal's own redirect. The Echo finalize return leg would be wrong for it.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    fake = _FakeClient()
+    status, _body = zr.handle_social_connect(
+        "gymA", "instagram", client=fake,
+        redirect_url="https://ops.lassoframework.com/my",
+        echo_return_url="https://echo.example/portal/tok/connect/return")
+    assert status == 200
+    call = _connect_call(fake)
+    assert call[3] == "https://ops.lassoframework.com/my"   # portal redirect, not Echo's return
+
+
+def test_portal_dest_url_allowlists_only_portal_origin(db_env, monkeypatch):
+    # The ?dest= that rides the return leg is validated by the SAME allowlist as the connect
+    # redirect: only the portal / intake-web origins are honored, so it can never be an open
+    # redirect. Off-origin junk falls back to the configured portal /my.
+    monkeypatch.setenv("PORTAL_PUBLIC_BASE_URL", "https://ops.lassoframework.com")
+    assert zr.portal_dest_url("https://ops.lassoframework.com/my/social") \
+        == "https://ops.lassoframework.com/my/social"
+    assert zr.portal_dest_url("https://evil.example/steal") \
+        == "https://ops.lassoframework.com/my"
+    assert zr.portal_dest_url("") == "https://ops.lassoframework.com/my"
+
+
 def test_client_connect_url_includes_headless_and_redirect(db_env):
     # Verify the actual Zernio GET params carry headless=true + redirect_url (the reproduced bug
     # was Echo omitting redirect_url so Zernio defaulted to its dashboard).

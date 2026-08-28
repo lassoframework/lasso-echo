@@ -213,6 +213,31 @@ def _upload_base_url():
     return raw.rstrip("/")
 
 
+def _connect_return_url(token, dest):
+    """The token-scoped Echo return leg handed to Zernio as the post-OAuth redirect_url for
+    Facebook / Google Business (FINALIZE FIX, Zanshin/Pete 2026-08-28).
+
+    Zernio always runs headless, so after the owner approves it bounces the browser back to this
+    URL with step/tempToken (GBP: pendingDataToken) and does NOT create the account. Landing on
+    the portal's /my (its old redirect_url) dropped every grant because /my has no finalize
+    handshake. Instead we land on Echo's own /portal/<token>/connect/return, which runs the
+    finalize SERVER-SIDE (creating the account on Zernio) and then 302s the browser to `dest`
+    (the portal's own Social page). `dest` is carried through so the owner still ends up back in
+    the LASSO portal. Returns '' when a base URL cannot be resolved (caller falls back to the
+    portal redirect, preserving old behaviour)."""
+    if not token:
+        return ""
+    base = _upload_base_url()
+    if not base:
+        return ""
+    url = f"{base}/portal/{token}/connect/return"
+    d = (dest or "").strip()
+    if d.startswith("http://") or d.startswith("https://"):
+        from urllib.parse import quote as _quote
+        url += "?dest=" + _quote(d, safe="")
+    return url
+
+
 def link_for(client_key, kind="u"):
     """The full signed intake link for a client key, or '' when it cannot be built
     (no signing secret set). kind='u' is the media upload page; kind='intake' is
@@ -1677,6 +1702,22 @@ def build_server(port=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_redirect(self, location, status=302):
+            """A bare 302 to `location` (the post-finalize bounce to the portal). Same
+            hardening headers as _send_html; the body is a tiny fallback link."""
+            from html import escape as _esc
+            safe = _esc(location or "/", quote=True)
+            body = (f"<!doctype html><meta http-equiv=refresh content='0;url={safe}'>"
+                    f"<a href='{safe}'>Continue</a>").encode()
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(body)
+
         def _send_json(self, obj, status=200, cors_origin=""):
             body = json.dumps(obj).encode()
             self.send_response(status)
@@ -1912,13 +1953,60 @@ def build_server(port=None):
                     # LASSO portal (never the Zernio dashboard). Read the SAME way as platform;
                     # a missing one falls back to the configured portal origin inside the handler.
                     redirect_url = (_q.get("redirect_url") or [""])[0]
-                    status, body = _zr.handle_social_connect(account_key, platform,
-                                                             redirect_url=redirect_url)
+                    # FINALIZE FIX (Zanshin/Pete 2026-08-28): hand Zernio a token-scoped Echo
+                    # return leg for FB/GBP so the headless account gets FINALIZED server-side
+                    # (the portal's /my page has no handshake). The portal's own landing rides
+                    # inside as ?dest=. See _connect_return_url + the /connect/return route.
+                    echo_return_url = _connect_return_url(pt_token, redirect_url)
+                    status, body = _zr.handle_social_connect(
+                        account_key, platform, redirect_url=redirect_url,
+                        echo_return_url=echo_return_url)
                 elif pt_sub == "social-status":
                     status, body = _zr.handle_social_status(account_key)
                 else:
                     status, body = _zr.handle_facebook_pages(account_key)
                 return self._send_json(body, status)
+
+            # Headless OAuth RETURN leg: GET /portal/<token>/connect/return (FINALIZE FIX,
+            # Zanshin/Pete 2026-08-28). This is the redirect_url Echo hands Zernio for FB/GBP.
+            # Zernio bounces the browser HERE after OAuth with step/tempToken/... and does NOT
+            # create the account (headless). We run the finalize SERVER-SIDE (creating the
+            # account on Zernio), then 302 the owner to the portal's own Social page (?dest=).
+            # A single Page/location auto-finalizes with ZERO clicks; several render Echo's
+            # branded picker (the same connect page JS handles the choice); an expired/empty
+            # link renders the connect page with an honest message. Token->account; unknown/
+            # revoked/zernio-off = 404.
+            m_creturn = re.match(r"^/portal/([A-Za-z0-9_.-]{8,})/connect/return$",
+                                 self.path.split("?")[0])
+            if m_creturn:
+                tok = m_creturn.group(1)
+                account_key = client_for_token(tok)
+                if (account_key is None or is_revoked(account_key)
+                        or not config.zernio_enabled()):
+                    return self._deny(404)
+                from urllib.parse import urlparse, parse_qs
+                _q = {k: (v[0] if v else "") for k, v in
+                      parse_qs(urlparse(self.path).query).items()}
+                dest = _zr.portal_dest_url(_q.get("dest") or "")
+                # Only the headless params from Zernio drive the finalize; dest is ours.
+                params = {k: v for k, v in _q.items() if k != "dest"}
+                # No step yet -> this was hit without a Zernio bounce; just show the page.
+                if not params.get("step"):
+                    return self._send_html(render_connect_page(tok, account_key))
+                try:
+                    status, resp = _zr.handle_connect_finalize(account_key, params)
+                except Exception as exc:  # noqa: BLE001 - never 500 a client return leg
+                    print(f"[portal] connect/return finalize errored for "
+                          f"{account_key}: {type(exc).__name__}")
+                    status, resp = 502, {}
+                if status == 200 and isinstance(resp, dict) and resp.get("finalized"):
+                    # Account is REALLY created (handle_connect_finalize re-checks
+                    # list_accounts before claiming finalized). Send them back to the portal.
+                    return self._send_redirect(dest)
+                # Not auto-finalized (several options, expired, or an error): render Echo's
+                # connect page. Its JS re-reads the same step/tempToken from the URL and either
+                # shows the picker or the honest "that link expired" message.
+                return self._send_html(render_connect_page(tok, account_key))
 
             # Self-serve CONNECT page: GET /portal/<token>/connect -> a branded HTML page
             # with Instagram / Facebook / Google Business buttons. Each button fetches the

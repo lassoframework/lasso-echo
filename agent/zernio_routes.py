@@ -149,6 +149,14 @@ def _connect_redirect_url(redirect_url):
     return f"{config.portal_public_base_url()}/my"
 
 
+def portal_dest_url(dest):
+    """The validated final landing for the post-finalize 302 (the FINALIZE FIX return leg).
+    Same allowlist as _connect_redirect_url: only the LASSO portal / intake-web origins are
+    honored, so the ?dest= param can never be turned into an open redirect. Anything else
+    (absent, off-origin, non-http) falls back to the configured portal /my."""
+    return _connect_redirect_url(dest)
+
+
 def connect_url_for(account_key, platform, client=None, redirect_url=None):
     """OPS: the OAuth CONNECT url for a gym + platform (instagram|facebook|googlebusiness),
     find-or-creating the Zernio profile first. This is the same URL the portal handler returns;
@@ -180,7 +188,8 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
     return True, str(auth_url)
 
 
-def handle_social_connect(account_key, platform, client=None, redirect_url=None):
+def handle_social_connect(account_key, platform, client=None, redirect_url=None,
+                          echo_return_url=None):
     """GET /portal/<token>/social-connect?platform=instagram|facebook|googlebusiness[&redirect_url=...]
     -> {oauth_url}. Google Business connects through the SAME find-or-create profile +
     connect_url path as IG/FB (Zernio platform key 'googlebusiness').
@@ -188,7 +197,19 @@ def handle_social_connect(account_key, platform, client=None, redirect_url=None)
     redirect_url is the post-OAuth return target the PORTAL passes (its own Social page) so the
     gym owner lands back in the LASSO portal after approving, never on the Zernio dashboard. When
     the portal does not pass one, _connect_redirect_url falls back to the configured portal
-    origin — the redirect is NEVER omitted, so Zernio can never default to its dashboard."""
+    origin — the redirect is NEVER omitted, so Zernio can never default to its dashboard.
+
+    echo_return_url (the FINALIZE FIX, Zanshin/Pete 2026-08-28): Zernio ALWAYS runs headless
+    (connect_url passes headless=true), so after OAuth it bounces the browser back with
+    step/tempToken and does NOT create the account. The account is only created when the
+    selection endpoints are called (handle_connect_finalize). The portal's /my page has NO
+    handshake for that return leg, so every portal-driven Facebook/Google grant was silently
+    dropped. When an echo_return_url is supplied (intake_web builds a token-scoped
+    /portal/<token>/connect/return that runs the finalize SERVER-SIDE and then 302s to the
+    portal), we hand THAT to Zernio instead of the raw portal url — so the finalize always
+    happens no matter where the connect was started. The portal's own desired final landing
+    rides inside echo_return_url as ?dest=. A missing echo_return_url preserves the old
+    behaviour (Echo's own connect page, which has the JS handshake)."""
     if not config.zernio_enabled():
         return _disabled("social-connect")
     if not account_key:
@@ -196,11 +217,16 @@ def handle_social_connect(account_key, platform, client=None, redirect_url=None)
     if platform not in _z.CONNECT_PLATFORMS:
         return 400, {"error": "platform must be instagram, facebook, or googlebusiness"}
     c = _client(client)
+    # Instagram is not headless (no page/location select step); it lands the account directly,
+    # so it keeps the portal's own redirect. Facebook/Google MUST come back through Echo's
+    # finalize return leg or the grant is dropped.
+    zernio_redirect = (echo_return_url if (echo_return_url and platform != "instagram")
+                       else _connect_redirect_url(redirect_url))
     try:
         pid = _ensure_profile_id(account_key, c)
         if not pid:
             return 502, {"error": "could not resolve a Zernio profile for this gym"}
-        data = c.connect_url(pid, platform, redirect_url=_connect_redirect_url(redirect_url))
+        data = c.connect_url(pid, platform, redirect_url=zernio_redirect)
     except _z.ZernioError as exc:
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
     except Exception as exc:  # network/parse: honest, never a fabricated URL

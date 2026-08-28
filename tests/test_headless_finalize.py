@@ -400,3 +400,39 @@ def test_client_headless_methods_hit_documented_endpoints():
     assert (m, url.endswith("/v1/connect/googlebusiness/select-location")) == ("POST", True)
     assert body == {"profileId": "prof1", "locationId": "locations/5",
                     "pendingDataToken": "pdt1", "accountId": "accounts/2"}
+
+
+# ---- FINALIZE FIX: the Echo return leg URL (Zanshin/Pete 2026-08-28) -------------
+def test_connect_return_url_wraps_portal_dest(monkeypatch):
+    """Echo hands Zernio its OWN token-scoped /connect/return (which finalizes the
+    account server-side), carrying the portal's real landing inside ?dest=. Without
+    this the portal's /my got the redirect and dropped the grant (no /my handshake)."""
+    from agent import intake_web
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "https://echo-intake.example.com")
+    url = intake_web._connect_return_url("tok_abc123",
+                                         "https://ops.lassoframework.com/my")
+    assert url.startswith("https://echo-intake.example.com/portal/tok_abc123/connect/return")
+    # the portal landing rides through, url-encoded, as ?dest=
+    assert "dest=https%3A%2F%2Fops.lassoframework.com%2Fmy" in url
+
+
+def test_connect_return_url_omits_bad_dest(monkeypatch):
+    from agent import intake_web
+    monkeypatch.setenv("AGENT_UPLOAD_BASE_URL", "https://echo-intake.example.com")
+    # a non-http(s) dest is not appended; the return route falls back to the portal /my.
+    url = intake_web._connect_return_url("tok_x", "javascript:alert(1)")
+    assert url == "https://echo-intake.example.com/portal/tok_x/connect/return"
+    # no token -> no url (caller falls back to the portal redirect)
+    assert intake_web._connect_return_url("", "https://ops.lassoframework.com/my") == ""
+
+
+def test_connect_return_route_registered_in_get_handler():
+    """The GET dispatcher must recognize /portal/<token>/connect/return so Zernio's
+    post-OAuth bounce is finalized server-side, not 404'd."""
+    import inspect
+    from agent import intake_web
+    src = inspect.getsource(intake_web)
+    assert "connect/return" in src
+    # it drives the SAME finalize the connect page JS uses, then bounces to the portal.
+    assert "handle_connect_finalize" in src
+    assert "_send_redirect" in src
