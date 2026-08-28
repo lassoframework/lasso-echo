@@ -812,6 +812,27 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # ACCOUNT-KEY DOCTOR (AGENT_ACCOUNT_KEY_DOCTOR_ALERTS, default OFF -> alert
+    # suppressed, report still computed): nightly READ-ONLY coverage check that every
+    # social-product gym's base still resolves to exactly one non-archived gyms row
+    # (+ its Zernio profile). A base that can't resolve is a STRANDING RISK — the
+    # base != slug / phantom-key class that made "still not connected" a recurring
+    # client complaint. The doctor surfaces it as a THROTTLED ops alert the morning it
+    # appears instead of via a client weeks later. Read-only; inert (and never alerts)
+    # without Supabase creds. Isolated: a failure never blocks the draft run.
+    try:
+        from . import account_key_doctor as _akd
+        _dsum = _akd.diagnose()
+        _alerted = _akd.fire_alerts(_dsum)
+        _stranded = _dsum.get("stranded") or []
+        if _stranded:
+            print(f"[account-key-doctor] {len(_stranded)} stranding risk(s): "
+                  f"{', '.join(str(s) for s in _stranded)}")
+    except Exception as e:
+        print(f"[account-key-doctor] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"account-key doctor failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     # INBOX ALERTS (flag AGENT_INBOX_ALERTS, default OFF -> no-op): daily
     # READ-ONLY sweep of unhandled comments/mentions/reviews per gym, one
     # coach-channel card per gym per day max (kv-stamped). Never replies,
