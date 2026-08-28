@@ -147,9 +147,17 @@ class _Resp:
         return ""
 
 
+# The REAL echo_social_connections columns (mirrors the live DB). A write to any other
+# column is rejected 400 here exactly as PostgREST would — this is what catches a phantom
+# column (e.g. the ever_connected regression) in tests instead of only in production.
+_ESC_COLS = {"id", "gym_id", "platform", "state", "handle",
+             "first_connected_at", "last_verified_at", "updated_at"}
+
+
 class _RoutingHttp:
     """A PostgREST stand-in that answers by table + filter, backing a tiny in-memory
-    'gyms' and 'echo_gym_settings' and 'echo_social_connections'. Records writes."""
+    'gyms' and 'echo_gym_settings' and 'echo_social_connections'. Records writes and
+    rejects writes to columns that do not exist on echo_social_connections."""
 
     def __init__(self, gyms=None, settings=None, conns=None):
         self.gyms = gyms or {}          # slug -> uuid
@@ -171,6 +179,11 @@ class _RoutingHttp:
             uuid = (params.get("gym_id") or "").replace("eq.", "")
             row = self.settings.get(uuid)
             return _Resp(200, [row] if row else [])
+        if t == "echo_social_connections":
+            uuid = (params.get("gym_id") or "").replace("eq.", "")
+            plat = (params.get("platform") or "").replace("eq.", "")
+            row = self.conns.get((uuid, plat))
+            return _Resp(200, [row] if row else [])
         return _Resp(200, [])
 
     def post(self, url, params=None, headers=None, json=None, timeout=None):
@@ -188,6 +201,11 @@ class _RoutingHttp:
         t = self._table(url)
         self.writes.append(("patch", t, params, json))
         if t == "echo_social_connections":
+            unknown = set(json or {}) - _ESC_COLS
+            if unknown:
+                col = sorted(unknown)[0]
+                return _Resp(400, {"message": f"column \"{col}\" of relation "
+                                              f"\"echo_social_connections\" does not exist"})
             uuid = (params.get("gym_id") or "").replace("eq.", "")
             plat = (params.get("platform") or "").replace("eq.", "")
             row = dict(self.conns.get((uuid, plat)) or {"gym_id": uuid, "platform": plat})
@@ -274,15 +292,16 @@ def test_a_bare_live_row_still_reads_connected_no_flap():
 
 
 # ===========================================================================
-# 5. re-verify sweep overwrites a poisoned row + repairs ever_connected
+# 5. re-verify sweep overwrites a poisoned row + repairs the durable connect signal
 # ===========================================================================
-def test_reverify_overwrites_poisoned_row_and_repairs_ever_connected(shared_env, monkeypatch):
-    # Poisoned cache: FB marked not_connected + ever_connected false by the bad cron.
+def test_reverify_overwrites_poisoned_row_and_repairs_first_connected_at(shared_env, monkeypatch):
+    # Poisoned cache: FB marked not_connected by the bad cron, no first_connected_at.
     http = _RoutingHttp(
         gyms={"gritx": "uuid-gritx"},
         settings={"uuid-gritx": {"zernio_profile_id": GRITX_PROFILE}},
         conns={("uuid-gritx", "facebook"): {"gym_id": "uuid-gritx", "platform": "facebook",
-                                            "state": "not_connected", "ever_connected": False}},
+                                            "state": "not_connected",
+                                            "first_connected_at": None}},
     )
     store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
                                       service_key="svc-secret", http=http)
@@ -294,11 +313,33 @@ def test_reverify_overwrites_poisoned_row_and_repairs_ever_connected(shared_env,
     assert out["ok"] is True
     row = http.conns[("uuid-gritx", "facebook")]
     assert row["state"] == "connected"
-    assert row["ever_connected"] is True  # repaired so reconcileWithPriorConnection works
+    # The durable "was connected" signal is first_connected_at (this schema has NO
+    # ever_connected column); a genuinely-connected platform gets it stamped.
+    assert row.get("first_connected_at")  # truthy timestamp, repaired
+    assert row.get("last_verified_at")    # verification bumped
     assert row["handle"] == "Gritx Gym"
 
 
-def test_reverify_writes_not_connected_but_does_not_touch_ever_connected_when_unresolved(
+def test_reverify_preserves_original_first_connected_at(shared_env, monkeypatch):
+    # An existing first_connected_at must never be overwritten by a re-verify.
+    http = _RoutingHttp(
+        gyms={"gritx": "uuid-gritx"},
+        settings={"uuid-gritx": {"zernio_profile_id": GRITX_PROFILE}},
+        conns={("uuid-gritx", "facebook"): {"gym_id": "uuid-gritx", "platform": "facebook",
+                                            "state": "connected",
+                                            "first_connected_at": "2026-01-01T00:00:00+00:00"}},
+    )
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc-secret", http=http)
+    monkeypatch.setattr(zr, "_shared_store", lambda: store)
+    fake = FakeZernio(accounts={"accounts": [{"platform": "facebook", "_id": "fb1",
+                                              "displayName": "Gritx Gym"}]})
+    rv.reverify_gym("gritx", client=fake, store=store)
+    row = http.conns[("uuid-gritx", "facebook")]
+    assert row["first_connected_at"] == "2026-01-01T00:00:00+00:00"  # untouched
+
+
+def test_reverify_writes_not_connected_but_does_not_stamp_first_connected_when_unresolved(
         shared_env, monkeypatch):
     http = _RoutingHttp(gyms={"gritx": "uuid-gritx"})  # no settings row, no profile
     store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
@@ -309,5 +350,5 @@ def test_reverify_writes_not_connected_but_does_not_touch_ever_connected_when_un
     assert out["ok"] is True
     row = http.conns[("uuid-gritx", "facebook")]
     assert row["state"] == "not_connected"
-    # ever_connected must NOT be forced when we have no positive signal.
-    assert "ever_connected" not in row or row.get("ever_connected") is not True
+    # first_connected_at must NOT be forced when we have no positive signal.
+    assert not row.get("first_connected_at")

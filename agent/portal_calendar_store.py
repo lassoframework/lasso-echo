@@ -683,9 +683,13 @@ class SupabaseCalendarStore:
                                   mark_ever_connected=False):
         """RE-VERIFY SWEEP writer: set echo_social_connections.state (+ handle) for a
         gym's platform to the TRUE Zernio state, overwriting the poisoned not_connected
-        the 6h cron wrote. When a platform is genuinely connected now, mark_ever_connected
-        repairs ever_connected=true so the portal's reconcileWithPriorConnection rescue
-        works again. No-op (returns None) when the gym/row is absent. Gym-scoped."""
+        the 6h cron wrote, and bump last_verified_at. When a platform is genuinely
+        connected now (mark_ever_connected), ensure first_connected_at is set — that is
+        the durable "was connected" signal this schema actually carries (there is NO
+        ever_connected column; writing one 400s). first_connected_at is stamped ONLY when
+        currently null, so the ORIGINAL connect time is never overwritten. No-op (returns
+        None) when the gym/row is absent. Gym-scoped."""
+        from datetime import datetime, timezone
         g = self._client().get(
             self._rest("gyms"),
             params={"slug": f"eq.{gym_slug}", "select": "id"},
@@ -697,9 +701,22 @@ class SupabaseCalendarStore:
         if not grows or not grows[0].get("id"):
             return None
         gym_uuid = grows[0]["id"]
-        body = {"state": state, "handle": handle}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        body = {"state": state, "handle": handle, "last_verified_at": now_iso}
         if mark_ever_connected:
-            body["ever_connected"] = True
+            # Preserve the first-ever connect time: only stamp first_connected_at when the
+            # row does not already carry one. Read the current value to decide.
+            cur = self._client().get(
+                self._rest("echo_social_connections"),
+                params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}",
+                        "select": "first_connected_at"},
+                headers=self._headers(), timeout=30,
+            )
+            if cur.status_code >= 400:
+                raise PortalStoreError(cur.status_code, _scrub((cur.text or "")[:200]))
+            crows = cur.json() or []
+            if not crows or not (crows[0] or {}).get("first_connected_at"):
+                body["first_connected_at"] = now_iso
         r = self._client().patch(
             self._rest("echo_social_connections"),
             params={"gym_id": f"eq.{gym_uuid}", "platform": f"eq.{platform}"},
