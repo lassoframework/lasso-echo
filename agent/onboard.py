@@ -183,6 +183,17 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     if brains_dir is None:
         brains_dir = "brains"
 
+    # CANONICAL KEY AT MINT (topfuel / district_h stranding fix): derive the key EVERY
+    # onboarding artifact + the intake link will use from the portal gyms.id UUID +
+    # display_name, so a fresh link can never carry an ad-hoc key that later disagrees with
+    # gyms.slug / the Zernio handle. Behind config.canonical_mint_enabled() (defaults ON, only
+    # affects NEW links). Idempotent: an already-onboarded gym (local row exists under the
+    # passed key) keeps its key untouched — an already-signed token self-decodes its own key,
+    # so its resolution never changes. When the portal uuid can't be resolved (dev host / no
+    # creds) the passed key is kept verbatim; NEVER fabricates a gym_id, NEVER blocks the mint.
+    from . import account_key_mint as _akm
+    account_key, _mint_info = _akm.derive_mint_key(account_key, display_name)
+
     result = {
         "account_key": account_key,
         "display_name": display_name,
@@ -195,6 +206,7 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
         "upload_link": None,
         "socialapi_brand_id": None,
         "pending_human_items": [],
+        "canonical_mint": _mint_info,
     }
 
     # (a) Upsert gym row --------------------------------------------------

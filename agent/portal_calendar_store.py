@@ -606,6 +606,22 @@ class SupabaseCalendarStore:
     # time; read first in _resolve_profile_id, so status no longer depends on the ephemeral
     # web volume. Mirrors gym_autonomy exactly (gyms.slug -> id -> echo_gym_settings).
 
+    def list_gyms_min(self):
+        """Read-only: the minimal gyms list (id, slug, name) for every gym. Used by the
+        account-key doctor to CLASSIFY an unresolved base (AMBIGUOUS vs ARCHIVED_ONLY vs a
+        true no-match) without ever binding or writing. Returns [] on no creds / a read
+        failure (an honest 'no data', never a crash). Never raises out."""
+        try:
+            r = self._client().get(
+                self._rest("gyms"),
+                params={"select": "id,slug,name"},
+                headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                return []
+            return r.json() or []
+        except Exception:  # noqa: BLE001 - a read failure is 'no data', never a crash
+            return []
+
     def resolve_gym_uuid(self, base):
         """The gyms.id UUID for an account-registry BASE, or None. THE base != slug bug
         (topfuel/district_h/hillcountry, live 2026-08-28): the account registry keys by a
