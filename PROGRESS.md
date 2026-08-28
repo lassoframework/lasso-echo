@@ -10,6 +10,50 @@ Last updated: 2026-08-28
 
 ---
 
+## Report-card score fixes (2026-08-28, feat/report-card-score)
+
+LASSO's own Social Report Card (90d ending 2026-08-28) scored 67/100 (D). Five
+build-time fixes, every new behavior flag-gated OFF; cadence (20/20) protected:
+blocked slots re-draft or refill on the next plan pass, never a posting gap.
+
+- [~] HARD never-verbatim-twice (upgrades AGENT_CAPTION_COOLDOWN when armed):
+      caption_ledger verbatim layer (trim/case/whitespace normalize, 180-day
+      window, dates-list so a row's own stamp never masks an earlier dup;
+      same-date rows = ONE post, incl. the is_on_cooldown same-date fix that
+      would have self-blocked every armed publish recheck). Belts: planner
+      re-draft, insert_rows drop+alert, publish_guard duplicate_caption,
+      meta/zernio publisher wires, chat gate. Tests per lane
+      (tests/test_caption_dedup.py).
+- [~] Empty-caption double belt: stage-time drop+alert in insert_rows behind
+      AGENT_EMPTY_CAPTION_GUARD (stories exempt); publish-time always-on rails
+      in meta_publisher (new, parity with zernio's) + zernio + publish_guard +
+      chat gate (tests/test_empty_caption_guard.py).
+- [~] Ask coverage (AGENT_ASK_COVERAGE, B2B/LASSO lane only): every reel
+      carries EXACTLY ONE ask family (one destination per post; bio untouched,
+      Blake's ruling), month coverage floor >= 70% (AGENT_ASK_COVERAGE_FLOOR),
+      testimonial/proof/welcome stay genuine no-ask room; deletes/appends only,
+      copy_gate-clean; wired in apply_month_plan before the grade gate
+      (tests/test_ask_coverage.py).
+- [~] Reels floor (AGENT_LASSO_REELS_FLOOR, >=35% video feed posts). MEASURED
+      FIRST per Blake's ruling: forward plan (video mix ON) lands 5.7-19.4%
+      video-preferred, so the floor rebalances minimally (b2b -> platform ->
+      doctrine days, earliest first). Sprints byte-for-byte intact, thu/sun
+      podcast preserved, dated overrides never converted. Lands 35.8-37.0%
+      across the live windows; podcast pillar goes past the 25% mix cap (-3
+      content_mix, grade gate still has headroom) — flagged for Blake
+      (tests/test_lasso_reels_floor.py).
+- [~] Owner-voice testimonial pillar (AGENT_LASSO_TESTIMONIAL_PILLAR):
+      alternate-Tuesday slot + agent/testimonial_pillar.py drafting ONLY from
+      approved social_proof entries (Permission: yes + Verified date, e.g. Fit
+      Mamas Tribe $19K -> $47K); nothing approved -> None -> existing-pillar
+      fallback, never a fabricated quote (tests/test_testimonial_pillar.py).
+
+Suite: 4078+ passed; only pre-existing allowed failure
+(test_clipper_phase0 faster-whisper prereq). Approval gate, copy_gate, trust
+ladder untouched.
+
+---
+
 ## Story Studio: raw footage -> finished stories (2026-08-28, feat/story-studio)
 
 Spec: ECHO_STORY_STUDIO_BUILD.md (scratchpad). Builds the four missing pieces on

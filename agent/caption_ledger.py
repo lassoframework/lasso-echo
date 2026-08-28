@@ -17,6 +17,17 @@ from datetime import date, timedelta
 COOLDOWN_DAYS = 60          # a caption may not re-enter a calendar within 60 days
 HARD_BLOCK_SAME_MONTH = True  # and never twice in the same calendar month, period
 
+# HARD verbatim rule (report-card upgrade, 2026-08-28): a verbatim-duplicate
+# caption (normalized only for trim / case / whitespace, nothing else) NEVER
+# ships twice on the same gym within a rolling 180 days. This is stricter in
+# window (180 vs 60 days) and looser in normalization (a genuinely reworded
+# caption is NOT a verbatim dup) than the fuzzy cooldown above; the two run
+# together via is_blocked(). The verbatim record keeps a DATES LIST (not just
+# last_used) so a row's own staging stamp can never mask an earlier true dup
+# at publish time.
+VERBATIM_BLOCK_DAYS = 180
+_VERBATIM_MAX_DATES = 40    # bounded history per (gym, verbatim hash)
+
 CONCEPT_COOLDOWN_DAYS = 30  # doctrine/education concept pool gap
 
 
@@ -41,6 +52,23 @@ def caption_hash(text: str) -> str:
     return hashlib.sha256(t.encode()).hexdigest()[:16]
 
 
+def verbatim_normalize(text: str) -> str:
+    """The verbatim-rule normalization: trim, casefold, collapse whitespace runs.
+    NOTHING else — punctuation, tags, and full length all count, so only a
+    truly verbatim repeat (modulo spacing/case) matches."""
+    return re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+
+
+def verbatim_hash(text: str) -> str:
+    """Stable 16-char hex fingerprint for the VERBATIM rule (see
+    verbatim_normalize). An empty/whitespace caption hashes to '' so it can
+    never match anything (stories carry empty bodies by design)."""
+    t = verbatim_normalize(text)
+    if not t:
+        return ""
+    return hashlib.sha256(t.encode()).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 # KV key
 # ---------------------------------------------------------------------------
@@ -48,6 +76,11 @@ def caption_hash(text: str) -> str:
 def ledger_key(gym_id: str, h: str) -> str:
     """The kv key for a gym+hash pair."""
     return f"caption_ledger_{gym_id}_{h}"
+
+
+def verbatim_key(gym_id: str, h: str) -> str:
+    """The kv key for a gym + VERBATIM hash pair."""
+    return f"caption_verbatim_{gym_id}_{h}"
 
 
 def _concept_key(gym_id: str, concept_key: str) -> str:
@@ -81,6 +114,14 @@ def is_on_cooldown(gym_id: str, caption_text: str, planned_date: str,
             return False
         last = date.fromisoformat(last_used)
         planned = date.fromisoformat(planned_date)
+        # SAME DATE = the SAME post (the IG/FB cross-post and the paired story
+        # share a caption on one date by design, and a staged row's own ledger
+        # stamp carries its own post_date). Never a repeat, never a block —
+        # without this, arming the flag would self-block every staged row at
+        # the publish-time recheck (its own record_staged stamp reads as a
+        # same-month hit).
+        if last == planned:
+            return False
         # Same calendar month: hard block regardless of how many days apart
         if HARD_BLOCK_SAME_MONTH and last.year == planned.year and last.month == planned.month:
             return True
@@ -89,6 +130,70 @@ def is_on_cooldown(gym_id: str, caption_text: str, planned_date: str,
         return gap < COOLDOWN_DAYS
     except Exception:
         return False  # never block on error
+
+
+def is_verbatim_blocked(gym_id: str, caption_text: str, planned_date: str,
+                        db=None) -> bool:
+    """The HARD verbatim rule: True when this exact caption (verbatim_normalize)
+    was staged or published for gym_id on a DIFFERENT date within
+    VERBATIM_BLOCK_DAYS of planned_date. Same-date records are the same post
+    (cross-post / paired story / the row's own stamp) and never block.
+
+    An empty/whitespace caption is never verbatim-blocked (stories carry an
+    empty body by design; the empty-caption guard is a separate rail).
+    Returns False (safe) on any error so a kv failure never blocks content."""
+    try:
+        h = verbatim_hash(caption_text)
+        if not h:
+            return False
+        _db = db if db is not None else _default_db()
+        raw = _kv_get(_db, verbatim_key(gym_id, h))
+        if not raw:
+            return False
+        record = json.loads(raw)
+        planned = date.fromisoformat(planned_date)
+        for used in (record.get("dates") or []):
+            try:
+                d = date.fromisoformat(str(used))
+            except ValueError:
+                continue
+            if d == planned:
+                continue  # same date = same post, never a repeat
+            if abs((planned - d).days) < VERBATIM_BLOCK_DAYS:
+                return True
+        return False
+    except Exception:
+        return False  # never block on error
+
+
+def is_blocked(gym_id: str, caption_text: str, planned_date: str,
+               db=None) -> bool:
+    """The combined draft-time check: the fuzzy cooldown (60d + same-month)
+    OR the hard verbatim rule (180d). Call sites still guard on
+    config.caption_cooldown_enabled(); this only widens what ARMED means."""
+    return (is_on_cooldown(gym_id, caption_text, planned_date, db=db)
+            or is_verbatim_blocked(gym_id, caption_text, planned_date, db=db))
+
+
+def _record_verbatim(gym_id: str, caption_text: str, date_str: str, db_obj) -> None:
+    """Append date_str to the verbatim record's bounded dates list. Empty
+    captions are never recorded. Never raises (callers already swallow, this
+    keeps the two ledgers' failure posture identical)."""
+    try:
+        h = verbatim_hash(caption_text)
+        if not h:
+            return
+        key = verbatim_key(gym_id, h)
+        raw = _kv_get(db_obj, key)
+        record = json.loads(raw) if raw else {"dates": [], "uses": 0}
+        dates = [str(d) for d in (record.get("dates") or [])]
+        if date_str not in dates:
+            dates.append(str(date_str))
+        record["dates"] = sorted(dates)[-_VERBATIM_MAX_DATES:]
+        record["uses"] = int(record.get("uses", 0)) + 1
+        _kv_set(db_obj, key, json.dumps(record))
+    except Exception:
+        pass
 
 
 def record_staged(gym_id: str, caption_text: str, date_str: str,
@@ -112,6 +217,7 @@ def record_staged(gym_id: str, caption_text: str, date_str: str,
             record["last_used"] = date_str
         record["uses"] = int(record.get("uses", 0)) + 1
         _kv_set(_db, key, json.dumps(record))
+        _record_verbatim(gym_id, caption_text, date_str, _db)
     except Exception:
         pass  # ledger write failure is never fatal
 
@@ -135,6 +241,7 @@ def record_published(gym_id: str, caption_text: str, date_str: str,
             record["last_used"] = date_str
         record["uses"] = int(record.get("uses", 0)) + 1
         _kv_set(_db, key, json.dumps(record))
+        _record_verbatim(gym_id, caption_text, date_str, _db)
     except Exception:
         pass
 

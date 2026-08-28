@@ -44,9 +44,15 @@ MISSING_MENTION = "missing_mention"
 MULTI_ASK = "multi_ask"
 AVATAR_BLOCK = "avatar_block"
 MEDIA_MISSING = "media_missing"
+# Rail 8 (report-card build, 2026-08-28, behind AGENT_CAPTION_COOLDOWN): a FEED
+# caption that is a VERBATIM duplicate (trim/case/whitespace-normalized) of a
+# caption used on a DIFFERENT date for the same gym within the last 180 days
+# (caption_ledger.VERBATIM_BLOCK_DAYS) never ships. The caller reverts the row
+# to pending with this reject_reason; the planner re-drafts the slot.
+DUPLICATE_CAPTION = "duplicate_caption"
 
 ALL_CODES = (EMPTY_CAPTION, THIN_CAPTION, COPY_VIOLATION, MISSING_MENTION,
-             MULTI_ASK, AVATAR_BLOCK, MEDIA_MISSING)
+             MULTI_ASK, AVATAR_BLOCK, MEDIA_MISSING, DUPLICATE_CAPTION)
 
 # Categories that MUST carry a proof-tag: results/proof posts without a real
 # @mention are unverifiable brag copy (the '0 tags in 219 posts' class).
@@ -96,6 +102,11 @@ class PublishPayload:
     # A story publishes empty-body by design (see module docstring); the caller
     # sets this from the row's format so the caption rails know to stand down.
     is_story: bool = False
+    # The row's post_date (YYYY-MM-DD). Feeds the duplicate_caption rail: rows
+    # sharing a caption on the SAME date are one post (cross-post / paired
+    # story) and never a dup. Empty -> the dup rail stands down (no date, no
+    # window math; the stage-time belt already ran).
+    post_date: str = ""
 
 
 def _normalized_mentions(payload) -> set:
@@ -103,13 +114,19 @@ def _normalized_mentions(payload) -> set:
             for h in (payload.mentions or []) if str(h or "").strip()}
 
 
-def check(payload: PublishPayload, *, handles_fn=None) -> list:
+def check(payload: PublishPayload, *, handles_fn=None, dedup_fn=None) -> list:
     """Every violation code this payload carries (empty list == clear to publish).
 
     handles_fn(gym_id) -> list of allowlisted handles; defaults to
     agent.mentions.allowlisted_handles. Injectable so tests run offline. A
     handles_fn failure fails CLOSED for proof/results (missing_mention), never
     open: an unverifiable mention is not a mention.
+
+    dedup_fn(gym_id, caption, post_date) -> bool; defaults to
+    caption_ledger.is_verbatim_blocked and only runs when
+    AGENT_CAPTION_COOLDOWN is armed and the payload carries a post_date. A
+    dedup_fn failure fails OPEN (the ledger is a best-effort cache and the
+    stage-time belt already ran) — a kv hiccup never blocks a legit publish.
     """
     from . import copy_gate, post_quality
 
@@ -148,5 +165,17 @@ def check(payload: PublishPayload, *, handles_fn=None) -> list:
 
     if post_quality.avatar_breach(cap):
         violations.append(AVATAR_BLOCK)
+
+    # Rail 8: verbatim duplicate caption (AGENT_CAPTION_COOLDOWN, default OFF).
+    if visible_len(cap) and (payload.post_date or "").strip():
+        try:
+            from . import config
+            if config.caption_cooldown_enabled():
+                if dedup_fn is None:
+                    from .caption_ledger import is_verbatim_blocked as dedup_fn
+                if dedup_fn(payload.gym_id, cap, str(payload.post_date)[:10]):
+                    violations.append(DUPLICATE_CAPTION)
+        except Exception:
+            pass  # fail open: a ledger hiccup never blocks a legit publish
 
     return violations

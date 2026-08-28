@@ -938,6 +938,20 @@ class SupabaseCalendarStore:
             clean = {k: v for k, v in dict(row or {}).items() if k != "id"}
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
             payload.append(clean)
+        # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
+        # account-agnostic — LASSO and gyms share the bug class):
+        #   1. AGENT_EMPTY_CAPTION_GUARD: a FEED row with zero visible characters
+        #      in its caption is never staged.
+        #   2. AGENT_CAPTION_COOLDOWN: a FEED row whose caption is a VERBATIM
+        #      duplicate (180-day rule, caption_ledger.is_verbatim_blocked) of a
+        #      previously staged/published caption for this gym — or of an
+        #      earlier row in this same batch on a DIFFERENT date — is never
+        #      staged.
+        # A blocked row is DROPPED from the batch with a loud, honest alert
+        # (never silently shipped); the slot refills on the next plan pass (the
+        # planner re-drafts under the same rule, so cadence never gaps). STORY
+        # rows are exempt from both (empty body / shared caption by design).
+        payload = _stage_belts(account_key, payload)
         if not payload:
             return []
         all_keys = set()
@@ -1177,6 +1191,75 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+def _stage_belts(account_key, payload):
+    """Apply the stage-time empty-caption + verbatim-dedup belts to an
+    insert_rows batch (see the insert_rows comment). Returns the rows that may
+    stage. Both belts are flag-gated (default OFF -> the batch passes through
+    byte-for-byte). A belt failure NEVER blocks staging (fails open, matching
+    the ledger's posture) — the always-on publish-time belts still stand."""
+    empty_guard = False
+    dedup_guard = False
+    try:
+        empty_guard = config.empty_caption_guard_enabled()
+        dedup_guard = config.caption_cooldown_enabled()
+    except Exception:
+        return payload
+    if not (empty_guard or dedup_guard):
+        return payload
+
+    def _is_story(row):
+        return str((row or {}).get("format") or "").strip().lower() == "story"
+
+    def _alert(msg):
+        print(f"[portal-calendar-store] {msg}")
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(msg)
+        except Exception:
+            pass  # alerting never blocks staging
+
+    kept = []
+    batch_dates_by_hash = {}   # verbatim hash -> set of post_dates staged in THIS batch
+    for row in payload:
+        caption = str(row.get("caption") or "")
+        post_date = str(row.get("post_date") or "")[:10]
+        if _is_story(row):
+            kept.append(row)
+            continue
+        if empty_guard:
+            try:
+                from .publish_guard import visible_len
+                if visible_len(caption) == 0:
+                    _alert(
+                        f"empty caption guard: dropped a {account_key} feed row for "
+                        f"{post_date or 'unknown date'} at stage time (a feed post may "
+                        "not ship without real words); the slot refills on the next "
+                        "plan pass")
+                    continue
+            except Exception:
+                pass
+        if dedup_guard and caption.strip() and post_date:
+            try:
+                from . import caption_ledger as _ledger
+                h = _ledger.verbatim_hash(caption)
+                seen_dates = batch_dates_by_hash.get(h, set())
+                in_batch_dup = any(d != post_date for d in seen_dates)
+                if in_batch_dup or _ledger.is_verbatim_blocked(
+                        account_key, caption, post_date):
+                    _alert(
+                        f"caption dedup: dropped a {account_key} feed row for "
+                        f"{post_date} at stage time (verbatim duplicate of a caption "
+                        f"used within {_ledger.VERBATIM_BLOCK_DAYS} days); the slot "
+                        "refills on the next plan pass with a fresh caption")
+                    continue
+                if h:
+                    batch_dates_by_hash.setdefault(h, set()).add(post_date)
+            except Exception:
+                pass
+        kept.append(row)
+    return kept
+
 
 def preserve_and_prune(store, account_key, months, rows):
     """Shared guard for every delete-then-insert rebuild lane (client month, real month,

@@ -412,7 +412,8 @@ def _base_summit_weekday():
 
 def plan_month(account_key, start_date, days=30, *, book_dates=None,
                summit_day_fn=None, welcome_dates=None, sprint_day_fn=None,
-               sprint_feed_count_fn=None, posts_per_day=1, video_mix=None):
+               sprint_feed_count_fn=None, posts_per_day=1, video_mix=None,
+               reels_floor=None, testimonial=None):
     """A deterministic month plan: for each of `days` consecutive dates from start_date,
     the resolved category (weekly rotation + sprint/book/summit/welcome overrides) and its
     feed + paired story slots.
@@ -461,6 +462,24 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
     # the mix is off, so the base rotation stands byte for byte.
     if video_mix is None:
         video_mix = config.lasso_video_mix_enabled()
+    # REELS FLOOR (AGENT_LASSO_REELS_FLOOR, default OFF -> byte-for-byte the
+    # video-mix plan): when on, a post-pass converts the minimum number of
+    # non-sprint b2b/platform/doctrine days to podcast video slots so the
+    # month's FEED posts are >= the reels floor (35% by default). Measured
+    # 2026-08-28 (Blake's ruling: measure first): the forward plan lands
+    # 5.7-19.4% video-preferred (podcast pillar 20.8-26.1%) across the live
+    # windows, below the 35% benchmark, so the floor rebalances — minimally.
+    if reels_floor is None:
+        reels_floor = config.lasso_reels_floor_enabled()
+    # TESTIMONIAL PILLAR (AGENT_LASSO_TESTIMONIAL_PILLAR, default OFF): the
+    # Tuesday doctrine day becomes 'testimonial' on alternate (even ISO) weeks
+    # so owner-voice proof recurs without erasing doctrine. The builder drafts
+    # ONLY from the approved social-proof doc; no approved entry -> the slot
+    # falls back to a real pillar (never fabricated).
+    if testimonial is None:
+        testimonial = config.lasso_testimonial_pillar_enabled()
+    # Both video levers mark podcast slots video-preferred.
+    mark_video = bool(video_mix or reels_floor)
     midweek_video = (_midweek_video_days(start, days, sprint_day_fn)
                      if video_mix else set())
 
@@ -468,6 +487,11 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
     for i in range(days):
         d = (start + timedelta(days=i)).isoformat()
         base = _weekday_category(d)
+        # TESTIMONIAL PILLAR: the Tuesday doctrine day carries owner-voice proof
+        # on alternate (even ISO) weeks. Base-rotation change only; the dated
+        # overrides below still take precedence.
+        if testimonial and base == "doctrine" and _testimonial_day(d):
+            base = "testimonial"
         # VIDEO MIX: on a cap-safe non-sprint Wed, borrow the base b2b day for a video
         # (podcast) slot. This changes ONLY the base rotation category for the day; the
         # dated overrides below still take precedence, so a book/welcome/summit day is
@@ -508,10 +532,17 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
                 _alt = [c for c in _FALLBACK_ORDER if c != "summit"]
                 varied_cat = _alt[date.fromisoformat(d).toordinal() % len(_alt)]
                 varied_over = True
+            # REELS FLOOR only: a sprint day's VARIED slot that already lands on
+            # podcast prefers a real video clip (counts toward the floor). The
+            # sprint's own summit slots above are byte-for-byte untouched, and
+            # plain video_mix behavior is unchanged (no marking here).
+            _vvp = bool(reels_floor and varied_cat == "podcast")
             slots.append(PlanSlot(post_date=d, category=varied_cat, fmt=FEED,
-                                  base_category=base, overridden=varied_over))
+                                  base_category=base, overridden=varied_over,
+                                  video_preferred=_vvp))
             slots.append(PlanSlot(post_date=d, category=varied_cat, fmt=STORY,
-                                  base_category=base, overridden=varied_over))
+                                  base_category=base, overridden=varied_over,
+                                  video_preferred=_vvp))
             continue
         # 2x CADENCE (CADENCE_SPEC.md D5): posts_per_day==2 emits a SECOND
         # feed+story pair whose category is the NEXT pillar in _FALLBACK_ORDER after
@@ -524,7 +555,7 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         # text/infographic podcast fallback. Marked only when the mix is on and the
         # resolved category is podcast; the builder honors it, the honesty guard is
         # unchanged (no clip -> fall through, never faked).
-        _vp = bool(video_mix and category == "podcast")
+        _vp = bool(mark_video and category == "podcast")
         if int(posts_per_day or 1) == 2:
             slots.append(PlanSlot(post_date=d, category=category, fmt=FEED,
                                   base_category=base, overridden=overridden,
@@ -533,7 +564,7 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
                                   base_category=base, overridden=overridden,
                                   cadence_slot=0, video_preferred=_vp))
             second = _next_fallback_category(category)
-            _vp2 = bool(video_mix and second == "podcast")
+            _vp2 = bool(mark_video and second == "podcast")
             slots.append(PlanSlot(post_date=d, category=second, fmt=FEED,
                                   base_category=base, overridden=True,
                                   cadence_slot=1, video_preferred=_vp2))
@@ -547,7 +578,89 @@ def plan_month(account_key, start_date, days=30, *, book_dates=None,
         slots.append(PlanSlot(post_date=d, category=category, fmt=STORY,
                               base_category=base, overridden=overridden,
                               video_preferred=_vp))
-    return _cap_platform(slots, video_mix=video_mix)
+    slots = _cap_platform(slots, video_mix=mark_video)
+    if reels_floor:
+        slots = _apply_reels_floor(slots)
+    return slots
+
+
+def _testimonial_day(day_key):
+    """True on the alternate-week testimonial Tuesday (even ISO week). Pure."""
+    d = date.fromisoformat(day_key)
+    return d.weekday() == 1 and d.isocalendar()[1] % 2 == 0
+
+
+def _apply_reels_floor(slots, floor_fraction=None):
+    """REELS FLOOR post-pass (AGENT_LASSO_REELS_FLOOR): convert the MINIMUM
+    number of eligible feed slots to podcast video slots so video-preferred
+    feeds are >= floor_fraction of ALL planned feed slots. Pure and
+    deterministic; only ever RELABELS the plan (the podcast builder stages a
+    real Drive clip or the slot falls through to a real pillar — never
+    fabricated).
+
+    Preserved, always:
+      * SUMMIT SPRINT slots (is_sprint) are byte-for-byte untouched.
+      * thu + sun podcast days are already video (Blake's ruling) and are
+        never converted away.
+      * dated book / welcome / summit days are never converted (category
+        filter: only b2b, platform, doctrine days are eligible; a sprint
+        day's VARIED slot is eligible, its summit slots are not).
+      * the testimonial pillar is never converted (owner-voice proof recurs).
+      * a 2x day never carries podcast twice (skip when the date already has
+        a podcast feed).
+
+    Conversion order is deterministic: b2b days first (the same day the video
+    mix already borrows), then platform, then doctrine; earliest date first
+    within each. The paired STORY slot converts with its feed. Best-effort:
+    when the candidates run out below the floor (extreme sprint density) the
+    plan ships as close to the floor as the honest candidates allow."""
+    if floor_fraction is None:
+        floor_fraction = config.lasso_reels_floor_pct() / 100.0
+    feeds = [s for s in slots if s.fmt == FEED]
+    total = len(feeds)
+    if total <= 0 or floor_fraction <= 0:
+        return slots
+    video = sum(1 for s in feeds if s.video_preferred)
+    if video / total >= floor_fraction:
+        return slots  # Blake's ruling: already at/over the floor -> do not touch
+    _priority = {"b2b": 0, "platform": 1, "doctrine": 2}
+    cats_by_date = {}
+    for s in feeds:
+        cats_by_date.setdefault(s.post_date, []).append(s.category)
+    candidates = sorted(
+        (s for s in feeds if not s.is_sprint and s.category in _priority),
+        key=lambda s: (_priority[s.category], s.post_date,
+                       -1 if s.cadence_slot is None else s.cadence_slot,
+                       s.slot_index))
+    convert = set()
+    for s in candidates:
+        if video / total >= floor_fraction:
+            break
+        if "podcast" in cats_by_date.get(s.post_date, []):
+            continue  # the date already carries a podcast feed; never double up
+        convert.add((s.post_date, s.cadence_slot, s.slot_index, s.category))
+        day = cats_by_date.setdefault(s.post_date, [])
+        try:
+            day.remove(s.category)
+        except ValueError:
+            pass
+        day.append("podcast")
+        video += 1
+    if not convert:
+        return slots
+    out = []
+    for s in slots:
+        key = (s.post_date, s.cadence_slot, s.slot_index, s.category)
+        if not s.is_sprint and key in convert:
+            out.append(PlanSlot(post_date=s.post_date, category="podcast",
+                                fmt=s.fmt,
+                                base_category=s.base_category or s.category,
+                                overridden=True, slot_index=s.slot_index,
+                                is_sprint=False, cadence_slot=s.cadence_slot,
+                                video_preferred=True))
+        else:
+            out.append(s)
+    return out
 
 
 def _next_fallback_category(category):
@@ -884,11 +997,16 @@ def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
     # key or an object with an account_key / key attribute.
     gym_id = _resolve_gym_id(target)
 
+    # is_blocked = the fuzzy 60-day cooldown PLUS the hard 180-day VERBATIM rule
+    # (report-card build 2026-08-28): when the flag is armed, a verbatim dup
+    # NEVER ships — the builder is retried for a fresh concept, then the next
+    # real pillar fills the day (the slot re-drafts; cadence never gaps).
+    _check = getattr(_ledger, "is_blocked", _ledger.is_on_cooldown)
     attempts = [first_draft]
     for attempt in range(1, _max_attempts):
         d = attempts[-1]
         caption = _draft_caption(d)
-        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+        if not _check(gym_id, caption, day_key):
             return d
         log(f"caption cooldown hit {attempt}/{_max_attempts} for "
             f"{day_key} {cat}: retrying builder for next concept")
@@ -901,7 +1019,7 @@ def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
     if attempts:
         last = attempts[-1]
         caption = _draft_caption(last)
-        if not _ledger.is_on_cooldown(gym_id, caption, day_key):
+        if not _check(gym_id, caption, day_key):
             return last
     return None
 
@@ -1061,6 +1179,22 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     if account_key == config.demo_calendar_gym_id():
         return {"ok": False, "reason": "refusing to plan over the demo gym id",
                 "upserted": 0, "deleted": 0}
+
+    # ASK COVERAGE (AGENT_ASK_COVERAGE, default OFF; LASSO/B2B lane only —
+    # gym-facing months are untouched). Runs BEFORE the grade gate and the
+    # stage write so the graded rows and the staged rows both carry the
+    # enforced asks: every video/reel feed draft gets exactly ONE clear ask
+    # (one destination per post) and month-wide ask coverage is raised to the
+    # configured floor (default 70%), leaving testimonial/proof/welcome as
+    # genuine no-ask room. Deletes redundant ask sentences or appends the one
+    # approved CTA phrase only; never invents facts. A failure degrades to the
+    # unenforced drafts (flag-off behavior), never a blocked stage.
+    if config.ask_coverage_enabled() and _profile_for(account_key) == "B2B":
+        try:
+            from . import ask_coverage as _ask
+            _ask.enforce_drafts(drafts)
+        except Exception:
+            pass
 
     # CALENDAR GRADE GATE (AGENT_CALENDAR_GRADE / per-gym override, default OFF)
     # The gate runs over the planned rows (as calendar dicts), not the draft objects,

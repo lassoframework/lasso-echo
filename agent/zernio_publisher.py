@@ -153,6 +153,35 @@ def publish(draft, account, client=None, scheduled_for=None,
                 f"{account.key}: refusing to publish a FEED post with an empty "
                 "(zero visible characters) body; stories send an empty body by "
                 "design, a feed caption must carry real words.")
+        # VERBATIM DEDUP BELT (AGENT_CAPTION_COOLDOWN, default OFF): a FEED
+        # caption already used for this gym on a DIFFERENT date within 180 days
+        # (caption_ledger.VERBATIM_BLOCK_DAYS) never ships through this wire
+        # either — the same rail meta_publisher carries, so the guarantee holds
+        # no matter which lane reached a publisher. Same-date records (the
+        # row's own staging stamp, the FB cross-post, the paired story) never
+        # block; ledger errors fail open (a kv hiccup never blocks a legit
+        # publish). Raising makes the caller's revert + alert path own it.
+        if config.caption_cooldown_enabled():
+            _dup = False
+            try:
+                from .caption_ledger import is_verbatim_blocked, VERBATIM_BLOCK_DAYS
+                from datetime import date as _date
+                _gym = account.key
+                for _suf in ("_ig", "_fb"):
+                    if _gym.endswith(_suf):
+                        _gym = _gym[: -len(_suf)]
+                        break
+                _day = (getattr(draft, "day_key", "") or "")[:10] or \
+                    _date.today().isoformat()
+                _dup = bool(body.strip()) and is_verbatim_blocked(_gym, body, _day)
+            except Exception:
+                _dup = False
+            if _dup:
+                raise ValueError(
+                    f"{account.key}: refusing to publish a FEED post whose "
+                    f"caption already ran within {VERBATIM_BLOCK_DAYS} days "
+                    "(verbatim duplicate); redraft it, a caption never ships "
+                    "twice.")
 
     # AGENT_MENTIONS: append validated @handle mentions (newline-separated) to the
     # caption when the flag is ON. @handles in caption text are rendered by Zernio

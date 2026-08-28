@@ -2609,8 +2609,127 @@ def caption_cooldown_enabled() -> bool:
 
     When OFF, all caption_ledger calls are bypassed and today is byte-for-byte
     unchanged. Arm by hand: AGENT_CAPTION_COOLDOWN=true (Railway env).
+
+    UPGRADED (report-card build, 2026-08-28): when ARMED this is now a HARD
+    never-verbatim-twice guarantee on top of the fuzzy cooldown: a
+    verbatim-duplicate caption (trim/case/whitespace-normalized) never ships
+    twice on the same gym within a rolling 180 days
+    (caption_ledger.VERBATIM_BLOCK_DAYS). Enforced at THREE belts:
+      - plan time: real_month_planner retries the builder / falls to the next
+        real pillar (the slot re-drafts, cadence never drops);
+      - stage time: portal_calendar_store.insert_rows drops a verbatim-dup
+        FEED row from the batch with a loud alert (the slot refills on the
+        next plan pass, never silently ships);
+      - publish time: publish_guard.check emits duplicate_caption and the row
+        reverts to pending with an honest reject_reason.
+    Same-date rows sharing a caption (IG/FB cross-post + paired story) are ONE
+    post by design and are never blocked. OFF stays byte-for-byte today.
     """
     return _truthy(os.environ.get("AGENT_CAPTION_COOLDOWN", "false"))
+
+
+def empty_caption_guard_enabled() -> bool:
+    """
+    Draft/stage-time empty-caption belt (AGENT_EMPTY_CAPTION_GUARD). OFF by
+    default = zero behavior change. When ON, portal_calendar_store.insert_rows
+    drops any FEED row whose caption has zero visible (alphanumeric)
+    characters, with a loud honest alert, so an empty caption can never even
+    be STAGED (LASSO's audited feed shipped one). Account-agnostic: covers
+    LASSO and every gym (same bug class). STORY rows are exempt (empty body by
+    design; the caption is burned onto the media).
+
+    The publish-time belt is separate and ALWAYS on: zernio_publisher and
+    meta_publisher both refuse to send a feed post with an empty body, and
+    publish_guard.check flags empty_caption. Arm by hand:
+    AGENT_EMPTY_CAPTION_GUARD=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_EMPTY_CAPTION_GUARD", "false"))
+
+
+def ask_coverage_enabled() -> bool:
+    """
+    LASSO-lane ask coverage switch (AGENT_ASK_COVERAGE). OFF by default = zero
+    behavior change. When ON, real_month_planner.apply_month_plan runs
+    agent/ask_coverage.enforce_drafts over the planned LASSO (B2B) month
+    BEFORE the grade gate and the stage write:
+      - every VIDEO/REEL feed draft carries EXACTLY ONE clear ask (one ask
+        family per publish_guard.ask_families; zero asks get the approved
+        default ask appended, extra ask families are pruned to one — one
+        destination per POST; nothing here touches or assumes anything about
+        the bio, Blake's ruling 2026-08-28: the bio's links stay);
+      - overall ask coverage across the month's feed drafts is raised to at
+        least ask_coverage_floor() percent, leaving genuine no-ask room
+        (testimonial / proof / welcome posts stay askless while the floor is
+        met without them).
+    Only DELETES redundant ask sentences or APPENDS a fixed approved CTA
+    phrase; never invents facts, offers, or numbers. All output passes
+    copy_gate (no dashes). Gym-facing months are untouched (B2B profile
+    only). Arm by hand: AGENT_ASK_COVERAGE=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_ASK_COVERAGE", "false"))
+
+
+def ask_coverage_floor() -> int:
+    """The minimum percent of a planned month's feed drafts that must carry an
+    ask when AGENT_ASK_COVERAGE is armed. Default 70 (the report-card floor);
+    override with AGENT_ASK_COVERAGE_FLOOR (clamped 0..100)."""
+    try:
+        val = int(os.environ.get("AGENT_ASK_COVERAGE_FLOOR", "70"))
+    except (TypeError, ValueError):
+        val = 70
+    return max(0, min(100, val))
+
+
+def lasso_reels_floor_enabled() -> bool:
+    """
+    LASSO reels-share floor switch (AGENT_LASSO_REELS_FLOOR). OFF by default =
+    byte-for-byte today's plan (video mix included, unchanged). When ON,
+    real_month_planner.plan_month post-processes the LASSO month so that at
+    least lasso_reels_floor_pct() percent of the planned FEED posts are
+    video/reel slots (video_preferred podcast clips from the real Drive
+    library), converting non-sprint b2b -> platform -> doctrine days (earliest
+    first, deterministic) until the floor is met. Blake's locked rulings are
+    preserved: thu + sun stay podcast (and stay video-preferred), the summit
+    10-day SPRINT slots are byte-for-byte untouched, and dated book/welcome/
+    summit overrides are never converted. The honesty guard is unchanged: a
+    video-preferred slot with no groundable clip falls through to the real
+    fallback pillars, never a fabricated post. NOTE: a floor above ~25% pushes
+    the podcast pillar past calendar_grade's 25% content-mix cap (-3 on that
+    leg) — a deliberate trade the grade gate still has headroom for.
+    Arm by hand: AGENT_LASSO_REELS_FLOOR=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_LASSO_REELS_FLOOR", "false"))
+
+
+def lasso_reels_floor_pct() -> int:
+    """The reels/video floor as a percent of planned feed posts when
+    AGENT_LASSO_REELS_FLOOR is armed. Default 35 (the report-card benchmark);
+    override with AGENT_LASSO_REELS_FLOOR_PCT (clamped 0..100)."""
+    try:
+        val = int(os.environ.get("AGENT_LASSO_REELS_FLOOR_PCT", "35"))
+    except (TypeError, ValueError):
+        val = 35
+    return max(0, min(100, val))
+
+
+def lasso_testimonial_pillar_enabled() -> bool:
+    """
+    LASSO owner-voice testimonial pillar switch (AGENT_LASSO_TESTIMONIAL_PILLAR).
+    OFF by default = zero behavior change. When ON:
+      - real_month_planner.plan_month gives the LASSO month a recurring
+        'testimonial' slot (the Tuesday doctrine day on alternate ISO weeks,
+        so doctrine stays represented);
+      - real_month_run wires the pillar to
+        agent/testimonial_pillar.build_testimonial_draft, which drafts ONLY
+        from the approved social-proof source doc (brand_voice/social_proof.md
+        entries with explicit `Permission: yes` + `Verified: YYYY-MM-DD`, e.g.
+        the Fit Mamas Tribe case numbers).
+    HARD RAIL (no fabrication): no approved entry -> the builder returns None
+    and the planner's existing fallback fills the day from a REAL pillar; a
+    quote or number is NEVER invented. Arm by hand:
+    AGENT_LASSO_TESTIMONIAL_PILLAR=true (Railway env).
+    """
+    return _truthy(os.environ.get("AGENT_LASSO_TESTIMONIAL_PILLAR", "false"))
 
 
 def metrics_sync_enabled() -> bool:

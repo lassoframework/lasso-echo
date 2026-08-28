@@ -698,8 +698,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             from agent import caption_ledger as _cl, ops_alerts as _oa
             from agent import publish_guard as _pg
             _cap = draft.caption or ""
-            if _cl.is_on_cooldown(gym_id, _cap, row.get("post_date", ""),
-                                  db=None):
+            # is_blocked = the fuzzy cooldown PLUS the hard 180-day verbatim
+            # rule (report-card build 2026-08-28). Same-date records are the
+            # row's own staging stamp / its cross-post siblings and never
+            # block (caption_ledger same-date rule).
+            if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
+                              db=None):
                 try:
                     store.mark_publish_failed(
                         row_id, revert_status="pending")
@@ -716,7 +720,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 caption=_cap, category=(row.get("category") or ""),
                 mentions=_planned_mentions(_cap, gym_id, row.get("category")),
                 media_ready=bool((row.get("image_url") or "").strip()),
-                is_story=_is_story_row(row))
+                is_story=_is_story_row(row),
+                post_date=str(row.get("post_date") or "")[:10])
             _viols = _pg.check(_payload)
             if _viols:
                 _reason = "publish_guard: " + ", ".join(_viols)
