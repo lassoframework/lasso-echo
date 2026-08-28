@@ -1554,6 +1554,43 @@ def ops_alerts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_ALERTS_ENABLED", "false"))
 
 
+def support_inbox_enabled() -> bool:
+    """
+    Gym-facing support inbox switch. OFF by default = the /portal/<token>/support
+    write route is DARK (returns 403), so a gym can never reach the Slack poster
+    until Blake arms it by hand. When ON, a gym's support message lands in the
+    LASSO support channel stamped with WHO it is from. Nothing here publishes to
+    social; it only forwards a client's own words to Slack.
+    """
+    return _truthy(os.environ.get("AGENT_SUPPORT_INBOX", "false"))
+
+
+def support_channel_id() -> str:
+    """
+    The Slack channel a gym support request is posted to, read lazily BY NAME
+    every call so a change takes effect without a reimport. Empty string when
+    unset -> the support poster is INERT and returns {ok:false} without touching
+    Slack (the feature is a no-op even when support_inbox_enabled() is ON). The
+    LASSO #echosupport channel id is C0BTDAE1GLW; set it by hand in Railway env.
+    """
+    return os.environ.get("AGENT_SUPPORT_CHANNEL_ID", "")
+
+
+def support_slack_bot_token() -> str:
+    """
+    The Slack bot token used ONLY for the gym support channel post. Read lazily BY
+    NAME every call so a rotation takes effect without a reimport, and NEVER logged.
+    The #echosupport channel is PRIVATE and the default Echo bot is not a member;
+    the member bot (Scout) has its own xoxb token, set by hand as
+    AGENT_SUPPORT_SLACK_BOT_TOKEN. Falls back to the default AGENT_SLACK_BOT_TOKEN
+    when the dedicated one is unset (single-bot setups / tests). This selection
+    affects the support post ONLY — every other alert/approval path keeps the
+    default token untouched.
+    """
+    return (os.environ.get("AGENT_SUPPORT_SLACK_BOT_TOKEN", "")
+            or os.environ.get(SLACK_BOT_TOKEN_ENV, ""))
+
+
 def publish_confirm_enabled() -> bool:
     """
     Publish confirmation switch. OFF by default = publish behavior is exactly

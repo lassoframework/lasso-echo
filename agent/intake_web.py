@@ -1537,6 +1537,93 @@ def render_connect_page(token, account_key):
     return CONNECT_PAGE.replace("__TOKEN__", token).replace("__GYM__", _esc(gym))
 
 
+def render_support_page(token, account_key):
+    """The gym-facing support page HTML for a resolved token + account. Holds NO
+    secret: the form POSTs its message to the token-gated /support endpoint, which
+    resolves the token -> account server-side and forwards to Slack. The gym name is
+    HTML-escaped; the token is path-safe ([A-Za-z0-9_.-]) so it is injected verbatim
+    into the JS string."""
+    from html import escape as _esc
+    gym = _db_gym_name(account_key) or "your gym"
+    return SUPPORT_PAGE.replace("__TOKEN__", token).replace("__GYM__", _esc(gym))
+
+
+# ---- the LASSO gym support page (V3 palette, mobile first) ----------------------
+# Client facing copy law: no dash characters, never the word vendor. The textarea
+# message POSTs to /portal/<token>/support; success flips to a thank-you state,
+# a failure shows an honest, retryable error.
+SUPPORT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LASSO Support</title>
+<style>
+ :root{--navy:#121E3C;--red:#FF2A2A;--sky:#5EB9E6;--cream:#FAF6F0;--steel:#D8E3EE}
+ body{font-family:-apple-system,'Inter',Helvetica,Arial,sans-serif;background:var(--navy);
+      color:var(--cream);margin:0;padding:32px 16px 48px;display:flex;justify-content:center}
+ .card{max-width:520px;width:100%}
+ h1{font-size:24px;line-height:1.15;margin:0 0 6px}
+ h1 .a{color:var(--red)}
+ .deck{color:var(--steel);font-size:14px;margin:0 0 22px;line-height:1.45}
+ label{display:block;font-size:13px;font-weight:600;color:var(--steel);margin:12px 0 5px}
+ textarea{width:100%;box-sizing:border-box;background:var(--cream);color:var(--navy);
+    border:none;border-radius:10px;padding:12px;font-size:15px;min-height:140px;resize:vertical}
+ button{width:100%;background:var(--red);color:#fff;border:none;border-radius:10px;
+    padding:15px;font-size:16px;font-weight:700;margin-top:20px}
+ button[disabled]{opacity:.6}
+ .msg{margin-top:16px;font-size:14px;line-height:1.5;border-radius:8px;padding:12px 14px}
+ .ok{background:rgba(94,185,230,.15);border-left:4px solid var(--sky);color:var(--cream)}
+ .err{background:rgba(255,42,42,.12);border-left:4px solid var(--red);color:var(--cream)}
+ .hidden{display:none}
+ .done h2{font-size:22px;margin:0 0 10px}
+ .done p{color:var(--steel);font-size:15px;line-height:1.5;margin:0}
+</style></head><body><div class="card">
+ <div id="formview">
+  <h1>Need a hand? Talk to <span class="a">LASSO</span></h1>
+  <p class="deck">Tell us what is going on with your social for __GYM__ and your
+  LASSO team will get back to you. Questions, requests, a heads up, anything.</p>
+  <label>Your message</label>
+  <textarea id="message" maxlength="4000" placeholder="What can we help with?"></textarea>
+  <button id="send" type="button">Send to LASSO</button>
+  <div id="err" class="msg err hidden"></div>
+ </div>
+ <div id="doneview" class="done hidden">
+  <h2>Thanks. Your LASSO team got it.</h2>
+  <p>We have your message and will reply soon.</p>
+ </div>
+</div>
+<script>
+ var TOKEN = "__TOKEN__";
+ var send = document.getElementById("send");
+ var box = document.getElementById("message");
+ var err = document.getElementById("err");
+ function showErr(t){ err.textContent = t; err.classList.remove("hidden"); }
+ send.addEventListener("click", function(){
+   var text = (box.value || "").trim();
+   err.classList.add("hidden");
+   if(!text){ showErr("Please type a message first."); return; }
+   send.disabled = true; send.textContent = "Sending…";
+   fetch("/portal/" + encodeURIComponent(TOKEN) + "/support", {
+     method: "POST",
+     headers: {"Content-Type": "application/json"},
+     body: JSON.stringify({message: text})
+   }).then(function(r){ return r.json().catch(function(){ return {}; })
+       .then(function(j){ return {ok: r.ok, body: j}; }); })
+   .then(function(res){
+     if(res.ok && res.body && res.body.ok){
+       document.getElementById("formview").classList.add("hidden");
+       document.getElementById("doneview").classList.remove("hidden");
+       return;
+     }
+     send.disabled = false; send.textContent = "Send to LASSO";
+     showErr("We could not reach your LASSO team just now. Please try again in a moment.");
+   }).catch(function(){
+     send.disabled = false; send.textContent = "Send to LASSO";
+     showErr("We could not reach your LASSO team just now. Please try again in a moment.");
+   });
+ });
+</script>
+</body></html>"""
+
+
 # ---- the LASSO social intake form (V3 palette, mobile first) --------------------
 # Client facing copy law: no dash characters, never the word vendor.
 FORM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -1937,6 +2024,16 @@ def build_server(port=None):
                 return m.group(1), "create-story", None
             return None, None, None
 
+        def _support_route(self):
+            """Gym-facing support inbox: GET/POST /portal/<token>/support.
+            Returns the token, else None. GET serves the tiny support form page;
+            POST forwards the gym's message to the LASSO Slack support channel.
+            Gated by config.support_inbox_enabled() (default OFF) at the handler;
+            a disabled route 403s, an unknown/revoked token 404s."""
+            m = re.match(r"^/portal/([A-Za-z0-9_.-]{8,})/support$",
+                         self.path.split("?")[0])
+            return m.group(1) if m else None
+
         def _tracker_route(self):
             """Returns (token, page) for admin tracker URLs, else (None, None)."""
             m = re.match(r"^/admin/tracker/([A-Za-z0-9_-]{8,})(/handoff)?$",
@@ -2141,6 +2238,19 @@ def build_server(port=None):
                     status, body = _ps.handle_metrics(account_key, days)
                 return self._send_json(body, status)
 
+            # Gym-facing SUPPORT page: GET /portal/<token>/support -> a tiny on-brand
+            # HTML page (textarea + Send) that POSTs to the same path. So a gym can be
+            # handed a support link. Gated by config.support_inbox_enabled() (403 when
+            # off) so the surface is dark until armed; token->account, revoked = 404.
+            sup_token = self._support_route()
+            if sup_token is not None:
+                if not config.support_inbox_enabled():
+                    return self._deny(403, "support is not available")
+                account_key = client_for_token(sup_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                return self._send_html(render_support_page(sup_token, account_key))
+
             # Health check: answers even while AGENT_INTAKE_ENABLED is OFF —
             # the SERVICE being up and the FEATURE being armed are different
             # facts, and Railway's health check must not kill a dark service.
@@ -2335,6 +2445,46 @@ def build_server(port=None):
                     status, resp = _pe.handle_recur_event(
                         account_key, str((body or {}).get("event_id") or ""))
                 return self._send_json(resp, status)
+
+            # Gym-facing SUPPORT inbox WRITE: POST /portal/<token>/support {message}.
+            # Token->account_key; revoked/unknown = 404. Cross-origin only from the
+            # portal origin (403 otherwise). Per-token rate limited (429). Gated by
+            # config.support_inbox_enabled() (403 when off) so the route is dark until
+            # armed. The message lands as ONE Slack line in the LASSO support channel,
+            # stamped with THIS token's gym only (tenant isolation). A Slack failure
+            # returns 502 with {ok:false}; nothing here publishes to social.
+            sup_token = self._support_route()
+            if sup_token is not None:
+                if not config.support_inbox_enabled():
+                    return self._send_json({"ok": False, "error": "support is not available"}, 403)
+                allowed, _origin = self._origin_ok()
+                if not allowed:
+                    return self._deny(403, "forbidden")
+                if not allow_token_request(_token_hash_prefix(sup_token)):
+                    return self._deny(429, "rate limited")
+                account_key = client_for_token(sup_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 64 * 1024:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"ok": False, "error": "invalid JSON"}, 400)
+                message = str((body or {}).get("message") or "").strip()
+                if not message:
+                    return self._send_json({"ok": False, "error": "the message is empty"}, 400)
+                from . import support_inbox as _si
+                result = _si.submit_support_message(account_key, message)
+                if result.get("ok"):
+                    return self._send_json({"ok": True}, 200)
+                reason = result.get("reason") or ""
+                # Empty body already handled above; an inert/failed Slack lane is an
+                # honest 502 the page shows as "could not reach your LASSO team".
+                status = 429 if reason == "rate_limited" else 502
+                return self._send_json({"ok": False, "error": reason or "delivery failed"}, status)
 
             # Story Studio "Create a Story" WRITE routes (ECHO_STORY_STUDIO_BUILD §4):
             #   POST /portal/<token>/studio/story                        {asset_ids,...}

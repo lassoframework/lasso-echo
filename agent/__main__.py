@@ -177,6 +177,9 @@ def _status():
     print(f"  platform_var   : {config.platform_variants_enabled()}  (env AGENT_PLATFORM_VARIANTS_ENABLED)")
     print(f"  idempotent     : {config.idempotent_drafts_enabled()}  (env AGENT_IDEMPOTENT_DRAFTS_ENABLED)")
     print(f"  ops_alerts     : {config.ops_alerts_enabled()}  (env AGENT_OPS_ALERTS_ENABLED)")
+    print(f"  support_inbox  : {config.support_inbox_enabled()}  (env AGENT_SUPPORT_INBOX; "
+          f"gym support -> Slack channel {config.support_channel_id() or 'unset'}, "
+          f"token env AGENT_SUPPORT_SLACK_BOT_TOKEN falls back to AGENT_SLACK_BOT_TOKEN)")
     print(f"  publish_confirm: {config.publish_confirm_enabled()}  (env AGENT_PUBLISH_CONFIRM_ENABLED)")
     print(f"  token_watchdog : {config.token_watchdog_enabled()}  (env AGENT_TOKEN_WATCHDOG_ENABLED, "
           f"warn at {config.token_warn_days()} days)")
