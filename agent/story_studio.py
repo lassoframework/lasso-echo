@@ -53,7 +53,7 @@ def _base_gym(gym_id):
 
 def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                  store=None, music_library=None, render_fn=None, output_dir=None,
-                 now=None):
+                 now=None, downloader=None):
     """Build ONE Story from a request dict and stage it PENDING (or HOLD it honestly).
 
     request keys: gym_id, asset_ids (list), brief (optional str), template (optional),
@@ -63,6 +63,11 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     Returns a result dict: {status, reason, draft, story_render, request_id}. status is
     'staged' (a PENDING draft was written), 'held' (nothing staged, honest reason), or
     'off' (the render lane is not armed for this gym).
+
+    candidates/assets_by_id: normally DISCOVERED from the gym's pool (a real tap passes
+    neither); inject them to bypass discovery in a test. downloader(file_id, dest): the
+    injectable Drive fetch used to bind each picked segment to a local source file (the
+    live default is drive_client.download); only used on the default renderer path.
     """
     gym_id = _base_gym(request.get("gym_id"))
     if not config.story_studio_render_active_for(gym_id):
@@ -74,6 +79,20 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
 
     store = store or _default_store()
     request_id = request.get("id") or str(uuid.uuid4())
+
+    # 0. LIVE candidate discovery. When candidates are not injected (a REAL coach tap
+    #    or the event one-tap both reach here with candidates=None), discover the gym's
+    #    eligible RAW pool ourselves — otherwise every real render HELDs "too few
+    #    segments" because nothing ever fed the composer. Discovery asserts tenant
+    #    isolation, the eligibility gate, the re-ingest guard, and the input caps; it
+    #    reuses the SAME store read pick_media uses and opus's scoring intent. The coach
+    #    may still scope the pick to specific asset_ids (declared beats discovery).
+    if candidates is None:
+        from . import story_candidates
+        candidates, discovered_assets = story_candidates.discover_candidates(
+            gym_id, asset_ids=request.get("asset_ids"), store=None, now=now)
+        if assets_by_id is None:
+            assets_by_id = discovered_assets
 
     # 1. template (declared beats vision).
     tmpl_name, tmpl_src = story_templates.resolve_template(
@@ -122,9 +141,31 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                      f"'none' to ship without a bed).", store, request, tmpl_name,
                      music_sel.shelf)
 
+    # 5b. bind each planned segment to a REAL local source file so the composer can read
+    #     it. Segments whose source_path is already set (an injected test render) are left
+    #     alone; the live path downloads the picked assets via the SAME Drive download the
+    #     sync job uses, re-asserting tenant on every segment. Sources are cleaned up after
+    #     the render (the montage lives in a separate out_dir, untouched by cleanup).
+    #     Binding runs for the DEFAULT (real) renderer only: an injected render_fn is a
+    #     test/alternate renderer that owns its own source handling, so we never reach
+    #     out to Drive for it. The default renderer needs real bytes on disk.
+    src_tmp = None
     rfn = render_fn or story_composer.render_compose
-    result = rfn(plan, output_dir=out_dir, ask_frame_text=overlay.ask,
-                 music_path=music_path)
+    need_bind = ([s for s in plan.segments if not getattr(s, "source_path", "")]
+                 if render_fn is None else [])
+    try:
+        if need_bind:
+            from . import story_candidates
+            src_tmp = story_candidates.bind_source_paths(
+                need_bind, assets_by_id or {}, gym_id=gym_id,
+                downloader=downloader)
+
+        result = rfn(plan, output_dir=out_dir, ask_frame_text=overlay.ask,
+                     music_path=music_path)
+    finally:
+        if src_tmp:
+            from . import story_candidates
+            story_candidates.cleanup(src_tmp)
     if getattr(result, "held", False) or not getattr(result, "output_path", ""):
         return _held(request_id, gym_id,
                      getattr(result, "hold_reason", "render produced no output"),
