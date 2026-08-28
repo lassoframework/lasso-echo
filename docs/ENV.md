@@ -60,6 +60,7 @@ before this file existed.
 | AGENT_CATEGORY_ROTATION | false | BLAKE | The seven-day category schedule. ARMED in production. |
 | AGENT_CATEGORY_MAX_CONSECUTIVE | 0 | code | Hard consecutive cap on campaign categories. |
 | AGENT_BOOK_CAMPAIGN_EVERY_N_DAYS | 1 | code | Book frequency cap (7 = once a week). |
+| AGENT_PLAN_HORIZON_DAYS | 31 | code | HARD planning horizon (Blake 2026-08-28): no plan/backfill/remap builds or stages a calendar row more than this many days past today (the monthly relearn rebuilds it anyway). Dated rows are exempt (event_id / LASSO summit-book-welcome). 0 = no cap (emergency only). |
 
 ## Content sources & drafting
 

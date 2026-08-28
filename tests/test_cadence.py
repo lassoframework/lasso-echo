@@ -206,11 +206,19 @@ def test_plan_2x_two_distinct_pairs_every_day():
 
 # ---- client month (build_client_month) --------------------------------------------
 
+# Builds start at TODAY, exactly like the production scan (client_media_sync passes
+# date.today()). A fixed future literal here would collide with the HARD planning
+# horizon (a build may not start beyond today+31; plan_horizon.py, Blake 2026-08-28).
+from datetime import date as _date  # noqa: E402
+
+_BUILD_START = _date.today().isoformat()
+
+
 def _build(tmp_path, store, days=4, n_media=8):
     account = _account()
     _stock_clean(account.key)
     return cmr.build_client_month(
-        account, "gritx", "2026-10-01", days, voice=_voice(),
+        account, "gritx", _BUILD_START, days, voice=_voice(),
         library_path=_lib(tmp_path, n=n_media), store=store, banned_words=())
 
 
@@ -269,7 +277,7 @@ def test_client_2x_locked_day_untouched(tmp_path, monkeypatch):
 
     class _StoreWithApproved(_FakeStore):
         def list_month(self, base_key, month):
-            return [{"post_date": "2026-10-01", "format": "feed",
+            return [{"post_date": _BUILD_START, "format": "feed",
                      "account": "instagram", "status": "approved",
                      "caption": "human owned", "image_url":
                      "https://gritx.media/photo_00.jpg"}]
@@ -278,7 +286,7 @@ def test_client_2x_locked_day_untouched(tmp_path, monkeypatch):
     out = _build(tmp_path, store, days=2, n_media=8)
     assert out["ok"]
     planned_days = {r["post_date"] for r in store.inserted}
-    assert "2026-10-01" not in planned_days            # locked day never re-planned
+    assert _BUILD_START not in planned_days            # locked day never re-planned
 
 
 # ---- publish-time slot times -------------------------------------------------------

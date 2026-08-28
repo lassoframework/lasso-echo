@@ -663,6 +663,15 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
     from datetime import date
     start = now if isinstance(now, date) else date.today()
 
+    # HARD PLANNING HORIZON (Blake, 2026-08-28): the scan's window is clamped ONCE
+    # here so the feed budget, the month span, and the builder call all share one
+    # honest span (build_client_month clamps again internally — idempotent belt and
+    # suspenders). The scan always starts at "today" (`now`), so the default 30-day
+    # window never clamps at the default 31-day horizon; only an over-long request
+    # (days=60) does, with one log line.
+    from .plan_horizon import horizon_clamp
+    days = horizon_clamp(start, days, now=start, logger=log, label="client-scan")
+
     r2 = r2 if r2 is not None else _default_r2()
     if store is None:
         store = _default_store()

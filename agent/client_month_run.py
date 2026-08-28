@@ -550,6 +550,22 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     start = start_date if isinstance(start_date, date) \
         else date.fromisoformat(str(start_date)[:10])
 
+    # HARD PLANNING HORIZON (Blake, 2026-08-28): Echo builds at most one month out —
+    # the monthly relearn rebuilds anything further, so a longer span is pure token
+    # waste. One clamp, one place (plan_horizon.horizon_clamp): a days=60 request is
+    # clamped with ONE honest log line; clamping only shortens the TAIL of the span
+    # (cadence never gaps inside the month). Existing rows are untouched (the cap
+    # governs what gets BUILT, never a retroactive sweep). AGENT_PLAN_HORIZON_DAYS=0
+    # disables (emergency only).
+    from .plan_horizon import horizon_clamp
+    days = horizon_clamp(start, days, logger=log, label=base_key)
+    if days <= 0:
+        log(f"{base_key}: the whole requested window starts beyond the planning "
+            "horizon; nothing built")
+        return {"ok": False, "reason": "plan window is beyond the planning horizon",
+                "upserted": 0, "days": 0, "skipped_banned": 0,
+                "media_count": media_count}
+
     # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
     # published / denied / killed — anything a rebuild must preserve) across the span
     # BEFORE planning, so the rebuild composes with them instead of fighting them:
@@ -1152,6 +1168,14 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     from datetime import date, timedelta
     start = start_date if isinstance(start_date, date) \
         else date.fromisoformat(str(start_date)[:10])
+    # HARD PLANNING HORIZON: a denied slot beyond one month out is relearn churn (the
+    # monthly rebuild replaces it anyway) — never backfill past the horizon. Clamping
+    # shortens only the window's tail; denied days inside the month still backfill.
+    from .plan_horizon import horizon_clamp
+    days = horizon_clamp(start, days, logger=log, label=f"{base_key} deny-backfill")
+    if days <= 0:
+        return {"ok": True, "backfilled": 0, "days_needing": 0, "skipped": 0,
+                "reason": "backfill window is beyond the planning horizon"}
     win_start = start.isoformat()
     win_end = (start + timedelta(days=max(1, days) - 1)).isoformat()
     months = sorted({(start + timedelta(days=i)).isoformat()[:7]

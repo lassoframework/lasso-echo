@@ -231,10 +231,15 @@ def test_remap_noop_when_real_month_plan_off(monkeypatch):
 
 
 def test_remap_dry_run_stages_nothing(monkeypatch):
+    from datetime import date
     from agent import lasso_remap
     monkeypatch.setenv("AGENT_REAL_MONTH_PLAN", "true")
     store = _FakeStore([])
-    out = lasso_remap.remap("lasso", month="2026-11", write=False, store=store)
+    # The CURRENT month: a far-future month is now refused outright by the HARD
+    # planning horizon (plan_horizon.py, Blake 2026-08-28) — see
+    # tests/test_plan_horizon.py::test_lasso_remap_refuses_far_future_month.
+    out = lasso_remap.remap("lasso", month=date.today().strftime("%Y-%m"),
+                            write=False, store=store)
     assert out.get("dry_run") is True
     assert not store.inserted and not store.deleted
 
