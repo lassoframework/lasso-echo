@@ -7,6 +7,8 @@ re-ingest ledger.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import story_studio as ss  # noqa: E402
@@ -59,6 +61,31 @@ def _cands(gym, n=6, seg=10.0):
 def _fake_render(plan, *, output_dir, ask_frame_text="", music_path=""):
     from agent import story_composer as comp
     return comp.ComposeResult(plan=plan, output_path=f"{output_dir}/final.mp4")
+
+
+# The approval-queue row Story Studio writes. Patched in for every test in this file
+# so the REAL _stage_calendar_row path runs (row build + insert), fully offline.
+_STAGED_ROWS = []
+
+
+class _FakeCalStore:
+    def insert_rows(self, gym_id, rows):
+        out = []
+        for i, r in enumerate(rows or []):
+            row = dict(r)
+            row["id"] = f"cal-{len(_STAGED_ROWS) + i}"
+            _STAGED_ROWS.append((gym_id, row))
+            out.append(row)
+        return out
+
+
+@pytest.fixture(autouse=True)
+def _cal(monkeypatch):
+    _STAGED_ROWS.clear()
+    monkeypatch.setattr("agent.config.portal_calendar_supabase_enabled", lambda: True)
+    monkeypatch.setattr("agent.portal_calendar_store.SupabaseCalendarStore",
+                        lambda *a, **k: _FakeCalStore())
+    yield
 
 
 def _arm(monkeypatch, gym="pierce"):
@@ -194,3 +221,62 @@ def test_deny_rolls_back_and_logs(monkeypatch, tmp_path):
     plan_assets = set(rec.get("asset_ids") or [])
     assert plan_assets                                  # at least the used segments
     assert plan_assets.issubset({f"a{i}" for i in range(6)})
+
+
+# ---- the approval row is REALLY written (the lane used to only return a Draft) -----
+def test_staged_story_writes_a_pending_approval_row(monkeypatch, tmp_path):
+    """REGRESSION: create_story built a Draft, returned it, and called that "staged"
+    while NO content_calendar row was ever written — the coach got a success response
+    and no approval card ever appeared. A staged story must leave a real PENDING row."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    assert res["status"] == "staged"
+    assert len(_STAGED_ROWS) == 1, "no approval row reached the calendar"
+    gym_id, row = _STAGED_ROWS[0]
+    assert gym_id == "pierce"
+    assert row["status"] == "pending", "the approval gate must be intact"
+    assert row["format"] == "story"
+    assert row.get("image_url"), "the row must carry the rendered story media"
+    assert res["calendar_row_id"] == row["id"]
+    assert res["story_render"]["calendar_row_id"] == row["id"]
+
+
+def test_calendar_insert_failure_holds_instead_of_claiming_staged(monkeypatch, tmp_path):
+    """If the row cannot be written the coach must NOT be told the story is staged."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+
+    class _Boom:
+        def insert_rows(self, gym_id, rows):
+            raise RuntimeError("supabase down")
+
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path), cal_store=_Boom())
+    assert res["status"] == "held"
+    assert "approval queue" in res["reason"]
+    assert not _STAGED_ROWS
+
+
+def test_unconfigured_calendar_store_holds(monkeypatch, tmp_path):
+    """An unconfigured store must HOLD, never report a staged story nobody can approve."""
+    _arm(monkeypatch)
+    monkeypatch.setattr("agent.config.portal_calendar_supabase_enabled", lambda: False)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    assert res["status"] == "held"
+    assert not _STAGED_ROWS

@@ -34,6 +34,33 @@ from agent.drafter import DraftStatus  # noqa: E402
 from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_asset  # noqa: E402
 
 
+# Story Studio now writes a real PENDING approval row; give these offline tests a
+# calendar store so the genuine _stage_calendar_row path runs.
+_SS_ROWS = []
+
+
+class _SSFakeCalStore:
+    def insert_rows(self, gym_id, rows):
+        out = []
+        for i, r in enumerate(rows or []):
+            row = dict(r)
+            row["id"] = f"cal-{len(_SS_ROWS) + i}"
+            _SS_ROWS.append((gym_id, row))
+            out.append(row)
+        return out
+
+
+@pytest.fixture(autouse=True)
+def _ss_cal(monkeypatch):
+    _SS_ROWS.clear()
+    monkeypatch.setattr("agent.config.portal_calendar_supabase_enabled", lambda: True)
+    monkeypatch.setattr("agent.portal_calendar_store.SupabaseCalendarStore",
+                        lambda *a, **k: _SSFakeCalStore())
+    yield
+
+
+
+
 # ---- fakes -----------------------------------------------------------------
 class _FakeStore:
     """story_studio_store stand-in (story_request / story_render sink)."""

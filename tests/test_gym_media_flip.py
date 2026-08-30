@@ -21,19 +21,28 @@ from agent import gym_media_index as _idx  # noqa: E402
 
 
 class _FakeResp:
-    def __init__(self, status=204):
+    def __init__(self, status=204, payload=None, text=""):
         self.status_code = status
+        self._payload = payload if payload is not None else []
+        self.text = text
+
+    def json(self):
+        return self._payload
 
 
 class _FakeRequests:
-    """Captures the single PATCH the flip issues so the test can assert its shape."""
+    """Captures the single PATCH the flip issues so the test can assert its shape.
+    `status` is settable: the original fake always returned 204, which is exactly why
+    nobody noticed Postgres was rejecting every one of these PATCHes with a 400."""
 
-    def __init__(self):
+    def __init__(self, status=200, payload=None):
         self.calls = []
+        self.status = status
+        self.payload = payload if payload is not None else [{"id": "row1"}]
 
     def patch(self, url, params=None, json=None, headers=None, timeout=None):
         self.calls.append({"url": url, "params": params, "json": json})
-        return _FakeResp(204)
+        return _FakeResp(self.status, self.payload, text="constraint violation")
 
 
 @pytest.fixture
@@ -48,7 +57,7 @@ def _sb(monkeypatch):
 # ---- HIDE flips a pending row back to needs_media ---------------------------------
 def test_hide_flips_pending_row(_sb, monkeypatch):
     from agent import gym_media_routes as gm
-    gm._flip_pending_using_asset("gritx", "drivepic1")
+    flipped, err = gm._flip_pending_using_asset("gritx", "drivepic1")
     assert len(_sb.calls) == 1
     call = _sb.calls[0]
     assert call["url"].endswith("/rest/v1/content_calendar")
@@ -56,9 +65,13 @@ def test_hide_flips_pending_row(_sb, monkeypatch):
     assert call["params"]["gym_id"] == "eq.gritx"
     assert call["params"]["status"] == "eq.pending"
     assert call["params"]["source_media_asset_id"] == "eq.drivepic1"
-    # Flips it to needs_media with the media_hidden reason.
-    assert call["json"]["status"] == "needs_media"
+    # DENIED, not 'needs_media': that value is not in the content_calendar status
+    # CHECK constraint, so every one of these PATCHes was rejected 400 and hiding a
+    # photo silently did nothing. 'denied' is real AND is what deny-backfill watches.
+    assert call["json"]["status"] == "denied"
+    assert call["json"]["reject_reason"] == _idx.REJECT_HIDDEN
     assert call["json"]["media_not_ready_reason"] == _idx.REJECT_HIDDEN
+    assert flipped == 1 and err is None
 
 
 # ---- removed-from-Drive flips a pending row back to needs_media --------------------
@@ -72,7 +85,8 @@ def test_removed_from_drive_flips_pending_row(_sb):
     assert call["params"]["gym_id"] == "eq.gritx"
     assert call["params"]["status"] == "eq.pending"
     assert call["params"]["source_media_asset_id"] == "eq.p_gone"
-    assert call["json"]["status"] == "needs_media"
+    assert call["json"]["status"] == "denied"
+    assert call["json"]["reject_reason"] == _idx.REJECT_REMOVED
     assert call["json"]["media_not_ready_reason"] == _idx.REJECT_REMOVED
 
 
@@ -86,7 +100,7 @@ def test_flip_noop_without_creds(monkeypatch):
         types.SimpleNamespace(patch=lambda *a, **k: called.append(1)))
     from agent import gym_media_routes as gm
     from agent.jobs import sync_gym_media as sgm
-    gm._flip_pending_using_asset("gritx", "x")
+    assert gm._flip_pending_using_asset("gritx", "x") == (0, "the calendar store is not configured")
     assert sgm._flip_pending_for_missing("gritx", ["y"], lambda m: None) == 0
     assert called == []
 
@@ -127,3 +141,54 @@ def test_builder_stamps_asset_id_end_to_end(monkeypatch, tmp_path):
     # And the row mapper carries it onto the content_calendar row the store inserts.
     row = mirror._real_row("gritx", draft)
     assert row["source_media_asset_id"] == "A1"
+
+
+# ---- a REJECTED flip must be reported, never reported as success ------------------
+def test_hide_flip_reports_a_rejected_patch(monkeypatch):
+    """The bug this whole file missed for months: Postgres rejected the PATCH with a
+    400 (status 'needs_media' is not in the CHECK constraint), the response was never
+    inspected, and the client was told the photo was hidden while the post stayed
+    scheduled. A 4xx must now surface as an error."""
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key")
+    fake = _FakeRequests(status=400)
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(patch=fake.patch))
+    from agent import gym_media_routes as gm
+    flipped, err = gm._flip_pending_using_asset("gritx", "drivepic1")
+    assert flipped == 0
+    assert err and "400" in err
+
+
+def test_hide_route_tells_the_client_when_the_post_could_not_be_pulled(monkeypatch):
+    """The route must NOT answer 200 ok when a scheduled post still uses the photo."""
+    from agent import gym_media_routes as gm
+
+    class _Store:
+        def available(self):
+            return True
+
+        def get_asset(self, aid):
+            return {"id": aid, "gym_id": "gritx"}
+
+        def update_asset(self, aid, patch):
+            return True
+
+    monkeypatch.setattr(gm, "_armed", lambda k: True)
+    monkeypatch.setattr(gm, "_flip_pending_using_asset",
+                        lambda g, a: (0, "calendar store returned 400"))
+    monkeypatch.setattr(gm._sel, "rollback_asset", lambda a, store=None: True)
+    status, body = gm.handle_hide_asset("gritx", "a1", hide=True, store=_Store())
+    assert status == 502
+    assert body.get("hidden") is True and body.get("pulled") == 0
+    assert "still using it" in body.get("error", "")
+
+
+def test_removed_from_drive_logs_a_rejected_patch(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key")
+    fake = _FakeRequests(status=400)
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(patch=fake.patch))
+    from agent.jobs import sync_gym_media as sgm
+    logs = []
+    assert sgm._flip_pending_for_missing("gritx", ["p_gone"], logs.append) == 0
+    assert any("REJECTED 400" in m for m in logs), "a 4xx flip must be logged, not silent"

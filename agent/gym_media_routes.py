@@ -339,35 +339,66 @@ def handle_hide_asset(account_key, asset_id, hide=True, *, store=None):
     except Exception as e:  # noqa: BLE001
         return 502, {"error": f"update failed ({type(e).__name__})"}
     if hide:
-        # Flip any PENDING row using this asset back to needs_media + rollback use.
-        _flip_pending_using_asset(gym, asset_id)
+        # Pull any PENDING row off this asset and return the photo to the pool.
+        # HONEST: if the calendar flip fails we say so, because "hidden" that leaves
+        # the post scheduled is the worst possible answer for a client who just told
+        # us not to publish that photo.
+        flipped, flip_err = _flip_pending_using_asset(gym, asset_id)
         try:
             _sel.rollback_asset(asset_id, store=store)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - the pool stamp is best effort
             pass
+        if flip_err:
+            return 502, {"error": "the photo is hidden from future posts, but a "
+                                  "scheduled post still using it could not be pulled "
+                                  f"back ({flip_err}). Tell your coach before it goes "
+                                  "out.", "hidden": True, "pulled": 0}
+        return 200, {"ok": True, "pulled": flipped}
     return 200, {"ok": True}
 
 
 def _flip_pending_using_asset(gym_id, asset_id):
-    """Flip any PENDING content_calendar row using this asset back to needs_media
-    with reject_reason='media_hidden' (§8). Best effort; no creds -> no-op."""
+    """Pull any PENDING content_calendar row off a just-hidden asset. Returns
+    (rows_pulled, error_string_or_None).
+
+    Writes status='denied' with reject_reason='media_hidden', NOT 'needs_media':
+    'needs_media' is not in the content_calendar status CHECK constraint, so every
+    one of these PATCHes was rejected 400 by Postgres — and because the response was
+    never inspected and the caller returned 200 regardless, hiding a photo silently
+    did nothing while the client was told it worked. 'denied' is a real status, and
+    it is the one the armed deny-backfill lane watches, so the day gets a fresh
+    caption on a DIFFERENT photo instead of a hole.
+
+    media_not_ready_reason carries the same marker for the media lane. Never raises."""
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
-        return
+        return 0, "the calendar store is not configured"
     import requests  # lazy
     try:
-        requests.patch(
+        r = requests.patch(
             f"{url.rstrip('/')}/rest/v1/content_calendar",
             params={"gym_id": f"eq.{gym_id}", "status": "eq.pending",
                     "source_media_asset_id": f"eq.{asset_id}"},
-            json={"status": "needs_media",
+            json={"status": "denied",
+                  "reject_reason": _idx.REJECT_HIDDEN,
                   "media_not_ready_reason": _idx.REJECT_HIDDEN},
             headers={"apikey": key, "Authorization": f"Bearer {key}",
-                     "Content-Type": "application/json", "Prefer": "return=minimal"},
+                     "Content-Type": "application/json",
+                     "Prefer": "return=representation"},
             timeout=30)
     except Exception as e:  # noqa: BLE001
         print(f"[gym-media-routes] flip-pending on hide failed: {type(e).__name__}: {e}")
+        return 0, type(e).__name__
+    if r.status_code >= 400:
+        # The exact failure that hid itself for months. Say it out loud.
+        print(f"[gym-media-routes] flip-pending on hide REJECTED {r.status_code}: "
+              f"{(r.text or '')[:200]}")
+        return 0, f"calendar store returned {r.status_code}"
+    try:
+        return len(r.json() or []), None
+    except Exception:  # noqa: BLE001 - a 2xx with an unreadable body still succeeded
+        return 0, None
 
 
 # ---- GET /media/thumb/<asset_id> (gym-scoped proxy) --------------------------

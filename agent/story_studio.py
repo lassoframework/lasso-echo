@@ -53,7 +53,7 @@ def _base_gym(gym_id):
 
 def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                  store=None, music_library=None, render_fn=None, output_dir=None,
-                 now=None, downloader=None):
+                 now=None, downloader=None, cal_store=None):
     """Build ONE Story from a request dict and stage it PENDING (or HOLD it honestly).
 
     request keys: gym_id, asset_ids (list), brief (optional str), template (optional),
@@ -61,8 +61,11 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     (optional list), ask (optional str override).
 
     Returns a result dict: {status, reason, draft, story_render, request_id}. status is
-    'staged' (a PENDING draft was written), 'held' (nothing staged, honest reason), or
-    'off' (the render lane is not armed for this gym).
+    'staged' (a PENDING content_calendar row was written and is in the approval
+    queue), 'held' (nothing staged, honest reason), or 'off' (the render lane is not
+    armed for this gym). cal_store is the injectable calendar store; when omitted the
+    live SupabaseCalendarStore is used, and an unconfigured one HOLDS rather than
+    reporting a staged story nobody can approve.
 
     candidates/assets_by_id: normally DISCOVERED from the gym's pool (a real tap passes
     neither); inject them to bypass discovery in a test. downloader(file_id, dest): the
@@ -221,11 +224,27 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     }
     _persist(store, request, request_id, gym_id, tmpl_name, music_sel, story_render)
 
+    # 8b. WRITE THE APPROVAL ROW. Without this the whole lane was a promise it never
+    # kept: the video rendered, the clips were stamped used, story_render recorded a
+    # calendar_row_id that pointed at nothing, and the coach got status="staged" while
+    # NO card ever reached the approval queue. The row lands PENDING like every other
+    # lane's, so the human tap is untouched — but it now actually exists.
+    row_id, cal_err = _stage_calendar_row(gym_id, draft, cal_store=cal_store)
+    if cal_err:
+        # Never claim staged when the client-visible artifact was not created. The
+        # segments are stamped at step 9 (below), so nothing needs rolling back here.
+        return _held(request_id, gym_id,
+                     f"the story rendered but could not be added to your approval "
+                     f"queue ({cal_err}); nothing was scheduled",
+                     store, request, tmpl_name, music_sel.shelf)
+    story_render["calendar_row_id"] = row_id or draft.draft_id
+
     # 9. stamp segment usage so a deny can roll it back (return segments to the pool).
     _stamp_segments(gym_id, request_id, plan.segments)
 
     return {"status": "staged", "reason": "", "draft": draft,
-            "story_render": story_render, "request_id": request_id}
+            "story_render": story_render, "request_id": request_id,
+            "calendar_row_id": row_id}
 
 
 def deny(request_id, gym_id, reason="", *, store=None):
@@ -247,6 +266,34 @@ def deny(request_id, gym_id, reason="", *, store=None):
 
 
 # ---- helpers ----------------------------------------------------------------
+def _stage_calendar_row(gym_id, draft, *, cal_store=None):
+    """Write the rendered story into content_calendar as a PENDING row so it reaches
+    the approval queue. Returns (row_id_or_None, error_string_or_None).
+
+    This is the step the lane was missing entirely: it built a Draft, returned it, and
+    called that "staged". Uses the SAME mirror + store every other lane uses, so the
+    row shape, the status and the approval gate are identical. An unconfigured store
+    is an ERROR here, not a silent skip — a story nobody can approve is not staged."""
+    try:
+        from .real_calendar_mirror import _real_row  # noqa: PLC0415
+        row = {k: v for k, v in _real_row(gym_id, draft).items() if k != "id"}
+    except Exception as exc:  # noqa: BLE001
+        return None, f"row build failed ({type(exc).__name__})"
+    try:
+        if cal_store is None:
+            from . import config  # noqa: PLC0415
+            if not config.portal_calendar_supabase_enabled():
+                return None, "the calendar store is not configured"
+            from .portal_calendar_store import SupabaseCalendarStore  # noqa: PLC0415
+            cal_store = SupabaseCalendarStore()
+        written = cal_store.insert_rows(gym_id, [row]) or []
+    except Exception as exc:  # noqa: BLE001
+        return None, f"calendar insert failed ({type(exc).__name__})"
+    if not written:
+        return None, "the calendar store accepted no rows"
+    return (written[0] or {}).get("id"), None
+
+
 def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf):
     """Record a HELD outcome: NOTHING is staged, an honest reason is logged, and no
     asset usage is stamped (so the pool is untouched)."""

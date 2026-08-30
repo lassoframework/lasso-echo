@@ -20,9 +20,10 @@ FID = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
 def _arm(monkeypatch):
     # Arm the lane for every gym in these tests.
     monkeypatch.setattr("agent.config.gym_drive_connect_active_for", lambda g: True)
-    # No pending-row flips over the wire in tests.
+    # No pending-row flips over the wire in tests. Returns the real (pulled, err)
+    # shape so a stub can never mask the route's honest-failure branch.
     monkeypatch.setattr("agent.gym_media_routes._flip_pending_using_asset",
-                        lambda g, a: None)
+                        lambda g, a: (0, None))
 
 
 def _drive(meta=None, children=None):
@@ -157,13 +158,14 @@ def test_disconnect_cross_gym_404s():
 def test_hide_flips_pending_and_rolls_back(monkeypatch):
     flipped = []
     monkeypatch.setattr("agent.gym_media_routes._flip_pending_using_asset",
-                        lambda g, a: flipped.append((g, a)))
+                        lambda g, a: (flipped.append((g, a)), (1, None))[1])
     rolled = []
     monkeypatch.setattr("agent.gym_media_selector.rollback_asset",
                         lambda aid, store=None: rolled.append(aid) or True)
     store = FakeMediaStore(assets=[make_asset("a1", gym_id="pierce")])
     status, body = gm.handle_hide_asset("pierce", "a1", hide=True, store=store)
     assert status == 200 and store.assets["a1"]["excluded_by_coach"] is True
+    assert body.get("pulled") == 1, "the client is told how many scheduled posts were pulled"
     assert flipped == [("pierce", "a1")]
     assert rolled == ["a1"]
 

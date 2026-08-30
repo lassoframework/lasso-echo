@@ -132,9 +132,15 @@ def _coach_channel(gym_id):
 
 
 def _flip_pending_for_missing(gym_id, asset_ids, log):
-    """When an asset a PENDING calendar row is using disappears from Drive, flip
-    that row back via the media-not-ready pattern (spec §4). Best effort: no creds
-    -> no-op. Reuses the same content_calendar update shape the rest of Echo uses."""
+    """When an asset a PENDING calendar row is using disappears from Drive, pull that
+    row off it (spec §4). Best effort: no creds -> no-op.
+
+    Writes status='denied' with reject_reason, NOT 'needs_media': 'needs_media' is not
+    in the content_calendar status CHECK constraint, so every one of these PATCHes was
+    rejected 400 and `flipped` stayed 0 — a photo the client DELETED from their Drive
+    stayed scheduled to publish, and only an exception (never a 4xx) was logged.
+    'denied' is a real status and is the one the armed deny-backfill lane watches, so
+    the day gets a fresh caption on a photo that still exists."""
     if not asset_ids:
         return 0
     url = config.supabase_url()
@@ -150,7 +156,8 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
                 f"{url.rstrip('/')}/rest/v1/content_calendar",
                 params={"gym_id": f"eq.{gym_id}", "status": "eq.pending",
                         "source_media_asset_id": f"eq.{aid}"},
-                json={"status": "needs_media",
+                json={"status": "denied",
+                      "reject_reason": _idx.REJECT_REMOVED,
                       "media_not_ready_reason": _idx.REJECT_REMOVED},
                 headers={"apikey": key, "Authorization": f"Bearer {key}",
                          "Content-Type": "application/json",
@@ -158,6 +165,11 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
                 timeout=30)
             if r.status_code < 400:
                 flipped += 1
+            else:
+                # A 4xx here used to be invisible: only exceptions were logged, so a
+                # rejected flip looked exactly like "no row was using that asset".
+                log(f"flip-pending REJECTED {r.status_code} for {aid}: "
+                    f"{(r.text or '')[:200]}")
         except Exception as e:  # noqa: BLE001
             log(f"flip-pending failed for {aid}: {type(e).__name__}: {e}")
     return flipped
