@@ -225,13 +225,30 @@ def approved_sources(account_key, category=None):
 
 
 def pending_sources(account_key, category=None):
-    """The account's PENDING sources awaiting human approval."""
-    return _rows(account_key, status="pending", category=category)
+    """The account's PENDING sources awaiting human approval.
+
+    Falls back across tenant key variants for the SAME reason approved_sources does.
+    Without this the fallback was half-applied: a gym whose intake landed under the
+    bare base key had approved_sources find it but pending_sources return [] — so the
+    approval tooling could not SEE the rows a human needed to approve, and the gym sat
+    in no_sources forever with its answers sitting right there. Live on 2026-08-30:
+    Zanshin had 45 pending sources under 'zanshinfitness630e22' that were invisible to
+    every reader that lists what is awaiting approval."""
+    for key in _tenant_variants(account_key):
+        rows = _rows(key, status="pending", category=category)
+        if rows:
+            return rows
+    return []
 
 
 def all_sources(account_key, category=None):
-    """Every source for the account, any status (for review/reporting)."""
-    return _rows(account_key, status=None, category=category)
+    """Every source for the account, any status (for review/reporting). Variant-aware
+    for the same reason as approved_sources / pending_sources."""
+    for key in _tenant_variants(account_key):
+        rows = _rows(key, status=None, category=category)
+        if rows:
+            return rows
+    return []
 
 
 def approve_source(source_id):

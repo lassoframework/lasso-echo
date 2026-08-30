@@ -86,3 +86,30 @@ def test_approved_claims_contains_stored_text():
     cs.add_source("gym_alpha_ig", "offer", "Join for $99 a month")
     claims = cs.approved_claims("gym_alpha_ig")
     assert "Join for $99 a month" in claims
+
+
+# ---- the variant fallback must apply to EVERY reader, not just approved ----------
+def test_pending_and_all_sources_are_variant_aware():
+    """LIVE BUG (2026-08-30): the tenant-variant fallback was applied to
+    approved_sources ONLY. A gym whose portal intake landed under the BARE base key had
+    pending_sources return [] — so the approval tooling could not see the rows a human
+    needed to approve, and the gym sat in no_sources forever with its answers sitting
+    right there. Zanshin had 45 pending sources that were invisible this way."""
+    # the portal form lands sources under the BARE base key, PENDING approval...
+    cs.add_source("westside", "offer", "A real offer line", "client social intake",
+                  status="pending")
+    # ...while every builder reads them under <base>_ig.
+    assert [s.text for s in cs.pending_sources("westside_ig")] == ["A real offer line"]
+    assert [s.text for s in cs.all_sources("westside_ig")] == ["A real offer line"]
+    # and the reverse direction still works
+    assert [s.text for s in cs.pending_sources("westside")] == ["A real offer line"]
+
+
+def test_variant_fallback_never_merges_two_keys():
+    """First variant WITH rows wins; rows are never merged, so a gym with rows under
+    both keys is not double-counted."""
+    cs.add_source("westside_ig", "offer", "Primary key line", "intake",
+                  status="pending")
+    cs.add_source("westside", "offer", "Base key line", "intake", status="pending")
+    got = [s.text for s in cs.pending_sources("westside_ig")]
+    assert got == ["Primary key line"], f"variants were merged: {got}"
