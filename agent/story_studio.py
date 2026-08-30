@@ -242,6 +242,9 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                      f"queue ({cal_err}); nothing was scheduled",
                      store, request, tmpl_name, music_sel.shelf)
     story_render["calendar_row_id"] = row_id or draft.draft_id
+    # story_render was persisted BEFORE the insert, so its stored calendar_row_id is
+    # still the fabricated draft id. Record the REAL one where deny() can find it.
+    _remember_calendar_row(gym_id, request_id, row_id)
 
     # 9. stamp segment usage so a deny can roll it back (return segments to the pool).
     _stamp_segments(gym_id, request_id, plan.segments)
@@ -251,12 +254,18 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
             "calendar_row_id": row_id}
 
 
-def deny(request_id, gym_id, reason="", *, store=None):
-    """A coach denied a staged Story: return its segments to the pool + log the reason
-    (spec §4/§6). Idempotent. Returns True when a rollback actually happened."""
+def deny(request_id, gym_id, reason="", *, store=None, cal_store=None):
+    """A coach denied a staged Story: DENY its approval row, return its segments to the
+    pool, and log the reason (spec §4/§6). Idempotent. Returns True when a rollback
+    actually happened."""
     from . import story_music  # noqa: F401 - keep import graph symmetric
     from . import db
     base = _base_gym(gym_id)
+    # The calendar row FIRST. Now that create_story writes a real PENDING row, denying
+    # only the story_request would leave that card sitting in the approval queue, still
+    # approvable by anyone using the normal calendar UI — and pointing at segments this
+    # very call is about to recycle into another story.
+    _deny_calendar_row(base, request_id, reason, cal_store=cal_store)
     rolled = _rollback_segments(base, request_id)
     store = store or _default_store()
     try:
@@ -267,6 +276,54 @@ def deny(request_id, gym_id, reason="", *, store=None):
         print(f"[story-studio] deny request update failed: {type(e).__name__}: {e}")
     db.audit("story_studio", request_id, f"denied: {reason} (segments returned to pool)")
     return rolled
+
+
+def _deny_calendar_row(gym_id, request_id, reason, *, cal_store=None):
+    """Flip the approval row create_story wrote for this request to 'denied'. Matched by
+    the stored calendar_row_id when we have it, else by the request's story marker.
+    Best effort; never raises (a deny must always return the segments)."""
+    row_id = _stored_calendar_row_id(gym_id, request_id)
+    if not row_id:
+        return False
+    try:
+        if cal_store is None:
+            from . import config  # noqa: PLC0415
+            if not config.portal_calendar_supabase_enabled():
+                return False
+            from .portal_calendar_store import SupabaseCalendarStore  # noqa: PLC0415
+            cal_store = SupabaseCalendarStore()
+        deny_fn = getattr(cal_store, "deny_with_reason", None)
+        if not callable(deny_fn):
+            return False
+        return bool(deny_fn(gym_id, row_id,
+                            (reason or "story denied by coach")[:200]))
+    except Exception as e:  # noqa: BLE001
+        print(f"[story-studio] deny calendar row failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _stored_calendar_row_id(gym_id, request_id):
+    """The REAL content_calendar id create_story recorded for this request, or ""."""
+    from . import db
+    try:
+        import json as _json
+        rec = _json.loads(db.kv_get(_ROW_KEY.format(gym_id, request_id), "") or "{}")
+        return str(rec.get("calendar_row_id") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _remember_calendar_row(gym_id, request_id, row_id):
+    """Record the REAL calendar row id so deny() can reach it. Written AFTER the row
+    exists — story_render.calendar_row_id is persisted before the insert and therefore
+    still carries the fabricated draft id."""
+    from . import db
+    try:
+        import json as _json
+        db.kv_set(_ROW_KEY.format(gym_id, request_id),
+                  _json.dumps({"calendar_row_id": str(row_id or "")}))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---- helpers ----------------------------------------------------------------
@@ -366,6 +423,7 @@ def _host(path, gym_id):
 
 # ---- segment usage stamping (deny rollback) ---------------------------------
 _SEG_KEY = "story_studio_segs:{}"      # per request_id
+_ROW_KEY = "story_studio_row:{}:{}"    # per gym + request_id -> real calendar id
 
 
 def _stamp_segments(gym_id, request_id, segments):

@@ -1201,3 +1201,29 @@ def test_expired_sweep_survives_a_read_failure():
     assert cap.sweep_expired_rows(store=_Boom(), kv=_MemKV(), alert=seen.append,
                                   now="2026-08-30T12:00:00") == []
     assert seen == []
+
+
+def test_expired_sweep_excludes_google_business_rows():
+    """GBP publishes through its OWN lane (gbp_store.approved_gbp_rows), which has NO
+    age cutoff at all — an aged approved GBP row is still perfectly publishable.
+    due_rows excludes them for the same reason, so counting them here would fire false
+    'can never publish' alerts on healthy rows."""
+    from agent.portal_calendar_store import SupabaseCalendarStore
+
+    seen = {}
+
+    class _Http:
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.update(params or {})
+
+            class _R:
+                status_code = 200
+
+                def json(self):
+                    return []
+            return _R()
+
+    store = SupabaseCalendarStore(url="http://x", service_key="k", http=_Http())
+    store.expired_rows("2026-08-23")
+    assert seen.get("account") == "neq.googlebusiness", \
+        "GBP rows must not be reported as expired"

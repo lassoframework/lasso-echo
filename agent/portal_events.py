@@ -106,7 +106,12 @@ def handle_create_event(account_key, body, *, store=None, event_store=None,
         "arc": preview,
         "staged": staged.get("staged", 0),
         "held_recap": staged.get("held_recap", 0),
+        # Rows held because no photo was available. Surfaced so a coach whose arc
+        # stages fewer posts than the preview sees WHY, instead of a silent shortfall.
+        "held_media": staged.get("held_media", 0),
         "thinned": staged.get("thinned", 0),
+        "ok": bool(staged.get("ok", True)),
+        "reason": staged.get("reason", ""),
         "grade": staged.get("grade"),
         "story_studio": ge.story_studio_request(event),   # one-tap story offer
         "label": f"{event.name} arc",
@@ -182,11 +187,16 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
 
     # Stage only the changed rows (pending); approved unaffected rows are left as-is.
     staged = 0
+    held_media = 0
+    stage_reason = ""
     if _store is not None and restage:
         res = ec.stage_arc(_store, new_event, restage,
                            profile=_profile_for(account_key))
         staged = res.get("staged", 0)
+        held_media = res.get("held_media", 0)
+        stage_reason = res.get("reason", "")
     return 200, {"event": _event_row(new_event), "restaged": staged,
+                 "held_media": held_media, "reason": stage_reason,
                  "kept": len(keep), "removed": len(remove_keys)}
 
 

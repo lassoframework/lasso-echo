@@ -877,6 +877,12 @@ class SupabaseCalendarStore:
             "post_date": f"lt.{before_date}",
             "status": f"in.({','.join(statuses)})",
             "published_at": "is.null",
+            # GOOGLE BUSINESS IS EXCLUDED. GBP rows publish through their own lane
+            # (gbp_store.approved_gbp_rows), which has NO age cutoff at all — an aged
+            # approved GBP row is still perfectly publishable. due_rows excludes them
+            # for the same reason, so counting them here would fire false "can never
+            # publish" alerts on healthy rows.
+            "account": "neq.googlebusiness",
             "select": "id,gym_id,account,post_date,status",
             "order": "post_date.asc",
         }

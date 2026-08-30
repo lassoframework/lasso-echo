@@ -49,30 +49,41 @@ def _acct_hash_prefix(account_key: str) -> str:
     return hashlib.sha256((account_key or "").encode()).hexdigest()[:16]
 
 
-def _allow(account_key: str, now=None) -> bool:
-    """Sliding-window rate limit, keyed by the account_key hash prefix. False when
-    over SUPPORT_RATE_PER_MINUTE in the last 60s; True otherwise."""
+def _allow(account_key: str, now=None):
+    """Sliding-window rate limit, keyed by the account_key hash prefix. Returns the
+    STAMP this call recorded (a float, always truthy for our purposes via `is not
+    None`) or None when over SUPPORT_RATE_PER_MINUTE in the last 60s. The stamp lets a
+    failed send refund exactly its own hit under concurrency."""
     import time
     now = now if now is not None else time.monotonic()
     key = _acct_hash_prefix(account_key)
     window = [t for t in _support_hits.get(key, []) if now - t < 60.0]
     if len(window) >= SUPPORT_RATE_PER_MINUTE:
         _support_hits[key] = window
-        return False
+        return None
     window.append(now)
     _support_hits[key] = window
-    return True
+    return now
 
 
-def _refund(account_key: str) -> None:
+def _refund(account_key: str, stamp=None) -> None:
     """Give back the rate-limit hit a FAILED send consumed. Without this, five
     consecutive Slack failures ate the gym's whole per-minute budget and the sixth
     attempt was refused as 'rate_limited' — so an outage silently turned into a
-    lockout on the one surface a stuck client uses to reach us."""
+    lockout on the one surface a stuck client uses to reach us.
+
+    Removes THIS request's own stamp, not simply the last one: the portal runs a
+    ThreadingHTTPServer, so two concurrent requests from one gym can interleave and a
+    pop-last would refund the OTHER request's hit."""
     key = _acct_hash_prefix(account_key)
     window = _support_hits.get(key) or []
-    if window:
-        _support_hits[key] = window[:-1]
+    if not window:
+        return
+    if stamp is not None and stamp in window:
+        window.remove(stamp)
+    else:
+        window.pop()
+    _support_hits[key] = window
 
 
 def _escalate_undelivered(account_key, display_name, text_in, reason):
@@ -215,7 +226,8 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
         _escalate_undelivered(account_key, display_name, text_in, "no support channel configured")
         return {"ok": False, "delivered": False, "reason": "no_channel"}
 
-    if not _allow(account_key):
+    _hit = _allow(account_key)
+    if _hit is None:
         return {"ok": False, "delivered": False, "reason": "rate_limited"}
 
     # Length cap: keep the request one scannable message.
@@ -232,7 +244,7 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
         resp = poster._chat_post(text=text, blocks=None, channel=channel)
     except Exception as e:  # noqa: BLE001 - a Slack failure must never crash the request
         print(f"[support-inbox] post failed: {type(e).__name__}")
-        _refund(account_key)
+        _refund(account_key, _hit)
         _escalate_undelivered(account_key, display_name, text_in,
                               f"slack transport failed ({type(e).__name__})")
         return {"ok": False, "delivered": False, "reason": "slack_failed"}
@@ -242,7 +254,7 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
         # the poster; surface {ok:false} without leaking the response.
         print("[support-inbox] Slack did not confirm the support post "
               f"(gym={account_key})")
-        _refund(account_key)
+        _refund(account_key, _hit)
         _escalate_undelivered(account_key, display_name, text_in,
                               "slack did not confirm the post")
         return {"ok": False, "delivered": False, "reason": "slack_failed"}

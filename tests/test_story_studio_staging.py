@@ -313,3 +313,32 @@ def test_story_row_with_no_publish_target_is_refused(monkeypatch):
                 draft_type="story_studio", category="hype_montage")
     row_id, err = ss._stage_calendar_row("pierce", bad, cal_store=_FakeCalStore())
     assert row_id is None and "publish target" in err
+
+
+def test_deny_also_denies_the_approval_row_it_created(monkeypatch, tmp_path):
+    """Now that create_story writes a real PENDING row, denying only the story_request
+    would leave that card in the approval queue — still approvable by anyone using the
+    normal calendar UI, and pointing at segments the deny just recycled."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    row_id = res["calendar_row_id"]
+    assert row_id
+
+    denied = []
+
+    class _CalStore:
+        def deny_with_reason(self, gym, rid, reason):
+            denied.append((gym, rid, reason))
+            return {"id": rid}
+
+    ss.deny(res["request_id"], "pierce", reason="not on brand",
+            store=_FakeStore(), cal_store=_CalStore())
+    assert denied and denied[0][1] == row_id, "the approval row was left orphaned"
+    assert denied[0][0] == "pierce"
+    assert "not on brand" in denied[0][2]
