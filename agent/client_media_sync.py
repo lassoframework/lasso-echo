@@ -605,6 +605,22 @@ def _maybe_infographic_fill(base, account, store, log):
         log(f"{base}: infographic fill failed: {type(exc).__name__}")
 
 
+def _maybe_seed_onboarding_demo(base_key, store, log):
+    """Seed the SAMPLE month for a gym that cannot build real content yet. Best effort:
+    a demo must never sink or slow the scan.
+
+    Samples carry NO image by design. They are not the gym's content, so using the
+    gym's photos on them would burn real creative on a mock, and a row with no
+    image_url cannot even enter due_rows — defence in depth behind the publish rail."""
+    try:
+        from . import onboarding_demo
+        if not onboarding_demo.enabled():
+            return
+        onboarding_demo.seed(base_key, store=store, log=log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: onboarding sample skipped ({type(exc).__name__})")
+
+
 def _alert_stall(base_key, stage, detail, log):
     """A NEW-GYM STALL is never silent (audit 2026-08-25 MAJOR): every state where a
     gym's pipeline cannot advance (no registry account, no approved sources, no voice
@@ -715,6 +731,12 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                                  "it has uploaded media but no APPROVED client sources; "
                                  "run: python -m agent approve-sources --account "
                                  f"{account.key}", log)
+                # ONBOARDING SAMPLE (AGENT_ONBOARDING_DEMO, default OFF): this gym
+                # cannot get a real month until intake produces approved sources, so
+                # without this its portal is simply EMPTY and reads as broken. Seed a
+                # clearly-labelled sample so the client sees the shape of what they
+                # bought. Refuses if any real row exists; samples can never publish.
+                _maybe_seed_onboarding_demo(base, store, log)
                 results.append({"base": base, "status": "no_sources",
                                 "synced": sync.get("synced", 0)})
                 continue
@@ -743,6 +765,7 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # NO PHOTOS AT ALL: the exact "if they don't upload" case — fill
                 # upcoming days with approved-source infographic cards (self-gated).
                 _maybe_infographic_fill(base, account, store, log)
+                _maybe_seed_onboarding_demo(base, store, log)
                 results.append({"base": base, "status": "awaiting_media",
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: awaiting media (no usable photos/videos yet)")

@@ -309,6 +309,25 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+def onboarding_demo_enabled() -> bool:
+    """
+    ONBOARDING SAMPLE MONTH (AGENT_ONBOARDING_DEMO). Default OFF.
+
+    A brand-new gym cannot get a real calendar until its social intake produces
+    APPROVED SOURCES, and Echo must never invent facts to fill that gap — so a
+    correctly-behaving Echo shows a new client an EMPTY portal for days, which reads as
+    a broken product. With this ON, such a gym is seeded a clearly-labelled SAMPLE
+    month (pillar='sample' + a 'SAMPLE: ' caption prefix) showing the cadence, the
+    pillar rotation and a paired story per day.
+
+    A sample makes ZERO factual claims about the gym, so the no-fabrication gate is
+    intact, and calendar_autopublish REFUSES to publish a sample row regardless of its
+    status, the gym's autonomy or any approval. Samples are deleted the moment real
+    content is built. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARDING_DEMO", "false"))
+
+
 # The gym_id the DEMO calendar content is valid for. The demo manifest drafts only
 # ever belong to THIS gym in the shared content_calendar. A real gym id must never
 # be this value, so the real-calendar mirror can prove it never leaves demo rows on a

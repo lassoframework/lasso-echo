@@ -154,6 +154,7 @@ def _status():
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
     print(f"  welcome_queue  : {config.welcome_queue_enabled()}  (env AGENT_WELCOME_QUEUE_ENABLED; one/day drip + new-client trigger, needs hosting)")
     print(f"  demo_calendar  : {config.demo_calendar_enabled()}  (env AGENT_DEMO_CALENDAR_ENABLED; 30-day done-for-you demo calendar, needs hosting)")
+    print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
     print(f"  event_campaigns: {config.event_campaigns_enabled()}  (env AGENT_EVENT_CAMPAIGNS, per-gym AGENT_EVENT_CAMPAIGNS_<GYM>; self-serve Events & Promos: the 'Add an Event or Promo' portal form + the arc planner draft a dated PENDING arc for a gym_event through the ONE window-timed engine that also runs Summit; pilot Pete first; needs the gym_event + content_calendar.event_id migrations; no publish)")
     print(f"  no_creative_fb : {config.no_creative_fallback_enabled()}  (env AGENT_NO_CREATIVE_FALLBACK; a calendar row with no usable creative image degrades to a clean website-style infographic from its own approved caption/pillar via the house PIL renderer; no fabrication, no publish; OFF => empty image stays empty)")

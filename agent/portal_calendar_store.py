@@ -864,6 +864,30 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def delete_rows(self, account_key, row_ids):
+        """Hard-delete specific rows for ONE gym. Filtered by BOTH id AND gym_id so a
+        row belonging to another gym can never be removed. Returns the number deleted.
+
+        Used by the onboarding-sample clear. Note the normal rebuild already removes
+        samples for free (they are status='draft', which is wipeable, so delete_month
+        takes them), so this is the explicit/ops path, not the main one."""
+        ids = [str(i) for i in (row_ids or []) if i]
+        if not account_key or not ids:
+            return 0
+        r = self._client().delete(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}",
+                    "id": f"in.({','.join(ids)})"},
+            headers=self._headers({"Prefer": "return=representation"}),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        try:
+            return len(r.json() or [])
+        except Exception:  # noqa: BLE001 - a 2xx with an unreadable body still deleted
+            return len(ids)
+
     def expired_rows(self, before_date, statuses=("approved", "pending")):
         """Rows whose post_date is BEFORE `before_date` and that are still waiting to
         publish — i.e. already outside the catch-up window, so due_rows will never

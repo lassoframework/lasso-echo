@@ -574,6 +574,19 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             skipped.append(row_id)
             continue
 
+        # SAMPLE RAIL (onboarding_demo): a seeded SAMPLE row shows a brand-new gym what
+        # its calendar will look like while intake lands. It is NOT the gym's content
+        # and must never reach a real feed. Checked BEFORE the approval gate, the slot
+        # gate and the claim, so it holds regardless of status, autonomy, catch_all or
+        # a client tapping approve on it by mistake — marking alone is not trusted.
+        try:
+            from . import onboarding_demo as _demo
+            if _demo.is_sample_row(row):
+                skipped.append(row_id)
+                continue
+        except Exception:  # noqa: BLE001 - a rail that cannot load must not publish
+            pass
+
         # CLIENT approval gate: when approved_only (client gyms), a row that the client
         # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO
         # (approved_only=False) is unchanged: it auto-publishes pending rows at slot time.
