@@ -269,7 +269,8 @@ def sweep_arc_rows(arc_rows, reason):
 # Store-facing wrappers (apply through the injectable store).
 # ---------------------------------------------------------------------------
 
-def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None):
+def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
+              media_picker=None, media_host_fn=None):
     """Insert `arc_rows` into the gym's live month plan through `store`, re-grade, and
     stage the kept rows as 'pending'. Returns a summary dict. Never publishes.
 
@@ -324,6 +325,13 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None):
     # blocked (no media yet) are held out of staging until media arrives.
     to_stage = [r for r in thinned if not r.get("recap_blocked")]
     held_recap = [r for r in thinned if r.get("recap_blocked")]
+    # MEDIA: an arc row was staged with NO image_url, and a feed post without an image
+    # cannot publish — Zanshin's entire first month (2026-08-30) was image-less rows
+    # that could only ever fail. Attach a real photo from the gym's own pool; a row we
+    # cannot give an image is HELD, never staged as an unpublishable promise.
+    to_stage, held_media = _attach_media(gym_id, to_stage, log,
+                                         picker=media_picker,
+                                         host=media_host_fn)
     inserted = 0
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
@@ -335,9 +343,90 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None):
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
                     "staged": 0}
     return {"ok": True, "staged": inserted, "held_recap": len(held_recap),
+            "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
             "grade": (grade.total if grade else None),
             "letter": (grade.letter if grade else None), "months": months}
+
+
+def _attach_media(gym_id, rows, log, *, picker=None, host=None):
+    """Give every image-less arc row a real photo from the gym's OWN pool.
+
+    Returns (rows_with_media, held_rows). A row that already carries an image_url is
+    untouched. A row we cannot give an image is HELD OUT of staging: an Instagram feed
+    post with no image cannot publish, so staging one only creates a card the client
+    approves and then watches fail.
+
+    Reuses the same selector + host the Drive lane uses, so tenant isolation, the
+    eligibility gate and the reuse cooldown all apply. Best effort per row; any failure
+    holds that row rather than sinking the arc."""
+    need = [r for r in rows if not (r.get("image_url") or "").strip()]
+    if not need:
+        return rows, []
+    try:
+        from . import gym_media_selector as _sel, media_host
+        from .integrations import drive_client as _dc
+    except Exception as exc:  # noqa: BLE001 - no media lane available: hold, never stage blind
+        log(f"event media: lane unavailable ({type(exc).__name__}); "
+            f"holding {len(need)} image-less row(s)")
+        return [r for r in rows if r not in need], list(need)
+
+    picker = picker or (lambda exclude: _sel.pick_media(gym_id, exclude_ids=exclude))
+    kept, held, used = [], [], []
+    for row in rows:
+        if (row.get("image_url") or "").strip():
+            kept.append(row)
+            continue
+        asset = None
+        try:
+            asset = picker(tuple(used))
+        except Exception as exc:  # noqa: BLE001
+            log(f"event media: pick failed ({type(exc).__name__})")
+        if not asset:
+            held.append(row)
+            continue
+        try:
+            url = (host or _host_asset)(asset, gym_id, _dc)
+        except Exception as exc:  # noqa: BLE001
+            log(f"event media: host failed for {asset.get('id')} ({type(exc).__name__})")
+            url = ""
+        if not url:
+            held.append(row)
+            continue
+        row = dict(row)
+        row["image_url"] = url
+        row["source_media_asset_id"] = str(asset.get("id") or "")
+        used.append(asset.get("id"))
+        try:
+            _sel.stamp_use(asset, gym_id, str(row.get("post_date") or ""))
+        except Exception:  # noqa: BLE001 - the stamp is best effort
+            pass
+        kept.append(row)
+    if held:
+        log(f"event media: HELD {len(held)} row(s) with no available photo "
+            f"(an image-less feed post cannot publish); the gym needs more media")
+    return kept, held
+
+
+def _host_asset(asset, gym_id, drive_mod):
+    """Download one pool asset and host it, returning the public url ("" on failure)."""
+    import os
+    import tempfile
+    from . import media_host
+    fid = str(asset.get("drive_file_id") or asset.get("id") or "")
+    if not fid:
+        return ""
+    suffix = os.path.splitext(str(asset.get("title") or ""))[1] or ".jpg"
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        drive_mod.DriveClient().download(fid, tmp)
+        return media_host.host_media(tmp, gym_id) or ""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # Transient, planner-only keys that are NOT content_calendar columns and must be

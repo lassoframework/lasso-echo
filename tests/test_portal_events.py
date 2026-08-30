@@ -78,6 +78,20 @@ class _EvStore:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _fake_media(monkeypatch):
+    """Event rows now REQUIRE a real photo (an image-less feed post cannot publish).
+    Give these offline tests a pool so arcs stage; the held-when-no-photo behavior has
+    its own test in test_event_calendar.py."""
+    monkeypatch.setattr(
+        "agent.event_calendar._attach_media",
+        lambda gym_id, rows, log, picker=None, host=None: (
+            [dict(r, image_url=r.get("image_url") or "https://cdn.test/e.jpg",
+                  source_media_asset_id=r.get("source_media_asset_id") or "m1")
+             for r in rows], []))
+    yield
+
+
 def _form(**over):
     base = dict(name="Bring a Friend Week", type="bring_a_friend",
                 starts_on="2026-09-22", ends_on="2026-09-28",

@@ -266,3 +266,50 @@ def test_stage_arc_stages_pending_and_holds_blocked_recap():
     assert res["held_recap"] >= 1
     # transient keys are stripped from the DB payload.
     assert all("recap_blocked" not in r and "arc_kind" not in r for r in store.inserted)
+
+
+# ---- an image-less arc row must never be staged ----------------------------------
+def test_attach_media_gives_rows_a_photo_and_stamps_the_asset():
+    """Event rows used to be staged with NO image_url at all — media_ids existed on
+    GymEvent but was never consumed anywhere, so every event post for every gym was
+    unpublishable. Each row now gets a real photo from the gym's own pool."""
+    from agent import event_calendar as ec
+    rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"},
+            {"post_date": "2026-10-04", "account": "instagram", "format": "feed"}]
+    picked = [{"id": "a1", "title": "one.jpg"}, {"id": "a2", "title": "two.jpg"}]
+    kept, held = ec._attach_media(
+        "zanshinfitness630e22", rows, lambda m: None,
+        picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
+        host=lambda asset, gym, drive: f"https://cdn.test/{asset['id']}.jpg")
+    assert held == []
+    assert [r["image_url"] for r in kept] == ["https://cdn.test/a1.jpg",
+                                              "https://cdn.test/a2.jpg"]
+    assert [r["source_media_asset_id"] for r in kept] == ["a1", "a2"]
+
+
+def test_attach_media_holds_a_row_it_cannot_give_a_photo():
+    """An Instagram feed post with no image cannot publish, so a row we cannot give a
+    photo is HELD OUT of staging rather than staged as a promise that must fail."""
+    from agent import event_calendar as ec
+    rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"}]
+    kept, held = ec._attach_media("zanshinfitness630e22", rows, lambda m: None,
+                                  picker=lambda exclude: None,
+                                  host=lambda *a: "")
+    assert kept == [] and len(held) == 1
+
+
+def test_attach_media_leaves_rows_that_already_have_an_image():
+    from agent import event_calendar as ec
+    rows = [{"post_date": "2026-10-03", "image_url": "https://cdn.test/keep.jpg"}]
+    kept, held = ec._attach_media("g", rows, lambda m: None,
+                                  picker=lambda exclude: None, host=lambda *a: "")
+    assert held == [] and kept[0]["image_url"] == "https://cdn.test/keep.jpg"
+
+
+def test_attach_media_holds_when_hosting_fails():
+    from agent import event_calendar as ec
+    rows = [{"post_date": "2026-10-03", "account": "instagram", "format": "feed"}]
+    kept, held = ec._attach_media("g", rows, lambda m: None,
+                                  picker=lambda exclude: {"id": "a1", "title": "x.jpg"},
+                                  host=lambda *a: "")
+    assert kept == [] and len(held) == 1
