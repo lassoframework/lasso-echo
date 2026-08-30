@@ -376,6 +376,12 @@ class _FakeCadenceHttp(_FakeGymsHttp):
     def get(self, url, params=None, headers=None, timeout=None):
         if "echo_gym_settings" in url:
             uuid = (params or {}).get("gym_id", "").replace("eq.", "")
+            select = (params or {}).get("select", "")
+            if select == "autonomous":
+                auto = getattr(self, "autonomy", {})
+                if uuid in auto:
+                    return _FakeResp([{"autonomous": auto[uuid]}])
+                return _FakeResp([])
             if uuid in self.settings:
                 return _FakeResp([{"posts_per_day": self.settings[uuid]}])
             return _FakeResp([])
@@ -411,6 +417,29 @@ def test_set_gym_posts_per_day_writes_when_base_differs_from_slug():
     assert http.written[0][0]["posts_per_day"] == 2
     assert s.set_gym_posts_per_day("nosuchgym", 2) is False
     assert s.set_gym_posts_per_day("topfuel", 3) is False   # only 1 or 2 is valid
+
+
+def test_gym_autonomy_resolves_when_base_differs_from_slug():
+    """Same base != slug defect as the cadence pair: the Autonomous toggle was silently
+    a no-op for every gym whose base differs from its gyms.slug. Verified before the
+    change that only lasso is autonomous=true (and it reads from local kv first), so a
+    False gym still reads False — approval required stays the safe default."""
+    http = _FakeCadenceHttp()
+    http.autonomy = {"uuid-topfuel": False, "uuid-eng": False}
+    s = _cadence_store(http)
+    assert s.gym_autonomy("topfuel") is False   # base 'topfuel' -> slug 'top-fuel'
+    assert s.gym_autonomy("eng") is False
+    assert s.gym_autonomy("nosuchgym") is None  # unknown gym -> None, never True
+
+
+def test_set_gym_autonomy_writes_when_base_differs_from_slug():
+    http = _FakeCadenceHttp()
+    http.autonomy = {}
+    s = _cadence_store(http)
+    assert s.set_gym_autonomy("topfuel", True, actor="owner") is True
+    assert http.written and http.written[0][0]["gym_id"] == "uuid-topfuel"
+    assert http.written[0][0]["autonomous"] is True
+    assert s.set_gym_autonomy("nosuchgym", True) is False
 
 
 def test_resolve_gym_uuid_exact_slug_when_base_equals_slug():

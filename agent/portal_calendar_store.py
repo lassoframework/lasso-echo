@@ -456,21 +456,19 @@ class SupabaseCalendarStore:
 
     def gym_autonomy(self, gym_slug):
         """The portal's per-gym Autonomous toggle for one gym, read from Supabase:
-        gyms.slug -> echo_gym_settings.autonomous. Returns True/False, or None when
-        the gym or its settings row is absent (caller treats None as NOT autonomous —
-        approval required is always the safe default). Read-only, gym-scoped."""
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        if not rows:
-            return None
-        gym_uuid = rows[0].get("id")
+        base -> gyms.id -> echo_gym_settings.autonomous. Returns True/False, or None
+        when the gym or its settings row is absent (caller treats None as NOT
+        autonomous — approval required is always the safe default). Read-only.
+
+        Resolves through resolve_gym_uuid for the same base != slug reason as the
+        cadence pair: the worker asks with an account-registry BASE (piercefitness,
+        topfuel) while gyms.slug is hyphenated (pierce-fitness, top-fuel), so the old
+        exact-slug match returned None for those gyms and their portal Autonomous
+        toggle was silently a no-op in BOTH directions. Verified before changing this:
+        lasso-framework-llc is the ONLY gym with autonomous=true, and it already reads
+        autonomous from the worker's local kv (which is consulted first), so no gym's
+        effective autonomy changes here. A gym that is False still reads False."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return None
         r2 = self._client().get(
@@ -487,21 +485,17 @@ class SupabaseCalendarStore:
         return bool(srows[0].get("autonomous"))
 
     def set_gym_autonomy(self, gym_slug, autonomous, actor=""):
-        """UPSERT the portal's per-gym Autonomous toggle: gyms.slug ->
+        """UPSERT the portal's per-gym Autonomous toggle: base -> gyms.id ->
         echo_gym_settings.autonomous. This is the SHARED persistence plane the publish
         lane reads (gym_autonomy) — the local SQLite kv alone is ephemeral and invisible
         across services, so the toggle must land here to actually change publishing.
-        Returns True on write, False when the gym slug is unknown (caller surfaces it)."""
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        gym_uuid = (rows[0].get("id") if rows else None)
+        Returns True on write, False when the gym is unknown (caller surfaces it).
+
+        Resolves through resolve_gym_uuid for the same base != slug reason as the
+        reader above: without it every gym whose base differs from its slug got a False
+        here, so its Autonomous toggle could not be saved at all — in either direction,
+        including turning autonomy OFF."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return False
         r2 = self._client().post(
