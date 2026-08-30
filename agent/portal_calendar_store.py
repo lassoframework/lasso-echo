@@ -53,7 +53,16 @@ _WIPEABLE_STATUSES = ("pending", "draft", "queued")
 
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
-    same slot key are the same calendar cell (a rebuild must not create a second one)."""
+    same slot key are the same calendar cell (a rebuild must not create a second one).
+
+    DELIBERATELY NOT slot-aware. Adding slot_index here would let a 2x day keep its PM
+    row when the AM row is human-owned — but it also makes a 2x->1x rebuild (which
+    stamps NO slot_index) stop matching an approved slot-1 row, so the planner lanes
+    that rely on preserve_and_prune as their ONLY collision guard (real_month_planner,
+    real_calendar_mirror — LASSO's own, with auto-approve armed) would insert a fresh
+    row beside an approved one and publish it. The client lane never needs the slot
+    dimension: it skips locked DATES wholesale (client_month_run covered_days). Revisit
+    only together with the locked-day question in PROGRESS.md."""
     return (
         str((row or {}).get("post_date") or "")[:10],
         str((row or {}).get("account") or "").lower(),
@@ -512,22 +521,19 @@ class SupabaseCalendarStore:
 
     def gym_posts_per_day(self, gym_slug):
         """The portal's per-gym posting cadence for one gym, read from Supabase:
-        gyms.slug -> echo_gym_settings.posts_per_day. Returns 1 or 2, or None when
-        the gym or its settings row is absent / carries no valid value (caller
+        base -> gyms.id -> echo_gym_settings.posts_per_day. Returns 1 or 2, or None
+        when the gym or its settings row is absent / carries no valid value (caller
         treats None as 1 — today's cadence is always the safe default). Read-only,
-        gym-scoped. Mirrors gym_autonomy."""
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        if not rows:
-            return None
-        gym_uuid = rows[0].get("id")
+        gym-scoped.
+
+        Resolves through resolve_gym_uuid, NOT a raw `slug=eq.<base>` match: the
+        worker asks with an account-registry BASE (piercefitness, topfuel) while
+        gyms.slug is a hyphenated human slug (pierce-fitness, top-fuel). The old
+        exact-slug lookup silently returned None for every gym whose base differs
+        from its slug, so their owners' 2x toggle saved to the shared plane and the
+        worker never saw it (LASSO and Pierce were both sitting at 2 and building
+        at 1)."""
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return None
         r2 = self._client().get(
@@ -545,28 +551,24 @@ class SupabaseCalendarStore:
         return int(val) if val in (1, 2) else None
 
     def set_gym_posts_per_day(self, gym_slug, posts_per_day, actor=""):
-        """UPSERT the portal's per-gym posting cadence: gyms.slug ->
+        """UPSERT the portal's per-gym posting cadence: base -> gyms.id ->
         echo_gym_settings.posts_per_day. This is the SHARED persistence plane the
         worker's planners read (gym_posts_per_day) — the intake-web kv alone is a
         different service's SQLite and invisible to the worker. Only 1 or 2 is a
         valid cadence (refused otherwise: returns False, writes nothing). Returns
-        True on write, False when the gym slug is unknown. Mirrors set_gym_autonomy."""
+        True on write, False when the gym is unknown.
+
+        Resolves through resolve_gym_uuid for the same base != slug reason as the
+        reader above: without it, every gym whose base differs from its slug got a
+        False here, and portal_social.handle_cadence turns that into a 503 — so
+        those owners could not save a cadence at all."""
         try:
             posts_per_day = int(posts_per_day)
         except (TypeError, ValueError):
             return False
         if posts_per_day not in (1, 2):
             return False
-        r = self._client().get(
-            self._rest("gyms"),
-            params={"slug": f"eq.{gym_slug}", "select": "id"},
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        rows = r.json() or []
-        gym_uuid = (rows[0].get("id") if rows else None)
+        gym_uuid = self.resolve_gym_uuid(gym_slug)
         if not gym_uuid:
             return False
         payload = {"gym_id": gym_uuid, "posts_per_day": posts_per_day}

@@ -401,7 +401,7 @@ def _is_first_month(base_key, store, log):
 _GYM_DRIVE_PILLARS = ("faces", "community", "results")
 
 
-def _gym_drive_source_for(account_key, day_key):
+def _gym_drive_source_for(account_key, day_key, slot_i=0):
     """One APPROVED source (the day's verbatim fact) to hand the gym-media builder so
     the Drive caption's CLAIMS still come only from approved material — the frame only
     shapes the SCENE. Resolved against the GENERATION account key (client_sources is
@@ -417,24 +417,56 @@ def _gym_drive_source_for(account_key, day_key):
         # Prefer a source in the day's rotated client category; fall back to any one
         # approved source so a Drive photo day is never starved when the pillar has
         # none. The fact is always an approved source — never invented.
-        category = client_content.category_for_day(account_key, day_key, present)
+        #
+        # slot_i OFFSETS the rotation so a 2x day's two posts draw DIFFERENT approved
+        # facts. category_for_day is deterministic per (account, day), so without the
+        # offset both slots got the same source and the generator produced the same
+        # caption twice on one day.
+        offset = int(slot_i or 0)
         src = None
-        if category:
+        for step in range(len(present)):
+            cat = present[(client_content._day_ordinal(day_key)  # noqa: SLF001
+                           + offset + step) % len(present)]
             src = client_content._source_for_day(  # noqa: SLF001
-                account_key, day_key, category, present)
+                account_key, day_key, cat, present)
+            if src is not None:
+                break
         if src is None:
-            for cat in present:
+            ordered = (present[offset % len(present):] + present[:offset % len(present)])
+            for cat in ordered:
                 items = client_sources.approved_sources(account_key, category=cat)
                 if items:
-                    src = items[0]
+                    src = items[offset % len(items)]
                     break
         return src
     except Exception:  # noqa: BLE001 - no approved source resolvable -> skip the lane
         return None
 
 
+def _rollback_drive_asset(draft, day_key, log):
+    """Return a dropped Drive draft's asset to the pool. build_gym_media_draft stamps
+    used_count/last_used_at at BUILD time, so a draft we then decline to stage would
+    otherwise burn that photo for the 90-day reuse cooldown. Best effort, never raises.
+
+    Scoped to THIS asset on THIS date, never a cross-date rollback_asset: use-records
+    are not cleared on publish, so the same photo re-staged after its cooldown still
+    carries the record of its earlier PUBLISHED post, and undoing that would re-pool
+    an image currently live on the gym's feed."""
+    asset_id = (getattr(draft, "source_media_asset_id", "") or "").strip()
+    account_key = getattr(draft, "account_key", "") or ""
+    if not asset_id or not account_key or not day_key:
+        return
+    try:
+        from . import gym_media_selector
+        gym_media_selector.rollback_use(account_key, day_key, asset_id=asset_id)
+    except Exception as exc:  # noqa: BLE001 - a rollback failure never sinks the build
+        log(f"[gym-drive] could not return asset {asset_id} to the pool "
+            f"({type(exc).__name__})")
+
+
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
-                            covered_days, drive=None, store=None):
+                            covered_days, drive=None, store=None,
+                            library_path="", slots_per_day=1):
     """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
     (gym_media_drive spec §7). This is the production caller of
     gym_media_builder.build_gym_media_draft: for each day in the span that the
@@ -449,7 +481,14 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     Drive lane must never sink a client's uploaded-media month.
 
     covered_days: the day_keys the uploaded-media loop already placed a feed on, so the
-    Drive lane FILLS THE GAPS instead of doubling up a day."""
+    Drive lane FILLS THE GAPS instead of doubling up a day.
+
+    Emits the SAME card shape as the uploaded-media loop: every feed goes out through
+    _finish_feed_with_story (paired story on the same asset) and honors slots_per_day,
+    so a gym on 2x gets two Drive pairs a day and its rows carry the slot ordinal.
+    (Before 2026-08-30 this lane emitted a bare feed and hard-coded one post per day,
+    which is what left Dale/ENG with no stories and a single daily post after his 2x
+    toggle — the Drive lane had quietly taken over his whole forward month.)"""
     from datetime import timedelta
     from . import gym_media_builder
     extra = []
@@ -457,38 +496,64 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     platform = getattr(account, "platform", None) or ""
     account_key = getattr(account, "key", "") or base_key
     pillar_i = 0
+    slots = 2 if int(slots_per_day or 1) == 2 else 1
     for i in range(days):
         day_key = (start + timedelta(days=i)).isoformat()
         if day_key in covered:
             continue
-        pillar = _GYM_DRIVE_PILLARS[pillar_i % len(_GYM_DRIVE_PILLARS)]
-        source = _gym_drive_source_for(account_key, day_key)
-        if source is None:
-            # No approved fact for the copy: a Drive photo never posts on imagination.
-            continue
-        try:
-            draft = gym_media_builder.build_gym_media_draft(
-                account, day_key, pillar, voice, source, store=store, drive=drive)
-        except Exception as e:  # noqa: BLE001 - the lane never sinks the month
-            log(f"[gym-drive] builder failed for {base_key} {day_key}: "
-                f"{type(e).__name__}: {e}")
-            draft = None
-        if draft is None:
-            continue  # empty pool / gate miss: the builder already alerted if needed
-        # Cross-post platform parity with the uploaded-media feed (the FB mirror in
-        # _to_rows keys off an ig/empty account); leave the platform as the account's.
-        if not (getattr(draft, "platform", "") or "").strip():
+        day_captions = []          # captions already placed on THIS day (2x uniqueness)
+        for slot_i in range(slots):
+            pillar = _GYM_DRIVE_PILLARS[pillar_i % len(_GYM_DRIVE_PILLARS)]
+            source = _gym_drive_source_for(account_key, day_key, slot_i)
+            if source is None:
+                # No approved fact for the copy: a Drive photo never posts on imagination.
+                break
             try:
-                draft.platform = platform
-            except Exception:  # noqa: BLE001 - a frozen draft never blocks the build
-                pass
-        draft.day_key = day_key
-        _mark_feed(draft)
-        extra.append(draft)
+                draft = gym_media_builder.build_gym_media_draft(
+                    account, day_key, pillar, voice, source, store=store, drive=drive)
+            except Exception as e:  # noqa: BLE001 - the lane never sinks the month
+                log(f"[gym-drive] builder failed for {base_key} {day_key}: "
+                    f"{type(e).__name__}: {e}")
+                draft = None
+            if draft is None:
+                # Empty pool / gate miss: the builder already alerted if needed. Stop
+                # this day rather than retry the same starved pool for slot 2.
+                break
+            # NEVER THE SAME CONCEPT TWICE IN ONE DAY (the uploaded loop's rule). The
+            # slot-offset source rotation above should already differ, but this is the
+            # hard guard: a repeat caption is DROPPED rather than staged, so a 2x day
+            # can never publish the same words twice.
+            _cap = (getattr(draft, "caption", "") or "").strip()
+            if _cap and _cap in day_captions:
+                log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, its "
+                    "caption repeats the day's other post")
+                _rollback_drive_asset(draft, day_key, log)
+                break
+            day_captions.append(_cap)
+            # Cross-post platform parity with the uploaded-media feed (the FB mirror in
+            # _to_rows keys off an ig/empty account); leave the platform as the account's.
+            if not (getattr(draft, "platform", "") or "").strip():
+                try:
+                    draft.platform = platform
+                except Exception:  # noqa: BLE001 - a frozen draft never blocks the build
+                    pass
+            draft.day_key = day_key
+            # SAME cards as the uploaded-media loop: feed + its paired story on the one
+            # asset, through the shared helper (video edit, poster, autofit, captionless
+            # guard). A story that cannot carry its caption is still dropped in there.
+            day_drafts = _finish_feed_with_story(
+                account, draft, library_path, log, day_key=day_key)
+            if slots == 2:
+                for d in day_drafts:
+                    try:
+                        d.cadence_slot_index = slot_i
+                    except Exception:  # noqa: BLE001 - a frozen draft never blocks
+                        pass
+            extra.extend(day_drafts)
+            pillar_i += 1
+            log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} post from the "
+                f"connected Drive pool (asset {draft.source_media_asset_id}), PENDING")
         covered.add(day_key)
-        pillar_i += 1
-        log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} post from the "
-            f"connected Drive pool (asset {draft.source_media_asset_id}), PENDING")
     return extra
 
 
@@ -757,7 +822,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         try:
             drive_extra = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
-                covered_days=covered_days)
+                covered_days=covered_days, library_path=library_path,
+                slots_per_day=slots_per_day)
             if drive_extra:
                 drafts.extend(drive_extra)
                 log(f"{base_key}: +{len(drive_extra)} post(s) from the connected "
@@ -870,6 +936,39 @@ def _is_infographic_creative(draft):
     return False
 
 
+def _localize_creative(story, feed, path, log):
+    """Download the STORY's hosted media to a temp file and return that path, or None.
+
+    For lanes whose draft carries a remote asset title instead of a local file (the
+    gym-drive lane), this is what lets the story caption actually be burned. Best
+    effort and never raises: no url, a failed fetch, or empty bytes all return None,
+    and the caller then falls through to the existing captionless guard.
+
+    Reads story.creative_public_url FIRST, never the feed's: _finish_feed_with_story
+    snapshots the pre-autofit media onto the story precisely so a story is not built
+    from the SQUARE 1080x1080 feed card. Localizing from the feed would re-introduce
+    that bug for every Drive story whenever AGENT_FEED_AUTOFIT is armed (it is)."""
+    url = ((getattr(story, "creative_public_url", "") or "").strip()
+           or (getattr(feed, "creative_public_url", "") or "").strip())
+    if not url:
+        return None
+    try:
+        from . import media_host
+        data = media_host.download_bytes(url)
+        if not data:
+            return None
+        import tempfile
+        ext = os.path.splitext(path)[1] or os.path.splitext(url.split("?")[0])[1] or ".jpg"
+        fd, tmp = tempfile.mkstemp(suffix=ext)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return tmp
+    except Exception as exc:  # noqa: BLE001 - never block a build on a fetch
+        log(f"could not localize hosted media for the story burn "
+            f"({type(exc).__name__}); the story will be dropped, not shipped bare")
+        return None
+
+
 def _maybe_format_story(account, story, feed, library_path, log):
     """Give a story its CAPTION on the media (a story publishes empty-body, so the words
     must be burned in), and report whether the story may ship:
@@ -904,6 +1003,17 @@ def _maybe_format_story(account, story, feed, library_path, log):
         return True
     path = (getattr(feed, "creative_path", "") or "").strip()
     is_video = bool(path) and path.lower().endswith(_VIDEO_EXTS)
+    # REMOTE-MEDIA STORIES (gym-drive lane): a Drive-sourced feed carries the asset
+    # TITLE in creative_path, not a readable local file (its temp download is cleaned
+    # up in the builder), so the burn below would fail and the captionless guard would
+    # silently drop every Drive story. Materialize the hosted media to a temp file and
+    # burn from that — the same download_bytes lane the publish-time aspect preflight
+    # uses, because pub-*.r2.dev 403s a plain GET.
+    _tmp_story_src = None
+    if path and not os.path.isfile(path):
+        _tmp_story_src = _localize_creative(story, feed, path, log)
+        if _tmp_story_src:
+            path = _tmp_story_src
     # The STORY's own caption wins when it was overridden by a client edit; otherwise it
     # equals the feed caption (the paired story is cloned from the feed). This is what
     # lets a saved story caption actually get BURNED onto the media on re-render.
@@ -911,10 +1021,13 @@ def _maybe_format_story(account, story, feed, library_path, log):
     # Task #28 (§5c): keep the RAW (un-captioned) source url so an edited story caption can
     # re-burn IMMEDIATELY instead of only on the next monthly rebuild. Gated: written to
     # content_calendar.source_media_url only when AGENT_STORY_SOURCE_MEDIA is on (the column
-    # exists). feed.creative_public_url is the raw feed media before the story burn swaps
-    # story.creative_public_url to the captioned asset.
+    # exists). Read the STORY's url, not the feed's: _finish_feed_with_story has already
+    # restored the PRE-AUTOFIT media onto the story, whereas feed.creative_public_url may
+    # by now be the SQUARE 1080x1080 autofit card — storing that made every edited-caption
+    # re-burn come back cropped to the feed shape (both flags are armed in production).
     if config.story_source_media_enabled():
-        story.source_media_url = (getattr(feed, "creative_public_url", "") or "")
+        story.source_media_url = ((getattr(story, "creative_public_url", "") or "")
+                                  or (getattr(feed, "creative_public_url", "") or ""))
     try:
         from . import story_image, media_host
         gym_name = _display_name_for(account)
@@ -950,6 +1063,12 @@ def _maybe_format_story(account, story, feed, library_path, log):
         log(f"story format lane failed for {os.path.basename(path)}: "
             f"{type(exc).__name__}; dropping the story to avoid a captionless post")
         return False
+    finally:
+        if _tmp_story_src:
+            try:
+                os.unlink(_tmp_story_src)
+            except OSError:
+                pass
 
 
 def _maybe_format_feed(account, feed, library_path, log):

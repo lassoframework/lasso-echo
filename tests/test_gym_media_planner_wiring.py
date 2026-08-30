@@ -230,3 +230,144 @@ def test_append_helper_builds_pending_with_asset_id(monkeypatch, tmp_path):
     assert d.status == DraftStatus.PENDING
     assert d.draft_type == "gym_media"
     assert d.source_media_asset_id == "drivepic9"
+
+
+# ---- Dale/ENG 2026-08-30: the Drive lane must emit the SAME cards as the
+# ---- uploaded-media loop (paired story + the 2x cadence), not a bare 1x feed.
+def test_drive_lane_pairs_a_story_with_every_feed(monkeypatch, tmp_path):
+    """The lane used to append a bare _mark_feed draft, so a gym whose month the
+    Drive lane filled got feed rows and ZERO stories. Dale (ENG) lost every story
+    for a full month the day this lane took over his calendar."""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("drivepicS", gym_id="gritx", kind="photo", title="class.jpg")])
+    drive = FakeDrive(blobs={"drivepicS": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+    from datetime import date
+    extra = cmr.append_gym_drive_drafts(
+        _account(), "gritx", date(2026, 8, 1), 1, _voice(),
+        log=lambda m: None, covered_days=set(), drive=drive, store=store,
+        library_path=_lib(tmp_path))
+    assert extra, "the helper built no Drive drafts"
+    assert any(getattr(d, "is_story", False) for d in extra), \
+        "a Drive feed must carry its paired story, exactly like an uploaded-media feed"
+    assert any(not getattr(d, "is_story", False) for d in extra), "the feed itself is gone"
+
+
+def test_drive_lane_honors_the_2x_cadence(monkeypatch, tmp_path):
+    """The lane hard-coded one post per day (`for i in range(days)`), so a gym on 2x
+    still got a single daily post and no slot ordinal — Dale's 'only one post a day
+    goes out' after he turned on 2x."""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("d1", gym_id="gritx", kind="photo", title="a.jpg"),
+        make_asset("d2", gym_id="gritx", kind="photo", title="b.jpg")])
+    drive = FakeDrive(blobs={"d1": b"jpgbytes", "d2": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+    from datetime import date
+    # Captions are GROUNDED in the day's approved source, so two slots drawing
+    # different sources produce different copy (the stub models that).
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda a, source, *r, **k: (f"Caption about {source}", []))
+    extra = cmr.append_gym_drive_drafts(
+        _account(), "gritx", date(2026, 8, 1), 1, _voice(),
+        log=lambda m: None, covered_days=set(), drive=drive, store=store,
+        library_path=_lib(tmp_path), slots_per_day=2)
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    assert len(feeds) == 2, f"2x must stage two feeds on the day, got {len(feeds)}"
+    assert feeds[0].caption != feeds[1].caption, \
+        "a 2x day must never publish the same words twice"
+    assert sorted(getattr(d, "cadence_slot_index", None) for d in feeds) == [0, 1], \
+        "each 2x feed carries its slot ordinal so publish times are deterministic"
+
+
+def test_drive_lane_at_1x_is_unchanged_one_feed_per_day(monkeypatch, tmp_path):
+    """1x keeps its shape: one feed per day and NO slot ordinal, so the row shape and
+    publish hashing do not move for the gyms that never toggled. (Slot 0 picks the
+    same category as the old code; only the no-source-in-that-pillar FALLBACK now
+    walks a rotated order, which can land on a different approved fact.)"""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("e1", gym_id="gritx", kind="photo", title="a.jpg"),
+        make_asset("e2", gym_id="gritx", kind="photo", title="b.jpg")])
+    drive = FakeDrive(blobs={"e1": b"jpgbytes", "e2": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+    from datetime import date
+    extra = cmr.append_gym_drive_drafts(
+        _account(), "gritx", date(2026, 8, 1), 1, _voice(),
+        log=lambda m: None, covered_days=set(), drive=drive, store=store,
+        library_path=_lib(tmp_path))
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    assert len(feeds) == 1
+    assert getattr(feeds[0], "cadence_slot_index", None) is None
+
+
+def test_drive_story_burns_its_caption_from_the_hosted_media(monkeypatch, tmp_path):
+    """PRODUCTION POSTURE (AGENT_STORY_FORMAT on). A Drive draft carries the asset
+    TITLE in creative_path, not a readable local file, so the caption burn used to
+    fail and the captionless guard dropped every Drive story. The story must now be
+    rendered from the HOSTED media and kept."""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("dS2", gym_id="gritx", kind="photo", title="class.jpg")])
+    drive = FakeDrive(blobs={"dS2": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_HOSTING_ENABLED", "true")
+
+    seen = {}
+    # The hosted media is fetched through the same download_bytes lane the
+    # publish-time aspect preflight uses (pub-*.r2.dev 403s a plain GET).
+    monkeypatch.setattr("agent.media_host.download_bytes", lambda url: b"realphotobytes")
+
+    def _fake_story_image(photo_path, caption, gym_name, library_path, logger=None):
+        # Proves we handed the renderer a REAL readable file, not the bare title.
+        seen["path"] = photo_path
+        seen["readable"] = os.path.isfile(photo_path)
+        seen["bytes"] = open(photo_path, "rb").read()
+        out = os.path.join(str(library_path), "burned__story.jpg")
+        with open(out, "wb") as fh:
+            fh.write(b"burned")
+        return out
+
+    monkeypatch.setattr("agent.story_image.get_or_make_story_image", _fake_story_image)
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda asset, key: "https://cdn.test/story.jpg")
+
+    from datetime import date
+    extra = cmr.append_gym_drive_drafts(
+        _account(), "gritx", date(2026, 8, 1), 1, _voice(),
+        log=lambda m: None, covered_days=set(), drive=drive, store=store,
+        library_path=_lib(tmp_path))
+
+    stories = [d for d in extra if getattr(d, "is_story", False)]
+    assert stories, "the Drive story was dropped by the captionless guard"
+    assert seen.get("readable") is True, "the renderer got a bare title, not a real file"
+    assert seen.get("bytes") == b"realphotobytes"
+    assert stories[0].creative_public_url == "https://cdn.test/story.jpg"
+    # the temp download is not left behind
+    assert not os.path.isfile(seen["path"])
+
+
+def test_drive_lane_never_stages_the_same_caption_twice_in_a_day(monkeypatch, tmp_path):
+    """HARD GUARD: whatever the generator does, a repeat caption on one day is DROPPED,
+    never staged — and its photo goes back to the pool instead of being burned."""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("z1", gym_id="gritx", kind="photo", title="a.jpg"),
+        make_asset("z2", gym_id="gritx", kind="photo", title="b.jpg")])
+    drive = FakeDrive(blobs={"z1": b"jpgbytes", "z2": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+    # A generator that returns identical copy no matter the source.
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: ("The exact same words", []))
+    from datetime import date
+    extra = cmr.append_gym_drive_drafts(
+        _account(), "gritx", date(2026, 8, 1), 1, _voice(),
+        log=lambda m: None, covered_days=set(), drive=drive, store=store,
+        library_path=_lib(tmp_path), slots_per_day=2)
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    assert len(feeds) == 1, "the duplicate second post must be dropped, not staged"
+    # The dropped draft's asset was returned to the pool, not burned for 90 days.
+    burned = [a for a in store.assets.values() if int(a.get("used_count") or 0) > 0]
+    assert len(burned) == 1, f"a dropped draft burned its photo: {burned}"

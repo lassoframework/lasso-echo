@@ -365,6 +365,54 @@ def _store():
     return SupabaseCalendarStore(url="http://x", service_key="k", http=_FakeGymsHttp())
 
 
+class _FakeCadenceHttp(_FakeGymsHttp):
+    """gyms + echo_gym_settings, so the cadence accessors can be exercised end to end.
+    Top Fuel (base 'topfuel', slug 'top-fuel') is the base != slug case."""
+
+    def __init__(self):
+        self.settings = {"uuid-topfuel": 2, "uuid-eng": 1}
+        self.written = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if "echo_gym_settings" in url:
+            uuid = (params or {}).get("gym_id", "").replace("eq.", "")
+            if uuid in self.settings:
+                return _FakeResp([{"posts_per_day": self.settings[uuid]}])
+            return _FakeResp([])
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+    def post(self, url, params=None, headers=None, json=None, timeout=None):
+        self.written.append(json)
+        return _FakeResp(json or [])
+
+
+def _cadence_store(http):
+    from agent.portal_calendar_store import SupabaseCalendarStore
+    return SupabaseCalendarStore(url="http://x", service_key="k", http=http)
+
+
+def test_gym_posts_per_day_resolves_when_base_differs_from_slug():
+    """Dale/ENG 2026-08-30 regression: the cadence reader used a raw slug=eq.<base>
+    match, so every gym whose account-registry base differs from its gyms.slug read
+    None and silently built at 1x no matter what its owner had toggled."""
+    s = _cadence_store(_FakeCadenceHttp())
+    assert s.gym_posts_per_day("topfuel") == 2   # base 'topfuel' -> slug 'top-fuel'
+    assert s.gym_posts_per_day("eng") == 1       # base == slug still works
+    assert s.gym_posts_per_day("nosuchgym") is None
+
+
+def test_set_gym_posts_per_day_writes_when_base_differs_from_slug():
+    """The writer had the same miss, and handle_cadence turns a False into a 503 —
+    so those owners could not save a cadence at all."""
+    http = _FakeCadenceHttp()
+    s = _cadence_store(http)
+    assert s.set_gym_posts_per_day("topfuel", 2, actor="client") is True
+    assert http.written and http.written[0][0]["gym_id"] == "uuid-topfuel"
+    assert http.written[0][0]["posts_per_day"] == 2
+    assert s.set_gym_posts_per_day("nosuchgym", 2) is False
+    assert s.set_gym_posts_per_day("topfuel", 3) is False   # only 1 or 2 is valid
+
+
 def test_resolve_gym_uuid_exact_slug_when_base_equals_slug():
     s = _store()
     assert s.resolve_gym_uuid("eng") == "uuid-eng"

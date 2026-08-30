@@ -93,3 +93,101 @@ def test_stamp_and_rollback(monkeypatch):
     assert store.assets["a"]["last_used_at"] is None
     # Idempotent second rollback.
     assert sel.rollback_use("pierce", "2026-08-27", store=store) is False
+
+
+def test_two_assets_on_one_date_both_roll_back(monkeypatch):
+    """A 2x day stages TWO gym-media posts on one date, and Story Studio stamps every
+    segment asset under one pseudo-date key. The old single-record write clobbered all
+    but the LAST, so the earlier assets could never be returned to the pool and sat out
+    the 90-day cooldown. Every record on the key must survive and roll back."""
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    store = FakeMediaStore(assets=[
+        make_asset("am", used_count=0, last_used_at=None),
+        make_asset("pm", used_count=0, last_used_at=None)])
+    sel.stamp_use(store.get_asset("am"), "pierce", "2026-08-27", store=store, now=NOW)
+    sel.stamp_use(store.get_asset("pm"), "pierce", "2026-08-27", store=store, now=NOW)
+    assert store.assets["am"]["used_count"] == 1
+    assert store.assets["pm"]["used_count"] == 1
+
+    assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
+    assert store.assets["am"]["used_count"] == 0, "the AM asset was stranded"
+    assert store.assets["pm"]["used_count"] == 0
+    assert sel.rollback_use("pierce", "2026-08-27", store=store) is False
+
+
+def test_rollback_asset_returns_one_and_leaves_the_days_other_post_stamped(monkeypatch, tmp_path):
+    """Denying ONE post of a 2x day must return only ITS photo — the other post is
+    still standing and must keep its asset stamped. Uses a REAL temp kv because
+    rollback_asset scans the kv table directly (as it does in production)."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    store = FakeMediaStore(assets=[
+        make_asset("am", used_count=0, last_used_at=None),
+        make_asset("pm", used_count=0, last_used_at=None)])
+    sel.stamp_use(store.get_asset("am"), "pierce", "2026-08-27", store=store, now=NOW)
+    sel.stamp_use(store.get_asset("pm"), "pierce", "2026-08-27", store=store, now=NOW)
+
+    assert sel.rollback_asset("pm", store=store) is True
+    assert store.assets["pm"]["used_count"] == 0
+    assert store.assets["am"]["used_count"] == 1, "the standing post lost its stamp"
+    # And the day's remaining record still rolls back on a full deny.
+    assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
+    assert store.assets["am"]["used_count"] == 0
+
+
+def test_legacy_single_dict_record_still_rolls_back(monkeypatch):
+    """Records written before the list format (a bare dict) must still roll back."""
+    import json as _json
+    kv = {"gym_media_use:pierce:2026-08-27": _json.dumps({
+        "asset_id": "old", "gym_id": "pierce", "prev_used_count": 0,
+        "prev_last_used_at": None, "staged_at": NOW.isoformat(), "rolled_back": False})}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    store = FakeMediaStore(assets=[make_asset("old", used_count=1)])
+    assert sel.rollback_use("pierce", "2026-08-27", store=store) is True
+    assert store.assets["old"]["used_count"] == 0
+
+
+def test_deny_never_rolls_back_the_same_photos_earlier_published_use(monkeypatch, tmp_path):
+    """A denied post must NOT undo the same asset's EARLIER, still-published use.
+
+    Use records are never cleared on publish, so an asset re-staged after its 90-day
+    cooldown carries both records. A cross-date rollback would restore the live post's
+    counters and hand a photo that is currently on the gym's feed straight back to the
+    pool. on_draft_denied must stay scoped to the denied draft's own date."""
+    import json as _json
+    from datetime import timedelta
+    from agent import db as _db
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    later = NOW + timedelta(days=95)
+    store = FakeMediaStore(assets=[make_asset("a", used_count=0, last_used_at=None)])
+    # Day 1: staged and PUBLISHED (its record stays un-rolled forever — nothing
+    # clears a use-record on publish).
+    sel.stamp_use(store.get_asset("a"), "pierce", "2026-01-01", store=store, now=NOW)
+    # Day 95: the cooldown has passed, so the same photo is legitimately re-staged.
+    sel.stamp_use(store.get_asset("a"), "pierce", "2026-04-05", store=store, now=later)
+    assert store.assets["a"]["used_count"] == 2
+
+    class _Draft:
+        draft_type = "gym_media"
+        day_key = "2026-04-05"
+        account_key = "pierce_ig"
+        source_media_asset_id = "a"
+
+    assert sel.on_draft_denied(_Draft(), store=store) is True
+
+    # THE DISCRIMINATING ASSERTION: the PUBLISHED day-1 record must still be
+    # un-rolled. A cross-date rollback flips it to True — and because that record's
+    # prev_ values are the pre-publish ones, the live photo is handed back to the
+    # pool as if it had never run. (used_count alone does NOT catch this: both
+    # orderings happen to land on 1.)
+    day1 = _json.loads(_db.kv_get("gym_media_use:pierce:2026-01-01", "[]"))
+    assert day1 and day1[0]["rolled_back"] is False, \
+        "the live published use was rolled back — a posted photo returned to the pool"
+    # The denied day's own record IS rolled back, and the asset keeps the published use.
+    day95 = _json.loads(_db.kv_get("gym_media_use:pierce:2026-04-05", "[]"))
+    assert day95 and day95[0]["rolled_back"] is True
+    assert store.assets["a"]["used_count"] == 1
+    assert store.assets["a"]["last_used_at"] == NOW.isoformat(), \
+        "the asset must fall back to its PUBLISHED day-1 timestamp, not to never-used"

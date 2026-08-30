@@ -125,12 +125,17 @@ def test_resolve_flag_off_is_always_one(monkeypatch):
     assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=2)) == 1
 
 
-def test_resolve_order_kv_then_store_then_default(monkeypatch):
+def test_resolve_order_store_then_kv_then_default(monkeypatch):
     monkeypatch.setenv("ECHO_CADENCE_2X_ENABLED", "true")
     assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=None)) == 1
     assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=2)) == 2
+    # The SHARED PLANE wins over the local kv. The portal writes the owner's toggle
+    # there and each service has its own SQLite, so a stale local '1' must never
+    # override the owner's saved choice (it used to, permanently and unclearably).
     db.set_posts_per_day("gritx", 1)
-    assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=2)) == 1  # kv wins
+    assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=2)) == 2
+    # kv is still the fallback when the shared plane has nothing to say.
+    assert cadence.resolve_posts_per_day("gritx", _FakeStore(ppd=None)) == 1
     db.set_posts_per_day("gritx", 2)
     assert cadence.resolve_posts_per_day("gritx", None) == 2
 

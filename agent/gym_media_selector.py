@@ -127,11 +127,35 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
 
 
 # ---- usage stamping + deny rollback ------------------------------------------
+def _as_records(raw):
+    """The list of use-records held under one kv key. A 2x day stages TWO gym-media
+    posts on one date, so the value is a LIST. Legacy values (a single dict, written
+    before 2026-08-30) are read as a one-element list, so old records still roll back."""
+    try:
+        val = json.loads(raw or "[]")
+    except Exception:  # noqa: BLE001 - an unreadable record is simply skipped
+        return []
+    if isinstance(val, dict):
+        return [val] if val else []
+    if not isinstance(val, list):
+        return []                                # a scalar (null/5/true) is not a record
+    return [r for r in val if isinstance(r, dict)]
+
+
 def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
     """Stamp used_count += 1 and last_used_at = now — called ONLY when the slot is
     actually STAGED (the builder, after the PENDING row is assembled). Records prior
     values in kv so a coach deny rolls the stamp back and the asset returns to the
-    pool."""
+    pool.
+
+    APPENDS to the date's record list rather than replacing it: at 2x two assets are
+    staged on one date, and the old single-record write meant the PM stamp clobbered
+    the AM one — so a denied AM asset could never be rolled back and silently sat out
+    the 90-day cooldown, burning half the gym's pool over a month. Re-staging the SAME
+    asset on the same date replaces its record rather than adding a second one (so a
+    rollback cannot double-restore). NOTE it is not fully idempotent: the second stamp
+    records the already-incremented count as `prev_used_count`, so a later rollback
+    leaves a residual +1. Pre-existing; callers stamp once per staged slot."""
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     now = _now_utc(now)
@@ -142,39 +166,60 @@ def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
         "last_used_at": now.isoformat(),
     })
     from . import db
-    db.kv_set(_USE_KEY.format(base, post_date), json.dumps({
+    key = _USE_KEY.format(base, post_date)
+    records = [r for r in _as_records(db.kv_get(key, ""))
+               if r.get("asset_id") != asset["id"]]
+    records.append({
         "asset_id": asset["id"],
         "gym_id": base,
         "prev_used_count": prev_count,
         "prev_last_used_at": prev_last,
         "staged_at": now.isoformat(),
         "rolled_back": False,
-    }))
+    })
+    db.kv_set(key, json.dumps(records))
 
 
-def rollback_use(gym_id, post_date, *, store=None):
-    """Roll a staged asset's usage stamp back (the coach denied the post): the asset
-    returns to the pool exactly as it was. Idempotent. Returns True when a rollback
-    actually happened."""
+def rollback_use(gym_id, post_date, *, store=None, asset_id=None):
+    """Roll the staged assets for one gym+date back (the post was denied): each asset
+    returns to the pool exactly as it was. Idempotent. Returns True when at least one
+    rollback actually happened.
+
+    Rolls back EVERY un-rolled record on that date by default: a 2x day stages two
+    gym-media posts, and callers reach that form only once the whole date is denied
+    with nothing live left on it (observe_denials' denied-and-not-live test, or a 1x
+    deny where the date holds a single post).
+
+    asset_id scopes the rollback to ONE asset ON THIS DATE — what a single denied
+    card needs when the day's other post still stands. Deliberately date-scoped:
+    use-records are never cleared on publish, so an asset legitimately re-staged after
+    its 90-day cooldown still carries the record of its earlier PUBLISHED post, and a
+    cross-date rollback would restore that live photo's counters and hand it straight
+    back to the pool."""
     from . import db
     base = base_gym_key(gym_id)
     key = _USE_KEY.format(base, post_date)
-    try:
-        rec = json.loads(db.kv_get(key, "") or "{}")
-    except Exception:
-        rec = {}
-    if not rec or rec.get("rolled_back"):
+    records = _as_records(db.kv_get(key, ""))
+    if not records or all(r.get("rolled_back") for r in records):
         return False
     store = store or _idx.default_store()
     if not store.available():
         return False
-    store.update_asset(rec["asset_id"], {
-        "used_count": int(rec.get("prev_used_count") or 0),
-        "last_used_at": rec.get("prev_last_used_at"),
-    })
-    rec["rolled_back"] = True
-    db.kv_set(key, json.dumps(rec))
-    return True
+    rolled = False
+    for rec in records:
+        if rec.get("rolled_back"):
+            continue
+        if asset_id and rec.get("asset_id") != asset_id:
+            continue
+        store.update_asset(rec["asset_id"], {
+            "used_count": int(rec.get("prev_used_count") or 0),
+            "last_used_at": rec.get("prev_last_used_at"),
+        })
+        rec["rolled_back"] = True
+        rolled = True
+    if rolled:
+        db.kv_set(key, json.dumps(records))
+    return rolled
 
 
 def rollback_asset(asset_id, *, store=None):
@@ -187,16 +232,21 @@ def rollback_asset(asset_id, *, store=None):
     if not store.available():
         return False
     rolled = False
-    for key, rec in _use_records():
-        if rec.get("asset_id") != asset_id or rec.get("rolled_back"):
-            continue
-        store.update_asset(rec["asset_id"], {
-            "used_count": int(rec.get("prev_used_count") or 0),
-            "last_used_at": rec.get("prev_last_used_at"),
-        })
-        rec["rolled_back"] = True
-        db.kv_set(key, json.dumps(rec))
-        rolled = True
+    for key, records in _use_records():
+        touched = False
+        for rec in records:
+            if rec.get("asset_id") != asset_id or rec.get("rolled_back"):
+                continue
+            store.update_asset(rec["asset_id"], {
+                "used_count": int(rec.get("prev_used_count") or 0),
+                "last_used_at": rec.get("prev_last_used_at"),
+            })
+            rec["rolled_back"] = True
+            touched = True
+        if touched:
+            # Rewrite the WHOLE list: the day's other post keeps its own stamp.
+            db.kv_set(key, json.dumps(records))
+            rolled = True
     return rolled
 
 
@@ -209,12 +259,19 @@ def on_draft_denied(draft, *, store=None):
     account_key = getattr(draft, "account_key", "") or ""
     if not day_key or not account_key:
         return False
-    return rollback_use(account_key, day_key, store=store)
+    # EXACT when we know the asset: a 2x day stages two gym-media posts, and denying
+    # one must return only ITS photo, leaving the day's other (still-standing) post
+    # stamped. Scoped to THIS DATE — never a cross-date rollback_asset, which would
+    # also undo the same photo's earlier PUBLISHED record and re-pool a live image.
+    asset_id = (getattr(draft, "source_media_asset_id", "") or "").strip() or None
+    return rollback_use(account_key, day_key, store=store, asset_id=asset_id)
 
 
 # ---- nightly denial observer (portal denies happen out-of-band) --------------
 def _use_records():
-    """Every gym_media_use kv record as (key, dict), unreadable rows skipped."""
+    """Every gym_media_use kv record as (key, [record, ...]), unreadable rows skipped.
+    One key holds a LIST because a 2x day stages two assets on one date; a legacy
+    single-dict value is normalized to a one-element list by _as_records."""
     from . import db
     out = []
     try:
@@ -224,10 +281,14 @@ def _use_records():
     except Exception:
         return out
     for r in rows:
+        # Per-row guard: ONE malformed value must never disable the whole ledger for
+        # every gym (the callers all swallow exceptions, so it would fail silently).
         try:
-            out.append((r["key"], json.loads(r["value"] or "{}")))
-        except Exception:
+            records = _as_records(r["value"])
+        except Exception:  # noqa: BLE001 - an unreadable row is skipped, not fatal
             continue
+        if records:
+            out.append((r["key"], records))
     return out
 
 
@@ -263,8 +324,9 @@ def observe_denials(*, store=None, fetch_rows=None):
     podcast_selector.observe_denials. Idempotent. Returns a summary."""
     fetch_rows = fetch_rows or _default_fetch_rows
     checked = rolled = 0
-    for key, rec in _use_records():
-        if not rec or rec.get("rolled_back"):
+    for key, records in _use_records():
+        # A date is worth checking while ANY of its staged assets is un-rolled.
+        if not any(not r.get("rolled_back") for r in records):
             continue
         try:
             _, gym_id, post_date = key.split(":", 2)

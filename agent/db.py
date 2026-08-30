@@ -330,7 +330,8 @@ def set_posts_per_day(base_key, n):
 
 def posts_per_day(base_key):
     """The gym's LOCALLY stored cadence preference: 1, 2, or None when unset /
-    unreadable (caller falls back to the shared plane, then to 1)."""
+    unreadable. This is the FALLBACK: cadence.resolve_posts_per_day reads the
+    shared plane first and only consults this when that says nothing."""
     if not base_key:
         return None
     try:
