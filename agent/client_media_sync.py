@@ -610,8 +610,9 @@ def _maybe_seed_onboarding_demo(base_key, store, log):
     a demo must never sink or slow the scan.
 
     Samples carry NO image by design. They are not the gym's content, so using the
-    gym's photos on them would burn real creative on a mock, and a row with no
-    image_url cannot even enter due_rows — defence in depth behind the publish rail."""
+    gym's photos on them would burn real creative on a mock. The image_url is written
+    NULL (not ""), which is what genuinely keeps them out of due_rows — an empty string
+    passes its `not.is.null` filter. The publish rail is the second line of defence."""
     try:
         from . import onboarding_demo
         if not onboarding_demo.enabled():

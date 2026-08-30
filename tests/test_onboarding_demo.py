@@ -99,7 +99,9 @@ def test_every_sample_row_is_marked_twice_and_carries_no_image():
     for r in od.build_rows("hillcountry", days=4):
         assert r["pillar"] == od.SAMPLE_PILLAR
         assert r["caption"].startswith(od.SAMPLE_PREFIX)
-        assert r["image_url"] == ""
+        assert r["image_url"] is None, (
+            "must be NULL, not '': due_rows filters image_url with not.is.null and an "
+            "empty string PASSES that filter, so '' would put samples in the due set")
         assert r["status"] == "draft"
         assert od.is_sample_row(r)
 

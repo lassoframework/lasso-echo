@@ -116,12 +116,16 @@ def build_rows(base_key, *, days=14, start=None, account="instagram",
     for i in range(max(0, int(days))):
         day = (start + timedelta(days=i)).isoformat()
         headline, body = _SHAPE[i % len(_SHAPE)]
-        img = ""
+        # NULL, not "": due_rows filters image_url with `not.is.null`, and an EMPTY
+        # STRING passes that filter. Writing None is what actually keeps a sample out
+        # of the publisher's due set, so the publish rail is a second line of defence
+        # rather than the only one. (Measured: with "" the due set returned samples.)
+        img = None
         if callable(image_for_day):
             try:
-                img = image_for_day(i) or ""
+                img = image_for_day(i) or None
             except Exception:  # noqa: BLE001 - a sample never fails on media
-                img = ""
+                img = None
         feed_caption = (f"{SAMPLE_PREFIX}This is where {headline} will go.\n\n{body}\n\n"
                         "This is a sample so you can see your calendar before your "
                         "content is ready. It will be replaced by your real post.")
