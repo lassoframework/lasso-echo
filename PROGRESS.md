@@ -10,6 +10,78 @@ Last updated: 2026-08-30
 
 ---
 
+## Fleet-wide silent-failure sweep (2026-08-30, SHIPPED + VERIFIED LIVE)
+
+Blake after the ENG ticket: "really need echo to work and stop having issues... deep
+dive into all the features and portals and fix any errors to keep these things from
+happening." Every bug below is ONE of two shapes: (a) a write aimed at PER-SERVICE
+local SQLite the other service can never read, or (b) a response nobody inspected, so
+a failed write returned 200 "ok".
+
+### [x] TIER 1 — three gyms were INVISIBLE to Echo (commit: data fix on the worker)
+  - /data/gym_accounts.json had entries keyed by gym UUID instead of base key
+    (5a906124=Hill Country, b536c122=Bolton, 43f2707f=CrossFit Local), a DUPLICATE
+    piercefitness stub (8a668b95), and no zanshin at all. client_gym_bases() and
+    client_media_sync._client_bases() both derive from all_accounts(), so those gyms
+    were in NEITHER the build nor the publish lane. Total blackout, no alert possible.
+  - FIXED: registry rewritten to the ESTABLISHED base keys (the ones media_asset /
+    content_calendar / ops/gym-slack-map.json already use). Backup:
+    /data/gym_accounts.json.bak-20260830. Then zernio_profile_link linked hillcountry
+    + zanshin (profile + FB page).
+  - AFTER the fix they report the HONEST blocker: no_sources. hillcountry,
+    theboltonclub, crossfitlocal, zanshinfitness630e22 and district_h have ZERO
+    approved AND ZERO pending client_sources. They need INTAKE completed (coach
+    action, not code). district_h also has zernio_profile_id pointing at a profile
+    with zero accounts.
+
+### [x] TIER 2 — client actions that reported success while doing nothing
+  - HIDE A PHOTO + REMOVED-FROM-DRIVE PATCHed status='needs_media', which is NOT in
+    the content_calendar CHECK constraint -> Postgres 400 EVERY time; the response was
+    never read and the route returned 200. A gym hid an embarrassing photo, was told
+    it was done, and the post published anyway. Now status='denied' + reject_reason
+    (what the armed deny-backfill watches), with the 4xx surfaced (dba9904).
+  - CREATE A STORY staged NOTHING: a Draft was built, the video hosted, clips stamped
+    used, and status="staged" returned with no content_calendar write in the module.
+    Now writes a real PENDING row. Self-caught follow-up: the row's `account` was the
+    gym key not 'instagram', so it still could not publish (26f2ac1).
+  - SORT QUEUE pending() read only local kv but rows are enqueued by the WORKER, so
+    the portal tab was permanently empty while the digest said N files waited;
+    resolve() discarded the shared write and always said ok (004390b).
+  - SUPPORT MESSAGES were dropped on a Slack failure or unset channel with no record
+    and no alert, and the failed attempt still burned the rate limit (5 = lockout).
+    Now escalates to the OPS channel with the client's words + refunds (004390b).
+  - EVENT ARCS: markdown pasted into a brief reached the caption BODY (Zanshin had a
+    literal "# BRING A FRIEND WEEK" on 4 APPROVED posts) -> strip_scaffold (24aca27).
+    GymEvent.media_ids was never consumed ANYWHERE, so every event post for every gym
+    was staged with NO image and could not publish -> _attach_media, which HOLDS a row
+    it cannot give a photo rather than staging an unpublishable promise (ce5f839).
+
+### [x] TIER 3 — posts that died silently
+  - due_rows only looks back CLIENT_CATCHUP_DAYS (7); an older row is never read,
+    claimed or failed and carries no reject_reason. 11 APPROVED LASSO posts and 26
+    GritX rows had died exactly this way with nothing reporting it. NEW
+    sweep_expired_rows + store.expired_rows, wired in listener.py: ONE digest line per
+    gym per day, alert-only, never publishes or denies (88fadfd).
+  - GritX + TopFuel calendars were FROZEN by STALE built_media_<base> markers (gritx
+    stamped 171 against a 30-day budget under older code, before the guard that only
+    stamps a media-capped gym). Cleared both so the scan can grow them again.
+
+### Open for Blake (NOT decided here)
+  - [ ] LASSO has 0 live forward stories (all 107 denied by duplicate_purge_2026_08);
+        needs a planner refill, and LASSO is autonomous so new rows auto-publish.
+  - [ ] LASSO rows run to 2026-12-04, past the today+31 horizon cap.
+  - [ ] A `Demo Fitness` gym (is_demo=true) owns the only gym_social_accounts rows and
+        they point at the REAL lassoframework IG/FB handles. Contained today only
+        because it is not in client_gym_bases.
+  - [ ] LASSO now genuinely resolves posts_per_day=2 AND is autonomous: its
+        auto-published volume roughly doubles once publishing resumes.
+  - [ ] thumb_url emits /media/thumb/<id> without the /portal/<token> prefix. NOT
+        changed: the media front-end is not in this repo and may already prefix it.
+
+Suite green on main throughout (4159 passed, 11 skipped at the last commit).
+
+---
+
 ## Gym-drive lane: stories + 2x cadence (2026-08-30, commit 6140b5c, SHIPPED + VERIFIED LIVE)
 
 Dale/ENG support ticket: "I turned on two times a day last week and now never have a
