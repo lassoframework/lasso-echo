@@ -1131,3 +1131,73 @@ def test_repeat_failure_alert_once_per_day_per_reason(monkeypatch):
     for _ in range(5):
         cap._note_repeat_failure("row-other", "topfuel", exc, now=day2)
     assert len(fired) == 4
+
+
+# ---- expired-row watchdog: rows that can never publish must be reported ----------
+class _ExpiredStore:
+    def __init__(self, rows):
+        self._rows = rows
+        self.asked = []
+
+    def expired_rows(self, before_date, statuses=("approved", "pending")):
+        self.asked.append(before_date)
+        return self._rows
+
+
+class _MemKV:
+    def __init__(self):
+        self.d = {}
+
+    def get(self, k, default=""):
+        return self.d.get(k, default)
+
+    def set(self, k, v):
+        self.d[k] = v
+
+
+def test_expired_rows_alert_once_per_gym_per_day():
+    """LIVE GAP: due_rows only looks back 7 days, so an older approved row is never
+    read, claimed or failed — it just stops existing to the publisher. 11 APPROVED
+    LASSO posts and 26 GritX rows died silently this way with no reject_reason."""
+    rows = [
+        {"id": "1", "gym_id": "lasso", "account": "instagram",
+         "post_date": "2026-08-07", "status": "approved"},
+        {"id": "2", "gym_id": "lasso", "account": "facebook",
+         "post_date": "2026-08-11", "status": "approved"},
+        {"id": "3", "gym_id": "gritx", "account": "instagram",
+         "post_date": "2026-08-17", "status": "pending"},
+    ]
+    store, kv, seen = _ExpiredStore(rows), _MemKV(), []
+    out = cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                                 now="2026-08-30T12:00:00")
+    assert sorted(out) == ["gritx", "lasso"]
+    assert len(seen) == 2
+    lasso_line = next(m for m in seen if m.startswith("lasso:"))
+    assert "2 calendar row(s)" in lasso_line
+    assert "2 already APPROVED" in lasso_line
+    assert "2026-08-07" in lasso_line               # names the oldest
+    # The cutoff is today minus the catch-up window, not today.
+    assert store.asked == ["2026-08-23"]
+    # Same day again: silent (no storm).
+    seen2 = []
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen2.append,
+                           now="2026-08-30T18:00:00")
+    assert seen2 == []
+
+
+def test_expired_sweep_is_silent_when_nothing_expired():
+    store, kv, seen = _ExpiredStore([]), _MemKV(), []
+    assert cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                                  now="2026-08-30T12:00:00") == []
+    assert seen == []
+
+
+def test_expired_sweep_survives_a_read_failure():
+    class _Boom:
+        def expired_rows(self, before_date, statuses=("approved", "pending")):
+            raise RuntimeError("supabase down")
+
+    seen = []
+    assert cap.sweep_expired_rows(store=_Boom(), kv=_MemKV(), alert=seen.append,
+                                  now="2026-08-30T12:00:00") == []
+    assert seen == []

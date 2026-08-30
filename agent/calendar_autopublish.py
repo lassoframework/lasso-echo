@@ -26,7 +26,7 @@ Nothing here logs a token or secret. The manual approval path is untouched.
 """
 
 import os
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from . import config
 from . import meta_publisher
@@ -1062,6 +1062,65 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
         except Exception:
             pass
         alerted.append(rid)
+    return alerted
+
+
+def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
+                       catchup_days=None):
+    """Alert ONCE PER GYM PER DAY on approved/pending rows that have aged past the
+    catch-up window and can therefore never publish.
+
+    THE GAP THIS CLOSES: due_rows only looks back `catchup_days` (7). A row older than
+    that is never read, never claimed, never failed and carries no reject_reason — it
+    just silently stops existing to the publisher. Live at the time of writing: 11
+    APPROVED LASSO posts (2026-08-07 to 08-11) and 26 GritX rows died exactly this way,
+    with nothing anywhere saying so. A client approved content that never went out and
+    nobody found out.
+
+    Read-only on the calendar: it never publishes, never reverts, never denies — a
+    human decides whether to re-date or drop them. One digest line per gym per day
+    (kv-deduped) so this can never become a storm. All I/O injectable."""
+    if store is None:
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+    if kv is None:
+        kv = _kv_default()
+    if alert is None:
+        from .ops_alerts import alert as _alert
+        alert = _alert
+    days = CLIENT_CATCHUP_DAYS if catchup_days is None else int(catchup_days)
+    now_dt = _local_now(now)
+    cutoff = (now_dt.date() - timedelta(days=days)).isoformat()
+    try:
+        rows = store.expired_rows(cutoff) or []
+    except Exception as e:  # noqa: BLE001 - a read failure must never crash the run
+        print(f"[calendar-autopublish] expired-row sweep read failed: "
+              f"{type(e).__name__}: {e}")
+        return []
+    by_gym = {}
+    for row in rows:
+        by_gym.setdefault(str(row.get("gym_id") or "?"), []).append(row)
+    alerted = []
+    today = now_dt.date().isoformat()
+    for gym, gym_rows in sorted(by_gym.items()):
+        key = f"expired_rows_{gym}_{today}"
+        try:
+            if kv.get(key, ""):
+                continue                          # already said today
+        except Exception:  # noqa: BLE001
+            pass
+        oldest = min(str(r.get("post_date") or "") for r in gym_rows)
+        approved = sum(1 for r in gym_rows
+                       if str(r.get("status") or "").lower() == "approved")
+        alert(f"{gym}: {len(gym_rows)} calendar row(s) ({approved} already APPROVED) "
+              f"are past the {days}-day catch-up window and can never publish. Oldest "
+              f"{oldest}. They were never read, claimed or failed, so nothing else "
+              f"reports them. Re-date them to publish, or deny them to clear the book.")
+        try:
+            kv.set(key, "alerted")
+        except Exception:  # noqa: BLE001
+            pass
+        alerted.append(gym)
     return alerted
 
 

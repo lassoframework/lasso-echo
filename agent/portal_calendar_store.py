@@ -864,6 +864,28 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def expired_rows(self, before_date, statuses=("approved", "pending")):
+        """Rows whose post_date is BEFORE `before_date` and that are still waiting to
+        publish — i.e. already outside the catch-up window, so due_rows will never
+        return them again and they can never go out.
+
+        Read-only; feeds the expired-row ALERT sweep. This is the state that ate 11
+        approved LASSO posts and 26 GritX posts silently: nothing read, nothing
+        claimed, nothing logged, no reject_reason — they simply stopped existing as
+        far as the publisher was concerned."""
+        params = {
+            "post_date": f"lt.{before_date}",
+            "status": f"in.({','.join(statuses)})",
+            "published_at": "is.null",
+            "select": "id,gym_id,account,post_date,status",
+            "order": "post_date.asc",
+        }
+        r = self._client().get(
+            self._rest(_TABLE), params=params, headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
     def mark_published(self, row_id, media_id, published_at):
         """
         Record a successful publish: status='published', published_at=<now iso>,

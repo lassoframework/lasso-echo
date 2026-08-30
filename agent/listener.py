@@ -442,6 +442,15 @@ def _daily_scheduler(store):
                 # that died between the claim and the publish leaves a row stuck;
                 # this surfaces it to a human instead of silent forever-orphaning.
                 calendar_autopublish.sweep_stuck_publishing()
+                # EXPIRED-ROW watchdog (alert-only): approved/pending rows aged past
+                # the catch-up window can never publish and nothing else reports them
+                # (11 approved LASSO posts and 26 GritX rows died exactly this way).
+                # One digest line per gym per day; never publishes, reverts or denies.
+                try:
+                    calendar_autopublish.sweep_expired_rows()
+                except Exception as _ee:  # noqa: BLE001 - a watchdog never breaks the loop
+                    print(f"[listener] expired-row sweep skipped: "
+                          f"{type(_ee).__name__}: {_ee}")
                 # GBP lane (AGENT_GBP_PUBLISH, OFF by default): publish approved
                 # googlebusiness rows via Zernio and run the §7.2 reconcile poll. A
                 # no-op unless armed; the autonomous build keeps this OFF so nothing
