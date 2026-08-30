@@ -514,13 +514,21 @@ def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
             "nothing was drafted.")
         return []
 
-    voice = load_voice(account.voice_doc) if account.voice_doc else \
-        load_voice(voice_path or config.VOICE_DOC_PATH)
+    # DURABLE-FIRST voice resolution (Pierce, 2026-08-25): this path used to read ONLY
+    # the account's repo-relative voice_doc — which lives under /app and is WIPED on
+    # every deploy for an onboarded client gym, so an upload alerted "voice doc is
+    # missing" while the gym's real bible sat on the persistent volume. Resolve exactly
+    # like the month builder: <DATA>/brand_voice/<base>/lasso_voice.md first, repo path
+    # as the fallback (which keeps LASSO's committed bibles working untouched).
+    from .client_media_sync import _resolve_client_voice_path
+    voice = load_voice(_resolve_client_voice_path(
+        tenant_key, account.voice_doc or voice_path or config.VOICE_DOC_PATH))
     if voice is None:
         ops_alerts.alert(
             f"draft-on-upload: {account.key} uploaded media but its voice doc is "
-            "missing or empty. Nothing was drafted (no fabrication). Add the voice "
-            "doc, then re-file or wait for the daily draw.")
+            "missing or empty (looked at the durable brand_voice dir AND the repo "
+            "path). Nothing was drafted (no fabrication). Add the voice doc, then "
+            "re-file or wait for the daily draw.")
         return []
 
     from .library import Creative

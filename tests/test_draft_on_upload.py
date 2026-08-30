@@ -260,3 +260,27 @@ def test_ingest_pass_triggers_draft_on_upload(monkeypatch, tmp_path):
     assert stats["gymx"]["accepted"] == 1
     assert stats["gymx"]["drafted_on_upload"] == 1
     assert len(poster.cards) == 1                 # the card is in the queue now
+
+
+def test_voice_resolves_durable_first_like_the_month_builder(monkeypatch, tmp_path):
+    """Pierce 2026-08-25: this path read ONLY the account's repo-relative voice_doc
+    (wiped on deploy for onboarded gyms) and alerted 'voice doc missing' while the real
+    bible sat on the persistent volume. It must resolve DURABLE-FIRST
+    (<DATA>/brand_voice/<base>/lasso_voice.md), exactly like the month builder."""
+    _arm(monkeypatch)
+    from agent import config as _config
+    # durable bible EXISTS; the account's repo voice_doc points at a WIPED path
+    durable_dir = tmp_path / "brand_voice" / "gymx"
+    durable_dir.mkdir(parents=True)
+    (durable_dir / "lasso_voice.md").write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(_config, "client_voice_dir",
+                        lambda: str(tmp_path / "brand_voice"))
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda t: _acct(voice_doc="/app/brand_voice/gymx.md"))  # gone
+    poster = FakePoster()
+    store = PendingStore(path=str(tmp_path / "s.json"))
+    out = runner.draft_for_new_upload(
+        "gymx", [_asset(tmp_path, "a.jpg", "Members crushing the 6am class.")],
+        poster=poster, store=store)
+    assert len(out) == 1, "the durable bible must be found; no false voice-missing skip"
+    assert len(poster.cards) == 1
