@@ -39,6 +39,12 @@ SAMPLE_PREFIX = "SAMPLE: "
 
 # The pillar rotation a real month uses, so the sample shows the actual shape of the
 # product rather than a flat week of the same thing.
+#
+# EVERY ENTRY MUST BE DISTINCT, and there must be at least as many as the default day
+# count: insert_rows runs a never-verbatim-twice caption belt, so a repeated caption is
+# DROPPED at stage time. With a six-entry bank a fourteen-day sample landed six feed
+# days and fourteen story days (stories are exempt from that belt) — a lopsided
+# calendar that looked broken. Keep this list >= the default `days`.
 _SHAPE = (
     ("what your members are proud of",
      "A member win goes here, in your words, from what you tell us."),
@@ -52,9 +58,35 @@ _SHAPE = (
      "What keeps your community together goes here, in your voice."),
     ("the result someone got",
      "A real result goes here once you have shared it with us."),
+    ("the thing beginners worry about",
+     "The question new members ask you most goes here, answered your way."),
+    ("what a first visit is like",
+     "How someone's first session actually goes here, as you run it."),
+    ("the coach behind the programme",
+     "A coach introduction goes here, from what you tell us about them."),
+    ("a moment from the floor",
+     "Something that happened in your gym this week goes here."),
+    ("who this is really for",
+     "The people you built this gym for go here, described in your words."),
+    ("the habit that changes things",
+     "The one thing you tell members to focus on goes here."),
+    ("what people say after a month",
+     "A member's own words go here, once you have shared them with us."),
+    ("the invitation",
+     "Your real call to come in goes here, worded the way you say it."),
 )
 
-_STORY_LINE = "The paired story for this day goes here."
+# One per day, so a client does not scroll fourteen identical story cards. Stories are
+# exempt from the caption belt, but a repeated card still reads as broken.
+_STORY_LINES = (
+    "The paired story for this day goes here.",
+    "A behind the scenes moment goes here.",
+    "A quick word from a coach goes here.",
+    "A look at today's session goes here.",
+    "A member shout out goes here.",
+    "A reminder of what is on this week goes here.",
+    "Something from your floor goes here.",
+)
 
 
 def enabled():
@@ -111,7 +143,8 @@ def build_rows(base_key, *, days=14, start=None, account="instagram",
             "post_date": day,
             "pillar": SAMPLE_PILLAR,
             "format": "story",
-            "caption": f"{SAMPLE_PREFIX}{_STORY_LINE}",
+            "caption": (f"{SAMPLE_PREFIX}"
+                        f"{_STORY_LINES[i % len(_STORY_LINES)]}"),
             "image_url": img,
             "status": "draft",
         })

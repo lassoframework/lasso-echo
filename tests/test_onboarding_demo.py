@@ -77,6 +77,21 @@ def test_sample_month_shows_cadence_pillars_and_a_story_per_day():
     assert len(set(feeds)) == len(feeds)
 
 
+def test_every_feed_caption_is_distinct_across_the_DEFAULT_span():
+    """LIVE BUG: the caption bank had 6 entries, so a 14-day sample repeated captions
+    from day 7 — and insert_rows' never-verbatim-twice belt DROPPED those feeds while
+    stories (exempt from that belt) all landed. The result was 6 feed days beside 14
+    story days: a lopsided calendar that looked broken. An earlier version of the test
+    above used days=3, under the wrap point, so it never saw this."""
+    rows = od.build_rows("hillcountry", days=14, start=date(2026, 9, 1))
+    feeds = [r["caption"] for r in rows if r["format"] == "feed"
+             and r["account"] == "instagram"]
+    assert len(feeds) == 14
+    assert len(set(feeds)) == 14, "a repeated feed caption will be dropped at stage time"
+    # and the day count a caller can ask for is covered by the bank
+    assert len(od._SHAPE) >= 14
+
+
 def test_every_sample_row_is_marked_twice_and_carries_no_image():
     """Marked by BOTH pillar and caption prefix so a caption edit cannot un-mark a row
     the publisher must skip. No image by design: a sample is not the gym's content, and
