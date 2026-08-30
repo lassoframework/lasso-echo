@@ -263,3 +263,45 @@ def test_render_event_story_honest_stub_on_renderer_exception():
         raise RuntimeError("renderer blew up")
 
     assert ge.render_event_story(ev, renderer=_boom) is None
+
+
+# ---- markdown scaffold must never reach a published caption -----------------------
+def test_strip_scaffold_removes_markers_but_keeps_every_word():
+    """LIVE BUG (Zanshin, 2026-08-30): an event brief pasted as markdown put a literal
+    '# BRING A FRIEND WEEK' / '## October 3, 10 at CrossFit Zanshin' into the caption
+    BODY of four already-approved posts. Markers go, words stay."""
+    from agent.gym_event import strip_scaffold
+    out = strip_scaffold("# BRING A FRIEND WEEK\n\n## October 3, 10 at CrossFit Zanshin"
+                         "\n\nWho keeps telling you to come?")
+    assert "#" not in out
+    assert "BRING A FRIEND WEEK" in out          # no client words lost
+    assert "October 3, 10" in out                # the dated fact survives for fact_ok
+    assert "Who keeps telling you to come?" in out
+
+
+def test_strip_scaffold_leaves_hashtags_alone():
+    """'#GetFit' is a hashtag, not a markdown header (no space after the #)."""
+    from agent.gym_event import strip_scaffold
+    assert strip_scaffold("Train with us #GetFit") == "Train with us #GetFit"
+
+
+def test_strip_scaffold_handles_bullets_rules_and_bold():
+    from agent.gym_event import strip_scaffold
+    out = strip_scaffold("- bring a friend\n- save 40%\n---\n**Free week**")
+    assert out == "bring a friend\nsave 40%\nFree week"
+    assert strip_scaffold("") == "" and strip_scaffold(None) == ""
+
+
+def test_event_caption_body_carries_no_markdown(monkeypatch):
+    """End to end: a scaffolded brief must not produce a scaffolded caption."""
+    from agent import gym_event as ge
+    ev = ge.GymEvent(
+        id="evt_test", gym_id="zanshinfitness630e22", name="Bring a Friend Week",
+        type="bring_a_friend", starts_on="2026-10-03", ends_on="2026-10-10",
+        tz="America/Toronto",
+        brief="# BRING A FRIEND WEEK\n\n## October 3, 10\n\nBring someone who needs it.",
+        offer_text="Train free for the week.", link="")
+    cap = ge.draft_copy(ge.ANNOUNCE, ev)
+    for line in cap.splitlines():
+        assert not line.lstrip().startswith("# "), f"markdown header leaked: {line!r}"
+        assert not line.lstrip().startswith("## "), f"markdown header leaked: {line!r}"

@@ -439,14 +439,43 @@ _DURING_OPENERS = (
 )
 
 
+def strip_scaffold(text):
+    """Drop MARKDOWN SCAFFOLD from copy that is about to become a caption body, while
+    keeping every word.
+
+    An event brief is free text a human pastes in, and people paste formatted specs:
+    Zanshin's live arc carried a literal "# BRING A FRIEND WEEK" / "## October 3, 10
+    at CrossFit Zanshin" into the published caption body, because the brief went
+    straight through. Markers only are removed, never words — so no client fact is
+    lost and fact_ok still sees every token it needs.
+
+    A '#hashtag' is NOT a header (no space after the #) and is left untouched."""
+    if not text:
+        return ""
+    out = []
+    for raw in str(text).splitlines():
+        ln = raw.strip()
+        if _re.fullmatch(r"[-*_=]{3,}", ln):      # horizontal rule: pure scaffold
+            continue
+        ln = _re.sub(r"^#{1,6}\s+", "", ln)        # '## Heading' -> 'Heading'
+        ln = _re.sub(r"^\s*[-*+]\s+", "", ln)      # '- bullet'   -> 'bullet'
+        ln = _re.sub(r"^\s*>\s*", "", ln)          # blockquote marker
+        ln = _re.sub(r"\*\*(.+?)\*\*", r"\1", ln)  # **bold**
+        ln = _re.sub(r"__(.+?)__", r"\1", ln)      # __bold__
+        ln = _re.sub(r"`{1,3}", "", ln)            # code ticks
+        if ln:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
 def _body_for(kind, event: GymEvent, variant=0):
     """The grounded body lines for one arc kind, drawn ONLY from the event record
     (name, dates, offer_text, brief, link). No invented price/deadline/perk: every
     concrete claim is a token already in the record. `variant` distinguishes repeated
     DURING posts so they never share a caption. Returns a list of lines."""
     dates = _pretty_dates(event)
-    offer = _sentence(event.offer_text)
-    brief = (event.brief or "").strip()
+    offer = _sentence(strip_scaffold(event.offer_text))
+    brief = strip_scaffold(event.brief)
     lines = []
     if kind == ANNOUNCE:
         lines.append(f"Mark it: {dates}.")
