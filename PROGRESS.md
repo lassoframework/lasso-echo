@@ -6,7 +6,63 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-28
+Last updated: 2026-08-30
+
+---
+
+## Gym-drive lane: stories + 2x cadence (2026-08-30, commit 6140b5c, SHIPPED + VERIFIED LIVE)
+
+Dale/ENG support ticket: "I turned on two times a day last week and now never have a
+story and only one post a day goes out." Both symptoms, ONE root cause.
+
+- [x] ROOT CAUSE: `append_gym_drive_drafts` (added 8/28, 80fe3aa) appended a bare
+      `_mark_feed` draft and hard-coded `for i in range(days)`. It never called
+      `_finish_feed_with_story` (no stories) and never read `slots_per_day` or stamped
+      `cadence_slot_index` (1 post/day, slot_index NULL). ENG's uploaded library was
+      exhausted, so the primary loop emitted nothing and the Drive lane filled all 29
+      days alone. Evidence: whole forward book (58 rows, 0 stories) written in ONE burst
+      at 8/29 13:00 UTC, pillars in the `_GYM_DRIVE_PILLARS` faces/community/results cycle.
+- [x] Drive feeds route through `_finish_feed_with_story` and honor slots_per_day.
+- [x] `_localize_creative(story, feed, path, log)`: a Drive draft carries the asset TITLE,
+      not a local file, so the burn failed and the captionless guard silently dropped every
+      Drive story. Now downloads the hosted media and burns from that. Reads the STORY url
+      (pre-autofit), never the feed's SQUARE autofit card. Same fix for source_media_url,
+      which made edited-caption re-burns come back feed-cropped. Both flags are armed live.
+- [x] 2x uniqueness: slot-offset source rotation + a hard drop-on-repeat guard that returns
+      the photo to the pool. One-approved-source gyms degrade to 1/day, never a duplicate.
+- [x] CADENCE FLEET-WIDE: `gym_posts_per_day`/`set_gym_posts_per_day` matched gyms.slug
+      against the worker's BASE key, so piercefitness/topfuel/district_h/lasso read None
+      (built 1x) and got a 503 saving a cadence. Now via `resolve_gym_uuid`. Verified live:
+      all 7 gyms resolve.
+- [x] `resolve_posts_per_day` reads the SHARED PLANE FIRST (was local kv first, which let a
+      stale local "1" pin a gym at 1x permanently with no way to clear it).
+- [x] USE LEDGER: `gym_media_use:{base}:{date}` held ONE record, so a 2x day's PM stamp
+      clobbered the AM one and that photo could never return to the pool. Now a LIST per
+      date (legacy dicts still read). Also repairs story_studio's multi-segment stamps.
+      `on_draft_denied` rolls back the exact asset ON ITS OWN DATE, never cross-date (a
+      cross-date rollback re-pools a photo currently LIVE on the feed).
+- [x] Triage timeout 4 -> 10 min (scout-listener aa6d83a). Partial-output salvage was built,
+      MEASURED as always-empty in text mode, and deleted rather than shipped as decoration.
+
+DELIBERATE DESCOPES (need Blake's ruling, NOT settled):
+  1. Locked days never gain a PM slot at 2x — the skip sits outside the slot loop. Cannot
+     be "just fixed": locked_days includes DENIED days, so a naive change would add posts
+     to days a client rejected. This is why Pierce only reached 2 of 30 days.
+  2. `_slot_key` deliberately NOT slot-aware (would let a 2x->1x rebuild insert beside an
+     approved row on the real_month_planner / real_calendar_mirror lanes).
+  3. `gym_autonomy`/`set_gym_autonomy` still carry the SAME base!=slug bug, left unfixed on
+     purpose: fixing it flips LASSO from "reads not-autonomous" to autonomous, an
+     auto-publish gate change.
+  4. LASSO + Pierce sit at posts_per_day=2 and now actually resolve to 2.
+
+VERIFIED LIVE (ENG): 56 stories (was 0), 168 rows with slot ordinals split 84/84, 30 days,
+0 duplicate captions, 0 same-day reused photos, 0 missing images, 0 em dashes, 168 pending
+(approval gate intact), 3 approved + 1 published preserved.
+Pierce: mechanism proven (12 rows, 2 clean 2x days with paired video stories); reach limited
+to 9/27+ by 28 locked days and an exhausted library (51 media vs 52 feeds).
+
+Three independent audit rounds (round 1 and 2 returned DO-NOT-SHIP; both blocking sets
+fixed). Suite green on main: 4133 passed, 11 skipped. scout-listener 395 passed.
 
 ---
 
