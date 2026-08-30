@@ -55,6 +55,42 @@ def test_digest_fires_when_non_empty(monkeypatch):
 def test_resolve_marks_resolved_and_returns_lane(monkeypatch):
     _no_supabase(monkeypatch)
     q.enqueue("westside", "amb_r", reasons=["borderline"])
-    lane = q.resolve("westside", "amb_r", "raw", resolved_by="coach1")
+    lane, err = q.resolve("westside", "amb_r", "raw", resolved_by="coach1")
     assert lane == "raw"
+    # The kv record existed here, so the tap IS recorded even with no shared plane.
+    assert err is None
     assert q.pending("westside") == []  # no longer pending
+
+
+def test_resolve_reports_an_error_when_nothing_was_recorded(monkeypatch):
+    """The portal process has its own SQLite, so from there the kv branch is always a
+    miss and the SHARED write is the only one that counts. A tap that recorded nothing
+    must NOT come back as success — the coach would move on and the same file would
+    reappear unsorted on the next sync."""
+    _no_supabase(monkeypatch)          # no shared plane AND no local record
+    lane, err = q.resolve("westside", "never_queued", "raw", resolved_by="coach1")
+    assert lane == "raw"
+    assert err, "a tap that recorded nothing must report an error"
+
+
+def test_pending_prefers_the_shared_plane(monkeypatch):
+    """The rows are enqueued by the WORKER; a kv-only read from the portal always
+    returned [] and the gym's Sort these tab was permanently empty."""
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key")
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return [{"gym_id": "westside", "asset_id": "from_worker",
+                     "status": "pending", "enqueued_at": "2026-08-30T00:00:00Z",
+                     "reasons": '["borderline"]'}]
+
+    class _Http:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _Resp()
+
+    rows = q.pending("westside", http=_Http())
+    assert [r["asset_id"] for r in rows] == ["from_worker"]
+    assert rows[0]["reasons"] == ["borderline"], "the jsonb blob is decoded"

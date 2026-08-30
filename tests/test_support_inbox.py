@@ -184,3 +184,47 @@ def test_neither_token_is_logged(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "xoxb-scout-support" not in out
     assert "xoxb-default-echo" not in out
+
+
+# ---- an UNDELIVERED support message must never just evaporate -------------------
+def test_slack_failure_escalates_the_message_to_ops(monkeypatch):
+    """A gym's support message is the one thing we cannot afford to drop. When the
+    support channel post fails, the words must still reach a human."""
+    seen = []
+    monkeypatch.setattr("agent.ops_alerts.alert",
+                        lambda msg, poster=None, force=False: seen.append(msg))
+    out = support_inbox.submit_support_message(
+        "gritx_ig", "my instagram is not posting", poster=ExplodingPoster())
+    assert out["ok"] is False and out["reason"] == "slack_failed"
+    assert len(seen) == 1
+    assert "UNDELIVERED" in seen[0]
+    assert "my instagram is not posting" in seen[0], "the client's words must survive"
+    assert "Gritx Strength" in seen[0]
+
+
+def test_no_channel_configured_still_escalates(monkeypatch):
+    """The likeliest silent-drop mode in production: the support channel is unset, so
+    the client retries forever and nobody at LASSO ever learns they tried."""
+    monkeypatch.delenv("AGENT_SUPPORT_CHANNEL_ID", raising=False)
+    seen = []
+    monkeypatch.setattr("agent.ops_alerts.alert",
+                        lambda msg, poster=None, force=False: seen.append(msg))
+    out = support_inbox.submit_support_message("gritx_ig", "help please")
+    assert out["reason"] == "no_channel"
+    assert len(seen) == 1 and "help please" in seen[0]
+
+
+def test_failed_sends_do_not_burn_the_rate_limit(monkeypatch):
+    """Five Slack failures used to eat the whole per-minute budget, turning an outage
+    into a lockout on the one surface a stuck client uses to reach us."""
+    monkeypatch.setattr("agent.ops_alerts.alert",
+                        lambda msg, poster=None, force=False: None)
+    for _ in range(support_inbox.SUPPORT_RATE_PER_MINUTE):
+        out = support_inbox.submit_support_message("gritx_ig", "x",
+                                                   poster=ExplodingPoster())
+        assert out["reason"] == "slack_failed"
+    # Slack recovers: the gym must still be able to get through.
+    good = RecordingPoster(ok=True)
+    out = support_inbox.submit_support_message("gritx_ig", "now it works", poster=good)
+    assert out["ok"] is True, "a recovered Slack must not be blocked by earlier failures"
+    assert len(good.calls) == 1

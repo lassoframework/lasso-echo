@@ -88,9 +88,50 @@ def _sb_enqueue(row, http=None):
 
 
 # ---- read (for the digest + the portal) -------------------------------------
-def pending(gym_id=None):
-    """Every pending sort-queue row (optionally filtered to one gym), from the kv
-    mirror (always present). Ordered by enqueued_at."""
+def _sb_pending(gym_id=None, http=None):
+    """Pending sort-queue rows from the SHARED plane, or None when it is unavailable.
+    None (not []) means "could not read", so the caller can tell an empty queue apart
+    from an unreadable one."""
+    url, key = _supabase_conf()
+    if not url or not key:
+        return None
+    if http is None:
+        import requests  # lazy
+        http = requests
+    params = {"status": f"eq.{STATUS_PENDING}", "order": "enqueued_at.asc"}
+    if gym_id is not None:
+        params["gym_id"] = f"eq.{gym_id}"
+    try:
+        r = http.get(f"{url.rstrip('/')}/rest/v1/{_TABLE}", params=params,
+                     headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                     timeout=30)
+        if r.status_code >= 400:
+            print(f"[story-sort-queue] supabase read failed {r.status_code}")
+            return None
+        rows = r.json() or []
+    except Exception as e:  # noqa: BLE001
+        print(f"[story-sort-queue] supabase read failed: {type(e).__name__}: {e}")
+        return None
+    for rec in rows:
+        if isinstance(rec.get("reasons"), str):
+            try:
+                rec["reasons"] = json.loads(rec["reasons"])
+            except Exception:  # noqa: BLE001 - a bad blob is not worth dropping the row
+                rec["reasons"] = []
+    return rows
+
+
+def pending(gym_id=None, *, http=None):
+    """Every pending sort-queue row (optionally filtered to one gym), ordered by
+    enqueued_at.
+
+    Reads the SHARED plane first. The kv mirror is per-SERVICE SQLite: the rows are
+    enqueued by the WORKER during media sync, so a kv-only read from the portal
+    process always returned an empty list and the gym's "Sort these" tab was
+    permanently empty while the coach digest said there were files waiting."""
+    sb = _sb_pending(gym_id, http=http)
+    if sb is not None:
+        return sb
     from . import db
     rows = []
     try:
@@ -118,7 +159,12 @@ def resolve(gym_id, asset_id, lane, *, resolved_by="", http=None):
     """A coach tapped Raw / Finished / Skip on a queued asset. Marks the kv + Supabase
     row resolved and returns the declared lane the caller feeds back to the classifier
     on the next sync (so the SAME bytes are then a declared lane, not a re-guess).
-    lane in {'raw','finished','skip'}. Idempotent."""
+    lane in {'raw','finished','skip'}. Idempotent.
+
+    Returns (lane, error_or_None). The error is what stops the portal answering
+    "saved" to a tap that recorded nothing: the kv mirror is per-service, so from the
+    portal process the local branch is always a miss and the SHARED write is the only
+    one that counts."""
     from . import db
     key = _KV_PREFIX + str(gym_id) + ":" + str(asset_id)
     try:
@@ -131,8 +177,10 @@ def resolve(gym_id, asset_id, lane, *, resolved_by="", http=None):
         rec["resolved_by"] = resolved_by
         rec["resolved_at"] = _now_iso()
         db.kv_set(key, json.dumps(rec))
-    _sb_resolve(gym_id, asset_id, lane, resolved_by, http=http)
-    return lane
+    shared_ok = _sb_resolve(gym_id, asset_id, lane, resolved_by, http=http)
+    if not shared_ok and not rec:
+        return lane, "the sort queue could not be updated"
+    return lane, None
 
 
 def _sb_resolve(gym_id, asset_id, lane, resolved_by, http=None):

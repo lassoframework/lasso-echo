@@ -140,7 +140,11 @@ def handle_resolve_sort_item(account_key, asset_id, lane, actor_id=""):
         return 400, {"ok": False, "error": "lane must be raw | finished | skip"}
     from . import story_sort_queue as _q
     try:
-        out = _q.resolve(_base(account_key), asset_id, lane, resolved_by=actor_id)
+        out, err = _q.resolve(_base(account_key), asset_id, lane, resolved_by=actor_id)
     except Exception as e:  # noqa: BLE001
         return 502, {"ok": False, "error": f"resolve failed ({type(e).__name__})"}
+    if err:
+        # Never answer "saved" to a tap that recorded nothing: the coach would move on
+        # and the same file would come back unsorted on the next sync.
+        return 502, {"ok": False, "lane": out, "error": err}
     return 200, {"ok": True, "lane": out}

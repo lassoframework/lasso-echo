@@ -64,6 +64,34 @@ def _allow(account_key: str, now=None) -> bool:
     return True
 
 
+def _refund(account_key: str) -> None:
+    """Give back the rate-limit hit a FAILED send consumed. Without this, five
+    consecutive Slack failures ate the gym's whole per-minute budget and the sixth
+    attempt was refused as 'rate_limited' — so an outage silently turned into a
+    lockout on the one surface a stuck client uses to reach us."""
+    key = _acct_hash_prefix(account_key)
+    window = _support_hits.get(key) or []
+    if window:
+        _support_hits[key] = window[:-1]
+
+
+def _escalate_undelivered(account_key, display_name, text_in, reason):
+    """A support message we could not deliver must NOT evaporate. Re-post it to the
+    OPS channel (a different channel from the support one, so the single most likely
+    failure — SUPPORT_CHANNEL_ID unset or the bot not in that channel — is covered)
+    and make the failure visible. Best effort; never raises."""
+    try:
+        ops_alerts.alert(
+            f"SUPPORT MESSAGE UNDELIVERED ({reason}) from {display_name} "
+            f"({account_key}). The gym could not reach #echosupport, so their words "
+            f"are here instead. Reply to them directly:\n{text_in}",
+            force=True)
+        return True
+    except Exception as e:  # noqa: BLE001 - the request must still return honestly
+        print(f"[support-inbox] escalation also failed: {type(e).__name__}: {e}")
+        return False
+
+
 def resolve_gym_identity(account_key: str):
     """
     (display_name, owner) for a gym, resolved from what we actually know — never
@@ -179,7 +207,12 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
 
     channel = config.support_channel_id()
     if not channel:
-        # INERT: no channel configured -> never touch Slack.
+        # No support channel configured. This used to drop the gym's message on the
+        # floor with nobody told — the most likely silent-drop mode in production,
+        # because the client just sees "try again" and retries forever. Escalate to
+        # ops so a human still gets the words.
+        display_name, _owner = resolve_gym_identity(account_key)
+        _escalate_undelivered(account_key, display_name, text_in, "no support channel configured")
         return {"ok": False, "delivered": False, "reason": "no_channel"}
 
     if not _allow(account_key):
@@ -199,6 +232,9 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
         resp = poster._chat_post(text=text, blocks=None, channel=channel)
     except Exception as e:  # noqa: BLE001 - a Slack failure must never crash the request
         print(f"[support-inbox] post failed: {type(e).__name__}")
+        _refund(account_key)
+        _escalate_undelivered(account_key, display_name, text_in,
+                              f"slack transport failed ({type(e).__name__})")
         return {"ok": False, "delivered": False, "reason": "slack_failed"}
 
     if not isinstance(resp, dict) or not resp.get("ok"):
@@ -206,6 +242,9 @@ def submit_support_message(account_key, message, *, poster=None, store=None):
         # the poster; surface {ok:false} without leaking the response.
         print("[support-inbox] Slack did not confirm the support post "
               f"(gym={account_key})")
+        _refund(account_key)
+        _escalate_undelivered(account_key, display_name, text_in,
+                              "slack did not confirm the post")
         return {"ok": False, "delivered": False, "reason": "slack_failed"}
 
     return {"ok": True, "delivered": True, "reason": ""}
