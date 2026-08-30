@@ -185,7 +185,11 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     draft = Draft(
         draft_id=f"story_{request_id}",
         account_key=request.get("account_key") or gym_id,
-        platform=request.get("platform") or gym_id,
+        # A rendered Story is an INSTAGRAM story. This used to fall back to gym_id,
+        # which lands in content_calendar.account as a gym base key ('pierce') —
+        # calendar_autopublish._account_for only accepts 'instagram'/'facebook' and
+        # SKIPS anything else, so such a row could never publish.
+        platform=request.get("platform") or "instagram",
         caption="",                          # stories carry no caption body
         hashtags=[],
         creative_path=result.output_path,
@@ -279,6 +283,14 @@ def _stage_calendar_row(gym_id, draft, *, cal_store=None):
         row = {k: v for k, v in _real_row(gym_id, draft).items() if k != "id"}
     except Exception as exc:  # noqa: BLE001
         return None, f"row build failed ({type(exc).__name__})"
+    # The publisher routes on `account` and SKIPS anything that is not a real
+    # platform, so a row with a gym key there would sit pending forever. Refuse to
+    # stage one rather than create a card that can never go out.
+    acct = str(row.get("account") or "").strip().lower()
+    if acct not in ("instagram", "facebook"):
+        return None, f"the story has no valid publish target (account={acct!r})"
+    if not str(row.get("image_url") or "").strip():
+        return None, "the rendered story has no hosted media"
     try:
         if cal_store is None:
             from . import config  # noqa: PLC0415

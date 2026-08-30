@@ -280,3 +280,36 @@ def test_unconfigured_calendar_store_holds(monkeypatch, tmp_path):
         render_fn=_fake_render, output_dir=str(tmp_path))
     assert res["status"] == "held"
     assert not _STAGED_ROWS
+
+
+def test_staged_story_row_targets_instagram_not_the_gym_key(monkeypatch, tmp_path):
+    """content_calendar.account must be a real PLATFORM. It defaulted to gym_id, and
+    calendar_autopublish._account_for skips anything that is not instagram/facebook —
+    so the row would have sat pending forever, unpublishable and unexplained."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    assert res["status"] == "staged"
+    _gym, row = _STAGED_ROWS[0]
+    assert row["account"] == "instagram", f"unpublishable account: {row['account']!r}"
+    # The publisher routes on this column and skips anything that is not a platform.
+    from agent import calendar_autopublish as cap
+    assert cap._account_for(row, gym_id="eng") is not None, \
+        "the publisher cannot route this row"
+
+
+def test_story_row_with_no_publish_target_is_refused(monkeypatch):
+    """The guard itself: a row whose account is not a platform must never be staged."""
+    from agent.drafter import Draft, DraftStatus
+    bad = Draft(draft_id="story_x", account_key="pierce", platform="pierce",
+                caption="", hashtags=[], creative_path="/tmp/x.mp4",
+                creative_public_url="https://cdn/x.mp4", scheduled_for="",
+                status=DraftStatus.PENDING, is_story=True, day_key="2026-09-05",
+                draft_type="story_studio", category="hype_montage")
+    row_id, err = ss._stage_calendar_row("pierce", bad, cal_store=_FakeCalStore())
+    assert row_id is None and "publish target" in err
