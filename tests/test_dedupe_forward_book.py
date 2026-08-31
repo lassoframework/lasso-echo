@@ -420,3 +420,25 @@ def test_pending_row_matching_a_published_caption_is_denied():
     out = dedupe_gym("lasso", store, "2026-08-31", dry_run=False)
     assert out["duplicates_found"] == 1
     assert [d[0] for d in store.denied] == ["p1"]     # story + fresh caption untouched
+
+
+def test_lasso_dedupes_its_own_approved_rows_clients_never():
+    """LASSO is autonomous: its 'approved' is machine-made, so later-date approved dups
+    are wipeable for lasso ONLY. A client gym's approved rows are the gym's word and
+    stay untouchable."""
+    from agent.jobs.dedupe_forward_book import dedupe_gym
+    pending = [_row("p1", "2026-09-01", "One platform every lead")]
+    approved_dup = dict(_row("a1", "2026-09-16", "One platform every lead"),
+                        status="approved")
+    window = pending + [approved_dup]
+
+    class _S(_XStore):
+        def list_pending_future(self, gym_id, today_iso):
+            return [dict(r) for r in pending]
+    store = _S(pending, window)
+    out = dedupe_gym("lasso", store, "2026-08-31", dry_run=False)
+    assert [d[0] for d in store.denied] == ["a1"]        # lasso approved dup denied
+    # a client gym: identical shape, approved row untouched
+    store2 = _S(pending, window)
+    out2 = dedupe_gym("gritx", store2, "2026-08-31", dry_run=False)
+    assert store2.denied == []

@@ -140,6 +140,24 @@ def dedupe_gym(
     rows = store.list_pending_future(gym_id, today_iso)
     result["total_pending"] = len(rows)
 
+    # LASSO'S OWN ACCOUNT ALSO DEDUPES APPROVED ROWS (2026-08-31): lasso is
+    # autonomous, so its 'approved' is the machine's own auto-approve — not a gym
+    # owner's decision — and its remaining cross-date dups all sat on approved rows
+    # the pending-only read never saw. A CLIENT gym's approved rows stay untouchable
+    # (the gym's word is the one human gate). The refill lane re-fills any day this
+    # opens up.
+    if gym_id == "lasso":
+        try:
+            from datetime import date, timedelta
+            f_end = (date.fromisoformat(today_iso) + timedelta(days=60)).isoformat()
+            window_rows = store.rows_in_range(gym_id, today_iso, f_end) or []
+            seen_ids = {str(r.get("id")) for r in rows}
+            rows = rows + [r for r in window_rows
+                           if str(r.get("status") or "").lower() == "approved"
+                           and str(r.get("id")) not in seen_ids]
+        except Exception as exc:  # noqa: BLE001 - additive read, never blocks
+            print(f"[dedupe] lasso approved-read skipped: {type(exc).__name__}")
+
     _keepers, duplicates = find_duplicates(rows)
 
     # ALREADY-PUBLISHED CAPTIONS (2026-08-31): a pending row whose caption ALREADY went
@@ -166,8 +184,9 @@ def dedupe_gym(
                 cap = (r.get("caption") or "").strip()
                 if not cap or str(r.get("format") or "").strip().lower() == "story":
                     continue
-                if str(r.get("status") or "").lower() not in ("pending",):
-                    continue                    # only unapproved rows are wipeable here
+                wipeable = ("pending", "approved") if gym_id == "lasso" else ("pending",)
+                if str(r.get("status") or "").lower() not in wipeable:
+                    continue        # a CLIENT gym's approved rows are the gym's word
                 if caption_hash(cap) in published_hashes \
                         and str(r.get("id")) not in dup_ids:
                     duplicates.append(r)
