@@ -160,3 +160,19 @@ def test_an_unreadable_registry_never_reports_every_gym_unregistered():
     seen = []
     assert ow.run(deps=deps, alert=seen.append, kv=_KV()) == {}
     assert seen == []
+
+
+# ---- LASSO is not a client gym and must never be audited as one -----------------
+def test_lasso_and_staff_accounts_are_never_flagged():
+    """LASSO is excluded from client_gym_bases BY DESIGN (its own lane) and grounds its
+    copy in brand_voice rather than client_sources, so auditing it reported
+    not_registered + no_sources every single day. Caught on the first live sweep."""
+    deps = _deps(roster=[("g1", "lasso"), ("g2", "blake_personal")],
+                 intake={}, bases=[])
+    seen = []
+    assert ow.run(deps=deps, alert=seen.append, kv=_KV()) == {}
+    assert seen == []
+    assert ow.is_client_gym("lasso") is False
+    assert ow.is_client_gym("lasso_demo") is False
+    assert ow.is_client_gym("blake_personal") is False
+    assert ow.is_client_gym("eng") is True

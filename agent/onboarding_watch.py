@@ -69,8 +69,22 @@ _FIX = {
 }
 
 
+# Bases that are NOT client gyms and must never be audited as one. LASSO is excluded
+# from client_gym_bases BY DESIGN (it has its own lane) and grounds its copy in
+# brand_voice rather than client_sources, so auditing it reports not_registered +
+# no_sources every single day forever. blake_personal is a staff account.
+_NOT_CLIENTS = ("lasso", "blake_personal")
+
+
 def enabled():
     return config.onboarding_watch_enabled()
+
+
+def is_client_gym(base_key):
+    """False for LASSO and staff accounts, which are legitimately absent from the
+    client registry and legitimately have no client_sources."""
+    k = str(base_key or "").strip().lower()
+    return bool(k) and k not in _NOT_CLIENTS and not k.startswith("lasso")
 
 
 def portal_keys(http=None):
@@ -168,6 +182,8 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
         return {}
     out = {}
     for gym_id, base_key in roster:
+        if not is_client_gym(base_key):
+            continue
         try:
             issues = check_gym(base_key, gym_id, intake.get(gym_id, ""),
                                bases=bases, deps=d)
