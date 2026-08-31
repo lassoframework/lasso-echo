@@ -62,8 +62,13 @@ def _arm_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_fully_configured_account_is_ready(monkeypatch, tmp_path):
+    """A client gym publishes through Zernio, not Meta-direct (calendar_autopublish's
+    ONE choke point routes every non-lasso row through zernio_publish), so readiness
+    hinges on a connected Zernio profile, not the legacy Meta env vars."""
     _arm_env(monkeypatch)
-    report = check_account(_client(tmp_path))
+    report = check_account(_client(tmp_path),
+                           zernio_profile_resolver=lambda k: "p1",
+                           zernio_page_resolver=lambda k: "pg1")
     assert report["verdict"] == "READY", report["blocking"]
     assert report["blocking"] == []
 
@@ -75,12 +80,34 @@ def test_missing_slack_channel_is_not_ready(monkeypatch, tmp_path):
     assert "slack_channel" in report["blocking"]
 
 
-def test_missing_token_is_not_ready(monkeypatch, tmp_path):
+def test_a_lasso_account_off_zernio_still_checks_meta_token(monkeypatch, tmp_path):
+    """The ONE case that stays Meta-direct: a lasso account with
+    AGENT_LASSO_VIA_ZERNIO off (the default). Missing token blocks it exactly as
+    before this fix."""
+    monkeypatch.delenv("AGENT_LASSO_VIA_ZERNIO", raising=False)
     monkeypatch.delenv("TOK_GYM_ALPHA", raising=False)
     monkeypatch.setenv("TGT_GYM_ALPHA", "12345")
-    report = check_account(_client(tmp_path))
+    report = check_account(_client(tmp_path, key="lasso_ig"))
     assert report["verdict"] == "NOT READY"
     assert "meta_token" in report["blocking"]
+
+
+def test_a_client_gym_with_no_zernio_profile_is_not_ready(monkeypatch, tmp_path):
+    """Pete/Zanshin, 2026-08-31 ('we are using zernio not meta'): a client gym's
+    readiness must be judged on the lane it actually publishes through."""
+    _arm_env(monkeypatch)
+    report = check_account(_client(tmp_path), zernio_profile_resolver=lambda k: None)
+    assert report["verdict"] == "NOT READY"
+    assert "zernio_profile" in report["blocking"]
+    assert "meta_token" not in [c["name"] for c in report["checks"]],         "a client gym must never be judged on Meta creds it never reads"
+
+
+def test_facebook_connected_with_no_page_selected_is_not_ready(monkeypatch, tmp_path):
+    _arm_env(monkeypatch)
+    report = check_account(
+        _client(tmp_path, platform=Platform.FACEBOOK_PAGE),
+        zernio_profile_resolver=lambda k: "p1", zernio_page_resolver=lambda k: None)
+    assert "zernio_fb_page" in report["blocking"]
 
 
 def test_thin_library_fails_under_minimum(monkeypatch, tmp_path):
@@ -145,9 +172,10 @@ def test_cli_exits_nonzero_on_fail(monkeypatch, tmp_path, capsys):
 
 def test_cli_exits_zero_on_ready(monkeypatch, tmp_path, capsys):
     import agent.__main__ as mm
-    from agent import accounts as _accounts
+    from agent import accounts as _accounts, zernio_publisher as _zp
     _arm_env(monkeypatch)
     monkeypatch.setattr(_accounts, "ACCOUNTS", [_client(tmp_path)])
+    monkeypatch.setattr(_zp, "_default_profile_resolver", lambda k: "p1")
     with pytest.raises(SystemExit) as e:
         mm.main(["preflight", "--account", "gym_alpha_ig"])
     assert e.value.code == 0

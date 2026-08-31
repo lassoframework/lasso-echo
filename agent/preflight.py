@@ -43,10 +43,15 @@ def _count_library(path):
                if os.path.splitext(n)[1].lower() in _MEDIA_EXTS)
 
 
-def check_account(account, live=False, poster=None, http=None):
+def check_account(account, live=False, poster=None, http=None,
+                  zernio_profile_resolver=None, zernio_page_resolver=None):
     """Run every check for one account. Returns
     {"account", "checks": [{"name", "status", "detail"}], "verdict",
-     "blocking": [names]}. Never raises; a check that errors is a FAIL."""
+     "blocking": [names]}. Never raises; a check that errors is a FAIL.
+
+    zernio_profile_resolver / zernio_page_resolver: injectable, default the live
+    zernio_publisher resolvers. For a Zernio-routed account (every client gym) so
+    tests can exercise the connected/not-connected states offline."""
     checks = []
 
     def add(name, status, detail):
@@ -88,38 +93,77 @@ def check_account(account, live=False, poster=None, http=None):
         add("approvers", WARN,
             "no per-account approvers: only the global approver can act")
 
-    # 3. Meta token presence (+ expiry when --live, via the watchdog's check)
-    token = account.get_token()
-    if not token:
-        add("meta_token", FAIL,
-            f"token env {account.token_env} is unset or empty")
-    elif live:
-        try:
-            import time as _time
-            from .token_watchdog import _check_one, _requests
-            r = _check_one(http or _requests(), account, _time.time(),
-                           config.token_warn_days(), None)
-            status = r.get("status")
-            days = r.get("days_remaining")
-            if status in ("ok", "never_expires"):
-                add("meta_token", PASS,
-                    "valid" + (f", {days} day(s) remaining" if days is not None
-                               else ", never expires"))
-            elif status == "expiring":
-                add("meta_token", WARN, f"expiring in {days} day(s)")
-            else:
-                add("meta_token", FAIL, f"debug_token says {status}")
-        except Exception as e:
-            add("meta_token", FAIL, f"expiry check failed: {type(e).__name__}")
-    else:
-        add("meta_token", PASS,
-            "token env set (expiry not checked; use --live)")
+    # 3/4. Publish-lane readiness: Meta token/target_id for a Meta-direct account,
+    # Zernio profile/connection for everyone else.
+    #
+    # calendar_autopublish's own publish step (the ONE choke point every client and
+    # LASSO row goes through) makes the routing binary: a lasso row is Meta-direct
+    # only while AGENT_LASSO_VIA_ZERNIO is OFF; every other row, EVERY client gym,
+    # always publishes through zernio_publish. There is no third path. So checking
+    # AGENT_<KEY>_TOKEN / AGENT_<KEY>_ID for a client account was checking creds
+    # nothing ever reads: those FAILs read as "not set up to publish" to an operator
+    # (and to a confused client forwarding the report) when the real, and only
+    # relevant, question is whether the gym's Zernio profile is connected.
+    # Pete/Zanshin, 2026-08-31 ('we are using zernio not meta').
+    uses_zernio = not (account.key.startswith("lasso")
+                       and not config.lasso_via_zernio_enabled())
+    if not uses_zernio:
+        token = account.get_token()
+        if not token:
+            add("meta_token", FAIL,
+                f"token env {account.token_env} is unset or empty")
+        elif live:
+            try:
+                import time as _time
+                from .token_watchdog import _check_one, _requests
+                r = _check_one(http or _requests(), account, _time.time(),
+                               config.token_warn_days(), None)
+                status = r.get("status")
+                days = r.get("days_remaining")
+                if status in ("ok", "never_expires"):
+                    add("meta_token", PASS,
+                        "valid" + (f", {days} day(s) remaining" if days is not None
+                                   else ", never expires"))
+                elif status == "expiring":
+                    add("meta_token", WARN, f"expiring in {days} day(s)")
+                else:
+                    add("meta_token", FAIL, f"debug_token says {status}")
+            except Exception as e:
+                add("meta_token", FAIL, f"expiry check failed: {type(e).__name__}")
+        else:
+            add("meta_token", PASS,
+                "token env set (expiry not checked; use --live)")
 
-    # 4. Target id env
-    if os.environ.get(account.target_id_env):
-        add("target_id", PASS, f"{account.target_id_env} set")
+        if os.environ.get(account.target_id_env):
+            add("target_id", PASS, f"{account.target_id_env} set")
+        else:
+            add("target_id", FAIL, f"{account.target_id_env} is unset")
     else:
-        add("target_id", FAIL, f"{account.target_id_env} is unset")
+        from .zernio_publisher import (_default_page_resolver,
+                                       _default_profile_resolver, _PLATFORM)
+        resolve_profile = zernio_profile_resolver or _default_profile_resolver
+        resolve_page = zernio_page_resolver or _default_page_resolver
+        try:
+            profile_id = resolve_profile(account.key)
+        except Exception:  # noqa: BLE001 - an unreadable resolve reads as absent
+            profile_id = None
+        if not profile_id:
+            add("zernio_profile", FAIL,
+                "no Zernio profile resolves for this gym; run "
+                "zernio_profile_link or stamp gyms.zernio_profile_id by hand")
+        else:
+            add("zernio_profile", PASS, f"profile {profile_id}")
+            if _PLATFORM.get(account.platform) == "facebook":
+                try:
+                    page_id = resolve_page(account.key)
+                except Exception:  # noqa: BLE001
+                    page_id = None
+                if not page_id:
+                    add("zernio_fb_page", FAIL,
+                        "Facebook connected but no PAGE is selected; every "
+                        "publish will raise 'no Facebook page selected'")
+                else:
+                    add("zernio_fb_page", PASS, f"page {page_id}")
 
     # 5. Library depth: under the minimum the account drafts blocked cards
     n = _count_library(account.library_path())
