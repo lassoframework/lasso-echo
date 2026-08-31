@@ -381,6 +381,57 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             "letter": (grade.letter if grade else None), "months": months}
 
 
+def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "approved"),
+                            picker=None, host=None, logger=None):
+    """Give a real photo to STALE arc rows that were staged with no image_url.
+
+    stage_arc's own media-attach guard (_attach_media, below) HOLDS an image-less arc
+    row out of staging today, but that guard did not always exist: rows inserted before
+    it shipped (Pete/CrossFit Zanshin, Bring a Friend Week + the first pass of Back To
+    School Special, both 2026-08-30) sit forever with image_url='', reaching the
+    approval card with no photo and permanently failing publish_guard's media_missing
+    check. This is the one-time (or periodic) catch-up for exactly that stale state —
+    it changes NOTHING about the guard itself, which already prevents the problem for
+    every event created from here on.
+
+    Only rows whose status is in `statuses` (default pending/approved — never denied or
+    killed rows, which a human or the system already decided against) AND whose
+    image_url is currently empty are touched. Each is given the SAME real-photo pool
+    pick + host that _attach_media uses (tenant-isolated, reuse-cooldown respected,
+    usage stamped), then PATCHed through store.patch_media — id+gym_id scoped, and
+    itself re-confirms the row still has no image before writing (never clobbers a row
+    a human or a later pass already gave a photo, never crosses to a different row).
+    Only image_url + source_media_asset_id are written; caption/status/date are never
+    touched.
+
+    Returns {"backfilled": [row_id, ...], "held": n} — `held` is how many candidate
+    rows still could not get an image (pool exhausted / hosting failed), left exactly
+    as they were for the next pass."""
+    log = logger or (lambda m: print(f"[event-calendar] {m}"))
+    lister = getattr(store, "list_event_rows", None)
+    if lister is None:
+        log(f"backfill_missing_media: store has no list_event_rows; nothing to do")
+        return {"backfilled": [], "held": 0}
+    rows = lister(gym_id, event_id) or []
+    candidates = [r for r in rows
+                  if str(r.get("status") or "").lower() in statuses
+                  and not (r.get("image_url") or "").strip()]
+    if not candidates:
+        return {"backfilled": [], "held": 0}
+    kept, held = _attach_media(gym_id, candidates, log, picker=picker, host=host)
+    backfilled = []
+    patcher = getattr(store, "patch_media", None)
+    for row in kept:
+        rid = row.get("id")
+        if not rid or patcher is None:
+            continue
+        updated = patcher(gym_id, rid, row.get("image_url") or "",
+                          row.get("source_media_asset_id") or "")
+        if updated is not None:
+            backfilled.append(rid)
+    return {"backfilled": backfilled, "held": len(held)}
+
+
 def _attach_media(gym_id, rows, log, *, picker=None, host=None):
     """Give every image-less arc row a real photo from the gym's OWN pool.
 

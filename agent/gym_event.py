@@ -509,42 +509,68 @@ def strip_scaffold(text):
     return "\n".join(out).strip()
 
 
+def _first_line(text):
+    """The first non-blank line of `text`, stripped. A genuine, verbatim substring
+    of the client's own words — never a summary, never a rewrite. Used as the short
+    reminder excerpt of a long offer_text (see _body_for); empty when `text` is
+    blank."""
+    for ln in str(text or "").splitlines():
+        ln = ln.strip()
+        if ln:
+            return ln
+    return ""
+
+
 def _body_for(kind, event: GymEvent, variant=0):
     """The grounded body lines for one arc kind, drawn ONLY from the event record
     (name, dates, offer_text, brief, link). No invented price/deadline/perk: every
     concrete claim is a token already in the record. `variant` distinguishes repeated
-    DURING posts so they never share a caption. Returns a list of lines."""
+    DURING posts so they never share a caption.
+
+    OFFER LENGTH (Pete/CrossFit Zanshin, 2026-08-31): offer_text is a free-text field
+    and a coach/owner may paste an entire pre-written caption into it (the Back To
+    School Special and Bring a Friend Week events both did). Echoing that FULL block
+    on every one of the arc's 6-9 beats reads to the client as "the same post over
+    and over" even though each beat's headline differs. The two EXPLAINER beats
+    (ANNOUNCE, HOW_IT_WORKS) still carry the full offer once each, in full, since
+    they are meant to fully explain the offer; every REMINDER beat (LAST_CALL,
+    DURING, FINAL_DAY) carries only its first line instead — a genuine, verbatim
+    excerpt of the client's own words (never a rewrite, never a summary), so the
+    fabrication/fact_ok gate still sees only tokens already in the full offer_text.
+    RECAP never repeats the offer at all (it looks back on the event, not sells it).
+    Returns a list of lines."""
     dates = _pretty_dates(event)
-    offer = _sentence(strip_scaffold(event.offer_text))
+    offer_full = _sentence(strip_scaffold(event.offer_text))
+    offer_short = _sentence(_first_line(strip_scaffold(event.offer_text)))
     brief = strip_scaffold(event.brief)
     lines = []
     if kind == ANNOUNCE:
         lines.append(f"Mark it: {dates}.")
         if brief:
             lines.append(_sentence(brief))
-        if offer:
-            lines.append(offer)
+        if offer_full:
+            lines.append(offer_full)
     elif kind == HOW_IT_WORKS:
         lines.append(f"Here is how {event.name} works.")
-        if offer:
-            lines.append(offer)
+        if offer_full:
+            lines.append(offer_full)
         if brief:
             lines.append(_sentence(brief))
     elif kind == LAST_CALL:
         lines.append("Starts tomorrow.")
-        if offer:
-            lines.append(offer)
+        if offer_short:
+            lines.append(offer_short)
     elif kind == DURING:
         opener = _DURING_OPENERS[variant % len(_DURING_OPENERS)]
         lines.append(opener.format(name=event.name))
-        if offer:
-            lines.append(offer)
+        if offer_short:
+            lines.append(offer_short)
         if brief and variant % 2 == 0:
             lines.append(_sentence(brief))
     elif kind == FINAL_DAY:
         lines.append("Last day.")
-        if offer:
-            lines.append(offer)
+        if offer_short:
+            lines.append(offer_short)
     elif kind == RECAP:
         lines.append(f"That was {event.name}.")
         if brief:

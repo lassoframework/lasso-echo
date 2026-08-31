@@ -245,6 +245,37 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_media(self, account_key, row_id, image_url, source_media_asset_id=""):
+        """Backfill a row's image_url (+ source_media_asset_id) that was staged with NO
+        image, WITHOUT touching status or caption (Pete/CrossFit Zanshin, 2026-08-31: an
+        event arc row inserted before event_calendar's media-attach guard existed sat
+        forever with image_url=''). A prefetch (get_row) confirms the row STILL has no
+        image before this ever writes, so a row a human or a later pass already gave a
+        real photo is never clobbered — the same never-cross-date, never-overwrite
+        discipline as gym_media_selector's rollback path. id+gym_id isolation like every
+        other write here. Returns the updated row, or None when the row does not exist,
+        belongs to another gym, or already carries an image (nothing to backfill)."""
+        current = self.get_row(account_key, row_id)
+        if current is None:
+            return None
+        if (current.get("image_url") or "").strip():
+            return None  # already has a real image; never overwrite
+        payload = {"image_url": image_url}
+        if source_media_asset_id:
+            payload["source_media_asset_id"] = source_media_asset_id
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def patch_gbp_fields(self, account_key, row_id, fields):
         """G1: persist edited GBP structured columns (already normalized to gbp_* names)
         and revert status to 'pending' — an edit to CTA/event/offer/location resets the

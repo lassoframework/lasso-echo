@@ -175,6 +175,77 @@ def test_drafted_copy_has_no_fact_absent_from_form(etype, offer, link, brief):
         assert not bad, f"{etype}/{row['arc_kind']} invented facts {bad}: {row['caption']!r}"
 
 
+# ---- long offer_text is not echoed whole on every beat (Pete/Zanshin, 2026-08-31) --
+
+_LONG_OFFER = (
+    "If you spent the entire summer driving kids around, changing schedules, "
+    "planning vacations, and taking care of everyone except yourself, this "
+    "message is for you.\n\n"
+    "The kids are finally back in school.\n\n"
+    "Now it's time to get back to you.\n\n"
+    "Sign up before September 15th and save $200, our 12 Week Back to Program "
+    "is only $599."
+)
+
+
+def test_long_offer_full_only_on_announce_and_howto():
+    """The two EXPLAINER beats carry the full offer_text; every REMINDER beat
+    (last-call, during, final-day) carries only its first line, so a long,
+    essay-length offer is not echoed whole on every one of the arc's posts."""
+    ev = _event(offer_text=_LONG_OFFER, media_ids=("m1",))
+    full = ge._sentence(ge.strip_scaffold(ev.offer_text))
+    first_line_only = ge._sentence(ge._first_line(ge.strip_scaffold(ev.offer_text)))
+    assert full != first_line_only  # the fixture is genuinely multi-line
+
+    announce = ge.draft_copy(ge.ANNOUNCE, ev)
+    howto = ge.draft_copy(ge.HOW_IT_WORKS, ev)
+    lastcall = ge.draft_copy(ge.LAST_CALL, ev)
+    during0 = ge.draft_copy(ge.DURING, ev, variant=0)
+    finalday = ge.draft_copy(ge.FINAL_DAY, ev)
+
+    assert full in announce
+    assert full in howto
+    # Reminder beats never carry the full essay again.
+    assert full not in lastcall
+    assert full not in during0
+    assert full not in finalday
+    # But they still carry a genuine, grounded excerpt of the client's own words.
+    assert first_line_only in lastcall
+    assert first_line_only in during0
+    assert first_line_only in finalday
+
+
+def test_long_offer_reminder_beats_shorter_than_explainer_beats():
+    """Regression for the literal symptom Pete reported ('the body/text is the
+    same every post'): a reminder-beat caption must be materially shorter than
+    an explainer-beat caption once offer_text is long, not a byte-for-byte
+    repeat of it."""
+    ev = _event(offer_text=_LONG_OFFER, media_ids=("m1",))
+    announce = ge.draft_copy(ge.ANNOUNCE, ev)
+    lastcall = ge.draft_copy(ge.LAST_CALL, ev)
+    assert len(lastcall) < len(announce)
+
+
+def test_long_offer_no_fact_absent_from_form():
+    """The dedup fix must never break the fabrication gate: the short excerpt is
+    a literal substring of the full offer, so every numeric token it carries is
+    already a record fact."""
+    ev = _event(offer_text=_LONG_OFFER, media_ids=("m1",))
+    arc = ge.plan_arc(ev, today=date(2026, 9, 1))
+    rows = ge.draft_arc(ev, arc)
+    assert rows
+    for row in rows:
+        bad = ge.fact_ok(row["caption"], ev)
+        assert not bad, f"{row['arc_kind']} invented facts {bad}: {row['caption']!r}"
+
+
+def test_first_line_helper():
+    assert ge._first_line("  \n\nfirst\nsecond\n") == "first"
+    assert ge._first_line("") == ""
+    assert ge._first_line(None) == ""
+    assert ge._first_line("only one line") == "only one line"
+
+
 def test_every_arc_row_pending():
     ev = _event(media_ids=("m1",))
     arc = ge.plan_arc(ev, today=date(2026, 9, 1))

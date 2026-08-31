@@ -268,6 +268,52 @@ def test_patch_caption_cross_gym_returns_none(monkeypatch):
     assert result is None
 
 
+# ---- patch_media: backfill a stale image-less arc row (Pete/Zanshin, 2026-08-31) --
+
+def test_patch_media_writes_image_and_asset_when_row_has_no_image(monkeypatch):
+    prefetch = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22", image_url="")])
+    patched = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22",
+                               image_url="https://cdn.test/a1.jpg")])
+    http = _FakeHTTP(get_resp=prefetch, patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_media(
+        "zanshinfitness630e22", "id-m", "https://cdn.test/a1.jpg", "asset-1")
+    assert result is not None
+    assert result["image_url"] == "https://cdn.test/a1.jpg"
+    method, url, params, headers, payload = http.calls[1]
+    assert method == "patch"
+    assert params["id"] == "eq.id-m"
+    assert params["gym_id"] == "eq.zanshinfitness630e22"
+    assert payload == {"image_url": "https://cdn.test/a1.jpg",
+                       "source_media_asset_id": "asset-1"}
+    # status/caption are never part of the write payload.
+    assert "status" not in payload and "caption" not in payload
+
+
+def test_patch_media_refuses_when_row_already_has_an_image(monkeypatch):
+    prefetch = _Resp(200, [_row("id-m", gym_id="zanshinfitness630e22",
+                                image_url="https://cdn.test/keep.jpg")])
+    http = _FakeHTTP(get_resp=prefetch)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_media(
+        "zanshinfitness630e22", "id-m", "https://cdn.test/a1.jpg", "asset-1")
+    assert result is None
+    # No PATCH was ever issued — the prefetch was the only call.
+    assert all(c[0] == "get" for c in http.calls)
+
+
+def test_patch_media_missing_row_returns_none_and_no_write(monkeypatch):
+    http = _FakeHTTP(get_resp=_Resp(200, []))   # row not found / wrong gym
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().patch_media(
+        "zanshinfitness630e22", "id-missing", "https://cdn.test/a1.jpg")
+    assert result is None
+    assert all(c[0] == "get" for c in http.calls)
+
+
 # ---- 6. report returns the null shape (no zeros) ------------------------------
 
 def test_report_null_shape(monkeypatch):

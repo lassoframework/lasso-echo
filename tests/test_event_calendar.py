@@ -322,6 +322,106 @@ def test_attach_media_holds_when_hosting_fails():
     assert kept == [] and len(held) == 1
 
 
+# ---- backfill_missing_media: stale image-less rows get a real photo, in place ----
+class _BackfillStore:
+    """Mimics SupabaseCalendarStore's list_event_rows + patch_media (id+gym_id
+    scoped, prefetch-confirms no image before writing) for backfill_missing_media."""
+    def __init__(self, rows):
+        self.rows = {r["id"]: dict(r) for r in rows}
+        self.patched = []
+
+    def list_event_rows(self, gym_id, event_id):
+        return [dict(r) for r in self.rows.values()
+                if r.get("gym_id") == gym_id and r.get("event_id") == event_id]
+
+    def get_row(self, gym_id, row_id):
+        r = self.rows.get(row_id)
+        if r and r.get("gym_id") == gym_id:
+            return dict(r)
+        return None
+
+    def patch_media(self, gym_id, row_id, image_url, source_media_asset_id=""):
+        current = self.get_row(gym_id, row_id)
+        if current is None or (current.get("image_url") or "").strip():
+            return None
+        r = self.rows[row_id]
+        r["image_url"] = image_url
+        if source_media_asset_id:
+            r["source_media_asset_id"] = source_media_asset_id
+        self.patched.append(row_id)
+        return dict(r)
+
+
+def _stale_row(rid, post_date, status, event_id="evt_x", image_url=""):
+    return {"id": rid, "gym_id": "zanshinfitness630e22", "event_id": event_id,
+            "post_date": post_date, "status": status, "image_url": image_url,
+            "caption": "unchanged"}
+
+
+def test_backfill_missing_media_patches_pending_and_approved_rows():
+    """The exact live shape (Pete/Zanshin, 2026-08-31): pending + approved rows
+    staged with no image before the media-attach guard existed. Each gets a real
+    photo, caption/status/date untouched."""
+    from agent import event_calendar as ec
+    rows = [
+        _stale_row("r1", "2026-10-02", "pending"),
+        _stale_row("r2", "2026-09-29", "approved"),
+        _stale_row("r3", "2026-09-26", "denied"),   # denied: never touched
+    ]
+    store = _BackfillStore(rows)
+    picked = [{"id": "a1", "title": "one.jpg"}, {"id": "a2", "title": "two.jpg"}]
+    res = ec.backfill_missing_media(
+        store, "zanshinfitness630e22", "evt_x",
+        picker=lambda exclude: next((a for a in picked if a["id"] not in exclude), None),
+        host=lambda asset, gym, drive: f"https://cdn.test/{asset['id']}.jpg")
+    assert sorted(res["backfilled"]) == ["r1", "r2"]
+    assert res["held"] == 0
+    assert store.rows["r1"]["image_url"] == "https://cdn.test/a1.jpg"
+    assert store.rows["r1"]["status"] == "pending"        # status untouched
+    assert store.rows["r1"]["caption"] == "unchanged"      # caption untouched
+    assert store.rows["r2"]["image_url"] == "https://cdn.test/a2.jpg"
+    assert store.rows["r2"]["status"] == "approved"
+    # denied row never entered the candidate set at all.
+    assert store.rows["r3"]["image_url"] == ""
+    assert "r3" not in store.patched
+
+
+def test_backfill_missing_media_never_touches_a_row_that_already_has_an_image():
+    from agent import event_calendar as ec
+    rows = [_stale_row("r1", "2026-10-02", "pending", image_url="https://cdn.test/keep.jpg")]
+    store = _BackfillStore(rows)
+    res = ec.backfill_missing_media(
+        store, "zanshinfitness630e22", "evt_x",
+        picker=lambda exclude: {"id": "a1"}, host=lambda *a: "https://cdn.test/a1.jpg")
+    assert res["backfilled"] == []
+    assert store.rows["r1"]["image_url"] == "https://cdn.test/keep.jpg"
+
+
+def test_backfill_missing_media_holds_when_pool_empty():
+    from agent import event_calendar as ec
+    rows = [_stale_row("r1", "2026-10-02", "pending")]
+    store = _BackfillStore(rows)
+    res = ec.backfill_missing_media(
+        store, "zanshinfitness630e22", "evt_x",
+        picker=lambda exclude: None, host=lambda *a: "")
+    assert res["backfilled"] == []
+    assert res["held"] == 1
+    assert store.rows["r1"]["image_url"] == ""
+
+
+def test_backfill_missing_media_scoped_to_the_named_gym_only():
+    """A row belonging to another gym is never patched even if it slipped into the
+    listing (defense in depth: list_event_rows is already gym-scoped upstream)."""
+    from agent import event_calendar as ec
+    rows = [_stale_row("r1", "2026-10-02", "pending")]
+    rows[0]["gym_id"] = "some_other_gym"
+    store = _BackfillStore(rows)
+    res = ec.backfill_missing_media(
+        store, "zanshinfitness630e22", "evt_x",
+        picker=lambda exclude: {"id": "a1"}, host=lambda *a: "https://cdn.test/a1.jpg")
+    assert res == {"backfilled": [], "held": 0}   # list_event_rows found nothing for THIS gym
+
+
 # ---- overlap_thin must only fire on events that ACTUALLY overlap -----------------
 def _arc_offer_row(date, event_id, pillar=None):
     from agent import gym_event as ge
