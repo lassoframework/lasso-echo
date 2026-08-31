@@ -121,7 +121,7 @@ def _url_basename(url):
 _PHOTO_CONSUMING_STATUSES = ("approved", "published", "publishing")
 
 
-def _locked_calendar_state(base_key, start, days, store, log):
+def _locked_calendar_state(base_key, start, days, store, log, library_path=None):
     """(locked_feed_days, used_keys) from the gym's EXISTING human-owned calendar rows
     across the planned span. locked_feed_days: post_dates whose feed a human already
     owns (approved/published/denied/killed — anything not machine-wipeable), so the
@@ -165,7 +165,8 @@ def _locked_calendar_state(base_key, start, days, store, log):
     # degrades open (the rotation window stays the backstop).
     try:
         from . import media_guard
-        used |= media_guard.surviving_keys(base_key, store, start, days, log=log)
+        used |= media_guard.surviving_keys(base_key, store, start, days, log=log,
+                                           library_path=library_path)
     except Exception as exc:  # noqa: BLE001 - the guard must never sink a build
         log(f"cross-day media guard read skipped ({type(exc).__name__})")
     return locked_days, used
@@ -669,7 +670,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # Without this the builder re-picked approved photos (double-place) and photos
     # consumed by pruned colliding rows were lost forever (under-build).
     locked_feed_days, used_keys = _locked_calendar_state(
-        base_key, start, days, store, log)
+        base_key, start, days, store, log, library_path=library_path)
     # Client-EDITED story captions per day: honor them on re-render so a saved story
     # caption is not discarded by the rebuild (Dale, 2026-08-17).
     edited_story_caps = _edited_story_captions(base_key, start, days, store, log)
@@ -1384,7 +1385,8 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     guard_state = {}
     if media_guard.enabled():
         try:
-            guard_state = media_guard.book_state(base_key, store, start, days, log=log)
+            guard_state = media_guard.book_state(base_key, store, start, days, log=log,
+                                                 library_path=library_path)
         except Exception as exc:  # noqa: BLE001 - the guard never sinks a backfill
             log(f"{base_key}: cross-day media guard read skipped ({type(exc).__name__})")
     drafts = []

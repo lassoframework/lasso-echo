@@ -346,3 +346,42 @@ def test_find_cross_day_repeats_groups_and_exempts_same_date():
     dupes = media_guard.find_cross_day_repeats(rows)
     assert set(dupes) == {"x.jpg"}
     assert set(dupes["x.jpg"]) == {"2026-09-01", "2026-09-04"}
+
+
+# ---- autofit reframe resolution (zanshin: approved reframe never blocked the raw) ---
+def _sha12(path):
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
+
+
+def test_surviving_keys_resolves_reframe_names_to_raw_photos(tmp_path):
+    from datetime import date
+    lib = _lib(tmp_path, n=2)
+    h = _sha12(os.path.join(lib, "photo_00.jpg"))
+    # An APPROVED row that shipped through feed autofit carries the reframe name,
+    # not the library basename — the guard must still block re-picking photo_00.
+    store = _Store([_row("2026-08-22", f"{h}__feed.jpg", "approved")])
+    keys = media_guard.surviving_keys("gritx", store, date(2026, 8, 15), 30,
+                                      library_path=lib)
+    assert "photo_00.jpg" in keys, \
+        "an approved autofit reframe must block its RAW library photo"
+
+
+def test_row_media_key_prefers_story_raw_source():
+    row = {"image_url": "https://cdn/abc123_story_card.jpg",
+           "source_media_url": "https://gritx.media/photo_05.jpg"}
+    assert media_guard.row_media_key(row) == "photo_05.jpg", \
+        "a story's identity is its raw source photo, not the burned caption card"
+
+
+def test_book_state_keys_stories_by_source(tmp_path):
+    lib = _lib(tmp_path, n=2)
+    story = _row("2026-08-20", "burned_card_zz.jpg", "pending", fmt="story")
+    story["source_media_url"] = "https://gritx.media/photo_01.jpg"
+    store = _Store([story])
+    state = media_guard.book_state("gritx", store, "2026-08-15", 30,
+                                   library_path=lib)
+    assert "photo_01.jpg" in state
+    blocked = media_guard.blocked_keys(state, "2026-08-25")
+    assert "photo_01.jpg" in blocked

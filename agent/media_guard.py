@@ -57,6 +57,76 @@ def media_key(url_or_path):
     return (str(url_or_path or "")).split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
 
 
+def row_media_key(row):
+    """A calendar row's PHOTO IDENTITY: the raw source (source_media_url, kept on
+    stories so an edited caption can re-burn) when present, else image_url. A
+    story's image_url is a BURNED caption card with its own name — keying it by
+    the raw source is what lets the guard see the actual photo."""
+    row = row or {}
+    return media_key(row.get("source_media_url") or row.get("image_url"))
+
+
+# ---- feed-autofit reframe resolution -------------------------------------------------
+# feed_image names a reframed feed card sha256(file bytes)[:12] + '__feed.jpg', so a
+# row that shipped through autofit carries the REFRAME name, not the library photo's.
+# Without resolving it back, an approved/published reframe would never block a re-pick
+# of its own raw photo (the exact zanshin repeats). Hashes are cached by (path, mtime,
+# size) so a scan does not re-read an unchanged library.
+_REFRAME_SUFFIX = "__feed.jpg"
+_hash_cache = {}
+
+
+def _library_hash(path):
+    try:
+        st = os.stat(path)
+        ck = (path, st.st_mtime, st.st_size)
+    except OSError:
+        return None
+    h = _hash_cache.get(ck)
+    if h is None:
+        import hashlib
+        try:
+            with open(path, "rb") as fh:
+                h = hashlib.sha256(fh.read()).hexdigest()[:12]
+        except OSError:
+            return None
+        _hash_cache[ck] = h
+    return h
+
+
+def reframe_map(library_path, wanted_keys):
+    """{reframe_key: raw_library_basename} for the '<sha12>__feed.jpg'-shaped keys
+    among wanted_keys that resolve to a file in this gym's library. Only hashes
+    until every wanted key is found; empty when nothing wants resolving."""
+    wanted = {k for k in (wanted_keys or ()) if str(k).endswith(_REFRAME_SUFFIX)}
+    if not wanted or not library_path:
+        return {}
+    out = {}
+    for key in sorted(library_keys(library_path)):
+        if not wanted:
+            break
+        h = _library_hash(os.path.join(library_path, key))
+        if not h:
+            continue
+        rk = f"{h}{_REFRAME_SUFFIX}"
+        if rk in wanted:
+            out[rk] = key
+            wanted.discard(rk)
+    return out
+
+
+def resolve_raw_keys(state, library_path):
+    """Merge each reframe-named entry of a book state into its RAW library
+    basename (the key every pick excludes by), keeping the reframe entry too for
+    sweep-side matching. In place; returns state."""
+    if not state or not library_path:
+        return state
+    rmap = reframe_map(library_path, state.keys())
+    for rk, raw in rmap.items():
+        state.setdefault(raw, set()).update(state.get(rk, set()))
+    return state
+
+
 def _months_between(start, end):
     """['YYYY-MM', ...] covering start..end inclusive."""
     months = []
@@ -74,7 +144,8 @@ def _as_date(value):
         return None
 
 
-def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=()):
+def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(),
+               library_path=None):
     """{media_key: {(iso_date, status), ...}} for every guard-relevant row of the
     gym: forward-book statuses (any date) + PUBLISHED rows near the planned span
     (read back one repeat window before start). Reads via store.list_month
@@ -119,11 +190,13 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
                 continue
             if status in _WIPEABLE and pd[:7] in skip:
                 continue                     # this rebuild wipes it; photo is free
-            key = media_key(row.get("image_url"))
+            key = row_media_key(row)
             if not key:
                 continue
             state.setdefault(key, set()).add((pd, status))
-    return state
+    # Resolve autofit reframe names back to their raw library photos so the raw
+    # basename (the key every pick excludes by) carries the block.
+    return resolve_raw_keys(state, library_path)
 
 
 def blocked_keys(state, day_key):
@@ -160,7 +233,7 @@ def note_placed(state, key, day_key):
     state.setdefault(key, set()).add((str(day_key)[:10], "pending"))
 
 
-def surviving_keys(base_key, store, start, days, *, log=None):
+def surviving_keys(base_key, store, start, days, *, log=None, library_path=None):
     """For a MONTH REBUILD over [start, start+days): every media key that will
     still be on the gym's book AFTER the rebuild's delete-then-insert — so the
     rebuild must not re-place any of them on a (different) day. Wipeable rows
@@ -176,7 +249,8 @@ def surviving_keys(base_key, store, start, days, *, log=None):
     span_end = start + timedelta(days=max(1, int(days or 1)) - 1)
     span_months = set(_months_between(start, span_end))
     state = book_state(base_key, store, start, days, log=log,
-                       skip_wipeable_months=span_months)
+                       skip_wipeable_months=span_months,
+                       library_path=library_path)
     win = config.media_repeat_window_days()
     keys = set()
     for key, occurrences in state.items():
@@ -276,7 +350,7 @@ def find_cross_day_repeats(rows, *, repeat_window_days=None):
         if acct not in _GUARDED_ACCOUNTS:
             continue
         pd = str(row.get("post_date") or "")[:10]
-        key = media_key(row.get("image_url"))
+        key = row_media_key(row)
         if not pd or not key:
             continue
         by_key.setdefault(key, {}).setdefault(pd, []).append(row)

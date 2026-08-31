@@ -6,21 +6,26 @@ photo across different weeks).
 WHAT IT DOES, per gym:
   1. Reads the trailing repeat window + forward book (rows_in_range: pending /
      approved / publishing / published / coach_review).
-  2. Groups rows by photo (media_guard.find_cross_day_repeats). Same-DATE
-     siblings (FB mirror, paired story) are ONE post — never a repeat.
+  2. Keys every row by its RAW photo: source_media_url when present (stories
+     carry it — their image_url is a burned caption card), else image_url, with
+     feed-autofit reframe names ('<sha12>__feed.jpg') resolved back to the raw
+     library photo. Same-DATE siblings (FB mirror, paired story) are ONE post —
+     never a repeat.
   3. For each photo on more than one date, ONE date keeps it:
        - any date with a published / publishing / approved row wins (earliest
          such date when several — those rows are never touched);
        - else the earliest date keeps it.
-     Every LATER date's PENDING/COACH_REVIEW rows get a FRESH, genuinely unused
-     library photo through the cross-day guard: feed rows are patched to the
-     newly hosted image; a paired story is re-burned (caption on the new photo)
-     when the story-format lane is armed, else patched to the raw photo.
+     Every LATER date's PENDING/COACH_REVIEW rows get a FRESH, genuinely unused,
+     PIL-VALIDATED library photo: feeds are re-pointed (autofit parity), the
+     paired story is re-burned (caption on the new photo) when the story-format
+     lane is armed, and source_media_url is updated so a later edited-caption
+     re-burn uses the new photo.
   4. NEVER touches published or publishing rows. NEVER swaps an APPROVED row's
      media (the gym approved that exact card) — approved duplicates are
-     REPORTED, not mutated. A gym whose library has no unused photo left is
-     reported as SMALL LIBRARY (one deduped digest) and its rows are left alone
-     — never fabricated media, never an emptied slot.
+     REPORTED, not mutated (swap_media is status-guarded server-side anyway).
+     A gym with no unused photo left is reported as SMALL LIBRARY (one deduped
+     digest) and its rows are left alone — never fabricated media, never an
+     emptied slot.
 
 Dry-run by default; --apply makes the writes. Prints a per-gym before/after
 table. Read/write goes through portal_calendar_store only (id+gym scoped).
@@ -41,6 +46,7 @@ from agent.portal_calendar_store import SupabaseCalendarStore
 
 FIXABLE = ("pending", "coach_review")
 UNTOUCHABLE = ("published", "publishing")
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
 def _log(msg):
@@ -50,6 +56,21 @@ def _log(msg):
 def _lib_dir(base):
     from agent.client_media_sync import _library_dir
     return _library_dir(base)
+
+
+def _is_real_image(path):
+    """A pickable replacement must be a real, decodable image — never a leaked
+    test fixture (the 11-byte FAKEJPEGs found in gritx's production library) or
+    a truncated upload."""
+    try:
+        if os.path.getsize(path) < 2048:
+            return False
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _owner_date(by_date):
@@ -64,17 +85,17 @@ def _owner_date(by_date):
     return sorted(by_date)[0]
 
 
-def _fresh_photo(base, lib, state, exclude):
-    """A genuinely unused library IMAGE (never on any book/window date, never in
-    exclude), deterministic. None when the library has nothing unused."""
+def _fresh_photo(lib, state, exclude):
+    """A genuinely unused, VALIDATED library image (never on any book/window
+    date, never in exclude), deterministic. (None, None) when nothing unused."""
     used = set(state.keys()) | set(exclude)
     for key in sorted(media_guard.library_keys(lib)):
         if key in used:
             continue
-        if os.path.splitext(key)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+        if os.path.splitext(key)[1].lower() not in _IMG_EXTS:
             continue                       # image swaps only; videos need their lanes
         path = os.path.join(lib, key)
-        if os.path.isfile(path):
+        if os.path.isfile(path) and _is_real_image(path):
             return key, path
     return None, None
 
@@ -92,6 +113,59 @@ def _gym_name(base):
         return base
 
 
+def _reburn_story(base, row, new_path, lib):
+    """Burn the story's caption onto the NEW photo and host it. None on failure."""
+    try:
+        from agent import media_host, story_image
+        caption = (row.get("caption") or "").strip()
+        asset = story_image.get_or_make_story_image(
+            new_path, caption, _gym_name(base), lib, logger=_log)
+        if not asset or not config.hosting_enabled():
+            return None
+        return media_host.host_media(asset, f"{base}_ig") or None
+    except Exception as exc:  # noqa: BLE001
+        _log(f"{base}: story re-burn error ({type(exc).__name__})")
+        return None
+
+
+def _grouped(rows, lib):
+    """{raw_key: {date: [row, ...]}} across guard-scope rows, autofit reframe
+    names resolved back to raw library photos so a feed and its paired story
+    share one key."""
+    keyed = []
+    raw_keys = set()
+    for row in rows or []:
+        status = str(row.get("status") or "").strip().lower()
+        if status not in media_guard.FORWARD_STATUSES and status != "published":
+            continue
+        acct = str(row.get("account") or "").strip().lower()
+        if acct not in ("instagram", "ig", "facebook", "fb", ""):
+            continue
+        pd = str(row.get("post_date") or "")[:10]
+        key = media_guard.row_media_key(row)
+        if not pd or not key:
+            continue
+        keyed.append((key, pd, row))
+        raw_keys.add(key)
+    rmap = media_guard.reframe_map(lib, raw_keys)
+    out = {}
+    for key, pd, row in keyed:
+        out.setdefault(rmap.get(key, key), {}).setdefault(pd, []).append(row)
+    return out
+
+
+def cross_day_repeats(rows, lib):
+    """The subset of _grouped with >1 distinct date and at least one
+    forward-book row (something the sweep could act on or must report)."""
+    out = {}
+    for key, by_date in _grouped(rows, lib).items():
+        forward = any(str(r.get("status") or "").lower() in media_guard.FORWARD_STATUSES
+                      for rws in by_date.values() for r in rws)
+        if len(by_date) > 1 and forward:
+            out[key] = by_date
+    return out
+
+
 def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     today = today or date.today()
     win = config.media_repeat_window_days()
@@ -102,22 +176,20 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     except Exception as exc:  # noqa: BLE001
         _log(f"{base}: read failed ({type(exc).__name__}); skipped")
         return {"gym": base, "error": type(exc).__name__}
-    dupes = media_guard.find_cross_day_repeats(rows)
+    lib = _lib_dir(base)
+    dupes = cross_day_repeats(rows, lib)
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
               "small_library": False, "detail": []}
     if not dupes:
         return result
 
-    # Full occupancy state for the fresh-pick guard (every key on the book/window).
+    # Full occupancy state for the fresh pick (every raw key on the book/window).
     state = {}
-    for r in rows:
-        k = media_guard.media_key(r.get("image_url"))
-        pd = str(r.get("post_date") or "")[:10]
-        if k and pd:
-            state.setdefault(k, set()).add((pd, str(r.get("status") or "").lower()))
+    for key, by_date in _grouped(rows, lib).items():
+        for pd in by_date:
+            state.setdefault(key, set()).add((pd, "x"))
 
-    lib = _lib_dir(base)
     today_iso = today.isoformat()
     for key, by_date in sorted(dupes.items()):
         owner = _owner_date(by_date)
@@ -143,20 +215,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                        if str(r.get("status") or "").lower() in FIXABLE]
             if not fixable:
                 continue
-            # SAME-DATE STORY SIBLINGS: the paired story's image_url is a BURNED
-            # caption card (different basename), so it never groups under the feed
-            # photo's key — but it shows the SAME duplicated photo. Match it by its
-            # raw source_media_url (or image_url) and swap it together with the feed
-            # so the day's cards stay one consistent post.
-            sibs = [r for r in rows
-                    if str(r.get("post_date") or "")[:10] == pd
-                    and str(r.get("format") or "").lower() == "story"
-                    and str(r.get("status") or "").lower() in FIXABLE
-                    and r not in group
-                    and (media_guard.media_key(r.get("source_media_url")) == key
-                         or media_guard.media_key(r.get("image_url")) == key)]
-            fixable = fixable + sibs
-            new_key, new_path = _fresh_photo(base, lib, state, exclude={key})
+            new_key, new_path = _fresh_photo(lib, state, exclude={key})
             if not new_key:
                 result["small_library"] = True
                 result["detail"].append(f"{key} {pd}: no unused photo left "
@@ -168,7 +227,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             if not apply:
                 result["dates_fixed"] += 1
                 result["rows_repointed"] += len(fixable)
-                state.setdefault(new_key, set()).add((pd, "pending"))
+                state.setdefault(new_key, set()).add((pd, "x"))
                 continue
             hosted = ""
             try:
@@ -185,7 +244,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             feed_url = hosted
             if config.feed_autofit_enabled():
                 try:
-                    from agent import feed_image
+                    from agent import feed_image, media_host
                     asset = feed_image.get_or_make_feed_image(new_path, lib,
                                                               logger=_log)
                     if asset:
@@ -221,7 +280,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                     fixed_any = True
             if fixed_any:
                 result["dates_fixed"] += 1
-                state.setdefault(new_key, set()).add((pd, "pending"))
+                state.setdefault(new_key, set()).add((pd, "x"))
                 try:
                     from agent import dam, rotation
                     rotation.record_served(f"{base}_ig", dam.rotation_key(new_path),
@@ -231,21 +290,6 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     if result["small_library"] and apply:
         media_guard.alert_small_library(base, today_iso, _log)
     return result
-
-
-def _reburn_story(base, row, new_path, lib):
-    """Burn the story's caption onto the NEW photo and host it. None on failure."""
-    try:
-        from agent import media_host, story_image
-        caption = (row.get("caption") or "").strip()
-        asset = story_image.get_or_make_story_image(
-            new_path, caption, _gym_name(base), lib, logger=_log)
-        if not asset or not config.hosting_enabled():
-            return None
-        return media_host.host_media(asset, f"{base}_ig") or None
-    except Exception as exc:  # noqa: BLE001
-        _log(f"{base}: story re-burn error ({type(exc).__name__})")
-        return None
 
 
 def run(gyms, *, apply=False, horizon=62):
