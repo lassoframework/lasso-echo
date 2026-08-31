@@ -314,6 +314,28 @@ def _bump_pub_count(gym_id, run_date):
         pass
 
 
+def _alert_daily_cap_hit(gym_id, run_date):
+    """ONE ops alert per gym per DAY, the FIRST time AGENT_CLIENT_DAILY_PUBLISH_CAP
+    throttles that gym (DEFECT 3, audit 2026-08-30): the cap silently left rows in
+    'waiting' with nothing telling anyone, so at 100 gyms a gym recovering from a
+    stall sat invisibly throttled. Deduped in kv per (gym, run_date) so the ~1-min
+    retry cadence never storms — same stamp shape as onboarding_watch.run's `stamp`
+    (a kv.get check, then kv.set after alerting). A new run_date re-arms it."""
+    try:
+        from . import db, ops_alerts
+        key = f"dailycap_alerted_{gym_id}_{run_date}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: hit its daily publish cap for {run_date}. The rest of "
+            "today's due rows are held (not lost) and will drip out on later "
+            "days; this is expected during a stall recovery, but flag it if "
+            "the gym should never be capped this low.")
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
 def scheduled_iso_for_row(row, now=None, tz_name=None):
     """The ISO8601 go-live timestamp for a row: its post_date at its OWN stable slot
     time (slot_time_for_row), in the GYM'S posting timezone (tz_name; default the
@@ -662,6 +684,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # flooding the feed. Applies only when a daily_cap is set (the client lane).
         if daily_cap and (cap_used + len(published)) >= int(daily_cap):
             waiting.append(row_id)
+            _alert_daily_cap_hit(gym_id, run_date)
             continue
 
         # FEED ASPECT PREFLIGHT: a feed photo outside IG/FB's accepted ratio is re-framed
@@ -686,6 +709,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             print(f"[calendar-autopublish] claim failed for row {row_id}: "
                   f"{type(e).__name__}: {e}")
+            # DEFECT 4 (audit 2026-08-30): this branch used to be print-only, unlike
+            # the network-publish exception path below, so a row whose atomic claim
+            # kept throwing (e.g. a flaky store connection) looped every ~1-min tick
+            # forever with no human ever told. Route it through the SAME counter.
+            _note_repeat_failure(row_id, gym_id, e)
             continue
         if not won:
             # Another run/worker owns it (or it was already published). Skip.
@@ -826,10 +854,28 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                                      _now_iso(now))
             except Exception as e:
                 # The post went out but we could not record it. Do NOT revert (that
-                # would re-publish next run). Report it loudly instead.
+                # would re-publish next run — it already published live). DEFECT 2
+                # (audit 2026-08-30): this used to be print-only despite the comment
+                # already saying "report it loudly instead" — for up to 2h (until
+                # sweep_stuck_publishing's STALE_PUBLISHING_SECONDS backstop fires) a
+                # LIVE post showed as neither published nor failed. Alert directly
+                # here instead of waiting on the sweep. The exactly-once claim above
+                # (mark_publishing already flipped this row out of pending/approved)
+                # means this same row can never re-enter this branch, so one direct
+                # alert per row cannot storm even across 100 gyms.
                 failed.append(row_id)
                 print(f"[calendar-autopublish] published row {row_id} but the "
                       f"mark_published write failed: {type(e).__name__}: {e}")
+                try:
+                    from . import ops_alerts as _oa
+                    _oa.alert(
+                        f"calendar row {row_id} (gym {gym_id}) PUBLISHED live but "
+                        f"the mark_published write failed: {type(e).__name__}: {e}. "
+                        "It will show stuck in 'publishing' in the portal until the "
+                        "2h stale sweep catches it or a human fixes it by hand — it "
+                        "is NOT reverted (that would republish a post already live).")
+                except Exception:
+                    pass
                 continue
             published.append(row_id)
             published_accounts.add(account.key)
@@ -843,6 +889,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 print(f"[calendar-autopublish] revert failed for row {row_id}: "
                       f"{type(e).__name__}: {e}")
             failed.append(row_id)
+            # DEFECT 1 (audit 2026-08-30): a SOFT failure (publisher returned
+            # normally with ok=False or mode != 'published', e.g. 'would_publish')
+            # used to fall through here with no counter and no alert at all — only
+            # the neighbouring EXCEPTION branch above called _note_repeat_failure,
+            # so a row stuck soft-failing (never raising) looped every ~1-min tick
+            # forever, completely invisibly. Feed it into the SAME strike counter,
+            # naming ok/mode so the eventual alert says what actually happened.
+            _note_repeat_failure(
+                row_id, gym_id,
+                RuntimeError(f"soft publish failure: ok={ok!r} mode={mode!r}"))
 
     # ONE lightweight Slack "posted" notice, matching the auto-approve notice style.
     # Only sent when something actually published. Never carries a token or secret.

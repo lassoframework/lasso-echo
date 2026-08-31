@@ -345,3 +345,215 @@ def test_http_action_flag_off_returns_403(monkeypatch):
         assert exc_info.value.code == 403
     finally:
         server.shutdown()
+
+
+# ---- 7. Portal-deny asset rollback (24h-refill-gap fix) ------------------------
+#
+# _handle_action_supabase's deny branch writes status='denied' straight to
+# content_calendar; it never ran through approvals.handle_action's deny branch
+# (gym_media_selector.on_draft_denied / podcast_selector.on_draft_denied), so a
+# denied asset sat out the once-a-day observe_denials sweep (agent.runner.run_daily)
+# for up to 24h before it could refill the day it just freed. These tests exercise
+# the real deny action against the REAL gym_media_selector / podcast_selector
+# rollback_use (not a mock), so the type-routing, date/asset scoping, and
+# idempotency are proven against production code, not a test double.
+
+from agent import portal_calendar_store as _pcs_mod  # noqa: E402
+from agent import gym_media_selector as _gms  # noqa: E402
+from agent import podcast_selector as _pods  # noqa: E402
+from tests.gym_media_fakes import FakeMediaStore, make_asset as _make_gym_asset  # noqa: E402
+from tests.podcast_fakes import FakeStore as _FakePodcastStore, make_asset as _make_pod_asset  # noqa: E402
+
+
+class _DenyCalendarStore:
+    """Stands in for SupabaseCalendarStore for the deny-rollback tests only
+    (mirrors _Store in test_portal_actions_finality.py)."""
+
+    def __init__(self, rows):
+        self._rows = {r["id"]: dict(r) for r in rows}
+        self.writes = []
+
+    def get_row(self, account_key, row_id):
+        r = self._rows.get(row_id)
+        if r is None or r.get("gym_id") != account_key:
+            return None
+        return dict(r)
+
+    def set_status(self, account_key, row_id, new_status):
+        self.writes.append(("status", row_id, new_status))
+        return dict(self._rows[row_id], status=new_status)
+
+
+def _deny_env(monkeypatch):
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "svc-key-secret")
+
+
+def _patch_deny_calendar_store(monkeypatch, store):
+    monkeypatch.setattr(_pcs_mod, "SupabaseCalendarStore", lambda *a, **k: store)
+    monkeypatch.setattr(portal_routes._pcs, "SupabaseCalendarStore",
+                        lambda *a, **k: store)
+
+
+def _row(row_id="r1", account_key="eng", post_date="2026-08-27",
+        draft_type=None, pillar=None, asset_id=None, status="pending"):
+    return {"id": row_id, "gym_id": account_key, "post_date": post_date,
+            "account": "instagram", "status": status, "caption": "text",
+            "draft_type": draft_type, "pillar": pillar,
+            "source_media_asset_id": asset_id, "image_url": "https://r2/x.jpg"}
+
+
+def test_deny_gym_media_rolls_back_asset_scoped_to_date(monkeypatch):
+    """A portal deny of a gym-media row (draft_type == 'gym_media') returns its
+    photo to the pool SYNCHRONOUSLY, scoped to this row's own post_date + asset."""
+    _deny_env(monkeypatch)
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    media_store = FakeMediaStore(assets=[
+        _make_gym_asset("a1", gym_id="eng", used_count=0, last_used_at=None)])
+    monkeypatch.setattr("agent.gym_media_index.default_store", lambda: media_store)
+    from datetime import datetime, timezone
+    asset = media_store.get_asset("a1")
+    _gms.stamp_use(asset, "eng", "2026-08-27", store=media_store,
+                   now=datetime(2026, 8, 27, tzinfo=timezone.utc))
+    assert media_store.assets["a1"]["used_count"] == 1  # staged, awaiting approval
+
+    store = _DenyCalendarStore([_row(draft_type="gym_media", asset_id="a1")])
+    _patch_deny_calendar_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+
+    assert status == 200
+    assert body["status"] == "denied"
+    assert media_store.assets["a1"]["used_count"] == 0
+    assert media_store.assets["a1"]["last_used_at"] is None
+
+
+def test_deny_rolls_back_a_LIVE_SHAPED_row_that_has_no_draft_type(monkeypatch):
+    """THE ROUTING BUG. content_calendar has NO draft_type column: measured against
+    the live table 2026-08-30, it reads None on all 229 ENG rows. Keying the rollback
+    on draft_type == 'gym_media' therefore made the whole fix a silent no-op for gym
+    media, the main case it exists for. The real signal is a non-empty
+    source_media_asset_id, present on exactly the photo pillars (faces/community/
+    results, 172 of 229) and absent on every generated pillar. This row is shaped like
+    a real one: draft_type absent entirely."""
+    _deny_env(monkeypatch)
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    media_store = FakeMediaStore(assets=[
+        _make_gym_asset("a1", gym_id="eng", used_count=0, last_used_at=None)])
+    monkeypatch.setattr("agent.gym_media_index.default_store", lambda: media_store)
+    from datetime import datetime, timezone
+    _gms.stamp_use(media_store.get_asset("a1"), "eng", "2026-08-27",
+                   store=media_store, now=datetime(2026, 8, 27, tzinfo=timezone.utc))
+    assert media_store.assets["a1"]["used_count"] == 1
+
+    row = _row(asset_id="a1", pillar="faces")
+    row.pop("draft_type", None)                    # exactly as the live table returns
+    store = _DenyCalendarStore([row])
+    _patch_deny_calendar_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+
+    assert status == 200 and body["status"] == "denied"
+    assert media_store.assets["a1"]["used_count"] == 0, "live-shaped row did not roll back"
+
+
+def test_deny_podcast_rolls_back_clip(monkeypatch):
+    """A portal deny of a podcast row (pillar == 'podcast') returns its clip too --
+    the same synchronous rollback, routed to the OTHER selector."""
+    _deny_env(monkeypatch)
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    pod_store = _FakePodcastStore(assets=[
+        _make_pod_asset("clip1", used_count=0, last_used_at=None)])
+    monkeypatch.setattr("agent.podcast_index.default_store", lambda: pod_store)
+    from datetime import datetime, timezone
+    asset = pod_store.assets["clip1"]
+    _pods.stamp_use(asset, "eng", "2026-08-27", store=pod_store,
+                    now=datetime(2026, 8, 27, tzinfo=timezone.utc))
+    assert pod_store.assets["clip1"]["used_count"] == 1
+
+    store = _DenyCalendarStore([_row(pillar="podcast")])
+    _patch_deny_calendar_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+
+    assert status == 200
+    assert body["status"] == "denied"
+    assert pod_store.assets["clip1"]["used_count"] == 0
+    assert pod_store.assets["clip1"]["last_used_at"] is None
+
+
+def test_deny_unrecognized_type_does_not_guess(monkeypatch):
+    """A row that is neither draft_type=='gym_media' nor pillar=='podcast' (a plain
+    post) is left ALONE -- a wrong guess would re-pool the WRONG asset, which is
+    worse than the 24h delay this fix exists to close."""
+    _deny_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(_gms, "rollback_use",
+                        lambda *a, **k: calls.append(("gym", a, k)))
+    monkeypatch.setattr(_pods, "rollback_use",
+                        lambda *a, **k: calls.append(("pod", a, k)))
+
+    store = _DenyCalendarStore([_row(draft_type="post", pillar=None)])
+    _patch_deny_calendar_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+
+    assert status == 200
+    assert body["status"] == "denied"
+    assert calls == [], "neither selector may be touched for an unrecognized type"
+
+
+def test_deny_rollback_exception_does_not_break_deny_response(monkeypatch):
+    """A rollback failure (e.g. the media store is down) must never fail the deny
+    itself -- the client still gets its normal 200/denied response."""
+    _deny_env(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("media store unavailable")
+
+    monkeypatch.setattr(_gms, "rollback_use", _boom)
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg, **k: alerts.append(msg))
+
+    store = _DenyCalendarStore([_row(draft_type="gym_media", asset_id="a1")])
+    _patch_deny_calendar_store(monkeypatch, store)
+    status, body = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+
+    assert status == 200
+    assert body["status"] == "denied"
+    assert alerts and "r1" in alerts[0]
+
+
+def test_deny_twice_does_not_double_rollback(monkeypatch):
+    """Denying the same row twice (or the nightly observe_denials sweep running
+    after the synchronous call) must never double-rollback or corrupt the ledger.
+    Exercised against the REAL rollback_use, whose idempotency is the actual
+    protection -- not a test double standing in for it."""
+    _deny_env(monkeypatch)
+    kv = {}
+    monkeypatch.setattr("agent.db.kv_get", lambda k, d="": kv.get(k, d))
+    monkeypatch.setattr("agent.db.kv_set", lambda k, v: kv.__setitem__(k, v))
+    media_store = FakeMediaStore(assets=[
+        _make_gym_asset("a1", gym_id="eng", used_count=0, last_used_at=None)])
+    monkeypatch.setattr("agent.gym_media_index.default_store", lambda: media_store)
+    from datetime import datetime, timezone
+    asset = media_store.get_asset("a1")
+    _gms.stamp_use(asset, "eng", "2026-08-27", store=media_store,
+                   now=datetime(2026, 8, 27, tzinfo=timezone.utc))
+
+    store = _DenyCalendarStore([_row(draft_type="gym_media", asset_id="a1")])
+    _patch_deny_calendar_store(monkeypatch, store)
+
+    status1, _ = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+    assert status1 == 200
+    assert media_store.assets["a1"]["used_count"] == 0
+
+    status2, _ = portal_routes.handle_portal_action("deny", "eng", "r1", "actor")
+    assert status2 == 200
+    # A second rollback of an already-rolled-back record must be a no-op: the
+    # counter must NOT go negative (the real bug a double-rollback would cause).
+    assert media_store.assets["a1"]["used_count"] == 0
+    assert media_store.assets["a1"]["last_used_at"] is None

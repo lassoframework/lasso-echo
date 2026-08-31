@@ -241,6 +241,58 @@ def _normalize_gbp_fields(gbp):
     return out
 
 
+def _rollback_denied_asset(account_key, row):
+    """Portal-deny belt-and-suspenders: return a denied row's staged asset to its
+    selector pool right now, rather than leaving it to the once-a-day
+    observe_denials sweep (agent.runner.run_daily). Mirrors the SAME type test
+    each selector's Slack-lane on_draft_denied hook runs on a Draft object --
+    but read off the columns content_calendar ACTUALLY has. Measured against the
+    live table 2026-08-30, because the obvious test was wrong: there is NO
+    draft_type column at all (it reads None on every row), so keying on it would
+    have made this whole function a silent no-op for gym media, which is the
+    main case it exists for. The real signals, from 229 live ENG rows and 483
+    LASSO rows:
+      - podcast_selector  : pillar == 'podcast'. All 9 LASSO podcast rows carry
+                            NO source_media_asset_id, so this test is checked
+                            FIRST and can never be shadowed by the next one.
+      - gym_media_selector: a non-empty source_media_asset_id. Present on
+                            exactly the photo pillars (faces/community/results,
+                            172 of 229) and absent on every generated pillar
+                            (about/service/testimonial/offer).
+    A row that matches NEITHER (or a missing post_date) is left alone: guessing
+    the wrong selector would re-pool the WRONG asset, which is worse than the
+    24h delay this function exists to close. Returns True only when a rollback
+    actually ran.
+
+    DATE-SCOPED, on purpose (prior incident: a cross-date rollback re-pooled a
+    photo that was LIVE and already published on a different day). Both
+    gym_media_selector.rollback_use(gym_id, post_date, *, asset_id=None) and
+    podcast_selector.rollback_use(gym_id, post_date) key their kv record off
+    THIS row's own post_date, so a use-record from any other date is never
+    touched. For gym_media, asset_id further narrows the rollback to THIS
+    row's own source_media_asset_id -- required because a 2x day can stage two
+    gym-media posts on one date, and denying one must return only ITS photo,
+    leaving the day's other (still-standing) post's stamp alone.
+
+    IDEMPOTENT: both rollback_use implementations short circuit on their
+    record's own `rolled_back` flag, so calling this twice for the same deny
+    (or the nightly sweep running again afterward) is a no-op the second time,
+    never a double-rollback."""
+    pillar = str(row.get("pillar") or "").strip().lower()
+    post_date = row.get("post_date")
+    if not post_date:
+        return False
+    if pillar == "podcast":
+        from . import podcast_selector
+        return podcast_selector.rollback_use(account_key, post_date)
+    asset_id = str(row.get("source_media_asset_id") or "").strip()
+    if asset_id:
+        from . import gym_media_selector
+        return gym_media_selector.rollback_use(account_key, post_date,
+                                               asset_id=asset_id)
+    return False
+
+
 def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=None):
     """
     Supabase content_calendar action path. approve/deny/kill flip status; edit
@@ -391,6 +443,24 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
         if updated is None:
             # Zero rows matched the id+gym_id filter -> treat as not found.
             return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+        if action == "deny":
+            # SYNCHRONOUS POOL RETURN (the 24h-refill-gap bug): the Slack/SQLite deny
+            # lane returns a denied asset to its selector pool immediately via
+            # approvals.handle_action (gym_media_selector.on_draft_denied /
+            # podcast_selector.on_draft_denied), but the portal deny writes straight
+            # to content_calendar and never runs through that hook. Without this call
+            # a gym at its creative cap that denies a photo in the portal could not
+            # refill the day it just freed until the once-a-day observe_denials sweep
+            # (agent.runner.run_daily) caught up -- up to 24h later. Best effort: a
+            # rollback failure must never break the deny response the client is
+            # waiting on.
+            try:
+                _rollback_denied_asset(account_key, row)
+            except Exception as exc:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"portal deny rollback failed for {account_key} draft "
+                    f"{draft_id}: {type(exc).__name__}: {exc}")
         # Task #28 (false-approval fix): return the AUTHORITATIVE status + day_key of the
         # row actually written, so the portal updates ONLY that card from server truth and
         # never carries the badge onto the next post.

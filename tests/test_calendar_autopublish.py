@@ -1227,3 +1227,166 @@ def test_expired_sweep_excludes_google_business_rows():
     store.expired_rows("2026-08-23")
     assert seen.get("account") == "neq.googlebusiness", \
         "GBP rows must not be reported as expired"
+
+
+# ---- audit 2026-08-30: four silent-failure defects in publish_due ---------------
+# The portal said nothing was wrong and the post never went out, and no human was
+# told. All four fixes route into either the SAME _note_repeat_failure counter used
+# by the existing publish-exception path, or a direct ops_alerts.alert call, or a
+# kv-deduped per-gym-per-day stamp — never a NEW unbounded alert path.
+
+def test_soft_failure_now_feeds_the_repeat_failure_counter(armed, monkeypatch):
+    """DEFECT 1: a SOFT failure (publisher returns normally with ok=False / a
+    non-'published' mode, never raises) used to fall through with only a print —
+    _note_repeat_failure was wired ONLY to the neighbouring exception branch, so a
+    row stuck soft-failing looped every tick forever with nobody told. Now it counts
+    the same way: silent for the first REPEAT_FAILURE_ALERT_AT-1 ticks, then ONE
+    alert naming ok/mode. mark_publish_failed reverts to pending each tick, so the
+    row is due again next call — simulating the real ~1-min retry loop."""
+    sent = _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("soft")])
+    pub = _FakePublisher(PublishResult(ok=False, mode="failed", detail="ig 400"))
+
+    for _ in range(cap.REPEAT_FAILURE_ALERT_AT - 1):
+        summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+        assert sent == []                          # silent below threshold
+        assert store.rows["soft"]["status"] == "pending"   # retryable, not lost
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "soft" in summary["failed"]
+    assert len(sent) == 1                           # threshold alert, exactly one
+    assert "ok=False" in sent[0] and "mode='failed'" in sent[0]
+
+
+def test_soft_failure_alert_does_not_storm_past_threshold(armed, monkeypatch):
+    """DEFECT 1 anti-storm: once alerted, the SAME reason on the SAME row must not
+    re-fire on every further ~1-min tick (matches _note_repeat_failure's existing
+    per-(row,reason)-per-day dedupe)."""
+    sent = _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("soft2")])
+    pub = _FakePublisher(PublishResult(ok=False, mode="failed"))
+
+    for _ in range(cap.REPEAT_FAILURE_ALERT_AT + 6):    # well past the threshold
+        cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert len(sent) == 1
+
+
+def test_claim_exception_now_feeds_the_repeat_failure_counter(armed, monkeypatch):
+    """DEFECT 4: an exception from store.mark_publishing (the atomic claim) used to
+    be print-only with no _note_repeat_failure call, unlike the publish-exception
+    path. A row whose claim keeps throwing (flaky store connection) must now count
+    and eventually alert the same way."""
+    sent = _capture_alerts(monkeypatch)
+
+    class _ClaimBoomStore(_FakeStore):
+        def mark_publishing(self, row_id):
+            self.publishing_calls.append(row_id)
+            raise RuntimeError("supabase connection reset")
+
+    store = _ClaimBoomStore([_row("claimboom")])
+    pub = _FakePublisher()
+
+    for _ in range(cap.REPEAT_FAILURE_ALERT_AT - 1):
+        cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert sent == []
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert "claimboom" in summary["failed"]
+    assert len(sent) == 1
+    assert "supabase connection reset" in sent[0]
+    assert pub.calls == []                          # never reached the network
+
+
+def test_mark_published_write_failure_alerts_directly(armed, monkeypatch):
+    """DEFECT 2: the post REALLY published, but the mark_published write itself
+    failed. The comment already said 'report it loudly instead' but only print()d.
+    Must now alert directly via ops_alerts (not wait on the 2h stale sweep), and
+    must NOT revert the claim (that would republish a post already live)."""
+    sent = _capture_alerts(monkeypatch)
+
+    class _MarkPublishedBoomStore(_FakeStore):
+        def mark_published(self, row_id, media_id, published_at):
+            raise RuntimeError("supabase write timeout")
+
+    store = _MarkPublishedBoomStore([_row("livebutlost")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+
+    assert "livebutlost" in summary["failed"]
+    assert summary["published"] == []
+    # NOT reverted: mark_publishing already flipped it to 'publishing' and the
+    # failed mark_published write must leave it there for the 2h backstop sweep.
+    assert store.rows["livebutlost"]["status"] == "publishing"
+    assert len(sent) == 1
+    assert "PUBLISHED live" in sent[0]
+    assert "supabase write timeout" in sent[0]
+
+
+def test_mark_published_write_failure_alert_does_not_storm_across_ticks(armed, monkeypatch):
+    """Anti-storm for DEFECT 2: the exactly-once claim means this row can never
+    win mark_publishing again, so repeated ticks over the same stuck row must fire
+    the direct alert only ONCE, not once per tick."""
+    sent = _capture_alerts(monkeypatch)
+
+    class _MarkPublishedBoomStore(_FakeStore):
+        def mark_published(self, row_id, media_id, published_at):
+            raise RuntimeError("timeout")
+
+    store = _MarkPublishedBoomStore([_row("livebutlost2")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+    for _ in range(5):
+        cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert len(sent) == 1
+
+
+def test_daily_cap_hit_alerts_once_per_gym_per_day(armed, monkeypatch):
+    """DEFECT 3: the first row THIS TICK to be throttled by the daily cap must fire
+    ONE ops alert for the gym; further rows throttled the SAME tick (same gym, same
+    day) must not re-fire (kv-deduped, same stamp shape as onboarding_watch.stamp)."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    sent = _capture_alerts(monkeypatch)
+    store = _FakeStore([_row(x) for x in ("a", "b", "c")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    summary = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                              catch_all=True, daily_cap=1)
+
+    assert len(summary["published"]) == 1
+    assert len(summary["waiting"]) == 2             # 2 rows throttled this tick
+    assert len(sent) == 1                           # but only ONE alert
+    assert "lasso" in sent[0] and "daily publish cap" in sent[0] and RUN_DATE in sent[0]
+
+
+def test_daily_cap_hit_alert_does_not_storm_across_ticks(armed, monkeypatch):
+    """Anti-storm for DEFECT 3: a gym sitting at/over its cap for the WHOLE day
+    (the ~1-min tick keeps re-checking) must alert only once per day, not once
+    per tick, across many repeated ticks."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 5)   # already at cap
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    sent = _capture_alerts(monkeypatch)
+    store = _FakeStore([_row("z")])
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    for _ in range(6):
+        cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW,
+                        catch_all=True, daily_cap=1)
+    assert len(sent) == 1
+
+
+def test_daily_cap_hit_alert_rearms_on_a_new_day(armed, monkeypatch):
+    """The dedupe key includes run_date, so a NEW day re-arms the alert instead of
+    permanently silencing a gym that is capped again tomorrow."""
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 5)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+    sent = _capture_alerts(monkeypatch)
+    pub = _FakePublisher(PublishResult(ok=True, mode="published", media_id="M"))
+
+    store1 = _FakeStore([_row("day1")])
+    cap.publish_due(RUN_DATE, store=store1, publisher=pub, now=LATE_NOW,
+                    catch_all=True, daily_cap=1)
+    day2 = "2026-08-11"
+    store2 = _FakeStore([_row("day2", post_date=day2)])
+    cap.publish_due(day2, store=store2, publisher=pub,
+                    now="2026-08-11T23:59:00-04:00", catch_all=True, daily_cap=1)
+    assert len(sent) == 2
