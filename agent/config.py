@@ -309,6 +309,25 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+def intake_auto_approve() -> bool:
+    """
+    AUTO-APPROVE a gym's own intake answers (AGENT_INTAKE_AUTO_APPROVE). Default OFF.
+
+    Intake sources landed PENDING and waited on a human. In practice nobody ran the
+    approval, so gyms sat in no_sources for weeks with their answers in the table:
+    Hill Country 22 sources from Aug 23, Zanshin 45 from Aug 27, ENG 61, all invisible
+    to their own calendars. Blake's call 2026-08-30: a gym's own words about its own gym
+    do not need LASSO to vet them before Echo may quote them.
+
+    WHAT THIS DOES NOT CHANGE: the POST approval gate is untouched. Every drafted post
+    still waits for the client's tap, copy_gate and the avatar rail still run on every
+    caption, and Echo still cannot state anything that is not in the gym's own material.
+    This only removes the human step between "the client wrote it" and "Echo may quote
+    it". Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_INTAKE_AUTO_APPROVE", "false"))
+
+
 def event_lead_days() -> int:
     """
     How many days BEFORE an event starts its promo arc opens (AGENT_EVENT_LEAD_DAYS).

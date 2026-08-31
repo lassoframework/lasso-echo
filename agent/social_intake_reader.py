@@ -331,7 +331,9 @@ def onboard_from_social(account_key, answers, *, approve=True):
 
     created = []
     if fresh:
-        status = "approved" if approve else "pending"
+        # `approve` is the explicit caller override; otherwise the shared
+        # intake posture decides (AGENT_INTAKE_AUTO_APPROVE).
+        status = "approved" if approve else client_sources.intake_status()
         created = client_sources.submit_intake(account_key, fresh, status=status)
 
     return {

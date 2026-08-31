@@ -89,7 +89,8 @@ def _step_sources(account_key, text, report):
         report["sources"] = (f"nothing new ({skipped_dupes} already stored)"
                              if skipped_dupes else "no source sections in the intake")
         return
-    created = client_sources.submit_intake(account_key, fresh, status="pending")
+    created = client_sources.submit_intake(
+        account_key, fresh, status=client_sources.intake_status())
     note = f"{len(created)} landed PENDING (approve before drafting)"
     if skipped_dupes:
         note += f", {skipped_dupes} duplicate(s) skipped"

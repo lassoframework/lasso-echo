@@ -145,3 +145,42 @@ def test_exact_key_always_beats_the_normalised_twin(monkeypatch):
                         lambda key, status=None, category=None: list(stored.get(key, [])))
     got = cs.pending_sources("district_h_ig")
     assert got == ["Exact key line"], f"normalised variant won over the exact key: {got}"
+
+
+# ---- intake auto-approve (Blake 2026-08-30) --------------------------------------
+def test_intake_status_is_pending_by_default(monkeypatch):
+    monkeypatch.delenv("AGENT_INTAKE_AUTO_APPROVE", raising=False)
+    from agent import client_sources as cs
+    assert cs.intake_status() == "pending"
+
+
+def test_intake_status_is_approved_when_armed(monkeypatch):
+    """Intake sources landed PENDING and waited on a human step nobody ran, so gyms sat
+    in no_sources for weeks with their own answers in the table (Hill Country 22 from
+    Aug 23, Zanshin 45 from Aug 27, ENG 61). A gym's own words about its own gym do not
+    need vetting before Echo may quote them."""
+    monkeypatch.setenv("AGENT_INTAKE_AUTO_APPROVE", "true")
+    from agent import client_sources as cs
+    assert cs.intake_status() == "approved"
+
+
+def test_auto_approved_intake_is_immediately_draftable(monkeypatch, tmp_path):
+    """The whole point: a gym that submits intake can build a calendar straight away."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("AGENT_INTAKE_AUTO_APPROVE", "true")
+    from agent import client_sources as cs
+    cs.submit_intake("newgym_ig", {"offer": ["Their real front door offer"]},
+                     status=cs.intake_status())
+    assert [s.text for s in cs.approved_sources("newgym_ig")] == \
+        ["Their real front door offer"]
+    assert cs.pending_sources("newgym_ig") == []
+
+
+def test_the_post_approval_gate_is_untouched_by_auto_approve(monkeypatch):
+    """Auto-approving SOURCES must not be confused with auto-approving POSTS. Every
+    drafted post still waits for the client's tap."""
+    monkeypatch.setenv("AGENT_INTAKE_AUTO_APPROVE", "true")
+    from agent import config
+    assert config.intake_auto_approve() is True
+    # the publish-side gates are entirely separate switches and stay off
+    assert config.publish_enabled() is False

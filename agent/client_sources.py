@@ -126,6 +126,15 @@ def add_source(account_key, category, text, citation="", status="approved"):
                         text=text, citation=citation, status=status)
 
 
+def intake_status():
+    """The status a gym's OWN intake answers land in: 'approved' when
+    AGENT_INTAKE_AUTO_APPROVE is armed, else 'pending' (the historic default).
+
+    Every intake path shares this so a gym can never land half-approved."""
+    from . import config
+    return "approved" if config.intake_auto_approve() else "pending"
+
+
 def submit_intake(account_key, bundle, status="pending", default_citation=""):
     """
     Land a client's intake bundle (the intake form, or uploaded material) as

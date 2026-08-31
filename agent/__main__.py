@@ -154,6 +154,8 @@ def _status():
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
     print(f"  welcome_queue  : {config.welcome_queue_enabled()}  (env AGENT_WELCOME_QUEUE_ENABLED; one/day drip + new-client trigger, needs hosting)")
     print(f"  demo_calendar  : {config.demo_calendar_enabled()}  (env AGENT_DEMO_CALENDAR_ENABLED; 30-day done-for-you demo calendar, needs hosting)")
+    print(f"  intake_autoapp : {config.intake_auto_approve()}  (env AGENT_INTAKE_AUTO_APPROVE; a gym's own intake answers land approved, not queued)")
+    print(f"  event_lead_days: {config.event_lead_days()}  (env AGENT_EVENT_LEAD_DAYS; how many days before an event its promo arc opens)")
     print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
     print(f"  event_campaigns: {config.event_campaigns_enabled()}  (env AGENT_EVENT_CAMPAIGNS, per-gym AGENT_EVENT_CAMPAIGNS_<GYM>; self-serve Events & Promos: the 'Add an Event or Promo' portal form + the arc planner draft a dated PENDING arc for a gym_event through the ONE window-timed engine that also runs Summit; pilot Pete first; needs the gym_event + content_calendar.event_id migrations; no publish)")

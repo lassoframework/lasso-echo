@@ -310,7 +310,8 @@ def _land_intake_form(client, payload, r2, key, manifest):
             if fact and (category, fact) not in existing:
                 existing.add((category, fact))
                 bundle.setdefault(category, []).append((fact, citation))
-    created = client_sources.submit_intake(client, bundle, status="pending") \
+    created = client_sources.submit_intake(
+        client, bundle, status=client_sources.intake_status()) \
         if bundle else []
 
     # HELD proposal, never applied live: overwrites in place, so a re-submission
