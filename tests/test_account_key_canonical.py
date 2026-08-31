@@ -547,3 +547,93 @@ def test_an_expired_entry_is_re_read():
     pcs._UUID_CACHE["topfuel"] = (uuid, 0)
     assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
     assert http.calls > before, "a stale entry must be re-read"
+
+
+# 7. --apply must never SPLIT A LIVE GYM IN TWO (Blake's ruling, 2026-08-31) -----------
+from agent import account_key_reconcile as akr  # noqa: E402
+
+
+def _rec(gym_id, name, key):
+    return {"gym_id": gym_id, "name": name, "account_key": key,
+            "has_social_product": True}
+
+
+def _counter(**kw):
+    """A data probe for ONE key: everything else reads as an unused key."""
+    def _c(account_key):
+        return kw.get(account_key,
+                      {"sources": 0, "calendar": 0, "voice": False, "library": False})
+    return _c
+
+
+def test_a_collided_gym_with_data_is_blocked_not_repointed():
+    """THE SPLIT. --apply rewrites exactly ONE field, echo_intake_tokens.
+    echo_account_key: it moves the POINTER and moves no DATA, so every source, calendar
+    row, voice doc and media folder stays under the OLD key and the gym is handed an
+    empty one. Echo then reads zero approved sources, the no-fabrication gate refuses to
+    draft, and the gym goes quiet with its scheduled rows orphaned.
+
+    NOTE the real blast radius, measured 2026-08-31: a NON-collided gym is never
+    re-pointed at all (build_plan treats its current key as ISSUED, so canonical ==
+    current and change is False). Pierce Fitness, with 155 calendar rows and 17 sources,
+    plans OK and is never touched. The hazard is real only for a COLLIDED or
+    MISSING-key gym, which is exactly what this test builds: two gyms sharing one key,
+    where the one holding the data must still be refused."""
+    wrote = []
+    out = akr.reconcile(
+        reader=lambda: [_rec("g-a", "Bird Dog CrossFit", "shared"),
+                        _rec("g-b", "Bolton Club", "shared")],
+        writer=lambda row: wrote.append(row["gym_id"]) or (True, "updated"),
+        logger=lambda m: None, apply=True,
+        data_counter=_counter(shared={"sources": 17, "calendar": 155,
+                                      "voice": False, "library": True}))
+    assert wrote == [], "a collided gym holding data was split from it"
+    for row in out["plan"]:
+        assert row["status"] == "BLOCKED"
+        assert "strand" in row["error"] and "Migrate first" in row["error"]
+    assert all(a["ok"] is False for a in out["applied"])
+
+
+def test_a_non_collided_live_gym_is_never_repointed_at_all():
+    """Pierce's real shape: a unique current key is treated as ISSUED, so there is no
+    change to make and the guard never even has to fire."""
+    plan = akr.build_plan([_rec("g-pierce", "Pierce Fitness", "piercefitness")])
+    assert plan[0]["status"] == "OK" and plan[0]["change"] is False
+
+
+def test_an_unused_key_is_still_reconciled():
+    """The guard must not disable the tool. A key holding NOTHING is exactly the case
+    reconcile exists for, and it must still be re-pointed."""
+    wrote = []
+    akr.reconcile(
+        reader=lambda: [_rec("g-fresh", "Fresh Box", "")],   # MISSING key: nothing to strand
+        writer=lambda row: wrote.append(row) or (True, "updated"),
+        logger=lambda m: None, apply=True, data_counter=_counter())
+    assert len(wrote) == 1, "a gym with no key at all should still be reconciled"
+
+
+def test_each_kind_of_data_blocks_on_its_own():
+    for label, probe in (
+            ("sources", {"sources": 3, "calendar": 0, "voice": False, "library": False}),
+            ("calendar", {"sources": 0, "calendar": 9, "voice": False, "library": False}),
+            ("voice", {"sources": 0, "calendar": 0, "voice": True, "library": False}),
+            ("library", {"sources": 0, "calendar": 0, "voice": False, "library": True})):
+        assert akr.blocking_data("k", counter=_counter(k=probe)), f"{label} did not block"
+
+
+def test_an_unreadable_probe_blocks_rather_than_assuming_empty():
+    """If we cannot tell whether a gym has data, the safe answer is that it does.
+    Assuming empty is how a healthy gym gets silently re-pointed."""
+    probe = {"sources": -1, "calendar": -1, "voice": False, "library": False}
+    reason = akr.blocking_data("k", counter=_counter(k=probe))
+    assert "unreadable" in reason
+
+
+def test_the_writer_itself_refuses_a_key_with_data(monkeypatch):
+    """Defence in depth: reconcile() skips a blocked row, but a script or a hand-run
+    that calls the writer directly must be refused too."""
+    monkeypatch.setenv("AGENT_ACCOUNT_KEY_RECONCILE", "true")
+    monkeypatch.setattr(akr, "blocking_data", lambda k, **kw: "has stuff")
+    ok, detail = akr._default_writer({"gym_id": "g1", "canonical": "newkey",
+                                      "current": "oldkey"})
+    assert ok is False and detail.startswith("BLOCKED:")

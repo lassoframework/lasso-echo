@@ -162,6 +162,90 @@ def _default_reader():
     return out
 
 
+class _NoCreds(Exception):
+    """Internal: the shared plane has no credentials, so no write is possible either."""
+
+
+def existing_data_for(account_key, *, counter=None):
+    """What a key ALREADY OWNS: {"sources": n, "calendar": n, "voice": bool,
+    "library": bool}. Empty-ish means the key is unused and safe to re-point.
+
+    Read-only, never raises: a probe that fails reports the thing as PRESENT, because
+    the safe answer to "can I tell if this gym has data" is "assume it does".
+    `counter` is injectable so the whole guard is testable offline."""
+    if counter is not None:
+        return counter(account_key)
+    base = (str(account_key) if account_key is not None else "").strip()
+    out = {"sources": 0, "calendar": 0, "voice": True, "library": True}
+    if not base:
+        return {"sources": 0, "calendar": 0, "voice": False, "library": False}
+    try:
+        from . import client_sources
+        out["sources"] = len(client_sources.all_sources(f"{base}_ig") or [])
+    except Exception:  # noqa: BLE001 - unreadable means assume data, never "it's empty"
+        out["sources"] = -1
+    try:
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+        if not (config.supabase_url() and config.supabase_service_key()):
+            # No creds means the WRITE is impossible too (_default_writer returns
+            # "supabase creds absent"), so there is nothing to protect and this is not
+            # an "unreadable" state. Reporting a block here would just make the guard
+            # look broken offline. A read that FAILS with creds present is different,
+            # and still blocks below.
+            raise _NoCreds
+        r = store._client().get(  # noqa: SLF001
+            store._rest("content_calendar"),  # noqa: SLF001
+            params={"select": "id", "gym_id": f"eq.{base}", "limit": "1"},
+            headers=store._headers(), timeout=30)  # noqa: SLF001
+        out["calendar"] = len(r.json() or []) if r.status_code < 400 else -1
+    except _NoCreds:
+        out["calendar"] = 0
+    except Exception:  # noqa: BLE001
+        out["calendar"] = -1
+    try:
+        import os
+        out["voice"] = os.path.exists(f"brand_voice/{base}/lasso_voice.md")
+        out["library"] = os.path.isdir(os.path.join(config.LIBRARY_PATH, base))
+    except Exception:  # noqa: BLE001
+        out["voice"] = out["library"] = True
+    return out
+
+
+def blocking_data(account_key, *, counter=None):
+    """The reason a key must NOT be re-pointed, or "" when it is safe.
+
+    THE SPLIT-IN-TWO HAZARD: --apply rewrites exactly ONE field,
+    echo_intake_tokens.echo_account_key. It moves the POINTER and moves no DATA. Every
+    source, calendar row, brand voice doc and media folder stays under the OLD key. So
+    re-pointing a gym that already has data hands it a key holding NOTHING: Echo then
+    reads zero approved sources and the no-fabrication gate correctly refuses to draft,
+    the gym goes quiet, and its existing scheduled rows are orphaned under a key nothing
+    points at. Measured on Pierce Fitness, a healthy publishing gym, 2026-08-31: its live
+    key held 155 calendar rows, 17 sources and its media library, while its canonical key
+    held 0 and 0. That is the exact stranding this session spent hours repairing on other
+    gyms, except self-inflicted on one that was working.
+
+    Recovery is a manual migration of sources, calendar rows, the voice doc and the
+    library. Until --apply performs that migration itself, a key with data is BLOCKED."""
+    d = existing_data_for(account_key, counter=counter)
+    bits = []
+    if d.get("sources"):
+        bits.append("unreadable sources" if d["sources"] < 0
+                    else f"{d['sources']} source(s)")
+    if d.get("calendar"):
+        bits.append("unreadable calendar" if d["calendar"] < 0
+                    else "calendar rows")
+    if d.get("voice"):
+        bits.append("a brand voice doc")
+    if d.get("library"):
+        bits.append("a media library")
+    if not bits:
+        return ""
+    return ("re-pointing would strand " + ", ".join(bits) + " under the old key "
+            "(--apply moves the pointer, never the data). Migrate first.")
+
+
 def _default_writer(plan_row):
     """Live writer for --apply. Behind AGENT_ACCOUNT_KEY_RECONCILE (default OFF): a no-op
     return when the flag is dark, so --apply is safe even if run by accident. When armed,
@@ -174,6 +258,12 @@ def _default_writer(plan_row):
     new_key = (str(plan_row.get("canonical") or "")).strip()
     if not gid or not new_key or new_key in ("(error)", "(none)"):
         return False, "nothing to write"
+    # LAST LINE OF DEFENCE. reconcile() already skips a BLOCKED row, but the guard also
+    # lives here so no caller (a script, a future job, a hand-run) can re-point a gym
+    # that owns data by going straight to the writer. See blocking_data for the hazard.
+    blocked = blocking_data((str(plan_row.get("current") or "")).strip())
+    if blocked:
+        return False, f"BLOCKED: {blocked}"
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
@@ -194,13 +284,18 @@ def _default_writer(plan_row):
 
 # ---- sweep ------------------------------------------------------------------------
 
-def reconcile(gym_id=None, apply=False, *, reader=None, writer=None, logger=None):
+def reconcile(gym_id=None, apply=False, *, reader=None, writer=None, logger=None,
+              data_counter=None):
     """Reconcile ONE gym (gym_id set) or the whole fleet (gym_id None). Dry-run unless
     apply=True. Returns a summary {ok, apply, plan:[...], applied:[...]}. Never raises out.
 
-    apply=True writes ONLY the rows whose change is True and status is not ERROR, each via the
-    writer (itself flag-gated + gym_id-scoped). Idempotent: an already-canonical fleet plans
-    all-OK and writes nothing."""
+    apply=True writes ONLY the rows whose change is True, whose status is not ERROR, and
+    whose CURRENT key owns no data (see blocking_data: the write moves the pointer and
+    never the data, so re-pointing a gym that has sources / calendar rows / a voice doc /
+    a library would strand all of it). A blocked row is reported as status BLOCKED with
+    the reason, never silently skipped. Each write goes via the writer (itself flag-gated,
+    gym_id-scoped, and guarded again). Idempotent: an already-canonical fleet plans all-OK
+    and writes nothing. data_counter is injectable so the guard is testable offline."""
     log = logger or (lambda m: print(f"[account-key-reconcile] {m}"))
     reader = reader or _default_reader
     records = reader() or []
@@ -217,6 +312,20 @@ def reconcile(gym_id=None, apply=False, *, reader=None, writer=None, logger=None
         writer = writer or _default_writer
         for row in plan:
             if row.get("change") and row.get("status") != "ERROR":
+                # A gym that already owns data is never re-pointed: the write moves the
+                # pointer and leaves every source, calendar row, voice doc and media
+                # folder behind under the old key. Reported as its own status so the
+                # operator sees WHY it was skipped rather than a silent no-write.
+                blocked = blocking_data((str(row.get("current") or "")).strip(),
+                                        counter=data_counter)
+                if blocked:
+                    row["status"] = "BLOCKED"
+                    row["error"] = blocked
+                    applied.append({"gym_id": row["gym_id"],
+                                    "canonical": row["canonical"],
+                                    "ok": False, "detail": f"BLOCKED: {blocked}"})
+                    log(f"skip {row['gym_id']}: {blocked}")
+                    continue
                 ok, detail = writer(row)
                 applied.append({"gym_id": row["gym_id"], "canonical": row["canonical"],
                                 "ok": ok, "detail": detail})
