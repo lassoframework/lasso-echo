@@ -93,16 +93,47 @@ def _sort_ambiguous(assets, gym_id, log):
     except Exception:  # noqa: BLE001
         return 0
     enqueued = 0
+    auto_sorted = 0
+    default_on = config.sort_ambiguous_default_enabled()
     for a in assets:
         try:
             sig = _sc.gather_signals(a)                 # metadata only (no OCR/probe here)
             verdict = _sc.classify(sig)                 # ledger guard runs inside classify
             if verdict.verdict == _sc.AMBIGUOUS:
+                # SELF-RUNNING SORT (Blake 2026-08-31: "the only human thing should be
+                # the gym approving the post" — a 774-file 'Sort these' queue is a staff
+                # task). When armed, Echo DECIDES ambiguous files instead of queueing:
+                # lean finished only on a real finished signal (edit-suite filename, or
+                # a finished score actually beating raw); everything else is treated as
+                # RAW — the safe side, because a finished graphic mis-read as raw is
+                # still caught downstream by the infographic guard before any caption
+                # burn, while a raw clip mis-read as finished would post unedited. The
+                # decision is written through the SAME resolve path a human tap uses
+                # (audited as echo-auto-sort), and the portal media tab remains a
+                # per-file OVERRIDE, not a chore.
+                if default_on:
+                    lane = "finished" if (
+                        _sc.edited_filename(a.get("title") or "")
+                        or verdict.finished_score > verdict.raw_score) else "raw"
+                    _q.enqueue(gym_id, a.get("id") or "", reasons=verdict.reasons,
+                               verdict=verdict.verdict)
+                    _lane, err = _q.resolve(gym_id, a.get("id") or "", lane,
+                                            resolved_by="echo-auto-sort")
+                    if err:
+                        # could not persist the decision: fall back to the human queue
+                        # rather than lose the file entirely.
+                        enqueued += 1
+                    else:
+                        auto_sorted += 1
+                    continue
                 if _q.enqueue(gym_id, a.get("id") or "", reasons=verdict.reasons):
                     enqueued += 1
         except Exception as e:  # noqa: BLE001 - one bad file never sinks the sort
             log(f"classifier sort failed for {a.get('title')!r}: "
                 f"{type(e).__name__}: {e}")
+    if auto_sorted:
+        log(f"auto-sorted {auto_sorted} ambiguous file(s) (echo-auto-sort; portal "
+            "media tab can re-tag any of them)")
     return enqueued
 
 

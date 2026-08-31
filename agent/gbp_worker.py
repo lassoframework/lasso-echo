@@ -61,6 +61,16 @@ def publish_gbp_row(row, connection, *, client, draft=True):
     draft=True (autonomous build + validation) sends isDraft — Zernio stores it and
     publishes NOTHING. The armed worker passes draft=False, human-tap gated upstream."""
     caption = row.get("caption") or ""
+    # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG '[why]' leak, 2026-08-23): a
+    # bracketed meta block after the real caption is stripped here so GBP can never
+    # ship internal reasoning; an ALL-meta caption strips to "" and fails the empty
+    # caption rail below (failed + reject_reason, a human rewrites it — never silent).
+    from . import post_quality as _pq
+    _body, _meta = _pq.split_meta_suffix(caption)
+    if _meta:
+        caption = _body.strip()
+        row = dict(row)
+        row["caption"] = caption
     # §7.1 re-validate the hard rails (no dash/hashtag/phone, image present, length).
     # city is a planner-time signal; at send we enforce the platform hard rules only.
     issues = gbp.caption_issues(caption)

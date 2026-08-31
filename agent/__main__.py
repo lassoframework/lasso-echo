@@ -143,6 +143,8 @@ def _status():
     print(f"  zernio_profile_link: {config.zernio_profile_link_enabled()}  (env AGENT_ZERNIO_PROFILE_LINK; once per loop, backfill gyms.zernio_profile_id (the PUBLISHER's profile id) for any client gym missing it by matching the Zernio profile name to the base, also storing the connected FB page id; reads Zernio + writes the gyms row only, NEVER publishes; idempotent, never overwrites a set id — fixes a connected gym that silently never published, e.g. Pierce 2026-08-24)")
     from .publish_billing_gate import gate_enabled as _billgate_enabled
     print(f"  publish_billing_gate: {_billgate_enabled()}  (env AGENT_PUBLISH_BILLING_GATE; hold a CLIENT gym's publishing when Stripe shows its subscription CANCELED — positive evidence only, every doubt fails OPEN so a paying gym is never held; kv-cached ~6h; one deduped alert per flip; read-only against Stripe, never touches billing)")
+    print(f"  expired_auto_redate: {config.expired_auto_redate_enabled()}  (env AGENT_EXPIRED_AUTO_REDATE; SELF-HEAL rows that aged past the catch-up window: re-date each onto the next open future day (approvals preserved, one move per row, today+31 horizon cap, 12/gym per sweep); an UNAPPROVED row that expires twice is retired; only what cannot move still asks a human. OFF => alert-only watchdog)")
+    print(f"  sort_ambiguous_default: {config.sort_ambiguous_default_enabled()}  (env AGENT_SORT_AMBIGUOUS_DEFAULT; SELF-RUNNING media sort: Echo decides every ambiguous raw-vs-finished file itself (finished only on a real finished signal, else RAW — the recoverable side) via the same resolve path a human tap uses; the portal media tab stays a per-file override. OFF => ambiguous files queue for a human)")
     from .client_infographic_fill import fill_enabled as _igfill_enabled
     print(f"  client_infographic_fill: {_igfill_enabled()}  (env AGENT_CLIENT_INFOGRAPHIC_FILL; when a client gym has NO fresh photos left for upcoming days, generate on-brand nano INFOGRAPHIC posts from its own APPROVED sources to fill the gaps (Blake 2026-08-25: 'if they dont upload, scan their website and make an infographic') — pending rows, approval-gated, capped per run, never replaces a photo day; OFF => days simply stay empty as before)")
     print(f"  client_media_sync: {config.client_media_sync_enabled()}  (env AGENT_CLIENT_MEDIA_SYNC; daily, pull each onboarded client gym's uploaded photos/videos out of R2 into its content library, then build its DRAFT month from its REAL media if it has media + approved sources + no calendar yet; client calendars are DRAFTS, never published; needs AGENT_CLIENT_MONTH + AGENT_CLIENT_SOURCES too)")
@@ -157,6 +159,7 @@ def _status():
     print(f"  onboarding_watch: {config.onboarding_watch_enabled()}  (env AGENT_ONBOARDING_WATCH; alerts when a gym the portal knows is not set up to post)")
     print(f"  onboarding_autoreg: {config.onboarding_autoregister_enabled()}  (env AGENT_ONBOARDING_AUTOREGISTER; lets that watch ACT on not_registered — adds the gym to the dynamic registry under the portal's own key, using its REAL name only; inactive record, no tokens/connection/publish)")
     print(f"  intake_autoapp : {config.intake_auto_approve()}  (env AGENT_INTAKE_AUTO_APPROVE; a gym's own intake answers land approved, not queued)")
+    print(f"  website_intake : {config.website_auto_intake_enabled()}  (env AGENT_WEBSITE_AUTO_INTAKE; a client gym with ZERO client_sources gets a CITED source bundle read off its OWN website — verbatim facts with page-URL citations, invented numbers dropped by the caption digit gate — landed via the standard intake path (pending unless AGENT_INTAKE_AUTO_APPROVE) plus a durable voice doc when none exists; a gym with any sources is skipped; no publish)")
     print(f"  event_lead_days: {config.event_lead_days()}  (env AGENT_EVENT_LEAD_DAYS; how many days before an event its promo arc opens)")
     print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
@@ -812,6 +815,7 @@ _COMMANDS = {
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
+        ("website-intake", "auto-intake a gym's sources from its OWN website (--account <base> [--domain x.com] [--force])"),
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
@@ -2486,6 +2490,37 @@ def main(argv=None):
                 print(f"{_acct}: no pending sources")
             for s in rows:
                 print(f"  [{s.id}] {s.category}: {s.text[:100]} ({s.citation})")
+    elif cmd == "website-intake":
+        # WEBSITE AUTO-INTAKE, one gym by hand (the runner sweep is the automatic
+        # lane): read a cited source bundle off the gym's OWN website and land it
+        # through the standard intake path. Skips a gym that already has sources
+        # unless --force; the landing status follows AGENT_INTAKE_AUTO_APPROVE.
+        from . import website_intake as _wi
+        _args = argv[1:]
+        _acct, _dom = "", None
+        _force = "--force" in _args
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--domain" and i + 1 < len(_args):
+                _dom = _args[i + 1]; i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent website-intake --account <base> "
+                  "[--domain x.com] [--force]")
+        else:
+            out = _wi.intake_from_website(_acct, domain=_dom, force=_force)
+            if out.get("ok"):
+                print(f"{_acct}: landed {out['landed']} {out['status']} source(s) "
+                      f"from {out['domain']} "
+                      f"(categories: {', '.join(out['categories'])})")
+                print(f"  {out['bible']}")
+                if out["status"] == "pending":
+                    print(f"  approve with: python -m agent approve-sources "
+                          f"--account {_acct}_ig --all")
+            else:
+                print(f"{_acct}: not intaken: {out.get('reason')}")
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])

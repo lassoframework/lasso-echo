@@ -83,6 +83,12 @@ def caption_issues(caption, city=""):
         issues.append("caption contains a dash (no-dash copy law)")
     if _SCAFFOLD_RE.match(cap):
         issues.append("caption starts with LLM scaffolding, not real copy")
+    # shared with the feed gate (post_quality): a bracketed edit-rationale label
+    # ([why]/[reason]/[edit]/[note]) is internal reasoning, never client copy.
+    from .post_quality import _EDIT_META_RE as _meta_re
+    if _meta_re.search(cap):
+        issues.append("caption carries an internal edit-rationale block "
+                      "(a bracketed meta-label like [why]), not client copy")
     if _HASHTAG_RE.search(cap):
         issues.append("caption contains a hashtag (GBP forbids hashtags)")
     if has_phone(cap):

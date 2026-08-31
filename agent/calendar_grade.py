@@ -145,7 +145,16 @@ def _consistency(rows, defects) -> int:
     # hash seen on MORE THAN ONE date is a true duplicate (-8 per extra date).
     dates_by_hash: dict = {}
     for row in rows:
-        cap = row.get("caption") or ""
+        cap = (row.get("caption") or "").strip()
+        # EMPTY captions are BY DESIGN, never duplicates (2026-08-31: hash("") counted
+        # LASSO's captionless story book + GBP photo posts as 'repeated 30 times',
+        # zeroed consistency, and the dedupe purge then DENIED 100+ healthy rows on the
+        # same primitive). A story's caption lives burned on its media and a GBP photo
+        # post has no caption; matching nothing-to-nothing says nothing about repeats.
+        if not cap:
+            continue
+        if str(row.get("format") or "").strip().lower() == "story":
+            continue          # a story shares its paired feed's caption by design
         h = caption_hash(cap)
         d = str(row.get("post_date") or "")[:10]
         dates_by_hash.setdefault(h, set()).add(d)
@@ -217,15 +226,27 @@ def _content_mix(rows, profile, quotas, defects) -> int:
             defects.append(("content_mix", cat, f"{cat} is {pct:.0%} of posts (over 25%)"))
             score -= 3
 
-    # Check unbacked proof/results slots
+    # Check unbacked proof/results slots. LIVE-SHAPE FIX (2026-08-31): the old check
+    # read `vision_derived` / `media_kind`, which are NOT columns on content_calendar
+    # (verified live: only `pillar` exists) — so EVERY proof/results row always flagged
+    # "unbacked", a phantom defect nothing could ever fix (ENG's book was held at F on
+    # three of these). A proof slot is honestly judged from what a row actually
+    # carries: it is unbacked only when it has NO real media attached (empty image_url)
+    # and no Drive-sourced asset. Rows that DO carry vision_derived/media_kind (test
+    # fakes, a future migration) still honor them.
     for row in rows:
         cat = (row.get("pillar") or row.get("category") or "").lower()
         if cat in ("proof", "results", "social_proof"):
-            vision_derived = row.get("vision_derived", False)
+            if row.get("vision_derived", False):
+                continue
             media_kind = row.get("media_kind", "")
-            if not vision_derived and media_kind not in ("photo", "video"):
+            if media_kind in ("photo", "video"):
+                continue
+            has_media = bool((row.get("image_url") or "").strip()
+                             or (row.get("source_media_asset_id") or "").strip())
+            if not has_media:
                 defects.append(("content_mix", row.get("post_date", ""),
-                                "proof/results slot unbacked (no vision-derived media)"))
+                                "proof/results slot unbacked (no media on the row)"))
                 score -= 4
 
     return max(0, score)

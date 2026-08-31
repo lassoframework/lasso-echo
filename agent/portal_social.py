@@ -756,12 +756,36 @@ def _clean_edit_note(note):
         return note or ""
 
 
+def _split_note_meta(note, reason=""):
+    """Split a trailing edit-rationale meta block off an EDIT note BEFORE it is saved
+    as the caption (CrossFit ENG live leak, 2026-08-23: a caption published ending with
+    '[why] Removed word parents and added people ...'). A note pasted as
+    'new caption [why] because ...' stores ONLY the caption body; the rationale moves
+    into the edit's `reason` (the brain's rule slot) when the approver did not send one
+    separately — the reason lives in its own field, never in the caption. A note that
+    is ALL meta returns "" so the normal empty-note validation refuses it (held for the
+    human, never silently saved). Returns (note_body, reason)."""
+    from . import post_quality
+    body, meta = post_quality.split_meta_suffix(note or "")
+    if not meta:
+        return note or "", reason or ""
+    if not (body or "").strip():
+        return "", reason or ""
+    if not (reason or "").strip():
+        # keep only the rationale text: drop the bracketed label itself
+        reason = post_quality._EDIT_META_RE.sub("", meta, count=1).strip()
+    return body.strip(), reason or ""
+
+
 def _handle_edit_supabase(account_key, draft_id, actor_id, note, reader, sb_store,
                           reason=""):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
         return short
     note = _clean_edit_note(note)
+    # a '[why] ...' rationale pasted into the note is captured as the reason, never
+    # saved into the caption (the ENG 2026-08-23 leak class, closed at the source).
+    note, reason = _split_note_meta(note, reason)
     # the fabrication gate runs BEFORE any store touch: an unsupported claim is refused
     # 422 whether or not the row exists, so a stat can never reach the caption. Gated
     # against THIS gym's own approved claims (LASSO globals only for LASSO itself).

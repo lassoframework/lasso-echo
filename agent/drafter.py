@@ -208,6 +208,24 @@ def _strip_llm_scaffold(text):
     # unwrap surrounding quotes if the whole body is quoted
     if len(out) >= 2 and out[0] in "\"'“”" and out[-1] in "\"'“”":
         out = out[1:-1].strip()
+    # TRAILING EDIT-RATIONALE BLOCK (CrossFit ENG live leak, 2026-08-23 00:02 ET): the
+    # model sometimes APPENDS its reasoning as a bracketed meta-label ("[why] Removed
+    # word parents and added people ..."). The head-strip above cannot catch a trailing
+    # block, and that is exactly what published to a real gym's page. The rationale is
+    # prompt exhaust, never caption copy: keep only the body. An output that is ALL
+    # meta returns "" so the caller's empty-response fallback takes over (a template
+    # caption beats publishing scaffolding).
+    from . import post_quality as _pq
+    body, meta = _pq.split_meta_suffix(out)
+    if meta:
+        if not body.strip():
+            print("[sb7] LLM output was only an edit-rationale meta block; "
+                  "discarding it (the fallback will produce the caption)")
+            return ""
+        print(f"[sb7] stripped a trailing edit-rationale meta block "
+              f"({len(meta)} chars) from the LLM output; a reason never "
+              "belongs in the caption")
+        out = body.strip()
     return out
 
 
@@ -420,6 +438,9 @@ class StoryBrandGenerator:
         "hook. Be punchy and direct.\n"
         "- Body max 260 characters (hashtags and CTA appended separately).\n"
         "- Output ONLY the caption body text. No CTA. No hashtags. No quotes.\n"
+        "- Never explain your choices. No trailing rationale and no bracketed "
+        "meta labels such as [why], [reason], [edit], or [note]. The output ends "
+        "with the caption's final sentence.\n"
         "- Never mention specific numbers, percentages, or prices unless they appear "
         "verbatim in the client note."
     )

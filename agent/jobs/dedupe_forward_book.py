@@ -78,18 +78,32 @@ def find_duplicates(rows: list[dict]) -> tuple[list[dict], list[dict]]:
         equals the original list in some order.
     """
     by_hash: dict[str, list[dict]] = collections.defaultdict(list)
-    for row in rows:
-        h = caption_hash(row.get("caption") or "")
-        by_hash[h].append(row)
-
     keepers: list[dict] = []
     duplicates: list[dict] = []
+    for row in rows:
+        cap = (row.get("caption") or "").strip()
+        # EMPTY captions and STORIES are structure, never duplicates (2026-08-31: this
+        # job denied LASSO's entire forward book — 112 paired/captionless stories, 89
+        # Facebook MIRRORS of kept feeds, 2 captionless GBP photos — because hash("")
+        # matches hash("") and a cross-posted sibling shares its feed's caption BY
+        # DESIGN). A story is governed by its paired feed; a captionless row carries
+        # its content on the media. Neither may ever be purged as a 'duplicate'.
+        if not cap or str(row.get("format") or "").strip().lower() == "story":
+            keepers.append(row)
+            continue
+        by_hash[caption_hash(cap)].append(row)
 
     for _hash, group in by_hash.items():
-        # Sort: earliest post_date first, then smallest id as tiebreak.
-        sorted_group = sorted(group, key=lambda r: (r.get("post_date") or "", str(r.get("id") or "")))
-        keepers.append(sorted_group[0])
-        duplicates.extend(sorted_group[1:])
+        # ONE POST SPANS SEVERAL SAME-DATE ROWS by design (a feed cross-posts to
+        # Instagram AND Facebook). Only a LATER DATE repeating the caption is a true
+        # duplicate: keep EVERY row on the earliest date, deny rows on later dates.
+        earliest = min(str(r.get("post_date") or "") for r in group)
+        for r in sorted(group, key=lambda r: (r.get("post_date") or "",
+                                              str(r.get("id") or ""))):
+            if str(r.get("post_date") or "") == earliest:
+                keepers.append(r)
+            else:
+                duplicates.append(r)
 
     return keepers, duplicates
 

@@ -395,6 +395,80 @@ def _alert_story_needs_render(row_id, gym_id):
         pass  # an alert failure must never block the publish lane
 
 
+def _alert_meta_leak_held(row_id, gym_id):
+    """One deduped ops alert per row when a due caption is HELD because it is ALL
+    edit-rationale scaffolding (a bracketed [why]/[reason] block with no real caption
+    body left to publish). Stripping would ship an empty caption, so a human must
+    rewrite it. Deduped in the shared kv so the ~1-min retry never storms."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_held_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: row {row_id} HELD at the publish boundary — its caption is "
+            "only an internal edit-rationale block ([why]/[reason] scaffolding) with "
+            "no real caption body to publish. A human needs to rewrite the caption; "
+            "it retries every tick once fixed.")
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _note_meta_stripped(row_id, gym_id):
+    """One deduped ops notice per row when the final gate SELF-HEALED a caption by
+    stripping a trailing edit-rationale block before the network call (the CrossFit
+    ENG '[why]' leak class). The post still publishes — this is visibility, not a
+    hold — so a human can trace which lane keeps producing scaffolding."""
+    try:
+        from . import db, ops_alerts
+        key = f"metaleak_stripped_{gym_id}_{row_id}"
+        if db.kv_get(key):
+            return
+        db.kv_set(key, "1")
+        ops_alerts.alert(
+            f"{gym_id}: row {row_id} carried an internal edit-rationale block "
+            "([why]/[reason] scaffolding) after the real caption. Echo stripped it "
+            "at the publish boundary and published the clean caption body.")
+    except Exception:
+        pass  # an alert failure must never block the publish lane
+
+
+def _strip_or_hold_meta(row, gym_id, store):
+    """FINAL GATE for internal edit-rationale blocks (CrossFit ENG live FB post,
+    2026-08-23 00:02 ET: a caption published ending with '[why] Removed word parents
+    and added people ...'). Runs UNCONDITIONALLY on every row about to publish —
+    unlike the publish_guard recheck this is not behind AGENT_CALENDAR_GRADE, because
+    this class of leak must never be publishable under any flag combination.
+
+    A clean SUFFIX (real caption body, then the meta block) is STRIPPED and the clean
+    body publishes this tick — the self-heal Blake wants, no human tap. The stripped
+    caption is persisted through the STATUS-PRESERVING patch (patch_caption would
+    reset an approved row to pending and un-approve it); a patch failure still
+    publishes the clean body (the local row is authoritative for THIS send). An
+    all-meta caption returns None: the caller HOLDS the row (never claimed) and
+    alerts once. Story rows heal too: cleaning the row's caption makes the burned
+    media read stale, so the existing reburn lane re-renders it with clean words."""
+    from . import post_quality
+    body, meta = post_quality.split_meta_suffix(row.get("caption") or "")
+    if not meta:
+        return row
+    if not (body or "").strip():
+        return None
+    patched = None
+    try:
+        patcher = getattr(store, "patch_caption_preserve_status", None)
+        if patcher is not None:
+            patched = patcher(row.get("gym_id") or gym_id, row.get("id"), body)
+    except Exception as e:  # noqa: BLE001 - persistence is best effort here
+        print(f"[calendar-autopublish] meta-strip caption patch failed for "
+              f"{row.get('id')}: {type(e).__name__}: {e}")
+    row = dict(patched or row)
+    row["caption"] = body   # what we SEND is clean even when the patch failed
+    _note_meta_stripped(row.get("id"), gym_id)
+    return row
+
+
 def _planned_mentions(caption, gym_id, category):
     """Every @handle the OUTBOUND caption will carry: the @handles already in the
     caption text PLUS the allowlisted handles the zernio publisher appends for
@@ -655,6 +729,18 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                     pass
             skipped.append(row_id)
             continue
+
+        # INTERNAL EDIT-RATIONALE FINAL GATE (CrossFit ENG, 2026-08-23): a caption
+        # carrying a bracketed meta block ([why]/[reason]/...) never reaches the
+        # network. Clean suffix -> stripped and published (self-heal); all-meta ->
+        # held + one alert. BEFORE the story-stale check on purpose: a cleaned story
+        # caption then mismatches its burned media and the reburn lane re-renders it.
+        cleaned = _strip_or_hold_meta(row, gym_id, store)
+        if cleaned is None:
+            waiting.append(row_id)
+            _alert_meta_leak_held(row_id, gym_id)
+            continue
+        row = cleaned
 
         # STORY CAPTION MUST BE ON THE MEDIA (Dale, 2026-08-17): a story publishes with
         # an EMPTY body, so its caption lives only on the rendered media. When a client
@@ -1172,6 +1258,33 @@ def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
     alerted = []
     today = now_dt.date().isoformat()
     for gym, gym_rows in sorted(by_gym.items()):
+        # SELF-HEAL FIRST (Blake 2026-08-31: "the only human thing should be the gym
+        # approving the post"): re-date expired rows into the next open future days
+        # instead of asking a human to. Only when it cannot (flag off, no open days,
+        # store error) does the old ask-a-human digest fire.
+        if config.expired_auto_redate_enabled():
+            try:
+                moved, retired = _auto_redate_expired(gym, gym_rows, store, kv, now_dt)
+            except Exception as e:  # noqa: BLE001 - self-heal never crashes the sweep
+                print(f"[calendar-autopublish] expired auto-redate failed for {gym}: "
+                      f"{type(e).__name__}: {e}")
+                moved, retired = [], []
+            handled = {r.get("id") for r in moved} | {r.get("id") for r in retired}
+            gym_rows = [r for r in gym_rows if r.get("id") not in handled]
+            if moved or retired:
+                bits = []
+                if moved:
+                    span = f"{moved[0]['new_date']}..{moved[-1]['new_date']}" \
+                        if len(moved) > 1 else moved[0]["new_date"]
+                    bits.append(f"re-dated {len(moved)} expired row(s) into open "
+                                f"day(s) {span} (approvals preserved)")
+                if retired:
+                    bits.append(f"retired {len(retired)} unapproved row(s) that "
+                                "expired twice")
+                alert(f"{gym}: {'; '.join(bits)}. No action needed.")
+            if not gym_rows:
+                alerted.append(gym)
+                continue
         key = f"expired_rows_{gym}_{today}"
         try:
             if kv.get(key, ""):
@@ -1191,6 +1304,74 @@ def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
             pass
         alerted.append(gym)
     return alerted
+
+
+REDATE_HORIZON_DAYS = 31        # plan-horizon law: never stage past today+31
+REDATE_MAX_PER_GYM = 12         # per sweep, so a huge backlog drips over passes
+
+
+def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
+    """Move a gym's expired waiting rows onto the next OPEN future days (one per
+    (account, format) per day, tomorrow .. today+31), preserving status so an approved
+    post still publishes without re-approval. Each row is re-dated ONCE (kv marker); a
+    row that expires a SECOND time was re-dated into the future and STILL never went
+    out (held/failed repeatedly) or was never approved — an APPROVED second expiry gets
+    one more chance forward (the gym said yes; we never drop it silently), while an
+    UNAPPROVED second expiry is retired ('killed' + reject_reason) so the book stays
+    clean. Returns (moved, retired) lists of {id, new_date} dicts."""
+    from datetime import date as _date
+    list_month = getattr(store, "list_month", None)
+    patch = getattr(store, "patch_post_date", None)
+    if list_month is None or patch is None:
+        return [], []
+    today = now_dt.date()
+    horizon = [today + timedelta(days=i) for i in range(1, REDATE_HORIZON_DAYS + 1)]
+    months = sorted({d.isoformat()[:7] for d in horizon})
+    occupied = set()
+    for month in months:
+        for r in (list_month(gym, month) or []):
+            if str(r.get("status") or "").lower() in ("denied", "killed", "deleted"):
+                continue
+            occupied.add((str(r.get("account") or "").lower(),
+                          str(r.get("format") or "feed").lower(),
+                          str(r.get("post_date") or "")[:10]))
+    moved, retired = [], []
+    for row in sorted(gym_rows, key=lambda r: str(r.get("post_date") or "")):
+        if len(moved) >= REDATE_MAX_PER_GYM:
+            break
+        rid = row.get("id")
+        status = str(row.get("status") or "").lower()
+        already = ""
+        try:
+            already = kv.get(f"redated_{rid}", "")
+        except Exception:  # noqa: BLE001
+            pass
+        if already and status != "approved":
+            # second expiry, never approved: retire it so the book clears itself.
+            try:
+                if store.set_status(gym, rid, "killed") is not None:
+                    retired.append({"id": rid, "new_date": ""})
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        acct = str(row.get("account") or "").lower()
+        fmt = str(row.get("format") or "feed").lower()
+        slot_day = next((d for d in horizon
+                         if (acct, fmt, d.isoformat()) not in occupied), None)
+        if slot_day is None:
+            continue                              # book is full: leave for the digest
+        try:
+            if patch(rid, slot_day.isoformat()) is None:
+                continue                          # raced (claimed/published): skip
+        except Exception:  # noqa: BLE001
+            continue
+        occupied.add((acct, fmt, slot_day.isoformat()))
+        moved.append({"id": rid, "new_date": slot_day.isoformat()})
+        try:
+            kv.set(f"redated_{rid}", "1")
+        except Exception:  # noqa: BLE001
+            pass
+    return moved, retired
 
 
 def publish_client_gyms(run_date, *, store=None, notifier=None, now=None,

@@ -424,3 +424,42 @@ def test_content_mix_off_sprint_summit_still_capped():
     defects = []
     cg._content_mix(rows, "B2B", None, defects)
     assert any(d[1] == "summit" for d in defects), "off-sprint summit must still cap"
+
+
+def test_empty_and_story_captions_never_count_as_duplicates():
+    """2026-08-31: hash('') zeroed LASSO's consistency ('repeated 30 times') over its
+    captionless story book + GBP photos, and stories share their paired feed's caption
+    BY DESIGN. Neither may ever count as a duplicate."""
+    from agent.calendar_grade import grade_month
+    rows = []
+    for d in range(1, 11):
+        day = f"2026-09-{d:02d}"
+        rows.append({"post_date": day, "account": "instagram", "format": "feed",
+                     "caption": f"Unique caption number {d} with plenty of words to "
+                                "clear the craft floor. Book your intro session.",
+                     "pillar": "service" if d % 2 else "about"})
+        rows.append({"post_date": day, "account": "instagram", "format": "story",
+                     "caption": "", "pillar": "service"})          # captionless story
+    g = grade_month(rows, profile="GYM")
+    assert not any("repeated" in str(d[2]) for d in g.defects), \
+        "captionless stories must never register as duplicate captions"
+
+
+def test_proof_slot_backing_judged_from_real_row_shape():
+    """2026-08-31: vision_derived/media_kind are NOT content_calendar columns, so every
+    proof/results row flagged 'unbacked' forever (a phantom that held ENG at F). A proof
+    slot with real media on the row is BACKED; only a media-less one is a defect."""
+    from agent.calendar_grade import grade_month
+    base = {"account": "instagram", "format": "feed",
+            "caption": "Real member results and the coaching that earned them. Ask us "
+                       "how to start your own twelve week block today."}
+    rows = [
+        dict(base, post_date="2026-09-01", pillar="proof",
+             image_url="https://r2/real_member_photo.jpg"),          # backed
+        dict(base, post_date="2026-09-02", pillar="results",
+             image_url="", source_media_asset_id="drive123"),        # backed (Drive)
+        dict(base, post_date="2026-09-03", pillar="proof", image_url=""),   # unbacked
+    ]
+    g = grade_month(rows, profile="GYM")
+    unbacked = [d for d in g.defects if "unbacked" in str(d[2])]
+    assert len(unbacked) == 1 and unbacked[0][1] == "2026-09-03"

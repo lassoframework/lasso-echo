@@ -159,3 +159,22 @@ def test_no_profile_is_skipped():
     out = gcs.sync_gbp_connections(store=store, zernio=z, clients=["eng"])
     assert out["skipped"] == 1
     assert store.upserts == []
+
+
+# ---- tz inference is SELF-RUNNING (Blake 2026-08-31: no VERIFY tasks) --------------
+
+def test_tz_split_zone_states_use_dominant_zone():
+    from agent.gbp_conn_sync import _tz_from_address
+    assert _tz_from_address(
+        "150 Russell Lane Building 4, Dripping Springs, TX") == "America/Chicago"
+    assert _tz_from_address("123 Main St, Nashville, TN 37201") == "America/Chicago"
+    assert _tz_from_address("9 Elm, Louisville, KY 40202") == "America/New_York"
+    assert _tz_from_address("1 A St, Indianapolis, IN 46204") == \
+        "America/Indiana/Indianapolis"
+
+
+def test_tz_off_zone_metros_are_corrected():
+    from agent.gbp_conn_sync import _tz_from_address
+    assert _tz_from_address("500 N Mesa, El Paso, TX 79901") == "America/Denver"
+    assert _tz_from_address("12 Beach Rd, Pensacola, FL") == "America/Chicago"
+    assert _tz_from_address("77 Gay St, Knoxville, TN") == "America/New_York"

@@ -1390,3 +1390,83 @@ def test_daily_cap_hit_alert_rearms_on_a_new_day(armed, monkeypatch):
     cap.publish_due(day2, store=store2, publisher=pub,
                     now="2026-08-11T23:59:00-04:00", catch_all=True, daily_cap=1)
     assert len(sent) == 2
+
+
+# ---- expired-row SELF-HEAL (Blake 2026-08-31: no human re-dating) -----------------
+
+class _RedateStore(_ExpiredStore):
+    """Expired store + the re-date surface: list_month (occupied days), patch_post_date,
+    set_status. Tracks every write."""
+
+    def __init__(self, rows, occupied=()):
+        super().__init__(rows)
+        self._occupied = list(occupied)      # rows already on the future book
+        self.redates = []                    # (row_id, new_date)
+        self.status_sets = []                # (row_id, status)
+
+    def list_month(self, gym, month):
+        return [dict(r) for r in self._occupied
+                if str(r.get("post_date", "")).startswith(month)]
+
+    def patch_post_date(self, row_id, new_date):
+        self.redates.append((row_id, new_date))
+        return {"id": row_id, "post_date": new_date}
+
+    def set_status(self, gym, row_id, status):
+        self.status_sets.append((row_id, status))
+        return {"id": row_id, "status": status}
+
+
+def test_expired_rows_self_heal_redate(monkeypatch):
+    """Armed: expired rows are RE-DATED onto the next open days (approvals preserved),
+    the digest says 'No action needed', and NO ask-a-human alert fires."""
+    monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    rows = [
+        {"id": "a", "gym_id": "lasso", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-07", "status": "approved"},
+        {"id": "b", "gym_id": "lasso", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-08", "status": "approved"},
+    ]
+    # 08-31 is occupied for (instagram, feed) -> first open day is 09-01
+    occupied = [{"account": "instagram", "format": "feed",
+                 "post_date": "2026-08-31", "status": "pending"}]
+    store, kv, seen = _RedateStore(rows, occupied), _MemKV(), []
+    out = cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                                 now="2026-08-30T12:00:00")
+    assert out == ["lasso"]
+    assert store.redates == [("a", "2026-09-01"), ("b", "2026-09-02")]
+    assert store.status_sets == []                       # nothing retired
+    assert len(seen) == 1 and "No action needed" in seen[0]
+    assert "re-dated 2" in seen[0]
+    assert not any("Re-date them to publish" in m for m in seen)   # no human ask
+
+
+def test_expired_unapproved_twice_is_retired(monkeypatch):
+    """A PENDING row that already got its one re-date and expired AGAIN is retired
+    (killed); an APPROVED second expiry gets another chance forward (never dropped)."""
+    monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    rows = [
+        {"id": "p1", "gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-10", "status": "pending"},
+        {"id": "ap1", "gym_id": "gritx", "account": "facebook", "format": "feed",
+         "post_date": "2026-08-10", "status": "approved"},
+    ]
+    store, kv, seen = _RedateStore(rows), _MemKV(), []
+    kv.set("redated_p1", "1")                            # both expired once before
+    kv.set("redated_ap1", "1")
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                           now="2026-08-30T12:00:00")
+    assert store.status_sets == [("p1", "killed")]       # unapproved: retired
+    assert [rid for rid, _ in store.redates] == ["ap1"]  # approved: moved again
+    assert any("retired 1" in m for m in seen)
+
+
+def test_expired_flag_off_keeps_alert_only(monkeypatch):
+    monkeypatch.delenv("AGENT_EXPIRED_AUTO_REDATE", raising=False)
+    rows = [{"id": "x", "gym_id": "lasso", "account": "instagram", "format": "feed",
+             "post_date": "2026-08-07", "status": "approved"}]
+    store, kv, seen = _RedateStore(rows), _MemKV(), []
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                           now="2026-08-30T12:00:00")
+    assert store.redates == [] and store.status_sets == []
+    assert len(seen) == 1 and "Re-date them to publish" in seen[0]

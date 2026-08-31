@@ -357,8 +357,17 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
                 # (audit 2026-08-25: LASSO's global stats must not clear a client claim,
                 # and a dashed edit must not reach media).
                 from . import rotation as _rotation
-                from .portal_social import _clean_edit_note, _edit_gate_claims
+                from .portal_social import (_clean_edit_note, _edit_gate_claims,
+                                            _split_note_meta)
                 note = _clean_edit_note(note)
+                # a '[why] ...' rationale pasted into the note is captured as the
+                # reason, never saved into the caption (ENG 2026-08-23 leak class).
+                note, reason = _split_note_meta(note, reason)
+                if not note:
+                    return 400, {"ok": False, "action": "edit", "draft_id": draft_id,
+                                 "error": "the note is only an edit-rationale block "
+                                          "([why]/[reason]); send the new caption "
+                                          "text itself"}
                 if not _rotation.is_gate_clean(
                         note, approved_claims=_edit_gate_claims(account_key)):
                     return 422, {"ok": False, "action": "edit", "draft_id": draft_id,
@@ -410,6 +419,10 @@ def _handle_action_supabase(action, account_key, draft_id, note, reason="", gbp=
                 return 409, {"ok": False, "action": "requeue", "draft_id": draft_id,
                              "error": "only a failed post can be requeued"}
             before = row.get("caption") or ""
+            # same source rule as edit: a pasted rationale block moves to `reason`
+            # and can never re-enter the caption through a requeue.
+            from .portal_social import _split_note_meta
+            note, reason = _split_note_meta(note, reason)
             changed = bool((note or "").strip()) and note.strip() != before.strip()
             if changed:
                 from . import rotation as _rotation

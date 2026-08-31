@@ -829,6 +829,30 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"Zernio profile link failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # WEBSITE AUTO-INTAKE (Blake 2026-08-31: "the only human thing should be the gym
+    # approving the post"; 2026-08-25: "if they don't upload, scan their website"):
+    # a client gym with ZERO client_sources cannot draft, has nothing for dup-caption
+    # remediation to regenerate from, and blocks the gap/infographic fills. This lane
+    # reads the gym's OWN website into a cited source bundle through the standard
+    # intake path (pending unless AGENT_INTAKE_AUTO_APPROVE). Idempotent — a gym with
+    # any sources is skipped, and each gym alerts once per outcome — and isolated: a
+    # sweep failure never takes the draft run down.
+    if config.website_auto_intake_enabled():
+        try:
+            from .website_intake import run as _website_intake_run
+            wisum = _website_intake_run()
+            if wisum.get("ok"):
+                print(f"[website-intake] intaken {len(wisum.get('intaken', []))} "
+                      f"gym(s) ({wisum.get('landed', 0)} source(s)), "
+                      f"skipped {len(wisum.get('skipped', []))}, "
+                      f"failed {len(wisum.get('failed', []))}")
+            else:
+                print(f"[website-intake] skipped: {wisum.get('reason')}")
+        except Exception as e:
+            print(f"[website-intake] sweep failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"Website auto-intake sweep failed: "
+                             f"{type(e).__name__}: {e}. The draft run is unaffected.")
+
     # LASSO TAG ALLOWLIST REFRESH (AGENT_MENTIONS, OFF by default): once per day
     # (kv-stamped inside run_nightly), upsert LASSO's gym_tag_allowlist rows from
     # the LIVE Zernio client roster (own + partner handles) so the publish_guard

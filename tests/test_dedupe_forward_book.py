@@ -165,15 +165,19 @@ class TestFindDuplicates:
         assert keepers[0]["id"] == "id1"
         assert dupes[0]["id"] == "id2"
 
-    def test_tiebreak_on_id_when_same_date(self):
+    def test_same_date_siblings_are_one_post_never_duplicates(self):
+        """CONTRACT FIX (2026-08-31): a feed cross-posts to Instagram AND Facebook on
+        the SAME date — those rows are ONE post by design. The old tiebreak denied the
+        Facebook mirror of every kept feed (89 healthy LASSO mirrors were purged).
+        Only a LATER date repeating the caption is a true duplicate."""
         rows = [
             _row("id_b", "2026-09-01", "Same caption for tiebreak"),
             _row("id_a", "2026-09-01", "Same caption for tiebreak"),
+            _row("id_c", "2026-09-05", "Same caption for tiebreak"),   # true dup (later date)
         ]
         keepers, dupes = find_duplicates(rows)
-        # "id_a" < "id_b" lexicographically.
-        assert keepers[0]["id"] == "id_a"
-        assert dupes[0]["id"] == "id_b"
+        assert {k["id"] for k in keepers} == {"id_a", "id_b"}
+        assert [d["id"] for d in dupes] == ["id_c"]
 
     def test_hash_normalization_treated_as_duplicate(self):
         # These captions differ only by case and hashtag — same hash, so duplicate.
@@ -191,14 +195,20 @@ class TestFindDuplicates:
         assert keepers == []
         assert dupes == []
 
-    def test_none_caption_rows_grouped_together(self):
+    def test_empty_and_none_captions_are_never_duplicates(self):
+        """CONTRACT FIX (2026-08-31): hash('')==hash('') says nothing about repeats —
+        a story's caption lives burned on its media and a GBP photo post is captionless
+        BY DESIGN. The old grouping denied 112 healthy LASSO stories + 2 GBP photos as
+        'duplicates'. Empty/None captions (and stories) are always keepers."""
         rows = [
             _row("id1", "2026-09-01", None),
             _row("id2", "2026-09-02", None),
+            _row("id3", "2026-09-03", ""),
+            dict(_row("id4", "2026-09-04", "burned on media"), format="story"),
+            dict(_row("id5", "2026-09-08", "burned on media"), format="story"),
         ]
         keepers, dupes = find_duplicates(rows)
-        assert len(keepers) == 1
-        assert len(dupes) == 1
+        assert len(keepers) == 5 and dupes == []
 
 
 # ---------------------------------------------------------------------------

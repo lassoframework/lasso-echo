@@ -146,3 +146,63 @@ def test_run_stagger_and_deny_sweep(monkeypatch):
     assert res["sources"] == 2
     assert res["rolled_back"] == 2
     assert sleeps == [30.0]        # staggered once between the two sources
+
+
+# ---- SELF-RUNNING ambiguous sort (Blake 2026-08-31: no human sorting) ---------------
+
+def _ambiguous_asset(aid="amb1", title="1KEKvwEuXYpEwCkohfN7"):
+    """A Drive-ID-titled photo with no dims/signals: metadata-classifies AMBIGUOUS."""
+    return {"id": aid, "title": title, "kind": "photo", "content_hash": ""}
+
+
+def test_ambiguous_defaults_raw_via_auto_resolve(monkeypatch):
+    monkeypatch.setenv("AGENT_SORT_AMBIGUOUS_DEFAULT", "true")
+    calls = {"enq": [], "res": []}
+    from agent import story_sort_queue as q
+    monkeypatch.setattr(q, "enqueue", lambda g, a, **k: calls["enq"].append((g, a)) or True)
+    monkeypatch.setattr(q, "resolve",
+                        lambda g, a, lane, resolved_by="": (calls["res"].append(
+                            (g, a, lane, resolved_by)) or (lane, None)))
+    n = sync._sort_ambiguous([_ambiguous_asset()], "pierce", lambda m: None)
+    assert n == 0, "nothing queues for a human when the default is armed"
+    assert calls["res"] == [("pierce", "amb1", "raw", "echo-auto-sort")]
+
+
+def test_ambiguous_with_edit_stamp_defaults_finished(monkeypatch):
+    monkeypatch.setenv("AGENT_SORT_AMBIGUOUS_DEFAULT", "true")
+    from agent import story_sort_queue as q
+    res = []
+    monkeypatch.setattr(q, "enqueue", lambda g, a, **k: True)
+    monkeypatch.setattr(q, "resolve",
+                        lambda g, a, lane, resolved_by="": (res.append(lane) or (lane, None)))
+    # an edit-suite export name is a finished signal, but paired with a conflicting
+    # camera-ish nothing it can still land ambiguous at the metadata stage for photos
+    # with zero dims — the default must then lean FINISHED on the name.
+    asset = {"id": "amb2", "title": "final_export_v2", "kind": "photo", "content_hash": ""}
+    from agent import story_classifier as sc
+    sig = sc.gather_signals(asset)
+    verdict = sc.classify(sig)
+    if verdict.verdict == sc.AMBIGUOUS:       # only assert the default when ambiguous
+        sync._sort_ambiguous([asset], "pierce", lambda m: None)
+        assert res == ["finished"]
+
+
+def test_ambiguous_flag_off_still_queues_for_human(monkeypatch):
+    monkeypatch.delenv("AGENT_SORT_AMBIGUOUS_DEFAULT", raising=False)
+    from agent import story_sort_queue as q
+    enq, res = [], []
+    monkeypatch.setattr(q, "enqueue", lambda g, a, **k: enq.append(a) or True)
+    monkeypatch.setattr(q, "resolve",
+                        lambda g, a, lane, resolved_by="": (res.append(lane) or (lane, None)))
+    n = sync._sort_ambiguous([_ambiguous_asset()], "pierce", lambda m: None)
+    assert n == 1 and enq == ["amb1"] and res == []
+
+
+def test_auto_resolve_failure_falls_back_to_human_queue(monkeypatch):
+    monkeypatch.setenv("AGENT_SORT_AMBIGUOUS_DEFAULT", "true")
+    from agent import story_sort_queue as q
+    monkeypatch.setattr(q, "enqueue", lambda g, a, **k: True)
+    monkeypatch.setattr(q, "resolve",
+                        lambda g, a, lane, resolved_by="": (None, "store down"))
+    n = sync._sort_ambiguous([_ambiguous_asset()], "pierce", lambda m: None)
+    assert n == 1, "a failed auto-decision must fall back to the human queue, never vanish"

@@ -105,6 +105,36 @@ _SCAFFOLD_RE = re.compile(
 _HINT_LEAK_RE = re.compile(
     r"WHAT THIS POST'S PHOTO/VIDEO SHOWS|VERIFIED IN THE IMAGE", re.IGNORECASE)
 
+# EDIT-RATIONALE META BLOCKS (CrossFit ENG, live FB post 2026-08-23 00:02 ET): a caption
+# published ending with "[why] Removed word parents and added people ..." — internal edit
+# reasoning shipped to a real gym's audience, called out by a member in the comments.
+# A bracketed meta-label ("[why]", "[reason]", "[edit]", "[note]" and kin) is reasoning
+# scaffolding, never client copy: a caption carrying one anywhere is not A+. Kept as one
+# shared pattern so the stage gate, the drafter's output parser, the publish-lane final
+# gate, and the book sweep all agree on what a meta block IS.
+_EDIT_META_RE = re.compile(
+    r"\[\s*(?:why|reason(?:s)?(?:\s+why)?|rationale|"
+    r"edit(?:s)?(?:\s+(?:note|reason))?|note(?:s)?|explanation|explainer|"
+    r"change(?:s)?(?:\s*log)?|internal|meta)\s*\]",
+    re.IGNORECASE)
+
+
+def split_meta_suffix(caption):
+    """Split an edit-rationale meta block off a caption.
+
+    Returns (body, meta). meta == "" means the caption is clean (body is then the
+    caption unchanged). When a meta label is present, body is everything BEFORE the
+    first label and meta is the label plus everything after it. The CALLER decides
+    the outcome — a non-empty body means the block was a clean suffix that can be
+    stripped so the real caption still ships (the self-heal Blake wants: no human
+    tap for scaffolding); an empty body means the whole text is scaffolding and the
+    row must be HELD for a human, never silently emptied."""
+    cap = str(caption or "")
+    m = _EDIT_META_RE.search(cap)
+    if m is None:
+        return cap, ""
+    return cap[:m.start()].rstrip(), cap[m.start():].strip()
+
 
 def _content_words(caption):
     """Every word of real caption copy: the whole caption MINUS hashtag-only lines.
@@ -136,6 +166,9 @@ def caption_issues(caption, banned_words=()):
     if _HINT_LEAK_RE.search(cap):
         issues.append("caption carries an internal prompt hint block "
                       "(scene/grounding scaffolding), not client copy")
+    if _EDIT_META_RE.search(cap):
+        issues.append("caption carries an internal edit-rationale block "
+                      "(a bracketed meta-label like [why]), not client copy")
     low = cap.lower()
     for w in banned_words or ():
         w = (w or "").strip().lower()

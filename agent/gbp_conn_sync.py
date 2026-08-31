@@ -47,6 +47,34 @@ _STATE_TZ = {
     "UT": "America/Denver", "CO": "America/Denver", "NM": "America/Denver",
     "MT": "America/Denver", "WY": "America/Denver", "HI": "Pacific/Honolulu",
     "AK": "America/Anchorage",
+    # SPLIT-ZONE STATES, mapped to their DOMINANT zone (audit 2026-08-31: omitting
+    # them meant 'Dripping Springs, TX' DEFAULTED to Indianapolis and every such
+    # connection demanded a human VERIFY — the opposite of self-running). The rare
+    # off-zone metros are corrected by _CITY_TZ below; a one-hour edge case for an
+    # unlisted border town beats a human task on every new connection.
+    "TX": "America/Chicago", "TN": "America/Chicago", "KY": "America/New_York",
+    "KS": "America/Chicago", "NE": "America/Chicago", "ND": "America/Chicago",
+    "SD": "America/Chicago", "ID": "America/Boise", "IN": "America/Indiana/Indianapolis",
+    "NH": "America/New_York", "VT": "America/New_York", "RI": "America/New_York",
+    "DE": "America/New_York", "WV": "America/New_York",
+}
+
+# Off-dominant-zone metros inside split states: checked BEFORE the state map so the
+# well-known exceptions land right without any human step.
+_CITY_TZ = {
+    "EL PASO": "America/Denver",              # TX (Mountain)
+    "PENSACOLA": "America/Chicago",           # FL panhandle
+    "PANAMA CITY": "America/Chicago",         # FL panhandle
+    "KNOXVILLE": "America/New_York",          # East TN
+    "CHATTANOOGA": "America/New_York",        # East TN
+    "JOHNSON CITY": "America/New_York",       # East TN
+    "BOWLING GREEN": "America/Chicago",       # West KY
+    "PADUCAH": "America/Chicago",             # West KY
+    "OWENSBORO": "America/Chicago",           # West KY
+    "EVANSVILLE": "America/Chicago",          # SW IN
+    "GARY": "America/Chicago",                # NW IN
+    "HAMMOND": "America/Chicago",             # NW IN
+    "COEUR D'ALENE": "America/Los_Angeles",   # North ID
 }
 
 
@@ -61,6 +89,8 @@ _STATE_NAMES = {
     "HAWAII": "HI", "ALASKA": "AK", "MONTANA": "MT", "WYOMING": "WY",
     "NEWMEXICO": "NM", "NORTHCAROLINA": "NC", "SOUTHCAROLINA": "SC", "NEWYORK": "NY",
     "NEWJERSEY": "NJ",
+    "TEXAS": "TX", "TENNESSEE": "TN", "KENTUCKY": "KY", "KANSAS": "KS",
+    "NEBRASKA": "NE", "IDAHO": "ID", "VERMONT": "VT", "DELAWARE": "DE",
 }
 
 
@@ -78,6 +108,11 @@ def _tz_from_address(address):
     if not address:
         return None
     parts = [p.strip() for p in str(address).split(",")]
+    # 0. off-dominant-zone metros inside split states (checked first, most specific).
+    upper = str(address).upper()
+    for city, tz in _CITY_TZ.items():
+        if city in upper:
+            return tz
     # 1. full state name (e.g. "... Cape Coral, Florida") — word-boundary, space-collapsed.
     words = {re.sub(r"[^A-Z]", "", w.upper()) for p in parts for w in p.split()}
     for name, st in _STATE_NAMES.items():
@@ -197,16 +232,28 @@ def sync_gbp_connections(store=None, zernio=None, clients=None, logger=None, ale
             has_row = any(c.get("gbp_location_id") == loc for c in already)
             if not has_row:
                 tz = _tz_from_address(md.get("locationAddress"))
-                conn["timezone"] = tz or DEFAULT_TZ
-                # Zernio never returns the tz, so a new row's tz is ALWAYS best-effort.
-                # Flag EVERY new connection for staff to verify (inferred OR defaulted) —
-                # a wrong tz publishes at the wrong hour and must never land silently.
-                if alert:
-                    how = (f"inferred {tz} from the address" if tz
-                           else f"DEFAULTED to {DEFAULT_TZ} (address unrecognized)")
-                    alert(f"GBP conn sync: new {base} connection tz {how} "
-                          f"(address={md.get('locationAddress')!r}) — VERIFY the timezone "
-                          "on the gym_gbp_connections row so posts publish at the right hour.")
+                # SELF-RUNNING (Blake 2026-08-31: no staff verification tasks): a
+                # confident address inference lands SILENTLY — the city/state maps now
+                # cover every state (split-zone states by their dominant zone, known
+                # off-zone metros corrected). Only a truly unparseable address falls
+                # back — first to the gym's own posting_timezone (set from its verified
+                # website), then the HQ default — with ONE informational alert (no
+                # action demanded; a wrong hour is self-evident and correctable).
+                if not tz:
+                    try:
+                        gym_tz = config.posting_timezone_for(base)
+                        tz_fallback = gym_tz if gym_tz != config.POSTING_TIMEZONE \
+                            else DEFAULT_TZ
+                    except Exception:  # noqa: BLE001
+                        tz_fallback = DEFAULT_TZ
+                    conn["timezone"] = tz_fallback
+                    if alert:
+                        alert(f"GBP conn sync: new {base} connection address was "
+                              f"unparseable ({md.get('locationAddress')!r}); tz set to "
+                              f"{tz_fallback} (the gym's own posting tz when known). "
+                              "No action needed unless posts land at an odd hour.")
+                else:
+                    conn["timezone"] = tz
 
             store.upsert_connection(conn)
             synced += 1

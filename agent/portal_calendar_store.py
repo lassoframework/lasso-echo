@@ -323,6 +323,39 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def patch_caption_preserve_status(self, account_key, row_id, new_caption):
+        """PATCH the row's caption WITHOUT touching status — the hygiene twin of
+        patch_caption, mirroring patch_image_url's status-preserving style. Exists for
+        Echo's OWN cleanup writes (stripping an internal edit-rationale block off a
+        caption, the CrossFit ENG '[why]' leak of 2026-08-23): the human approved the
+        real caption body, so cleaning scaffolding off it must not un-approve the row
+        the way patch_caption's pending reset would (that reset exists for HUMAN edits,
+        where re-approval is the point). Same id+gym_id isolation and the same
+        server-side race guard as patch_caption (never touches a row mid-publish or
+        already published). Returns the updated row dict, or None when zero rows
+        matched."""
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": "not.in.(publishing,published)",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"caption": new_caption},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     # ---- auto-publisher: read + exactly-once claim/update -------------------
     # These serve the scheduled calendar auto-publisher (calendar_autopublish.py).
     # They never publish; they only read the day's rows and flip status atomically
@@ -421,6 +454,30 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len(rows) == 1
+
+    def patch_post_date(self, row_id, new_post_date):
+        """RE-DATE one waiting row (expired-row self-heal, Blake 2026-08-31: no human
+        should have to re-date dead posts). Moves post_date forward and CLEARS
+        scheduled_at so the publish lane re-stamps the new slot time. Race-guarded:
+        only a row still waiting (pending/approved, never published) may move — a row
+        mid-claim or already live is refused (zero rows -> None). Status untouched, so
+        an approved row stays approved (the gym's approval is preserved)."""
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}",
+                    "status": "in.(pending,approved)",
+                    "published_at": "is.null"},
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"post_date": new_post_date, "scheduled_at": None},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
 
     def stamp_scheduled(self, row_id, scheduled_at_iso):
         """Record the row's planned go-live time (content_calendar.scheduled_at) so the

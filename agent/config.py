@@ -372,6 +372,28 @@ def intake_auto_approve() -> bool:
     return _truthy(os.environ.get("AGENT_INTAKE_AUTO_APPROVE", "false"))
 
 
+def website_auto_intake_enabled() -> bool:
+    """
+    WEBSITE AUTO-INTAKE switch (AGENT_WEBSITE_AUTO_INTAKE). Default OFF.
+
+    Blake's rulings: "the only human thing should be the gym approving the post"
+    (2026-08-31) and "if they don't upload, scan their website" (2026-08-25).
+    Eight client gyms sat with ZERO client_sources, so nothing could draft for
+    them, dup-caption remediation had nothing to regenerate from, and the gap/
+    infographic fill lanes were blocked — while the facts sat on each gym's own
+    public website.
+
+    ON, the runner sweeps client gyms with zero sources and lands a CITED source
+    bundle read off the gym's own site (agent/website_intake.py): verbatim-ish
+    facts only, each carrying its page URL, invented numbers dropped by the same
+    digit gate captions face. Rows land through the STANDARD intake path, so
+    they are pending unless AGENT_INTAKE_AUTO_APPROVE is armed; the POST approval
+    gate is untouched either way. A gym with any existing sources is skipped —
+    this only fills a vacuum. OFF => nothing is fetched or written.
+    """
+    return _truthy(os.environ.get("AGENT_WEBSITE_AUTO_INTAKE", "false"))
+
+
 def event_lead_days() -> int:
     """
     How many days BEFORE an event starts its promo arc opens (AGENT_EVENT_LEAD_DAYS).
@@ -1880,6 +1902,28 @@ def zernio_profile_link_enabled() -> bool:
     also storing the connected Facebook page id. Read-only against Zernio; idempotent; never
     overwrites a non-empty id. OFF by default; arm by hand in Railway env."""
     return _truthy(os.environ.get("AGENT_ZERNIO_PROFILE_LINK", "false"))
+
+
+def expired_auto_redate_enabled() -> bool:
+    """Self-heal expired calendar rows (AGENT_EXPIRED_AUTO_REDATE). Blake 2026-08-31:
+    "the only human thing should be the gym approving the post" — the expired-row
+    watchdog used to ask a human to re-date or deny rows that aged past the catch-up
+    window. When ON, the sweep RE-DATES each expired waiting row onto the next open
+    future day (approvals preserved, one move per row, plan-horizon capped) and only
+    retires an UNAPPROVED row that expires twice; the ask-a-human digest fires only for
+    what could not be moved. OFF = the alert-only behavior. Arm by hand in Railway."""
+    return _truthy(os.environ.get("AGENT_EXPIRED_AUTO_REDATE", "false"))
+
+
+def sort_ambiguous_default_enabled() -> bool:
+    """SELF-RUNNING media sort (AGENT_SORT_AMBIGUOUS_DEFAULT). Blake 2026-08-31: the
+    'Sort these' queue put hundreds of raw-vs-finished taps on staff. When ON, Echo
+    decides every ambiguous file itself (finished only on a real finished signal, else
+    RAW — the recoverable side; the infographic guard still protects caption burns) and
+    records the decision through the same resolve path a human tap uses
+    (resolved_by=echo-auto-sort). The portal media tab stays available as a per-file
+    OVERRIDE. OFF = ambiguous files queue for a human, the historic behavior."""
+    return _truthy(os.environ.get("AGENT_SORT_AMBIGUOUS_DEFAULT", "false"))
 
 
 def reel_target_sec() -> float:
