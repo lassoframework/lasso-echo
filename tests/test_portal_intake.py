@@ -414,31 +414,52 @@ def test_a_failing_bible_write_never_loses_the_landed_intake(server, monkeypatch
     assert len(cs.pending_sources("gym_alpha_ig")) == _EXPECTED_FACTS
 
 
-def test_texted_link_lane_gets_no_bible_and_no_false_alarm(monkeypatch, tmp_path):
-    # handle_intake_form (the urlencoded /f/<token> lane) archives a FLAT answers dict with
-    # no "portal" key. Feeding that to the mapper raises (it calls .get() on strings) and,
-    # if it did not, would lay down an unclobberable bible for "the gym" — worse than none,
-    # because a hollow bible looks like a satisfied precondition and blocks the real one.
+def test_texted_link_lane_now_gets_a_bible_from_its_own_answers(monkeypatch, tmp_path):
+    """SUPERSEDES 'the texted-link lane gets no bible' (Blake's ruling, 2026-08-31:
+    Echo drafts the voice doc and the brain from the gym's own intake, no human step).
+
+    handle_intake_form archives a FLAT answers dict with no 'portal' key, and feeding
+    that straight to the mapper raises, because it calls .get() on plain strings. So
+    the flat answers are RESHAPED first (sections_from_flat), a pure one-to-one field
+    mapping that invents nothing. The original protection still holds and is asserted
+    below: a payload with no usable answers must still produce NO bible, because a
+    hollow one looks like a satisfied precondition and blocks the real one forever."""
     monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     from agent import intake_ingest as ii
 
     flat = {"kind": "intake_form", "client": "gym_alpha_ig", "timestamp": "20260828T000000Z",
             "answers": {"gym_name": "Gym Alpha", "voice": "warm", "offers": "6 week challenge"}}
     assert ii._is_section_shaped(flat.get("portal")) is False
-    assert ii._is_section_shaped(flat["answers"]) is False, "flat answers must not qualify"
-
-    nested = {"gym": {"name": "Gym Alpha"}, "voice": {"vibe": "warm"}}
-    assert ii._is_section_shaped(nested) is True
+    assert ii._is_section_shaped(flat["answers"]) is False, "raw flat must not qualify"
+    assert ii._is_section_shaped(ii.sections_from_flat(flat["answers"])) is True
 
     alerts = []
     monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: alerts.append(m))
-    r2 = FakeR2()
-    ii._land_intake_form("gym_alpha_ig", flat, r2, "intake/gym_alpha_ig/incoming/x_intake.json",
-                         {"processed": []})
+    ii._land_intake_form("gym_alpha_ig", flat, FakeR2(),
+                         "intake/gym_alpha_ig/incoming/x_intake.json", {"processed": []})
     assert not any("brand bible could NOT" in m for m in alerts), \
         "the texted-link lane must not cry wolf on every submission"
     bible = os.path.join(config.client_voice_dir(), "gym_alpha", "lasso_voice.md")
-    assert not os.path.exists(bible), "must not write a hollow, unclobberable bible"
+    assert os.path.exists(bible), "the gym answered, so it must get a voice doc"
+    assert "Gym Alpha" in open(bible, encoding="utf-8").read()
+
+
+def test_an_empty_intake_still_writes_no_hollow_bible(monkeypatch, tmp_path):
+    """The protection the old test existed for, kept: a hollow bible looks like a
+    satisfied precondition and would block the real one forever."""
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from agent import intake_ingest as ii
+    assert ii.sections_from_flat({}) == {}
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
+    ii._land_intake_form("gym_empty_ig",
+                         {"kind": "intake_form", "client": "gym_empty_ig",
+                          "timestamp": "20260828T000000Z", "answers": {}},
+                         FakeR2(), "intake/gym_empty_ig/incoming/x.json",
+                         {"processed": []})
+    bible = os.path.join(config.client_voice_dir(), "gym_empty", "lasso_voice.md")
+    assert not os.path.exists(bible), "wrote a hollow bible from an empty intake"
 
 
 # ---- intake must land APPROVED and REGISTERED, never "go do it by hand" -------------
@@ -526,3 +547,45 @@ def test_intake_never_registers_without_a_real_gym_name(monkeypatch, tmp_path):
                          "intake/swiftgym_ig/incoming/x_intake.json", {"processed": []})
     assert accounts.get_account("swiftgym_ig_ig") is None
     accounts._dynamic_cache = None
+
+
+def test_the_brain_is_seeded_from_the_gyms_own_voice_answers(monkeypatch, tmp_path):
+    """Blake, 2026-08-31: Echo drafts the BRAIN from intake too. It used to start
+    empty and fill only as humans edited posts, so a gym's first weeks of captions
+    ignored the voice preferences it had just written down."""
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # AGENT_TENANT_BRAIN_DIR is the var brains_dir actually reads. Getting this
+    # wrong let the test read a LEFTOVER brain from the repo-relative dir and pass
+    # against unfixed code, while writing into a shared directory.
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_DIR", str(tmp_path / "brains"))
+    from agent import intake_ingest as ii, tenant_brain as brain
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
+    payload = {"kind": "intake_form", "client": "voicegym_ig",
+               "timestamp": "20260831T000000Z",
+               "answers": {"gym_name": "Voice Gym", "voice": "warm and direct"}}
+    ii._land_intake_form("voicegym_ig", payload, FakeR2(),
+                         "intake/voicegym_ig/incoming/x.json", {"processed": []})
+    rules = brain.style_rules("voicegym_ig")
+    assert any("warm and direct" in r for r in rules), f"brain not seeded: {rules}"
+
+
+def test_seeding_the_brain_is_idempotent_and_adds_no_facts():
+    """The brain's contract is that it never adds a claim. Offers, pricing and proof
+    are FACTS and must stay in client_sources behind the fabrication gate."""
+    from agent import tenant_brain as brain
+    sections = {"voice": {"vibe": "warm", "words_to_never_use": "shred, beast"},
+                "offers": {"front_door_offer": "6 weeks for $99"},
+                "proof": {"verifiable_numbers": "120 five star reviews"}}
+    import os as _os
+    os.environ["AGENT_TENANT_BRAIN_ENABLED"] = "true"
+    import tempfile
+    d = tempfile.mkdtemp()
+    first = brain.seed_from_intake("idem_gym", sections, base_dir=d)
+    assert first >= 2
+    assert brain.seed_from_intake("idem_gym", sections, base_dir=d) == 0, "seeded twice"
+    joined = " ".join(brain.style_rules("idem_gym", base_dir=d))
+    assert "warm" in joined and "shred" in joined
+    assert "$99" not in joined and "120" not in joined, "a FACT leaked into the brain"
+    _os.environ.pop("AGENT_TENANT_BRAIN_ENABLED", None)

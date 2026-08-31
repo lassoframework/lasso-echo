@@ -109,6 +109,55 @@ def killed_concepts(tenant_key, base_dir=None):
             if e["kind"] == "kill" and e.get("concept")}
 
 
+def seed_from_intake(tenant_key, sections, base_dir=None):
+    """Seed a NEW tenant's brain with the caption style rules its own intake stated.
+
+    WHY (Blake, 2026-08-31): a gym's brain started empty and only filled as humans
+    edited its posts, so its first weeks of captions ignored the voice preferences it
+    had just written down. Echo drafts the brain from intake like it drafts the bible,
+    so day one already reflects the gym's own stated style.
+
+    STYLE ONLY, NEVER FACTS. This module's contract is that the brain adds no claims,
+    and that is preserved exactly: the only fields read are the voice ones (vibe, the
+    words-to-never-use list, content goal, hashtags), which are instructions about HOW
+    to write, not assertions about the gym. Offers, pricing and proof are deliberately
+    NOT read here; those are facts and they belong in client_sources behind the
+    fabrication gate.
+
+    Idempotent: seeds only a brain with no seeded rules yet, so a re-run never stacks
+    duplicates and never overwrites what the gym's real edits have taught since.
+    Returns the number of rules written."""
+    voice = (sections or {}).get("voice") or {}
+    if not isinstance(voice, dict):
+        return 0
+    existing = set(style_rules(tenant_key, base_dir))
+    rules = []
+    vibe = str(voice.get("vibe") or "").strip()
+    if vibe:
+        rules.append(f"Write in the gym's own stated voice: {vibe}")
+    never = str(voice.get("words_to_never_use") or "").strip()
+    if never:
+        words = ", ".join(w.strip() for w in never.replace(",", "\n").splitlines()
+                          if w.strip())
+        if words:
+            rules.append(f"Never use these words, the gym asked for them to be "
+                         f"avoided: {words}")
+    goal = str(voice.get("content_goal") or "").strip()
+    if goal:
+        rules.append(f"The gym's stated content goal: {goal}")
+    tags = str(voice.get("hashtags") or "").strip()
+    if tags:
+        rules.append(f"Preferred hashtags the gym gave: {tags}")
+    written = 0
+    for rule in rules:
+        if rule in existing:
+            continue
+        if record_event(tenant_key, "edit_diff", base_dir=base_dir,
+                        before="", after="", rule=rule):
+            written += 1
+    return written
+
+
 def style_rules(tenant_key, base_dir=None):
     """Caption style rules the tenant's edits imply, most recent last."""
     return [e["rule"] for e in read_events(tenant_key, base_dir)

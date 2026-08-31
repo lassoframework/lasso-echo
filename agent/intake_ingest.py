@@ -279,6 +279,41 @@ _FORM_SOURCE_SECTIONS = (
 )
 
 
+def sections_from_flat(answers):
+    """The flat texted-link answers dict, reshaped into the 7-SECTION structure
+    normalize_portal_intake reads, so the flat lane can draft a brand bible too.
+
+    WHY: write_brand_docs needs section-shaped input, and the flat lane has none, so a
+    gym arriving through the texted-link door got NO voice doc at all and the drafter
+    then had nothing to ground captions in. Swift River CrossFit, 2026-08-31: 31
+    approved sources and no bible, because its payload was flat. Blake's ruling that
+    day: Echo drafts the voice doc and the brain from the gym's own intake, and does
+    not hand a human a TODO list.
+
+    Pure mapping, one field to one field. It NEVER invents a value: a field the gym did
+    not answer stays absent, so the bible is built only from the gym's own words.
+    """
+    from . import intake_web  # lazy: avoids an import cycle with the web module
+    a = {k: (str(answers.get(k) or "")).strip() for k in intake_web.FORM_FIELDS}
+
+    def _sec(**kw):
+        return {k: v for k, v in kw.items() if v}
+
+    out = {
+        "gym": _sec(name=a.get("gym_name"), city=a.get("city"),
+                    website=a.get("website"), about=a.get("about")),
+        "voice": _sec(vibe=a.get("voice")),
+        "offers": _sec(front_door_offer=a.get("offers"), services=a.get("services"),
+                       exact_pricing_wording=a.get("pricing_rule")),
+        "audience": _sec(ideal_member=a.get("audience")),
+        "proof": _sec(verifiable_numbers=a.get("proof")),
+        "media": _sec(notes=a.get("media_notes")),
+        "approver": _sec(name=a.get("approver_name"),
+                         contact=a.get("approver_contact")),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 #: The nested sections normalize_portal_intake reads. A payload is bible-drafting material
 #: only when at least one of these is a dict; the flat texted-link answers dict has none.
 _SECTION_KEYS = ("gym", "voice", "offers", "audience", "proof", "media", "approver")
@@ -364,8 +399,19 @@ def _land_intake_form(client, payload, r2, key, manifest):
     # .get() on what are plain strings and raises, and even if it did not, every section would
     # come back empty and _write_doc would lay down an unclobberable bible for "the gym" keyed
     # "client" — worse than no bible, because a hollow one looks like a satisfied precondition
-    # and blocks the real one forever. So: write only from the shape the mapper accepts.
+    # and blocks the real one forever. So: RESHAPE the flat answers into the sections the
+    # mapper accepts (sections_from_flat, a pure one-to-one field mapping that invents
+    # nothing) rather than either feeding it a shape it cannot read or leaving the gym
+    # with no voice doc at all. Blake's ruling 2026-08-31, after Swift River CrossFit
+    # landed 31 approved sources and still had no bible because its payload was flat:
+    # Echo drafts the voice doc from the gym's OWN intake; it does not hand a human a
+    # TODO list. Still no fabrication: a field the gym did not answer stays absent, and
+    # _write_doc never clobbers a bible that already exists.
     sections = payload.get("portal")
+    if not _is_section_shaped(sections):
+        flat = sections_from_flat(payload.get("answers") or {})
+        if _is_section_shaped(flat):
+            sections = flat
     if _is_section_shaped(sections):
         try:
             from .social_intake_reader import write_brand_docs
@@ -373,6 +419,20 @@ def _land_intake_form(client, payload, r2, key, manifest):
             if wrote["wrote"]:
                 db.audit("brand_bible", client,
                          f"drafted from intake ({wrote['bible_path']})", client)
+            # SEED THE BRAIN TOO. It used to start empty and fill only as humans edited
+            # the gym's posts, so the first weeks of captions ignored the voice
+            # preferences the gym had just written down. Style rules only (vibe, banned
+            # words, content goal, hashtags); offers, pricing and proof are facts and
+            # stay in client_sources behind the fabrication gate.
+            try:
+                from . import tenant_brain as _brain
+                seeded = _brain.seed_from_intake(client, sections)
+                if seeded:
+                    db.audit("brain_seed", client,
+                             f"{seeded} style rule(s) seeded from intake", client)
+            except Exception as exc:  # noqa: BLE001 - the bible still stands
+                print(f"[intake-ingest] {client}: brain seed skipped "
+                      f"({type(exc).__name__})")
         except Exception as exc:  # noqa: BLE001 - never lose a landed intake over the bible
             ops_alerts.alert(
                 f"intake landed for {client} but the brand bible could NOT be written "
