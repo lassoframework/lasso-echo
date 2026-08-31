@@ -784,3 +784,20 @@ def test_mechanical_repair_gives_up_on_unbreakable_hook():
                          "without any punctuation at all so no honest split point exists "
                          "anywhere within the hook band limit")
     assert _mechanical_repair(one_long_sentence, "Book now?") is None
+
+
+def test_booking_cta_falls_back_to_approved_source_sentence(monkeypatch, tmp_path):
+    """ENG 2026-08-31: the bible's CTA rotation was an onboarding TODO, so no_ask days
+    had nothing approved to carry. A VERBATIM booking-ask sentence from the gym's own
+    APPROVED sources is approved copy — the fallback uses the shortest qualifying one."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("AGENT_CLIENT_SOURCES", "true")
+    from agent import client_sources as cs
+    from agent.jobs.grade_fix import _booking_cta_for
+    cs.add_source("gymz_ig", "offer",
+                  "Our six week kickstart fills fast every season. "
+                  "Book your intro session today?",
+                  "website /start")
+    # voice doc resolution will find nothing (no bible on disk for gymz)
+    cta = _booking_cta_for("gymz", lambda m: None)
+    assert cta == "Book your intro session today?"

@@ -365,21 +365,41 @@ def _booking_deficit(rows) -> int:
 
 def _booking_cta_for(gym_id, log):
     """The gym's REAL booking CTA: the first CTA in its approved voice-doc
-    rotation that is both a booking term and a recognized ask. The intake has
-    no separate booking-link field today, so the voice doc is the only source;
-    a gym without one gets an honest skip (never an invented CTA)."""
+    rotation that is both a booking term and a recognized ask; when the bible's
+    CTA section is empty (a hand-fill onboarding TODO — ENG 2026-08-31), a
+    VERBATIM booking-ask sentence from the gym's own APPROVED sources. Both are
+    approved copy; a gym with neither gets an honest skip (never an invented CTA)."""
     try:
         from agent.client_media_sync import (_account_for_base,
                                              _resolve_client_voice_path)
         from agent.voice import load_voice
         account = _account_for_base(gym_id)
-        if account is None:
-            return None
-        voice = load_voice(_resolve_client_voice_path(gym_id, account.voice_doc_path()))
-        for cta in (getattr(voice, "ctas", None) or []):
-            text = copy_gate.scrub(str(cta or "")).strip()
-            if text and _BOOKING_RE.search(text) and copy_gate.ASK_RE.search(text):
-                return text
+        if account is not None:
+            voice = load_voice(
+                _resolve_client_voice_path(gym_id, account.voice_doc_path()))
+            for cta in (getattr(voice, "ctas", None) or []):
+                text = copy_gate.scrub(str(cta or "")).strip()
+                if text and _BOOKING_RE.search(text) and copy_gate.ASK_RE.search(text):
+                    return text
+        # BIBLE CTA SECTION EMPTY (ENG 2026-08-31: onboarding left '### CTA rotation'
+        # as a hand-fill TODO, so every no_ask repair had nothing approved to carry
+        # and 0/56 flagged days could clear). Fall back to the gym's own APPROVED
+        # client sources: a VERBATIM sentence that is already a booking ask (booking
+        # term + ask shape) is approved copy by definition — zero fabrication, same
+        # bar as the voice-doc rotation. Shortest qualifying sentence wins (a CTA
+        # should be punchy); nothing qualifying keeps the honest None.
+        import re as _re
+        from agent import client_sources as _cs
+        candidates = []
+        for src in _cs.approved_sources(f"{gym_id}_ig"):
+            for sent in _re.split(r"(?<=[.!?])\s+", str(src.text or "")):
+                text = copy_gate.scrub(sent).strip()
+                if (text and len(text) <= 120
+                        and _BOOKING_RE.search(text)
+                        and copy_gate.ASK_RE.search(text)):
+                    candidates.append(text)
+        if candidates:
+            return min(candidates, key=len)
     except Exception as exc:  # noqa: BLE001 - the bias is best effort
         log(f"{gym_id}: booking CTA unavailable: {type(exc).__name__}")
     return None
