@@ -45,8 +45,10 @@ class FakeR2:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.got = []
+        self.list_calls = []   # every prefix list_keys() was actually called with
 
     def list_keys(self, prefix):
+        self.list_calls.append(prefix)
         return [k for k in self.objects if k.startswith(prefix)]
 
     def get_bytes(self, key):
@@ -88,6 +90,12 @@ def _env(monkeypatch, tmp_path):
     from agent import config as _config
     monkeypatch.setattr(_config, "S3_PUBLIC_BASE_URL", "https://cdn.example.com")
     monkeypatch.chdir(tmp_path)
+    # The sidecar JSON cache (agent/client_media_sync.py:_JSON_CACHE) is a
+    # process-local dict keyed by R2 object key. Different tests reuse the SAME
+    # key strings (e.g. "intake/gritx/incoming/20260810T120000Z_upload.json") with
+    # DIFFERENT content, so it must start empty for every test or an earlier test's
+    # cached bytes would leak into a later one.
+    getattr(cms, "_JSON_CACHE", {}).clear()
     yield
 
 
@@ -291,6 +299,90 @@ def test_sync_empty_r2_zero_synced():
     r2 = FakeR2({})
     out = cms.sync_uploads("gritx", r2=r2)
     assert out == {"synced": 0, "skipped": 0}
+
+
+# ---- scale fix 2026-08-30: one listing per prefix per cycle + a sidecar JSON cache -
+
+def test_sync_lists_each_prefix_once_per_cycle_not_three_times():
+    """THE CONFIRMED DEFECT: the old code listed the SAME two R2 prefixes THREE
+    independent times per gym per cycle — sync_uploads' own scan, then again inside
+    _read_captions, then again inside _read_context_consent. One sync_uploads() call
+    must now call list_keys() exactly ONCE per prefix (two prefixes -> two calls
+    total), never six."""
+    from collections import Counter
+    r2 = _r2_with_uploads("gritx", n=3)
+    cms.sync_uploads("gritx", r2=r2)
+    counts = Counter(r2.list_calls)
+    assert counts == {
+        "intake/gritx/pending_caption/": 1,
+        "intake/gritx/incoming/": 1,
+    }
+
+
+def test_sync_second_cycle_does_not_refetch_unchanged_sidecar_json():
+    """THE WORSE HALF of the defect: get_bytes() ran for EVERY .json sidecar on
+    EVERY cycle, not only new ones, so cost grew with a gym's whole upload history.
+    A sidecar whose content cannot have changed must not be re-fetched on a second,
+    otherwise-idle cycle."""
+    r2 = _r2_with_uploads("gritx", n=3)
+    cms.sync_uploads("gritx", r2=r2)
+    upload_json_key = "intake/gritx/incoming/20260810T120000Z_upload.json"
+    assert r2.got.count(upload_json_key) == 1   # fetched once on the first cycle
+
+    r2.got.clear()
+    out2 = cms.sync_uploads("gritx", r2=r2)   # a second, otherwise-idle cycle
+    assert out2 == {"synced": 0, "skipped": 3}
+    assert r2.got.count(upload_json_key) == 0   # NOT re-fetched
+
+
+def test_sync_new_file_picked_up_on_next_cycle():
+    """CORRECTNESS RAIL: the cache is keyed by the R2 object key, so a brand-new
+    upload (a new stamp -> a new key) is always a cache miss and is synced normally
+    on the very next cycle."""
+    r2 = _r2_with_uploads("gritx", n=2)
+    out1 = cms.sync_uploads("gritx", r2=r2)
+    assert out1["synced"] == 2
+
+    # a fresh upload lands between cycles: new stamp, new photo, new batch sidecar
+    r2.objects["intake/gritx/incoming/20260811T090000Z_photo_new.jpg"] = (
+        b"\xff\xd8\xffNEW")
+    r2.objects["intake/gritx/incoming/20260811T090000Z_upload.json"] = json.dumps(
+        {"note": "batch",
+         "captions": {"20260811T090000Z_photo_new.jpg": "fresh one"}}
+    ).encode("utf-8")
+
+    out2 = cms.sync_uploads("gritx", r2=r2)
+    assert out2["synced"] == 1
+    lib = os.path.join("content_library", "gritx")
+    assert os.path.exists(os.path.join(lib, "20260811T090000Z_photo_new.jpg"))
+    side = json.load(open(os.path.join(lib, "20260811T090000Z_photo_new.json")))
+    assert side["note"] == "fresh one"
+
+
+def test_sync_json_cache_never_shares_entries_across_gyms():
+    """CORRECTNESS RAIL: two gyms whose uploads share the exact same stamp/basename
+    must never cross-contaminate captions. The cache is keyed by the FULL R2 object
+    key (which embeds the tenant base, "intake/<base>/..."), so gritx's caption can
+    never leak onto eng's identically-named file, or vice versa."""
+    caps_gritx = {"20260810T120000Z_photo_00.jpg": "gritx caption"}
+    caps_eng = {"20260810T120000Z_photo_00.jpg": "eng caption"}
+    r2 = FakeR2({
+        "intake/gritx/incoming/20260810T120000Z_photo_00.jpg": b"\xff\xd8\xffA",
+        "intake/gritx/incoming/20260810T120000Z_upload.json":
+            json.dumps({"note": "batch", "captions": caps_gritx}).encode("utf-8"),
+        "intake/eng/incoming/20260810T120000Z_photo_00.jpg": b"\xff\xd8\xffB",
+        "intake/eng/incoming/20260810T120000Z_upload.json":
+            json.dumps({"note": "batch", "captions": caps_eng}).encode("utf-8"),
+    })
+    cms.sync_uploads("gritx", r2=r2)
+    cms.sync_uploads("eng", r2=r2)
+
+    side_gritx = json.load(open(os.path.join(
+        "content_library", "gritx", "20260810T120000Z_photo_00.json")))
+    side_eng = json.load(open(os.path.join(
+        "content_library", "eng", "20260810T120000Z_photo_00.json")))
+    assert side_gritx["note"] == "gritx caption"
+    assert side_eng["note"] == "eng caption"
 
 
 # ---- scan_and_generate -----------------------------------------------------------

@@ -83,6 +83,20 @@ def _default_store():
         return None
 
 
+def _reads_ok(store):
+    """True when the shared plane is genuinely READABLE, not merely credentialled.
+    One cheap bounded gyms select. Any exception or non-2xx is False: we would rather
+    report 'could not read' than report every gym stranded."""
+    try:
+        r = store._client().get(  # noqa: SLF001
+            store._rest("gyms"),  # noqa: SLF001
+            params={"select": "id", "limit": "1"},
+            headers=store._headers(), timeout=30)  # noqa: SLF001
+        return r.status_code < 400
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _classify_base(base, store, *, expect_profile=True):
     """Read-only verdict for ONE base. Returns a row dict:
         {base, gym_uuid, profile_id, verdict}
@@ -169,8 +183,21 @@ def diagnose(base=None, *, bases=None, store=None, expect_profile=True):
         {ok, count, rows:[...], stranded:[...]}
     rows is every base's classification; stranded is the subset whose verdict is a
     STRANDING_VERDICT. Never writes, never alerts (that is fire_alerts' job). Never raises."""
+    injected = store is not None
     if store is None:
         store = _default_store()
+    # CANARY. available() only checks that CREDS exist, so a store whose every read
+    # raises still reports available -> resolve_gym_uuid returns an honest None for
+    # each gym -> the report says the WHOLE FLEET is stranded. Observed live
+    # 2026-08-30 running under an interpreter with no `requests`: 11 of 11 gyms read
+    # UNRESOLVED while all 11 were in fact fine. A monitor that cries wolf on every
+    # gym is worse than no monitor at 100 gyms, so prove ONE read works before
+    # classifying anything, and report "could not read" rather than "all stranded".
+    # Only probes the LIVE store: an injected store is the caller's own (tests use a
+    # simple double with no REST client), and probing it would read as unreadable.
+    if store is not None and not injected and not _reads_ok(store):
+        return {"ok": False, "count": 0, "rows": [], "stranded": [],
+                "store_available": False, "reads_ok": False}
     if base:
         base_list = [base]
     else:
@@ -259,6 +286,11 @@ def fire_alerts(summary, *, alert=None, kv=None, now=None, force=False):
 def print_report(summary, printer=print):
     """Print the per-base report table (mirrors the reconcile / reverify readable output)."""
     rows = summary.get("rows") or []
+    if summary.get("reads_ok") is False:
+        printer("account-key-doctor: could NOT read the shared plane (creds present but "
+                "the gyms read failed). Reporting nothing rather than reporting every "
+                "gym stranded. Check connectivity, then re-run.")
+        return
     if not rows:
         printer("account-key-doctor: no social-product gym bases to check (or no data).")
         return

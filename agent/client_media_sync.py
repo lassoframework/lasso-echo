@@ -143,7 +143,7 @@ def _caption_from_sidecar(data):
     return ""
 
 
-def _read_captions(r2, prefixes, log):
+def _read_captions(r2, prefixes, log, keys=None):
     """Build one {stored_basename: caption} map for the gym across every prefix that
     can hold its media. Two caption shapes are merged, both keyed by the STORED media
     basename (exactly the downloaded file name):
@@ -155,22 +155,33 @@ def _read_captions(r2, prefixes, log):
 
     A flaky/malformed sidecar is skipped (never raises out). The batch map is read
     first; a per-file sidecar only fills a basename the batch did not already caption,
-    so an explicit per-file note never silently loses to a blank batch entry."""
+    so an explicit per-file note never silently loses to a blank batch entry.
+
+    keys  optional {prefix: [key, ...]} already listed THIS cycle by the caller
+          (sync_uploads shares its one _list_prefixes_once() pass here so the same
+          prefix is never listed twice per cycle — see the triple-listing defect
+          fixed 2026-08-30). None (a direct/standalone call, incl. any pre-existing
+          test) preserves the old behavior: list every prefix here."""
     captions = {}
     seen = set()
     for prefix in prefixes:
-        try:
-            keys = list(r2.list_keys(prefix) or [])
-        except Exception as exc:  # noqa: BLE001
-            log(f"caption read: list failed: {type(exc).__name__}")
-            continue
-        for key in keys:
+        if keys is not None:
+            prefix_keys = keys.get(prefix)
+            if prefix_keys is None:
+                continue    # that prefix's listing failed upstream; skip, like before
+        else:
+            try:
+                prefix_keys = list(r2.list_keys(prefix) or [])
+            except Exception as exc:  # noqa: BLE001
+                log(f"caption read: list failed: {type(exc).__name__}")
+                continue
+        for key in prefix_keys:
             if key in seen:
                 continue
             seen.add(key)
             # BATCH sidecar: an _upload.json carrying a captions map.
             if key.endswith(_UPLOAD_SIDECAR_SUFFIX):
-                data = _load_json(r2, key)
+                data = _load_json_cached(r2, key)
                 caps = data.get("captions") if isinstance(data, dict) else None
                 if isinstance(caps, dict):
                     for name, cap in caps.items():
@@ -183,7 +194,7 @@ def _read_captions(r2, prefixes, log):
                 continue
             if os.path.basename(key) == _MANIFEST_BASENAME:
                 continue
-            cap = _caption_from_sidecar(_load_json(r2, key))
+            cap = _caption_from_sidecar(_load_json_cached(r2, key))
             if not cap:
                 continue
             stem = os.path.splitext(os.path.basename(key))[0]
@@ -196,13 +207,83 @@ def _read_captions(r2, prefixes, log):
 
 def _load_json(r2, key):
     """Parse an R2 JSON object, or {} on missing/empty/malformed. Never raises."""
+    data, _ok = _load_json_checked(r2, key)
+    return data
+
+
+def _load_json_checked(r2, key):
+    """(parsed dict, ok) for one R2 JSON object. ok is False ONLY when the GET itself
+    raised (a network/creds blip) — never for a missing/empty/malformed body, which
+    is a genuine (if unhappy) read of the object as it exists right now. This split
+    exists so _load_json_cached (below) never memoizes a TRANSIENT failure as though
+    it were the sidecar's real content — a retry-worthy blip must be retried next
+    cycle, not frozen into the cache forever."""
     try:
         raw = r2.get_bytes(key)
-        if not raw:
-            return {}
-        return json.loads(raw)
     except Exception:  # noqa: BLE001
-        return {}
+        return {}, False
+    if not raw:
+        return {}, True
+    try:
+        return json.loads(raw), True
+    except Exception:  # noqa: BLE001
+        return {}, True
+
+
+# Process-local cache: R2 object key -> parsed JSON dict. Audit finding 2026-08-30:
+# _read_captions issued an R2 get_bytes() for EVERY .json sidecar under a gym's media
+# prefixes on EVERY 5-minute cycle, not only new ones, and nothing is ever deleted
+# from those prefixes — so the per-cycle GET cost grew monotonically with a gym's
+# WHOLE upload history (tens of thousands of GETs/cycle at 100 gyms with a year of
+# uploads). A sidecar's bytes are fetched at most once per worker process; keyed by
+# the FULL object key (which embeds "intake/<base>/...") so two gyms can never share
+# a cache entry (see test_..._never_shares_cache_across_gyms).
+#
+# list_keys() (this module's own _R2, mirrored from intake_ingest._R2) returns bare
+# key strings only — no ETag / size / last-modified — so an in-place edit to an
+# EXISTING sidecar cannot be detected from the listing alone. NOTE, explicitly: this
+# cache is PROCESS-LOCAL and COLD after a worker restart/redeploy (a fresh process
+# re-fetches everything once, then caches again); and if a sidecar were ever
+# rewritten in place after we've already cached it, that edit would not be seen until
+# the next restart. Nothing in this codebase rewrites a sidecar after it is first
+# written (the batch _upload.json is stamped once per upload event; the per-file
+# <stem>.json is written once by ingest) — if that ever changes, this cache must gain
+# a real invalidation signal, not just a bigger dict.
+_JSON_CACHE = {}
+_JSON_CACHE_MAX = 5000   # bounded: a crude FIFO eviction keeps a long-lived worker's
+                         # memory flat across many gyms/months, best-effort only.
+
+
+def _load_json_cached(r2, key):
+    """_load_json(), memoized per R2 object key for the life of this process (see
+    _JSON_CACHE's comment above for the full tradeoff). A cache MISS behaves exactly
+    like the old _load_json(r2, key) call; a HIT skips the GET entirely."""
+    if key in _JSON_CACHE:
+        return _JSON_CACHE[key]
+    data, ok = _load_json_checked(r2, key)
+    if ok:
+        if len(_JSON_CACHE) >= _JSON_CACHE_MAX:
+            _JSON_CACHE.pop(next(iter(_JSON_CACHE)))   # crude FIFO, bounded size
+        _JSON_CACHE[key] = data
+    return data
+
+
+def _list_prefixes_once(r2, prefixes, log, gym_label):
+    """List every one of the gym's media-holding R2 prefixes EXACTLY ONCE this cycle,
+    returning {prefix: [key, ...]}. sync_uploads' own scan, _read_captions, and
+    _read_context_consent all share this ONE result instead of each calling
+    r2.list_keys() for the same prefix a-piece (the triple-listing defect confirmed
+    2026-08-30). A prefix whose listing raises is simply ABSENT from the returned
+    dict (never an empty list) so a caller can tell "listed, nothing there" apart
+    from "could not list" and skip it exactly like the old per-function try/except
+    did. gym_label names the gym in the log line so a failure is traceable."""
+    listed = {}
+    for prefix in prefixes:
+        try:
+            listed[prefix] = list(r2.list_keys(prefix) or [])
+        except Exception as exc:  # noqa: BLE001
+            log(f"{gym_label}: R2 list failed for {prefix}: {type(exc).__name__}")
+    return listed
 
 
 def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
@@ -237,17 +318,21 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     root = f"intake/{base_key}/"
     prefixes = [root + p for p in _MEDIA_PREFIXES]
 
+    # LIST EACH PREFIX ONCE THIS CYCLE (audit fix, 2026-08-30): the old code listed
+    # these SAME two prefixes three independent times per gym per 5-minute cycle —
+    # here, again inside _read_captions, again inside _read_context_consent. One
+    # listing is now shared by all three via the `keys` map below.
+    listed = _list_prefixes_once(r2, prefixes, log, base_key)
+
     # Collect media keys across every prefix that can hold the gym's real media. The
     # FIRST prefix to claim a basename wins (_MEDIA_PREFIXES order: pending_caption/
     # then incoming/). originals/ is never listed at all — see _MEDIA_PREFIXES.
     chosen = {}          # basename -> R2 key
     listed_any = False
     for prefix in prefixes:
-        try:
-            keys = list(r2.list_keys(prefix) or [])
-        except Exception as exc:  # noqa: BLE001
-            log(f"{base_key}: R2 list failed for {prefix}: {type(exc).__name__}")
-            continue
+        keys = listed.get(prefix)
+        if keys is None:
+            continue    # that prefix's listing failed; _list_prefixes_once logged it
         listed_any = True
         for key in keys:
             if not _is_media_key(key):
@@ -260,8 +345,8 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
 
     lib_dir = _library_dir(base_key, out_dir)
     os.makedirs(lib_dir, exist_ok=True)
-    captions = _read_captions(r2, prefixes, log)
-    contexts, consents = _read_context_consent(r2, prefixes, log)   # §8 per-file context + consent
+    captions = _read_captions(r2, prefixes, log, keys=listed)
+    contexts, consents = _read_context_consent(r2, prefixes, log, keys=listed)   # §8
 
     synced = 0
     skipped = 0
@@ -313,21 +398,29 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     return {"synced": synced, "skipped": skipped}
 
 
-def _read_context_consent(r2, prefixes, log):
+def _read_context_consent(r2, prefixes, log, keys=None):
     """({basename: client_context}, {basename: consent_bool}) from the batch upload
     sidecars (§8). Mirrors the batch read in _read_captions; malformed sidecars are
-    skipped, never raise."""
+    skipped, never raise.
+
+    keys  optional {prefix: [key, ...]} already listed THIS cycle (see _read_captions'
+          matching parameter). None preserves the old behavior: list it here."""
     contexts, consents, seen = {}, {}, set()
     for prefix in prefixes:
-        try:
-            keys = list(r2.list_keys(prefix) or [])
-        except Exception:  # noqa: BLE001
-            continue
-        for key in keys:
+        if keys is not None:
+            prefix_keys = keys.get(prefix)
+            if prefix_keys is None:
+                continue
+        else:
+            try:
+                prefix_keys = list(r2.list_keys(prefix) or [])
+            except Exception:  # noqa: BLE001
+                continue
+        for key in prefix_keys:
             if key in seen or not key.endswith(_UPLOAD_SIDECAR_SUFFIX):
                 continue
             seen.add(key)
-            data = _load_json(r2, key)
+            data = _load_json_cached(r2, key)
             if not isinstance(data, dict):
                 continue
             for name, ctx in (data.get("client_context") or {}).items():

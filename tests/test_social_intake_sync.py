@@ -274,3 +274,135 @@ def test_default_marker_records_resolved_account(monkeypatch):
     assert calls["params"] == {"client_key": "eq.uuid-123"}
     assert calls["body"]["echo_account_key"] == "eng"
     assert calls["body"]["echo_forwarded"] is True
+
+
+# ---- the UUID-keyed registry corruption (live 2026-08-30, repaired by hand) ----
+def test_uuid_key_with_no_token_row_mints_canonical_not_a_uuid_account(monkeypatch, tmp_path):
+    """The hole the token-row guard did not cover. With a token row, sync already
+    refuses to provision a UUID-named tenant. With NO token row there was nothing to
+    resolve against, so register_gym took the portal gym UUID verbatim and the gym was
+    registered under a UUID key: exactly what was found in /data/gym_accounts.json.
+    It must now mint the SAME canonical key portal onboarding would."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    from agent.account_key import canonical_account_key
+    accounts._dynamic_cache = None
+    uuid_key = "7c1d2e3f-4444-5555-6666-777788889999"
+    expected = canonical_account_key(uuid_key, "Fresh Box")
+    onboarded, marked = [], []
+
+    out = sir.sync_unrouted(
+        lister=lambda: [uuid_key],
+        reader=lambda b: _answers("Fresh Box"),
+        marker=lambda b, a: marked.append((b, a)) or True,
+        onboard=lambda ak, ans, approve=False: onboarded.append(ak) or {"sources_created": 1},
+        resolver=lambda k: None)
+
+    assert out[0]["ok"] is True
+    assert out[0]["account"] == f"{expected}_ig"
+    assert onboarded == [f"{expected}_ig"]
+    assert marked == [(uuid_key, expected)]
+    # the UUID must NOT become an account key
+    assert accounts.get_account(f"{uuid_key}_ig") is None
+    assert accounts.get_account(uuid_key) is None
+    assert accounts.get_account(f"{expected}_ig") is not None
+    accounts._dynamic_cache = None
+
+
+def test_a_slug_client_key_is_never_re_minted(monkeypatch, tmp_path):
+    """Only the UUID case is re-keyed. A slug-shaped client_key is already a real
+    account key, and re-minting it would hand an existing gym a brand new key: the
+    very stranding this guard exists to prevent."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    out = sir.sync_unrouted(
+        lister=lambda: ["freshbox"],
+        reader=lambda b: _answers("Fresh Box"),
+        marker=lambda b, a: True,
+        onboard=lambda ak, ans, approve=False: {"sources_created": 1},
+        resolver=lambda k: None)
+    assert out[0]["account"] == "freshbox_ig"
+    accounts._dynamic_cache = None
+
+
+def test_uuid_key_with_no_gym_name_is_left_unrouted_never_uuid_keyed(monkeypatch, tmp_path):
+    """No name means no honest canonical key. We never fabricate one, and a UUID key
+    is worse than waiting, so the row is left for a human with one alert."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    uuid_key = "8d2e3f4a-5555-6666-7777-888899990000"
+    alerts = []
+    monkeypatch.setattr(sir.ops_alerts, "alert", lambda m: alerts.append(m))
+
+    out = sir.sync_unrouted(
+        lister=lambda: [uuid_key],
+        reader=lambda b: {"gym": {}},
+        marker=lambda b, a: True,
+        onboard=lambda ak, ans, approve=False: {"sources_created": 1},
+        resolver=lambda k: None)
+
+    assert out[0]["ok"] is False and out[0]["reason"] == "no canonical key"
+    assert len(alerts) == 1 and "canonical account key" in alerts[0]
+    assert accounts.get_account(f"{uuid_key}_ig") is None
+    accounts._dynamic_cache = None
+
+
+# ---- a failed read must never look like a clean pass -------------------------
+def _fake_requests(status=500, boom=False):
+    class _R:
+        status_code = status
+
+        @staticmethod
+        def json():
+            return []
+
+    class _Req:
+        @staticmethod
+        def get(*a, **k):
+            if boom:
+                raise OSError("connection reset")
+            return _R()
+    return _Req
+
+
+def test_first_page_read_failure_alerts_instead_of_looking_clean(monkeypatch):
+    """A non-2xx used to break out and return [], which is indistinguishable from
+    'nothing un-routed'. Every stranded gym stayed stranded with no Slack signal."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.test")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    monkeypatch.setitem(sys.modules, "requests", _fake_requests(status=500))
+    alerts = []
+    monkeypatch.setattr(sir.ops_alerts, "alert", lambda m: alerts.append(m))
+    assert sir._default_lister() == []
+    assert len(alerts) == 1
+    assert "500" in alerts[0] and "looks clean but is not" in alerts[0]
+
+
+def test_network_error_alerts_and_does_not_escape(monkeypatch):
+    """A network exception used to escape the whole sweep to the listener's bare
+    print, aborting every gym's sync with no Slack signal."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.test")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    monkeypatch.setitem(sys.modules, "requests", _fake_requests(boom=True))
+    alerts = []
+    monkeypatch.setattr(sir.ops_alerts, "alert", lambda m: alerts.append(m))
+    assert sir._default_lister() == []
+    assert len(alerts) == 1 and "OSError" in alerts[0]
+
+
+def test_map_answers_caps_field_length(monkeypatch):
+    """This third intake door had no size cap, so an unbounded answer flowed into
+    the drafted bible, into client_sources, and from there into a caption."""
+    from agent import intake_web
+    huge = "x" * (intake_web._FIELD_MAX + 5000)
+    out = sir.map_answers({"gym": {"name": "Cap Gym", "about": huge},
+                           "voice": {"vibe": huge}})
+    blob = repr(out)
+    # the uncapped run would carry the full 9000-char answer straight through
+    assert "x" * (intake_web._FIELD_MAX + 1) not in blob, "field cap not applied"
+    assert "x" * 100 in blob, "the answer should be present, just truncated"

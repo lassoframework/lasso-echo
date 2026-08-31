@@ -30,6 +30,7 @@ every test runs fully offline (no Gemini / Supabase call in the build or test pa
 """
 
 import os
+import re
 
 from . import bible_drafter, client_sources, config, ops_alerts
 
@@ -91,10 +92,22 @@ def map_answers(answers):
     answers = answers or {}
     from . import intake_web  # lazy: avoids any import cycle with the web module
     from .intake_ingest import _FORM_SOURCE_SECTIONS
-    flat = intake_web.normalize_portal_intake(answers)
-    gym = dict(answers.get("gym") or {})
-    voice = dict(answers.get("voice") or {})
-    audience = dict(answers.get("audience") or {})
+    # SIZE CAP, matching intake_web's own two call sites (handle_intake_form and the
+    # portal status endpoint both truncate at _FIELD_MAX). This third path had none, so
+    # an unbounded answer flowed uncapped into the drafted bible and into client_sources
+    # text, and from there into a caption. Truncate here so every intake door agrees.
+    flat = {k: (v[:intake_web._FIELD_MAX] if isinstance(v, str) else v)  # noqa: SLF001
+            for k, v in intake_web.normalize_portal_intake(answers).items()}
+    def _cap(d):
+        """Same cap on the raw sub-dicts. They are read straight off `answers` rather
+        than through `flat`, so capping only the flat path would leave the exact fields
+        the bible is drafted from (gym.about, voice.vibe) uncapped."""
+        return {k: (v[:intake_web._FIELD_MAX] if isinstance(v, str) else v)  # noqa: SLF001
+                for k, v in dict(d or {}).items()}
+
+    gym = _cap(answers.get("gym"))
+    voice = _cap(answers.get("voice"))
+    audience = _cap(answers.get("audience"))
 
     cite = "client social intake"
     bundle = {}
@@ -378,9 +391,31 @@ def _default_lister():
         hdr = dict(headers)
         hdr["Range-Unit"] = "items"
         hdr["Range"] = f"{offset}-{offset + page - 1}"
-        r = requests.get(f"{url}/rest/v1/echo_social_intake", params=params,
-                         headers=hdr, timeout=30)
+        # A read failure here used to be indistinguishable from "nothing un-routed":
+        # a non-2xx broke out and a network error escaped the whole sweep to be caught
+        # by the listener's bare print. Either way EVERY stranded gym stayed stranded
+        # with no Slack signal. Both now alert, and a first-page failure is called out
+        # separately because that is the case that looks exactly like a clean run.
+        try:
+            r = requests.get(f"{url}/rest/v1/echo_social_intake", params=params,
+                             headers=hdr, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            ops_alerts.alert(
+                f"social-intake-sync: could not read the un-routed intake list "
+                f"({type(exc).__name__}). "
+                + ("NO rows were read, so this pass looks clean but is not. "
+                   if offset == 0 else
+                   f"Partial: {len(out)} row(s) read before the failure. ")
+                + "Un-routed gyms stay un-routed until the next successful pass.")
+            break
         if r.status_code >= 400:
+            ops_alerts.alert(
+                f"social-intake-sync: un-routed intake list read returned "
+                f"{r.status_code}. "
+                + ("NO rows were read, so this pass looks clean but is not. "
+                   if offset == 0 else
+                   f"Partial: {len(out)} row(s) read before the failure. ")
+                + "Un-routed gyms stay un-routed until the next successful pass.")
             break
         rows = r.json() or []
         for row in rows:
@@ -457,6 +492,32 @@ def _default_token_resolver(client_key):
     return None
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _looks_like_uuid(value):
+    """True for a canonical 8-4-4-4-12 UUID. Used to tell a portal gym IDENTIFIER apart
+    from a real account key, so only the identifier case gets re-minted."""
+    return bool(_UUID_RE.match((str(value) if value is not None else "").strip()))
+
+
+def _canonical_base(gym_id, answers):
+    """The canonical account base for a gym that has NO portal token row yet, or "" when
+    one cannot honestly be derived (no gym name). Same derivation as portal onboarding
+    (account_key.canonical_account_key), so a gym arriving through the intake door and one
+    arriving through the portal door land on the SAME key instead of two divergent tenants.
+    Pure apart from reading `answers`; never raises out."""
+    name = _clean(((answers or {}).get("gym") or {}).get("name"))
+    if not name:
+        return ""
+    try:
+        from .account_key import canonical_account_key
+        return _clean(canonical_account_key(gym_id, name))
+    except Exception:  # noqa: BLE001 - a derivation miss is an honest "" , never a crash
+        return ""
+
+
 def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
                   resolver=None, approve=False):
     """Map EVERY un-routed social intake into Echo. Returns a per-base summary list.
@@ -504,6 +565,35 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
         answers = read_social_intake(raw_key, reader=reader)
         have_account = (_accounts.get_account(account_key) is not None
                         or _accounts.get_account(base) is not None)
+
+        # NO TOKEN ROW *AND* A UUID CLIENT KEY: the row carries the portal gym UUID, which
+        # is an identifier, not an account key. The token-row branch above already refuses
+        # to provision a UUID-named tenant, but with NO token row there was nothing to
+        # resolve against and register_gym took the UUID verbatim. That is exactly the
+        # corruption found in /data/gym_accounts.json on 2026-08-30 and repaired by hand.
+        # Mint the CANONICAL key from (gym_id, gym name) instead, the same derivation
+        # portal onboarding uses, so both doors land on the SAME key.
+        # DELIBERATELY narrow: a slug-shaped client_key ('freshbox') is a real account key
+        # already and is left exactly as it was. Re-minting those would hand every existing
+        # gym a brand new key, which is the very stranding this guards against.
+        if not have_account and not resolved and _looks_like_uuid(raw_key):
+            minted = _canonical_base(raw_key, answers)
+            if minted and minted != base:
+                base = minted
+                account_key = f"{base}_ig"
+                have_account = (_accounts.get_account(account_key) is not None
+                                or _accounts.get_account(base) is not None)
+            elif not minted:
+                # No usable gym name. We never fabricate one, and a UUID key is worse
+                # than waiting, so leave it un-routed for a human rather than mint junk.
+                ops_alerts.alert(
+                    f"social-intake-sync: '{raw_key}' has no portal token row and no "
+                    "usable gym name, so no canonical account key can be derived. "
+                    "Left un-routed (a UUID-keyed account would strand it). Add the "
+                    "gym name to its intake, or mint its key in the portal, then re-run.")
+                results.append({"base": raw_key, "ok": False,
+                                "reason": "no canonical key"})
+                continue
 
         # AUTO-PROVISION (AGENT_DYNAMIC_ACCOUNTS): create the inactive Account record
         # from the intake's gym info so no gym is stranded waiting on a hand-added

@@ -306,3 +306,39 @@ def test_doctor_excludes_internal_personal_bases():
         ca.client_gym_bases = orig
     assert "blake_personal" not in bases and "lasso" not in bases
     assert "gritx" in bases and "eng" in bases
+
+
+def test_an_unreadable_live_store_reports_could_not_read_not_all_stranded(monkeypatch):
+    """LIVE 2026-08-30: run under an interpreter with no `requests`, every gyms read
+    raised, resolve_gym_uuid honestly returned None for all 11 gyms, and the doctor
+    reported the ENTIRE FLEET stranded. available() only proves CREDS exist, not that
+    reads work. At 100 gyms a monitor that cries wolf on every gym is worse than none,
+    so a store that cannot be read must report exactly that."""
+    from agent import account_key_doctor as akd
+
+    class _DeadStore:
+        def available(self):
+            return True
+
+        def _client(self):
+            raise RuntimeError("no transport")
+
+        def _rest(self, t):
+            return t
+
+        def _headers(self):
+            return {}
+
+        def resolve_gym_uuid(self, base):
+            return None
+
+    monkeypatch.setattr(akd, "_default_store", lambda: _DeadStore())
+    monkeypatch.setattr(akd, "_default_bases", lambda: ["eng", "gritx", "topfuel"])
+    summary = akd.diagnose()
+    assert summary["reads_ok"] is False
+    assert summary["stranded"] == [], "must not report gyms stranded on a failed read"
+    assert summary["rows"] == []
+    lines = []
+    akd.print_report(summary, printer=lines.append)
+    assert any("could NOT read" in ln for ln in lines)
+    assert not any("STRANDING RISK" in ln for ln in lines)

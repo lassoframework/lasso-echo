@@ -1,4 +1,5 @@
 """Shared test isolation: every test gets its OWN sqlite db file, so the /data
+import pytest
 store never leaks state across tests (and never touches a real /data).
 
 ENV ISOLATION (2026-08-27, Blake's done-criterion "suite must pass in the Railway
@@ -80,4 +81,28 @@ def _isolated_db(tmp_path, monkeypatch):
         # where the constant is "". Rebind to the local-dev default.
         monkeypatch.setattr(_config, "SLACK_CHANNEL_ID", "", raising=False)
     except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _clear_process_local_caches():
+    """Empty every process-local memo cache before AND after each test.
+
+    client_media_sync._JSON_CACHE memoises parsed R2 sidecars by object key for the
+    life of the worker process (the fix for the per-cycle GET storm). Test files reuse
+    the SAME object keys with DIFFERENT contents, so a cache surviving between tests
+    makes results depend on test ORDER: test_client_media_sync clears it in its own
+    fixture, but test_cadence touches the same code path and did not, which is exactly
+    how a passing suite starts failing only under -p no:randomly or a new file. Doing
+    it here covers every test file, including ones not yet written."""
+    try:
+        from agent import client_media_sync as _cms
+        _cms._JSON_CACHE.clear()
+    except Exception:  # noqa: BLE001 - a cache that is absent needs no clearing
+        pass
+    yield
+    try:
+        from agent import client_media_sync as _cms
+        _cms._JSON_CACHE.clear()
+    except Exception:  # noqa: BLE001
         pass
