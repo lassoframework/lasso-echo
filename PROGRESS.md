@@ -6,7 +6,42 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
+
+---
+
+## LASSO Brain recompile (2026-08-31, Blake's instruction, built in sandbox, NOT committed/pushed)
+
+Echo's LASSO (B2B) content engine recompiled from the shared LASSO Brain at
+`~/LASSO/lasso-brain/` (READ-ONLY corpus; Echo compiles, never edits — see
+corpus-map.md there). Content edits only, plus two small code changes; suite
+green (4346 passed).
+
+- [~] VOICE: the 40-line Full Gym Voice Bank (book-doctrine.md §22) folded into
+      `brand_voice/lasso_voice.md` as the caption voice section, quotes verbatim;
+      `load_voice` still parses CTA rotation + hashtags (tested).
+- [~] PILLARS: 22 book pillars (one per chapter chunk of book-chapter-summaries.md,
+      Preface+Conclusion merged) compiled into the `lasso_now.md` pillar copy bank;
+      they rotate with the original five through the existing content brain.
+- [~] HOOKS: owner objections (book-objection-answers.md §A) compiled into pillar
+      hooks (e.g. "You tried Facebook ads and got burned. The ads were never the
+      problem."); CAPTION_ANGLES / angle-rotation contract untouched.
+- [~] PROOF: new `brand_voice/knowledge/09_website_kb_2026.md` — website-kb offers
+      + proof stats as exact USE claims, led by "71.9% booking rate vs. 18.5%
+      industry average." with the "297 leads nurtured across 4 gyms" qualifier
+      (source lassoframework.com/lead-nurture). Gate clears it verbatim; blends
+      with the homepage "60% top booking rate" stat still block. Site's "500+"
+      count NOT adopted (Blake's 2026-08-04 "1,000+" ruling stands).
+- [~] HIERARCHY: `agent/doctrine.py` now stands down for `Book:` pillars (the
+      declared citation hierarchy: the book outranks platform_2026), so book
+      hooks lead even with AGENT_KNOWLEDGE_ENABLED armed.
+- [~] PODCAST: `AGENT_PODCAST_TRANSCRIPTS_DIR` (default EMPTY = no change) points
+      the transcript lane at the Brain's `podcast/transcripts/` so each
+      `<episode>.txt` is an episode-scoped repurposing source; DB-ingested
+      transcripts still win; AGENT_PODCAST_ENABLED still gates. To arm:
+      `AGENT_PODCAST_TRANSCRIPTS_DIR=~/LASSO/lasso-brain/podcast/transcripts`.
+- Tests: `tests/test_lasso_brain_recompile.py` (new) + 4 local-dir tests in
+      `tests/test_podcast_transcripts.py`.
 
 ---
 

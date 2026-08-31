@@ -10,6 +10,17 @@ any code, read these three files. They are the source of truth for scope and sta
    completes ([x] done, [~] built in sandbox pending push, [ ] not started).
 3. `echo_build_tracker.html` — the visual dashboard that mirrors PROGRESS.md.
 
+## LASSO Brain — Echo's knowledge source (Blake, 2026-08-31)
+Echo's LASSO-content knowledge source is `~/LASSO/lasso-brain/` — the shared LASSO
+Brain (READ-ONLY: agents compile FROM it, never edit those files; the rules live in
+its `corpus-map.md`). The compilation contract: caption VOICE from the 40-line voice
+bank in `book-doctrine.md` (§22); content PILLARS from `book-chapter-summaries.md`
+(22 chapters = 22 pillars); HOOKS from `book-objection-answers.md` (objections make
+the best organic hooks); OFFERS/PROOF stats from `website-kb.md` quoted EXACTLY
+(lead with the "71.9% booking rate vs. 18.5% industry average" pilot stat); each
+podcast transcript in `podcast/transcripts/` is a repurposing source for posts/reels.
+New corpus lands in the Brain so every consumer (Echo, Lainey/Engage) inherits it.
+
 ## Non-negotiable gates (never remove, never weaken)
 - Approval gate default: every post waits for human approval. Approver Slack id: U06EPUUCL13.
   Exception: `AGENT_AUTO_APPROVE_ENABLED=true` (armed by Blake 2026-07-22) bypasses the

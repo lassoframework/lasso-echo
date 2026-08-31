@@ -159,3 +159,42 @@ def test_flag_off_everything_dark(monkeypatch, capsys):
     assert not podcast_transcripts.gate_clean_for_episode(said, 7)
     podcast_transcripts.ingest_cli(7, "x.txt", "")
     assert "OFF" in capsys.readouterr().out
+
+
+# ---- local Brain transcripts dir (Blake 2026-08-31) -------------------------------------
+def test_local_dir_unset_is_todays_behavior(monkeypatch):
+    _arm(monkeypatch)
+    monkeypatch.delenv("AGENT_PODCAST_TRANSCRIPTS_DIR", raising=False)
+    assert podcast_transcripts.transcript_text(115) == ""
+
+
+def test_local_brain_file_serves_as_episode_source(monkeypatch, tmp_path):
+    _arm(monkeypatch)
+    (tmp_path / "115.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    monkeypatch.setenv("AGENT_PODCAST_TRANSCRIPTS_DIR", str(tmp_path))
+    text = podcast_transcripts.transcript_text(115)
+    assert "Follow up wins the month." in text
+    # the episode-scoped gate clears a transcript-backed claim ...
+    said = "Our blended cost per lead across the portfolio is $16 right now."
+    assert podcast_transcripts.gate_clean_for_episode(said, 115)
+    # ... but the GLOBAL gate never borrows it (scope law unchanged)
+    assert not rotation.is_gate_clean(said, rotation._approved_claims())
+    # and a claim NOT in the transcript still blocks, episode tag or not
+    assert not podcast_transcripts.gate_clean_for_episode(
+        "Members grew 80 percent in a month.", 115)
+
+
+def test_db_ingested_transcript_wins_over_local_file(monkeypatch, tmp_path):
+    _arm(monkeypatch)
+    (tmp_path / "7.txt").write_text("Local brain file words.", encoding="utf-8")
+    monkeypatch.setenv("AGENT_PODCAST_TRANSCRIPTS_DIR", str(tmp_path))
+    podcast_transcripts.ingest(7, TRANSCRIPT, "test")
+    assert "Follow up wins the month." in podcast_transcripts.transcript_text(7)
+    assert "Local brain file" not in podcast_transcripts.transcript_text(7)
+
+
+def test_local_dir_dark_when_flag_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_PODCAST_ENABLED", raising=False)
+    (tmp_path / "115.txt").write_text(TRANSCRIPT, encoding="utf-8")
+    monkeypatch.setenv("AGENT_PODCAST_TRANSCRIPTS_DIR", str(tmp_path))
+    assert podcast_transcripts.transcript_text(115) == ""

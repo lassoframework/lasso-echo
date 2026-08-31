@@ -985,6 +985,20 @@ def podcast_enabled():
     return _truthy(os.environ.get("AGENT_PODCAST_ENABLED", "false"))
 
 
+def podcast_transcripts_dir() -> str:
+    """
+    Optional LOCAL transcripts folder: the LASSO Brain repurposing source
+    (Blake 2026-08-31). Point it at ~/LASSO/lasso-brain/podcast/transcripts and
+    each <episode>.txt there becomes that episode's transcript source when no
+    DB-ingested transcript exists (podcast_transcripts.transcript_text falls
+    back to the file). The Brain is READ-ONLY: Echo only ever reads here.
+
+    Default EMPTY = today's behavior byte for byte (DB-ingested transcripts
+    only). Still gated by AGENT_PODCAST_ENABLED like every transcript read.
+    """
+    return os.environ.get("AGENT_PODCAST_TRANSCRIPTS_DIR", "").strip()
+
+
 # The Full Gym book campaign: approved source docs at the repo-root knowledge/
 # folder (env override for tests). The book file is the MASTER source.
 BOOK_DIR = os.environ.get("AGENT_BOOK_DIR", "knowledge")

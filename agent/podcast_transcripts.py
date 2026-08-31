@@ -18,8 +18,16 @@ transcript still blocks, episode tag or not.
 NO LOG LEAKAGE: transcript content never lands in logs, audits, or alerts
 beyond SNIPPET_LEN characters (the CLI preview); the core ingest logs a
 character count only. Nothing here drafts or publishes.
+
+LOCAL BRAIN TRANSCRIPTS (Blake 2026-08-31): when AGENT_PODCAST_TRANSCRIPTS_DIR
+points at the LASSO Brain folder (~/LASSO/lasso-brain/podcast/transcripts,
+READ-ONLY — never edit those files), an <episode>.txt there serves as that
+episode's transcript whenever no DB-ingested row exists, making each Brain
+episode a repurposing source with the same episode-scoped gate. Env empty
+(the default) = zero behavior change; AGENT_PODCAST_ENABLED still gates reads.
 """
 
+import os
 import re
 
 from . import config, db
@@ -109,14 +117,31 @@ def ingest_url(episode, url, fetch=None):
 
 
 # ---- reads --------------------------------------------------------------------------
+def _local_transcript(episode):
+    """<episode>.txt from the local Brain transcripts dir (READ-ONLY), cleaned
+    like every other transcript. '' when the dir is unset (default) or the file
+    is absent/unreadable. Never writes, never ingests, never logs content."""
+    d = config.podcast_transcripts_dir()
+    if not d:
+        return ""
+    path = os.path.join(os.path.expanduser(d), f"{int(episode)}.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return _plain_text(fh.read())
+    except OSError:
+        return ""
+
+
 def transcript_text(episode):
-    """The stored transcript for episode <N>, '' when absent or flag OFF."""
+    """The stored transcript for episode <N>, '' when absent or flag OFF.
+    A DB-ingested transcript always wins; the local Brain file (see module
+    docstring) is the fallback when no row exists."""
     if not config.podcast_enabled():
         return ""
     with _conn() as conn:
         row = conn.execute("SELECT text FROM podcast_transcripts WHERE episode=?",
                            (int(episode),)).fetchone()
-    return row["text"] if row else ""
+    return row["text"] if row else _local_transcript(episode)
 
 
 def transcript_sentences(episode):

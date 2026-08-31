@@ -72,7 +72,15 @@ def angle_for_pillar(pillar, day_key):
     off, or nothing resolvable) so the caller falls back to lasso_now. An
     angle candidate that LOOKS like doctrine but carries no resolvable anchor
     is dropped loudly (audited), never returned uncited.
+
+    BOOK PILLARS OUTRANK THE PLATFORM DOC (the citation hierarchy declared in
+    08_platform_2026.md: "the book (The Full Gym) stays on top; this file ranks
+    directly under it"). A pillar compiled from the book (name prefixed
+    'Book:') keeps its own approved hook from the source doc, so this resolver
+    deliberately stands down for it and the lasso_now book hook leads.
     """
+    if (pillar or "").strip().lower().startswith("book"):
+        return None
     angles = platform_angles()
     if not angles:
         return None
