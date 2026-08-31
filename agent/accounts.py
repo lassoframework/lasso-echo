@@ -10,6 +10,7 @@ is kept as an INACTIVE record (personal-profile publishing ended in 2018). Edit
 ACCOUNTS or override the target ids via env. Tokens are set by Blake's own hand.
 """
 
+import contextlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -317,15 +318,74 @@ def _account_from_registry_row(row):
     ]
 
 
-def _load_registry_rows():
+class RegistryUnreadable(RuntimeError):
+    """The gym registry file exists but could not be parsed. Raised only to the
+    WRITER, so a corrupt file is never mistaken for an empty one and saved over."""
+
+
+@contextlib.contextmanager
+def _registry_lock(path):
+    """Exclusive advisory lock for a read-modify-write of the registry, held on a
+    sibling .lock file so the lock never depends on the registry existing yet.
+    Best effort: on a platform or filesystem without flock we proceed unlocked
+    rather than refuse to register a gym, since the atomic replace below is the
+    protection that actually prevents data LOSS; the lock prevents a lost UPDATE."""
+    lock_path = f"{path}.lock"
+    fh = None
+    try:
+        fh = open(lock_path, "a+")
+        try:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except Exception:  # noqa: BLE001 - no flock here; carry on unlocked
+            pass
+        yield
+    finally:
+        if fh is not None:
+            try:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _load_registry_rows(*, strict=False):
+    """The dynamic registry rows, or [] when there is no registry yet.
+
+    strict=True raises RegistryUnreadable when the file EXISTS but cannot be parsed,
+    instead of reporting it as an empty registry. Readers want the lenient default
+    (a missing registry really is no gyms); the WRITER must be strict, because
+    treating a corrupt file as empty and then saving would erase every gym in it."""
     from . import config
     path = config.gym_registry_path()
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return []
-    return data if isinstance(data, list) else []
+    except (OSError, ValueError) as exc:
+        # The file is THERE but unreadable/corrupt. Reporting that as "no gyms" is
+        # how a whole fleet goes invisible at once, so say so out loud either way.
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(
+                f"gym registry at {path} exists but could not be read "
+                f"({type(exc).__name__}). Every dynamically registered gym is "
+                "invisible until this is fixed. Restore it from a .bak beside it.")
+        except Exception:  # noqa: BLE001
+            pass
+        if strict:
+            raise RegistryUnreadable(str(exc)) from exc
+        return []
+    if not isinstance(data, list):
+        if strict:
+            raise RegistryUnreadable("registry is not a list")
+        return []
+    return data
 
 
 def _dynamic_accounts():
@@ -364,17 +424,33 @@ def register_gym(base, *, name="", ig_handle="", fb_page=""):
     if not base or not config.dynamic_accounts_enabled():
         return []
     path = config.gym_registry_path()
-    rows = _load_registry_rows()
-    row = {"base": base, "name": (name or base).strip(),
-           "ig_handle": (ig_handle or "").strip(), "fb_page": (fb_page or "").strip()}
-    rows = [r for r in rows if (r.get("base") or "").strip() != base]
-    rows.append(row)
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except OSError:
         pass
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(rows, fh, indent=2)
+    # LOCKED read-modify-write. This is a whole-file rewrite: two registrations
+    # racing (the intake sweep provisioning one gym while the portal onboards
+    # another) would otherwise both read the old list and the second write would
+    # silently drop the first gym. At 100 gyms, concurrent signups are normal.
+    with _registry_lock(path):
+        rows = _load_registry_rows(strict=True)
+        row = {"base": base, "name": (name or base).strip(),
+               "ig_handle": (ig_handle or "").strip(),
+               "fb_page": (fb_page or "").strip()}
+        rows = [r for r in rows if (r.get("base") or "").strip() != base]
+        rows.append(row)
+        # ATOMIC. The old code opened the real path "w", which TRUNCATES first: a
+        # crash or a container restart between truncate and write left a partial or
+        # empty file, _load_registry_rows read that as "no gyms", and the next
+        # registration then SAVED that loss permanently. Write a sibling temp file
+        # and rename it over the target instead, so the registry is only ever the
+        # old complete file or the new complete file, never a half of either.
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
     _dynamic_cache = None   # invalidate so the new gym resolves immediately
     return [f"{base}_ig", f"{base}_fb"]
 

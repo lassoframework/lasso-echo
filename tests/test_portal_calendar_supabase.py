@@ -609,3 +609,173 @@ def test_mark_published_only_stamps_the_claimed_row(monkeypatch):
     monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http2)
     with pytest.raises(pcs.PortalStoreError):
         pcs.SupabaseCalendarStore().mark_published("id-x", "M1", "2026-08-25T12:00:00Z")
+
+
+# ---- due_rows ordering vs. the daily publish cap (2026-08-30 audit) ------------
+#
+# CONFIRMED DEFECT (fixed below): due_rows() used to order by created_at (STAGE
+# time) alone, not post_date. A whole month is staged in ONE insert_rows() batch
+# per build (build_client_month/real_month_planner -> a single POST covering
+# every day of the month), so every row from that batch shares a created_at close
+# to when the build ran. An OLD approved backlog row (staged in an EARLIER build,
+# e.g. last month) therefore sorted BEFORE this month's freshly staged same-day
+# cadence rows -- created_at ordering does not track post_date. publish_due's
+# per-day cap processes due_rows() in whatever order it arrives and does
+# `continue` (never `break`) once the cap is hit, so whichever rows arrive FIRST
+# consume the cap budget for the day: a real client gym could see its normal
+# cadence silently starved behind old backlog while the lane reported itself
+# healthy. Fix: due_rows now orders `post_date.desc,created_at` so a run_date's
+# own rows (the maximum post_date the catch-up window ever contains) are served
+# before older catch-up backlog; ties within a day still break by created_at.
+
+def test_due_rows_orders_todays_post_date_before_older_backlog(monkeypatch):
+    """Confirms the FIX: due_rows requests order=post_date.desc,created_at, so a
+    row dated run_date (today) sorts AHEAD of an older backlog row even though the
+    backlog row was staged (created_at) long before today's row."""
+    old_row = _row("old", post_date="2026-08-29", status="approved")
+    old_row["created_at"] = "2026-07-01T00:00:00+00:00"     # staged last month
+    new_row = _row("new", post_date="2026-08-30", status="pending")
+    new_row["created_at"] = "2026-08-29T00:00:00+00:00"     # staged THIS month's build
+    # order=post_date.desc,created_at -> the live server returns the row with the
+    # LARGER post_date (today) first; the canned payload mirrors that real result.
+    http = _FakeHTTP(get_resp=_Resp(200, [new_row, old_row]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    rows = pcs.SupabaseCalendarStore().due_rows("lasso", "2026-08-30", catchup_days=7)
+
+    _method, _url, params, _headers = http.calls[0]
+    assert params["order"] == "post_date.desc,created_at"
+    # Today's row comes back FIRST now, ahead of the older backlog row.
+    assert [r["id"] for r in rows] == ["new", "old"]
+
+
+def test_due_rows_order_unchanged_when_no_catchup(monkeypatch):
+    """catchup_days=0 (e.g. LASSO's own lane) narrows post_date to a single eq.
+    filter, so every returned row already shares one post_date -- the new
+    post_date.desc key is a no-op tie and created_at ordering is unchanged from
+    before the fix."""
+    http = _FakeHTTP(get_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    pcs.SupabaseCalendarStore().due_rows("lasso", "2026-08-30")
+    _method, _url, params, _headers = http.calls[0]
+    assert params["post_date"] == "eq.2026-08-30"
+    assert params["order"] == "post_date.desc,created_at"
+
+
+def _cap_starvation_scenario(monkeypatch, *, backlog_first):
+    """Shared rig for the two tests below: 7 days of old approved backlog plus
+    today's 6 cadence rows, fed to publish_due with daily_cap=8 through a minimal
+    store that returns due_rows() output in a caller-chosen order -- everything
+    downstream of due_rows() (the claim/publish/cap loop) is untouched real code
+    from agent/calendar_autopublish.py."""
+    from agent import calendar_autopublish as cap
+    from agent.meta_publisher import PublishResult
+
+    RUN_DATE = "2026-08-30"
+    OLD = "2026-07-01T00:00:00+00:00"      # last month's build batch
+    NEW = "2026-08-29T00:00:00+00:00"      # this month's build batch (still < today)
+
+    backlog_days = ["2026-08-23", "2026-08-24", "2026-08-25", "2026-08-26",
+                     "2026-08-27", "2026-08-28", "2026-08-29"]
+    backlog = []
+    for i, day in enumerate(backlog_days):
+        r = _row(f"old{i}", post_date=day, status="approved")
+        r["created_at"] = OLD
+        r["published_at"] = None
+        r["late_post_id"] = None
+        backlog.append(r)
+    cadence = []
+    for i in range(6):
+        r = _row(f"new{i}", post_date=RUN_DATE, status="pending")
+        r["created_at"] = NEW
+        r["published_at"] = None
+        r["late_post_id"] = None
+        cadence.append(r)
+
+    ordered_rows = (backlog + cadence) if backlog_first else (cadence + backlog)
+
+    class _MutableStore:
+        """Returns due_rows() output in the FIXED order (post_date.desc,created_at)
+        or the PRE-FIX order (created_at only), per `backlog_first`, then supplies
+        the minimal claim/publish/revert plumbing publish_due needs."""
+
+        def __init__(self, rows):
+            self.rows = {r["id"]: dict(r) for r in rows}
+            self._order = [r["id"] for r in rows]
+
+        def due_rows(self, gym_id, run_date, catchup_days=0):
+            return [dict(self.rows[rid]) for rid in self._order]
+
+        def mark_publishing(self, row_id):
+            r = self.rows.get(row_id)
+            if not r or r.get("status") not in ("pending", "approved") \
+                    or r.get("published_at"):
+                return False
+            r["status"] = "publishing"
+            return True
+
+        def mark_published(self, row_id, media_id, published_at):
+            r = self.rows.get(row_id)
+            if r:
+                r["status"] = "published"
+                r["published_at"] = published_at
+                r["late_post_id"] = media_id
+            return r
+
+        def mark_publish_failed(self, row_id, revert_status="pending"):
+            r = self.rows.get(row_id)
+            if r:
+                r["status"] = revert_status
+            return r
+
+    class _Pub:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, draft, account):
+            self.calls.append(draft.draft_id)
+            return PublishResult(ok=True, mode="published", media_id="M")
+
+    monkeypatch.setenv("AGENT_CALENDAR_AUTOPUBLISH", "true")
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.setattr(cap, "_pub_count_today", lambda g, d: 0)
+    monkeypatch.setattr(cap, "_bump_pub_count", lambda g, d: None)
+
+    store = _MutableStore(ordered_rows)
+    pub = _Pub()
+    summary = cap.publish_due(
+        RUN_DATE, gym_id="lasso", store=store, publisher=pub,
+        now=RUN_DATE + "T23:59:00-04:00", catch_all=True, catchup_days=7,
+        daily_cap=8)
+    cadence_ids = {r["id"] for r in cadence}
+    return summary, cadence_ids
+
+
+def test_pre_fix_order_would_have_starved_same_day_cadence(monkeypatch):
+    """REPRODUCTION of the confirmed defect mechanism: when due_rows() returns
+    backlog BEFORE cadence (the plain `order=created_at` behavior this store had
+    before the fix), publish_due's cap loop (`continue`, never `break`, once the
+    cap is hit) spends the whole cap=8 budget on 7 old backlog rows and only 1 of
+    today's 6 cadence rows gets through -- confirming the starvation is real
+    given that ordering, independent of the due_rows fix itself."""
+    summary, cadence_ids = _cap_starvation_scenario(monkeypatch, backlog_first=True)
+    published_cadence = cadence_ids & set(summary["published"])
+    assert len(summary["published"]) == 8       # exactly the cap: 7 backlog + 1 cadence
+    assert len(published_cadence) == 1
+    assert published_cadence != cadence_ids, (
+        "expected same-day cadence rows to be starved behind older backlog when "
+        f"backlog sorts first; published={sorted(summary['published'])} "
+        f"waiting={sorted(summary['waiting'])}"
+    )
+
+
+def test_fixed_order_serves_same_day_cadence_before_backlog(monkeypatch):
+    """With the FIX's order (today's rows before older backlog, matching what
+    due_rows() now actually returns), all 6 of today's cadence rows publish and
+    the cap only eats into the older backlog (2 of the 7 backlog rows go out this
+    run, filling the cap=8 budget the rest of the way)."""
+    summary, cadence_ids = _cap_starvation_scenario(monkeypatch, backlog_first=False)
+    published_cadence = cadence_ids & set(summary["published"])
+    assert len(summary["published"]) == 8       # exactly the cap: 6 cadence + 2 backlog
+    assert published_cadence == cadence_ids      # EVERY same-day row published
+    assert len(summary["waiting"]) == 5          # only backlog left waiting

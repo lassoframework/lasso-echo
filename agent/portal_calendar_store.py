@@ -347,7 +347,20 @@ class SupabaseCalendarStore:
         post this morning used to strand it forever (post_date=eq.<today> could never
         see it again). With a small catch-up window the approved row is picked up and
         published immediately (approved_only still guards: a pending past row is never
-        touched)."""
+        touched).
+
+        ORDER (2026-08-30 fix): TODAY's rows (post_date DESC puts run_date, the max
+        value the catch-up window ever contains, first) are served before older
+        catch-up backlog, tie-broken by created_at (STAGE time) for determinism within
+        a day. Without this, a whole month is staged in ONE insert_rows() batch, so an
+        OLD approved backlog row (staged in an earlier build, weeks ago) sorted AHEAD
+        of this month's freshly staged same-day cadence rows under a plain
+        `order=created_at` -- and publish_due's per-day cap (AGENT_CLIENT_DAILY_PUBLISH_CAP)
+        processes rows in due_rows() order, spending its whole budget on backlog before
+        ever reaching today's rows (a client gym's normal cadence looked "stopped" while
+        old backlog silently ate the cap). This only changes SERVE ORDER, never which
+        rows are eligible; with catchup_days=0 every returned row already shares the
+        same post_date so the ordering is unchanged from before."""
         if catchup_days and int(catchup_days) > 0:
             from datetime import date as _date, timedelta as _td
             start = (_date.fromisoformat(run_date)
@@ -362,7 +375,7 @@ class SupabaseCalendarStore:
             "published_at": "is.null",
             "image_url": "not.is.null",
             "account": "in.(instagram,facebook)",
-            "order": "created_at",
+            "order": "post_date.desc,created_at",
         }
         r = self._client().get(
             self._rest(_TABLE),
