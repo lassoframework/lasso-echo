@@ -401,7 +401,11 @@ def test_map_answers_caps_field_length(monkeypatch):
     from agent import intake_web
     huge = "x" * (intake_web._FIELD_MAX + 5000)
     out = sir.map_answers({"gym": {"name": "Cap Gym", "about": huge},
-                           "voice": {"vibe": huge}})
+                           "voice": {"vibe": huge},
+                           # faq/promo are read straight off the RAW answers, so the
+                           # first cap missed them entirely and they flowed uncapped
+                           # into client_sources and from there into a caption.
+                           "faq": huge, "promo": huge})
     blob = repr(out)
     # the uncapped run would carry the full 9000-char answer straight through
     assert "x" * (intake_web._FIELD_MAX + 1) not in blob, "field cap not applied"

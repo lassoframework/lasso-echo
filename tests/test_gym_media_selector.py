@@ -191,3 +191,46 @@ def test_deny_never_rolls_back_the_same_photos_earlier_published_use(monkeypatch
     assert store.assets["a"]["used_count"] == 1
     assert store.assets["a"]["last_used_at"] == NOW.isoformat(), \
         "the asset must fall back to its PUBLISHED day-1 timestamp, not to never-used"
+
+
+def test_observe_denials_works_on_LIVE_SHAPED_rows(monkeypatch, tmp_path):
+    """THE DEAD BACKSTOP. This sweep filtered candidate rows with
+    draft_type == 'gym_media', but content_calendar has NO draft_type column: it
+    reads None on every live row (measured across 229 ENG rows, 2026-08-30). So the
+    filter was ALWAYS empty and this sweep has never rolled a single asset back
+    since it was written. The sibling podcast_selector.observe_denials was written
+    correctly against `pillar` and this one was simply never ported, which meant the
+    portal-deny rollback had no second line of defence at all. A denied photo's real
+    signal is a non-empty source_media_asset_id."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="pierce")])
+    sel.stamp_use(store.get_asset("a1"), "pierce", "2026-08-27",
+                  store=store, now=NOW)
+    assert store.assets["a1"]["used_count"] == 1
+
+    def fetch_rows(gym_id, post_date):
+        # exactly the shape the live table returns: no draft_type key at all
+        return [{"id": "r1", "status": "denied", "pillar": "faces",
+                 "source_media_asset_id": "a1"}]
+
+    summary = sel.observe_denials(store=store, fetch_rows=fetch_rows)
+    assert summary["rolled_back"] == 1, "the nightly backstop is still a no-op"
+    assert store.assets["a1"]["used_count"] == 0
+    # idempotent: a second sweep rolls nothing twice
+    assert sel.observe_denials(store=store, fetch_rows=fetch_rows)["rolled_back"] == 0
+
+
+def test_observe_denials_leaves_a_generated_row_alone(monkeypatch, tmp_path):
+    """A generated pillar carries no source_media_asset_id, so there is no photo to
+    return. Rolling one back would re-pool an asset this row never used."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo2.db"))
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="pierce")])
+    sel.stamp_use(store.get_asset("a1"), "pierce", "2026-08-27",
+                  store=store, now=NOW)
+
+    def fetch_rows(gym_id, post_date):
+        return [{"id": "r1", "status": "denied", "pillar": "about",
+                 "source_media_asset_id": ""}]
+
+    assert sel.observe_denials(store=store, fetch_rows=fetch_rows)["rolled_back"] == 0
+    assert store.assets["a1"]["used_count"] == 1

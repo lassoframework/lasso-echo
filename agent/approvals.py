@@ -13,6 +13,7 @@ from the right person AND (b) the publish flag armed. Both. Always.
 from dataclasses import dataclass
 
 from . import config, meta_publisher, gbp_publisher, ops_alerts, postlog, publish_confirm
+from . import store as draft_store
 from .accounts import get_account, Platform
 from .drafter import Draft, DraftStatus
 
@@ -100,7 +101,7 @@ def _is_approver(actor_slack_id, account=None):
 
 def handle_action(action, draft, actor_slack_id, note="",
                   redraft_fn=None, publisher=None, logger=None, account=None,
-                  confirmer=None, **kwargs):
+                  confirmer=None, store=None, **kwargs):
     """
     Apply an approval action.
 
@@ -110,6 +111,9 @@ def handle_action(action, draft, actor_slack_id, note="",
     account                                (optional; falls back to registry lookup)
     confirmer(draft, account, result)      (injectable; defaults to publish_confirm,
                                             which is a no-op unless its flag is armed)
+    store                                  (injectable; the atomic-claim guard on the
+                                            approve path, defaults to the live
+                                            PendingStore -- see the approve branch)
     """
     # --- approver gate: global approver, or this account's own approvers ---
     gate_acct = account or get_account(getattr(draft, "account_key", "") or "")
@@ -231,6 +235,24 @@ def handle_action(action, draft, actor_slack_id, note="",
         if acct is None:
             return ActionResult(ok=False, action="approve", draft_id=draft.draft_id,
                                 detail=f"Unknown account {draft.account_key}.")
+        # ATOMIC PUBLISH CLAIM (Slack double-publish fix): nothing here stopped two
+        # concurrent approves of the SAME draft (a Slack retry on a slow ack, a double
+        # tap by the approver, two listener replicas) from both reaching pub.publish()
+        # below, because draft.status only flipped to APPROVED AFTER publish() returned,
+        # so both readers saw PENDING. meta_publisher's 24h content-hash dedup was the
+        # only guard and it is check-then-act, so two callers that both checked before
+        # either stamped both published live. Claim the row FIRST; only the winner may
+        # publish. See store.claim_for_publish for the compare-and-swap, and for why a
+        # never-persisted draft (the per-account autonomy lane approves before its first
+        # store.put()) is granted the claim rather than treated as contested.
+        st = store or draft_store.PendingStore()
+        from_status = getattr(draft.status, "value", draft.status)
+        if not st.claim_for_publish(draft.draft_id, from_status):
+            # Lost the race: a concurrent approve is already publishing it, or has.
+            # Skip, not error: the human gets their confirmation from the winner.
+            return ActionResult(ok=True, action="approve", draft_id=draft.draft_id,
+                                detail="Already claimed by a concurrent approve; "
+                                       "skipped so it is not published twice.")
         pub = publisher or _publisher_for(acct)
         try:
             result = pub.publish(draft, acct)   # draft-only guard lives inside publish()
@@ -240,6 +262,9 @@ def handle_action(action, draft, actor_slack_id, note="",
             # clear, non-alarming note — never the loud "publish attempt failed"
             # alarm, because no post went out. The draft stays PENDING (we return
             # before marking APPROVED), so tapping Approve again retries it.
+            # Release the claim first: never strand a draft in the claiming state,
+            # which would turn one rare double post into a common never post.
+            st.release_claim(draft.draft_id, from_status)
             ops_alerts.alert(f"held (media not ready) for {draft.account_key} draft "
                              f"{draft.draft_id}: {e} Nothing published; the card is "
                              "held. Approve again in a minute to retry.")
@@ -251,9 +276,19 @@ def handle_action(action, draft, actor_slack_id, note="",
         except Exception as e:
             # Behavior unchanged (the error still raises to the caller); with
             # AGENT_OPS_ALERTS_ENABLED it also posts one loud ops alert first.
+            # Same "never strand the claim" reasoning as MediaNotReady above.
+            st.release_claim(draft.draft_id, from_status)
             ops_alerts.alert(f"publish attempt failed for {draft.account_key} draft "
                              f"{draft.draft_id}: {type(e).__name__}: {e}")
             raise
+        # NOTHING ACTUALLY WENT OUT: publish() can return NORMALLY without posting.
+        # The dry run (AGENT_PUBLISH_ENABLED off, which is the DEFAULT) returns
+        # mode="would_publish" and raises nothing, so neither release path above
+        # fires. Holding the claim there would strand the draft and refuse every
+        # later approve, turning the rare double post this guard prevents into a
+        # permanent never post: strictly worse than the bug.
+        if getattr(result, "mode", "") != "published":
+            st.release_claim(draft.draft_id, from_status)
         draft.status = DraftStatus.APPROVED
         # Meta returns media_id, GBP returns post_id — log whichever the result carries.
         post_ref = getattr(result, "media_id", "") or getattr(result, "post_id", "")

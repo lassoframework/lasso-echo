@@ -131,10 +131,16 @@ def map_answers(answers):
     if ideal:
         _add("about", f"Who we help: {ideal}")
 
-    # faq / promo: only when the intake actually carries them.
-    for line in _nonempty_lines(answers.get("faq")):
+    # faq / promo: only when the intake actually carries them. Read straight off the
+    # RAW answers, so they need the same cap as the sub-dicts above: capping only the
+    # fields the first cap happened to cover left these two uncapped all the way into
+    # client_sources and from there into a caption.
+    def _capped_lines(value):
+        return [ln[:intake_web._FIELD_MAX] for ln in _nonempty_lines(value)]  # noqa: SLF001
+
+    for line in _capped_lines(answers.get("faq")):
         _add("faq", line)
-    for line in _nonempty_lines(answers.get("promo")):
+    for line in _capped_lines(answers.get("promo")):
         _add("promo", line)
 
     banned_words = _parse_banned(voice.get("words_to_never_use"))

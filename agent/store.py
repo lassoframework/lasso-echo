@@ -227,6 +227,83 @@ class PendingStore:
             return None
         return _row_to_draft(row)
 
+    # Transient marker (NOT a DraftStatus enum member): a draft currently
+    # owned by a claim_for_publish() winner, between the claim and the
+    # publish() call resolving. Never written by put()/_to_dict(), and never
+    # readable back out as a Draft (approvals.py always resolves it via
+    # claim_for_publish/release_claim, by draft_id, before anything reads the
+    # row again). Kept off DraftStatus so a stray read can't hand a caller a
+    # Draft object claiming to be in an enum state that never existed.
+    CLAIMING_STATUS = "publishing"
+
+    def claim_for_publish(self, draft_id, from_status):
+        """
+        ATOMIC PUBLISH CLAIM (the fix for the Slack-lane double-publish
+        incident): the Slack listener's _act() reads a draft via a plain
+        store.get() -- no conditional update -- then calls
+        approvals.handle_action("approve", ...), which only flipped
+        draft.status to APPROVED *after* pub.publish() returned. Two
+        concurrent approvals of the same draft_id (a Slack retry on a slow
+        ack, a double tap by the approver, or two listener replicas) could
+        both read the same row while it was still unclaimed and both reach
+        publish() -- meta_publisher's 24h content-hash dedup was the only
+        guard, and it is check-then-act (reads _recent_duplicate before the
+        network call, stamps _stamp_published only after), so two callers
+        that both checked before either stamped both published live.
+
+        This is a compare-and-swap: flip this row's status from_status ->
+        CLAIMING_STATUS, but ONLY if the row's CURRENTLY STORED status still
+        equals from_status (the status the caller actually read before
+        deciding this draft was approvable -- 'pending' the ordinary case,
+        'expired' for the approve-on-expired path). Two callers racing on the
+        same persisted row: only the first UPDATE can match (rowcount 1); the
+        second sees the row already flipped away from from_status and gets
+        rowcount 0, i.e. it lost the race and must not call publish().
+
+        A draft with NO persisted row at all (runner.py's per-account
+        autonomy lane calls approve() on a freshly drafted Draft *before* its
+        first store.put(); tests routinely build a Draft in memory and call
+        handle_action directly) has nothing to protect: there is only ever
+        one caller who could possibly be racing against nothing, so the claim
+        is granted by default rather than mistaken for "someone else already
+        has it".
+
+        Returns True iff this call may proceed to publish.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE drafts SET status=? WHERE draft_id=? AND status=?",
+                (self.CLAIMING_STATUS, draft_id, from_status))
+            conn.commit()
+            if cur.rowcount > 0:
+                return True
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE draft_id=?", (draft_id,)).fetchone()
+            return exists is None
+
+    def release_claim(self, draft_id, from_status):
+        """
+        Undo a claim after a publish FAILURE (MediaNotReady, or any other
+        exception out of publisher.publish()), restoring the row to
+        from_status so a human can retry -- exactly the state it was in
+        before the claim. Without this, a claimed-then-failed draft would be
+        stranded in CLAIMING_STATUS forever (invisible to list_pending(),
+        unrecoverable), which would turn the rare double-post this fixes into
+        a common never-post: worse than the bug it replaces.
+
+        Only ever flips a row THIS store marked CLAIMING_STATUS; a row that
+        moved on to something else in the meantime (there is no such caller
+        today, since only the claim winner ever reaches publish()) is left
+        alone rather than clobbered. A draft with no persisted row (the
+        claim-granted-by-default case above) has nothing to release; this is
+        then a harmless no-op.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE drafts SET status=? WHERE draft_id=? AND status=?",
+                (from_status, draft_id, self.CLAIMING_STATUS))
+            conn.commit()
+
 
 def _is_sqlite(path):
     try:

@@ -337,8 +337,15 @@ def observe_denials(*, store=None, fetch_rows=None):
             rows = fetch_rows(gym_id, post_date) or []
         except Exception:
             continue
-        mine = [r for r in rows
-                if str(r.get("draft_type") or "").strip().lower() == "gym_media"]
+        # THE DEAD FILTER. This keyed on draft_type == 'gym_media', but content_calendar
+        # has NO draft_type column: it reads None on every live row (measured across 229
+        # ENG rows, 2026-08-30). So `mine` was ALWAYS empty and this sweep has never
+        # rolled a single asset back since it was written. The sibling
+        # podcast_selector.observe_denials was written correctly against `pillar` and
+        # this one was simply never ported. A denied photo's real signal is a non-empty
+        # source_media_asset_id, present on exactly the photo pillars and absent on
+        # every generated one.
+        mine = [r for r in rows if str(r.get("source_media_asset_id") or "").strip()]
         if not mine:
             continue
         denied = any(str(r.get("status") or "").lower() == "denied" for r in mine)
