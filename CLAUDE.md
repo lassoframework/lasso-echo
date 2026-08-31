@@ -21,6 +21,15 @@ the best organic hooks); OFFERS/PROOF stats from `website-kb.md` quoted EXACTLY
 podcast transcript in `podcast/transcripts/` is a repurposing source for posts/reels.
 New corpus lands in the Brain so every consumer (Echo, Lainey/Engage) inherits it.
 
+## Client-facing Slack comes FROM ECHO (Blake, 2026-08-31, hard rule)
+Any message to a gym owner or coach goes out as the Echo app, never as Blake and never
+through the Claude Slack connector (that posts as whoever is driving it and stamps
+"Sent using @Claude"). Use `scripts/echo_slack.py <channel_id> <message_file>` — it pulls
+AGENT_SLACK_BOT_TOKEN from the deployed `echo` service in memory only. Verify the sender
+first with `--whoami` (expect bot user U0BE39F02KV). The Claude connector is for internal
+notes to LASSO staff only. Write the message to a file so the copy is reviewable before
+it sends. Note: ~/scout-listener's Slack token is a DIFFERENT app (scout2), not Echo.
+
 ## Non-negotiable gates (never remove, never weaken)
 - Approval gate default: every post waits for human approval. Approver Slack id: U06EPUUCL13.
   Exception: `AGENT_AUTO_APPROVE_ENABLED=true` (armed by Blake 2026-07-22) bypasses the
