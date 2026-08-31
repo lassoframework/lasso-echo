@@ -62,6 +62,39 @@ _REGISTRY = {
     "x4 hoover": {
         "domain": "x4fit.com",                    # Hoover, AL location of the X4 FIT brand
     },
+    # Looked up + verified 2026-08-31 (website auto-intake rollout; every domain
+    # confirmed against the gym's own site + its known GBP street address). Each gym
+    # is keyed by BOTH its human name and its exact account base key, because the
+    # intake resolver tries the display name first and the base key second.
+    "hill country mvmt": {
+        "domain": "hillcountrymvmt.com",          # Dripping Springs, TX (150 Russell Ln)
+    },
+    "hillcountry": {"domain": "hillcountrymvmt.com"},
+    "zanshin fitness": {
+        "domain": "zanshin.fit",                  # Peachtree Corners, GA (4015 Holcomb Bridge Rd)
+    },
+    "zanshinfitness630e22": {"domain": "zanshin.fit"},
+    "crossfit reverb": {
+        "domain": "crossfitreverb.net",           # Upland, CA (1120 Dewey Way)
+    },
+    "crossfitreverb30b5b2": {"domain": "crossfitreverb.net"},
+    "crossfit local": {
+        "domain": "crossfitlocal.com",            # Chapel Hill, NC (7401 Rex Rd)
+    },
+    "crossfitlocal": {"domain": "crossfitlocal.com"},
+    "crossfit newtown": {
+        "domain": "crossfitnewtown.com",          # Newtown, PA (121 Friends Lane; NOT the CT box)
+    },
+    "crossfitnewtown": {"domain": "crossfitnewtown.com"},
+    "train716": {
+        "domain": "train716buffalo.com",          # Orchard Park, NY (Buffalo; 3356 Southwestern Blvd)
+    },
+    "train7164ae502": {"domain": "train716buffalo.com"},
+    "district h strength fitness": {
+        "domain": "districthsf.com",              # Houston, TX (two locations; verified 2026-08-25)
+    },
+    "district h": {"domain": "districthsf.com"},
+    "district h strength and fitness": {"domain": "districthsf.com"},
 }
 
 
