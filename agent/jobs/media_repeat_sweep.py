@@ -143,6 +143,19 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                        if str(r.get("status") or "").lower() in FIXABLE]
             if not fixable:
                 continue
+            # SAME-DATE STORY SIBLINGS: the paired story's image_url is a BURNED
+            # caption card (different basename), so it never groups under the feed
+            # photo's key — but it shows the SAME duplicated photo. Match it by its
+            # raw source_media_url (or image_url) and swap it together with the feed
+            # so the day's cards stay one consistent post.
+            sibs = [r for r in rows
+                    if str(r.get("post_date") or "")[:10] == pd
+                    and str(r.get("format") or "").lower() == "story"
+                    and str(r.get("status") or "").lower() in FIXABLE
+                    and r not in group
+                    and (media_guard.media_key(r.get("source_media_url")) == key
+                         or media_guard.media_key(r.get("image_url")) == key)]
+            fixable = fixable + sibs
             new_key, new_path = _fresh_photo(base, lib, state, exclude={key})
             if not new_key:
                 result["small_library"] = True
@@ -167,26 +180,43 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
             if not hosted:
                 result["detail"].append(f"{key} {pd}: hosting unavailable; left")
                 continue
+            # FEED AUTOFIT PARITY: the original feeds shipped through the autofit
+            # reframe; give the replacement the same treatment (raw on any failure).
+            feed_url = hosted
+            if config.feed_autofit_enabled():
+                try:
+                    from agent import feed_image
+                    asset = feed_image.get_or_make_feed_image(new_path, lib,
+                                                              logger=_log)
+                    if asset:
+                        reframed = media_host.host_media(asset, f"{base}_ig")
+                        if reframed:
+                            feed_url = reframed
+                except Exception:  # noqa: BLE001 - keep the raw hosted photo
+                    pass
             fixed_any = False
             for r in fixable:
                 rid = r.get("id")
                 fmt = str(r.get("format") or "").lower()
-                # Re-confirm status right before the write (never race a claim).
-                fresh = store.get_row(base, rid)
-                if fresh is None or str(fresh.get("status") or "").lower() \
-                        not in FIXABLE:
-                    continue
-                target_url = hosted
-                if fmt == "story" and config.story_format_enabled():
-                    burned = _reburn_story(base, r, new_path, lib)
-                    if burned:
+                target_url = feed_url
+                src_url = None
+                if fmt == "story":
+                    if config.story_format_enabled():
+                        burned = _reburn_story(base, r, new_path, lib)
+                        if not burned:
+                            result["detail"].append(
+                                f"{key} {pd}: story re-burn failed; left")
+                            continue
                         target_url = burned
                         result["stories_reburned"] += 1
                     else:
-                        result["detail"].append(
-                            f"{key} {pd}: story re-burn failed; left")
-                        continue
-                if store.patch_image_url(base, rid, target_url) is not None:
+                        target_url = hosted            # raw photo, never the square
+                    if config.story_source_media_enabled():
+                        src_url = hosted
+                # swap_media is status-guarded server-side (pending/coach_review
+                # only), so an approval or publish landing mid-sweep wins the race.
+                if store.swap_media(base, rid, target_url,
+                                    source_media_url=src_url) is not None:
                     result["rows_repointed"] += 1
                     fixed_any = True
             if fixed_any:

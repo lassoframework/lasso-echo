@@ -276,6 +276,33 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def swap_media(self, account_key, row_id, image_url, source_media_url=None):
+        """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
+        media to a fresh photo because its current photo already sits on another day
+        of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
+        status in (pending, coach_review), so an approved / publishing / published row
+        can NEVER be swapped through this method — the gym's approval and anything
+        live keep exactly the pixels they had. Caption, status and date are untouched.
+        source_media_url (when given) is updated too, so a later edited-caption story
+        re-burn burns onto the NEW photo, not the replaced duplicate. id+gym_id
+        isolation. Returns the updated row, or None when nothing matched."""
+        payload = {"image_url": image_url}
+        if source_media_url is not None:
+            payload["source_media_url"] = source_media_url
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",
+                    "status": "in.(pending,coach_review)"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if str(row.get("gym_id")) == str(account_key):
+                return row
+        return None
+
     def patch_gbp_fields(self, account_key, row_id, fields):
         """G1: persist edited GBP structured columns (already normalized to gbp_* names)
         and revert status to 'pending' — an edit to CTA/event/offer/location resets the

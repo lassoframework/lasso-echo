@@ -825,3 +825,30 @@ def test_fixed_order_serves_same_day_cadence_before_backlog(monkeypatch):
     assert len(summary["published"]) == 8       # exactly the cap: 6 cadence + 2 backlog
     assert published_cadence == cadence_ids      # EVERY same-day row published
     assert len(summary["waiting"]) == 5          # only backlog left waiting
+
+
+# ---- swap_media (cross-day media guard sweep) --------------------------------------
+def test_swap_media_is_status_guarded_to_waiting_rows(monkeypatch):
+    """The sweep's media swap must be server-side limited to pending/coach_review:
+    an approved, publishing or published row can NEVER have its pixels swapped."""
+    patched = _Resp(200, [_row("id-m", gym_id="gritx", status="pending")])
+    http = _FakeHTTP(patch_resp=patched)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    out = pcs.SupabaseCalendarStore().swap_media(
+        "gritx", "id-m", "https://cdn/new.jpg", source_media_url="https://cdn/raw.jpg")
+    assert out is not None
+    _m, _u, params, _h, payload = http.calls[0]
+    assert params["status"] == "in.(pending,coach_review)"
+    assert params["id"] == "eq.id-m" and params["gym_id"] == "eq.gritx"
+    assert payload == {"image_url": "https://cdn/new.jpg",
+                       "source_media_url": "https://cdn/raw.jpg"}
+
+
+def test_swap_media_zero_match_returns_none(monkeypatch):
+    """A row that got approved/claimed between the sweep's read and its write matches
+    zero rows -> None (the race loser is the sweep, never the approval)."""
+    http = _FakeHTTP(patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    assert pcs.SupabaseCalendarStore().swap_media("gritx", "id-m", "u") is None
+    _m, _u, _params, _h, payload = http.calls[0]
+    assert payload == {"image_url": "u"}   # source_media_url omitted when not given
