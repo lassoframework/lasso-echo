@@ -170,6 +170,46 @@ def check_gym(base_key, gym_id="", intake_key="", *, bases=None, deps=None):
     return issues
 
 
+def autoregister(base_key, gym_id, *, deps=None, alert=None):
+    """Register ONE portal-known gym into Echo's dynamic account registry under the
+    exact key the portal minted. Returns True when a registration happened.
+
+    Closes the hand step that was paid five times (Hill Country, The Bolton Club,
+    CrossFit Local, CrossFit Reverb, CrossFit Newtown): register_gym has ONE
+    production caller, the social-intake sweep, so a gym that has not submitted
+    intake yet is in NEITHER lane and no automation ever puts it in one.
+
+    Rails: behind AGENT_ONBOARDING_AUTOREGISTER (default OFF); registers only under
+    the portal's own key; needs the gym's REAL name from the gyms table and does
+    NOTHING without one, because inventing a name is fabrication. Creates an inactive
+    Account record only: no tokens, no connection, no approval, no publish. Never
+    raises out."""
+    if not config.onboarding_autoregister_enabled():
+        return False
+    if not is_client_gym(base_key):
+        return False
+    d = deps or _live_deps()
+    try:
+        name = str(d["gym_name"](gym_id) or "").strip()
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name:
+        return False
+    try:
+        from . import accounts
+        accounts.register_gym(base_key, name=name)
+    except Exception as exc:  # noqa: BLE001 - one gym never blocks the sweep
+        if alert:
+            alert(f"{base_key}: auto-register failed ({type(exc).__name__}: {exc}). "
+                  "It stays in neither lane until registered by hand.")
+        return False
+    if alert:
+        alert(f"{base_key}: registered into Echo's account registry as '{name}' so it "
+              "is in the build lane. It still needs its own intake, connection and "
+              "media before anything real can post.")
+    return True
+
+
 def run(*, deps=None, alert=None, kv=None, today=None, http=None):
     """Sweep every gym on the portal roster and alert on the ones set up wrong.
     Returns {base_key: [reason, ...]} for the gyms alerted this pass."""
@@ -199,6 +239,17 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
                                bases=bases, deps=d)
         except Exception:  # noqa: BLE001 - one gym never blocks the sweep
             continue
+        # ACT on not_registered when armed, instead of asking a human to do the one
+        # mechanical step in this whole list. Re-check after, so the alert reports
+        # what is ACTUALLY still wrong rather than a problem we just fixed.
+        if REASON_NOT_REGISTERED in issues:
+            try:
+                if autoregister(base_key, gym_id, deps=d, alert=alert):
+                    bases.add(base_key)
+                    issues = check_gym(base_key, gym_id, intake.get(gym_id, ""),
+                                       bases=bases, deps=d)
+            except Exception:  # noqa: BLE001
+                pass
         if not issues:
             continue
         stamp = f"onboarding_watch_{base_key}_{'+'.join(issues)}_{day}"
@@ -250,6 +301,27 @@ def _live_deps():
         except Exception:  # noqa: BLE001
             return ""
 
+    def _gym_name(gym_id):
+        """The gym's REAL display name from the shared plane, or "" — never invented.
+        autoregister does nothing without one, because a fabricated name would become
+        the gym's Zernio profile name and its account label."""
+        url = config.supabase_url()
+        key = config.supabase_service_key()
+        if not url or not key or not gym_id:
+            return ""
+        try:
+            import requests  # lazy
+            r = requests.get(f"{url.rstrip('/')}/rest/v1/gyms",
+                             params={"id": f"eq.{gym_id}", "select": "name"},
+                             headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                             timeout=30)
+            if r.status_code >= 400:
+                return ""
+            rows = r.json() or []
+            return str((rows[0] or {}).get("name") or "") if rows else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     return {"roster": portal_keys, "intake": intake_keys, "bases": _bases,
             "approved_sources": _approved, "profile_id": _profile,
-            "platforms": _platforms, "fb_page": _fb_page}
+            "platforms": _platforms, "fb_page": _fb_page, "gym_name": _gym_name}

@@ -36,7 +36,7 @@ class _KV:
 
 
 def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
-          platforms=None, pages=None):
+          platforms=None, pages=None, names=None):
     sources = sources or {}
     profiles = profiles or {}
     platforms = platforms or {}
@@ -49,6 +49,7 @@ def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
         "profile_id": lambda b: profiles.get(b, ""),
         "platforms": lambda pid: set(platforms.get(pid, set())),
         "fb_page": lambda b: pages.get(b, ""),
+        "gym_name": lambda gid: (names or {}).get(gid, ""),
     }
 
 
@@ -191,3 +192,79 @@ def test_lasso_and_staff_accounts_are_never_flagged():
     assert ow.is_client_gym("lasso_demo") is False
     assert ow.is_client_gym("blake_personal") is False
     assert ow.is_client_gym("eng") is True
+
+
+# ---- auto-register: act on not_registered instead of asking a human -------------
+def _unregistered(names=None):
+    return _deps(roster=[("g1", "newbox")], intake={"g1": "newbox"}, bases=[],
+                 sources={"newbox": ["s"]}, profiles={"newbox": "p1"},
+                 platforms={"p1": {"instagram"}}, pages={"newbox": "1"},
+                 names=({"g1": "New Box Fitness"} if names is None else names))
+
+
+def test_autoregister_defaults_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_ONBOARDING_AUTOREGISTER", raising=False)
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    out = ow.run(deps=_unregistered(), alert=lambda m: None, kv=_KV())
+    assert out == {"newbox": [ow.REASON_NOT_REGISTERED]}, "it acted while OFF"
+    assert accounts.get_account("newbox_ig") is None
+    accounts._dynamic_cache = None
+
+
+def test_autoregister_puts_a_portal_known_gym_into_the_lane(monkeypatch, tmp_path):
+    """register_gym has ONE production caller, the social-intake sweep, so a gym that
+    has not submitted intake yet is in NEITHER lane and nothing ever puts it there.
+    That hand step was paid five times (Hill Country, Bolton, Local, Reverb, Newtown)
+    and does not survive 100 gyms."""
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    seen = []
+    out = ow.run(deps=_unregistered(), alert=seen.append, kv=_KV())
+    assert accounts.get_account("newbox_ig") is not None
+    assert out == {}, "the gym is healthy once registered, so nothing should be flagged"
+    assert any("registered into Echo's account registry" in m for m in seen)
+    accounts._dynamic_cache = None
+
+
+def test_autoregister_never_invents_a_name(monkeypatch, tmp_path):
+    """No real name means no registration: a fabricated one becomes the gym's Zernio
+    profile name and its account label."""
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    out = ow.run(deps=_unregistered(names={}), alert=lambda m: None, kv=_KV())
+    assert out == {"newbox": [ow.REASON_NOT_REGISTERED]}
+    assert accounts.get_account("newbox_ig") is None
+    accounts._dynamic_cache = None
+
+
+def test_autoregister_never_touches_lasso_or_staff(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    assert ow.autoregister("lasso", "g9", deps=_unregistered()) is False
+    assert ow.autoregister("blake_personal", "g9", deps=_unregistered()) is False
+    accounts._dynamic_cache = None
+
+
+def test_a_registration_failure_never_breaks_the_sweep(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    monkeypatch.setattr(accounts, "register_gym",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    seen = []
+    out = ow.run(deps=_unregistered(), alert=seen.append, kv=_KV())
+    assert out == {"newbox": [ow.REASON_NOT_REGISTERED]}
+    assert any("auto-register failed" in m for m in seen)

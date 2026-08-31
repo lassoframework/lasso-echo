@@ -327,6 +327,32 @@ def onboarding_watch_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ONBOARDING_WATCH", "false"))
 
 
+def onboarding_autoregister_enabled() -> bool:
+    """
+    ONBOARDING AUTO-REGISTER (AGENT_ONBOARDING_AUTOREGISTER). Default OFF.
+
+    Lets the readiness watch ACT on its own not_registered finding: add the gym to
+    Echo's dynamic account registry under the exact key the portal already minted.
+
+    WHY: accounts.register_gym has exactly ONE production caller, the social-intake
+    sweep. So a gym is registered only if it submits intake AND that sweep routes it.
+    A gym that signed up but has not filled anything in yet is therefore in NEITHER
+    lane, gets no sample month, and needs a human to register it by hand. That hand
+    step was paid five times over (Hill Country, The Bolton Club, CrossFit Local,
+    CrossFit Reverb, CrossFit Newtown) and does not survive 100 gyms.
+
+    It must run on the WORKER: the registry is a file on the worker's own volume, and
+    AGENT_DYNAMIC_ACCOUNTS is not even set on the web service, so registering from the
+    portal would be a silent no-op.
+
+    RAILS: registers ONLY under the portal's own key, only for a gym the portal roster
+    already lists, and only with the gym's REAL name from the gyms table. No name means
+    no registration (we never fabricate one). It creates an inactive Account record and
+    nothing else: no tokens, no connection, no approval, no publish. Arm by hand.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARDING_AUTOREGISTER", "false"))
+
+
 def intake_auto_approve() -> bool:
     """
     AUTO-APPROVE a gym's own intake answers (AGENT_INTAKE_AUTO_APPROVE). Default OFF.
