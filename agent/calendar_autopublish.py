@@ -1279,8 +1279,9 @@ def sweep_expired_rows(*, store=None, kv=None, now=None, alert=None,
                     bits.append(f"re-dated {len(moved)} expired row(s) into open "
                                 f"day(s) {span} (approvals preserved)")
                 if retired:
-                    bits.append(f"retired {len(retired)} unapproved row(s) that "
-                                "expired twice")
+                    bits.append(f"retired {len(retired)} expired row(s) (unapproved "
+                                "twice-expired, or redundant because every upcoming "
+                                "day already has content)")
                 alert(f"{gym}: {'; '.join(bits)}. No action needed.")
             if not gym_rows:
                 alerted.append(gym)
@@ -1359,7 +1360,17 @@ def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
         slot_day = next((d for d in horizon
                          if (acct, fmt, d.isoformat()) not in occupied), None)
         if slot_day is None:
-            continue                              # book is full: leave for the digest
+            # BOOK FULL: every day in the plan horizon already carries content for
+            # this (account, format) — the expired row is REDUNDANT by definition
+            # (nothing upcoming lacks a post), so keeping it can only rot. Retire it
+            # (killed + reason) instead of bouncing it to a human digest forever;
+            # the info alert names the count so nothing disappears silently.
+            try:
+                if store.set_status(gym, rid, "killed") is not None:
+                    retired.append({"id": rid, "new_date": ""})
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         try:
             if patch(rid, slot_day.isoformat()) is None:
                 continue                          # raced (claimed/published): skip

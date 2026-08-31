@@ -1470,3 +1470,23 @@ def test_expired_flag_off_keeps_alert_only(monkeypatch):
                            now="2026-08-30T12:00:00")
     assert store.redates == [] and store.status_sets == []
     assert len(seen) == 1 and "Re-date them to publish" in seen[0]
+
+
+def test_expired_row_with_full_book_is_retired_not_stranded(monkeypatch):
+    """BOOK FULL: when every horizon day already has content for the row's
+    (account, format), the expired row is redundant — retired with an info alert,
+    never bounced to a human digest forever (LASSO 2026-08-31: 4 approved rows
+    could not fit a 31-day-full book and fell through silently)."""
+    monkeypatch.setenv("AGENT_EXPIRED_AUTO_REDATE", "true")
+    rows = [{"id": "full1", "gym_id": "lasso", "account": "instagram",
+             "format": "feed", "post_date": "2026-08-09", "status": "approved"}]
+    from datetime import date, timedelta
+    occupied = [{"account": "instagram", "format": "feed",
+                 "post_date": (date(2026, 8, 30) + timedelta(days=i)).isoformat(),
+                 "status": "pending"} for i in range(1, 33)]
+    store, kv, seen = _RedateStore(rows, occupied), _MemKV(), []
+    cap.sweep_expired_rows(store=store, kv=kv, alert=seen.append,
+                           now="2026-08-30T12:00:00")
+    assert store.redates == []
+    assert store.status_sets == [("full1", "killed")]
+    assert len(seen) == 1 and "No action needed" in seen[0] and "retired 1" in seen[0]
