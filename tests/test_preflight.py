@@ -108,6 +108,10 @@ def test_library_warn_band(monkeypatch, tmp_path):
 
 def test_missing_voice_doc_is_not_ready(monkeypatch, tmp_path):
     _arm_env(monkeypatch)
+    # preflight now resolves DURABLE-FIRST, like the drafter. Point the durable root at
+    # an empty tmp dir so this asserts a genuinely missing bible rather than picking up
+    # whatever ./brand_voice happens to hold on the machine running the suite.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     report = check_account(
         _client(tmp_path, voice_doc=str(tmp_path / "missing.md")))
     assert "voice_doc" in report["blocking"]
@@ -259,3 +263,21 @@ def test_run_daily_lasso_default_channel_unaffected(monkeypatch, tmp_path):
                     accounts=[lasso], store=PendingStore(path=db_path))
     assert out["status"] == "drafted"
     assert "lasso_ig" in posted
+
+
+def test_a_durable_bible_is_found_even_when_the_repo_path_is_gone(monkeypatch, tmp_path):
+    """LIVE, 2026-08-31: ENG and GritX both read brand_voice/<base>/lasso_voice.md,
+    which does not exist on the worker (/app is wiped every deploy), while their real
+    bible sat in /data/brand_voice/<base>/. They draft fine, because the drafting lane
+    resolves durable-first; preflight was the last reader that had not been taught the
+    same thing, so it reported 'voice doc missing' for every onboarded gym that had a
+    perfectly good bible."""
+    _arm_env(monkeypatch)
+    durable = tmp_path / "bv" / "gym_alpha"
+    durable.mkdir(parents=True)
+    (durable / "lasso_voice.md").write_text("# Gym Alpha bible\n\nWho we are.\n")
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
+    report = check_account(
+        _client(tmp_path, voice_doc=str(tmp_path / "gone-from-app.md")))
+    assert "voice_doc" not in report["blocking"], \
+        "a real durable bible was reported missing"

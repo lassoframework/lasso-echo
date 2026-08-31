@@ -426,6 +426,7 @@ def test_texted_link_lane_now_gets_a_bible_from_its_own_answers(monkeypatch, tmp
     hollow one looks like a satisfied precondition and blocks the real one forever."""
     monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     from agent import intake_ingest as ii
 
     flat = {"kind": "intake_form", "client": "gym_alpha_ig", "timestamp": "20260828T000000Z",
@@ -450,6 +451,7 @@ def test_an_empty_intake_still_writes_no_hollow_bible(monkeypatch, tmp_path):
     satisfied precondition and would block the real one forever."""
     monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     from agent import intake_ingest as ii
     assert ii.sections_from_flat({}) == {}
     monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
@@ -482,6 +484,9 @@ def test_intake_alert_never_calls_approved_sources_pending(monkeypatch, tmp_path
     monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
     monkeypatch.setenv("AGENT_INTAKE_AUTO_APPROVE", "true")
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # client_voice_dir falls back to ./brand_voice with no /data, so without this
+    # the test writes a bible into the REPO and later tests read it as real.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     monkeypatch.chdir(tmp_path)
     from agent import intake_ingest as ii
     alerts = []
@@ -502,6 +507,9 @@ def test_intake_registers_the_gym_instead_of_holding_it(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
     monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # client_voice_dir falls back to ./brand_voice with no /data, so without this
+    # the test writes a bible into the REPO and later tests read it as real.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     monkeypatch.chdir(tmp_path)
     from agent import intake_ingest as ii, accounts
     accounts._dynamic_cache = None
@@ -520,6 +528,9 @@ def test_intake_registration_stays_off_by_default(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
     monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # client_voice_dir falls back to ./brand_voice with no /data, so without this
+    # the test writes a bible into the REPO and later tests read it as real.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     monkeypatch.chdir(tmp_path)
     from agent import intake_ingest as ii, accounts
     accounts._dynamic_cache = None
@@ -537,6 +548,9 @@ def test_intake_never_registers_without_a_real_gym_name(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
     monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # client_voice_dir falls back to ./brand_voice with no /data, so without this
+    # the test writes a bible into the REPO and later tests read it as real.
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     monkeypatch.chdir(tmp_path)
     from agent import intake_ingest as ii, accounts
     accounts._dynamic_cache = None
@@ -560,6 +574,7 @@ def test_the_brain_is_seeded_from_the_gyms_own_voice_answers(monkeypatch, tmp_pa
     # wrong let the test read a LEFTOVER brain from the repo-relative dir and pass
     # against unfixed code, while writing into a shared directory.
     monkeypatch.setenv("AGENT_TENANT_BRAIN_DIR", str(tmp_path / "brains"))
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "bv"))
     from agent import intake_ingest as ii, tenant_brain as brain
     monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
     payload = {"kind": "intake_form", "client": "voicegym_ig",

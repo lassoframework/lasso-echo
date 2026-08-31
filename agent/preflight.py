@@ -133,13 +133,27 @@ def check_account(account, live=False, poster=None, http=None):
     else:
         add("library", PASS, f"{n} media item(s)")
 
-    # 6. Brand voice doc exists and is nonempty
+    # 6. Brand voice doc exists and is nonempty.
+    # DURABLE FIRST, matching what the DRAFTER actually reads. A client bible is
+    # written to config.client_voice_dir()/<base>/lasso_voice.md on the persistent
+    # volume, while the Account still carries a repo-relative voice_doc pointing into
+    # /app, which is wiped every deploy. Checking only the account path reported
+    # "voice doc missing" for EVERY onboarded gym that had a perfectly good bible:
+    # measured 2026-08-31, ENG and GritX both read brand_voice/<base>/lasso_voice.md
+    # (absent) while their real doc sat in /data/brand_voice/<base>/. They draft fine,
+    # because the drafting lane resolves durable-first via
+    # client_media_sync._resolve_client_voice_path; preflight was simply the last
+    # reader that had not been taught the same thing, so its verdict was wrong for the
+    # whole fleet. LASSO's own committed bibles ship in the repo and have no durable
+    # copy, so the repo fallback keeps them working untouched.
     from .voice import load_voice
-    if load_voice(account.voice_doc_path()) is not None:
-        add("voice_doc", PASS, account.voice_doc_path())
+    from .client_media_sync import _resolve_client_voice_path
+    _base = (account.key or "").rsplit("_", 1)[0]
+    voice_path = _resolve_client_voice_path(_base, account.voice_doc_path())
+    if load_voice(voice_path) is not None:
+        add("voice_doc", PASS, voice_path)
     else:
-        add("voice_doc", FAIL,
-            f"voice doc missing or empty: {account.voice_doc_path()}")
+        add("voice_doc", FAIL, f"voice doc missing or empty: {voice_path}")
 
     # 7. Gemini spend cap
     if config.spend_cap_enabled():
