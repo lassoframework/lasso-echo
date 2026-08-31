@@ -57,7 +57,10 @@ def test_bad_tz_raises():
 # ---- full lead -> full arc -----------------------------------------------------
 
 def test_full_lead_full_arc():
-    ev = _event()
+    # lead_days=7 pins the HISTORIC arc shape this test was written for. The default
+    # is now 21 (Blake, 2026-08-30) so a coach can promote three weeks out; the shape
+    # at a 7-day lead must stay byte-for-byte what it always was.
+    ev = _event(lead_days=7)
     arc = ge.plan_arc(ev, today=date(2026, 9, 1))  # ~3 weeks out
     kinds = [p.kind for p in arc]
     assert ge.ANNOUNCE in kinds
@@ -305,3 +308,33 @@ def test_event_caption_body_carries_no_markdown(monkeypatch):
     for line in cap.splitlines():
         assert not line.lstrip().startswith("# "), f"markdown header leaked: {line!r}"
         assert not line.lstrip().startswith("## "), f"markdown header leaked: {line!r}"
+
+
+# ---- configurable lead time (Pete/CrossFit Zanshin asked to promote earlier) ------
+def test_default_lead_is_21_days_and_spreads_the_middle_beat(monkeypatch):
+    """The lead was a hardcoded 7 with no override: "it is only posting a few days in
+    advance of the event, can I start posting earlier?" The default is now 21, and the
+    middle beat spreads across the runway instead of pinning to T-4, so a three week
+    promo is announce / build / last call rather than one post then silence."""
+    monkeypatch.delenv("AGENT_EVENT_LEAD_DAYS", raising=False)
+    ev = _event()                                   # no per-event lead -> the default
+    arc = ge.plan_arc(ev, today=date(2026, 8, 25))
+    by_kind = {p.kind: p.post_date for p in arc if p.kind != ge.DURING}
+    assert by_kind[ge.ANNOUNCE] == "2026-09-01"     # starts_on 2026-09-22 minus 21
+    assert by_kind[ge.HOW_IT_WORKS] == "2026-09-12"  # spread to T-10, not T-4
+    assert by_kind[ge.LAST_CALL] == "2026-09-21"     # unchanged, T-1
+
+
+def test_a_per_event_lead_overrides_the_default():
+    ev = _event(lead_days=14)
+    arc = ge.plan_arc(ev, today=date(2026, 8, 25))
+    by_kind = {p.kind: p.post_date for p in arc if p.kind != ge.DURING}
+    assert by_kind[ge.ANNOUNCE] == "2026-09-08"      # T-14
+
+
+def test_lead_is_clamped_and_junk_falls_back(monkeypatch):
+    """A typo must not push an announce months out, and must never refuse the event."""
+    assert ge.lead_days_for(_event(lead_days=9999)) == ge._MAX_LEAD
+    assert ge.lead_days_for(_event(lead_days=-3)) == 21     # junk -> configured default
+    monkeypatch.setenv("AGENT_EVENT_LEAD_DAYS", "not-a-number")
+    assert ge.lead_days_for(_event()) == 7                  # bad config -> historic 7

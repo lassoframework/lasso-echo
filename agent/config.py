@@ -309,6 +309,27 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+def event_lead_days() -> int:
+    """
+    How many days BEFORE an event starts its promo arc opens (AGENT_EVENT_LEAD_DAYS).
+    Default 21 (Blake's call, 2026-08-30).
+
+    This was a hardcoded 7 with no override anywhere, so a coach could not promote
+    further out than a week: "when I planned my bring a friend it is only posting a few
+    days in advance of the event, can I start posting earlier?" (Pete, CrossFit
+    Zanshin). A per-event gym_event.lead_days overrides this; the arc clamps the result
+    to at most 60 days so a typo cannot push an announce months out. A junk value here
+    falls back to the historic 7 rather than refusing to plan.
+    """
+    raw = (os.environ.get("AGENT_EVENT_LEAD_DAYS", "") or "").strip()
+    if not raw:
+        return 21
+    try:
+        return int(raw)
+    except ValueError:
+        return 7
+
+
 def onboarding_demo_enabled() -> bool:
     """
     ONBOARDING SAMPLE MONTH (AGENT_ONBOARDING_DEMO). Default OFF.

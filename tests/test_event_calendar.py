@@ -153,14 +153,17 @@ def test_insertion_regrades_to_A():
 # ---- date edit re-times without killing approved -------------------------------
 
 def test_date_edit_retimes_without_killing_approved():
-    ev = _event()
+    # lead_days=7 pins the historic arc shape: this test is about RETIMING, not lead
+    # time. The default lead is now 21 (Blake, 2026-08-30), which legitimately places
+    # the announce before starts_on and would break the date assertions below.
+    ev = _event(lead_days=7)
     old_arc = _arc_rows(ev)
     # approve the announce row (human owns it).
     for r in old_arc:
         if r["arc_kind"] == ge.ANNOUNCE:
             r["status"] = "approved"
     # move the event one week later.
-    new_ev = _event(starts_on="2026-09-29", ends_on="2026-10-05")
+    new_ev = _event(starts_on="2026-09-29", ends_on="2026-10-05", lead_days=7)
     restage, keep, remove = ec.retime_arc(old_arc, new_ev, today=date(2026, 9, 1))
     # the approved old announce row is KEPT (never reverted).
     assert any(r["arc_kind"] == ge.ANNOUNCE and r["status"] == "approved" for r in keep)
@@ -350,3 +353,42 @@ def test_a_genuinely_overlapping_event_still_thins():
     arc = [_arc_offer_row(f"2026-09-{d:02d}", "evt_new") for d in range(1, 13)]
     kept = ec.overlap_thin(existing, arc)
     assert len(kept) < len(arc), "a truly overlapping event was not thinned"
+
+
+# ---- re-staging an arc must top it up, never duplicate it -----------------------
+class _ReStageStore:
+    def __init__(self, existing):
+        self._existing = list(existing)
+        self.inserted = []
+
+    def list_month(self, gym_id, month):
+        return [r for r in self._existing
+                if str(r.get("post_date", ""))[:7] == month]
+
+    def insert_rows(self, gym_id, rows):
+        self.inserted.extend(rows)
+        return rows
+
+
+def test_restaging_an_arc_tops_up_instead_of_duplicating(monkeypatch):
+    """LIVE (Pete/Zanshin 2026-08-30): re-staging Back to School after the overlap fix
+    brought four dates back a SECOND time, three of them where the client had already
+    APPROVED the original. stage_arc only ever ADDS, and preserve_and_prune did not
+    catch it, so the client would have seen doubled posts."""
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    # half the arc is already on the calendar for THIS event
+    half = arc[: len(arc) // 2]
+    existing = [dict(r, event_id=ev.id, status="approved") for r in half]
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.stage_arc(store, ev, arc, profile="GYM")
+    staged_days = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+                   for r in store.inserted}
+    already = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+               for r in existing}
+    assert not (staged_days & already), "a day already on the calendar was staged twice"
+    assert res["staged"] == len(store.inserted)
+    assert store.inserted, "the genuinely new days should still be topped up"

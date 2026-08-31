@@ -65,6 +65,9 @@ RECAP = "recap"
 #   Final day (ends_on), Recap T+2.
 _ANNOUNCE_LEAD = 7
 _HOWTO_LEAD = 4
+# The longest runway a coach may ask for. A lead beyond this is clamped rather than
+# refused, so a typo cannot push an announce months out.
+_MAX_LEAD = 60
 _LASTCALL_LEAD = 1
 _RECAP_TRAIL = 2
 # During posts: one every _DURING_STEP days across the window (1-2 days apart).
@@ -100,6 +103,11 @@ class GymEvent:
     media_ids: tuple = ()
     status: str = "draft"
     created_by: str = ""
+    # How many days BEFORE starts_on the arc opens. None -> the configured default
+    # (config.event_lead_days). A coach asked to promote three weeks out rather than
+    # one (Pete/CrossFit Zanshin, 2026-08-30); the lead used to be a hardcoded 7 with
+    # no way to change it.
+    lead_days: int = 0
 
     def __post_init__(self):
         if not self.gym_id:
@@ -158,6 +166,7 @@ class GymEvent:
             link=str(row.get("link") or ""),
             brief=str(row.get("brief") or ""),
             media_ids=media,
+            lead_days=_coerce_lead(row.get("lead_days")),
             status=str(row.get("status") or "draft"),
             created_by=str(row.get("created_by") or ""),
         )
@@ -165,6 +174,33 @@ class GymEvent:
 
 def _as_date(v):
     return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
+
+
+def _coerce_lead(v):
+    """A row's lead_days as a clean int, or 0 meaning "use the configured default".
+    A junk value is 0 (the default) rather than an error: a coach's typo must not
+    refuse their event."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def lead_days_for(event):
+    """How many days before starts_on this event's arc opens.
+
+    Order: the event's own lead_days, else config.event_lead_days (AGENT_EVENT_LEAD_DAYS,
+    default 21), clamped to [1, _MAX_LEAD]. Pete/CrossFit Zanshin asked to promote three
+    weeks out and there was no way to do it: the lead was the hardcoded _ANNOUNCE_LEAD."""
+    from . import config
+    n = _coerce_lead(getattr(event, "lead_days", 0))
+    if not n:
+        try:
+            n = int(config.event_lead_days())
+        except Exception:  # noqa: BLE001 - a bad config never breaks an arc
+            n = _ANNOUNCE_LEAD
+    return max(1, min(int(n), _MAX_LEAD))
 
 
 def make_event_id(gym_id, name, starts_on):
@@ -242,8 +278,13 @@ def plan_arc(event: GymEvent, *, today=None):
         return _ordered(posts)
 
     # PRE-WINDOW (created before start). Candidate pre-window posts by lead:
-    announce_date = s - timedelta(days=_ANNOUNCE_LEAD)
-    howto_date = s - timedelta(days=_HOWTO_LEAD)
+    lead = lead_days_for(event)
+    announce_date = s - timedelta(days=lead)
+    # SPREAD the middle beat across the runway instead of pinning it to T-4. At the
+    # historic 7-day lead this is max(4, 3) = 4, i.e. byte-for-byte the old arc; at a
+    # 21-day lead it lands ~T-10 so the run is announce / build / last call rather than
+    # one post followed by two and a half weeks of silence.
+    howto_date = s - timedelta(days=max(_HOWTO_LEAD, lead // 2))
     lastcall_date = s - timedelta(days=_LASTCALL_LEAD)
 
     posts = []

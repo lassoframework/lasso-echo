@@ -335,6 +335,27 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # Stage only the NEW arc rows (existing rows already live). Recap rows that are
     # blocked (no media yet) are held out of staging until media arrives.
     to_stage = [r for r in thinned if not r.get("recap_blocked")]
+    # RE-STAGE GUARD: stage_arc only ever ADDS, so staging an arc that is already on the
+    # calendar duplicated every one of its days. Hit live on 2026-08-30 re-staging
+    # Pete/Zanshin's Back to School promo: four dates came back twice, including three
+    # where the client had already APPROVED the original. preserve_and_prune did not
+    # catch it because an arc row carries no slot the incoming row collides on. Drop any
+    # incoming row this event already occupies on the same date + account + format, so a
+    # re-stage after an edit tops the arc up instead of doubling it.
+    already = {(str(r.get("post_date"))[:10],
+                str(r.get("account") or "").lower(),
+                str(r.get("format") or "").lower())
+               for r in existing
+               if str(r.get("event_id") or "") == str(event.id)}
+    if already:
+        before = len(to_stage)
+        to_stage = [r for r in to_stage
+                    if (str(r.get("post_date"))[:10],
+                        str(r.get("account") or "").lower(),
+                        str(r.get("format") or "").lower()) not in already]
+        if before != len(to_stage):
+            log(f"re-stage: {before - len(to_stage)} row(s) for {event.id} already on "
+                "the calendar, topping up rather than duplicating")
     held_recap = [r for r in thinned if r.get("recap_blocked")]
     # MEDIA: an arc row was staged with NO image_url, and a feed post without an image
     # cannot publish — Zanshin's entire first month (2026-08-30) was image-less rows
