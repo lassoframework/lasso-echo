@@ -302,24 +302,47 @@ def handle_action(action, draft, actor_slack_id, note="",
             set_name = sidecar_set(draft.creative_path)
         except Exception:
             archetype = set_name = ""
-        log.log_post(
-            account_key=draft.account_key,
-            platform=draft.platform,
-            caption=draft.caption,
-            media_id=post_ref,
-            mode=result.mode,                  # "published" or "would_publish"
-            draft_id=draft.draft_id,
-            creative_key=creative_key,
-            archetype=archetype,
-            set_name=set_name,
-            # SocialAPI returns a permalink on the result; Meta's result has no
-            # such attr, so getattr keeps the Meta path byte-identical ("").
-            permalink=getattr(result, "permalink", "") or "",
-        )
+        # THE POST IS ALREADY LIVE. Everything from here down is BOOKKEEPING, and none
+        # of it can un-send the post. Before this guard, postlog.log_post's own
+        # open(path, "a") was unguarded, so a full or read-only disk raised straight out
+        # of handle_action; listener._act has no try/except around the call, so
+        # store.remove() and the Slack card update never ran and the card sat showing
+        # PENDING forever for a post that HAD gone out. The claim above also stays held,
+        # so the draft is invisible to a retry. Worse, nothing alerted: the ops alert
+        # only wraps publish() itself, not what runs after it succeeds. A human then
+        # sees an un-actioned card and re-approves a live post.
+        try:
+            log.log_post(
+                account_key=draft.account_key,
+                platform=draft.platform,
+                caption=draft.caption,
+                media_id=post_ref,
+                mode=result.mode,              # "published" or "would_publish"
+                draft_id=draft.draft_id,
+                creative_key=creative_key,
+                archetype=archetype,
+                set_name=set_name,
+                # SocialAPI returns a permalink on the result; Meta's result has no
+                # such attr, so getattr keeps the Meta path byte-identical ("").
+                permalink=getattr(result, "permalink", "") or "",
+            )
+        except Exception as exc:  # noqa: BLE001 - never re-raise past a live post
+            ops_alerts.alert(
+                f"published {draft.account_key} draft {draft.draft_id} but could not "
+                f"record it: {type(exc).__name__}: {exc}. The post IS live. Its local "
+                "log entry is missing, so reporting will undercount it. Do NOT "
+                "re-approve the card.")
         # Publish confirmation loop: dormant behind AGENT_PUBLISH_CONFIRM_ENABLED
         # (returns None immediately when OFF, and only ever READS when ON).
-        confirm = confirmer or publish_confirm.confirm_publish
-        confirm(draft, acct, result)
+        # Guarded for the same reason: a confirmation read must not undo a live post.
+        try:
+            confirm = confirmer or publish_confirm.confirm_publish
+            confirm(draft, acct, result)
+        except Exception as exc:  # noqa: BLE001
+            ops_alerts.alert(
+                f"published {draft.account_key} draft {draft.draft_id} but the publish "
+                f"confirmation step raised: {type(exc).__name__}: {exc}. The post IS "
+                "live; only the confirmation is missing.")
         # record approve streak in the tenant brain (best effort)
         if config.tenant_brain_enabled():
             try:

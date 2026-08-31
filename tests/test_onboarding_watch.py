@@ -268,3 +268,23 @@ def test_a_registration_failure_never_breaks_the_sweep(monkeypatch, tmp_path):
     out = ow.run(deps=_unregistered(), alert=seen.append, kv=_KV())
     assert out == {"newbox": [ow.REASON_NOT_REGISTERED]}
     assert any("auto-register failed" in m for m in seen)
+
+
+def test_autoregister_never_reports_success_when_it_wrote_nothing(monkeypatch, tmp_path):
+    """FABRICATED SUCCESS. accounts.register_gym silently no-ops and returns [] (it does
+    NOT raise) when AGENT_DYNAMIC_ACCOUNTS is off. Ignoring that return had this alert
+    say 'registered into Echo's account registry', return True, and let run() drop
+    not_registered from the day's alert while NOTHING was written: a gym reported as
+    fixed that is still in neither lane. That is the exact failure class this sweep
+    exists to catch, so it must never be the sweep's own behaviour."""
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.delenv("AGENT_DYNAMIC_ACCOUNTS", raising=False)   # the registry is OFF
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    seen = []
+    out = ow.run(deps=_unregistered(), alert=seen.append, kv=_KV())
+    assert out == {"newbox": [ow.REASON_NOT_REGISTERED]}, "reported fixed while unwritten"
+    assert not any("registered into Echo's account registry" in m for m in seen)
+    assert any("did nothing" in m and "AGENT_DYNAMIC_ACCOUNTS" in m for m in seen)
+    accounts._dynamic_cache = None

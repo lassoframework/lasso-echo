@@ -315,3 +315,61 @@ def test_a_real_publish_still_blocks_a_second_approve(tmp_path):
         "approve", store.get(d.draft_id), actor_slack_id=config.APPROVER_SLACK_ID,
         publisher=second, logger=SpyLogger(), account=_acct(), store=store)
     assert second.calls == 0, "the same draft published twice"
+
+
+class BoomLogger:
+    """postlog.log_post's own open(path, "a") is unguarded, so a full or read-only
+    disk raises here — AFTER the post has already gone out live."""
+
+    def log_post(self, **kw):
+        raise OSError("read-only file system")
+
+
+def test_bookkeeping_failure_after_a_live_post_never_escapes(tmp_path):
+    """THE POST IS ALREADY LIVE. Before the guard, this OSError propagated out of
+    handle_action; listener._act has no try/except around the call, so store.remove()
+    and the Slack card update never ran and the card sat showing PENDING forever for a
+    post that HAD gone out. Nothing alerted either, because the ops alert only wraps
+    publish() itself. A human then re-approves a live post."""
+    store = PendingStore(path=str(tmp_path / "book.db"))
+    d = _draft(draft_id="book1")
+    store.put(d)
+    pub = OkPublisher()
+    alerts = []
+    import agent.approvals as _ap
+    real_alert = _ap.ops_alerts.alert
+    _ap.ops_alerts.alert = lambda m, **k: alerts.append(m)
+    try:
+        res = _ap.handle_action(
+            "approve", store.get(d.draft_id), actor_slack_id=config.APPROVER_SLACK_ID,
+            publisher=pub, logger=BoomLogger(), account=_acct(), store=store)
+    finally:
+        _ap.ops_alerts.alert = real_alert
+    assert pub.calls == 1, "the post went out"
+    assert res.ok is True, "a bookkeeping failure must not report the publish as failed"
+    assert any("The post IS live" in m for m in alerts), "nobody was told"
+    assert any("Do NOT" in m and "re-approve" in m for m in alerts)
+
+
+def test_a_confirmation_failure_after_a_live_post_never_escapes(tmp_path):
+    store = PendingStore(path=str(tmp_path / "confirm.db"))
+    d = _draft(draft_id="confirm1")
+    store.put(d)
+    pub = OkPublisher()
+    alerts = []
+    import agent.approvals as _ap
+    real_alert = _ap.ops_alerts.alert
+    _ap.ops_alerts.alert = lambda m, **k: alerts.append(m)
+
+    def _boom_confirm(draft, account, result):
+        raise RuntimeError("confirm read failed")
+
+    try:
+        res = _ap.handle_action(
+            "approve", store.get(d.draft_id), actor_slack_id=config.APPROVER_SLACK_ID,
+            publisher=pub, logger=SpyLogger(), account=_acct(), store=store,
+            confirmer=_boom_confirm)
+    finally:
+        _ap.ops_alerts.alert = real_alert
+    assert pub.calls == 1 and res.ok is True
+    assert any("The post IS" in m for m in alerts)

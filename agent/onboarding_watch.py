@@ -197,7 +197,18 @@ def autoregister(base_key, gym_id, *, deps=None, alert=None):
         return False
     try:
         from . import accounts
-        accounts.register_gym(base_key, name=name)
+        # CHECK THE RETURN. register_gym silently no-ops and returns [] (it does NOT
+        # raise) when AGENT_DYNAMIC_ACCOUNTS is off. Ignoring that would have this
+        # function alert "registered into Echo's account registry", return True, and
+        # let run() drop not_registered from the day's alert while NOTHING was written:
+        # a fabricated success, which is the exact failure class this whole sweep
+        # exists to catch.
+        if not accounts.register_gym(base_key, name=name):
+            if alert:
+                alert(f"{base_key}: auto-register did nothing (the dynamic account "
+                      "registry is off, so there is nowhere to write). It stays in "
+                      "neither lane. Arm AGENT_DYNAMIC_ACCOUNTS on the worker.")
+            return False
     except Exception as exc:  # noqa: BLE001 - one gym never blocks the sweep
         if alert:
             alert(f"{base_key}: auto-register failed ({type(exc).__name__}: {exc}). "
