@@ -141,6 +141,40 @@ def dedupe_gym(
     result["total_pending"] = len(rows)
 
     _keepers, duplicates = find_duplicates(rows)
+
+    # ALREADY-PUBLISHED CAPTIONS (2026-08-31): a pending row whose caption ALREADY went
+    # out (a published row anywhere in the graded window) is a duplicate the audience
+    # would actually see twice — the pending-only pass above cannot know that. The
+    # grader counts these ('caption hash repeated N times' across published+pending),
+    # so the cleaner must too, with the SAME exclusions (empty captions and stories are
+    # structure, never dupes). Best effort: an unreadable published set skips this pass.
+    try:
+        from datetime import date, timedelta
+        start = (date.fromisoformat(today_iso) - timedelta(days=30)).isoformat()
+        end = (date.fromisoformat(today_iso) + timedelta(days=60)).isoformat()
+        window = store.rows_in_range(gym_id, start, end) or []
+        published_hashes = {
+            caption_hash((r.get("caption") or "").strip())
+            for r in window
+            if str(r.get("status") or "").lower() == "published"
+            and (r.get("caption") or "").strip()
+            and str(r.get("format") or "").strip().lower() != "story"
+        }
+        if published_hashes:
+            dup_ids = {str(d.get("id")) for d in duplicates}
+            for r in _keepers:
+                cap = (r.get("caption") or "").strip()
+                if not cap or str(r.get("format") or "").strip().lower() == "story":
+                    continue
+                if str(r.get("status") or "").lower() not in ("pending",):
+                    continue                    # only unapproved rows are wipeable here
+                if caption_hash(cap) in published_hashes \
+                        and str(r.get("id")) not in dup_ids:
+                    duplicates.append(r)
+    except Exception as exc:  # noqa: BLE001 - the published cross-check is additive
+        print(f"[dedupe] published cross-check skipped for {gym_id}: "
+              f"{type(exc).__name__}")
+
     result["duplicates_found"] = len(duplicates)
 
     if dry_run:

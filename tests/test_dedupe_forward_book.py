@@ -381,3 +381,42 @@ class TestRunFunction:
         assert "duplicates_found" in results[0]
         assert "duplicates_denied" in results[0]
         assert "errors" in results[0]
+
+
+class _XStore:
+    """dedupe_gym store fake: pending-future + the published window read."""
+
+    def __init__(self, pending, window):
+        self._pending = pending
+        self._window = window
+        self.denied = []
+
+    def list_pending_future(self, gym_id, today_iso):
+        return [dict(r) for r in self._pending]
+
+    def rows_in_range(self, gym_id, start, end):
+        return [dict(r) for r in self._window]
+
+    def deny_with_reason(self, gym_id, row_id, reason):
+        self.denied.append((row_id, reason))
+        return {"id": row_id}
+
+
+def test_pending_row_matching_a_published_caption_is_denied():
+    """2026-08-31: the grader counts published+pending caption repeats, so the cleaner
+    must too — a pending row whose caption already went out would show the audience the
+    same post twice. Stories and empty captions stay excluded."""
+    from agent.jobs.dedupe_forward_book import dedupe_gym
+    pending = [
+        _row("p1", "2026-09-05", "Join our community and win"),
+        dict(_row("p2", "2026-09-06", "Join our community and win"), format="story"),
+        _row("p3", "2026-09-07", "A totally fresh caption"),
+    ]
+    window = pending + [
+        dict(_row("pub1", "2026-08-20", "Join our community and win"),
+             status="published"),
+    ]
+    store = _XStore(pending, window)
+    out = dedupe_gym("lasso", store, "2026-08-31", dry_run=False)
+    assert out["duplicates_found"] == 1
+    assert [d[0] for d in store.denied] == ["p1"]     # story + fresh caption untouched
