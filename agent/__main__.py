@@ -806,6 +806,7 @@ _COMMANDS = {
         ("onboard", "stand up a new gym end to end"),
         ("onboard-client / add-client", "scaffold a new client account"),
         ("onboard-verify", "check onboarding completeness for one or all gyms"),
+        ("onboarding-audit", "fleet readiness: every gym the PORTAL knows, and what blocks it posting"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
@@ -1810,6 +1811,46 @@ def main(argv=None):
             r = verify_gym(acct_key)
             for line in format_result(r):
                 print(line)
+    elif cmd == "onboarding-audit":
+        # READ ONLY fleet readiness. Sweeps the PORTAL roster (echo_intake_tokens),
+        # not Echo's registry, because every failure of this class has arrived as a
+        # gym MISSING from the registry. Sends NO alerts and writes NO dedup stamps:
+        # this is the on-demand human view, runner.py owns the alerting pass. At 100
+        # gyms this is the one screen that answers "who cannot post today".
+        from . import onboarding_watch as _ow
+        _deps = _ow._live_deps()  # noqa: SLF001
+        _roster = _deps["roster"](None)
+        _intake = _deps["intake"](None)
+        try:
+            _bases = set(_deps["bases"]())
+        except Exception as exc:  # noqa: BLE001
+            print(f"onboarding-audit: registry unreadable ({exc}); aborting rather "
+                  f"than reporting every gym as unregistered.")
+            return
+        _rows = []
+        for _gid, _base in sorted(_roster, key=lambda x: x[1]):
+            if not _ow.is_client_gym(_base):
+                continue
+            try:
+                _rows.append((_base, _ow.check_gym(_base, _gid, _intake.get(_gid, ""),
+                                                   bases=_bases, deps=_deps)))
+            except Exception as exc:  # noqa: BLE001 - one gym never blocks the sweep
+                _rows.append((_base, [f"check_failed:{type(exc).__name__}"]))
+        print(f"portal roster: {len(_roster)} gyms   client gyms audited: {len(_rows)}"
+              f"   registry bases: {len(_bases)}")
+        print()
+        for _base, _issues in _rows:
+            print(f"  {_base:28s} {'ready' if not _issues else ', '.join(_issues)}")
+        _ok = sum(1 for _, i in _rows if not i)
+        print()
+        print(f"ready to post: {_ok} / {len(_rows)}")
+        for _reason in (_ow.REASON_NOT_REGISTERED, _ow.REASON_KEY_MISMATCH,
+                        _ow.REASON_NO_SOURCES, _ow.REASON_NO_PROFILE,
+                        _ow.REASON_NOT_CONNECTED, _ow.REASON_NO_FB_PAGE):
+            _hit = [b for b, i in _rows if _reason in i]
+            if _hit:
+                print(f"  {_reason}: {', '.join(_hit)}")
+                print(f"    fix: {_ow._FIX[_reason]}")  # noqa: SLF001
     elif cmd == "add-client":
         # MANUAL onboarding scaffold: config entry + voice/proof templates +
         # library folder + the by-hand checklist. Touches no env, arms nothing.

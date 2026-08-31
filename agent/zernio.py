@@ -58,7 +58,32 @@ def match_profile_id(profiles, name):
             return str(pid)
         if fallback is None and str(pname).strip().lower() == want_lower:
             fallback = str(pid)
-    return fallback
+    if fallback:
+        return fallback
+    # NORMALISED + UNIQUE-CONTAINMENT fallback. Ops create profiles under HUMAN names
+    # ("CrossFit Reverb") while Echo looks them up by account key
+    # ("crossfitreverb30b5b2"), so exact and case-insensitive both miss and the gym
+    # reads as having no profile at all — CrossFit Reverb, live 2026-08-30, with three
+    # platforms connected the whole time. Compare alphanumerics only, then accept a
+    # UNIQUE containment either way. Ambiguity returns None: never guess between two
+    # gyms' profiles.
+    def _norm(s):
+        return "".join(c for c in str(s or "").lower() if c.isalnum())
+
+    target = _norm(want)
+    if not target:
+        return None
+    clean = [(str(p.get("_id") or p.get("id")), _norm(p.get("name")))
+             for p in (profiles or [])
+             if isinstance(p, dict) and (p.get("_id") or p.get("id")) and p.get("name")]
+    exact = [pid for pid, n in clean if n == target]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None                      # ambiguous -> refuse to guess
+    contain = [pid for pid, n in clean
+               if n and (target.startswith(n) or n.startswith(target))]
+    return contain[0] if len(contain) == 1 else None
 
 
 def _media_type(url):
