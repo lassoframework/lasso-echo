@@ -385,6 +385,34 @@ def _booking_cta_for(gym_id, log):
     return None
 
 
+def _mechanical_repair(caption, cta):
+    """Deterministic, ZERO-FABRICATION repair of the fixable craft dimensions
+    (2026-08-31: the LLM regen cleared 0 of ENG's 56 flagged days — it kept missing
+    the all-at-once bar — so mechanics now fix what mechanics can):
+
+      * hook_too_long: re-lineate the first line at its first sentence boundary so the
+        hook fits the band — NOT ONE WORD changes, only a line break moves;
+      * no_ask: append the gym's APPROVED booking CTA as the caption's single ask.
+
+    thin_caption needs real content and stays the regen's job. Returns the repaired
+    caption, or None when mechanics cannot help (an unbreakable first sentence)."""
+    import re as _re
+    cap = (caption or "").strip()
+    if not cap:
+        return None
+    lines = cap.splitlines()
+    first = lines[0].strip()
+    if len(first) > _HOOK_MAX:
+        m = _re.match(r"^(.{10,%d}?[.!?])\s+(\S.*)$" % _HOOK_MAX, first)
+        if not m:
+            return None
+        rest = "\n".join([m.group(2)] + [ln for ln in lines[1:]]).strip()
+        cap = f"{m.group(1)}\n\n{rest}"
+    if _ask_count(cap) == 0 and (cta or "").strip():
+        cap = f"{cap}\n{cta.strip()}"
+    return cap.strip()
+
+
 def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
                booking_cta=None):
     """Regenerate the caption of every fully wipeable day that trips a craft
@@ -426,24 +454,38 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
             out = caption_regen(grp[0], avoid, "")
         except Exception as exc:  # noqa: BLE001
             log(f"{gym_id} {d}: craft regen raised {type(exc).__name__}")
-        if not out:
-            log(f"{gym_id} {d}: no fresh caption could be built for the "
-                "craft flags; left in place")
+        # Candidate order: the LLM regen first (a genuinely fresh caption), then the
+        # MECHANICAL repair of the current caption (re-lineated hook / appended
+        # approved CTA — zero fabrication) as the fallback that always exists. The
+        # first candidate to clear the bar wins; none clearing keeps the caption.
+        candidates = []
+        new_cat = None
+        if out:
+            regen_cap, new_cat = out
+            regen_cap = (regen_cap or "").strip()
+            carried_cta = False
+            if (deficit > 0 and booking_cta
+                    and not _BOOKING_RE.search(regen_cap)
+                    and _ask_count(regen_cap) == 0):
+                # The already-flagged day is the honest place to carry the gym's
+                # real booking CTA: it becomes the caption's single ask.
+                regen_cap = f"{regen_cap}\n{booking_cta}".strip()
+                carried_cta = True
+            if regen_cap:
+                candidates.append((regen_cap, new_cat, carried_cta))
+        if booking_cta is None:
+            booking_cta = _booking_cta_for(gym_id, log)
+        repaired = _mechanical_repair(cap, booking_cta)
+        if repaired and repaired != cap:
+            candidates.append((repaired, None,
+                               _ask_count(cap) == 0 and _ask_count(repaired) == 1))
+        winner = next(((c, cat, cta_used) for c, cat, cta_used in candidates
+                       if c and c not in avoid and _clears_craft(c)), None)
+        if winner is None:
+            log(f"{gym_id} {d}: neither the regenerated nor the mechanically "
+                "repaired caption clears the craft bar; keeping the current caption")
             continue
-        new_cap, new_cat = out
-        new_cap = (new_cap or "").strip()
-        carried_cta = False
-        if (deficit > 0 and booking_cta
-                and not _BOOKING_RE.search(new_cap)
-                and _ask_count(new_cap) == 0):
-            # The already-flagged day is the honest place to carry the gym's
-            # real booking CTA: it becomes the caption's single ask.
-            new_cap = f"{new_cap}\n{booking_cta}".strip()
-            carried_cta = True
-        if not new_cap or new_cap in avoid or not _clears_craft(new_cap):
-            log(f"{gym_id} {d}: regenerated caption does not clear the craft "
-                "bar; keeping the current caption")
-            continue
+        new_cap, new_cat, carried_cta = winner
         if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
             fixed += 1
             avoid.add(new_cap)

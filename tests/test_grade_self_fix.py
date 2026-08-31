@@ -754,3 +754,33 @@ def test_all_a_books_stay_silent(_self_fix_on):
     assert result["self_fixed"] == [] and result["held"] == []
     assert alerts == [], f"an A book must produce zero Slack lines: {alerts}"
     assert "self_fix" not in result["gyms"]["gritx"]
+
+
+def test_mechanical_repair_fixes_hook_and_ask_without_fabrication():
+    """2026-08-31: the LLM regen cleared 0/56 flagged ENG days. Mechanics now fix what
+    mechanics can: an over-long first line is re-lineated at its sentence boundary (no
+    words change) and a missing ask gets the gym's APPROVED CTA appended."""
+    from agent.jobs.grade_fix import _mechanical_repair, _clears_craft
+    long_hook = ("You are juggling work and kids and the list never ends so the gym "
+                 "always slips to the bottom of the pile every single week. We built "
+                 "coaching for exactly that life.")
+    body = "Small group sessions that fit real schedules with a coach who knows you."
+    cap = f"{long_hook}\n{body}"
+    out = _mechanical_repair(cap, "Book your intro session today?")
+    assert out is not None
+    first = out.splitlines()[0]
+    assert len(first) <= 125
+    # zero fabrication: every original word survives, in order
+    import re
+    orig_words = re.findall(r"[A-Za-z']+", cap)
+    new_words = re.findall(r"[A-Za-z']+", out)
+    assert new_words[:len(orig_words)] == orig_words
+    assert _clears_craft(out), f"repair must clear the bar, got: {out!r}"
+
+
+def test_mechanical_repair_gives_up_on_unbreakable_hook():
+    from agent.jobs.grade_fix import _mechanical_repair
+    one_long_sentence = ("a single breathless sentence that just keeps going and going "
+                         "without any punctuation at all so no honest split point exists "
+                         "anywhere within the hook band limit")
+    assert _mechanical_repair(one_long_sentence, "Book now?") is None
