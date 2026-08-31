@@ -263,6 +263,24 @@ def test_never_re_alerts_once_alerted(armed, monkeypatch, tmp_path):
     assert db.kv_get(f"zernio_link_alerted_{base}") == "alerted"
 
 
+def test_legacy_unparseable_stamp_starts_the_clock_not_alert(armed, monkeypatch, tmp_path):
+    """The 2026-08-31 deploy itself: a gym already carrying a pre-grace-period sentinel
+    ("1", written by the old immediate-alert code) must NOT be read as instantly overdue.
+    Swift River hit this exact landmine — the fix designed to add a grace period fired a
+    second alert within the hour of shipping because the legacy value failed isoformat
+    parsing and fell through to 'alert now'. An unparseable stamp must reset the clock,
+    same as no stamp at all, never fire immediately."""
+    base = "ghost"
+    _with_media(monkeypatch, tmp_path, base)
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: alerts.append(msg))
+    db = _FakeDb({base: {"zernio_profile_id": ""}}, kv={f"zernio_link_alerted_{base}": "1"})
+    zpl.link_client_profiles(bases=[base], zernio=_FakeZernio({}), db=db)
+    assert alerts == []
+    seen = db.kv_get(f"zernio_link_alerted_{base}")
+    assert seen and seen != "alerted" and seen != "1"   # clock was reset to a real timestamp
+
+
 def test_no_media_never_starts_the_clock(armed, monkeypatch, tmp_path):
     """An empty onboarding stub (no uploaded media) must never even start the grace clock."""
     base = "ghost"

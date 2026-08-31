@@ -185,18 +185,29 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
                     if has_media:
                         key = f"zernio_link_alerted_{base}"
                         seen = db.kv_get(key) or ""
-                        if seen == "alerted":
-                            pass                            # already notified once
-                        elif not seen:
-                            db.kv_set(key, datetime.now(timezone.utc).isoformat())
-                        else:
-                            due = True
+                        first = None
+                        if seen and seen != "alerted":
                             try:
                                 first = datetime.fromisoformat(seen)
-                                due = (datetime.now(timezone.utc) - first).total_seconds() \
-                                    >= ZERNIO_LINK_GRACE_SECONDS
                             except ValueError:
-                                pass                        # unparseable stamp: alert now
+                                first = None                # legacy/corrupt stamp (e.g. the
+                                # pre-grace-period "1" sentinel): treat as a FRESH sighting,
+                                # never as instantly overdue. Swift River, 2026-08-31: a
+                                # leftover "1" from the old immediate-alert code parsed as
+                                # due=True the moment this grace period shipped, and re-fired
+                                # the alert within the hour of the fix deploying — defeating
+                                # the grace period for exactly the gym it was built to
+                                # protect. Resetting the clock (not alerting) is safe: it can
+                                # only ever delay a real alert by one more grace window, never
+                                # suppress it, since it still lands in the timestamp branch on
+                                # the very next sweep.
+                        if seen == "alerted":
+                            pass                            # already notified once
+                        elif first is None:
+                            db.kv_set(key, datetime.now(timezone.utc).isoformat())
+                        else:
+                            due = (datetime.now(timezone.utc) - first).total_seconds() \
+                                >= ZERNIO_LINK_GRACE_SECONDS
                             if due:
                                 from . import ops_alerts
                                 ops_alerts.alert(
