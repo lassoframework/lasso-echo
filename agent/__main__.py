@@ -154,6 +154,7 @@ def _status():
     print(f"  welcome_posts  : {config.welcome_posts_enabled()}  (env AGENT_WELCOME_POSTS_ENABLED; needs STRIPE_API_KEY)")
     print(f"  welcome_queue  : {config.welcome_queue_enabled()}  (env AGENT_WELCOME_QUEUE_ENABLED; one/day drip + new-client trigger, needs hosting)")
     print(f"  demo_calendar  : {config.demo_calendar_enabled()}  (env AGENT_DEMO_CALENDAR_ENABLED; 30-day done-for-you demo calendar, needs hosting)")
+    print(f"  onboarding_watch: {config.onboarding_watch_enabled()}  (env AGENT_ONBOARDING_WATCH; alerts when a gym the portal knows is not set up to post)")
     print(f"  intake_autoapp : {config.intake_auto_approve()}  (env AGENT_INTAKE_AUTO_APPROVE; a gym's own intake answers land approved, not queued)")
     print(f"  event_lead_days: {config.event_lead_days()}  (env AGENT_EVENT_LEAD_DAYS; how many days before an event its promo arc opens)")
     print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")

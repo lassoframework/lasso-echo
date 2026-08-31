@@ -718,6 +718,21 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         except Exception as e:
             print(f"[connection-watch] failed: {type(e).__name__}: {e}")
 
+    # ONBOARDING READINESS (AGENT_ONBOARDING_WATCH): connection_watch above sweeps the
+    # ACCOUNT REGISTRY, so a gym MISSING from that registry is invisible to it — which
+    # is every failure of this class, including Hill Country, the gym it was built for,
+    # and CrossFit Reverb hours after signing up. This one audits the PORTAL roster
+    # instead, so a gym cannot hide by being absent from Echo's side. Read-only.
+    try:
+        from . import onboarding_watch
+        if onboarding_watch.enabled():
+            flagged = onboarding_watch.run(alert=ops_alerts.alert)
+            if flagged:
+                print(f"[onboarding-watch] {len(flagged)} gym(s) not set up to post: "
+                      + ", ".join(sorted(flagged)))
+    except Exception as e:  # noqa: BLE001 - a watch never takes the run down
+        print(f"[onboarding-watch] failed: {type(e).__name__}: {e}")
+
     # ZERNIO PROFILE LINK (Pierce 2026-08-24): backfill gyms.zernio_profile_id (the
     # PUBLISHER's profile id) for any client gym missing it, matching the Zernio profile by
     # name. A fully-connected gym with an empty profile id silently never publishes ("no

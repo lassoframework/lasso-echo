@@ -309,6 +309,24 @@ def demo_calendar_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DEMO_CALENDAR_ENABLED", "false"))
 
 
+def onboarding_watch_enabled() -> bool:
+    """
+    ONBOARDING READINESS WATCH (AGENT_ONBOARDING_WATCH). Default OFF.
+
+    Alerts when a gym the PORTAL knows about is not actually set up to post: missing
+    from Echo's account registry (so it is in neither lane), its intake forwarded under
+    a different key, no approved sources, no Zernio profile, zero connected platforms,
+    or Facebook connected with no page selected.
+
+    It audits against echo_intake_tokens rather than Echo's own registry, because every
+    failure of this class has arrived as a gym MISSING from that registry — which is
+    exactly why connection_watch never saw Hill Country, the gym it was built for.
+    Read-only apart from its dedup stamps; it never registers, connects or approves
+    anything. Arm by hand in Railway env.
+    """
+    return _truthy(os.environ.get("AGENT_ONBOARDING_WATCH", "false"))
+
+
 def intake_auto_approve() -> bool:
     """
     AUTO-APPROVE a gym's own intake answers (AGENT_INTAKE_AUTO_APPROVE). Default OFF.
