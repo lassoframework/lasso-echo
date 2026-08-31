@@ -197,13 +197,24 @@ def _tenant_variants(account_key):
     never merged, so a gym with rows under both keys is not double-counted)."""
     key = (account_key or "").strip()
     variants = [key]
+    base = key
     for suf in ("_ig", "_fb"):
         if key.endswith(suf):
-            variants.append(key[: -len(suf)])
+            base = key[: -len(suf)]
+            variants.append(base)
             break
     else:
         if key:
             variants.append(f"{key}_ig")
+    # PUNCTUATION DRIFT: the portal and the account registry do not always agree on
+    # separators — echo_intake_tokens carried 'districth' for the gym Echo knows as
+    # 'district_h', so an intake would have landed on a key no reader ever searched.
+    # Try the alphanumeric-normalised twin too (both bare and _ig). Order still puts
+    # the exact key first and it is first-match-wins, never a merge, so an exact hit
+    # always beats a normalised one and two gyms are never combined.
+    norm = "".join(c for c in base.lower() if c.isalnum())
+    if norm and norm != base:
+        variants.extend([f"{norm}_ig", norm])
     seen, out = set(), []
     for v in variants:
         if v and v not in seen:

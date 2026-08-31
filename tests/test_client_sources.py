@@ -113,3 +113,35 @@ def test_variant_fallback_never_merges_two_keys():
     cs.add_source("westside", "offer", "Base key line", "intake", status="pending")
     got = [s.text for s in cs.pending_sources("westside_ig")]
     assert got == ["Primary key line"], f"variants were merged: {got}"
+
+
+def test_variants_bridge_punctuation_drift_between_portal_and_registry():
+    """LIVE (2026-08-30): echo_intake_tokens carried 'districth' for the gym Echo knows
+    as 'district_h'. An intake submitted then would have landed on a key NO reader ever
+    searched, and the gym would have sat in no_sources with its answers in the table —
+    the exact failure four other gyms had already hit."""
+    from agent import client_sources as cs
+    v = cs._tenant_variants("district_h_ig")
+    assert "districth" in v and "districth_ig" in v
+    # the exact key still comes first
+    assert v[0] == "district_h_ig"
+
+
+def test_punctuation_variant_finds_sources_landed_under_the_portal_key(monkeypatch):
+    """Reads are exercised against a stubbed row source: this asserts the VARIANT
+    SEARCH, not sqlite, and keeps the test free of shared-db side effects."""
+    from agent import client_sources as cs
+    stored = {"districth": ["Their real offer line"]}
+    monkeypatch.setattr(cs, "_rows",
+                        lambda key, status=None, category=None: list(stored.get(key, [])))
+    assert cs.pending_sources("district_h_ig") == ["Their real offer line"]
+    assert cs.all_sources("district_h_ig") == ["Their real offer line"]
+
+
+def test_exact_key_always_beats_the_normalised_twin(monkeypatch):
+    from agent import client_sources as cs
+    stored = {"district_h_ig": ["Exact key line"], "districth": ["Normalised key line"]}
+    monkeypatch.setattr(cs, "_rows",
+                        lambda key, status=None, category=None: list(stored.get(key, [])))
+    got = cs.pending_sources("district_h_ig")
+    assert got == ["Exact key line"], f"normalised variant won over the exact key: {got}"
