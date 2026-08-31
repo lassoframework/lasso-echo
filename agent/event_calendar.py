@@ -41,6 +41,14 @@ REJECT_DEAD_LINK = "event_link_dead"
 # (>= 10 rows) is enough to grade a month worth protecting.
 _MIN_MONTH_FOR_GATE = 10
 
+# FEED-REACHABLE statuses: what the gym's audience can actually end up seeing. The
+# same positive allowlist the grade-read lane uses (c629ed8): dead rows (denied /
+# killed / expired / retired) and placeholder sample books never count for or
+# against a month. stage_arc thins, merges and A-grades against THIS view only —
+# Zanshin's 100+ denied duplicate-purge rows graded the merged month D and blocked
+# a healthy arc top-up the night before the promo (2026-08-31).
+_FEED_REACHABLE = ("pending", "approved", "publishing", "published", "coach_review")
+
 
 def _cat(row):
     return str((row or {}).get("pillar") or (row or {}).get("category") or "").lower()
@@ -281,7 +289,7 @@ def sweep_arc_rows(arc_rows, reason):
 # ---------------------------------------------------------------------------
 
 def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
-              media_picker=None, media_host_fn=None):
+              media_picker=None, media_host_fn=None, gate="hard"):
     """Insert `arc_rows` into the gym's live month plan through `store`, re-grade, and
     stage the kept rows as 'pending'. Returns a summary dict. Never publishes.
 
@@ -292,7 +300,15 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
       4. re-grade through the A-gate with remediation (regrade). A month that cannot
          reach A after 4 passes is NOT staged (alert + refuse), matching apply_month_plan.
       5. insert the kept new arc rows (store.insert_rows). Existing rows are untouched
-         (we only ADD arc rows and rely on the A-gate; we never delete a human row)."""
+         (we only ADD arc rows and rely on the A-gate; we never delete a human row).
+
+    gate: "hard" (default) refuses to stage a month that cannot hold A — the contract
+    for CREATING an arc. "advisory" grades, logs and ALERTS a sub-A month but stages
+    anyway: the top-up heal of an event the client already created and the gate
+    already admitted once must never silently strand a running promo over a few
+    caption soft flags (Zanshin Back To School graded C->D on the arc's own punchy
+    beat lines the night before its start). Every staged row still lands PENDING
+    behind the client's approval gate either way."""
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
     if isinstance(event, dict):
         event = ge.GymEvent.from_row(event)
@@ -308,12 +324,22 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
             except Exception as exc:  # noqa: BLE001
                 log(f"stage_arc: list_month {m} failed {type(exc).__name__}; treating as empty")
 
-    thinned = overlap_thin(existing, arc_rows)
+    # THE MONTH THE AUDIENCE SEES (Zanshin top-up refusal, 2026-08-31): list_month
+    # returns EVERY status, but overlap-thin, merge and the A-gate are promises about
+    # what will actually publish. Grading Zanshin's 100+ denied duplicate-purge rows
+    # as "the month" scored the merged plan D(69) and refused to stage a healthy arc
+    # the night before the promo started; a denied offer row was also consuming the
+    # offer ceiling in overlap_thin. Thin/merge/grade against feed-reachable rows
+    # only; the full `existing` list still feeds the occupancy guard below (which
+    # NEEDS the denied/killed rows to apply the deny-reopens-once rule).
+    live_existing = [r for r in existing if _status(r) in _FEED_REACHABLE]
+
+    thinned = overlap_thin(live_existing, arc_rows)
     if len(thinned) < len(arc_rows):
         log(f"overlap guard: thinned event {event.id} arc from {len(arc_rows)} to "
             f"{len(thinned)} to respect the offer category ceiling")
 
-    merged = merge_arc(existing, thinned)
+    merged = merge_arc(live_existing, thinned)
     # A-GATE: the promise is the month must still grade A AFTER insertion — i.e. the
     # arc must not BREAK an already-good month. When there is a real existing month to
     # protect (enough rows for the grader to score a month, not a sparse seed), we grade
@@ -322,15 +348,23 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # the arc is a seed the normal month planner fills around, so there is no month to
     # break — we skip the gate and stage the pending arc (every row still lands pending).
     grade = None
-    if len(existing) >= _MIN_MONTH_FOR_GATE:
+    if len(live_existing) >= _MIN_MONTH_FOR_GATE:
         merged, grade = regrade(merged, profile=profile)
         if grade.total < _a_threshold():
             from agent import ops_alerts
+            if gate == "hard":
+                ops_alerts.alert(
+                    f"event arc insert: {gym_id}/{event.id} would drop the month to "
+                    f"{grade.total} ({grade.letter}) after 4 remediation passes. NOT STAGING.")
+                return {"ok": False, "reason": f"month would grade {grade.letter}",
+                        "grade": grade.total, "staged": 0}
+            # advisory: the top-up heal of an admitted, client-created arc. Visibility,
+            # never a silent strand — the promo's missing beats still stage PENDING.
             ops_alerts.alert(
-                f"event arc insert: {gym_id}/{event.id} would drop the month to "
-                f"{grade.total} ({grade.letter}) after 4 remediation passes. NOT STAGING.")
-            return {"ok": False, "reason": f"month would grade {grade.letter}",
-                    "grade": grade.total, "staged": 0}
+                f"event arc top-up: {gym_id}/{event.id} month grades {grade.total} "
+                f"({grade.letter}) after remediation; staging anyway (advisory gate — "
+                "top-up of an already-admitted client event; rows land pending).")
+            log(f"advisory gate: month grades {grade.total} ({grade.letter}); staging anyway")
 
     # Stage only the NEW arc rows (existing rows already live). Recap rows that are
     # blocked (no media yet) are held out of staging until media arrives.
@@ -476,7 +510,8 @@ def top_up_arc(store, event, *, today=None, avatar=None, logger=None,
     if not rows:
         return {"ok": True, "staged": 0, "reason": "no arc rows planned"}
     return stage_arc(store, event, rows, logger=logger,
-                     media_picker=media_picker, media_host_fn=media_host_fn)
+                     media_picker=media_picker, media_host_fn=media_host_fn,
+                     gate="advisory")
 
 
 def _attach_media(gym_id, rows, log, *, picker=None, host=None):

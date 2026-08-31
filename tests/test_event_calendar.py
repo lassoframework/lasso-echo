@@ -582,3 +582,74 @@ def test_top_up_arc_stages_only_missing_beats(monkeypatch):
                 for r in keep}
     assert not (staged_days & approved), "an approved beat was re-staged"
     assert store.inserted, "missing beats should have been topped up"
+
+
+def test_denied_backlog_never_blocks_the_gate_or_the_ceiling(monkeypatch):
+    """LIVE (Zanshin 2026-08-31, the top-up refusal): list_month returns every
+    status, and stage_arc graded 100+ denied duplicate-purge rows as 'the month',
+    scoring the merged plan D and refusing a healthy arc. Dead rows must neither
+    feed the A-gate nor consume the offer ceiling in overlap_thin."""
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    # A big denied backlog: same caption repeated (zeroes consistency if graded),
+    # dated across the arc months, belonging to OTHER events/slots.
+    denied_backlog = [
+        {"id": f"dead_{i}", "gym_id": "pete", "post_date": f"2026-09-{(i % 27) + 1:02d}",
+         "pillar": "offer", "format": "feed", "account": "instagram",
+         "event_id": "evt_other", "caption": "Same denied caption every time.",
+         "status": "denied"}
+        for i in range(40)
+    ]
+    store = _ReStageStore(denied_backlog)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.stage_arc(store, ev, arc, profile="GYM")
+    assert res.get("ok", True) and store.inserted, (
+        f"a denied backlog blocked a healthy arc: {res}")
+    assert len(store.inserted) == len([r for r in arc if not r.get("recap_blocked")]), (
+        "denied offer rows consumed the offer ceiling (overlap_thin saw dead rows)")
+
+
+def _poisoned_month(n=12):
+    # em dashes are a hard copy violation: caption_craft zeroes and the month
+    # cannot reach A no matter the remediation.
+    return [
+        {"id": f"live_{i}", "gym_id": "pete", "post_date": f"2026-09-{(i % 27) + 1:02d}",
+         "pillar": "doctrine", "format": "feed", "account": "instagram",
+         "caption": "Bad caption — with an em dash every time.", "status": "approved"}
+        for i in range(n)
+    ]
+
+
+def test_hard_gate_still_refuses_a_month_that_cannot_hold_a(monkeypatch):
+    from agent import event_calendar as ec
+    import agent.ops_alerts as oa
+    alerts = []
+    monkeypatch.setattr(oa, "alert", lambda m, *a, **k: alerts.append(m))
+    ev = _event()
+    arc = _arc_rows(ev)
+    store = _ReStageStore(_poisoned_month())
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.stage_arc(store, ev, arc, profile="GYM")
+    assert res["ok"] is False and not store.inserted
+    assert alerts and "NOT STAGING" in alerts[0]
+
+
+def test_advisory_gate_alerts_but_stages_the_top_up(monkeypatch):
+    """Zanshin Back To School, 2026-08-31: the heal of an admitted client event must
+    never be silently stranded by the A-gate — alert for visibility, stage pending."""
+    from agent import event_calendar as ec
+    import agent.ops_alerts as oa
+    alerts = []
+    monkeypatch.setattr(oa, "alert", lambda m, *a, **k: alerts.append(m))
+    ev = _event()
+    arc = _arc_rows(ev)
+    store = _ReStageStore(_poisoned_month())
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.stage_arc(store, ev, arc, profile="GYM", gate="advisory")
+    assert res.get("ok", True) is not False and store.inserted, f"advisory gate refused: {res}"
+    assert alerts and "staging anyway" in alerts[0]
+    assert all((r.get("status") or "pending") == "pending" for r in store.inserted)
