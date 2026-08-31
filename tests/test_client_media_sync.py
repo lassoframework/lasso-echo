@@ -511,6 +511,50 @@ def test_drive_only_gym_builds_from_connected_pool_not_awaiting(monkeypatch):
         assert row["status"] == "pending"      # still lands PENDING, no gate weakened
 
 
+def test_drive_only_gym_with_stale_sample_rows_still_builds(monkeypatch):
+    """MARKER-DEADLOCK REGRESSION (Dean Holcomb / CrossFit Reverb, live, 2026-08-31):
+    the FIRST post-fix scan for Dean landed on 'has_calendar' (skip) instead of
+    'generated', even though only 14 sample placeholder feeds existed against a
+    build_target of 30. Root cause: _already_built_for_media compared
+    media_count(0) <= built_media_marker(default 0), which is unconditionally TRUE
+    for a Drive-only gym (media_count is structurally always 0) the instant ANY
+    existing feed rows are present on the calendar — including unrelated onboarding
+    SAMPLE rows (status=draft, no image_url) seeded before the gym ever connected
+    Drive. Reproduces that exact shape: pre-existing draft/no-image rows on a few
+    distinct days, well under the feed budget (30, the default days), must NOT
+    block the Drive lane."""
+    from datetime import date
+
+    from tests.gym_media_fakes import make_asset
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    assets = [make_asset(f"d{i}", gym_id="gritx", title=f"team_{i}.jpg")
+             for i in range(5)]
+    _arm_drive_pool(monkeypatch, assets)
+    r2 = FakeR2({})
+    # 3 pre-existing SAMPLE feed rows (draft, no image_url, no source_media_asset_id)
+    # on distinct days — far below the default 30-day build_target, so only the
+    # marker deadlock explains a skip.
+    aug_rows = [{"gym_id": "gritx", "account": "instagram", "format": "feed",
+                "post_date": "2026-08-31", "status": "draft", "image_url": None}]
+    sep_rows = [{"gym_id": "gritx", "account": "instagram", "format": "feed",
+                "post_date": f"2026-09-0{d}", "status": "draft", "image_url": None}
+               for d in (1, 2)]
+    store = FakeStore(existing={
+        ("gritx", "2026-08"): aug_rows,
+        ("gritx", "2026-09"): sep_rows,
+    })
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 8, 31))
+
+    assert out["ok"] is True
+    assert out["generated"] == 1, (
+        f"stale sample rows must not deadlock the Drive lane, got {out}")
+    drive_rows = [r for r in store.inserted if r.get("source_media_asset_id")]
+    assert drive_rows, "expected real content_calendar rows built from the Drive pool"
+
+
 def test_drive_only_gym_without_gym_drive_flags_still_awaits(monkeypatch):
     """REGRESSION GUARD: the fix must be gated behind GYM_DRIVE_STAGE +
     gym_drive_connect_active_for, exactly like the lane already is. A Drive pool

@@ -963,7 +963,16 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 _built_marker = int(_db.kv_get(f"built_media_{base}") or 0)
             except Exception:  # noqa: BLE001
                 _built_marker = 0
-            _already_built_for_media = existing_feeds > 0 and media_count <= _built_marker
+            # media_count > 0 required: for a Drive-only gym (media_count is
+            # STRUCTURALLY always 0 — it never reflects the connected Drive pool) this
+            # marker comparison is meaningless and 0 <= 0 is unconditionally true, so
+            # without this guard ANY pre-existing calendar rows (even unrelated onboarding
+            # SAMPLE placeholders, status=draft/no image) would false-positive
+            # "already built" and permanently block the Drive lane from ever running
+            # (Dean Holcomb / CrossFit Reverb, 2026-08-31: 42 sample rows already on the
+            # calendar tripped this on the very first post-fix scan).
+            _already_built_for_media = (media_count > 0 and existing_feeds > 0
+                                        and media_count <= _built_marker)
             if not cadence_changed and (existing_feeds >= build_target
                                         or _already_built_for_media):
                 # Already built out to the media the gym supports (capped at `days`):
