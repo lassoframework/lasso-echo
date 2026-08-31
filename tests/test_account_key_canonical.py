@@ -483,3 +483,67 @@ def test_canonical_key_is_stable_across_the_disagreeing_identifiers():
     k1 = ak.canonical_account_key(u1, "Hill Country MVMT")
     k2 = ak.canonical_account_key(u2, "Hill Country MVMT")
     assert k1 == k2
+
+
+# 6. the resolver CACHE (scale audit 2026-08-30) ------------------------------------
+class _CountingGymsHttp(_FakeGymsHttp):
+    """_FakeGymsHttp that counts every gyms read, so the cache can be MEASURED."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls += 1
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+def _counting_store(http):
+    from agent.portal_calendar_store import SupabaseCalendarStore
+    return SupabaseCalendarStore(url="http://x", service_key="k", http=http)
+
+
+def test_repeat_resolves_of_the_same_base_cost_one_read_not_one_per_tick():
+    """publish_client_gyms resolves EVERY gym on a ~1 minute tick. For a base != slug
+    gym that was three gyms reads a tick, the third pulling the whole table unfiltered.
+    At 100 gyms that is ~24k Supabase calls an hour, issued serially inside one tick."""
+    http = _CountingGymsHttp()
+    s = _counting_store(http)
+    assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+    first = http.calls
+    assert first >= 2, "topfuel is the base != slug case, so it costs several reads"
+    for _ in range(60):                       # an hour of ticks
+        assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+    assert http.calls == first, "a repeat resolve must cost NOTHING"
+
+
+def test_a_miss_is_never_cached_so_a_new_gym_resolves_immediately():
+    """Caching a miss would reintroduce the exact stranding this resolver exists to
+    kill: a gym registering a moment from now must resolve on its very next tick,
+    not after a six hour TTL."""
+    http = _CountingGymsHttp()
+    s = _counting_store(http)
+    assert s.resolve_gym_uuid("nosuchgym") is None
+    after_miss = http.calls
+    assert s.resolve_gym_uuid("nosuchgym") is None
+    assert http.calls > after_miss, "a miss must be re-read, never served from cache"
+
+
+def test_the_cache_never_confuses_two_gyms():
+    http = _CountingGymsHttp()
+    s = _counting_store(http)
+    assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+    assert s.resolve_gym_uuid("eng") == "uuid-eng"
+    assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+
+
+def test_an_expired_entry_is_re_read():
+    import agent.portal_calendar_store as pcs
+    http = _CountingGymsHttp()
+    s = _counting_store(http)
+    assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+    before = http.calls
+    # age the entry past its TTL
+    uuid, _exp = pcs._UUID_CACHE["topfuel"]
+    pcs._UUID_CACHE["topfuel"] = (uuid, 0)
+    assert s.resolve_gym_uuid("topfuel") == "uuid-topfuel"
+    assert http.calls > before, "a stale entry must be re-read"

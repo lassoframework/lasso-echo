@@ -143,9 +143,19 @@ def check_gym(base_key, gym_id="", intake_key="", *, bases=None, deps=None):
     registered = base_key in (bases if bases is not None else d["bases"]())
     if not registered:
         issues.append(REASON_NOT_REGISTERED)
-    if intake_key and intake_key != base_key:
+    # A mismatch only MATTERS while it is still stranding the answers. Once the sources
+    # have been migrated onto the portal key the old echo_social_intake row still records
+    # the original key forever, so a bare mismatch check re-reports gyms that were fixed
+    # weeks ago. Measured on the first full sweep, 2026-08-30: Pierce, Reverb, Hill
+    # Country and The Bolton Club all flagged key_mismatch while each had its sources
+    # (17, 6, 22 and 3) present and was publishing normally. With alerts armed that is a
+    # daily page about four healthy gyms, and at 100 gyms it is the noise that trains
+    # everyone to ignore the watch. So: report it only when the answers really are
+    # missing from the key we read.
+    has_sources = bool(d["approved_sources"](base_key))
+    if intake_key and intake_key != base_key and not has_sources:
         issues.append(REASON_KEY_MISMATCH)
-    if not d["approved_sources"](base_key):
+    if not has_sources:
         issues.append(REASON_NO_SOURCES)
     profile_id = d["profile_id"](base_key)
     if not profile_id:

@@ -88,15 +88,30 @@ def test_a_gym_missing_from_the_registry_is_caught():
     assert "registry" in seen[0]                 # the alert names the fix
 
 
-def test_a_key_mismatch_is_caught():
+def test_a_key_mismatch_is_caught_while_it_is_still_stranding_the_answers():
     """Reverb's intake forwarded under crossfitreverb6cdf33 while its portal key was
     crossfitreverb30b5b2, so its answers landed where nothing reads them."""
+    deps = _deps(roster=[("g1", "reverb30b5b2")], intake={"g1": "reverb6cdf33"},
+                 bases=["reverb30b5b2"], sources={},
+                 profiles={"reverb30b5b2": "p1"},
+                 platforms={"p1": {"instagram"}}, pages={"reverb30b5b2": "1"})
+    out = ow.run(deps=deps, alert=lambda m: None, kv=_KV())
+    assert out == {"reverb30b5b2": [ow.REASON_KEY_MISMATCH, ow.REASON_NO_SOURCES]}
+
+
+def test_a_repaired_key_mismatch_is_silent():
+    """Once the sources are migrated onto the portal key the gym is healthy, but the
+    echo_social_intake row records the ORIGINAL key forever. Measured on the first full
+    sweep 2026-08-30: Pierce, Reverb, Hill Country and The Bolton Club all flagged
+    key_mismatch with 17, 6, 22 and 3 sources respectively, all publishing normally.
+    With alerts armed that is a daily page about four healthy gyms."""
     deps = _deps(roster=[("g1", "reverb30b5b2")], intake={"g1": "reverb6cdf33"},
                  bases=["reverb30b5b2"], sources={"reverb30b5b2": ["s"]},
                  profiles={"reverb30b5b2": "p1"},
                  platforms={"p1": {"instagram"}}, pages={"reverb30b5b2": "1"})
-    out = ow.run(deps=deps, alert=lambda m: None, kv=_KV())
-    assert out == {"reverb30b5b2": [ow.REASON_KEY_MISMATCH]}
+    seen = []
+    assert ow.run(deps=deps, alert=seen.append, kv=_KV()) == {}
+    assert seen == []
 
 
 def test_zero_connected_platforms_is_caught():

@@ -27,8 +27,16 @@ the row exists and never issues a write that could touch it.
 """
 
 import calendar as _calendar
+import time as _time
 
 from . import config
+
+# base -> (gyms.id uuid, expires_at). POSITIVE resolutions only; see
+# SupabaseCalendarStore.resolve_gym_uuid for why a miss is deliberately never cached.
+# Six hours: a gym's uuid is effectively immutable, and re-slugging or archiving one is
+# a rare, human-driven act, so this bounds staleness without paying the read every tick.
+_UUID_CACHE = {}
+_UUID_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 # Wave 3: caption cooldown ledger. Imported lazily inside insert_rows when
 # AGENT_CAPTION_COOLDOWN is ON so the flag-off path has zero cost.
@@ -619,6 +627,37 @@ class SupabaseCalendarStore:
             return []
 
     def resolve_gym_uuid(self, base):
+        """CACHED. See _resolve_gym_uuid_uncached for the resolution rules.
+
+        WHY A CACHE (scale audit, 2026-08-30): this is the hottest read in the publish
+        path. publish_client_gyms asks gym_autonomy for EVERY gym on the listener's
+        ~1 minute tick, and gym_autonomy resolves the base first. For any gym whose
+        base is not identical to its hyphenated slug (topfuel, district_h, hillcountry
+        and friends, i.e. the common case, not the exception) that costs three gyms
+        reads, the third of which pulls the ENTIRE gyms table with no filter, plus the
+        settings read. At 100 gyms that is roughly 24,000 Supabase calls an hour for a
+        value that essentially never changes, issued SERIALLY inside one tick, which
+        can push a tick past its own cadence and back the queue up.
+
+        ONLY SUCCESSFUL resolutions are cached. A None is never cached, so a gym that
+        registers a moment from now resolves on its very next tick rather than waiting
+        out a TTL: caching the miss would reintroduce the stranding this resolver was
+        written to kill. Process-local and cold after a restart."""
+        key = (str(base) if base is not None else "").strip()
+        if not key:
+            return None
+        hit = _UUID_CACHE.get(key)
+        if hit is not None:
+            uuid, expires = hit
+            if expires > _time.time():
+                return uuid
+            _UUID_CACHE.pop(key, None)
+        uuid = self._resolve_gym_uuid_uncached(key)
+        if uuid:
+            _UUID_CACHE[key] = (uuid, _time.time() + _UUID_CACHE_TTL_SECONDS)
+        return uuid
+
+    def _resolve_gym_uuid_uncached(self, base):
         """The gyms.id UUID for an account-registry BASE, or None. THE base != slug bug
         (topfuel/district_h/hillcountry, live 2026-08-28): the account registry keys by a
         base STRING (topfuel), but gyms.slug is a hyphenated human slug (top-fuel), so the

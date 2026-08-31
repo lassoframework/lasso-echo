@@ -94,15 +94,21 @@ def _clear_process_local_caches():
     makes results depend on test ORDER: test_client_media_sync clears it in its own
     fixture, but test_cadence touches the same code path and did not, which is exactly
     how a passing suite starts failing only under -p no:randomly or a new file. Doing
-    it here covers every test file, including ones not yet written."""
-    try:
-        from agent import client_media_sync as _cms
-        _cms._JSON_CACHE.clear()
-    except Exception:  # noqa: BLE001 - a cache that is absent needs no clearing
-        pass
+    it here covers every test file, including ones not yet written.
+
+    portal_calendar_store._UUID_CACHE also memoises base -> gyms.id for six hours; a
+    test that stubs the gyms table would otherwise be answered from the previous
+    test's stub.
+    """
+    def _clear():
+        for mod, attr in (("client_media_sync", "_JSON_CACHE"),
+                          ("portal_calendar_store", "_UUID_CACHE")):
+            try:
+                import importlib
+                getattr(importlib.import_module(f"agent.{mod}"), attr).clear()
+            except Exception:  # noqa: BLE001 - an absent cache needs no clearing
+                pass
+
+    _clear()
     yield
-    try:
-        from agent import client_media_sync as _cms
-        _cms._JSON_CACHE.clear()
-    except Exception:  # noqa: BLE001
-        pass
+    _clear()
