@@ -166,17 +166,72 @@ def _autonomous_publish(draft, store, poster):
         actor = (acct.approver_ids() or [config.APPROVER_SLACK_ID])[0]
     except Exception:
         actor = config.APPROVER_SLACK_ID
+    # EXACTLY-ONCE (LASSO IG triple-publish, 2026-08-27). This lane was never wired to
+    # the socialapi_claims guard its siblings got after that incident: auto-approve and
+    # trust-autopublish both route through _claimed_meta_publish, but the autonomy lane
+    # published with no claim at all. The draft is not persisted yet at this point, so
+    # approvals' own row-level claim grants by default and cannot cover this: two
+    # overlapping daily draws for an autonomy-enabled gym, exactly what happened on
+    # 2026-08-27, would both publish live. Claim on the DETERMINISTIC draft id, which a
+    # refired draw reproduces, so the second run loses the claim instead of the gym.
+    from . import ops_alerts as _oa
+    if not _db.kv_is_durable():
+        print(f"[autonomy] {draft.draft_id} ({account_key}) HELD: kv is not durable, "
+              "so an out-of-band process cannot guarantee exactly-once.")
+        return False
+    try:
+        claim_state, _pid = _db.socialapi_claim(draft.draft_id, account_key)
+    except Exception as e:  # noqa: BLE001 - a claim we cannot take is a claim we do not have
+        print(f"[autonomy] {draft.draft_id} ({account_key}) HELD: claim failed "
+              f"({type(e).__name__}: {e}); never publishing blind.")
+        return False
+    if claim_state == "done":
+        return False                      # already published; never send it twice
+    if claim_state == "in_flight":
+        # A prior attempt holds the claim. VERIFY against the post log rather than
+        # blind-republishing; unverifiable fails CLOSED with one line for a human.
+        verified = _verify_published_24h(account_key, draft.caption)
+        if verified:
+            try:
+                _db.socialapi_claim_done(draft.draft_id, account_key, verified)
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        _oa.alert(f"autonomy: {account_key} draft {draft.draft_id} has an in-flight "
+                  "publish claim that cannot be verified against the post log. HELD, "
+                  "not republished. Reconcile by hand.")
+        return False
     try:
         result = handle_action("approve", draft, actor, account=acct)
     except Exception as e:
-        # A real publish failure already alerted inside handle_action; hold the draft
-        # PENDING for a manual retry rather than dropping it.
+        # AMBIGUOUS: handle_action only raises out of the publish call itself, so the
+        # post may or may not have gone out. KEEP the claim in flight so the next run
+        # VERIFIES instead of resending. A real publish failure already alerted inside
+        # handle_action; hold the draft PENDING for a manual retry rather than dropping.
         print(f"[autonomy] approve failed for {account_key} {draft.draft_id}: "
-              f"{type(e).__name__}: {e}; holding PENDING")
+              f"{type(e).__name__}: {e}; holding PENDING, claim kept for verification")
         return False
     if not getattr(result, "ok", False):
-        # e.g. media not ready / not authorized: hold PENDING, do not fake success.
+        # e.g. media not ready / not authorized: NOTHING published, so release the claim
+        # for a clean retry, then hold PENDING. Never fake success.
+        try:
+            _db.socialapi_claim_release(draft.draft_id, account_key)
+        except Exception:  # noqa: BLE001
+            pass
         return False
+    detail = str(getattr(result, "detail", "") or "")
+    if detail.startswith("published"):
+        try:
+            _db.socialapi_claim_done(draft.draft_id, account_key, detail)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        # would_publish: the dry run sent nothing, so the claim must not stand or the
+        # post could never go out once publishing is armed.
+        try:
+            _db.socialapi_claim_release(draft.draft_id, account_key)
+        except Exception:  # noqa: BLE001
+            pass
     # handle_action set draft.status to APPROVED on success; persist that record.
     store.put(draft)
     from . import db

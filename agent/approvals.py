@@ -247,7 +247,13 @@ def handle_action(action, draft, actor_slack_id, note="",
         # store.put()) is granted the claim rather than treated as contested.
         st = store or draft_store.PendingStore()
         from_status = getattr(draft.status, "value", draft.status)
-        if not st.claim_for_publish(draft.draft_id, from_status):
+        # A store that cannot claim is not a store that lost the claim. Callers inject
+        # all sorts of store-likes (the portal's own loader, test doubles), and treating
+        # a missing method as a lost race would silently stop approving posts entirely.
+        # Such a store behaves exactly as it did before the claim existed.
+        _claim = getattr(st, "claim_for_publish", None)
+        _release = getattr(st, "release_claim", None)
+        if _claim is not None and not _claim(draft.draft_id, from_status):
             # Lost the race: a concurrent approve is already publishing it, or has.
             # Skip, not error: the human gets their confirmation from the winner.
             return ActionResult(ok=True, action="approve", draft_id=draft.draft_id,
@@ -264,7 +270,8 @@ def handle_action(action, draft, actor_slack_id, note="",
             # before marking APPROVED), so tapping Approve again retries it.
             # Release the claim first: never strand a draft in the claiming state,
             # which would turn one rare double post into a common never post.
-            st.release_claim(draft.draft_id, from_status)
+            if _release is not None:
+                _release(draft.draft_id, from_status)
             ops_alerts.alert(f"held (media not ready) for {draft.account_key} draft "
                              f"{draft.draft_id}: {e} Nothing published; the card is "
                              "held. Approve again in a minute to retry.")
@@ -277,7 +284,8 @@ def handle_action(action, draft, actor_slack_id, note="",
             # Behavior unchanged (the error still raises to the caller); with
             # AGENT_OPS_ALERTS_ENABLED it also posts one loud ops alert first.
             # Same "never strand the claim" reasoning as MediaNotReady above.
-            st.release_claim(draft.draft_id, from_status)
+            if _release is not None:
+                _release(draft.draft_id, from_status)
             ops_alerts.alert(f"publish attempt failed for {draft.account_key} draft "
                              f"{draft.draft_id}: {type(e).__name__}: {e}")
             raise
@@ -287,8 +295,8 @@ def handle_action(action, draft, actor_slack_id, note="",
         # fires. Holding the claim there would strand the draft and refuse every
         # later approve, turning the rare double post this guard prevents into a
         # permanent never post: strictly worse than the bug.
-        if getattr(result, "mode", "") != "published":
-            st.release_claim(draft.draft_id, from_status)
+        if getattr(result, "mode", "") != "published" and _release is not None:
+            _release(draft.draft_id, from_status)
         draft.status = DraftStatus.APPROVED
         # Meta returns media_id, GBP returns post_id — log whichever the result carries.
         post_ref = getattr(result, "media_id", "") or getattr(result, "post_id", "")

@@ -373,3 +373,41 @@ def test_a_confirmation_failure_after_a_live_post_never_escapes(tmp_path):
         _ap.ops_alerts.alert = real_alert
     assert pub.calls == 1 and res.ok is True
     assert any("The post IS" in m for m in alerts)
+
+
+class StoreWithoutClaim:
+    """A store-like with no claim_for_publish: the portal's own loader and several
+    test doubles look exactly like this."""
+
+    def __init__(self):
+        self.puts = []
+
+    def get(self, draft_id):
+        return None
+
+    def put(self, draft):
+        self.puts.append(draft)
+
+
+def test_a_store_that_cannot_claim_still_approves(tmp_path):
+    """A store that CANNOT claim is not a store that LOST the claim. Treating a
+    missing method as a lost race silently stopped approving posts altogether:
+    caught when forwarding the store into handle_action turned every portal autonomy
+    auto-approve into zero approvals."""
+    pub = OkPublisher()
+    res = approvals.handle_action(
+        "approve", _draft(draft_id="nostore1"),
+        actor_slack_id=config.APPROVER_SLACK_ID, publisher=pub,
+        logger=SpyLogger(), account=_acct(), store=StoreWithoutClaim())
+    assert res.ok is True
+    assert pub.calls == 1, "a store without the claim capability blocked the publish"
+
+
+def test_a_store_without_release_survives_a_publish_failure(tmp_path):
+    """The release path must be equally tolerant, or a failure turns into a crash."""
+    pub = FailingPublisher(meta_publisher.MediaNotReady("still processing"))
+    res = approvals.handle_action(
+        "approve", _draft(draft_id="nostore2"),
+        actor_slack_id=config.APPROVER_SLACK_ID, publisher=pub,
+        logger=SpyLogger(), account=_acct(), store=StoreWithoutClaim())
+    assert res.ok is False and pub.calls == 1

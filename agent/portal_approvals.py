@@ -87,7 +87,16 @@ def approve(account_key, draft_id, actor_id, store=None, **kwargs):
         # Cross-gym backstop: same not-found shape, never confirm it exists elsewhere.
         return _result(False, "approve", draft_id,
                        f"Draft {draft_id} not found for account {account_key}.")
-    result = handle_action("approve", draft, actor_id, account=account, **kwargs)
+    # FORWARD THE STORE. handle_action's publish claim is a compare-and-swap on the
+    # store the draft actually lives in. Without this, `store` was consumed only by
+    # _load_draft and handle_action built a DEFAULT PendingStore, so the claim checked
+    # a table the draft is not in and granted every time: an exactly-once guard that
+    # silently guards nothing. Dormant today, because the live portal path writes
+    # straight to content_calendar and never reaches here, but this is the fallback
+    # that takes over if the shared plane is briefly unreachable, which is exactly
+    # when a retry storm would find the hole.
+    result = handle_action("approve", draft, actor_id, account=account,
+                           store=store, **kwargs)
     return _result(result.ok, result.action, result.draft_id, result.detail)
 
 
