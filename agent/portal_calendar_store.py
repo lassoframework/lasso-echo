@@ -1355,7 +1355,14 @@ class SupabaseCalendarStore:
         duplicate purge) never count for or against a grade."""
         params = {
             "gym_id": f"eq.{account_key}",
-            "status": "neq.denied",
+            # ONLY FEED-REACHABLE ROWS GRADE (2026-08-31): the grade is a promise about
+            # what the gym's audience will actually see. Dead rows (denied/killed) and
+            # placeholder 'draft' sample books (294 boilerplate rows shared across 8
+            # template gyms — the cross-gym duplicate-hash alerts) were graded as the
+            # forward book and held every one of those gyms at F on content that can
+            # never publish. Positive allowlist, not exclusions, so a future status
+            # never leaks into grading by default.
+            "status": "in.(pending,approved,publishing,published,coach_review)",
             "post_date": f"gte.{start_iso}",
             "order": "post_date",
             "limit": "1000",
