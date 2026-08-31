@@ -275,3 +275,60 @@ def test_no_recap_request_when_media_exists(monkeypatch):
     ev = _event(media_ids=("p1",))
     assert es.recap_photo_request(ev) is None
     assert not posted
+
+
+# ---- nightly arc top-up (Pete/Zanshin Back To School, 2026-08-31) ----------------
+
+def test_status_job_tops_up_active_event(monkeypatch):
+    """A still-active (live/scheduled) armed event gets its missing beats re-staged
+    through top_up_arc, even when its status did not change this run."""
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    calls = []
+    monkeypatch.setattr(ec, "top_up_arc",
+                        lambda store, event, today=None, logger=None: (
+                            calls.append((event.id, today)) or {"ok": True, "staged": 3}))
+    ev_row = dict(id="evt_baf_x", gym_id="pete", name="Bring a Friend Week",
+                  type="bring_a_friend", starts_on="2026-09-22", ends_on="2026-09-28",
+                  tz="America/New_York", offer_text="free week", link="",
+                  brief="", media_ids=[], status="live")
+    estore = _EventStore([ev_row])
+    cstore = _CalStore([])
+    res = es.run_status_job(estore, cstore, today=date(2026, 9, 24))
+    assert res["ok"]
+    assert calls and calls[0][0] == "evt_baf_x"
+    assert res["topped_up"] == 3
+
+
+def test_status_job_never_tops_up_ended_event(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    import agent.ops_alerts as oa
+    monkeypatch.setattr(oa, "alert", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(ec, "top_up_arc",
+                        lambda *a, **k: calls.append(a) or {"ok": True, "staged": 9})
+    ev_row = dict(id="evt_baf_x", gym_id="pete", name="Bring a Friend Week",
+                  type="bring_a_friend", starts_on="2026-09-22", ends_on="2026-09-28",
+                  tz="America/New_York", offer_text="free week", link="",
+                  brief="", media_ids=[], status="live")
+    estore = _EventStore([ev_row])
+    cstore = _CalStore([])
+    res = es.run_status_job(estore, cstore, today=date(2026, 9, 29))
+    assert res["ended"] == 1
+    assert not calls, "an ended event must never be topped up"
+    assert res["topped_up"] == 0
+
+
+def test_status_job_top_up_failure_never_breaks_sweep(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    def _boom(*a, **k):
+        raise RuntimeError("store down")
+    monkeypatch.setattr(ec, "top_up_arc", _boom)
+    ev_row = dict(id="evt_baf_x", gym_id="pete", name="Bring a Friend Week",
+                  type="bring_a_friend", starts_on="2026-09-22", ends_on="2026-09-28",
+                  tz="America/New_York", offer_text="free week", link="",
+                  brief="", media_ids=[], status="live")
+    estore = _EventStore([ev_row])
+    cstore = _CalStore([])
+    res = es.run_status_job(estore, cstore, today=date(2026, 9, 24))
+    assert res["ok"]
+    assert res["topped_up"] == 0

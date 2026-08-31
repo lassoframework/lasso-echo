@@ -342,11 +342,32 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # catch it because an arc row carries no slot the incoming row collides on. Drop any
     # incoming row this event already occupies on the same date + account + format, so a
     # re-stage after an edit tops the arc up instead of doubling it.
-    already = {(str(r.get("post_date"))[:10],
+    #
+    # DENY = RECREATE (Pete/CrossFit Zanshin, 2026-08-31): a client deny burns a
+    # recreate unit and, everywhere else in the product, buys a fresh replacement.
+    # This guard used to count DENIED rows as occupying their slot forever, so a
+    # denied arc beat could never be re-staged: Pete denied his Back To School rows
+    # and the promo start date arrived with ZERO active posts and no way to heal.
+    # A slot whose only rows for this event are DENIED now counts as OPEN — but at
+    # most one automatic recreate per beat: a second deny on the same slot means
+    # the client really does not want that beat, and it stays closed. Every other
+    # status (pending/approved/published/killed/...) blocks exactly as before;
+    # kill in particular remains permanent.
+    already = set()
+    denied_count = {}
+    for r in existing:
+        if str(r.get("event_id") or "") != str(event.id):
+            continue
+        slot = (str(r.get("post_date"))[:10],
                 str(r.get("account") or "").lower(),
                 str(r.get("format") or "").lower())
-               for r in existing
-               if str(r.get("event_id") or "") == str(event.id)}
+        if _status(r) == "denied":
+            denied_count[slot] = denied_count.get(slot, 0) + 1
+        else:
+            already.add(slot)
+    for slot, n in denied_count.items():
+        if n >= 2:
+            already.add(slot)
     if already:
         before = len(to_stage)
         to_stage = [r for r in to_stage
@@ -430,6 +451,32 @@ def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "app
         if updated is not None:
             backfilled.append(rid)
     return {"backfilled": backfilled, "held": len(held)}
+
+
+def top_up_arc(store, event, *, today=None, avatar=None, logger=None,
+               media_picker=None, media_host_fn=None):
+    """Re-plan an ACTIVE (scheduled/live) event's arc from `today` and stage ONLY the
+    beats the calendar is missing.
+
+    stage_arc's occupancy guard makes this idempotent: a date this event already holds
+    with a live row (pending/approved/published/killed/...) or a twice-denied slot is
+    skipped, so the only rows added are beats with no live row — a beat the client
+    denied once (deny = recreate, same contract as the deny-backfill lane) or one that
+    was never staged at all (guard-denied at publish, or dropped by the since-fixed
+    overlap-thin bug). Every added row lands 'pending' behind the approval gate.
+    Never publishes, never touches existing rows.
+
+    Born 2026-08-31: Pete/CrossFit Zanshin's Back To School Special reached the night
+    before its start date with every arc row denied and nothing re-staging them — the
+    promo would have silently not run."""
+    from . import event_engine as _ee
+    if isinstance(event, dict):
+        event = ge.GymEvent.from_row(event)
+    rows = _ee.plan_event_arc(event, today=today, avatar=avatar, logger=logger)
+    if not rows:
+        return {"ok": True, "staged": 0, "reason": "no arc rows planned"}
+    return stage_arc(store, event, rows, logger=logger,
+                     media_picker=media_picker, media_host_fn=media_host_fn)
 
 
 def _attach_media(gym_id, rows, log, *, picker=None, host=None):

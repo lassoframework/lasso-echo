@@ -794,6 +794,31 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         except Exception as e:
             print(f"[connection-watch] failed: {type(e).__name__}: {e}")
 
+    # EVENT STATUS + ARC TOP-UP (AGENT_EVENT_CAMPAIGNS): the nightly date job
+    # event_status.run_status_job was documented ("driven by the nightly date job")
+    # but NOTHING ever called it — so an ended event never swept its leftover pending
+    # rows, its recap never got the photo request, and (Pete/CrossFit Zanshin
+    # Back To School, 2026-08-31) an active event whose beats were client-denied
+    # (deny = recreate) had no lane that ever re-staged them: the promo reached its
+    # start date with zero active posts. This wires the job in. Everything it stages
+    # lands PENDING behind the approval gate; it never publishes. Fully isolated:
+    # a failure never takes the draft run down.
+    if config.event_campaigns_enabled():
+        try:
+            from . import event_status as _es
+            from .gym_event_store import SupabaseGymEventStore as _GES
+            from .portal_calendar_store import SupabaseCalendarStore as _SCS
+            esum = _es.run_status_job(_GES(), _SCS())
+            if esum.get("ok") and (esum.get("flipped") or esum.get("topped_up")):
+                print(f"[event-status] flipped {esum.get('flipped', 0)} event(s), "
+                      f"{esum.get('ended', 0)} ended ({esum.get('denied', 0)} row(s) "
+                      f"swept), topped up {esum.get('topped_up', 0)} missing arc "
+                      f"row(s)")
+        except Exception as e:  # noqa: BLE001 - the event sweep never takes the run down
+            print(f"[event-status] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"event status/top-up sweep failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # ONBOARDING READINESS (AGENT_ONBOARDING_WATCH): connection_watch above sweeps the
     # ACCOUNT REGISTRY, so a gym MISSING from that registry is invisible to it — which
     # is every failure of this class, including Hill Country, the gym it was built for,

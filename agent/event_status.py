@@ -103,12 +103,12 @@ def run_status_job(event_store, calendar_store, *, today=None, logger=None):
 
     Returns a summary dict. Never publishes."""
     log = logger or (lambda m: print(f"[event-status] {m}"))
-    flipped, ended, denied = 0, 0, 0
+    flipped, ended, denied, topped_up = 0, 0, 0, 0
     try:
         active = event_store.list_active() or []
     except Exception as exc:  # noqa: BLE001
         log(f"run_status_job: list_active failed {type(exc).__name__}")
-        return {"ok": False, "flipped": 0, "ended": 0, "denied": 0}
+        return {"ok": False, "flipped": 0, "ended": 0, "denied": 0, "topped_up": 0}
 
     for row in active:
         try:
@@ -121,27 +121,44 @@ def run_status_job(event_store, calendar_store, *, today=None, logger=None):
         if event.status == "cancelled":
             continue
         want = status_for(event, today=today)
-        if want == event.status:
-            continue
-        # Apply the flip.
-        try:
-            event_store.set_status(event.gym_id, event.id, want)
-            flipped += 1
-        except Exception as exc:  # noqa: BLE001
-            log(f"set_status {event.id} -> {want} failed {type(exc).__name__}")
-            continue
-        if want == "ended":
-            ended += 1
-            # Sweep pending arc rows denied (posting stops dead).
-            res = ec.cancel_event(calendar_store, event.gym_id, event.id, ended=True,
-                                  logger=logger)
-            denied += res.get("denied", 0)
-            # Recap photo request the morning after the end (best-effort).
+        if want != event.status:
+            # Apply the flip.
             try:
-                recap_photo_request(event, logger=logger)
+                event_store.set_status(event.gym_id, event.id, want)
+                flipped += 1
             except Exception as exc:  # noqa: BLE001
-                log(f"recap photo request for {event.id} failed {type(exc).__name__}")
-    return {"ok": True, "flipped": flipped, "ended": ended, "denied": denied}
+                log(f"set_status {event.id} -> {want} failed {type(exc).__name__}")
+                continue
+            if want == "ended":
+                ended += 1
+                # Sweep pending arc rows denied (posting stops dead).
+                res = ec.cancel_event(calendar_store, event.gym_id, event.id,
+                                      ended=True, logger=logger)
+                denied += res.get("denied", 0)
+                # Recap photo request the morning after the end (best-effort).
+                try:
+                    recap_photo_request(event, logger=logger)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"recap photo request for {event.id} failed "
+                        f"{type(exc).__name__}")
+        if want in ("scheduled", "live") and calendar_store is not None:
+            # ARC TOP-UP (Pete/CrossFit Zanshin Back To School, 2026-08-31): a still-
+            # running event whose beats were denied (deny = recreate) or never staged
+            # gets its missing beats re-staged PENDING. stage_arc's occupancy guard
+            # makes this idempotent — a healthy arc stages nothing — and a beat the
+            # client denied twice stays closed. Isolated: one event failing never
+            # blocks the rest of the sweep. Never publishes.
+            try:
+                res = ec.top_up_arc(calendar_store, event, today=today, logger=logger)
+                added = int(res.get("staged") or 0)
+                if added:
+                    topped_up += added
+                    log(f"top-up: staged {added} missing arc row(s) for "
+                        f"{event.gym_id}/{event.id}")
+            except Exception as exc:  # noqa: BLE001
+                log(f"top_up_arc {event.id} failed {type(exc).__name__}")
+    return {"ok": True, "flipped": flipped, "ended": ended, "denied": denied,
+            "topped_up": topped_up}
 
 
 def recap_photo_request(event: ge.GymEvent, *, poster=None, logger=None):

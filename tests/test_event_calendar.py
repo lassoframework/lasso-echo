@@ -492,3 +492,93 @@ def test_restaging_an_arc_tops_up_instead_of_duplicating(monkeypatch):
     assert not (staged_days & already), "a day already on the calendar was staged twice"
     assert res["staged"] == len(store.inserted)
     assert store.inserted, "the genuinely new days should still be topped up"
+
+
+# ---- deny = recreate: a denied slot reopens ONCE, twice-denied stays closed -----
+# LIVE (Pete/Zanshin 2026-08-31): every Back To School arc row was denied and the
+# occupancy guard counted those slots as taken forever, so the promo reached its
+# start date with ZERO active posts and nothing could re-stage them.
+
+def test_denied_slot_is_restaged(monkeypatch):
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    existing = [dict(r, event_id=ev.id, status="denied") for r in arc]
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.stage_arc(store, ev, arc, profile="GYM")
+    assert store.inserted, "a slot whose only row is denied must reopen (deny = recreate)"
+    assert res["staged"] == len(store.inserted)
+    assert all((r.get("status") or "pending") == "pending" for r in store.inserted), (
+        "re-staged rows must land pending behind the approval gate")
+
+
+def test_twice_denied_slot_stays_closed(monkeypatch):
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    existing = ([dict(r, event_id=ev.id, status="denied") for r in arc]
+                + [dict(r, event_id=ev.id, status="denied") for r in arc])
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    ec.stage_arc(store, ev, arc, profile="GYM")
+    assert not store.inserted, (
+        "a slot the client denied twice must stay closed (no deny loop)")
+
+
+def test_killed_slot_stays_closed(monkeypatch):
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    existing = [dict(r, event_id=ev.id, status="killed") for r in arc]
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    ec.stage_arc(store, ev, arc, profile="GYM")
+    assert not store.inserted, "kill is permanent: a killed slot never reopens"
+
+
+def test_denied_row_of_another_event_does_not_open_this_events_slot(monkeypatch):
+    """The deny-reopen rule is scoped to THIS event: a live row from another event
+    still occupies nothing here (unchanged), and this event's live rows still block."""
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    existing = ([dict(r, event_id=ev.id, status="denied") for r in arc[:1]]
+                + [dict(r, event_id=ev.id, status="pending") for r in arc[1:]])
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    ec.stage_arc(store, ev, arc, profile="GYM")
+    staged_days = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+                   for r in store.inserted}
+    live = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+            for r in existing if r["status"] == "pending"}
+    assert not (staged_days & live), "a pending slot was re-staged over"
+    denied_slot = (str(arc[0]["post_date"])[:10], arc[0].get("account"),
+                   arc[0].get("format"))
+    assert denied_slot in staged_days, "the once-denied slot should have reopened"
+
+
+def test_top_up_arc_stages_only_missing_beats(monkeypatch):
+    """top_up_arc = plan + stage with the occupancy guard: live beats untouched,
+    once-denied and never-staged beats come back pending."""
+    from datetime import date as _date
+    from agent import event_calendar as ec
+    ev = _event()
+    arc = _arc_rows(ev)
+    keep = [dict(r, event_id=ev.id, status="approved") for r in arc[:2]]
+    denied = [dict(r, event_id=ev.id, status="denied") for r in arc[2:4]]
+    store = _ReStageStore(keep + denied)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+    res = ec.top_up_arc(store, ev, today=_date(2026, 9, 1))
+    assert res.get("staged", 0) == len(store.inserted)
+    staged_days = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+                   for r in store.inserted}
+    approved = {(str(r["post_date"])[:10], r.get("account"), r.get("format"))
+                for r in keep}
+    assert not (staged_days & approved), "an approved beat was re-staged"
+    assert store.inserted, "missing beats should have been topped up"
