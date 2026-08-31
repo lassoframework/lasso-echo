@@ -185,6 +185,23 @@ def test_missing_music_asset_holds(monkeypatch, tmp_path):
     assert "music" in res["reason"].lower()
 
 
+def test_empty_dir_library_still_holds(monkeypatch, tmp_path):
+    # AGENT_STORY_MUSIC_DIR armed but the manifest declares no tracks (the shipped
+    # /data/story-music template): behavior is EXACTLY today's — the render HOLDS on
+    # the missing licensed audio, never posts silently, never crashes.
+    _arm(monkeypatch)
+    music_dir = tmp_path / "story-music"
+    music_dir.mkdir()
+    (music_dir / "manifest.json").write_text('{"tracks": []}', encoding="utf-8")
+    monkeypatch.setenv("AGENT_STORY_MUSIC_DIR", str(music_dir))
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        candidates=_cands("pierce"), store=_FakeStore(),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    assert res["status"] == "held"
+    assert "music" in res["reason"].lower()
+
+
 def test_avatar_breach_holds(monkeypatch, tmp_path):
     _arm(monkeypatch)
     audio = tmp_path / "hype.mp3"

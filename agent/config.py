@@ -3138,3 +3138,15 @@ def story_studio_music_shelf() -> str:
     value of 'chill' here is coerced back to 'hype' (the no-chill-default rail)."""
     val = (os.environ.get("STORY_STUDIO_MUSIC_SHELF", "hype") or "hype").strip().lower()
     return "none" if val == "none" else "hype"  # never default to chill
+
+
+def story_music_dir() -> str:
+    """Directory holding the LICENSED story-music library (AGENT_STORY_MUSIC_DIR).
+    Default EMPTY = flag OFF: Story Studio keeps the metadata-only stub library and
+    any bed render HOLDS at burn time (today's behavior, unchanged). When set, the
+    directory must contain a manifest.json declaring tracks (track_id, shelf, title,
+    bpm, file, license_ref) with the audio files beside it; story_music excludes any
+    track whose file is missing on disk or whose license_ref is empty (we never claim
+    licensed music we cannot evidence). Blake arms this by hand once licensed files
+    + license refs are dropped in — never fabricate either."""
+    return (os.environ.get("AGENT_STORY_MUSIC_DIR", "") or "").strip()

@@ -25,6 +25,8 @@ an honest reason (never a silent no-audio post, never a fabricated track).
 """
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 
 SHELF_HYPE = "hype"
@@ -117,14 +119,106 @@ class StubMusicLibrary:
         return track.path or ""
 
 
+class DirMusicLibrary(StubMusicLibrary):
+    """The ops music library read from a directory (AGENT_STORY_MUSIC_DIR).
+
+    Layout: <dir>/manifest.json declaring
+        {"tracks": [{"track_id", "shelf" (hype|chill), "title", "bpm"?, "file",
+                     "license_ref"}, ...]}
+    with the audio files sitting beside the manifest (the "file" value is relative
+    to the directory).
+
+    HONESTY RAILS (never claim licensed music we cannot evidence):
+      * a track whose audio file is not present on disk is EXCLUDED at load;
+      * a track with no license_ref is EXCLUDED at load;
+      * an unreadable / malformed manifest raises — default_library() catches it,
+        logs ONE warning, and falls back to the stub (renders hold exactly as
+        today; never crash, never a silent bed-less post).
+
+    Selection stays deterministic by seed (pick() is inherited from the stub);
+    resolve_path() returns the absolute audio file path for a loaded track.
+    """
+
+    MANIFEST_NAME = "manifest.json"
+
+    def __init__(self, root):
+        self.root = os.path.abspath(str(root))
+        super().__init__(tracks=self._load_tracks())
+
+    def _load_tracks(self):
+        manifest_path = os.path.join(self.root, self.MANIFEST_NAME)
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)  # malformed JSON raises -> stub fallback upstream
+        rows = data.get("tracks") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("manifest.json has no 'tracks' list")
+        tracks = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            track_id = str(row.get("track_id") or "").strip()
+            shelf = str(row.get("shelf") or "").strip().lower()
+            license_ref = str(row.get("license_ref") or "").strip()
+            fname = str(row.get("file") or "").strip()
+            if not track_id or shelf not in (SHELF_HYPE, SHELF_CHILL):
+                continue
+            if not license_ref:
+                continue  # honesty rail: no license evidence -> not in the library
+            path = os.path.abspath(os.path.join(self.root, fname)) if fname else ""
+            if not path or not os.path.isfile(path):
+                continue  # honesty rail: no audio on disk -> not in the library
+            try:
+                bpm = int(row.get("bpm") or 0)
+            except (TypeError, ValueError):
+                bpm = 0
+            tracks.append(Track(
+                track_id=track_id, license_ref=license_ref, shelf=shelf,
+                title=str(row.get("title") or ""), bpm=bpm, path=path))
+        return tracks
+
+    def resolve_path(self, track):
+        """The absolute audio path for a track LOADED from this directory. A track_id
+        not in the manifest resolves to '' (the burn step HOLDS; we never point a
+        selection at some other file)."""
+        for t in self._tracks:
+            if t.track_id == track.track_id:
+                return t.path
+        return ""
+
+
 _DEFAULT_LIBRARY = None
+_DEFAULT_LIBRARY_KEY = None  # the AGENT_STORY_MUSIC_DIR value the cache was built for
 
 
 def default_library():
-    global _DEFAULT_LIBRARY
-    if _DEFAULT_LIBRARY is None:
-        _DEFAULT_LIBRARY = StubMusicLibrary()
-    return _DEFAULT_LIBRARY
+    """The process-default library. AGENT_STORY_MUSIC_DIR set AND yielding at least
+    one valid (on-disk, licensed) track -> DirMusicLibrary; otherwise the metadata-only
+    stub (bed renders HOLD, today's behavior). Cached per env value so a changed env
+    (tests, a redeploy-free re-arm) rebuilds the library instead of serving a stale
+    one."""
+    global _DEFAULT_LIBRARY, _DEFAULT_LIBRARY_KEY
+    from . import config
+    key = config.story_music_dir()
+    if _DEFAULT_LIBRARY is not None and key == _DEFAULT_LIBRARY_KEY:
+        return _DEFAULT_LIBRARY
+    lib = None
+    if key:
+        try:
+            candidate = DirMusicLibrary(key)
+            if candidate._tracks:
+                lib = candidate
+            else:
+                print(f"[story-music] AGENT_STORY_MUSIC_DIR={key!r} yielded no valid "
+                      f"tracks (rows missing an on-disk file or a license_ref are "
+                      f"excluded); using the metadata-only stub (bed renders HOLD).")
+        except Exception as e:
+            print(f"[story-music] AGENT_STORY_MUSIC_DIR={key!r} unreadable "
+                  f"({type(e).__name__}: {e}); using the metadata-only stub "
+                  f"(bed renders HOLD, never crash).")
+    if lib is None:
+        lib = StubMusicLibrary()
+    _DEFAULT_LIBRARY, _DEFAULT_LIBRARY_KEY = lib, key
+    return lib
 
 
 # ---- the engine -------------------------------------------------------------
