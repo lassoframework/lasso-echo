@@ -234,3 +234,41 @@ def test_observe_denials_leaves_a_generated_row_alone(monkeypatch, tmp_path):
 
     assert sel.observe_denials(store=store, fetch_rows=fetch_rows)["rolled_back"] == 0
     assert store.assets["a1"]["used_count"] == 1
+
+
+def test_empty_pool_alerts_for_a_publishing_gym(monkeypatch, tmp_path):
+    """A live gym's empty photo pool is a real problem: staff still get the one
+    deduped 'ask for photos' alert."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo3.db"))
+    monkeypatch.setattr(sel, "_publishing_gym", lambda base: True)
+    fired = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda k, m: fired.append(k) or True)
+    assert sel.pick_media("pierce", store=FakeMediaStore(assets=[]), now=NOW) is None
+    assert fired == ["pool_empty:pierce"]
+
+
+def test_empty_pool_stays_quiet_while_a_gym_is_onboarding(monkeypatch, tmp_path):
+    """A gym whose publish flag is still OFF has an empty pool by definition —
+    paging staff every build buries the alerts that matter. Selection behavior is
+    unchanged (still None); only the alert is withheld."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo4.db"))
+    monkeypatch.setattr(sel, "_publishing_gym", lambda base: False)
+    fired = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda k, m: fired.append(k) or True)
+    assert sel.pick_media("newgym", store=FakeMediaStore(assets=[]), now=NOW) is None
+    assert fired == []
+
+
+def test_publishing_gym_fails_loud_when_the_registry_cannot_answer(monkeypatch):
+    """Unknown gym or a broken lookup must answer True: a live gym's empty pool is
+    never silently swallowed."""
+    monkeypatch.setattr("agent.db.gym_get", lambda *a, **k: None)
+    assert sel._publishing_gym("nobody") is True
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("agent.db.gym_get", boom)
+    assert sel._publishing_gym("pierce") is True

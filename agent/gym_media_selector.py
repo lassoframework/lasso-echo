@@ -33,6 +33,21 @@ _POOL_EMPTY_STAMP = "pool_empty:{}"          # per gym
 _USE_KEY = "gym_media_use:{}:{}"             # gym base key, post_date
 
 
+def _publishing_gym(base):
+    """True when this gym is live enough that an empty photo pool is a real problem
+    (its publish flag is ON). Unknown gyms and any lookup failure answer True so a
+    live gym's empty pool is never silently swallowed."""
+    try:
+        from . import db as _db
+        row = _db.gym_get(base) or _db.gym_get(f"{base}_ig")
+        if not row:
+            return True
+        flag = str(dict(row).get("publish_flag") or "").strip().upper()
+        return flag != "OFF"
+    except Exception:
+        return True
+
+
 def _now_utc(now=None):
     return now or datetime.now(timezone.utc)
 
@@ -109,11 +124,16 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
         candidates.append(a)
 
     if not candidates:
-        _idx.dedup_alert(
-            _POOL_EMPTY_STAMP.format(base),
-            f"media pool empty for {base} — ask for photos. No eligible, "
-            "not-hidden asset outside the 90-day reuse cooldown. The slot falls "
-            "through to the existing media logic; nothing on cooldown was reused.")
+        # "Ask for photos" is only actionable for a gym that is actually posting.
+        # A gym still onboarding (publish flag OFF, socials not connected yet) has an
+        # empty pool BY DEFINITION, and paging staff about it every build is noise
+        # that buries the alerts that matter. Fail LOUD: any doubt still alerts.
+        if _publishing_gym(base):
+            _idx.dedup_alert(
+                _POOL_EMPTY_STAMP.format(base),
+                f"media pool empty for {base} — ask for photos. No eligible, "
+                "not-hidden asset outside the 90-day reuse cooldown. The slot falls "
+                "through to the existing media logic; nothing on cooldown was reused.")
         return None
     # Pool healthy again: reset the empty stamp so a future empty pool alerts once.
     _idx.clear_alert_stamp(_POOL_EMPTY_STAMP.format(base))
