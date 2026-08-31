@@ -854,7 +854,20 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # The starvation ALERT is fired once, deduped, by _alert_thin_creative below
                 # against this (cluster-capped) media_count — so a vision gym whose distinct
                 # clusters < days is caught there without spamming every scan.
-            if media_count <= 0:
+            # DRIVE-ONLY GYM (Dean Holcomb / CrossFit Reverb, 2026-08-30): a gym can be
+            # connected to Echo entirely through Google Drive (zero content_library
+            # uploads) — the exact self-serve portal flow Dean used. Without this, the
+            # outer media_count gate below would tell such a gym "awaiting media"
+            # forever, no matter how many Drive-synced photos it has, because
+            # content_library/<base> and the media_source/media_asset Drive pool are
+            # separate pools and this gate only ever looked at the former. The
+            # GYM-DRIVE LANE inside build_client_month is already correctly gated
+            # (GYM_DRIVE_STAGE + gym_drive_connect_active_for) and already no-ops
+            # safely on an empty pool; those gates are untouched. This only decides
+            # whether THIS outer short-circuit skips calling the builder at all.
+            drive_lane_may_cover = (config.gym_drive_stage_enabled()
+                                    and config.gym_drive_connect_active_for(base))
+            if media_count <= 0 and not drive_lane_may_cover:
                 awaiting += 1
                 # NO PHOTOS AT ALL: the exact "if they don't upload" case — fill
                 # upcoming days with approved-source infographic cards (self-gated).
@@ -864,6 +877,9 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                                 "synced": sync.get("synced", 0)})
                 log(f"{base}: awaiting media (no usable photos/videos yet)")
                 continue
+            if media_count <= 0:
+                log(f"{base}: no content_library uploads but a connected Drive pool "
+                    "is active; giving the Drive lane a chance to build the month")
 
             if store is None:
                 results.append({"base": base, "status": "no_store",
@@ -919,7 +935,14 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 _cadence_applied = "1"
             cadence_changed = str(ppd) != _cadence_applied
             feed_budget = days * ppd
-            build_target = min(feed_budget, media_count)
+            # A Drive-only gym (media_count == 0, drive_lane_may_cover True — the branch
+            # above already returned/continued for every other media_count == 0 case) has
+            # no local media to cap the target against; target the full feed budget so
+            # the "already built out" check below does not read 0 existing >= 0 target as
+            # done-forever and skip calling the builder. The Drive lane itself still caps
+            # what actually gets built to its real pool size.
+            build_target = (feed_budget if media_count <= 0
+                            else min(feed_budget, media_count))
             # THIN-CREATIVE SURFACE (Ryan's own hypothesis, made definitive): when the
             # gym has FEWER usable media than the month's feed budget, the calendar is
             # necessarily short and Echo is recycling what little it has. Say so, once,

@@ -615,14 +615,29 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
 
     # MEDIA-REQUIRED GUARD: a client with no uploaded media gets no calendar. WAIT and
     # write nothing (no render, no host, no delete, no insert). Never an infographic.
+    #
+    # EXCEPT a gym connected via Google Drive ONLY (zero content_library uploads, the
+    # exact self-serve portal flow — Dean Holcomb / CrossFit Reverb, 2026-08-30, 190
+    # Drive-synced assets and 0 in content_library): the GYM-DRIVE LANE further down
+    # (GYM_DRIVE_STAGE + gym_drive_connect_active_for) is ALREADY correctly gated and
+    # already no-ops safely on an empty Drive pool, so it deserves a chance to run
+    # instead of this function returning awaiting_media forever with no path forward
+    # except a human noticing and building the month by hand. Both Drive flags stay
+    # exactly as strict as today; this only stops the LOCAL-media short-circuit from
+    # pre-empting them.
     media_count = _client_media_count(library_path)
-    if media_count <= 0:
+    drive_lane_may_cover = (config.gym_drive_stage_enabled()
+                            and config.gym_drive_connect_active_for(base_key))
+    if media_count <= 0 and not drive_lane_may_cover:
         log(f"{base_key}: waiting for client media (no photos/videos uploaded yet); "
             "nothing rendered, nothing written")
         return {"ok": False,
                 "reason": "waiting for client media (no photos/videos uploaded yet)",
                 "awaiting_media": True, "upserted": 0, "days": 0, "skipped_banned": 0,
                 "media_count": 0}
+    if media_count <= 0:
+        log(f"{base_key}: no content_library uploads but a connected Drive pool is "
+            "active; giving the Drive lane a chance to build the month")
 
     from datetime import date, timedelta
     start = start_date if isinstance(start_date, date) \

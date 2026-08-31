@@ -451,6 +451,92 @@ def test_no_media_awaits_generator_not_called():
     assert store.inserted == [] and store.deleted == []
 
 
+# ---- DRIVE-ONLY GYM (Dean Holcomb / CrossFit Reverb, 2026-08-30) -----------------
+# content_library/<base> (the direct-upload/R2 pool) and the media_source/media_asset
+# Drive pool are SEPARATE. A gym connected via Drive ONLY (no direct uploads) must
+# still build, via the already-gated GYM-DRIVE LANE, instead of sitting in
+# 'awaiting_media' forever no matter how much Drive-synced media it has.
+
+def _arm_drive_pool(monkeypatch, assets, gym="gritx"):
+    """Arm GYM_DRIVE_STAGE + GYM_DRIVE_CONNECT for `gym` and stub the Drive-lane's
+    downstream vision/caption/host calls offline, mirroring
+    tests/test_gym_media_planner_wiring.py's _arm_drive_lane."""
+    from tests.gym_media_fakes import FakeDrive, FakeMediaStore
+    store = FakeMediaStore(assets=assets)
+    drive = FakeDrive(blobs={a["id"]: b"jpgbytes" for a in assets})
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", gym)
+    monkeypatch.delenv("GYM_DRIVE_CONNECT", raising=False)
+    monkeypatch.setattr("agent.gym_media_index.default_store", lambda: store)
+    monkeypatch.setattr("agent.integrations.drive_client.DriveClient",
+                        lambda *a, **k: drive)
+    monkeypatch.setattr("agent.vision.analyze_and_store",
+                        lambda path, gym=None: {
+                            "version": 2, "quality": {"usable": True},
+                            "safety_flags": [], "one_line": "members in a class"})
+    monkeypatch.setattr("agent.vision.auto_plannable", lambda a: (True, []))
+    monkeypatch.setattr("agent.vision.crop_verify",
+                        lambda b, a, **k: {"ok": True, "bucket": "small_group",
+                                           "verified_details": []})
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: ("A grounded caption about the class", []))
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, gym: "https://cdn.fake/drive_served.jpg")
+    return store, drive
+
+
+def test_drive_only_gym_builds_from_connected_pool_not_awaiting(monkeypatch):
+    """CONFIRMS the bug: a gym with ZERO content_library uploads but a connected +
+    staged Drive pool (Dean's exact state: 190 real Drive assets, 0 direct uploads)
+    must build a real calendar from the Drive lane, not report awaiting_media."""
+    from tests.gym_media_fakes import make_asset
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    assets = [make_asset(f"d{i}", gym_id="gritx", title=f"team_{i}.jpg")
+             for i in range(5)]
+    _arm_drive_pool(monkeypatch, assets)
+    r2 = FakeR2({})            # NOTHING in the direct-upload/R2 pool
+    store = FakeStore()
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2)
+
+    assert out["ok"] is True
+    assert out["synced"] == 0                 # nothing to sync from R2
+    assert out["awaiting"] == 0, "a connected Drive pool must not read as awaiting_media"
+    assert out["generated"] == 1
+    drive_rows = [r for r in store.inserted if r.get("source_media_asset_id")]
+    assert drive_rows, "expected real content_calendar rows built from the Drive pool"
+    for row in drive_rows:
+        assert row["gym_id"] == "gritx"
+        assert row["status"] == "pending"      # still lands PENDING, no gate weakened
+
+
+def test_drive_only_gym_without_gym_drive_flags_still_awaits(monkeypatch):
+    """REGRESSION GUARD: the fix must be gated behind GYM_DRIVE_STAGE +
+    gym_drive_connect_active_for, exactly like the lane already is. A Drive pool
+    existing in the DB is not enough by itself; with the flags off a gym with no
+    local uploads still (correctly) awaits media."""
+    from tests.gym_media_fakes import make_asset
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    assets = [make_asset("d1", gym_id="gritx", title="team_0.jpg")]
+    from tests.gym_media_fakes import FakeDrive, FakeMediaStore
+    store_media = FakeMediaStore(assets=assets)
+    monkeypatch.setattr("agent.gym_media_index.default_store", lambda: store_media)
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_CONNECT", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_CONNECT_GYMS", raising=False)
+    r2 = FakeR2({})
+    store = FakeStore()
+
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2)
+
+    assert out["ok"] is True
+    assert out["awaiting"] == 1
+    assert out["generated"] == 0
+    assert store.inserted == [] and store.deleted == []
+
+
 def _existing_feed_calendar(base, month, n):
     """n instagram FEED rows (one per already-placed photo) in the given month, the
     shape real_calendar_mirror writes and _existing_feed_count reads."""

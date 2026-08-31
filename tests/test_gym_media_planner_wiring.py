@@ -175,6 +175,58 @@ def test_drive_lane_inert_when_gym_not_armed(monkeypatch, tmp_path):
     assert not [r for r in cal.inserted if r.get("source_media_asset_id")]
 
 
+# ---- Dean Holcomb / CrossFit Reverb, 2026-08-30: a DRIVE-ONLY gym (zero
+# ---- content_library uploads) must still build from its connected Drive pool -----
+def test_drive_only_gym_empty_library_still_builds(monkeypatch, tmp_path):
+    """The MEDIA-REQUIRED guard used to return awaiting_media whenever
+    content_library/<base> was empty, even when the gym is connected via Google
+    Drive with real synced photos ready — the exact self-serve portal flow. That
+    early return sat BEFORE the GYM-DRIVE LANE, so the lane (already correctly
+    gated) never got a chance to run for a Drive-only gym."""
+    _stock_sources()
+    store = FakeMediaStore(assets=[
+        make_asset("drivepicY", gym_id="gritx", kind="photo", title="class.jpg")])
+    drive = FakeDrive(blobs={"drivepicY": b"jpgbytes"})
+    _arm_drive_lane(monkeypatch, drive, store)
+
+    empty_lib = tmp_path / "empty_gritx_lib"
+    empty_lib.mkdir()          # exists but holds NO media files at all
+
+    cal = _FakeCalStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=str(empty_lib), store=cal, banned_words=())
+
+    assert out["ok"] is True, f"expected a built month, got {out}"
+    assert not out.get("awaiting_media")
+    drive_rows = [r for r in cal.inserted
+                  if r.get("source_media_asset_id") == "drivepicY"]
+    assert drive_rows, "no content_calendar row was built from the connected Drive photo"
+    for r in drive_rows:
+        assert r["status"] == "pending"
+
+
+def test_drive_only_gym_empty_library_stays_awaiting_when_drive_not_armed(
+        monkeypatch, tmp_path):
+    """REGRESSION GUARD: an empty content_library with NO connected Drive lane
+    (flags off) must still report awaiting_media, exactly as before."""
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_CONNECT", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_CONNECT_GYMS", raising=False)
+    _stock_sources()
+    empty_lib = tmp_path / "empty_gritx_lib2"
+    empty_lib.mkdir()
+
+    cal = _FakeCalStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=str(empty_lib), store=cal, banned_words=())
+
+    assert out["ok"] is False
+    assert out.get("awaiting_media") is True
+    assert cal.inserted == []
+
+
 # ---- pool empty -> no Drive rows, uploaded-media month intact ---------------------
 def test_empty_pool_adds_no_drive_rows(monkeypatch, tmp_path):
     _stock_sources()
