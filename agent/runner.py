@@ -182,8 +182,11 @@ def _autonomous_publish(draft, store, poster):
     try:
         claim_state, _pid = _db.socialapi_claim(draft.draft_id, account_key)
     except Exception as e:  # noqa: BLE001 - a claim we cannot take is a claim we do not have
-        print(f"[autonomy] {draft.draft_id} ({account_key}) HELD: claim failed "
-              f"({type(e).__name__}: {e}); never publishing blind.")
+        # SCRUBBED: exception text is never printed raw. ops_alerts.alert strips known
+        # secret env values; a bare print does not, and this fix wave's own rule is that
+        # every new diagnostic goes through the scrubbed path.
+        _oa.alert(f"autonomy: {account_key} draft {draft.draft_id} HELD, claim could "
+                  f"not be taken ({type(e).__name__}). Never publishing blind.")
         return False
     if claim_state == "done":
         return False                      # already published; never send it twice
@@ -197,9 +200,27 @@ def _autonomous_publish(draft, store, poster):
             except Exception:  # noqa: BLE001
                 pass
             return False
-        _oa.alert(f"autonomy: {account_key} draft {draft.draft_id} has an in-flight "
-                  "publish claim that cannot be verified against the post log. HELD, "
-                  "not republished. Reconcile by hand.")
+        # DEDUPED, matching _claimed_meta_publish's own hold alert. Without a stamp a
+        # draft stuck on an unresolved claim re-alerts on EVERY daily run until a human
+        # releases it, and at 100 gyms that is the alert storm that trains people to
+        # ignore the channel.
+        hold_key = f"claim_hold_alerted_{draft.draft_id}_{account_key}"
+        try:
+            already = _db.kv_get(hold_key)
+        except Exception:  # noqa: BLE001
+            already = ""
+        if not already:
+            try:
+                _db.kv_set(hold_key, "1")
+            except Exception:  # noqa: BLE001
+                pass
+            _oa.alert(
+                f"autonomy: {account_key} draft {draft.draft_id} has an IN-FLIGHT "
+                "publish claim that cannot be verified against the post log. HELD, "
+                "not re-sent (fail closed: blind re-publish is what triple-posted "
+                "LASSO IG on 2026-08-27). Check the live feed: if the post is up, "
+                "nothing to do; if not, release the claim "
+                "(db.socialapi_claim_release) and re-run.")
         return False
     try:
         result = handle_action("approve", draft, actor, account=acct)

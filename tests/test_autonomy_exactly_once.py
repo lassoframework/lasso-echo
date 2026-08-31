@@ -132,3 +132,54 @@ def test_a_verified_in_flight_claim_is_closed_out_not_resent(monkeypatch):
     monkeypatch.setattr(runner, "_verify_published_24h", lambda a, c: "M1")
     assert _run(monkeypatch, calls) is False
     assert calls == ["auto1"], "a verified post was sent again"
+
+
+def test_the_hold_alert_does_not_storm(monkeypatch):
+    """A draft stuck on an unresolved claim would otherwise re-alert on EVERY daily
+    run until a human released it. At 100 gyms that is the storm that teaches people
+    to ignore the channel."""
+    import agent.approvals as _ap
+    import agent.ops_alerts as _oa
+    alerts = []
+    monkeypatch.setattr(_oa, "alert", lambda m, **k: alerts.append(m))
+    monkeypatch.setattr(_ap, "handle_action",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("mid-publish")))
+    runner._autonomous_publish(_draft(), _Store(), _Poster())      # claim left in flight
+    monkeypatch.setattr(runner, "_verify_published_24h", lambda a, c: None)
+    for _ in range(5):                                             # five daily runs
+        runner._autonomous_publish(_draft(), _Store(), _Poster())
+    assert len(alerts) == 1, f"the hold alert stormed ({len(alerts)} alerts)"
+
+
+# ---- INTEGRATION: the real handle_action, not a stub ------------------------------
+class _CountingPublisher:
+    """A fake PUBLISHER (the only thing stubbed): everything between the autonomy lane
+    and the network is the real code path."""
+
+    def __init__(self):
+        self.calls = 0
+        from agent import meta_publisher as _mp
+        self.MediaNotReady = _mp.MediaNotReady
+
+    def publish(self, draft, account):
+        from agent.meta_publisher import PublishResult
+        self.calls += 1
+        return PublishResult(ok=True, mode="published", media_id="M1")
+
+
+def test_refired_draw_through_the_REAL_approve_path_publishes_once(monkeypatch):
+    """The other tests in this file stub approvals.handle_action, so they prove the
+    runner's claim state machine but nothing about the integration. This one drives
+    _autonomous_publish through the REAL handle_action (approver gate, per-row claim,
+    postlog, the mode-string contract) with only the publisher faked, and re-runs the
+    same deterministic draft id exactly as a refired daily draw would."""
+    import agent.approvals as _ap
+    import agent.postlog as _pl
+    pub = _CountingPublisher()
+    monkeypatch.setattr(_ap, "_publisher_for", lambda acct: pub)
+    monkeypatch.setattr(_pl, "log_post", lambda **kw: None)
+
+    assert runner._autonomous_publish(_draft(), _Store(), _Poster()) is True
+    assert pub.calls == 1
+    assert runner._autonomous_publish(_draft(), _Store(), _Poster()) is False
+    assert pub.calls == 1, "the refired draw published a second time for real"
