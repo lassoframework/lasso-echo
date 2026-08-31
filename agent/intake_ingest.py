@@ -319,12 +319,36 @@ def _land_intake_form(client, payload, r2, key, manifest):
     proposal = {k: (answers.get(k) or "").strip()
                 for k in ("gym_name", "city", "website", "ig_handle", "fb_page",
                           "google_business", "approver_name", "approver_contact")}
+    registered = False
     if any(proposal.values()):
         db.kv_set(f"account_proposal_{client}", json.dumps(
             {**proposal, "timestamp": payload.get("timestamp", "")}))
         db.audit("account_proposal", client,
-                 "intake form proposal held (gym basics + approver); apply to "
-                 "the Account record by hand", client)
+                 "intake form proposal held (gym basics + approver)", client)
+        # APPLY IT, do not just hold it. Holding meant a gym that had done everything
+        # asked of it sat in NEITHER lane until someone hand-applied the proposal, and
+        # the alert below told a human to go do that. Swift River CrossFit, 2026-08-31:
+        # 31 sources landed and auto-approved, the proposal carried its real name, IG
+        # handle and Facebook page, and it still could not draft because nobody had
+        # applied it. Everything needed is right here, so use it. The kv proposal is
+        # still written as the record of what the gym actually said.
+        # Behind AGENT_ONBOARDING_AUTOREGISTER (default OFF), the same flag that lets
+        # the readiness watch register a portal-known gym: this is that capability
+        # reached through the intake-form door, which the portal roster never sees.
+        # Registration creates an INACTIVE Account record only: no tokens, no
+        # connection, no approval, no publish. A blank gym name registers nothing,
+        # because a fabricated name becomes the account label.
+        if config.onboarding_autoregister_enabled() and proposal.get("gym_name"):
+            try:
+                from . import accounts as _accounts
+                registered = bool(_accounts.register_gym(
+                    client, name=proposal["gym_name"],
+                    ig_handle=proposal.get("ig_handle", ""),
+                    fb_page=proposal.get("fb_page", "")))
+            except Exception as exc:  # noqa: BLE001 - never fail the intake landing
+                ops_alerts.alert(
+                    f"{client}: intake landed but auto-register failed "
+                    f"({type(exc).__name__}). It is in neither lane until registered.")
 
     # WRITE THE BRAND BIBLE. This is the lane a healthy intake takes, and it used to only
     # archive the payload "for the bible draft" while nothing ever drafted it: the one
@@ -369,10 +393,22 @@ def _land_intake_form(client, payload, r2, key, manifest):
                  content_type="application/json")
     r2.delete(key)
     manifest["processed"].append(key)
+    # TELL THE TRUTH. This line said "pending source(s) to review (approve before they
+    # can draft)" no matter what actually happened, so with AGENT_INTAKE_AUTO_APPROVE
+    # armed it reported 31 ALREADY-APPROVED sources as needing review and sent a human
+    # to do work that was already done. An alert that is wrong in the safe direction
+    # still costs exactly as much attention as a real one.
+    landed = client_sources.intake_status()
+    if landed == "approved":
+        state = f"{len(created)} source(s) approved and ready to draft from"
+    else:
+        state = f"{len(created)} pending source(s) to review before they can draft"
     ops_alerts.alert(
-        f"intake form received for {client}: {len(created)} pending source(s) "
-        "to review (approve before they can draft), account proposal held. Run "
-        f"`python -m agent preflight --account {client}` when applied.")
+        f"intake form received for {client}: {state}; "
+        + ("the gym is registered and in the build lane. "
+           if registered else "account proposal held. ")
+        + f"Run `python -m agent preflight --account {client}` to see what it still "
+          "needs.")
     return len(created)
 
 

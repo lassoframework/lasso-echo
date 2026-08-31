@@ -439,3 +439,90 @@ def test_texted_link_lane_gets_no_bible_and_no_false_alarm(monkeypatch, tmp_path
         "the texted-link lane must not cry wolf on every submission"
     bible = os.path.join(config.client_voice_dir(), "gym_alpha", "lasso_voice.md")
     assert not os.path.exists(bible), "must not write a hollow, unclobberable bible"
+
+
+# ---- intake must land APPROVED and REGISTERED, never "go do it by hand" -------------
+def _intake_payload(client="swiftgym_ig"):
+    return {"kind": "intake_form", "client": client, "timestamp": "20260831T175805Z",
+            "answers": {"gym_name": "Swift River CrossFit", "city": "Conway, NH",
+                        "website": "https://swiftrivercrossfit.com/",
+                        "ig_handle": "swiftrivercrossfit",
+                        "fb_page": "https://www.facebook.com/SwiftRiverCF",
+                        "approver_name": "Jess Pashos",
+                        "services": "Group classes\nPersonal training",
+                        "approver_contact": "jess@swiftrivercrossfit.com"}}
+
+
+def test_intake_alert_never_calls_approved_sources_pending(monkeypatch, tmp_path):
+    """LIVE, 2026-08-31: Swift River CrossFit's 31 sources landed and were APPROVED by
+    AGENT_INTAKE_AUTO_APPROVE, and the alert still said '31 pending source(s) to review
+    (approve before they can draft)'. It sent a human to do work already done. An alert
+    that is wrong in the safe direction costs exactly as much attention as a real one."""
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_INTAKE_AUTO_APPROVE", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.chdir(tmp_path)
+    from agent import intake_ingest as ii
+    alerts = []
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: alerts.append(m))
+    ii._land_intake_form("swiftgym_ig", _intake_payload(), FakeR2(),
+                         "intake/swiftgym_ig/incoming/x_intake.json", {"processed": []})
+    joined = " ".join(alerts)
+    assert "pending source" not in joined, f"reported approved sources as pending: {joined}"
+    assert "approved and ready to draft" in joined
+
+
+def test_intake_registers_the_gym_instead_of_holding_it(monkeypatch, tmp_path):
+    """Holding the proposal meant a gym that had done everything asked of it sat in
+    NEITHER lane until a human applied it by hand. Everything needed is in the
+    proposal, so it is applied."""
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.chdir(tmp_path)
+    from agent import intake_ingest as ii, accounts
+    accounts._dynamic_cache = None
+    alerts = []
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: alerts.append(m))
+    ii._land_intake_form("swiftgym_ig", _intake_payload(), FakeR2(),
+                         "intake/swiftgym_ig/incoming/x_intake.json", {"processed": []})
+    assert accounts.get_account("swiftgym_ig_ig") is not None, "the gym was left unregistered"
+    assert any("registered and in the build lane" in m for m in alerts)
+    accounts._dynamic_cache = None
+
+
+def test_intake_registration_stays_off_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.delenv("AGENT_ONBOARDING_AUTOREGISTER", raising=False)
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.chdir(tmp_path)
+    from agent import intake_ingest as ii, accounts
+    accounts._dynamic_cache = None
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
+    ii._land_intake_form("swiftgym_ig", _intake_payload(), FakeR2(),
+                         "intake/swiftgym_ig/incoming/x_intake.json", {"processed": []})
+    assert accounts.get_account("swiftgym_ig_ig") is None
+    accounts._dynamic_cache = None
+
+
+def test_intake_never_registers_without_a_real_gym_name(monkeypatch, tmp_path):
+    """A fabricated name becomes the account label and the Zernio profile name."""
+    monkeypatch.setenv("AGENT_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.chdir(tmp_path)
+    from agent import intake_ingest as ii, accounts
+    accounts._dynamic_cache = None
+    monkeypatch.setattr(ii.ops_alerts, "alert", lambda m, *a, **k: None)
+    payload = _intake_payload()
+    payload["answers"]["gym_name"] = "   "
+    ii._land_intake_form("swiftgym_ig", payload, FakeR2(),
+                         "intake/swiftgym_ig/incoming/x_intake.json", {"processed": []})
+    assert accounts.get_account("swiftgym_ig_ig") is None
+    accounts._dynamic_cache = None
