@@ -85,15 +85,34 @@ def _owner_date(by_date):
     return sorted(by_date)[0]
 
 
+def _cluster_key(lib, key):
+    """The near-dupe identity of a library file: dam.rotation_key when the gym
+    is vision-clustered, else the case-folded stem (catches IMG_6771.JPG vs
+    IMG_6771.jpg — the same photo uploaded twice)."""
+    try:
+        from agent import dam
+        rk = dam.rotation_key(os.path.join(lib, key))
+        if rk and rk != key:
+            return rk
+    except Exception:  # noqa: BLE001
+        pass
+    return os.path.splitext(key)[0].lower()
+
+
 def _fresh_photo(lib, state, exclude):
     """A genuinely unused, VALIDATED library image (never on any book/window
-    date, never in exclude), deterministic. (None, None) when nothing unused."""
+    date, never in exclude, never a NEAR-DUPE of one), deterministic.
+    (None, None) when nothing unused."""
     used = set(state.keys()) | set(exclude)
-    for key in sorted(media_guard.library_keys(lib)):
+    lib_names = media_guard.library_keys(lib)
+    used_clusters = {_cluster_key(lib, k) for k in used if k in lib_names}
+    for key in sorted(lib_names):
         if key in used:
             continue
         if os.path.splitext(key)[1].lower() not in _IMG_EXTS:
             continue                       # image swaps only; videos need their lanes
+        if _cluster_key(lib, key) in used_clusters:
+            continue                       # a near-dupe of a used photo repeats visually
         path = os.path.join(lib, key)
         if os.path.isfile(path) and _is_real_image(path):
             return key, path
