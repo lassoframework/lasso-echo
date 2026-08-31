@@ -1969,6 +1969,36 @@ def deny_backfill_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_DENY_BACKFILL", "false"))
 
 
+def media_cross_day_guard_enabled() -> bool:
+    """
+    CROSS-DAY MEDIA GUARD (AGENT_MEDIA_CROSS_DAY_GUARD). DEFAULT ON (Blake,
+    2026-08-31, after a client saw the same photo across different weeks): one
+    photo must never sit on MULTIPLE DIFFERENT DAYS of a gym's forward book
+    (pending/approved/publishing/coach_review rows on IG/FB), and must not repeat
+    against anything PUBLISHED within the trailing repeat window
+    (media_repeat_window_days). Same-DATE siblings — the FB mirror of a feed and
+    its paired story — are ONE post and legitimately share the photo: never blocked.
+    GBP keeps its own deliberate §3 reuse windows (rotation.reuse_blocked) and is
+    out of this guard's scope. Enforced by agent/media_guard.py at every path that
+    assigns a photo to a calendar row (month build, denied-slot backfill, expired
+    auto-redate). OFF restores the pre-guard behavior (emergency only).
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_CROSS_DAY_GUARD", "true"))
+
+
+def media_repeat_window_days() -> int:
+    """Trailing PUBLISHED repeat window for the cross-day media guard
+    (AGENT_MEDIA_REPEAT_WINDOW_DAYS, default 30, clamped 0..120): a photo on a row
+    PUBLISHED within this many days of a target day is not planned again for that
+    day. 0 disables only the published-trailing check (the hard forward-book rule
+    stays)."""
+    try:
+        val = int(os.environ.get("AGENT_MEDIA_REPEAT_WINDOW_DAYS", "30"))
+    except (TypeError, ValueError):
+        val = 30
+    return max(0, min(120, val))
+
+
 def client_scan_dynamic_enabled() -> bool:
     """
     DYNAMIC-GYM DISCOVERY switch (AGENT_CLIENT_SCAN_DYNAMIC). OFF by default. When ON,

@@ -1319,16 +1319,30 @@ def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
     out (held/failed repeatedly) or was never approved — an APPROVED second expiry gets
     one more chance forward (the gym said yes; we never drop it silently), while an
     UNAPPROVED second expiry is retired ('killed' + reject_reason) so the book stays
-    clean. Returns (moved, retired) lists of {id, new_date} dicts."""
-    from datetime import date as _date
+    clean. Returns (moved, retired) lists of {id, new_date} dicts.
+
+    SIBLINGS MOVE TOGETHER (cross-day media guard, Blake 2026-08-31): a feed, its FB
+    mirror and its paired story share ONE photo and ONE date by design. The old
+    per-row walk re-dated each independently — the feed to the first open feed day,
+    the mirror to a DIFFERENT open facebook day, the story to yet another — which put
+    the same photo on multiple different days (the exact repeat a client spotted).
+    Expired rows are now grouped by (original post_date, photo) and the whole group
+    lands on ONE new date where every member's (account, format) slot is open.
+
+    MEDIA-AWARE: when the group's photo ALREADY sits on another active future day
+    (a rebuild or backfill re-picked it after these rows expired), moving the group
+    would plant a duplicate — UNAPPROVED members are retired as redundant instead;
+    APPROVED members still move (the gym's word is never dropped silently, logged)."""
     list_month = getattr(store, "list_month", None)
     patch = getattr(store, "patch_post_date", None)
     if list_month is None or patch is None:
         return [], []
+    from . import media_guard
     today = now_dt.date()
     horizon = [today + timedelta(days=i) for i in range(1, REDATE_HORIZON_DAYS + 1)]
     months = sorted({d.isoformat()[:7] for d in horizon})
     occupied = set()
+    media_days = {}      # photo key -> future dates it already occupies (active rows)
     for month in months:
         for r in (list_month(gym, month) or []):
             if str(r.get("status") or "").lower() in ("denied", "killed", "deleted"):
@@ -1336,52 +1350,96 @@ def _auto_redate_expired(gym, gym_rows, store, kv, now_dt):
             occupied.add((str(r.get("account") or "").lower(),
                           str(r.get("format") or "feed").lower(),
                           str(r.get("post_date") or "")[:10]))
+            mk = media_guard.media_key(r.get("image_url"))
+            if mk:
+                media_days.setdefault(mk, set()).add(
+                    str(r.get("post_date") or "")[:10])
+
     moved, retired = [], []
-    for row in sorted(gym_rows, key=lambda r: str(r.get("post_date") or "")):
+
+    def _retire(rid):
+        try:
+            if store.set_status(gym, rid, "killed") is not None:
+                retired.append({"id": rid, "new_date": ""})
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Group same-date siblings sharing one photo; an imageless row is its own group.
+    groups = {}
+    for row in gym_rows:
+        pd = str(row.get("post_date") or "")[:10]
+        mk = media_guard.media_key(row.get("image_url"))
+        gkey = (pd, mk) if mk else (pd, f"row:{row.get('id')}")
+        groups.setdefault(gkey, []).append(row)
+
+    for (pd, gmk), members in sorted(groups.items(),
+                                     key=lambda kv_: (kv_[0][0], str(kv_[0][1]))):
         if len(moved) >= REDATE_MAX_PER_GYM:
             break
-        rid = row.get("id")
-        status = str(row.get("status") or "").lower()
-        already = ""
-        try:
-            already = kv.get(f"redated_{rid}", "")
-        except Exception:  # noqa: BLE001
-            pass
-        if already and status != "approved":
-            # second expiry, never approved: retire it so the book clears itself.
+        movers = []
+        for row in sorted(members, key=lambda r: str(r.get("id") or "")):
+            rid = row.get("id")
+            status = str(row.get("status") or "").lower()
+            already = ""
             try:
-                if store.set_status(gym, rid, "killed") is not None:
-                    retired.append({"id": rid, "new_date": ""})
+                already = kv.get(f"redated_{rid}", "")
             except Exception:  # noqa: BLE001
                 pass
+            if already and status != "approved":
+                # second expiry, never approved: retire it so the book clears itself.
+                _retire(rid)
+                continue
+            movers.append(row)
+        if not movers:
             continue
-        acct = str(row.get("account") or "").lower()
-        fmt = str(row.get("format") or "feed").lower()
+        photo_key = gmk if not str(gmk).startswith("row:") else ""
+        if photo_key and media_guard.enabled() and media_days.get(photo_key):
+            # The photo already lives on an active future day: moving this group
+            # would plant a cross-day duplicate. Retire the unapproved members as
+            # redundant; approved members keep moving (approval is sacred), logged.
+            still = []
+            for row in movers:
+                if str(row.get("status") or "").lower() == "approved":
+                    still.append(row)
+                else:
+                    _retire(row.get("id"))
+            movers = still
+            if not movers:
+                continue
+            print(f"[calendar-autopublish] {gym}: re-dating APPROVED row(s) whose "
+                  f"photo already sits on {sorted(media_days[photo_key])} "
+                  "(approval preserved; photo will repeat)")
+        slots = [(str(r.get("account") or "").lower(),
+                  str(r.get("format") or "feed").lower()) for r in movers]
         slot_day = next((d for d in horizon
-                         if (acct, fmt, d.isoformat()) not in occupied), None)
+                         if all((a, f, d.isoformat()) not in occupied
+                                for a, f in slots)), None)
         if slot_day is None:
             # BOOK FULL: every day in the plan horizon already carries content for
-            # this (account, format) — the expired row is REDUNDANT by definition
-            # (nothing upcoming lacks a post), so keeping it can only rot. Retire it
-            # (killed + reason) instead of bouncing it to a human digest forever;
-            # the info alert names the count so nothing disappears silently.
+            # these (account, format) slots — the expired group is REDUNDANT by
+            # definition (nothing upcoming lacks a post), so keeping it can only rot.
+            # Retire it (killed + reason) instead of bouncing it to a human digest
+            # forever; the info alert names the count so nothing disappears silently.
+            for row in movers:
+                _retire(row.get("id"))
+            continue
+        for row in movers:
+            rid = row.get("id")
+            acct = str(row.get("account") or "").lower()
+            fmt = str(row.get("format") or "feed").lower()
             try:
-                if store.set_status(gym, rid, "killed") is not None:
-                    retired.append({"id": rid, "new_date": ""})
+                if patch(rid, slot_day.isoformat()) is None:
+                    continue                      # raced (claimed/published): skip
+            except Exception:  # noqa: BLE001
+                continue
+            occupied.add((acct, fmt, slot_day.isoformat()))
+            moved.append({"id": rid, "new_date": slot_day.isoformat()})
+            try:
+                kv.set(f"redated_{rid}", "1")
             except Exception:  # noqa: BLE001
                 pass
-            continue
-        try:
-            if patch(rid, slot_day.isoformat()) is None:
-                continue                          # raced (claimed/published): skip
-        except Exception:  # noqa: BLE001
-            continue
-        occupied.add((acct, fmt, slot_day.isoformat()))
-        moved.append({"id": rid, "new_date": slot_day.isoformat()})
-        try:
-            kv.set(f"redated_{rid}", "1")
-        except Exception:  # noqa: BLE001
-            pass
+        if photo_key:
+            media_days.setdefault(photo_key, set()).add(slot_day.isoformat())
     return moved, retired
 
 

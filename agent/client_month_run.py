@@ -155,6 +155,19 @@ def _locked_calendar_state(base_key, start, days, store, log):
                 if key:
                     used.add(key)
     locked_days.discard("")
+    # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31: a client saw the same photo across
+    # different weeks): also exclude every photo that will SURVIVE this rebuild on
+    # the gym's book — published within the trailing repeat window (the span-months
+    # read above missed last month's publishes), coach_review rows (NOT wipeable, so
+    # they survive the delete), and wipeable rows OUTSIDE the span months. Wipeable
+    # rows INSIDE the span are about to be replaced, so their photos stay free —
+    # excluding them would starve the very rebuild that releases them. Read failure
+    # degrades open (the rotation window stays the backstop).
+    try:
+        from . import media_guard
+        used |= media_guard.surviving_keys(base_key, store, start, days, log=log)
+    except Exception as exc:  # noqa: BLE001 - the guard must never sink a build
+        log(f"cross-day media guard read skipped ({type(exc).__name__})")
     return locked_days, used
 
 
@@ -657,7 +670,16 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # approved row (one distinct creative per feed, no reuse). A 2-photo gym gets
     # 2 feeds, never 30. At 2x each day consumes two photos, so a thin library
     # covers half the days — never padded, never reused.
-    max_feed_days = min(days * slots_per_day, max(0, media_count - len(used_keys)))
+    # Only used keys that are ACTUAL library files reduce the cap: the cross-day
+    # media guard also collects non-library media (Drive assets, infographic cards)
+    # whose keys rightly block a re-pick but consume none of this library's photos.
+    try:
+        from . import media_guard as _mg
+        _lib_names = _mg.library_keys(library_path)
+        _used_in_lib = len(used_keys & _lib_names) if _lib_names else len(used_keys)
+    except Exception:  # noqa: BLE001 - fall back to the raw count, never block
+        _used_in_lib = len(used_keys)
+    max_feed_days = min(days * slots_per_day, max(0, media_count - _used_in_lib))
 
     drafts = []
     skipped_banned = 0
@@ -1338,6 +1360,18 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
         return {"ok": True, "backfilled": 0, "days_needing": 0, "skipped": 0}
 
     banned_words = tuple(banned_words or ())
+    # CROSS-DAY MEDIA GUARD (Blake, 2026-08-31): a replacement may REUSE a photo —
+    # that is this lane's whole point — but never one already sitting on ANOTHER
+    # day of the gym's forward book (pending rows included; the old exclude list
+    # only knew approved/published/publishing) or published within the trailing
+    # repeat window. Read once per run; a read failure degrades open.
+    from . import media_guard
+    guard_state = {}
+    if media_guard.enabled():
+        try:
+            guard_state = media_guard.book_state(base_key, store, start, days, log=log)
+        except Exception as exc:  # noqa: BLE001 - the guard never sinks a backfill
+            log(f"{base_key}: cross-day media guard read skipped ({type(exc).__name__})")
     drafts = []
     skipped = 0
     for day_key in todo:
@@ -1347,15 +1381,39 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
         own = denied_photo_by_day.get(day_key)
         if own:
             exclude.add(own)
+        blocked = (media_guard.blocked_keys(guard_state, day_key)
+                   if guard_state else set())
         feed, drop = _clean_draft_for_day(
             account, day_key, voice, library_path, banned_words, log,
-            exclude_keys=exclude, allow_reuse=True)
+            exclude_keys=exclude | blocked, allow_reuse=True)
+        if (feed is None or not _has_real_creative(feed)) and blocked:
+            # SMALL LIBRARY: every reusable photo already sits on another day of the
+            # book. Do not leave the denied slot empty — fall back to the photo whose
+            # other appearances are FARTHEST from this day (maximum spacing) and say
+            # so once (kv-deduped digest). Never fabricated, still every A+ gate.
+            choice = media_guard.spaced_choice(library_path, guard_state, day_key,
+                                               hard_exclude=exclude)
+            if choice:
+                media_guard.alert_small_library(base_key, day_key, log)
+                force_only = media_guard.library_keys(library_path) - {choice}
+                feed, drop = _clean_draft_for_day(
+                    account, day_key, voice, library_path, banned_words, log,
+                    exclude_keys=exclude | force_only, allow_reuse=True)
+                if feed is not None:
+                    log(f"{base_key} {day_key}: small library — reusing {choice} "
+                        "with maximum spacing (no unused photo remained)")
         if feed is None or not _has_real_creative(feed):
             skipped += 1
             log(f"{base_key} {day_key}: no A+ replacement could be built "
                 f"({drop or 'no usable creative'})")
             continue
         _record_feed_served(account, feed, day_key)   # KEPT: record only accepted backfills
+        # This run's placement joins the guard state so the NEXT denied day in the
+        # same pass cannot pick the same photo (the store read happened before any
+        # insert).
+        media_guard.note_placed(
+            guard_state, _url_basename(getattr(feed, "creative_public_url", ""))
+            or os.path.basename(getattr(feed, "creative_path", "") or ""), day_key)
         drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
                                               day_key=day_key))
 
