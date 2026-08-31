@@ -87,9 +87,13 @@ def test_merge_never_displaces_approved_doctrine():
 def test_overlap_second_arc_thins_under_ceiling():
     ev = _event()
     arc = _arc_rows(ev)
-    # A first overlapping event already put many OFFER posts on the same 30-day span,
-    # already at/over the 25% ceiling. The second arc must thin, not flood.
-    existing = [_offer_row(f"2026-09-{d:02d}", status="pending") for d in range(1, 11)]
+    # A first GENUINELY OVERLAPPING event already put many OFFER posts on the SAME DAYS
+    # this arc wants, already at/over the 25% ceiling. The second arc must thin, not
+    # flood. (Built from the arc's own dates: since 2026-08-30 overlap_thin only counts
+    # prior offer rows that actually INTERSECT the new arc's window, because counting
+    # every offer row in the month bucket thinned two events that never ran together.)
+    _arc_days = sorted({str(r["post_date"])[:10] for r in arc})
+    existing = [_offer_row(d, status="pending") for d in _arc_days]
     kept = ec.overlap_thin(existing, arc)
     assert len(kept) < len(arc)
     # keeps the spine (announce/final/recap present when heavily thinned).
@@ -313,3 +317,36 @@ def test_attach_media_holds_when_hosting_fails():
                                   picker=lambda exclude: {"id": "a1", "title": "x.jpg"},
                                   host=lambda *a: "")
     assert kept == [] and len(held) == 1
+
+
+# ---- overlap_thin must only fire on events that ACTUALLY overlap -----------------
+def _arc_offer_row(date, event_id, pillar=None):
+    from agent import gym_event as ge
+    return {"post_date": date, "account": "instagram", "format": "feed",
+            "pillar": pillar or ge.ARC_CATEGORY, "event_id": event_id,
+            "status": "pending"}
+
+
+def test_a_non_overlapping_prior_event_never_thins_the_new_arc():
+    """LIVE (Pete/Zanshin 2026-08-30): Back to School (Sep 1 to 15) was cut from 10 arc
+    posts to 4 because Bring a Friend Week (Oct 3 to 10) had rows in the same MONTH
+    read. The two runs never coincide. He saw 'three posts this week then nothing until
+    the last day' — 6 DURING posts silently dropped."""
+    from agent import event_calendar as ec
+    # the prior event's rows sit AFTER the new arc's whole span
+    existing = [_arc_offer_row("2026-09-26", "evt_bring_a_friend"),
+                _arc_offer_row("2026-09-29", "evt_bring_a_friend")]
+    arc = [_arc_offer_row(f"2026-09-{d:02d}", "evt_back_to_school")
+           for d in (1, 2, 4, 6, 8, 10, 12, 14, 15)]
+    kept = ec.overlap_thin(existing, arc)
+    assert len(kept) == len(arc), (
+        f"a non-overlapping event thinned the arc: {len(kept)} of {len(arc)} kept")
+
+
+def test_a_genuinely_overlapping_event_still_thins():
+    """The ceiling must still protect the calendar when two events DO run together."""
+    from agent import event_calendar as ec
+    existing = [_arc_offer_row(f"2026-09-{d:02d}", "evt_other") for d in range(1, 13)]
+    arc = [_arc_offer_row(f"2026-09-{d:02d}", "evt_new") for d in range(1, 13)]
+    kept = ec.overlap_thin(existing, arc)
+    assert len(kept) < len(arc), "a truly overlapping event was not thinned"

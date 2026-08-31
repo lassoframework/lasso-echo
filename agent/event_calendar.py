@@ -83,12 +83,23 @@ def overlap_thin(existing_rows, arc_rows, *, category_ceiling_fraction=0.25):
     first arc or any approved row."""
     if not arc_rows:
         return []
-    # PRIOR overlapping-event offer posts already on the calendar. A first event's arc
+    # PRIOR OVERLAPPING-event offer posts already on the calendar. A first event's arc
     # rows carry an event_id DIFFERENT from the new arc's; a plain live offer counts too.
+    #
+    # "OVERLAPPING" MEANS THE DATES ACTUALLY INTERSECT. This used to count ANY offer row
+    # the shared monthly list_month read returned, so two events that never run at the
+    # same time still thinned each other: Pete/Zanshin's Back to School (Sep 1 to 15) was
+    # cut from 10 arc posts to 4 because Bring a Friend Week (Oct 3 to 10) happened to
+    # have rows in the same month bucket. He saw "three posts this week then nothing
+    # until the last day" — 6 DURING posts silently dropped. The ceiling still applies in
+    # full when two events genuinely overlap; it just no longer fires when they do not.
     new_event_ids = {r.get("event_id") for r in arc_rows if r.get("event_id")}
+    arc_dates = {str(r.get("post_date"))[:10] for r in arc_rows if r.get("post_date")}
+    first_day, last_day = (min(arc_dates), max(arc_dates)) if arc_dates else ("", "")
     prior_offer = [r for r in existing_rows
                    if _cat(r) == ge.ARC_CATEGORY
-                   and r.get("event_id") not in new_event_ids]
+                   and r.get("event_id") not in new_event_ids
+                   and first_day <= str(r.get("post_date") or "")[:10] <= last_day]
     if not prior_offer:
         # No overlapping prior event: the arc's own concentration is by design, keep it.
         return list(arc_rows)
