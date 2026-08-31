@@ -226,3 +226,91 @@ def test_thumbnail_fallback_labels_with_asset_mime():
                                               drive=drive)
     assert status == 200 and ctype == "image/png" and data
     assert "a1" in drive.downloads                   # fell back to the original stream
+
+
+# ---- stale fingerprint resolution (CrossFit Reverb class, live 2026-08-31) ---
+def test_name_slug_of_extracts_fingerprinted_shape():
+    assert gm._name_slug_of("crossfitreverb6cdf33") == "crossfitreverb"
+    assert gm._name_slug_of("crossfitreverb30b5b2") == "crossfitreverb"
+
+
+def test_name_slug_of_rejects_bare_keys():
+    # No 6-hex tail: never treated as fingerprinted, never guessed at.
+    assert gm._name_slug_of("pierce") == ""
+    assert gm._name_slug_of("piercefitness") == ""
+    assert gm._name_slug_of("theboltonclub") == ""
+    assert gm._name_slug_of("") == ""
+    assert gm._name_slug_of(None) == ""
+
+
+def test_resolve_stale_fingerprint_remaps_to_the_one_registered_match():
+    bases = ["crossfitreverb30b5b2", "piercefitness", "eng"]
+    resolved = gm._resolve_stale_fingerprint(
+        "crossfitreverb6cdf33", bases_fn=lambda: bases)
+    assert resolved == "crossfitreverb30b5b2"
+
+
+def test_resolve_stale_fingerprint_alerts_once(monkeypatch):
+    fired = []
+    monkeypatch.setattr("agent.gym_media_index.dedup_alert",
+                        lambda k, m: fired.append((k, m)) or True)
+    bases = ["crossfitreverb30b5b2"]
+    gm._resolve_stale_fingerprint("crossfitreverb6cdf33", bases_fn=lambda: bases)
+    assert fired
+    assert "crossfitreverb6cdf33" in fired[0][1]
+    assert "crossfitreverb30b5b2" in fired[0][1]
+
+
+def test_resolve_stale_fingerprint_already_registered_is_untouched():
+    bases = ["crossfitreverb30b5b2"]
+    resolved = gm._resolve_stale_fingerprint(
+        "crossfitreverb30b5b2", bases_fn=lambda: bases)
+    assert resolved == "crossfitreverb30b5b2"
+
+
+def test_resolve_stale_fingerprint_never_guesses_on_ambiguity():
+    # Two registered gyms happen to share a name-slug (only the fingerprint tells
+    # them apart) -- refuse to guess, leave the stray key exactly as it arrived.
+    bases = ["crossfitreverb30b5b2", "crossfitreverbaaaaaa"]
+    resolved = gm._resolve_stale_fingerprint(
+        "crossfitreverb6cdf33", bases_fn=lambda: bases)
+    assert resolved == "crossfitreverb6cdf33"
+
+
+def test_resolve_stale_fingerprint_no_match_is_untouched():
+    bases = ["piercefitness", "eng"]
+    resolved = gm._resolve_stale_fingerprint(
+        "crossfitreverb6cdf33", bases_fn=lambda: bases)
+    assert resolved == "crossfitreverb6cdf33"
+
+
+def test_resolve_stale_fingerprint_bare_key_never_matched():
+    # A key with no 6-hex tail is never treated as a stale fingerprint, even if some
+    # registered base happens to share letters with it.
+    bases = ["pierce2222bb"]
+    resolved = gm._resolve_stale_fingerprint("pierce", bases_fn=lambda: bases)
+    assert resolved == "pierce"
+
+
+def test_resolve_stale_fingerprint_registry_failure_degrades_safely():
+    def _boom():
+        raise RuntimeError("registry unavailable")
+    resolved = gm._resolve_stale_fingerprint("crossfitreverb6cdf33", bases_fn=_boom)
+    assert resolved == "crossfitreverb6cdf33"
+
+
+def test_bind_remaps_stale_key_and_writes_under_the_live_gym(monkeypatch):
+    """The exact CrossFit Reverb scenario: a bind request arrives on a stale
+    fingerprint; the row is written under the CURRENT registered key instead."""
+    monkeypatch.setattr(
+        "agent.calendar_autopublish.client_gym_bases",
+        lambda: ["crossfitreverb30b5b2"])
+    store = FakeMediaStore()
+    drive = FakeDrive(meta={"name": "Reverb LASSO Content",
+                            "owner_email": "deanholcomb6@gmail.com",
+                            "case": "my_drive"})
+    status, body = gm.handle_bind_source(
+        "crossfitreverb6cdf33", f".../folders/{FID}", drive=drive, store=store)
+    assert status == 200 and body["ok"] is True
+    src = list(store.sources.values())[0]
+    assert src["gym_id"] == "crossfitreverb30b5b2"

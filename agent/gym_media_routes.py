@@ -23,15 +23,85 @@ RAILS (spec §1.5) enforced here:
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 
 from . import config, gym_media_index as _idx
 from . import gym_media_selector as _sel
 
+# <name-slug><6-hex-fingerprint> shape, matching account_key.py's canonical_account_key
+# output. Used only to detect a STALE fingerprint (see _resolve_stale_fingerprint) --
+# never to derive or mint a key.
+_FINGERPRINT_RE = re.compile(r"^([a-z0-9]+)([0-9a-f]{6})$")
+
+
+def _name_slug_of(key):
+    """The bare name-slug portion of a <slug><6-hex-fingerprint> shaped account key
+    ('crossfitreverb6cdf33' -> 'crossfitreverb'), or '' when the key does not look
+    fingerprinted (too short, or its tail is not 6 hex chars) -- such keys are left
+    alone, never guessed at."""
+    m = _FINGERPRINT_RE.match((key or "").strip().lower())
+    return m.group(1) if m else ""
+
+
+def _resolve_stale_fingerprint(gym, *, bases_fn=None):
+    """Resolve a STALE account-key fingerprint onto the currently-registered gym it
+    belongs to, or return `gym` unchanged.
+
+    WHY (live 2026-08-31, CrossFit Reverb): a signed portal connect-link self-decodes
+    its OWN account_key from its HMAC payload -- by design, re-canonicalizing a gym's
+    key (account_key_mint.py) never invalidates an already-issued link, so the link
+    keeps validating under whatever key it was ORIGINALLY minted with ("WHY THIS
+    CANNOT BREAK EXISTING LINKS" in that module). Dean Holcomb used a connect link
+    still carrying 'crossfitreverb6cdf33' to bind his Google Drive folder 12 minutes
+    after a fresh mint moved Reverb onto 'crossfitreverb30b5b2'; Echo wrote his
+    media_source row (and 190 media_asset rows behind it) under the stale key, which
+    nothing else in the system reads (client_sources, the account registry, and the
+    Zernio profile all live under the new key) -- his photos were indexed and
+    invisible.
+
+    If `gym` is not itself a currently REGISTERED gym base, but its name-slug (the
+    part before the trailing 6-hex fingerprint) matches the name-slug of EXACTLY ONE
+    registered base, that registered base is returned instead. Zero or more-than-one
+    matches leave `gym` untouched -- never guess across an ambiguity: two different
+    gyms can legitimately share a name-slug (the fingerprint is what tells them
+    apart), and a brand-new gym that has not registered yet is legitimately absent,
+    not a stale fingerprint. A key with no 6-hex tail (a bare slug like 'pierce', or
+    an ad-hoc key with no fingerprint) never matches the shape and is always returned
+    unchanged. Never writes anything itself -- purely a read-time/write-time key
+    resolution, one throttled ops alert per stale key so the real fix (re-issue the
+    gym's portal link) does not go unnoticed."""
+    if bases_fn is None:
+        def bases_fn():
+            from .calendar_autopublish import client_gym_bases
+            return client_gym_bases()
+    try:
+        bases = set(bases_fn())
+    except Exception:  # noqa: BLE001 - a registry read failure just skips the remap
+        return gym
+    if not bases or gym in bases:
+        return gym
+    slug = _name_slug_of(gym)
+    if not slug:
+        return gym
+    matches = {b for b in bases if _name_slug_of(b) == slug}
+    if len(matches) != 1:
+        return gym
+    remapped = next(iter(matches))
+    _idx.dedup_alert(
+        f"stale_key_remap:{gym}",
+        f"Connect Google Drive: a request carried account key {gym!r}, which is not "
+        f"a currently registered gym but looks like a STALE fingerprint of "
+        f"{remapped!r} (a portal link minted before a re-key). Resolved to "
+        f"{remapped!r} for this request so it is not silently invisible. Re-issue "
+        f"{gym!r}'s portal link so this stops being needed: python -m agent "
+        f"intake-link --account {remapped}")
+    return remapped
+
 
 def _base(account_key):
-    return _sel.base_gym_key(account_key)
+    return _resolve_stale_fingerprint(_sel.base_gym_key(account_key))
 
 
 def _armed(account_key):

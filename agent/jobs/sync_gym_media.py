@@ -409,12 +409,34 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
 
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
     try:
-        sources = [s for s in store.list_sources()
-                   if s.get("kind", "gym_drive") == "gym_drive"
-                   and config.gym_drive_connect_active_for(s.get("gym_id"))]
+        raw_sources = [s for s in store.list_sources()
+                       if s.get("kind", "gym_drive") == "gym_drive"]
     except Exception as e:  # noqa: BLE001
         log(f"could not list sources: {type(e).__name__}: {e}")
         return {"ok": False, "reason": f"source list failed: {type(e).__name__}"}
+
+    # DEFENSIVE READ-SIDE RESOLUTION (the CrossFit Reverb class, live 2026-08-31): a
+    # source can land with a STALE account-key fingerprint (a portal connect-link
+    # self-decodes its OWN key from its signed payload, so it keeps working under
+    # whatever key it was minted with even after the gym is later re-canonicalized).
+    # A stray source's gym_id is remapped to the currently-registered gym IN MEMORY
+    # ONLY for this sync pass -- the media_source row itself is never rewritten here
+    # (that is a by-hand fix or a fresh bind), so the alert fired by
+    # _resolve_stale_fingerprint is the operator's cue to actually fix the row.
+    # See gym_media_routes._resolve_stale_fingerprint for the resolution rule.
+    from .. import gym_media_routes as _gm_routes
+    sources = []
+    for s in raw_sources:
+        gym_id = s.get("gym_id")
+        resolved = _gm_routes._resolve_stale_fingerprint(gym_id)
+        if resolved != gym_id:
+            log(f"source {s.get('id')} carries stale key {gym_id!r}; resolved to "
+                f"{resolved!r} for this sync (the media_source row itself was NOT "
+                f"rewritten)")
+            s = dict(s)
+            s["gym_id"] = resolved
+        if config.gym_drive_connect_active_for(s.get("gym_id")):
+            sources.append(s)
 
     results = []
     for i, source in enumerate(sources):

@@ -148,6 +148,40 @@ def test_run_stagger_and_deny_sweep(monkeypatch):
     assert sleeps == [30.0]        # staggered once between the two sources
 
 
+def test_run_remaps_stale_fingerprint_source(monkeypatch):
+    """The CrossFit Reverb class: a media_source row landed under a stale account-key
+    fingerprint. The nightly sync resolves it to the currently-registered gym IN
+    MEMORY for this pass (never rewriting the row itself) so the assets it indexes
+    land under the key everything else reads."""
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: None)
+    monkeypatch.setattr("agent.config.gym_drive_connect_active_for", lambda g: True)
+    monkeypatch.setattr(
+        "agent.calendar_autopublish.client_gym_bases",
+        lambda: ["crossfitreverb30b5b2"])
+    drive = FakeDrive(files=[photo("p1")])
+    store = FakeMediaStore(sources=[
+        make_source("srev", gym_id="crossfitreverb6cdf33", folder_id="frev")])
+    res = sync.run(drive=drive, store=store, sleep=lambda s: None)
+    assert res["sources"] == 1
+    assert res["results"][0]["gym_id"] == "crossfitreverb30b5b2"
+    assert store.assets["p1"]["gym_id"] == "crossfitreverb30b5b2"
+
+
+def test_run_leaves_registered_sources_untouched(monkeypatch):
+    """A normal, already-registered gym key is never remapped (client_gym_bases
+    contains it, so _resolve_stale_fingerprint short-circuits)."""
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: None)
+    monkeypatch.setattr("agent.config.gym_drive_connect_active_for", lambda g: True)
+    monkeypatch.setattr(
+        "agent.calendar_autopublish.client_gym_bases", lambda: ["pierce"])
+    drive = FakeDrive(files=[photo("p1")])
+    store = FakeMediaStore(sources=[_src()])
+    res = sync.run(drive=drive, store=store, sleep=lambda s: None)
+    assert res["results"][0]["gym_id"] == "pierce"
+
+
 # ---- SELF-RUNNING ambiguous sort (Blake 2026-08-31: no human sorting) ---------------
 
 def _ambiguous_asset(aid="amb1", title="1KEKvwEuXYpEwCkohfN7"):
