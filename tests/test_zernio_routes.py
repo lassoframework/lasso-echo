@@ -392,6 +392,16 @@ def test_connect_url_for_rejects_bad_platform(db_env):
     assert ok is False and "platform must be" in err
 
 
+def test_connect_url_for_rejects_whitespace_key(db_env):
+    """A mis-quoted CLI arg ("gym instagram" as one value) must never reach
+    _ensure_profile_id, which would find-or-CREATE a junk Zernio profile."""
+    fake = _FakeClient()
+    for bad in ("gymA instagram", " gymA", "gymA\t"):
+        ok, err = zr.connect_url_for(bad, "instagram", client=fake)
+        assert ok is False and "malformed account_key" in err
+    assert not getattr(fake, "created_profiles", []), "no profile may be minted"
+
+
 def test_connect_url_for_dark_without_key(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
     monkeypatch.delenv("ZERNIO_API_KEY", raising=False)

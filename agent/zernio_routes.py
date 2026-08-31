@@ -301,6 +301,12 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
         return False, "zernio disabled (ZERNIO_API_KEY not set on this host)"
     if not account_key:
         return False, "missing account_key"
+    # A key with whitespace is always a mis-quoted CLI arg ("gym instagram" as one
+    # value). Refuse it: _ensure_profile_id find-or-CREATES, so a typo would mint a
+    # junk Zernio profile and a junk gyms row, and hand out a connect link that files
+    # the gym's accounts under the wrong profile.
+    if account_key != account_key.strip() or any(ch.isspace() for ch in account_key):
+        return False, f"malformed account_key {account_key!r} (whitespace)"
     if platform not in _z.CONNECT_PLATFORMS:
         return False, f"platform must be one of {', '.join(_z.CONNECT_PLATFORMS)}"
     c = _client(client)
