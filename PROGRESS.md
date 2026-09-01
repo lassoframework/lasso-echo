@@ -3791,6 +3791,22 @@ Portal CC reads this to build: intake wizard, media upload hand-off, calendar di
 
 ---
 
+## Governance rule: make-it-true vs. backlog it (Blake, 2026-09-01)
+When a real system gap surfaces against a claim, which treatment applies is decided by
+TWO tests together, not by how easy the fix looks:
+  1. Is the claim already blocked / can waiting to fix it cost nothing right now?
+  2. Is the claim the product's spine, or a convenience layered on top of something
+     that already works?
+MAKE IT TRUE NOW only when BOTH hold — the claim is blocked already (so there's no
+launch-date cost to getting it right) AND it's load-bearing (not a nice-to-have).
+Otherwise it's backlog: real, tracked, not silently dropped, but not built tonight.
+Worked example from tonight: the Story Studio overlay burn (page 4) was make-it-true —
+the deck was already held and the overlay standard IS the pitch. The approval-card
+inline overlay TEXT EDITOR (also page-3/4 adjacent) was backlogged — it would be the
+one thing holding an otherwise-green deck, and it's a convenience (redraft-and-
+regenerate already covers the job) not the pitch. Apply this test before reflexively
+scope-creeping a "make it true" fix into everything adjacent to it.
+
 ## Product backlog (Blake, 2026-09-01 — real follow-up, deliberately not built tonight)
 - Page 7 owner-preview proof used the documented no-Clerk owner-equivalent code path (real
   production rows, no real session) because this environment has no Clerk credentials.
@@ -3802,6 +3818,12 @@ Portal CC reads this to build: intake wizard, media upload hand-off, calendar di
   after creation (agent/story_studio_store.py's get_render/list_requests/update_render have
   zero callers) and no staff Command Center Story Studio surface. Needed to show music/overlay
   info on an OLD approval, not just at creation time.
+- Approval-card inline overlay TEXT EDITOR (lasso-ops-portal): confirmed absent by two
+  independent audits 2026-09-01. Today's card shows the burned text + track read-only;
+  editing means redraft-and-regenerate, not structured inline edit. The character-budget
+  constant (24 chars/line, story_layout.MAX_CHARS_PER_LINE) is already exposed on the
+  staged-story API response as the single source of truth for when this ships, so the
+  editor's live counter has something real to read rather than a duplicated magic number.
 
 ## Open risks / watch items
 - Repo divergence: deployed repo has commits from other agents (ruvnet, Manus); the
