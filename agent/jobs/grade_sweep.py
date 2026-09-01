@@ -23,6 +23,17 @@ everything above is byte-for-byte unchanged. Flag ON:
     remains;
   * at most ONE aggregated sweep summary line fires per run, and only when
     something changed (a gym self-fixed to A or a new held alert fired).
+
+THE REGRESSION GUARD (2026-08-31). Every alert above answers "is this book
+below the bar", which is a standing CONDITION — it fires night after night
+until everyone stops reading it, which is the failure mode this sweep exists
+to avoid. A grade that DROPPED since the last stored run is an EVENT, and a
+different one: it means defects are being BUILT into the book faster than the
+nightly repair clears them. topfuel went 74 -> 64 -> 67 -> 71 -> 74 across live
+runs and nothing ever said so. The guard fires at any letter (a book sliding
+from A to B is the early warning that a below-B alert would not give until far
+too late), reads the previous total BEFORE this run's is written, and is
+deduped to once per gym per day.
 """
 from __future__ import annotations
 
