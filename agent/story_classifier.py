@@ -13,14 +13,21 @@ THREE layers, the last is always a human (spec §0):
   1. INTENT BEATS INFERENCE. A declared upload lane ("Finished posts" / "Raw
      footage") or a Drive folder mapping OVERRIDES the classifier outright. classify()
      honors a `declared_lane` and never guesses when intent is known.
-  2. The classifier below, for everything unmapped. Signals (spec §0.2):
-       - OCR on sampled frames finds burned-in text  -> finished
-       - 9:16 AND 3..60s                              -> finished
+  2. The classifier below, for everything unmapped. Signals (spec §0.2, amended
+     2026-09-01 after a fleet dry-run — see score_signals for the evidence):
+       - vision finds POST-PRODUCTION overlay text/graphics on sampled frames
+         -> finished (in-scene text, e.g. a gym whiteboard, does NOT count)
        - 16:9 / 4:3, or > 90s                         -> raw
        - camera-native filename (IMG_/DJI_/GX/PXL_/.MOV off a phone) -> raw
-       - high cut density for its length              -> finished
+       - high cut density, on a clip >= 8s             -> finished
        - content_hash matches one of Echo's own past renders -> finished AND
          blocked from re-ingest (the re-ingest guard, story_ledger)
+     DROPPED 2026-09-01: "9:16 AND 3..60s -> finished". Phones shoot vertical by
+     default, so that described almost every raw clip a gym owner films.
+
+  No single fallible signal may be decisive against a camera-native original.
+  Overriding "this came straight off a phone" takes two independent finished
+  signals, which falls out of the weights rather than a special case.
   3. AMBIGUOUS never auto-posts. It lands in the sort queue (story_sort_queue) and a
      coach-channel digest fires when the queue is non-empty. A silent wrong guess is
      the ONLY unacceptable outcome, so the classifier fails toward the human.
@@ -54,17 +61,18 @@ _EDITED_NAME_RE = re.compile(
     r"(final|export|edit(ed)?|reel|story|post|capcut|canva|1080x1920|9x16|"
     r"vertical|caption(ed)?|_v\d)", re.IGNORECASE)
 
-# Duration / aspect windows (spec §0.2).
-_FINISHED_DUR_MIN = 3.0
-_FINISHED_DUR_MAX = 60.0
+# Duration / aspect windows (spec §0.2). The 3..60s "finished" window is gone —
+# see the note in score_signals; only the long-clip raw bound survives.
 _RAW_DUR_LONG = 90.0
 
-# aspect: 9:16 ~= 0.5625; 16:9 ~= 1.777; 4:3 ~= 1.333.
-_NINE_SIXTEEN = 9 / 16
-_ASPECT_TOL = 0.06
+# aspect: 16:9 ~= 1.777; 4:3 ~= 1.333. (9:16 is no longer a signal — see the
+# score_signals note; vertical is the default shape of raw phone footage.)
 
 # cut density (cuts per second) at/above which a clip reads as an edited cut-up.
 _HIGH_CUT_DENSITY = 0.25
+# ...but only on a clip at least this long. Below it, one false scene-detect hit
+# (camera whip, a light changing) already clears _HIGH_CUT_DENSITY on its own.
+_CUT_DENSITY_MIN_DUR = 8.0
 
 
 @dataclass
@@ -101,11 +109,6 @@ def _aspect(width, height):
     return w / h
 
 
-def _is_vertical(width, height):
-    a = _aspect(width, height)
-    return a is not None and abs(a - _NINE_SIXTEEN) <= _ASPECT_TOL
-
-
 def _is_landscape(width, height):
     a = _aspect(width, height)
     # 4:3 (1.333) or wider counts as landscape/raw.
@@ -139,41 +142,59 @@ def score_signals(sig: Signals):
     raw = 0.0
     reasons = []
 
-    # burned-in text (OCR) -> finished (strong).
+    # post-production overlay text/graphics (vision) -> finished (strong, but see
+    # the weights note below: never decisive against a camera-native original alone).
     if sig.has_burned_text is True:
         finished += 0.55
-        reasons.append("burned-in text found (OCR) -> finished")
+        reasons.append("post-production overlay text found (vision) -> finished")
     elif sig.has_burned_text is False:
-        reasons.append("no burned-in text (OCR)")
+        reasons.append("no post-production overlay (vision)")
 
-    # aspect + duration.
+    # aspect + duration. NOTE (2026-09-01): "9:16 AND 3..60s -> finished" (spec §0.2)
+    # is GONE, not downweighted. It has no discriminating power left: phones shoot
+    # vertical by default, so essentially every raw clip a gym owner films is also
+    # 9:16 and 3..60s. In the Reverb dry-run it fired as a +0.45 co-factor on 100% of
+    # the misclassified clips — it was what let one fallible vision call clear the
+    # decision floor. Landscape and >90s stay: those really do mean nobody cut this
+    # for a story.
     if sig.kind == "video" and sig.duration_sec is not None:
-        vertical = _is_vertical(sig.width, sig.height)
-        landscape = _is_landscape(sig.width, sig.height)
-        if vertical and _FINISHED_DUR_MIN <= sig.duration_sec <= _FINISHED_DUR_MAX:
-            finished += 0.45
-            reasons.append(
-                f"9:16 and {sig.duration_sec:g}s in 3..60s -> finished")
-        if landscape:
+        if _is_landscape(sig.width, sig.height):
             raw += 0.5
             reasons.append("16:9 / 4:3 landscape -> raw")
         if sig.duration_sec > _RAW_DUR_LONG:
             raw += 0.5
             reasons.append(f"{sig.duration_sec:g}s > 90s -> raw")
 
-    # camera-native filename -> raw.
+    # camera-native filename -> raw. Weighted to clear _DECIDE_FLOOR on its own: a
+    # file still named IMG_4902.MP4 straight off a phone is strong evidence nobody
+    # ran it through an editor (editors rename on export). Because 0.5 raw sits within
+    # _DECIDE_MARGIN of the 0.55 overlay signal, a single vision call can no longer
+    # flip a camera original to FINISHED — it takes a second, independent finished
+    # signal (an export-stamped name, or real cut density) to win. That corroboration
+    # requirement is the guard that would have stopped the Reverb near-wipe.
     if camera_native_filename(sig.filename):
-        raw += 0.45
+        raw += 0.5
         reasons.append("camera-native filename -> raw")
     elif edited_filename(sig.filename):
         finished += 0.3
         reasons.append("edit-suite / export filename -> finished")
 
-    # high cut density for its length -> finished (an edited cut-up).
-    if sig.cut_density is not None and sig.cut_density >= _HIGH_CUT_DENSITY:
-        finished += 0.4
+    # high cut density for its length -> finished (an edited cut-up), but only on a
+    # clip long enough for the measurement to mean anything. ffmpeg scene detection
+    # fires on fast camera movement and lighting changes, so on a 3.4s clip a single
+    # false hit reads as 0.29/s and clears the threshold on noise alone. Every
+    # cut-density hit in the Reverb dry-run came from a clip under 8s.
+    if (sig.cut_density is not None and sig.cut_density >= _HIGH_CUT_DENSITY
+            and (sig.duration_sec or 0) >= _CUT_DENSITY_MIN_DUR):
+        finished += 0.5
         reasons.append(
             f"high cut density ({sig.cut_density:.2f}/s) -> finished")
+    elif (sig.cut_density is not None and sig.cut_density >= _HIGH_CUT_DENSITY
+            and (sig.duration_sec or 0) < _CUT_DENSITY_MIN_DUR):
+        reasons.append(
+            f"cut density {sig.cut_density:.2f}/s ignored: clip is "
+            f"{sig.duration_sec or 0:g}s, under the {_CUT_DENSITY_MIN_DUR:g}s "
+            "minimum for that measurement to be meaningful")
 
     return finished, raw, reasons
 
@@ -344,29 +365,30 @@ def _extract_frame(local_path, ts):
     return None
 
 
-def _meaningful_text(text):
-    """A real threshold, not a bare truthiness check: a stray OCR artifact (one
-    stray character, whitespace) must not read as 'burned-in text found'."""
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", text or "")
-    return len(cleaned) >= 4
-
-
 def default_ocr_reader(local_path):
-    """Real burned-in-text detection for a downloaded video file.
+    """Real POST-PRODUCTION-overlay detection for a downloaded video file.
 
     Samples 2 frames (20% and 60% of duration; the first frame when duration is
-    unknown) and transcribes each with the SAME Gemini vision reader
-    agent/ocr_check.py already uses for the headline quality guard. True when
-    either sampled frame carries meaningful rendered text (the P1-1 / P1-3 /
-    R2-dark class: a caption, a benefit list, a fake-SMS bubble — all text-heavy),
-    False when both come back clean, None when the read could not run at all (no
-    ffmpeg, no vision reader armed, every attempt errored) — an unknown signal
-    that pushes a borderline file to AMBIGUOUS, never a fabricated verdict.
+    unknown) and asks the SAME Gemini vision reader agent/ocr_check.py already uses
+    whether the text on that frame was composited on in an editor or was physically
+    in front of the lens (ocr_check.overlay_verdict). True when either sampled frame
+    carries post-production text/graphics, False when both frames are clean or carry
+    only in-scene text, None when the read could not run at all (no ffmpeg, no vision
+    reader armed, every attempt errored or answered unparseably) — an unknown signal
+    that contributes nothing, never a fabricated verdict.
+
+    2026-09-01: this used plain transcription (ocr_check.rendered_read) and returned
+    True on ANY legible text >= 4 characters. A fleet dry-run against CrossFit Reverb
+    quarantined 31 of 34 clips of ordinary raw floor footage, because a CrossFit gym's
+    walls are covered in text — programming whiteboards, class signage, timers. The
+    signal claimed "this was already edited" while actually measuring "this room has
+    words in it". Asking the right question is the fix; the weights below stopped it
+    from ever being decisive on its own.
     """
     from . import ocr_check as _ocr
 
     try:
-        reader = _ocr._default_reader()  # noqa: SLF001 - the same lazy Gemini client
+        reader = _ocr.overlay_reader()
     except Exception as e:  # noqa: BLE001
         print(f"[story-classifier] OCR reader unavailable: {type(e).__name__}: {e}")
         return None
@@ -374,26 +396,28 @@ def default_ocr_reader(local_path):
         return None
     dur = _probe_duration(local_path)
     fractions = (0.2, 0.6) if dur else (None,)
-    ran_any = False
+    saw_a_readable_frame = False
     for frac in fractions:
         ts = None if frac is None else max(0.3, dur * frac)
         frame = _extract_frame(local_path, ts)
         if not frame:
             continue
-        ran_any = True
         try:
-            text = _ocr.rendered_read(frame, reader=reader)
+            verdict = _ocr.overlay_verdict(frame, reader=reader)
         except Exception as e:  # noqa: BLE001
             print(f"[story-classifier] OCR frame read failed: {type(e).__name__}: {e}")
-            text = ""
+            verdict = None
         finally:
             try:
                 os.remove(frame)
             except OSError:
                 pass
-        if _meaningful_text(text):
+        if verdict is True:
             return True
-    return False if ran_any else None
+        if verdict is False:
+            saw_a_readable_frame = True
+    # False only when a frame actually answered "no overlay"; otherwise UNKNOWN.
+    return False if saw_a_readable_frame else None
 
 
 def default_cut_probe(local_path):

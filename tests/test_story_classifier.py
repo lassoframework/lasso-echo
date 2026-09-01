@@ -8,6 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from agent import ocr_check as ocr  # noqa: E402
 from agent import story_classifier as sc  # noqa: E402
 
 
@@ -21,7 +22,7 @@ def test_burned_caption_is_finished():
                      duration_sec=22, has_burned_text=True)
     v = sc.classify(sig, ledger_lookup=_never)
     assert v.verdict == sc.FINISHED
-    assert any("burned" in r.lower() for r in v.reasons)
+    assert any("overlay" in r.lower() for r in v.reasons)
 
 
 def test_img4021_mov_16x9_3min_is_raw():
@@ -162,13 +163,12 @@ def test_r2_dark_original48_composited_fake_sms_is_finished():
 
 
 def test_these_3_clips_score_only_ambiguous_from_metadata_alone():
-    # The OTHER half of the root cause: even with NO OCR wired in at all, these
-    # 3 clips' metadata alone (9:16, in-band duration, a non-edited-suite
-    # filename) scores finished=0.45 > raw=0.0 -- below the AMBIGUOUS/FINISHED
-    # decision floor, so classify() alone reads AMBIGUOUS. Only the echo-auto-sort
-    # tie-break (finished_score > raw_score) would have called these "finished" --
-    # and until this hardening, THAT decision was never enforced against the pool
-    # either (agent/jobs/sync_gym_media.py _quarantine_finished fixes that half).
+    # The OTHER half of the root cause: with NO vision signal wired in at all, these
+    # 3 clips' metadata alone is not enough to call them anything -- classify() reads
+    # AMBIGUOUS and defers to a human. (Before 2026-09-01 the dropped "9:16 and
+    # 3..60s" signal gave them finished=0.45, which the echo-auto-sort tie-break
+    # would then have resolved to "finished" off a signal that meant nothing; now
+    # metadata alone genuinely carries no vote either way.)
     for title, dur in (
         ("original (21).mp4", 10.002868),
         ("original (35).mp4", 13.607684),
@@ -177,42 +177,136 @@ def test_these_3_clips_score_only_ambiguous_from_metadata_alone():
         sig = sc.Signals(filename=title, width=1080, height=1920, duration_sec=dur)
         v = sc.classify(sig, ledger_lookup=_never)
         assert v.verdict == sc.AMBIGUOUS, title
-        assert v.finished_score > v.raw_score, title
+        assert v.finished_score == 0.0 and v.raw_score == 0.0, title
+
+
+# ---- 2026-09-01 regression: the CrossFit Reverb near-wipe -------------------
+# A fleet-wide dry-run quarantined 31 of the 34 clips it reached in Reverb's raw
+# pool. Every one was ordinary phone footage off the gym floor (IMG_47xx.MP4), and
+# the signal that condemned them was "burned-in text found (OCR)" -- which at the
+# time meant nothing more than "this frame has legible text on it". A CrossFit box
+# is wall-to-wall text: programming whiteboards, class signage, workout timers.
+# Applied for real, this would have emptied a client's Story pool on the launch day
+# of the feature that needs it. These tests pin all three legs of the fix.
+
+def test_reverb_camera_native_clip_with_only_in_scene_text_is_raw():
+    # IMG_4902.MP4.mov, 9:16, 36s, whiteboard visible: the vision reader now answers
+    # the overlay question and says no (has_burned_text False), so this is RAW.
+    sig = sc.Signals(filename="IMG_4902.MP4.mov", width=1080, height=1920,
+                     duration_sec=36.0017, has_burned_text=False)
+    v = sc.classify(sig, ledger_lookup=_never)
+    assert v.verdict == sc.RAW
+
+
+def test_a_single_overlay_hit_cannot_flip_a_camera_native_original():
+    # THE guard. Even if the vision call misfires OVERLAY on a phone original, one
+    # fallible signal must not condemn it: 0.55 finished vs 0.5 raw is inside
+    # _DECIDE_MARGIN -> AMBIGUOUS (a human sorts it), never a silent quarantine.
+    sig = sc.Signals(filename="IMG_4902.MP4.mov", width=1080, height=1920,
+                     duration_sec=36.0017, has_burned_text=True)
+    v = sc.classify(sig, ledger_lookup=_never)
+    assert v.verdict == sc.AMBIGUOUS
+
+
+def test_two_independent_finished_signals_do_beat_a_camera_native_name():
+    # Corroboration works in the other direction too: overlay text AND real cut
+    # density on a long-enough clip is genuine evidence somebody edited this, even
+    # though the phone filename survived.
+    sig = sc.Signals(filename="IMG_4902.MP4.mov", width=1080, height=1920,
+                     duration_sec=36.0017, has_burned_text=True, cut_density=0.5)
+    v = sc.classify(sig, ledger_lookup=_never)
+    assert v.verdict == sc.FINISHED
+
+
+def test_cut_density_on_a_short_clip_is_ignored_as_noise():
+    # IMG_4908.MP4.mov: 3.4s, "0.59 cuts/sec" is 2 ffmpeg scene hits on a clip that
+    # short -- camera movement, not editing. The signal must not count at all.
+    sig = sc.Signals(filename="IMG_4908.MP4.mov", width=1080, height=1920,
+                     duration_sec=3.4, has_burned_text=False, cut_density=0.59)
+    v = sc.classify(sig, ledger_lookup=_never)
+    assert v.verdict == sc.RAW
+    assert any("ignored" in r for r in v.reasons)
+
+
+def test_vertical_in_band_duration_is_no_longer_a_finished_signal():
+    # The dropped signal, pinned so it cannot quietly return: a 9:16 clip of
+    # in-band length, with nothing else known, votes for nothing.
+    sig = sc.Signals(filename="movie.mp4", width=1080, height=1920, duration_sec=20)
+    f, r, reasons = sc.score_signals(sig)
+    assert f == 0.0 and r == 0.0
+    assert not any("3..60" in x for x in reasons)
 
 
 # ---- 2026-09-01: the real, live OCR / cut-density probes -------------------
 def test_default_ocr_reader_none_when_reader_unarmed(monkeypatch):
     # creative_studio / nano off (no API key) -> the reader is None -> unknown
     # signal, never a fabricated verdict.
-    monkeypatch.setattr("agent.ocr_check._default_reader", lambda: None)
+    monkeypatch.setattr("agent.ocr_check.overlay_reader", lambda: None)
     assert sc.default_ocr_reader("/does/not/matter") is None
 
 
-def test_default_ocr_reader_true_when_frame_carries_text(monkeypatch, tmp_path):
+def test_default_ocr_reader_true_on_post_production_overlay(monkeypatch, tmp_path):
     fake_video = tmp_path / "clip.mp4"
     fake_video.write_bytes(b"x")
     monkeypatch.setattr(sc, "_probe_duration", lambda p: 10.0)
     monkeypatch.setattr(sc, "_extract_frame", lambda p, ts: str(fake_video))
-    monkeypatch.setattr("agent.ocr_check._default_reader", lambda: (lambda b: "x"))
-    monkeypatch.setattr(
-        "agent.ocr_check.rendered_read",
-        lambda path, reader=None: "you are your own greatest project")
+    monkeypatch.setattr("agent.ocr_check.overlay_reader", lambda: (lambda b: "OVERLAY"))
     assert sc.default_ocr_reader(str(fake_video)) is True
 
 
-def test_default_ocr_reader_false_when_frames_are_clean(monkeypatch, tmp_path):
+def test_default_ocr_reader_false_on_in_scene_text(monkeypatch, tmp_path):
+    # The Reverb case at the reader level: the frame HAS text, but it is a whiteboard.
     fake_video = tmp_path / "clip.mp4"
     fake_video.write_bytes(b"x")
     monkeypatch.setattr(sc, "_probe_duration", lambda p: 10.0)
     monkeypatch.setattr(sc, "_extract_frame", lambda p, ts: str(fake_video))
-    monkeypatch.setattr("agent.ocr_check._default_reader", lambda: (lambda b: "x"))
-    monkeypatch.setattr("agent.ocr_check.rendered_read",
-                        lambda path, reader=None: "")
+    monkeypatch.setattr("agent.ocr_check.overlay_reader", lambda: (lambda b: "SCENE"))
     assert sc.default_ocr_reader(str(fake_video)) is False
 
 
-def test_meaningful_text_threshold():
-    assert sc._meaningful_text("you are your own greatest project") is True
-    assert sc._meaningful_text("") is False
-    assert sc._meaningful_text("  .. ") is False
-    assert sc._meaningful_text("ab") is False
+def test_default_ocr_reader_unknown_when_the_model_answers_unparseably(
+        monkeypatch, tmp_path):
+    fake_video = tmp_path / "clip.mp4"
+    fake_video.write_bytes(b"x")
+    monkeypatch.setattr(sc, "_probe_duration", lambda p: 10.0)
+    monkeypatch.setattr(sc, "_extract_frame", lambda p, ts: str(fake_video))
+    monkeypatch.setattr("agent.ocr_check.overlay_reader",
+                        lambda: (lambda b: "I think maybe there is some text?"))
+    assert sc.default_ocr_reader(str(fake_video)) is None
+
+
+def test_one_overlay_frame_wins_over_a_clean_first_frame(monkeypatch, tmp_path):
+    # A caption that only appears later in the clip still makes it finished; the
+    # reader samples 2 frames and True on either is enough.
+    answers = iter(["SCENE", "OVERLAY"])
+    frames = iter(["f0.png", "f1.png"])
+
+    def _fresh_frame(_path, _ts):
+        # a NEW file per call: default_ocr_reader removes each frame after reading
+        # it, so reusing one path would make the second read fail on a missing file.
+        p = tmp_path / next(frames)
+        p.write_bytes(b"x")
+        return str(p)
+
+    monkeypatch.setattr(sc, "_probe_duration", lambda p: 10.0)
+    monkeypatch.setattr(sc, "_extract_frame", _fresh_frame)
+    monkeypatch.setattr("agent.ocr_check.overlay_reader",
+                        lambda: (lambda b: next(answers)))
+    assert sc.default_ocr_reader("/clip.mp4") is True
+
+
+# ---- the overlay answer parser (agent/ocr_check) ---------------------------
+def test_parse_overlay_answer_reads_the_three_verdicts():
+    assert ocr.parse_overlay_answer("OVERLAY") == ocr.OVERLAY
+    assert ocr.parse_overlay_answer("scene") == ocr.SCENE
+    assert ocr.parse_overlay_answer(" None.\n") == ocr.NONE
+
+
+def test_parse_overlay_answer_refuses_to_guess():
+    # Unrecognized, empty, or self-contradicting replies are UNKNOWN, not a vote.
+    for bad in ("", None, "probably some text", "OVERLAY or maybe SCENE"):
+        assert ocr.parse_overlay_answer(bad) is None
+
+
+def test_overlay_verdict_is_none_when_unarmed():
+    assert ocr.overlay_verdict("/x", reader=None) is None

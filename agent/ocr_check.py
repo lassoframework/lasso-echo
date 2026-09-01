@@ -21,6 +21,29 @@ MATCH_THRESHOLD = 0.75
 _TRANSCRIBE_PROMPT = ("Transcribe ONLY the single largest text on this image, "
                       "exactly as rendered. Reply with that text and nothing else.")
 
+# Post-production overlay vs. text that is physically in the room (2026-09-01).
+# _TRANSCRIBE_PROMPT answers "what text is on this frame", which is the WRONG
+# question for the story classifier: a gym's programming whiteboard, wall signage,
+# a workout timer or a jersey number all transcribe as text, and the classifier was
+# reading every one of them as "this clip was already edited". This prompt asks the
+# question the classifier actually needs — was this text COMPOSITED ON in an editor,
+# or was it in front of the lens — and returns one token so the answer is parseable
+# rather than inferred from prose.
+OVERLAY = "overlay"
+SCENE = "scene"
+NONE = "none"
+_OVERLAY_PROMPT = (
+    "This is one frame from a video. Decide how any readable text or graphics on it "
+    "got there.\n"
+    "Answer OVERLAY if some text or graphic was ADDED IN POST-PRODUCTION on top of the "
+    "footage: a caption or subtitle, a title card, a lower third, an animated sticker, "
+    "a logo bug, a progress bar, or a designed graphic composited over the image.\n"
+    "Answer SCENE if the only readable text was physically present in front of the "
+    "camera: a whiteboard, a wall sign or banner, a poster, lettering on clothing or "
+    "equipment, a scoreboard, a clock or workout timer, or a screen being filmed.\n"
+    "Answer NONE if there is no readable text or graphic at all.\n"
+    "Reply with exactly one word: OVERLAY, SCENE, or NONE.")
+
 
 def _normalize(text):
     return re.sub(r"[^a-z0-9 ]+", "", (text or "").lower()).strip()
@@ -56,8 +79,13 @@ def _warn_if_model_missing(exc, model=None):
     return True
 
 
-def _default_reader():
-    """Gemini vision transcription (lazy; None when the studio is unarmed)."""
+def _default_reader(prompt=None):
+    """Gemini vision transcription (lazy; None when the studio is unarmed).
+
+    `prompt` overrides the transcription instruction for callers asking a different
+    visual question (see _OVERLAY_PROMPT / overlay_verdict). It defaults to
+    _TRANSCRIBE_PROMPT so every existing caller behaves exactly as before.
+    """
     if not config.creative_studio_enabled():
         return None
     import os
@@ -67,6 +95,7 @@ def _default_reader():
     from google import genai  # lazy
     from google.genai import types as gtypes
     client = genai.Client(api_key=key)
+    instruction = prompt or _TRANSCRIBE_PROMPT
 
     def _read(image_bytes):
         # OCR_MODEL, NOT NANO_MODEL: the generation model returns image parts, not
@@ -75,7 +104,7 @@ def _default_reader():
             resp = client.models.generate_content(
                 model=config.OCR_MODEL,
                 contents=[gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                          _TRANSCRIBE_PROMPT])
+                          instruction])
         except Exception as e:
             # A retired / wrong model name is named loudly, then re-raised so the
             # read fails and the gate blocks fail-closed (never a passthrough).
@@ -84,6 +113,49 @@ def _default_reader():
         return getattr(resp, "text", "") or ""
 
     return _read
+
+
+def overlay_reader():
+    """A reader that answers the overlay-vs-scene question, or None when unarmed."""
+    return _default_reader(prompt=_OVERLAY_PROMPT)
+
+
+def parse_overlay_answer(text):
+    """OVERLAY / SCENE / NONE from a model reply, or None when it answered with
+    something we refuse to guess at. Never raises.
+
+    Deliberately strict: an unrecognized reply returns None ("signal unknown"), which
+    the classifier treats as no evidence at all, rather than being coerced into a
+    verdict. A reply that names more than one of the three words is also None — that
+    is an unclear answer, not a vote for whichever word happened to come first.
+    """
+    low = re.sub(r"[^a-z]+", " ", (text or "").lower())
+    found = {w for w in (OVERLAY, SCENE, NONE) if re.search(rf"\b{w}\b", low)}
+    if len(found) != 1:
+        return None
+    return found.pop()
+
+
+def overlay_verdict(image_path, reader=None):
+    """True when this frame carries POST-PRODUCTION text/graphics, False when any
+    readable text was physically in the scene (or there is none), None when the read
+    could not run or came back unparseable.
+
+    True/False/None map onto the story classifier's has_burned_text contract, where
+    None means "unknown signal" and contributes no score in either direction.
+    """
+    reader = reader or overlay_reader()
+    if reader is None or not image_path:
+        return None
+    try:
+        with open(image_path, "rb") as fh:
+            answer = reader(fh.read())
+    except Exception:
+        return None
+    parsed = parse_overlay_answer(answer)
+    if parsed is None:
+        return None
+    return parsed == OVERLAY
 
 
 def headline_warning(image_path, intended_headline, reader=None):
