@@ -111,6 +111,58 @@ def test_render_succeeds_with_injected_primitives(tmp_path):
     assert "reframe" in steps and "assemble" in steps and "end" in steps
 
 
+def test_render_calls_the_overlay_burn_when_frames_are_given(tmp_path):
+    """REGRESSION GUARD (spec §1, page 4): the validated hook/ask overlay was
+    computed, stored, and then silently thrown away before the video was ever
+    touched. If a future change disconnects render_compose from overlay_fn again,
+    THIS must fail loudly — a passing render with overlay_frames given but overlay_fn
+    never invoked is exactly the bug that shipped."""
+    t = tmpl.get("hype_montage")
+    plan = comp.plan_compose(_cands("pierce", 6, seg=10.0), "pierce", t)
+    calls = []
+    res = comp.render_compose(
+        plan, output_dir=str(tmp_path), ask_frame_text="BOOK NOW",
+        ask_frame_lines=[["BOOK NOW"]],
+        overlay_frames=[["HOOK LINE ONE"], ["HOOK LINE TWO"]],
+        reframe_fn=lambda seg, d: f"{d}/{seg.asset_id}.mp4",
+        normalize_fn=lambda ps: ps,
+        assemble_fn=lambda ps, d: f"{d}/asm.mp4",
+        overlay_fn=lambda p, d, frames: (calls.append(("overlay", frames)), f"{d}/ov.mp4")[1],
+        end_frame_fn=lambda p, d, a: (calls.append(("end", a)), f"{d}/final.mp4")[1])
+    assert res.held is False
+    assert calls and calls[0][0] == "overlay", \
+        "overlay_frames was provided but the burn step was never called"
+    assert calls[0][1] == [["HOOK LINE ONE"], ["HOOK LINE TWO"]], \
+        "the ALREADY-VALIDATED frames must reach the burn unmodified, never re-derived"
+
+
+def test_render_never_calls_overlay_burn_when_no_frames_exist(tmp_path):
+    """The inverse guard: a caller that never built overlay data (a bare unit test,
+    or a lane with no overlay) must see byte-identical behavior to before overlay
+    wiring existed — no accidental burn call on empty input."""
+    t = tmpl.get("hype_montage")
+    plan = comp.plan_compose(_cands("pierce", 6, seg=10.0), "pierce", t)
+    calls = []
+    comp.render_compose(
+        plan, output_dir=str(tmp_path), ask_frame_text="BOOK NOW",
+        reframe_fn=lambda seg, d: f"{d}/{seg.asset_id}.mp4",
+        normalize_fn=lambda ps: ps,
+        assemble_fn=lambda ps, d: f"{d}/asm.mp4",
+        overlay_fn=lambda p, d, frames: (calls.append("overlay"), p)[1],
+        end_frame_fn=lambda p, d, a: f"{d}/final.mp4")
+    assert "overlay" not in calls
+
+
+def test_default_end_frame_refuses_to_drop_a_requested_ask(tmp_path):
+    """THE loud-failure guard for page 4's centerpiece bug: an ask was requested
+    (ask_frame_text set) but the validated ask_frame_lines never made it through —
+    this is EXACTLY the class of bug that shipped a blank overlay while the database
+    said everything was fine. It must raise, not silently render without the ask."""
+    from agent.story_composer import _default_end_frame
+    with pytest.raises(RuntimeError, match="refusing to burn"):
+        _default_end_frame("/tmp/in.mp4", str(tmp_path), "BOOK NOW", ask_lines=None)
+
+
 def test_render_burns_music_when_provided(tmp_path):
     t = tmpl.get("hype_montage")
     plan = comp.plan_compose(_cands("pierce", 6, seg=10.0), "pierce", t)

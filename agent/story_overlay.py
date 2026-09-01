@@ -230,6 +230,19 @@ def build_overlay(raw_text, *, identity_tokens=(), gym=None, ask="", grounded_fr
     surfaced loudly, never shipped)."""
     from . import copy_gate, post_quality
 
+    # spec §1: "Identity anchor: a city / brand token appears in the overlay." There
+    # is NO server-side default for identity_tokens (an audit found the frontend must
+    # supply it) -- ensure_identity_anchor silently no-ops when tokens is empty, which
+    # would ship a Story with no anchor at all. enforce_ask=True marks a REAL render
+    # (story_studio), where that hard invariant applies: refuse to guess a city/gym
+    # and refuse to silently ship without one -- HOLD with an honest reason instead
+    # (enforce_ask=False is card-builder / unit use, where no render is happening).
+    if enforce_ask and not identity_tokens:
+        raise OverlayRejected(
+            "no identity_tokens (city/gym anchor) were provided for this render; "
+            "Story Studio will not burn a Story without its identity anchor -- add "
+            "a city or gym token and retry")
+
     if low_confidence or not str(raw_text or "").strip():
         text = GENERIC_SAFE_HOOK
         grounded_from = "generic_safe"

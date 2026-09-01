@@ -153,10 +153,13 @@ def test_real_render_produces_pending_1080x1920_h264(tmp_path, monkeypatch):
 
     monkeypatch.setattr("agent.story_composer._default_reframe", _bind_reframe)
 
-    def _render_fn(plan, *, output_dir, ask_frame_text="", music_path=""):
-        # No primitives injected -> the module defaults (real ffmpeg lane) run.
+    def _render_fn(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
+                  overlay_frames=None, music_path=""):
+        # No primitives injected -> the module defaults (real ffmpeg lane, INCLUDING
+        # the real Roxx overlay burn) run.
         return comp.render_compose(
             plan, output_dir=output_dir, ask_frame_text=ask_frame_text,
+            ask_frame_lines=ask_frame_lines, overlay_frames=overlay_frames,
             music_path=music_path)
 
     request = {

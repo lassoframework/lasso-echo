@@ -44,6 +44,11 @@ MAX_SEGMENTS = 6
 ROUTE_STORY = "story"
 ROUTE_OPUS = "opus"
 
+# Roxx overlay burn timing (spec §1): the hook plays across the opening of the
+# montage, the single validated ask frame owns the closing window.
+HOOK_FRAME_MIN_SEC = 3.0
+ASK_FRAME_SEC = 3.0
+
 
 @dataclass
 class Segment:
@@ -195,21 +200,33 @@ def plan_compose(candidates, gym_id, template, *, assets_by_id=None):
 
 
 # ---- render (injectable heavy steps; HELD on a missing renderer) ------------
-def render_compose(plan, *, output_dir, ask_frame_text="",
+def render_compose(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
+                   overlay_frames=None,
                    reframe_fn=None, normalize_fn=None, assemble_fn=None,
-                   end_frame_fn=None, music_path="", music_burn_fn=None):
+                   overlay_fn=None, end_frame_fn=None, music_path="",
+                   music_burn_fn=None):
     """Render a ComposePlan into a 9:16 1080x1920 montage. Every heavy step is
     injectable so the suite runs offline:
 
       reframe_fn(segment, out_dir)                 -> path (9:16 subject-aware reframe)
       normalize_fn(paths)                          -> paths (loudness + color across phones)
       assemble_fn(paths, out_dir)                  -> path (concat)
-      end_frame_fn(path, out_dir, ask_text)        -> path (brand end-frame, ONE ask)
+      overlay_fn(path, out_dir, overlay_frames)    -> path (Roxx BODY overlay: the hook)
+      end_frame_fn(path, out_dir, ask_text)        -> path (single ask frame + brand cap)
       music_burn_fn(path, music_path, out_dir)     -> path (licensed bed burn)
 
+    overlay_frames is story_overlay.OverlaySpec.frames (ALREADY validated: ALL-CAPS,
+    density-wrapped, identity anchor on frame 0) — the body/hook overlay is burned
+    ONLY when it is non-empty, so a caller that never built one (e.g. a bare unit
+    test) gets byte-identical behavior to before this overlay wiring existed.
+    ask_frame_lines is story_overlay's single validated ask-frame lines
+    (assert_one_ask_frame's output); the default end_frame_fn burns THOSE lines,
+    never re-deriving them from ask_frame_text.
+
     A None default binds the clipper_render primitives lazily. If ANY primitive raises
-    (e.g. ffmpeg absent), the render is HELD with an honest reason (held=True), never a
-    crash and never a fabricated output path."""
+    (e.g. ffmpeg absent, or a burned box fails its own safe-zone/contrast check), the
+    render is HELD with an honest reason (held=True), never a crash, never a fabricated
+    output path, and never a frame burned that fails its own validation."""
     if plan.held:
         return ComposeResult(plan=plan, held=True, hold_reason=plan.hold_reason)
     if plan.route == ROUTE_OPUS:
@@ -219,7 +236,8 @@ def render_compose(plan, *, output_dir, ask_frame_text="",
         reframe_fn = reframe_fn or _default_reframe
         normalize_fn = normalize_fn or _default_normalize
         assemble_fn = assemble_fn or _default_assemble
-        end_frame_fn = end_frame_fn or _default_end_frame
+        overlay_fn = overlay_fn or _default_overlay_burn
+        end_frame_fn = end_frame_fn or _partial_end_frame(ask_frame_lines)
         # A licensed bed defaults to the real ffmpeg burn (amix under the video
         # audio). An injected music_burn_fn still overrides; music_path='' (a 'none'
         # selection) skips the burn entirely.
@@ -229,6 +247,8 @@ def render_compose(plan, *, output_dir, ask_frame_text="",
         reframed = [reframe_fn(seg, output_dir) for seg in plan.segments]
         normalized = normalize_fn(reframed)
         assembled = assemble_fn(normalized, output_dir)
+        if overlay_frames:
+            assembled = overlay_fn(assembled, output_dir, overlay_frames)
         final = end_frame_fn(assembled, output_dir, ask_frame_text)
         if music_path and music_burn_fn is not None:
             final = music_burn_fn(final, music_path, output_dir)
@@ -240,7 +260,8 @@ def render_compose(plan, *, output_dir, ask_frame_text="",
         return ComposeResult(
             plan=plan, held=True,
             hold_reason=f"render held: {type(e).__name__}: {e} (no ffmpeg / probe in "
-                        f"this env, or a primitive failed). Nothing was staged.")
+                        f"this env, or a primitive failed, or a burned overlay failed "
+                        f"its own safe-zone/contrast validation). Nothing was staged.")
 
 
 # ---- default primitives (bind clipper_render lazily; raise when unavailable) -
@@ -300,10 +321,65 @@ def _default_assemble(paths, out_dir):
     return dst
 
 
-def _default_end_frame(path, out_dir, ask_text):
+def _default_overlay_burn(path, out_dir, frames):
+    """Burn the Roxx BODY overlay (the hook) onto the opening of the assembled
+    montage. `frames` is story_overlay.OverlaySpec.frames — ALREADY validated
+    ALL-CAPS, density-wrapped lines with the identity anchor on frame 0; this
+    function only sequences and times them, it never re-wraps or re-derives copy.
+    Each frame gets >= HOOK_FRAME_MIN_SEC seconds, sequenced from t=0. Raises (via
+    clipper_render.burn_overlay_block) when a frame's box would violate the story
+    safe zone — the caller HOLDS rather than burning a bad frame."""
     from . import clipper_render
+    total = clipper_render.probe_duration(path)
+    n = max(len(frames), 1)
+    per = max(HOOK_FRAME_MIN_SEC, total / n) if total > 0 else HOOK_FRAME_MIN_SEC
+    cur = path
+    t = 0.0
+    for i, frame_lines in enumerate(frames):
+        end_t = min(t + per, total) if total > 0 else t + per
+        out = f"{out_dir}/story_hook_{i}.mp4"
+        cur = clipper_render.burn_overlay_block(
+            cur, out, frame_lines, anchor="top", start_t=t, end_t=end_t)
+        t = end_t
+    return cur
+
+
+def _partial_end_frame(ask_frame_lines):
+    """Bind the validated ask_frame_lines into the REAL default end-frame primitive
+    without changing end_frame_fn's (path, out_dir, ask_text) contract that injected
+    test/alternate renderers rely on. Only used when end_frame_fn is not injected."""
+    def _bound(path, out_dir, ask_text):
+        return _default_end_frame(path, out_dir, ask_text, ask_lines=ask_frame_lines)
+    return _bound
+
+
+def _default_end_frame(path, out_dir, ask_text, *, ask_lines=None):
+    """Burn the single validated ASK frame (story_overlay's assert_one_ask_frame
+    output, `ask_lines` — ALREADY validated: exactly one ask, will be safe-zone +
+    contrast checked at burn time) onto the closing ASK_FRAME_SEC seconds of the
+    clip, then caps the render with the LASSO brand watermark (unchanged, a
+    separate brand system from the Roxx overlay). `ask_text` is kept only for the
+    hold-reason / back-compat signature.
+
+    When ask_text is set but ask_lines is not wired through, this REFUSES to guess
+    or silently drop the ask (the exact failure mode this module used to have) —
+    it raises so the render HOLDS with an honest reason instead."""
+    from . import clipper_render
+    if ask_text and not ask_lines:
+        raise RuntimeError(
+            "an ask was requested but no validated ask_frame_lines were wired "
+            "through from story_overlay.build_overlay(); refusing to burn an "
+            "unvalidated ask or silently drop it")
     out = f"{out_dir}/story_final.mp4"
-    clipper_render.add_brand_frame(path, out)
+    cur = path
+    if ask_lines:
+        total = clipper_render.probe_duration(path)
+        start_t = max(0.0, total - ASK_FRAME_SEC) if total > 0 else 0.0
+        end_t = total if total > 0 else start_t + ASK_FRAME_SEC
+        cur = clipper_render.burn_overlay_block(
+            path, f"{out_dir}/story_ask.mp4", list(ask_lines), anchor="bottom",
+            start_t=start_t, end_t=end_t)
+    clipper_render.add_brand_frame(cur, out)
     return out
 
 

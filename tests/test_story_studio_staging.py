@@ -58,7 +58,7 @@ def _cands(gym, n=6, seg=10.0):
              "end_ts": seg, "score": 90 - i} for i in range(n)]
 
 
-def _fake_render(plan, *, output_dir, ask_frame_text="", music_path=""):
+def _fake_render(plan, *, output_dir, ask_frame_text="", music_path="", **_k):
     from agent import story_composer as comp
     return comp.ComposeResult(plan=plan, output_path=f"{output_dir}/final.mp4")
 
@@ -128,7 +128,8 @@ def test_render_stores_track_id_and_license_ref(monkeypatch, tmp_path):
     audio.write_bytes(b"x")
     store = _FakeStore()
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "Big lifts today"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "Big lifts today",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=store,
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -145,7 +146,8 @@ def test_content_hash_recorded_in_reingest_ledger(monkeypatch, tmp_path):
     audio.write_bytes(b"y")
     from agent import story_ledger
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -178,7 +180,8 @@ def test_missing_music_asset_holds(monkeypatch, tmp_path):
     _arm(monkeypatch)
     # default stub library has metadata but NO audio file path -> hold, never silent.
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         render_fn=_fake_render, output_dir=str(tmp_path))
     assert res["status"] == "held"
@@ -195,7 +198,8 @@ def test_empty_dir_library_still_holds(monkeypatch, tmp_path):
     (music_dir / "manifest.json").write_text('{"tracks": []}', encoding="utf-8")
     monkeypatch.setenv("AGENT_STORY_MUSIC_DIR", str(music_dir))
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         render_fn=_fake_render, output_dir=str(tmp_path))
     assert res["status"] == "held"
@@ -203,11 +207,16 @@ def test_empty_dir_library_still_holds(monkeypatch, tmp_path):
 
 
 def test_avatar_breach_holds(monkeypatch, tmp_path):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     _arm(monkeypatch)
     audio = tmp_path / "hype.mp3"
     audio.write_bytes(b"z")
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "HYROX prep starts now"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "HYROX prep starts now",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -222,7 +231,8 @@ def test_deny_rolls_back_and_logs(monkeypatch, tmp_path):
     audio.write_bytes(b"z")
     # selector store inert -> stamping no-ops, but the kv segment record is written.
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0", "a1"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0", "a1"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -249,7 +259,8 @@ def test_staged_story_writes_a_pending_approval_row(monkeypatch, tmp_path):
     audio = tmp_path / "hype.mp3"
     audio.write_bytes(b"z")
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -275,7 +286,8 @@ def test_calendar_insert_failure_holds_instead_of_claiming_staged(monkeypatch, t
             raise RuntimeError("supabase down")
 
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path), cal_store=_Boom())
@@ -307,7 +319,8 @@ def test_staged_story_row_targets_instagram_not_the_gym_key(monkeypatch, tmp_pat
     audio = tmp_path / "hype.mp3"
     audio.write_bytes(b"z")
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))
@@ -340,7 +353,8 @@ def test_deny_also_denies_the_approval_row_it_created(monkeypatch, tmp_path):
     audio = tmp_path / "hype.mp3"
     audio.write_bytes(b"z")
     res = ss.create_story(
-        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(),
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path))

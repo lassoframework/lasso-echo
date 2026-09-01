@@ -94,7 +94,11 @@ def test_overlay_copy_scrubs_dashes():
     assert "-" not in joined  # on-image text carries no ascii hyphen either
 
 
-def test_overlay_avatar_rail_blocks_hyrox_by_default():
+def test_overlay_avatar_rail_blocks_hyrox_by_default(monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     with pytest.raises(ov.OverlayRejected):
         ov.build_overlay("HYROX PREP STARTS NOW", identity_tokens=["City"], gym="pierce")
 
@@ -105,6 +109,25 @@ def test_overlay_avatar_rail_allows_hyrox_for_allowlisted_gym(monkeypatch):
                             identity_tokens=["Birmingham"], gym="birmingham")
     joined = " ".join(ln for fr in spec.frames for ln in fr)
     assert "HYROX" in joined
+
+
+# ---- identity anchor is a hard invariant on a REAL render (spec §1) --------
+def test_enforce_ask_refuses_a_render_with_no_identity_tokens():
+    """story_studio.py always calls build_overlay(enforce_ask=True) for a real
+    render. There is no server-side default for identity_tokens (the frontend must
+    supply the gym's city/name), so a render that would ship with no anchor at all
+    must HOLD, never silently post without one."""
+    with pytest.raises(ov.OverlayRejected):
+        ov.build_overlay("BOOK YOUR FREE INTRO", identity_tokens=(), gym="pierce",
+                         enforce_ask=True)
+
+
+def test_enforce_ask_false_is_the_card_builder_unit_path():
+    """enforce_ask defaults False (card-builder / unit use, where no render is
+    happening) — this path may build a spec with no identity_tokens; it is
+    story_studio's job, not build_overlay's, to refuse an actual render."""
+    spec = ov.build_overlay("BOOK YOUR FREE INTRO", identity_tokens=(), gym="pierce")
+    assert spec.frames  # no raise
 
 
 # ---- low confidence -> generic safe + flag ---------------------------------

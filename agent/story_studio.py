@@ -164,6 +164,7 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                 downloader=downloader)
 
         result = rfn(plan, output_dir=out_dir, ask_frame_text=overlay.ask,
+                     ask_frame_lines=overlay.ask_frame, overlay_frames=overlay.frames,
                      music_path=music_path)
     finally:
         if src_tmp:

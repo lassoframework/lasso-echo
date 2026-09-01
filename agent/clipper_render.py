@@ -416,6 +416,158 @@ def add_brand_frame(input_path, output_path,
     return output_path
 
 
+# ---- Part 8b: the Roxx overlay standard burn (hook + ask, spec §1) ------------------
+#
+# The overlay CONTENT (lines, contrast target, safe-zone bounds) is ALWAYS produced by
+# story_overlay.py's tested functions and passed in — this module never re-derives or
+# guesses copy, contrast, or position. It only turns already-validated data into real
+# ffmpeg drawbox/drawtext calls, reusing add_brand_frame's escaping + filter patterns.
+
+_OVERLAY_FONT_SIZE = 58     # px — legible on a 1080-wide frame at <=8 words/line
+_OVERLAY_LINE_GAP = 1.32    # line height multiplier
+_OVERLAY_PAD = 26           # px padding inside the scrim box (top/bottom)
+_OVERLAY_OUTER_MARGIN = 24  # px breathing room off the safe-zone boundary
+
+
+def probe_duration(path):
+    """ffprobe duration (seconds) of a media file. Raises RenderError when ffprobe
+    is absent or the probe fails — the overlay timing needs a REAL duration, never a
+    guess."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RenderError("ffprobe not found on PATH; cannot time the overlay burn")
+    result = subprocess.run(
+        [ffprobe, "-v", "quiet", "-print_format", "json", "-show_format", path],
+        capture_output=True, text=True)
+    try:
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except Exception as e:  # noqa: BLE001
+        raise RenderError(f"could not probe duration of {path}: {e}") from e
+
+
+def _extract_frame_png(input_path, at_t, out_png):
+    """Extract one real frame at at_t seconds to out_png. Used only to SAMPLE actual
+    backdrop pixels for the contrast math — never a stand-in for the burned output."""
+    cmd = [_ffmpeg(), "-y", "-ss", str(max(0.0, float(at_t))), "-i", input_path,
+          "-frames:v", "1", out_png]
+    _run(cmd, "extract_frame")
+    return out_png
+
+
+def _sample_backdrop_rgb(input_path, at_t, box, width=REEL_W, height=REEL_H):
+    """Mean RGB of the video's REAL pixels inside `box` (y_top, y_bottom), sampled
+    across the full frame width at time at_t. Feeds story_overlay.scrim_alpha_for so
+    the brand scrim is sized to the ACTUAL backdrop, never a fixed guess."""
+    from PIL import Image, ImageStat
+    with tempfile.TemporaryDirectory() as td:
+        png = os.path.join(td, "sample.png")
+        _extract_frame_png(input_path, at_t, png)
+        img = Image.open(png).convert("RGB")
+        if img.size != (width, height):
+            img = img.resize((width, height))
+        y_top, y_bottom = box
+        y_top = max(0, min(int(y_top), height - 1))
+        y_bottom = max(y_top + 1, min(int(y_bottom), height))
+        crop = img.crop((0, y_top, width, y_bottom))
+        r, g, b = ImageStat.Stat(crop).mean[:3]
+        return (int(r), int(g), int(b))
+
+
+def burn_overlay_block(input_path, output_path, lines, *, anchor="top",
+                       start_t=None, end_t=None, sample_t=None,
+                       width=REEL_W, height=REEL_H,
+                       fg_rgb=(255, 255, 255), scrim_rgb=(18, 30, 60)):
+    """
+    Burn ONE block of ALREADY-VALIDATED overlay `lines` (ALL-CAPS strings coming
+    straight out of story_overlay.py — density-wrapped, <=8 words/line, <=2
+    lines/frame; never re-wrapped or re-derived here) onto a video, per the Roxx
+    overlay standard:
+
+      * a brand scrim whose alpha comes from story_overlay.scrim_alpha_for(), fed a
+        REAL sampled backdrop color (never a fixed guess) so it clears the real
+        4.5:1 WCAG contrast target against THIS footage
+      * positioned inside the Story safe zone (top 250px / bottom 310px of a
+        1080x1920 frame) per story_overlay.safe_zone_ok(); a box that would violate
+        it raises RenderError instead of being drawn (the caller HOLDS the render
+        with an honest reason rather than burn a frame that fails its own
+        validation)
+      * anchor='top' places the block just inside the top safe boundary (the hook);
+        anchor='bottom' places it just inside the bottom safe boundary (the single
+        ask frame), always clear of the LASSO brand bar drawn later by
+        add_brand_frame
+      * start_t/end_t (seconds, optional): the block is visible only in that
+        window via ffmpeg drawtext's 'enable' expression; omitted = the whole clip
+
+    Raises RenderError when the render flag is OFF, ffmpeg is absent, `lines` is
+    empty, or the computed box fails the safe-zone check. Returns output_path.
+    """
+    from . import story_overlay as _ov
+
+    _require_render()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    lines = [str(ln or "").strip() for ln in (lines or []) if str(ln or "").strip()]
+    if not lines:
+        raise RenderError("burn_overlay_block: no lines to burn (empty overlay block); "
+                          "the render must HOLD rather than burn nothing")
+
+    line_h = int(_OVERLAY_FONT_SIZE * _OVERLAY_LINE_GAP)
+    block_h = _OVERLAY_PAD * 2 + line_h * len(lines)
+    safe_top, safe_bottom = _ov.safe_zone_bounds(height)
+    if anchor == "top":
+        y_top = safe_top + _OVERLAY_OUTER_MARGIN
+        y_bottom = y_top + block_h
+    else:
+        y_bottom = safe_bottom - _OVERLAY_OUTER_MARGIN
+        y_top = y_bottom - block_h
+
+    if not _ov.safe_zone_ok((y_top, y_bottom), frame_h=height):
+        raise RenderError(
+            f"overlay text box (top={y_top}px, bottom={y_bottom}px, "
+            f"{len(lines)} line(s)) violates the story safe zone "
+            f"(top>={_ov.SAFE_TOP}px, bottom<={height - _ov.SAFE_BOTTOM}px); "
+            f"render HELD, nothing burned")
+
+    sample_at = sample_t if sample_t is not None else (
+        ((start_t or 0.0) + end_t) / 2.0 if end_t is not None else (start_t or 0.0))
+    try:
+        backdrop = _sample_backdrop_rgb(input_path, sample_at, (y_top, y_bottom),
+                                        width=width, height=height)
+    except RenderError:
+        raise
+    except Exception as e:  # noqa: BLE001 - a sampling failure HOLDS, never guesses
+        raise RenderError(f"backdrop sample failed: {type(e).__name__}: {e}") from e
+    alpha = _ov.scrim_alpha_for(fg_rgb, backdrop, scrim_rgb=scrim_rgb)
+
+    def _esc(t):
+        return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+    fg_hex = "".join(f"{c:02X}" for c in fg_rgb)
+    scrim_hex = "".join(f"{c:02X}" for c in scrim_rgb)
+    enable = f":enable='between(t,{start_t or 0},{end_t})'" if end_t is not None else ""
+
+    vf_parts = []
+    if alpha > 0:
+        vf_parts.append(
+            f"drawbox=x=0:y={y_top}:w={width}:h={block_h}:"
+            f"color=0x{scrim_hex}@{alpha / 255:.3f}:t=fill{enable}")
+    for i, ln in enumerate(lines):
+        line_y = y_top + _OVERLAY_PAD + i * line_h
+        vf_parts.append(
+            f"drawtext=fontsize={_OVERLAY_FONT_SIZE}:fontcolor=0x{fg_hex}:"
+            f"text='{_esc(ln)}':x=(w-tw)/2:y={line_y}:font=Arial{enable}")
+    vf = ",".join(vf_parts)
+
+    cmd = [
+        _ffmpeg(), "-y", "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", "22", "-preset", "fast",
+        "-c:a", "copy",
+        output_path,
+    ]
+    _run(cmd, "burn_overlay_block")
+    return output_path
+
+
 # ---- orchestrator -------------------------------------------------------------------
 
 def render_clip(moment, media_path, transcript, output_dir, llm=None):

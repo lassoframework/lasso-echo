@@ -118,7 +118,7 @@ def _point_pool(monkeypatch, store):
 
 # ---- injected renderer that records the bound source paths -----------------
 def _recording_render(seen):
-    def _fn(plan, *, output_dir, ask_frame_text="", music_path=""):
+    def _fn(plan, *, output_dir, ask_frame_text="", music_path="", **_k):
         # capture what source_paths the wiring bound before the render.
         for s in plan.segments:
             seen.append(s.source_path)
@@ -203,7 +203,8 @@ def test_route_create_story_returns_staged(monkeypatch, tmp_path):
 
     status, body = routes.handle_create_story(
         "pierce_ig",
-        {"asset_ids": ["v1", "v2", "v3"], "brief": "Big lifts today"},
+        {"asset_ids": ["v1", "v2", "v3"], "brief": "Big lifts today",
+         "identity_tokens": ["Pierce"]},
         actor_id="coach1",
         store=_FakeStore(), music_library=_RealPathLibrary(str(audio)),
         render_fn=_recording_render([]))
@@ -222,7 +223,8 @@ def test_empty_pool_holds_honestly(monkeypatch, tmp_path):
     _point_pool(monkeypatch, FakeMediaStore(assets=[]))    # no assets
     store = _FakeStore()
     res = story_studio.create_story(
-        {"gym_id": "pierce", "asset_ids": [], "brief": "A win"},
+        {"gym_id": "pierce", "asset_ids": [], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
         store=store, music_library=_RealPathLibrary(str(audio)),
         output_dir=str(tmp_path))
     assert res["status"] == "held"
@@ -349,7 +351,7 @@ def test_event_one_tap_discovers_and_stages(monkeypatch, tmp_path):
     request = {
         "gym_id": "pierce", "account_key": "pierce",
         "asset_ids": ["e1", "e2", "e3"], "brief": "1 year party Saturday",
-        "requested_by": "coach1", "kind": "event",
+        "identity_tokens": ["Pierce"], "requested_by": "coach1", "kind": "event",
     }
     # inject the renderer so the offline test does not reach Drive; discovery still runs.
     res = gym_event.render_event_story(

@@ -79,7 +79,7 @@ def _cands(gym, n=6, seg=10.0):
              "end_ts": seg, "score": 90 - i} for i in range(n)]
 
 
-def _fake_render(plan, *, output_dir, ask_frame_text="", music_path=""):
+def _fake_render(plan, *, output_dir, ask_frame_text="", music_path="", **_k):
     return comp.ComposeResult(plan=plan, output_path=f"{output_dir}/final.mp4")
 
 
@@ -126,7 +126,8 @@ def test_create_hold_is_a_normal_200(monkeypatch, tmp_path):
     # a missing music ops asset HOLDS: nothing staged, honest reason, still a 200.
     _arm(monkeypatch)
     status, body = routes.handle_create_story(
-        "pierce_ig", {"asset_ids": ["a0"], "brief": "A win"},
+        "pierce_ig", {"asset_ids": ["a0"], "brief": "A win",
+                      "identity_tokens": ["Pierce"]},
         candidates=_cands("pierce"), store=_FakeStore(), render_fn=_fake_render)
     assert status == 200
     assert body["status"] == "held"
