@@ -367,6 +367,31 @@ def test_autoregister_puts_a_portal_known_gym_into_the_lane(monkeypatch, tmp_pat
     accounts._dynamic_cache = None
 
 
+def test_autoregister_passes_gym_id_to_register_gym(monkeypatch, tmp_path):
+    """autoregister HAS the portal gym_id in hand (it is its own second argument) -- it
+    must forward it to accounts.register_gym so the write-path dedup guard (the
+    Sunnyside/Swift River split-key fix) has a signal on this call site. Dropping it
+    silently would leave this door unguarded."""
+    monkeypatch.setenv("AGENT_ONBOARDING_AUTOREGISTER", "true")
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    calls = []
+    real = accounts.register_gym
+
+    def _spy(base, **kw):
+        calls.append((base, kw))
+        return real(base, **kw)
+    monkeypatch.setattr(accounts, "register_gym", _spy)
+    ow.run(deps=_unregistered(), alert=lambda m: None, kv=_KV())
+    assert calls, "register_gym was never called"
+    base, kw = calls[0]
+    assert base == "newbox"
+    assert kw.get("gym_id") == "g1"
+    accounts._dynamic_cache = None
+
+
 def test_autoregister_never_invents_a_name(monkeypatch, tmp_path):
     """No real name means no registration: a fabricated one becomes the gym's Zernio
     profile name and its account label."""

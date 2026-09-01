@@ -524,8 +524,28 @@ def _canonical_base(gym_id, answers):
         return ""
 
 
+def _default_gym_id_resolver(raw_key, base):
+    """Best-effort gym_id for a register_gym call, so the write-path dedup guard
+    (accounts.register_gym's gym_id cross-check) has a signal on this door too, not
+    only onboarding_watch.autoregister. Tries, in order: raw_key itself when it already
+    IS a portal UUID (the self-serve intake shape); else resolve_gym_uuid(base) via the
+    same shared resolver every other lane uses. Read-only; a miss returns None (the
+    caller registers with no gym_id rather than fabricating one, exactly like every
+    other resolver in this module)."""
+    if _looks_like_uuid(raw_key):
+        return raw_key
+    try:
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+        if not store.available():
+            return None
+        return store.resolve_gym_uuid(base)
+    except Exception:  # noqa: BLE001 - an honest miss, never a crash
+        return None
+
+
 def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
-                  resolver=None, approve=False):
+                  resolver=None, gym_id_resolver=None, approve=False):
     """Map EVERY un-routed social intake into Echo. Returns a per-base summary list.
 
     For each un-routed row (keyed by its raw client_key):
@@ -557,6 +577,7 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
     marker = marker or _default_marker
     onboard = onboard or onboard_from_social
     resolver = resolver or _default_token_resolver
+    gym_id_resolver = gym_id_resolver or _default_gym_id_resolver
 
     results = []
     for raw_key in lister():
@@ -607,11 +628,17 @@ def sync_unrouted(*, lister=None, reader=None, marker=None, onboard=None,
         if not have_account and _config.dynamic_accounts_enabled():
             gym = (answers or {}).get("gym") or {}
             try:
+                gid = None
+                try:
+                    gid = gym_id_resolver(raw_key, base)
+                except Exception:  # noqa: BLE001 - no signal is fine, never blocks registration
+                    gid = None
                 _accounts.register_gym(
                     base,
                     name=_clean(gym.get("name")) or base,
                     ig_handle=_clean(gym.get("ig_handle")),
-                    fb_page=_clean(gym.get("fb_page")))
+                    fb_page=_clean(gym.get("fb_page")),
+                    gym_id=gid)
                 have_account = _accounts.get_account(account_key) is not None
             except Exception as e:
                 ops_alerts.alert(f"social-intake-sync: auto-provision of '{base}' "

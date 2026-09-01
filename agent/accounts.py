@@ -306,6 +306,31 @@ class RegistryUnreadable(RuntimeError):
     WRITER, so a corrupt file is never mistaken for an empty one and saved over."""
 
 
+def _find_row_by_gym_id(rows, gym_id, *, exclude_base=None):
+    """The registry row already carrying this gym_id (excluding `exclude_base`), or
+    None. Pure; the only cross-row uniqueness check register_gym has."""
+    gid = (str(gym_id) if gym_id is not None else "").strip()
+    if not gid:
+        return None
+    for r in rows:
+        rb = (r.get("base") or "").strip()
+        if exclude_base is not None and rb == exclude_base:
+            continue
+        if (str(r.get("gym_id") or "")).strip() == gid:
+            return r
+    return None
+
+
+def find_base_for_gym_id(gym_id):
+    """Read-only: the base ALREADY registered for this gym_id, or None. Lets a caller
+    check before registering (or a test/tool assert single-key-ness) without going
+    through the locked write path."""
+    row = _find_row_by_gym_id(_load_registry_rows(), gym_id)
+    if not row:
+        return None
+    return (row.get("base") or "").strip() or None
+
+
 @contextlib.contextmanager
 def _registry_lock(path):
     """Exclusive advisory lock for a read-modify-write of the registry, held on a
@@ -396,16 +421,38 @@ def all_accounts():
     return list(ACCOUNTS) + _dynamic_accounts()
 
 
-def register_gym(base, *, name="", ig_handle="", fb_page=""):
+def register_gym(base, *, name="", ig_handle="", fb_page="", gym_id=None):
     """Persist one client gym to the dynamic registry so its Account records resolve
     without hand-editing accounts.py. Idempotent (a re-register updates in place).
     No-op returning [] when AGENT_DYNAMIC_ACCOUNTS is OFF. Returns the account keys
-    now resolvable for this gym. Tokens are NEVER written here (env, by hand)."""
+    now resolvable for this gym. Tokens are NEVER written here (env, by hand).
+
+    gym_id: optional, the gym's STABLE portal UUID, when the caller has one. THE
+    STRUCTURAL GUARD against the Sunnyside/Swift River class (2026-08-31): those two
+    gyms each ended up known under TWO account-registry bases because a second
+    registration path (a legacy manual key, a re-derived canonical key, a UUID-carrying
+    intake row) called register_gym with a base string and no cross-check against the
+    gym's real-world identity. every_consumer that iterates all_accounts() then
+    processed BOTH keys forever.
+
+    When gym_id is provided and a DIFFERENT base is already registered under that same
+    gym_id, this call REFUSES to mint a second row: it returns the EXISTING base's
+    account keys instead (idempotent-by-identity, mirroring canonical_account_key's own
+    issued_key contract) and fires one ops alert so the near-miss is visible. This makes
+    a second live registry row for one real gym structurally impossible at the ONE place
+    rows are ever created, rather than caught after the fact by a watchdog.
+
+    When gym_id is omitted the guard has no signal and cannot fire -- every write-path
+    caller that CAN resolve a gym_id (onboarding_watch.autoregister always can; the
+    intake-sweep callers resolve one best-effort via resolve_gym_uuid) MUST pass it. A
+    previously-stamped gym_id for this exact base is preserved across a later call that
+    omits it, so re-registration never erases a known-good stamp."""
     global _dynamic_cache
     from . import config
     base = (base or "").strip()
     if not base or not config.dynamic_accounts_enabled():
         return []
+    gym_id = (str(gym_id) if gym_id is not None else "").strip()
     path = config.gym_registry_path()
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -417,9 +464,32 @@ def register_gym(base, *, name="", ig_handle="", fb_page=""):
     # silently drop the first gym. At 100 gyms, concurrent signups are normal.
     with _registry_lock(path):
         rows = _load_registry_rows(strict=True)
+
+        # THE GUARD ITSELF. This gym_id already owns a DIFFERENT live base: refuse to
+        # fork the registry, return the existing base's keys, alert once. See the
+        # docstring above and account_key_split_watch.py for the incident this closes.
+        existing = _find_row_by_gym_id(rows, gym_id, exclude_base=base) if gym_id else None
+        if existing is not None:
+            existing_base = (existing.get("base") or "").strip()
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"register_gym: refused to register '{base}' as a NEW gym -- gym_id "
+                    f"{gym_id} is already registered under '{existing_base}'. Returned the "
+                    f"existing base's keys instead of forking the registry (this is the "
+                    "structural guard for the Sunnyside/Swift River split-key class; no "
+                    "action needed unless these two bases are genuinely different gyms).")
+            except Exception:  # noqa: BLE001 - the guard must never fail on its own alert
+                pass
+            _dynamic_cache = None
+            return [f"{existing_base}_ig", f"{existing_base}_fb"]
+
+        prior = next((r for r in rows if (r.get("base") or "").strip() == base), None)
         row = {"base": base, "name": (name or base).strip(),
                "ig_handle": (ig_handle or "").strip(),
-               "fb_page": (fb_page or "").strip()}
+               "fb_page": (fb_page or "").strip(),
+               # Never erase a previously-stamped gym_id with a call that omits one.
+               "gym_id": gym_id or (str((prior or {}).get("gym_id") or "").strip())}
         rows = [r for r in rows if (r.get("base") or "").strip() != base]
         rows.append(row)
         # ATOMIC. The old code opened the real path "w", which TRUNCATES first: a

@@ -287,7 +287,7 @@ def autoregister(base_key, gym_id, *, deps=None, alert=None):
         # let run() drop not_registered from the day's alert while NOTHING was written:
         # a fabricated success, which is the exact failure class this whole sweep
         # exists to catch.
-        if not accounts.register_gym(base_key, name=name):
+        if not accounts.register_gym(base_key, name=name, gym_id=gym_id):
             if alert:
                 alert(f"{base_key}: auto-register did nothing (the dynamic account "
                       "registry is off, so there is nowhere to write). It stays in "

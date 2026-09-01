@@ -153,3 +153,80 @@ def test_registering_a_second_gym_never_drops_the_first(monkeypatch, tmp_path):
     bases = {r["base"] for r in accounts._load_registry_rows()}
     assert bases == {"eng", "gritx"}
     assert not list(tmp_path.glob("*.tmp.*")), "a temp file was left behind"
+
+
+# ---- register_gym gym_id write-path guard (Sunnyside/Swift River split-key class,
+# 2026-08-31: the same real gym registered under TWO different base strings, so
+# all_accounts() served both keys forever). register_gym is the ONE place a registry
+# row is created; the guard lives there so a second live row for one gym_id is
+# structurally impossible, not merely detected after the fact. -----------------------
+
+def test_same_gym_id_twice_never_produces_two_live_registry_rows(monkeypatch, tmp_path):
+    """THE PIN. Registering the same gym_id twice under two different candidate bases
+    must never leave two rows in the registry: the second call is refused and returns
+    the FIRST base's keys instead of forking a second row."""
+    accounts, path = _reg_env(monkeypatch, tmp_path)
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda m: alerts.append(m))
+
+    first_keys = accounts.register_gym(
+        "swiftrivercrossfitd23567", name="Swift River CrossFit", gym_id="gym-uuid-1")
+    assert first_keys == ["swiftrivercrossfitd23567_ig", "swiftrivercrossfitd23567_fb"]
+
+    # Second onboarding path for the SAME gym_id, a DIFFERENT candidate base (the
+    # legacy/manual-key or re-derived-canonical-key shape).
+    second_keys = accounts.register_gym(
+        "swiftrivercrossfite5c9db", name="Swift River CrossFit", gym_id="gym-uuid-1")
+
+    # No fork: the second call is handed back the FIRST base's keys.
+    assert second_keys == first_keys
+
+    rows = accounts._load_registry_rows()
+    matching = [r for r in rows if r.get("gym_id") == "gym-uuid-1"]
+    assert len(matching) == 1, f"gym_id gym-uuid-1 has {len(matching)} live registry rows"
+    assert matching[0]["base"] == "swiftrivercrossfitd23567"
+    assert accounts.get_account("swiftrivercrossfite5c9db_ig") is None, \
+        "the refused second base must never resolve to an Account"
+    assert len(alerts) == 1 and "refused to register" in alerts[0]
+
+
+def test_register_gym_stamps_and_preserves_gym_id(monkeypatch, tmp_path):
+    """A re-registration that omits gym_id (a caller with no signal, e.g. the legacy
+    call sites before this fix) must never erase a gym_id already stamped."""
+    accounts, path = _reg_env(monkeypatch, tmp_path)
+    accounts.register_gym("boxfit", name="Box Fit", gym_id="gym-uuid-2")
+    accounts.register_gym("boxfit", name="Box Fit Renamed")   # no gym_id this time
+    rows = accounts._load_registry_rows()
+    row = next(r for r in rows if r["base"] == "boxfit")
+    assert row["gym_id"] == "gym-uuid-2"
+    assert row["name"] == "Box Fit Renamed"
+
+
+def test_find_base_for_gym_id(monkeypatch, tmp_path):
+    accounts, path = _reg_env(monkeypatch, tmp_path)
+    assert accounts.find_base_for_gym_id("gym-uuid-3") is None
+    accounts.register_gym("topfuel", name="Top Fuel", gym_id="gym-uuid-3")
+    assert accounts.find_base_for_gym_id("gym-uuid-3") == "topfuel"
+    assert accounts.find_base_for_gym_id("") is None
+
+
+def test_different_gym_ids_register_independently(monkeypatch, tmp_path):
+    """The guard must never block two genuinely DIFFERENT gyms, even with similar bases."""
+    accounts, path = _reg_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda m: None)
+    a = accounts.register_gym("crossfitlocal", name="CrossFit Local", gym_id="gym-a")
+    b = accounts.register_gym("crossfitlocal2", name="CrossFit Local Two", gym_id="gym-b")
+    assert a == ["crossfitlocal_ig", "crossfitlocal_fb"]
+    assert b == ["crossfitlocal2_ig", "crossfitlocal2_fb"]
+    bases = {r["base"] for r in accounts._load_registry_rows()}
+    assert bases == {"crossfitlocal", "crossfitlocal2"}
+
+
+def test_no_gym_id_signal_is_unchanged_behavior(monkeypatch, tmp_path):
+    """gym_id omitted entirely (no caller signal) -> today's behavior, byte for byte:
+    the guard cannot fire without a gym_id, by design (documented limitation)."""
+    accounts, path = _reg_env(monkeypatch, tmp_path)
+    keys = accounts.register_gym("boxfit", name="Box Fit", ig_handle="@boxfit")
+    assert keys == ["boxfit_ig", "boxfit_fb"]
+    row = next(r for r in accounts._load_registry_rows() if r["base"] == "boxfit")
+    assert row["gym_id"] == ""

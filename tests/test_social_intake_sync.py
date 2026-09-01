@@ -78,6 +78,35 @@ def test_auto_provisions_account_when_dynamic_enabled(monkeypatch, tmp_path):
     accounts._dynamic_cache = None
 
 
+def test_auto_provision_forwards_gym_id_to_register_gym(monkeypatch, tmp_path):
+    """The write-path dedup guard (accounts.register_gym's gym_id cross-check, the
+    Sunnyside/Swift River split-key fix) needs a signal on THIS door too. When the
+    injected gym_id_resolver returns a uuid, it must reach register_gym."""
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    from agent import accounts
+    accounts._dynamic_cache = None
+    calls = []
+    real = accounts.register_gym
+
+    def _spy(base, **kw):
+        calls.append((base, kw))
+        return real(base, **kw)
+    monkeypatch.setattr(accounts, "register_gym", _spy)
+
+    sir.sync_unrouted(
+        lister=lambda: ["newbox2"],
+        reader=lambda b: {"gym": {"name": "New Box Two"}},
+        marker=lambda b, a: True,
+        onboard=lambda *a, **k: {"sources_created": 1},
+        gym_id_resolver=lambda raw, base: "portal-uuid-42")
+    assert calls, "register_gym was never called"
+    base, kw = calls[0]
+    assert base == "newbox2"
+    assert kw.get("gym_id") == "portal-uuid-42"
+    accounts._dynamic_cache = None
+
+
 def test_no_account_and_dynamic_off_still_skips(monkeypatch):
     """Flag OFF: a base with no account is skipped with an alert (never fabricated)."""
     monkeypatch.delenv("AGENT_DYNAMIC_ACCOUNTS", raising=False)

@@ -376,10 +376,23 @@ def _land_intake_form(client, payload, r2, key, manifest):
         if config.onboarding_autoregister_enabled() and proposal.get("gym_name"):
             try:
                 from . import accounts as _accounts
+                # Best-effort gym_id so register_gym's write-path dedup guard has a
+                # signal on this door too (see accounts.register_gym docstring / the
+                # Sunnyside-Swift River split-key class). A miss registers with no
+                # gym_id, exactly like today -- never blocks the landing.
+                gid = None
+                try:
+                    from .portal_calendar_store import SupabaseCalendarStore
+                    _store = SupabaseCalendarStore()
+                    if _store.available():
+                        gid = _store.resolve_gym_uuid(client)
+                except Exception:  # noqa: BLE001
+                    gid = None
                 registered = bool(_accounts.register_gym(
                     client, name=proposal["gym_name"],
                     ig_handle=proposal.get("ig_handle", ""),
-                    fb_page=proposal.get("fb_page", "")))
+                    fb_page=proposal.get("fb_page", ""),
+                    gym_id=gid))
             except Exception as exc:  # noqa: BLE001 - never fail the intake landing
                 ops_alerts.alert(
                     f"{client}: intake landed but auto-register failed "
