@@ -980,3 +980,28 @@ def test_partial_repair_moves_the_score(monkeypatch):
     mostly_fixed = grade_month(_book(3), profile="GYM").total
     assert mostly_fixed > all_bad, (
         f"repairing 27 of 30 posts must raise the score: {all_bad} -> {mostly_fixed}")
+
+
+def test_overcap_pass_respects_the_llm_budget(monkeypatch):
+    """The over-cap move genuinely needs the LLM (it must find a DIFFERENT
+    approved category), and it iterates up to 6 waves. Unbounded, one gym could
+    eat the whole nightly run — hillcountry's over-cap pass alone outran a ten
+    minute ceiling. A spent budget stops it honestly instead."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    calls = []
+
+    def _regen(r, a, c=""):
+        calls.append(r)
+        return (_a_caption(80), "education")
+
+    rows = [_row(i, f"2026-09-{(i + 1):02d}", _a_caption(i), pillar="offer")
+            for i in range(12)]
+    store = _FakeStore(rows)
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, store, profile="GYM",
+        defects=[("content_mix", "offer", "offer is 100% of posts (over 25%)")],
+        today_iso=TODAY, caption_regen=_regen,
+        gap_filler=lambda *a, **k: "none", llm_budget_s=-1)
+    assert calls == [], "no LLM spend on the over-cap pass once the budget is gone"
+    assert out["repillared"] == 0
+    assert out["ok"] is True, "a spent budget is an honest stop, not a failure"

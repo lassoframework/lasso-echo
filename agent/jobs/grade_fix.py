@@ -153,7 +153,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 
     # ---- a) true duplicate captions (same hash on more than one date) ------
     dup_fixed, dup_skipped = _fix_duplicates(
-        gym_id, rows, store, caption_regen, avoid, log)
+        gym_id, rows, store, caption_regen, avoid, log, deadline=deadline)
     result["captions_fixed"] = dup_fixed
     result["skipped"] += dup_skipped
     if dup_fixed:
@@ -161,7 +161,8 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 
     # ---- c) category over-cap (iterates to convergence) ---------------------
     over_fixed, over_skipped = _fix_overcap(
-        gym_id, rows, store, defects, caption_regen, avoid, log)
+        gym_id, rows, store, defects, caption_regen, avoid, log,
+        deadline=deadline)
     result["repillared"] = over_fixed
     result["skipped"] += over_skipped
     if over_fixed:
@@ -215,7 +216,8 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 # a) duplicate captions
 # ---------------------------------------------------------------------------
 
-def _fix_duplicates(gym_id, rows, store, caption_regen, avoid, log):
+def _fix_duplicates(gym_id, rows, store, caption_regen, avoid, log,
+                    deadline=None):
     """Rewrite true duplicate-caption days (same hash on >1 post_date).
 
     Keeper: the earliest date holding the hash — unless a human-owned row holds
@@ -237,7 +239,7 @@ def _fix_duplicates(gym_id, rows, store, caption_regen, avoid, log):
         wipe_dates = sorted(d for d in by_date if d not in locked_dates)
         fix_dates = wipe_dates if locked_dates else wipe_dates[1:]
         for d in fix_dates:
-            if caption_regen is None:
+            if caption_regen is None or not _budget_left(deadline):
                 skipped += 1
                 continue
             out = None
@@ -277,7 +279,8 @@ def _over_cap_cats(rows):
     return sorted(cat for cat, count in counts.items() if count / n > 0.25)
 
 
-def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
+def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log,
+                 deadline=None):
     """Iterate the over-cap move until every category is at or under 25% of
     the plan or no more wipeable rows can honestly move. Activation is still
     gated on the GRADER's defect list (this pass never runs speculatively);
@@ -295,8 +298,11 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
 
     total_fixed = total_skipped = 0
     for _ in range(_OVERCAP_MAX_ITER):
+        if not _budget_left(deadline):
+            break              # bounded: the nightly run always finishes
         fixed, skipped = _overcap_pass(gym_id, rows, over_cats, store,
-                                       caption_regen, avoid, log)
+                                       caption_regen, avoid, log,
+                                       deadline=deadline)
         total_fixed += fixed
         total_skipped += skipped
         over_cats = _over_cap_cats(rows)
@@ -305,7 +311,8 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log):
     return total_fixed, total_skipped
 
 
-def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log):
+def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
+                  deadline=None):
     """One over-cap move wave: re-pillar excess wipeable days of each over-25%
     category by regenerating their caption from a DIFFERENT approved source
     category (the pillar label follows the caption that actually wrote the
@@ -331,6 +338,8 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log):
             grp = by_date[d]
             if any(not _is_wipeable(r) for r in grp):
                 continue                       # human-owned day is never re-pointed
+            if not _budget_left(deadline):
+                break                          # bounded LLM spend, honest stop
             out = None
             try:
                 out = caption_regen(grp[0], avoid, cat)
