@@ -61,6 +61,39 @@ def test_dynamic_account_auto_provision_and_isolation(monkeypatch, tmp_path):
     assert accounts.get_account("boxfit_ig") is None         # gone when OFF
 
 
+def test_dynamic_accounts_picks_up_an_external_edit_without_restart(monkeypatch, tmp_path):
+    """LIVE INCIDENT (2026-09-01): the daemon's cache was keyed on the registry PATH
+    only, which never changes for the process's whole life. An ops fix applied from
+    a SEPARATE process (railway ssh, exactly how every registry repair was applied
+    tonight) edited the file on disk correctly, but the long-running daemon kept
+    serving the OLD list for hours — a dead gym key resurrected a stale sample book
+    under it well after every other store was clean. register_gym's own
+    `_dynamic_cache = None` only helps a caller in the SAME process; this simulates
+    the cross-process case directly by writing the file with plain I/O, the way an
+    external script does, never touching this process's cache variable."""
+    import json
+    import time
+
+    monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
+    reg = tmp_path / "reg.json"
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(reg))
+    accounts._dynamic_cache = None
+
+    reg.write_text(json.dumps([{"base": "deadgym", "name": "Dead Gym"}]))
+    assert accounts.get_account("deadgym_ig") is not None   # cache primed, sees it
+
+    # An EXTERNAL process repairs the file — this process's cache is never told.
+    time.sleep(0.01)   # ensure a distinct mtime on every filesystem's clock resolution
+    reg.write_text(json.dumps([{"base": "realgym", "name": "Real Gym"}]))
+
+    # No accounts._dynamic_cache = None here — proving the mtime check alone
+    # is what makes the next read see the repaired file.
+    assert accounts.get_account("deadgym_ig") is None, \
+        "the dead gym must not resolve once the file was repaired, even without " \
+        "an in-process cache invalidation"
+    assert accounts.get_account("realgym_ig") is not None
+
+
 def test_register_gym_is_idempotent(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DYNAMIC_ACCOUNTS", "true")
     monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))

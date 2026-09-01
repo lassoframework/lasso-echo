@@ -398,21 +398,35 @@ def _load_registry_rows(*, strict=False):
 
 def _dynamic_accounts():
     """Dynamic client accounts, cached per process. Empty when the flag is OFF.
-    The cache is keyed on the registry path so a runtime path change never serves
-    stale rows from a different registry (defense in depth; single-registry in prod)."""
+
+    CROSS-PROCESS STALENESS (found live 2026-09-01): the cache used to be keyed on
+    the registry PATH alone, which stays constant for the process's whole life. A
+    fix applied from a SEPARATE process (an ops script over `railway ssh`, exactly
+    how every registry repair tonight was applied) edits the file on disk but never
+    touches the long-running daemon's in-memory cache — `register_gym`'s own
+    `_dynamic_cache = None` invalidation only helps a caller IN THE SAME PROCESS.
+    The daemon kept serving a dead gym key for hours after the file, the sqlite
+    rows, and every other store were already clean, and re-created a stale sample
+    book under it. The cache key now includes the file's mtime, so ANY edit from
+    ANY process is picked up on this process's very next call — no restart, no
+    coordination, self-healing."""
     global _dynamic_cache
     from . import config
     if not config.dynamic_accounts_enabled():
         return []
     path = config.gym_registry_path()
-    if _dynamic_cache is None or _dynamic_cache[0] != path:
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime = None   # file absent -> treat as its own stable "version"
+    if _dynamic_cache is None or _dynamic_cache[0] != (path, mtime):
         hardcoded = {a.key for a in ACCOUNTS}
         out = []
         for row in _load_registry_rows():
             for acct in _account_from_registry_row(row):
                 if acct.key not in hardcoded:   # hardcoded always wins
                     out.append(acct)
-        _dynamic_cache = (path, out)
+        _dynamic_cache = ((path, mtime), out)
     return _dynamic_cache[1]
 
 
