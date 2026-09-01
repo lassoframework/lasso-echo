@@ -26,18 +26,26 @@ import subprocess
 import tempfile
 
 from . import config
+from . import story_layout as _sl
 
 REEL_W = 1080
 REEL_H = 1920
-LOWER_H = 70    # lower-third bar height (pixels)
+# LOWER_H is the brand bar's height. DEFERRED to story_layout.BRAND_BAR_H (the
+# merged layout authority, ruling 3 2026-09-01) so the overlay's safe-zone
+# check and the brand bar's actual drawn footprint can never drift apart —
+# change the bar's height in ONE place (story_layout.py) and both move
+# together. Kept as a module-level name for existing callers/tests.
+LOWER_H = _sl.BRAND_BAR_H    # lower-third bar height (pixels)
 
 # Caption vertical position as a fraction of frame height, measured from the
 # bottom. 0.417 of a 1920px frame ~= 800px (lower-middle / second-third of the
 # frame). Scales correctly to any height (e.g. 1:1 1080 -> ~450px).
 _CAPTION_MARGIN_FRAC = 0.417
 
-_BRAND_NAVY_HEX = "121E3C"   # without # — LASSO V3 house-style navy
-_BRAND_RED_HEX = "FF0000"    # LASSO V3 house-style red
+_BRAND_NAVY_HEX = "121E3C"   # without # — LASSO V3 house-style navy (canonical)
+_BRAND_RED_HEX = "FF0000"    # LASSO V3 house-style red (canonical)
+_BRAND_SKY_HEX = "5EB9E6"    # LASSO V3 house-style sky (canonical)
+_BRAND_CREAM_HEX = "FAF6F0"  # LASSO V3 house-style cream (canonical)
 _BRAND_WHITE_HEX = "FFFFFF"
 
 _CAPTION_FONT_SIZE = 100   # px — large enough for mobile
@@ -371,23 +379,37 @@ def burn_captions(input_path, output_path, transcript, start_ts, end_ts,
 
 # ---- Part 8: LASSO brand frame + safe margins ---------------------------------------
 
+def _esc_ffmpeg(t):
+    """Escape a string for ffmpeg's drawtext filter arguments (text=, fontfile=)."""
+    return str(t).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
 def add_brand_frame(input_path, output_path,
                     logo_text="LASSO", handle_text="@GymMarketingMadeSimple",
-                    width=REEL_W, height=REEL_H):
+                    width=REEL_W, height=REEL_H, identity_text=None):
     """
     Overlay the LASSO brand frame on a vertical or square video.
     Design: thin LOWER_H-px solid navy bar at the bottom.
     - 3px LASSO red accent line at the very top of the bar
     - Logo left-aligned, white, vertically centered in bar
-    - Handle right-aligned, white, vertically centered in bar
-    Uses ffmpeg 'ih'/'iw' expressions so it adapts to any frame size.
+    - Handle right-aligned, white, vertically centered in bar — UNLESS
+      `identity_text` is given (ruling 3, 2026-09-01: on the Story's ask frame,
+      the identity anchor city/gym name moves INTO the brand bar in place of
+      the handle, so the ask frame's own overlay budget stays free for the ask
+      alone; see story_layout.identity_text_for_bar, the one place this text
+      is formatted).
+    Uses ffmpeg 'ih'/'iw' expressions so it adapts to any frame size, and an
+    explicit fontfile= (story_layout.OVERLAY_FONT_PATH) so the brand bar's
+    text renders in the SAME font this module measures for the overlay
+    character budget — no dependence on fontconfig name resolution.
     Raises RenderError when the render flag is OFF or ffmpeg is absent.
     """
     _require_render()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    def _esc(t):
-        return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    right_text = identity_text if identity_text else handle_text
+    right_size = 26 if identity_text else 22
+    fontfile = _esc_ffmpeg(_sl.OVERLAY_FONT_PATH)
 
     vf_parts = [
         # Solid navy brand bar (full width, LOWER_H tall, anchored to bottom)
@@ -397,11 +419,16 @@ def add_brand_frame(input_path, output_path,
         f"drawbox=x=0:y=ih-{LOWER_H}:w=iw:h=3:"
         f"color=0x{_BRAND_RED_HEX}@1.0:t=fill",
         # Logo: white, left-aligned, vertically centered via th expression
+        # (unchanged brand color -- ruling 2's cream-type call is about the
+        # Roxx overlay scrim card specifically, not this pre-existing bar used
+        # by every clipper render, Story or not).
         f"drawtext=fontsize=42:fontcolor=0x{_BRAND_WHITE_HEX}:"
-        f"text='{_esc(logo_text)}':x=28:y=h-{LOWER_H}+({LOWER_H}-th)/2:font=Arial",
-        # Handle: white, right-aligned, same vertical center
-        f"drawtext=fontsize=22:fontcolor=0x{_BRAND_WHITE_HEX}:"
-        f"text='{_esc(handle_text)}':x=w-tw-28:y=h-{LOWER_H}+({LOWER_H}-th)/2:font=Arial",
+        f"text='{_esc_ffmpeg(logo_text)}':x=28:y=h-{LOWER_H}+({LOWER_H}-th)/2:"
+        f"fontfile='{fontfile}'",
+        # Handle / identity: white, right-aligned, same vertical center
+        f"drawtext=fontsize={right_size}:fontcolor=0x{_BRAND_WHITE_HEX}:"
+        f"text='{_esc_ffmpeg(right_text)}':x=w-tw-28:y=h-{LOWER_H}+({LOWER_H}-th)/2:"
+        f"fontfile='{fontfile}'",
     ]
     vf = ",".join(vf_parts)
 
@@ -418,15 +445,23 @@ def add_brand_frame(input_path, output_path,
 
 # ---- Part 8b: the Roxx overlay standard burn (hook + ask, spec §1) ------------------
 #
-# The overlay CONTENT (lines, contrast target, safe-zone bounds) is ALWAYS produced by
-# story_overlay.py's tested functions and passed in — this module never re-derives or
-# guesses copy, contrast, or position. It only turns already-validated data into real
-# ffmpeg drawbox/drawtext calls, reusing add_brand_frame's escaping + filter patterns.
+# The overlay CONTENT (lines, character budget, safe-zone bounds, fonts, box
+# geometry) is ALWAYS produced by story_layout.py (the merged layout authority,
+# ruling 3 2026-09-01) and story_overlay.py's tested functions — this module
+# never re-derives or guesses copy, contrast, position, or font. It only turns
+# already-validated data into real ffmpeg drawbox/drawtext/overlay calls.
 
-_OVERLAY_FONT_SIZE = 58     # px — legible on a 1080-wide frame at <=8 words/line
-_OVERLAY_LINE_GAP = 1.32    # line height multiplier
-_OVERLAY_PAD = 26           # px padding inside the scrim box (top/bottom)
-_OVERLAY_OUTER_MARGIN = 24  # px breathing room off the safe-zone boundary
+_OVERLAY_FONT_SIZE = _sl.OVERLAY_FONT_SIZE   # kept as a module alias; story_layout owns it
+
+# The scrim alpha is sized against a SAFETY-MARGINED target, not the bare 4.5
+# WCAG bar (story_overlay.TARGET_CONTRAST). A discrete worst-case grid
+# (_worst_backdrop_rgb samples a finite number of instants/points) can still
+# miss a genuinely worse pixel between samples, and H.264 compression can
+# introduce a stray bright/dark pixel at a sharp scrim/footage boundary that a
+# single continuous frame wouldn't have. ~12% headroom absorbs both without
+# materially darkening the card on already-easy backdrops (scrim_alpha_for
+# only adds alpha when the backdrop actually needs it).
+_CONTRAST_SAFETY_TARGET = 5.0
 
 
 def probe_duration(path):
@@ -466,49 +501,127 @@ def _extract_frame_png(input_path, at_t, out_png):
     return out_png
 
 
-def _sample_backdrop_rgb(input_path, at_t, box, width=REEL_W, height=REEL_H):
-    """Mean RGB of the video's REAL pixels inside `box` (y_top, y_bottom), sampled
-    across the full frame width at time at_t. Feeds story_overlay.scrim_alpha_for so
-    the brand scrim is sized to the ACTUAL backdrop, never a fixed guess."""
-    from PIL import Image, ImageStat
+def _sample_times(start_t, end_t, n=5, margin=0.15):
+    """n evenly-spaced instants across [start_t, end_t] (n=1 -> just start_t).
+    Ruling 2 (2026-09-01): contrast must be sized from the WORST moment across
+    the full on-screen window, not one midpoint instant -- a frame can be dark
+    when the block first appears and pan to a bright wall two seconds later.
+
+    Insets `margin` seconds from BOTH edges: a seek landing exactly at (or
+    past) the container's reported end can hit past the last encoded video
+    frame, and _extract_frame_png raises loudly in that case (by design, it
+    means a real truncated track) -- but here it would misfire on a totally
+    healthy clip just because the sample window's own end_t equals the
+    video's total duration. Sampling strictly inside the window avoids that
+    false alarm while still covering the real displayed range."""
+    s = float(start_t or 0.0)
+    e = float(end_t) if end_t is not None else s
+    if e <= s:
+        return [s]
+    inset = min(margin, (e - s) / 4)
+    lo, hi = s + inset, e - inset
+    if hi <= lo:
+        return [(s + e) / 2.0]
+    if n <= 1:
+        return [lo]
+    return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+
+
+def _worst_backdrop_rgb(input_path, start_t, end_t, box, *, fg_rgb,
+                        width=REEL_W, height=REEL_H, n_times=5, n_cols=7, n_rows=4):
+    """The single pixel, across MULTIPLE instants in [start_t, end_t] AND
+    multiple rows/columns within `box`, that gives `fg_rgb` the WORST (lowest)
+    contrast ratio. Ruling 2: a mean-of-one-instant sample let bare light text
+    sit undetected on a bright wall (the mean diluted a small bright patch
+    across the whole band); sampling a grid of real points and taking the
+    single worst one catches that instead. Returns (rgb, contrast_ratio)."""
+    from PIL import Image
+    from . import story_overlay as _ov
+
+    y_top, y_bottom = box
+    y_top = max(0, min(int(y_top), height - 1))
+    y_bottom = max(y_top + 1, min(int(y_bottom), height))
+
+    worst_rgb, worst_c = (0, 0, 0), None
     with tempfile.TemporaryDirectory() as td:
-        png = os.path.join(td, "sample.png")
-        _extract_frame_png(input_path, at_t, png)
-        img = Image.open(png).convert("RGB")
-        if img.size != (width, height):
-            img = img.resize((width, height))
-        y_top, y_bottom = box
-        y_top = max(0, min(int(y_top), height - 1))
-        y_bottom = max(y_top + 1, min(int(y_bottom), height))
-        crop = img.crop((0, y_top, width, y_bottom))
-        r, g, b = ImageStat.Stat(crop).mean[:3]
-        return (int(r), int(g), int(b))
+        for i, t in enumerate(_sample_times(start_t, end_t, n_times)):
+            png = os.path.join(td, f"sample_{i}.png")
+            _extract_frame_png(input_path, t, png)
+            img = Image.open(png).convert("RGB")
+            if img.size != (width, height):
+                img = img.resize((width, height))
+            crop = img.crop((0, y_top, width, y_bottom))
+            cw, ch = crop.size
+            if cw <= 0 or ch <= 0:
+                continue
+            px = crop.load()
+            xs = sorted({min(cw - 1, int(cw * k / (n_cols - 1))) for k in range(n_cols)})
+            ys = sorted({min(ch - 1, int(ch * k / (max(2, n_rows) - 1)))
+                        for k in range(max(2, n_rows))})
+            for x in xs:
+                for y in ys:
+                    rgb = px[x, y]
+                    c = _ov.contrast_ratio(fg_rgb, rgb)
+                    if worst_c is None or c < worst_c:
+                        worst_c, worst_rgb = c, rgb
+    if worst_c is None:
+        raise RenderError(
+            f"no pixels sampled inside box (top={y_top}, bottom={y_bottom}) across "
+            f"t={start_t}..{end_t}; the overlay contrast cannot be sized without a "
+            f"real sample, render HELD")
+    return worst_rgb, worst_c
+
+
+def _make_scrim_png(w, h, rgb, alpha, out_path, radius=22):
+    """A single RGBA PNG: a rounded rectangle filled with `rgb` at `alpha`
+    (0..255), matching the LASSO deck's own card treatment (ruling 2: navy
+    scrim, consistent corner radius). ffmpeg's drawbox has no native rounded-
+    corner support, so the scrim is composited as an image via `overlay=`
+    instead of drawn with drawbox -- this is the ONE place a rounded card is
+    produced, so every scrim (hook or ask) looks identical."""
+    from PIL import Image, ImageDraw
+    w, h = max(1, int(w)), max(1, int(h))
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    r = max(0, min(int(radius), w // 2, h // 2))
+    fill = (int(rgb[0]), int(rgb[1]), int(rgb[2]), int(max(0, min(255, alpha))))
+    draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=fill)
+    img.save(out_path)
+    return out_path
 
 
 def burn_overlay_block(input_path, output_path, lines, *, anchor="top",
                        start_t=None, end_t=None, sample_t=None,
                        width=REEL_W, height=REEL_H,
-                       fg_rgb=(255, 255, 255), scrim_rgb=(18, 30, 60)):
+                       fg_rgb=None, scrim_rgb=None, anchor_text=None):
     """
     Burn ONE block of ALREADY-VALIDATED overlay `lines` (ALL-CAPS strings coming
-    straight out of story_overlay.py — density-wrapped, <=8 words/line, <=2
-    lines/frame; never re-wrapped or re-derived here) onto a video, per the Roxx
-    overlay standard:
+    straight out of story_overlay.py — density-wrapped, <=8 words/line, <=char
+    budget/line; never re-wrapped or re-derived here) onto a video, per the Roxx
+    overlay standard (as rebuilt 2026-09-01 after the 0/10 pixel-measured proof):
 
-      * a brand scrim whose alpha comes from story_overlay.scrim_alpha_for(), fed a
-        REAL sampled backdrop color (never a fixed guess) so it clears the real
-        4.5:1 WCAG contrast target against THIS footage
-      * positioned inside the Story safe zone (top 250px / bottom 310px of a
-        1080x1920 frame) per story_overlay.safe_zone_ok(); a box that would violate
-        it raises RenderError instead of being drawn (the caller HOLDS the render
-        with an honest reason rather than burn a frame that fails its own
-        validation)
-      * anchor='top' places the block just inside the top safe boundary (the hook);
-        anchor='bottom' places it just inside the bottom safe boundary (the single
-        ask frame), always clear of the LASSO brand bar drawn later by
-        add_brand_frame
+      * a LASSO-branded scrim (navy, rounded corners, cream type by default —
+        story_layout / the canonical V3 palette) whose alpha comes from
+        story_overlay.scrim_alpha_for(), fed the WORST real sampled backdrop
+        pixel across the FULL start_t..end_t display window (ruling 2), never
+        one midpoint instant and never a whole-band mean
+      * positioned via story_layout's box geometry (hook_box for anchor='top',
+        ask_box for anchor='bottom'), inside the safe zone that is itself
+        DERIVED from the brand bar's real footprint (ruling 3) — a box that
+        would violate it raises RenderError instead of being drawn
+      * each line's REAL rendered width (story_layout.measure_text_width, the
+        same font ffmpeg's drawtext uses) is checked against the box's usable
+        width; a line that still overflows at burn time (both the generation-
+        time character cap AND the approval-card cap already having run)
+        shrinks the WHOLE block's font size as a failsafe (never below
+        story_layout.SHRINK_FONT_FLOOR) and logs an ops alert loudly — this
+        firing at all means an upstream cap failed to catch something
+      * anchor_text (optional): a small identity-anchor line (city/gym, ruling
+        3) burned just below a 'top' block on EVERY hook frame — never on the
+        'bottom' (ask) frame, where the identity instead moves into the brand
+        bar (see clipper_render.add_brand_frame's identity_text)
       * start_t/end_t (seconds, optional): the block is visible only in that
-        window via ffmpeg drawtext's 'enable' expression; omitted = the whole clip
+        window via ffmpeg's 'enable' expression; omitted = the whole clip
 
     Raises RenderError when the render flag is OFF, ffmpeg is absent, `lines` is
     empty, or the computed box fails the safe-zone check. Returns output_path.
@@ -522,61 +635,161 @@ def burn_overlay_block(input_path, output_path, lines, *, anchor="top",
         raise RenderError("burn_overlay_block: no lines to burn (empty overlay block); "
                           "the render must HOLD rather than burn nothing")
 
-    line_h = int(_OVERLAY_FONT_SIZE * _OVERLAY_LINE_GAP)
-    block_h = _OVERLAY_PAD * 2 + line_h * len(lines)
-    safe_top, safe_bottom = _ov.safe_zone_bounds(height)
-    if anchor == "top":
-        y_top = safe_top + _OVERLAY_OUTER_MARGIN
-        y_bottom = y_top + block_h
-    else:
-        y_bottom = safe_bottom - _OVERLAY_OUTER_MARGIN
-        y_top = y_bottom - block_h
+    # Canonical LASSO V3 palette (ruling 2): navy scrim, cream type. Defaults
+    # kept as function params (not hardcoded in the call) so a caller CAN
+    # override for a proof/before-after comparison; production never does.
+    if fg_rgb is None:
+        fg_rgb = tuple(int(_BRAND_CREAM_HEX[i:i + 2], 16) for i in (0, 2, 4))
+    if scrim_rgb is None:
+        scrim_rgb = tuple(int(_BRAND_NAVY_HEX[i:i + 2], 16) for i in (0, 2, 4))
 
-    if not _ov.safe_zone_ok((y_top, y_bottom), frame_h=height):
+    box_fn = _sl.hook_box if anchor == "top" else _sl.ask_box
+    y_top, y_bottom = box_fn(len(lines), frame_h=height)
+
+    if not _sl.safe_zone_ok((y_top, y_bottom), frame_h=height):
+        lo, hi = _sl.safe_zone_bounds(height)
         raise RenderError(
             f"overlay text box (top={y_top}px, bottom={y_bottom}px, "
             f"{len(lines)} line(s)) violates the story safe zone "
-            f"(top>={_ov.SAFE_TOP}px, bottom<={height - _ov.SAFE_BOTTOM}px); "
-            f"render HELD, nothing burned")
+            f"(top>={lo}px, bottom<={hi}px, derived from the brand bar's real "
+            f"footprint); render HELD, nothing burned")
 
-    sample_at = sample_t if sample_t is not None else (
-        ((start_t or 0.0) + end_t) / 2.0 if end_t is not None else (start_t or 0.0))
+    anchor_bounds = None
+    if anchor_text and anchor == "top":
+        anchor_bounds = _sl.anchor_box((y_top, y_bottom), frame_h=height)
+        if not _sl.safe_zone_ok(anchor_bounds, frame_h=height):
+            raise RenderError(
+                f"identity-anchor box (top={anchor_bounds[0]}px, "
+                f"bottom={anchor_bounds[1]}px) violates the story safe zone; "
+                f"render HELD, nothing burned")
+
+    box_w = width - 2 * _sl.OVERLAY_PAD_X
+    # usable_w matches EXACTLY the width story_layout.MAX_CHARS_PER_LINE was
+    # measured against (FRAME_W - 2*OVERLAY_PAD_X) -- using a narrower number
+    # here would make this failsafe fire on lines the generation-time cap
+    # already legitimately cleared.
+    usable_w = box_w
+
+    # ---- render-time failsafe: REAL measured width, shrink only if needed ----
+    font_size = _sl.OVERLAY_FONT_SIZE
+    widest = max((_sl.measure_text_width(ln, font_size=font_size) for ln in lines),
+                 default=0)
+    if widest > usable_w:
+        font_size, fits = _sl.fit_font_size(
+            max(lines, key=lambda s: _sl.measure_text_width(s, font_size=_sl.OVERLAY_FONT_SIZE)),
+            max_width=usable_w, start_size=_sl.OVERLAY_FONT_SIZE)
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(
+                "story overlay shrink-to-fit failsafe fired: a line still "
+                f"overflowed at burn time ({widest:.0f}px > {usable_w}px usable) "
+                f"despite the generation-time character cap; shrunk font to "
+                f"{font_size}px (fits={fits}). Both upstream caps missed "
+                f"something -- investigate story_layout.MAX_CHARS_PER_LINE / "
+                f"the approval-card editor cap.")
+        except Exception:  # noqa: BLE001 - an alert failure must never block the burn
+            pass
+
+    line_h = int(font_size * _sl.OVERLAY_LINE_GAP)
+    block_h = _sl.OVERLAY_PAD * 2 + line_h * len(lines)
+    if anchor == "top":
+        y_bottom = y_top + block_h
+    else:
+        y_top = y_bottom - block_h
+
+    sample_start = start_t if start_t is not None else 0.0
+    sample_end = end_t if end_t is not None else sample_t if sample_t is not None else sample_start
     try:
-        backdrop = _sample_backdrop_rgb(input_path, sample_at, (y_top, y_bottom),
-                                        width=width, height=height)
+        backdrop, _worst_c = _worst_backdrop_rgb(
+            input_path, sample_start, sample_end, (y_top, y_bottom),
+            fg_rgb=fg_rgb, width=width, height=height)
     except RenderError:
         raise
     except Exception as e:  # noqa: BLE001 - a sampling failure HOLDS, never guesses
         raise RenderError(f"backdrop sample failed: {type(e).__name__}: {e}") from e
-    alpha = _ov.scrim_alpha_for(fg_rgb, backdrop, scrim_rgb=scrim_rgb)
-
-    def _esc(t):
-        return t.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    alpha = _ov.scrim_alpha_for(fg_rgb, backdrop, scrim_rgb=scrim_rgb,
+                                target=_CONTRAST_SAFETY_TARGET)
 
     fg_hex = "".join(f"{c:02X}" for c in fg_rgb)
-    scrim_hex = "".join(f"{c:02X}" for c in scrim_rgb)
     enable = f":enable='between(t,{start_t or 0},{end_t})'" if end_t is not None else ""
+    fontfile = _esc_ffmpeg(_sl.OVERLAY_FONT_PATH)
 
-    vf_parts = []
-    if alpha > 0:
-        vf_parts.append(
-            f"drawbox=x=0:y={y_top}:w={width}:h={block_h}:"
-            f"color=0x{scrim_hex}@{alpha / 255:.3f}:t=fill{enable}")
+    inputs = [input_path]
+    filter_stages = []
+    cur_label = "0:v"
+    next_idx = [1]
+
+    def _overlay_scrim(y0, h0, alpha0, radius=22):
+        if alpha0 <= 0:
+            return
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            png_path = tf.name
+        _make_scrim_png(box_w, h0, scrim_rgb, alpha0, png_path, radius=radius)
+        inputs.append(png_path)
+        idx = next_idx[0]
+        next_idx[0] += 1
+        x0 = _sl.OVERLAY_PAD_X
+        out_label = f"v{idx}"
+        filter_stages.append(
+            f"[{cur_label}][{idx}:v]overlay=x={x0}:y={y0}{enable}[{out_label}]")
+        return out_label
+
+    scrim_label = _overlay_scrim(y_top, block_h, alpha)
+    if scrim_label:
+        cur_label = scrim_label
+
+    anchor_scrim_label = None
+    if anchor_bounds:
+        a_top, a_bottom = anchor_bounds
+        try:
+            a_backdrop, _ = _worst_backdrop_rgb(
+                input_path, sample_start, sample_end, anchor_bounds,
+                fg_rgb=fg_rgb, width=width, height=height, n_times=3)
+        except RenderError:
+            raise
+        a_alpha = _ov.scrim_alpha_for(fg_rgb, a_backdrop, scrim_rgb=scrim_rgb,
+                                      target=_CONTRAST_SAFETY_TARGET)
+        anchor_scrim_label = _overlay_scrim(a_top, a_bottom - a_top, a_alpha, radius=10)
+        if anchor_scrim_label:
+            cur_label = anchor_scrim_label
+
+    draw_parts = []
     for i, ln in enumerate(lines):
-        line_y = y_top + _OVERLAY_PAD + i * line_h
-        vf_parts.append(
-            f"drawtext=fontsize={_OVERLAY_FONT_SIZE}:fontcolor=0x{fg_hex}:"
-            f"text='{_esc(ln)}':x=(w-tw)/2:y={line_y}:font=Arial{enable}")
-    vf = ",".join(vf_parts)
+        line_y = y_top + _sl.OVERLAY_PAD + i * line_h
+        draw_parts.append(
+            f"drawtext=fontsize={font_size}:fontcolor=0x{fg_hex}:"
+            f"text='{_esc_ffmpeg(ln)}':x=(w-tw)/2:y={line_y}:"
+            f"fontfile='{fontfile}'{enable}")
+    if anchor_bounds and anchor_text:
+        a_top, _ = anchor_bounds
+        anchor_fontfile = _esc_ffmpeg(_sl.ANCHOR_FONT_PATH)
+        draw_parts.append(
+            f"drawtext=fontsize={_sl.ANCHOR_FONT_SIZE}:fontcolor=0x{fg_hex}:"
+            f"text='{_esc_ffmpeg(str(anchor_text))}':x=(w-tw)/2:y={a_top}:"
+            f"fontfile='{anchor_fontfile}'{enable}")
 
-    cmd = [
-        _ffmpeg(), "-y", "-i", input_path,
-        "-vf", vf,
-        "-c:v", "libx264", "-crf", "22", "-preset", "fast",
-        "-c:a", "copy",
-        output_path,
-    ]
-    _run(cmd, "burn_overlay_block")
+    if draw_parts:
+        chained = ",".join(draw_parts)
+        filter_stages.append(f"[{cur_label}]{chained}[vout]")
+        final_label = "vout"
+    else:
+        final_label = cur_label
+
+    cmd = [_ffmpeg(), "-y"]
+    for p in inputs:
+        cmd += ["-i", p]
+    if filter_stages:
+        cmd += ["-filter_complex", ";".join(filter_stages),
+               "-map", f"[{final_label}]", "-map", "0:a?"]
+    cmd += ["-c:v", "libx264", "-crf", "22", "-preset", "fast", "-c:a", "copy", output_path]
+    try:
+        _run(cmd, "burn_overlay_block")
+    finally:
+        for p in inputs[1:]:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
     return output_path
 
 

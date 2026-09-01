@@ -84,11 +84,17 @@ def handle_create_story(account_key, body, actor_id="", *, candidates=None,
                      "hold_reason": res.get("reason")}
     draft = res.get("draft")
     sr = res.get("story_render") or {}
+    from . import story_layout as _sl
     return 200, {
         "ok": True, "status": "staged", "request_id": res.get("request_id"),
         "draft_id": getattr(draft, "draft_id", None),
         "overlay": sr.get("overlay_text_final"),
         "overlay_flags": sr.get("overlay_flags"),
+        # The character budget a portal-side overlay-text editor should mirror
+        # (2026-09-01 ruling 1: ONE source of truth, not a hardcoded duplicate
+        # in TypeScript). Measured live from the exact font the render burns —
+        # see story_layout.py's show-your-work derivation.
+        "overlay_char_budget": _sl.MAX_CHARS_PER_LINE,
         "music": {"shelf": sr.get("music_shelf"), "track_id": sr.get("track_id"),
                   "license_ref": sr.get("license_ref")},
     }

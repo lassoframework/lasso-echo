@@ -207,7 +207,7 @@ def plan_compose(candidates, gym_id, template, *, assets_by_id=None):
 
 # ---- render (injectable heavy steps; HELD on a missing renderer) ------------
 def render_compose(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
-                   overlay_frames=None,
+                   overlay_frames=None, identity_text="",
                    reframe_fn=None, normalize_fn=None, assemble_fn=None,
                    overlay_fn=None, end_frame_fn=None, music_path="",
                    music_burn_fn=None):
@@ -222,12 +222,22 @@ def render_compose(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
       music_burn_fn(path, music_path, out_dir)     -> path (licensed bed burn)
 
     overlay_frames is story_overlay.OverlaySpec.frames (ALREADY validated: ALL-CAPS,
-    density-wrapped, identity anchor on frame 0) — the body/hook overlay is burned
-    ONLY when it is non-empty, so a caller that never built one (e.g. a bare unit
-    test) gets byte-identical behavior to before this overlay wiring existed.
+    density-wrapped BODY COPY ONLY — the identity anchor is no longer merged
+    into frame content, see identity_text below, ruling 3 2026-09-01) — the
+    body/hook overlay is burned ONLY when it is non-empty, so a caller that
+    never built one (e.g. a bare unit test) gets byte-identical behavior to
+    before this overlay wiring existed.
     ask_frame_lines is story_overlay's single validated ask-frame lines
     (assert_one_ask_frame's output); the default end_frame_fn burns THOSE lines,
     never re-deriving them from ask_frame_text.
+    identity_text is story_overlay.OverlaySpec.identity_line (the small
+    city/gym anchor). The DEFAULT overlay_fn burns it on EVERY hook frame; the
+    DEFAULT end_frame_fn carries it into the brand bar instead, in place of the
+    bar's normal handle, on the ask frame (ruling 3). Injected overlay_fn /
+    end_frame_fn keep their existing (path, out_dir, frames) / (path, out_dir,
+    ask_text) signatures unchanged — identity_text only reaches the DEFAULT
+    primitives, via the partial binders below, exactly like ask_frame_lines
+    already does for end_frame_fn.
 
     A None default binds the clipper_render primitives lazily. If ANY primitive raises
     (e.g. ffmpeg absent, or a burned box fails its own safe-zone/contrast check), the
@@ -242,8 +252,8 @@ def render_compose(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
         reframe_fn = reframe_fn or _default_reframe
         normalize_fn = normalize_fn or _default_normalize
         assemble_fn = assemble_fn or _default_assemble
-        overlay_fn = overlay_fn or _default_overlay_burn
-        end_frame_fn = end_frame_fn or _partial_end_frame(ask_frame_lines)
+        overlay_fn = overlay_fn or _partial_overlay_burn(identity_text)
+        end_frame_fn = end_frame_fn or _partial_end_frame(ask_frame_lines, identity_text)
         # A licensed bed defaults to the real ffmpeg burn (amix under the video
         # audio). An injected music_burn_fn still overrides; music_path='' (a 'none'
         # selection) skips the burn entirely.
@@ -343,12 +353,25 @@ def _default_assemble(paths, out_dir):
     return dst
 
 
-def _default_overlay_burn(path, out_dir, frames):
+def _partial_overlay_burn(identity_text):
+    """Bind identity_text (story_overlay.OverlaySpec.identity_line) into the REAL
+    default overlay-burn primitive without changing overlay_fn's (path, out_dir,
+    frames) contract that injected test/alternate renderers rely on. Only used
+    when overlay_fn is not injected."""
+    def _bound(path, out_dir, frames):
+        return _default_overlay_burn(path, out_dir, frames, identity_text=identity_text)
+    return _bound
+
+
+def _default_overlay_burn(path, out_dir, frames, *, identity_text=""):
     """Burn the Roxx BODY overlay (the hook) onto the opening of the assembled
     montage. `frames` is story_overlay.OverlaySpec.frames — ALREADY validated
-    ALL-CAPS, density-wrapped lines with the identity anchor on frame 0; this
-    function only sequences and times them, it never re-wraps or re-derives copy.
-    Each frame gets >= HOOK_FRAME_MIN_SEC seconds, sequenced from t=0. Raises (via
+    ALL-CAPS, density-wrapped BODY COPY (the identity anchor is NOT merged into
+    these lines, ruling 3 2026-09-01); this function only sequences and times
+    them, it never re-wraps or re-derives copy. `identity_text` (when set) is
+    burned as its own small mono anchor line on EVERY hook frame — see
+    clipper_render.burn_overlay_block's anchor_text param. Each frame gets
+    >= HOOK_FRAME_MIN_SEC seconds, sequenced from t=0. Raises (via
     clipper_render.burn_overlay_block) when a frame's box would violate the story
     safe zone — the caller HOLDS rather than burning a bad frame."""
     from . import clipper_render
@@ -361,27 +384,33 @@ def _default_overlay_burn(path, out_dir, frames):
         end_t = min(t + per, total) if total > 0 else t + per
         out = f"{out_dir}/story_hook_{i}.mp4"
         cur = clipper_render.burn_overlay_block(
-            cur, out, frame_lines, anchor="top", start_t=t, end_t=end_t)
+            cur, out, frame_lines, anchor="top", start_t=t, end_t=end_t,
+            anchor_text=identity_text or None)
         t = end_t
     return cur
 
 
-def _partial_end_frame(ask_frame_lines):
-    """Bind the validated ask_frame_lines into the REAL default end-frame primitive
-    without changing end_frame_fn's (path, out_dir, ask_text) contract that injected
-    test/alternate renderers rely on. Only used when end_frame_fn is not injected."""
+def _partial_end_frame(ask_frame_lines, identity_text=""):
+    """Bind the validated ask_frame_lines + identity_text into the REAL default
+    end-frame primitive without changing end_frame_fn's (path, out_dir, ask_text)
+    contract that injected test/alternate renderers rely on. Only used when
+    end_frame_fn is not injected."""
     def _bound(path, out_dir, ask_text):
-        return _default_end_frame(path, out_dir, ask_text, ask_lines=ask_frame_lines)
+        return _default_end_frame(path, out_dir, ask_text, ask_lines=ask_frame_lines,
+                                  identity_text=identity_text)
     return _bound
 
 
-def _default_end_frame(path, out_dir, ask_text, *, ask_lines=None):
+def _default_end_frame(path, out_dir, ask_text, *, ask_lines=None, identity_text=""):
     """Burn the single validated ASK frame (story_overlay's assert_one_ask_frame
     output, `ask_lines` — ALREADY validated: exactly one ask, will be safe-zone +
     contrast checked at burn time) onto the closing ASK_FRAME_SEC seconds of the
-    clip, then caps the render with the LASSO brand watermark (unchanged, a
-    separate brand system from the Roxx overlay). `ask_text` is kept only for the
-    hold-reason / back-compat signature.
+    clip, then caps the render with the LASSO brand watermark. `identity_text`
+    (story_overlay.OverlaySpec.identity_line) is passed to add_brand_frame so the
+    ask frame's brand bar carries the city/gym name IN PLACE OF its normal handle
+    (ruling 3: the identity anchor moves INTO the brand bar for the ask frame, so
+    the ask frame's own overlay budget stays free for the ask alone). `ask_text`
+    is kept only for the hold-reason / back-compat signature.
 
     When ask_text is set but ask_lines is not wired through, this REFUSES to guess
     or silently drop the ask (the exact failure mode this module used to have) —
@@ -401,7 +430,7 @@ def _default_end_frame(path, out_dir, ask_text, *, ask_lines=None):
         cur = clipper_render.burn_overlay_block(
             path, f"{out_dir}/story_ask.mp4", list(ask_lines), anchor="bottom",
             start_t=start_t, end_t=end_t)
-    clipper_render.add_brand_frame(cur, out)
+    clipper_render.add_brand_frame(cur, out, identity_text=identity_text or None)
     return out
 
 

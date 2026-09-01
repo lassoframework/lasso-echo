@@ -46,13 +46,41 @@ def test_layout_is_all_caps():
     assert frames[0][0] == "START IN AUGUST"
 
 
+# ---- character cap (ruling 1, 2026-09-01: overflow is a CAP, not shrink-to-fit)
+def test_wrap_line_respects_the_real_character_budget():
+    # a line that is under the 8-word cap but WOULD overflow the frame at real
+    # render width (this is exactly what shipped 10/10 clipped renders) gets
+    # re-split by character width, never shipped as one over-width line.
+    text = "NOBODY IN THIS ROOM IS HERE BY ACCIDENT"  # 8 words, 39 chars (proof frame P1-1)
+    lines = ov.wrap_line(text)
+    for ln in lines:
+        assert len(ln) <= ov.MAX_CHARS_PER_LINE
+    assert len(lines) > 1, "a 39-char line must be re-split under the measured budget"
+
+
+def test_wrap_line_holds_on_an_unsplittable_token():
+    # a single token longer than the character budget cannot be fixed by more
+    # rewrapping (no amount of re-splitting shortens ONE word) -> HOLD honestly.
+    token = "X" * (ov.MAX_CHARS_PER_LINE + 5)
+    with pytest.raises(ov.OverlayRejected, match="cannot be fixed by rewrapping"):
+        ov.wrap_line(token)
+
+
+def test_max_chars_per_line_is_a_real_measured_constant():
+    # sane, non-degenerate bounds — not a magic number, but not unbounded either.
+    assert 10 < ov.MAX_CHARS_PER_LINE < 40
+
+
 # ---- safe zones ------------------------------------------------------------
 def test_safe_zone_rejects_top_and_bottom_bands():
+    # ruling 3 (2026-09-01): the bottom bound is DERIVED from the brand bar's
+    # real footprint (story_layout.BRAND_BAR_H=70 + BOTTOM_MARGIN=24), not a
+    # hardcoded 310px band unrelated to what add_brand_frame actually draws.
     assert ov.safe_zone_ok((300, 500)) is True
     assert ov.safe_zone_ok((100, 300)) is False               # into top 250px
-    assert ov.safe_zone_ok((1500, 1650)) is False             # into bottom 310px
+    assert ov.safe_zone_ok((1800, 1900)) is False             # into the brand bar's zone
     lo, hi = ov.safe_zone_bounds()
-    assert (lo, hi) == (250, 1610)
+    assert (lo, hi) == (250, 1826)
 
 
 # ---- contrast / scrim ------------------------------------------------------
@@ -72,17 +100,25 @@ def test_contrast_ratio_symmetric():
     assert round(r, 1) == 21.0
 
 
-# ---- identity anchor -------------------------------------------------------
-def test_identity_anchor_added_when_missing():
-    frames = ov.build_overlay("we start monday", identity_tokens=["Birmingham"]).frames
-    joined = " ".join(ln for fr in frames for ln in fr)
-    assert "BIRMINGHAM" in joined
-
-
-def test_identity_anchor_present_not_duplicated():
-    spec = ov.build_overlay("BIRMINGHAM starts monday", identity_tokens=["Birmingham"])
+# ---- identity anchor (ruling 3, 2026-09-01: its own layout element) --------
+def test_identity_anchor_is_its_own_line_not_merged_into_frames():
+    spec = ov.build_overlay("we start monday", identity_tokens=["Birmingham"])
+    assert spec.identity_line == "BIRMINGHAM"
+    # frames carry ONLY the body copy now — the anchor no longer eats into the
+    # hook's <=2-line content budget, and it is burned on EVERY hook frame (by
+    # clipper_render._default_overlay_burn), not merged into frame 0 only.
     joined = " ".join(ln for fr in spec.frames for ln in fr)
-    assert joined.count("BIRMINGHAM") == 1
+    assert "BIRMINGHAM" not in joined
+
+
+def test_identity_anchor_line_joins_multiple_tokens():
+    spec = ov.build_overlay("starts monday", identity_tokens=["Birmingham", "Iron Works"])
+    assert spec.identity_line == "BIRMINGHAM IRON WORKS"
+
+
+def test_identity_anchor_empty_when_no_tokens():
+    spec = ov.build_overlay("starts monday", identity_tokens=())
+    assert spec.identity_line == ""
 
 
 # ---- copy_gate + avatar rail on overlay copy -------------------------------

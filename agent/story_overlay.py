@@ -24,31 +24,70 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# Frame geometry (spec §1).
-FRAME_W = 1080
-FRAME_H = 1920
-SAFE_TOP = 250
-SAFE_BOTTOM = 310            # nothing below FRAME_H - SAFE_BOTTOM = 1610
+from . import story_layout as _layout
+
+# Frame geometry (spec §1). DEFERRED to story_layout.py (the single merged
+# layout authority, 2026-09-01 ruling 3) so this module can never define a
+# safe zone that drifts out of sync with what add_brand_frame actually draws.
+FRAME_W = _layout.FRAME_W
+FRAME_H = _layout.FRAME_H
+SAFE_TOP = _layout.SAFE_TOP
+# SAFE_BOTTOM is DERIVED from the brand bar's real footprint (story_layout.
+# BRAND_BAR_H), not a hardcoded 310px band that can silently fall out of sync
+# with what add_brand_frame actually draws — that drift was ruling 3's whole
+# complaint. Kept as a module-level constant for callers that still read it.
+SAFE_BOTTOM = FRAME_H - _layout.brand_bar_top(FRAME_H) + _layout.BOTTOM_MARGIN
 
 MAX_WORDS_PER_LINE = 8
 MAX_LINES_PER_FRAME = 2
+# The character cap (ruling 1: overflow is caught by a cap at generation time,
+# not shrink-to-fit at render time). Measured from REAL font metrics in
+# story_layout.py — see that module for the full show-your-work derivation.
+MAX_CHARS_PER_LINE = _layout.MAX_CHARS_PER_LINE
 
 TARGET_CONTRAST = 4.5        # WCAG-style ratio the brand scrim must reach
 
 
 # ---- wrapping + framing -----------------------------------------------------
-def wrap_line(text, max_words=MAX_WORDS_PER_LINE):
-    """Break ONE overlay string into lines of at most `max_words` words each. Words
-    are never split; a line is closed at the word boundary. Returns a list of lines."""
+def wrap_line(text, max_words=MAX_WORDS_PER_LINE, max_chars=None):
+    """Break ONE overlay string into lines of at most `max_words` words each AND
+    at most `max_chars` characters each (default: MAX_CHARS_PER_LINE, the REAL
+    measured budget for the font ffmpeg's drawtext actually renders — see
+    story_layout.py). Words are never split; a line is closed at the word
+    boundary as soon as adding the next word would breach EITHER budget.
+
+    Ruling 1a ("regenerate the line, don't truncate/shrink"): this module never
+    invents new words (it is the no-fabrication rail — copy comes from the
+    client brief or vision, verbatim/compressed, never authored here), so
+    "regenerate" means re-derive the line GROUPING until every line clears the
+    character budget — which is exactly what this greedy re-split does. A
+    SINGLE token that alone still exceeds max_chars cannot be fixed by more
+    splitting (no amount of re-wrapping shortens one word): that raises
+    OverlayRejected, this module's established HOLD-honestly contract (the
+    same one copy_gate / avatar-rail violations use), never truncated, never
+    silently shipped over-width."""
+    if max_chars is None:
+        max_chars = MAX_CHARS_PER_LINE
     words = str(text or "").split()
     lines, cur = [], []
     for w in words:
-        cur.append(w)
-        if len(cur) >= max_words:
+        candidate = cur + [w]
+        candidate_line = " ".join(candidate)
+        if cur and (len(candidate) > max_words or len(candidate_line) > max_chars):
             lines.append(" ".join(cur))
-            cur = []
+            cur = [w]
+        else:
+            cur = candidate
     if cur:
         lines.append(" ".join(cur))
+    for ln in lines:
+        if len(ln) > max_chars:
+            raise OverlayRejected(
+                f"a single word {ln!r} is {len(ln)} chars, over the "
+                f"{max_chars}-char safe-width budget (story_layout."
+                f"MAX_CHARS_PER_LINE) and cannot be fixed by rewrapping; "
+                f"overlay HELD rather than ship text that would clip off the "
+                f"frame")
     return lines
 
 
@@ -62,21 +101,26 @@ def frame_lines(lines, max_lines=MAX_LINES_PER_FRAME):
     return frames
 
 
-def layout_overlay(text, *, max_words=MAX_WORDS_PER_LINE, max_lines=MAX_LINES_PER_FRAME):
-    """Full layout for one overlay block: wrap to <= max_words/line, then split into
-    frames of <= max_lines lines. Upper-cases every line (the ALL-CAPS rule). Returns
-    a list of frames (each a list of ALL-CAPS lines)."""
+def layout_overlay(text, *, max_words=MAX_WORDS_PER_LINE, max_lines=MAX_LINES_PER_FRAME,
+                   max_chars=None):
+    """Full layout for one overlay block: wrap to <= max_words/line AND
+    <= max_chars/line (the real character-width cap, ruling 1), then split into
+    frames of <= max_lines lines. Upper-cases every line (the ALL-CAPS rule).
+    Returns a list of frames (each a list of ALL-CAPS lines)."""
     wrapped = []
     for chunk in str(text or "").split("\n"):
-        wrapped += wrap_line(chunk, max_words) if chunk.strip() else []
+        wrapped += wrap_line(chunk, max_words, max_chars) if chunk.strip() else []
     wrapped = [ln.upper() for ln in wrapped]
     return frame_lines(wrapped, max_lines)
 
 
-def line_violations(lines):
+def line_violations(lines, max_chars=None):
     """The list of Roxx rule violations for a set of lines on ONE frame (empty = ok).
-    Used by tests + the render gate: a >8-word line or a >2-line frame is a violation
-    the layout must fix (layout_overlay re-wraps so these never reach the render)."""
+    Used by tests + the render gate: a >8-word line, a >2-line frame, or a line
+    over the character-width budget is a violation the layout must fix
+    (layout_overlay re-wraps so these never reach the render)."""
+    if max_chars is None:
+        max_chars = MAX_CHARS_PER_LINE
     v = []
     if len(lines) > MAX_LINES_PER_FRAME:
         v.append(f"{len(lines)} lines on one frame (> {MAX_LINES_PER_FRAME})")
@@ -84,25 +128,23 @@ def line_violations(lines):
         n = len(str(ln).split())
         if n > MAX_WORDS_PER_LINE:
             v.append(f"line has {n} words (> {MAX_WORDS_PER_LINE}): {ln!r}")
+        if len(str(ln)) > max_chars:
+            v.append(f"line has {len(str(ln))} chars (> {max_chars}): {ln!r}")
     return v
 
 
-# ---- safe zones -------------------------------------------------------------
+# ---- safe zones (deferred to story_layout.py, the merged layout authority) --
 def safe_zone_ok(box, *, frame_h=FRAME_H):
     """True when a text box (y_top, y_bottom) in pixels sits inside the story safe
-    zone: nothing in the top SAFE_TOP px or the bottom SAFE_BOTTOM px. A box touching
-    either band FAILS (the render must move it or fail)."""
-    y_top, y_bottom = box
-    if y_top < SAFE_TOP:
-        return False
-    if y_bottom > frame_h - SAFE_BOTTOM:
-        return False
-    return True
+    zone. Delegates to story_layout.safe_zone_ok — see that module for why the
+    bottom boundary is DERIVED from the brand bar's real footprint rather than a
+    hardcoded constant."""
+    return _layout.safe_zone_ok(box, frame_h=frame_h)
 
 
 def safe_zone_bounds(frame_h=FRAME_H):
     """The (min_y, max_y) a text box must stay within."""
-    return SAFE_TOP, frame_h - SAFE_BOTTOM
+    return _layout.safe_zone_bounds(frame_h)
 
 
 # ---- contrast / scrim -------------------------------------------------------
@@ -146,6 +188,11 @@ def scrim_alpha_for(text_rgb, backdrop_rgb, scrim_rgb=(18, 30, 60), target=TARGE
 
 
 # ---- identity anchor + card shapes ------------------------------------------
+# NOTE (ruling 3, 2026-09-01): build_overlay no longer calls ensure_identity_anchor
+# to merge the anchor into frame content — the anchor is now its own layout
+# element (OverlaySpec.identity_line, formatted by story_layout.identity_anchor_line)
+# burned on every hook frame and, on the ask frame, carried by the brand bar
+# instead. These two helpers are kept as general-purpose text utilities.
 def has_identity_anchor(text, tokens):
     """True when the overlay carries at least one identity anchor token (city/brand).
     Case-insensitive whole-token match."""
@@ -171,13 +218,21 @@ def ensure_identity_anchor(lines, tokens):
 @dataclass
 class OverlaySpec:
     """A validated, framed, grounded overlay ready to burn. `frames` is a list of
-    frames (each a list of ALL-CAPS lines). `flags` carries any non-fatal warnings
-    (e.g. 'generic_safe: no brief, Echo guessed the copy')."""
+    frames (each a list of ALL-CAPS lines, BODY COPY ONLY — the identity anchor
+    is no longer merged into frame content, see `identity_line` below, ruling 3
+    2026-09-01). `flags` carries any non-fatal warnings (e.g. 'generic_safe: no
+    brief, Echo guessed the copy')."""
     frames: list = field(default_factory=list)
     grounded_from: str = ""          # 'brief' | 'vision' | 'generic_safe'
     flags: list = field(default_factory=list)
     ask: str = ""
     ask_frame: list = field(default_factory=list)   # the single end-frame's lines
+    # The small identity-anchor line (city + gym name), burned on EVERY hook
+    # frame as its OWN layout element (never counted against the hook's
+    # <=2-line content budget) and, on the ask frame, moved INTO the brand bar
+    # in place of its normal handle text — see story_layout.identity_anchor_line
+    # / identity_text_for_bar, the ONE place this text is formatted.
+    identity_line: str = ""
 
 
 GENERIC_SAFE_HOOK = "YOUR NEXT REP STARTS HERE"   # never a claim, never a number
@@ -262,12 +317,14 @@ def build_overlay(raw_text, *, identity_tokens=(), gym=None, ask="", grounded_fr
             f"overlay copy fails copy_gate: {copy_gate.violations(text)}")
 
     frames = layout_overlay(text)
-    # identity anchor on the FIRST frame.
-    if frames:
-        frames[0] = ensure_identity_anchor(frames[0], identity_tokens)
-        # re-frame in case the anchor pushed the first frame to 3 lines.
-        flat = [ln for fr in frames for ln in fr]
-        frames = frame_lines(flat)
+    # Ruling 3 (2026-09-01): the identity anchor is its OWN small mono line on
+    # EVERY hook frame, not merged into frame content (that used to consume
+    # one of the hook's <=2 content lines AND only appeared on frame 0). The
+    # burn primitive (clipper_render._default_overlay_burn) draws this line on
+    # every hook frame; the ask frame carries it via the brand bar instead
+    # (story_layout.identity_text_for_bar) so the ask keeps its full 2-line
+    # budget for the ask alone.
+    identity_line = _layout.identity_anchor_line(identity_tokens)
 
     flags = []
     if grounded_from == "generic_safe":
@@ -285,7 +342,7 @@ def build_overlay(raw_text, *, identity_tokens=(), gym=None, ask="", grounded_fr
     if enforce_ask:
         ask_frame = assert_one_ask_frame(frames, ask_text)
     return OverlaySpec(frames=frames, grounded_from=grounded_from, flags=flags,
-                       ask=ask_text, ask_frame=ask_frame)
+                       ask=ask_text, ask_frame=ask_frame, identity_line=identity_line)
 
 
 class OverlayRejected(Exception):

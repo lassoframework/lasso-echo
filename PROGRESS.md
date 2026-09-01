@@ -3838,3 +3838,39 @@ per-post data once Stage 3 reporting is live.
 - Arming (all by hand): apply the migration; set APIFY_TOKEN + AGENT_SOCIAL_BASELINE=true on
   the worker; run `social-before-after --all --capture` ONCE per gym before more Echo posting
   drifts the pre-start feed out of Apify's reach. Inert without the token; default OFF.
+
+## Story Studio overlay burn rebuild (Blake's 3 rulings, 2026-09-01)
+The Roxx overlay burn shipped and failed a 10-render pixel-measured proof 0/10 (contrast
+8/10, text off-frame 10/10, anchor missing/clipped 4/10). Rebuilt per Blake's three rulings:
+- **Overflow = a character cap, not shrink-to-fit.** `agent/story_layout.py` (new, the merged
+  layout authority) measures `MAX_CHARS_PER_LINE=24` from REAL glyph metrics (English-
+  frequency-weighted mean width of the ACTUAL font ffmpeg's drawtext resolves in production —
+  confirmed live via `fc-match Arial` on the `echo` Railway container: DejaVu Sans "Book", not
+  Arial; that exact file is bundled at `agent/assets/fonts/DejaVuSans.ttf` and drawtext now
+  uses an explicit `fontfile=` instead of the fontconfig name). Enforced at generation
+  (`story_overlay.wrap_line`, a greedy re-split that HOLDS via `OverlayRejected` on a single
+  unsplittable token — never truncates) and exported (`story_layout.MAX_CHARS_PER_LINE`, also
+  on `story_studio_routes.handle_create_story`'s staged response as `overlay_char_budget`, one
+  source of truth for a future portal editor). Shrink-to-fit survives ONLY as a render-time
+  failsafe (`story_layout.fit_font_size`, floor 34px) that logs an `ops_alerts.alert` when it
+  fires — firing at all means the upstream cap missed something.
+  **OPEN, OUT OF SCOPE:** no approval-card overlay-text editor exists yet in `lasso-ops-portal`
+  (`StoryStudio.tsx` only has the pre-render brief input, not a post-render overlay editor) —
+  ruling 1's editor-side cap needs that portal-repo surface built first.
+- **Contrast = worst-case sampling, LASSO-branded scrim.** `clipper_render._worst_backdrop_rgb`
+  samples 5 instants x 7x4 grid points across the FULL start_t..end_t window (not one midpoint
+  mean) and sizes the scrim alpha off the single worst pixel found, at a 5.0 safety-margined
+  target (not the bare 4.5 WCAG bar) to absorb discrete-grid + compression-artifact gaps. Navy
+  scrim (canonical V3 #121E3C) + cream type (#FAF6F0, not pure white), rounded corners via a
+  generated PNG composited with ffmpeg `overlay=` (drawbox has no native radius).
+- **Anchor = every frame, merged layout authority.** `story_layout.py` owns the WHOLE frame
+  (top safe zone, brand-bar footprint `BRAND_BAR_H=70`, and the bottom safe boundary DERIVED
+  from it, not a separate hardcoded 310px). The identity anchor (city+gym) is its own small
+  mono line (`DejaVuSansMono-Bold.ttf`) burned on EVERY hook frame, not merged into frame
+  content; on the ask frame it moves INTO the brand bar (`add_brand_frame(..., identity_text=)`,
+  replacing the handle) instead of a separate overlay line.
+- Proof: 6 real renders (real ffmpeg, real Pierce Fitness Drive footage, zero injected
+  render_fn), independently pixel-graded (contrast/safe-zone/fit/anchor/one-ask, no averaging)
+  — 6/6 pass (one automated false-positive on R2 traced to the gym's own tan door-frame color
+  at the frame's un-scrimmed margin, confirmed by visual inspection, not real clipping).
+  Full suite green (4704 passed, 11 skipped) before push.
