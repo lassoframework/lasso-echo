@@ -46,6 +46,11 @@ def avatar_breach(caption, gym=None):
     `gym` keeps the original all-gyms behavior (every existing caller is unchanged).
     The other banned phrases (competitive crossfit, strength/serious athletes) are
     NOT covered by the hyrox allowlist and always breach."""
+    from . import config
+    if not config.avatar_athlete_rail_enabled():
+        # Blake 2026-09-01: "confirmed we can talk about CrossFit, hyrox and competitive
+        # athletics." The rail is OFF by default; nothing breaches on avatar grounds.
+        return ""
     m = AVATAR_BLOCK_RE.search(caption or "")
     if not m:
         return ""

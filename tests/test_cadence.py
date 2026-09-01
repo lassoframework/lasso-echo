@@ -561,7 +561,11 @@ def test_client_2x_single_concept_day_emits_one_pair(tmp_path, monkeypatch):
 # Full publish_due boundary tests live in tests/test_calendar_autopublish.py
 # (thin feed reverts, story exempt, avatar term reverts, flag-off no-op).
 
-def test_avatar_breach_detector():
+def test_avatar_breach_detector(monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     from agent import post_quality as pq
     assert pq.avatar_breach("Join our HYROX prep class") == "HYROX"
     assert pq.avatar_breach("built for the competitive  CrossFit athlete")
@@ -570,7 +574,11 @@ def test_avatar_breach_detector():
     assert pq.avatar_breach("") == ""
 
 
-def test_post_issues_blocks_avatar_terms():
+def test_post_issues_blocks_avatar_terms(monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     from agent import post_quality as pq
 
     class _D:

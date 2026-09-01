@@ -362,7 +362,11 @@ def test_cross_date_repeat_still_counts_as_dup():
 # Test 10: defect tuples present for each violated leg
 # ---------------------------------------------------------------------------
 
-def test_defects_present_for_violations():
+def test_defects_present_for_violations(monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     # Rows with multiple deliberate violations:
     # - em-dash (caption_craft)
     # - no ask (path_to_join)

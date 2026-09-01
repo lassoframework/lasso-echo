@@ -71,10 +71,17 @@ BANDS = ((90, "A"), (80, "B"), (70, "C"), (60, "D"), (0, "F"))
 # max is 85 and the total is renormalized to 0-100 (see module docstring).
 _GYM_RAW_MAX = sum(WEIGHTS.values()) - WEIGHTS["visual_match"]  # 85
 
-# Athlete-avatar leak words (first-line scan)
+# Athlete-avatar leak words (first-line scan). Only scored while the avatar rail is
+# ARMED; Blake turned it off on 2026-09-01 ("confirmed we can talk about CrossFit, hyrox
+# and competitive athletics"), so a competitive-athlete hook is no longer a defect.
 _ATHLETE_WORDS = re.compile(
     r"\b(compete|competition|athlete|HYROX|pr your|one.rep max)\b", re.I
 )
+
+
+def _athlete_rail_on() -> bool:
+    from . import config
+    return config.avatar_athlete_rail_enabled()
 # Hook-intent mismatch: elite language
 _ELITE_WORDS = re.compile(r"\b(elite|advanced athlete)\b", re.I)
 
@@ -491,7 +498,7 @@ def _right_audience(rows, profile, defects, exempt=None) -> int:
         cap = grp[0].get("caption") or ""
         first_line = cap.strip().splitlines()[0] if cap.strip() else ""
 
-        if profile == "GYM":
+        if profile == "GYM" and _athlete_rail_on():
             # Athlete-avatar leak: -5 each
             if _ATHLETE_WORDS.search(first_line):
                 defects.append(("right_audience", day,

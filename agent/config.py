@@ -3295,3 +3295,19 @@ def billing_customer_sync_enabled() -> bool:
     flip). Reads the portal plane and writes ECHO's column only; it never touches a
     client's Stripe account, subscription, or billing setup."""
     return _truthy(os.environ.get("AGENT_BILLING_CUSTOMER_SYNC", "false"))
+
+
+def avatar_athlete_rail_enabled() -> bool:
+    """AGENT_AVATAR_ATHLETE_RAIL: block captions that address competitive-athlete
+    audiences (hyrox, competitive crossfit, strength/serious athletes).
+
+    DEFAULT OFF as of Blake's ruling on 2026-09-01: "confirmed we can talk about
+    CrossFit, hyrox and competitive athletics." He first amended this on 2026-08-18 and
+    re-confirmed it when the rail held ENG's only remaining graded defect. The rail's
+    machinery is kept intact so it can be re-armed with one env var if the positioning
+    changes again; per-gym hyrox allowlisting still works when it is armed.
+
+    NOTE FOR FUTURE SESSIONS: the workspace ORG INSTRUCTIONS still carry the older
+    gen-pop-only wording. Blake has been told the org settings need editing so the two
+    agree; until he does, this flag is the authoritative record of his ruling."""
+    return _truthy(os.environ.get("AGENT_AVATAR_ATHLETE_RAIL", "false"))

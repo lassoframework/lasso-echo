@@ -1078,6 +1078,10 @@ def test_recheck_story_empty_caption_is_exempt(graded, monkeypatch):
 
 
 def test_recheck_avatar_term_reverts(graded, monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     sent = _capture_alerts(monkeypatch)
     caption = ("HYROX season starts soon and our coaches are ready to help you "
                "train for it. Save your spot today.")

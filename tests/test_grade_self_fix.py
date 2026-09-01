@@ -961,9 +961,13 @@ def test_captionless_posts_are_exempt_and_counted_not_silently_dropped():
     assert g.total >= 90, f"{g.total} {g.scores} {g.defects}"
 
 
-def test_one_caption_mirrored_to_three_rows_is_one_defect_not_three():
+def test_one_caption_mirrored_to_three_rows_is_one_defect_not_three(monkeypatch):
     """ENG's single HYROX hook produced 3 right_audience defects because the IG
     feed, its FB mirror and the paired story were each judged separately."""
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     from agent.calendar_grade import grade_month
     bad = "You signed up for HYROX but haven't trained.\n" + _a_caption(3)
     rows = [

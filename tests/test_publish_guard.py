@@ -132,7 +132,11 @@ def test_one_ask_passes_even_repeated():
 
 # ---- avatar rail -----------------------------------------------------------------
 
-def test_hyrox_blocks():
+def test_hyrox_blocks(monkeypatch):
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     cap_text = ("HYROX season is here and our coaches are ready to guide your "
                 "training plan. Book your intro today.")
     assert pg.AVATAR_BLOCK in check(_payload(caption=cap_text))
@@ -235,6 +239,10 @@ def test_two_asks_reverts_one_ask_publishes(guarded, monkeypatch):
 def test_blocked_alert_fires_once_until_state_changes(guarded, monkeypatch):
     """kv key publish_blocked:<gym>:<code>: the first violating tick alerts, the
     retry tick is silent; a clean pass re-arms it and a NEW violation alerts."""
+    # The avatar rail is OFF by default since Blake's 2026-09-01 ruling (CrossFit,
+    # hyrox and competitive athletics are allowed). This test describes the rail's
+    # behavior WHEN ARMED, so it arms it explicitly.
+    monkeypatch.setenv("AGENT_AVATAR_ATHLETE_RAIL", "true")
     sent = _alerts(monkeypatch)
     hy = ("HYROX season is here and our coaches are ready to guide your "
           "training plan. Book your intro today.")
