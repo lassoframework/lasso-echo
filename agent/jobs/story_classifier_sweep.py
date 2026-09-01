@@ -107,9 +107,10 @@ def sweep_gym(base, store, drive, *, apply=False, limit=None):
         result["checked"] += 1
         if verdict.verdict == _sc.FINISHED:
             result["quarantined"] += 1
-            result["detail"].append(
-                f"{aid} ({title}): FINISHED -> quarantined "
-                f"[{'; '.join(verdict.reasons)}]" + ("" if apply else " [dry-run]"))
+            line = (f"{aid} ({title}): FINISHED -> quarantined "
+                    f"[{'; '.join(verdict.reasons)}]" + ("" if apply else " [dry-run]"))
+            result["detail"].append(line)
+            _log(f"{base}: {line}")
             if apply:
                 try:
                     store.update_asset(aid, {
@@ -121,8 +122,12 @@ def sweep_gym(base, store, drive, *, apply=False, limit=None):
                     result["errors"] += 1
         elif verdict.verdict == _sc.RAW:
             result["raw"] += 1
+            _log(f"{base}: {aid} ({title}): RAW ({result['checked']}/"
+                f"{len(candidates)})")
         else:
             result["ambiguous"] += 1
+            _log(f"{base}: {aid} ({title}): AMBIGUOUS ({result['checked']}/"
+                f"{len(candidates)})")
     return result
 
 
