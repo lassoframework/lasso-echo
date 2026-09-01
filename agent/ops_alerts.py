@@ -12,13 +12,25 @@ currently-silent fallback in the draft pipeline posts ONE plain line prefixed
   - publish attempt failed
   - store write failed
 
-NO SECRETS, guaranteed twice over: callers only pass exception class + message
-(never tokens), and scrub() additionally redacts the VALUE of any secret-looking
-env var (…TOKEN / …SECRET / …KEY / …PASSWORD) before the text leaves this module.
-Alerting never breaks the pipeline: a failed Slack post is itself only logged.
+NO SECRETS, guaranteed three times over:
+  1. callers only pass exception class + message (never tokens);
+  2. scrub() redacts the VALUE of any secret-looking env var (…TOKEN / …SECRET /
+     …KEY / …PASSWORD) before the text leaves this module;
+  3. scrub() ALSO redacts by SHAPE (_PATTERNS below), because a secret can arrive
+     from OUTSIDE our env entirely — a third-party response body echoing an
+     Authorization header, a provider error quoting the key it rejected, a signed
+     URL in a traceback. Env-value matching cannot see those: the value was never
+     in os.environ. Shape matching covers bearer/basic credentials, provider-
+     prefixed keys (sk-…, sk_live_…, xoxb-…, ghp_…, AKIA…, AIza…, EAA…, apify_api_…),
+     JWTs, `token=`/`api_key=`/`password=` style fields, and long hex / base64
+     blobs (signatures, session keys).
+Redaction is deliberately eager: an over-redacted alert is a nuisance, a leaked
+alert is an incident. Alerting never breaks the pipeline: a failed Slack post is
+itself only logged.
 """
 
 import os
+import re
 
 from . import config
 
@@ -26,6 +38,93 @@ _SECRET_NAME_HINTS = ("TOKEN", "SECRET", "KEY", "PASSWORD")
 # Values shorter than this are never treated as secrets (flag values like "true"
 # or "1" living under a …KEY name must not be redacted out of ordinary words).
 _MIN_SECRET_LEN = 6
+
+REDACTED = "[REDACTED]"
+
+# ---- shape-based redaction ---------------------------------------------------
+#
+# ORDER MATTERS and is asserted by the tests:
+#   1. bearer/basic FIRST — otherwise the named-field rule below matches
+#      "Authorization: Bearer <token>" and redacts only the word "Bearer",
+#      shipping the token itself.
+#   2. provider-prefixed keys and JWTs next (most specific shapes).
+#   3. named fields (token=…, api_key: …) — the catch-all for a value whose own
+#      shape says nothing.
+#   4. long hex / base64 blobs LAST (the broadest, most false-positive-prone).
+
+# Only real HTTP auth SCHEMES. "Token" is deliberately NOT here: it is an
+# ordinary English word in our own alert text ("token expiring") and would eat
+# the next word of every such line. GitHub's `Authorization: token ghp_…` is
+# still covered — by the ghp_ prefix rule below.
+_BEARER_RE = re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=\-]{8,}", re.I)
+
+_PREFIXED_RE = re.compile(
+    r"("
+    r"sk-[A-Za-z0-9_\-]{16,}"                 # OpenAI-style
+    r"|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"   # Stripe-style
+    r"|xox[baprse]-[A-Za-z0-9\-]{8,}"         # Slack bot/user/app tokens
+    r"|xapp-[A-Za-z0-9\-]{8,}"                # Slack app-level
+    r"|gh[pousr]_[A-Za-z0-9]{16,}"            # GitHub
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|(?:AKIA|ASIA)[0-9A-Z]{12,}"            # AWS access key id
+    r"|AIza[0-9A-Za-z_\-]{20,}"               # Google API key
+    r"|ya29\.[0-9A-Za-z_\-]{20,}"             # Google OAuth
+    r"|EAA[0-9A-Za-z]{40,}"                   # Meta / Facebook graph token
+    r"|apify_api_[A-Za-z0-9]{16,}"
+    r"|glpat-[A-Za-z0-9_\-]{16,}"
+    r"|shpat_[A-Za-z0-9]{16,}"
+    r")")
+
+_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}")
+
+# key=value / "key": "value" / key: value, where the KEY names a credential.
+_NAMED_FIELD_RE = re.compile(
+    r"(?i)\b(api[_\-]?key|apikey|access[_\-]?token|refresh[_\-]?token|"
+    r"auth[_\-]?token|id[_\-]?token|bearer[_\-]?token|session[_\-]?token|"
+    r"client[_\-]?secret|service[_\-]?key|service[_\-]?role|private[_\-]?key|"
+    r"authorization|password|passwd|secret|signature|token)"
+    r"(\"?\s*[:=]\s*\"?)"
+    r"(?!\[REDACTED\])"
+    r"([^\s\"',;&)}\]]{6,})")
+
+# A long unbroken hex run: signatures, session keys, HMACs. A UUID never matches
+# (its dashes break the run at 8 chars), so gym ids and row ids survive intact.
+# _hex_sub additionally requires real variety (>= 8 distinct characters), so a
+# run of padding ('aaaa…') or a repeated marker is not mistaken for entropy; a
+# random 32-hex string carries ~16 distinct characters, so no real secret is
+# missed by that floor.
+_HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_HEX_MIN_DISTINCT = 8
+
+
+def _hex_sub(match):
+    s = match.group(0)
+    return REDACTED if len(set(s.lower())) >= _HEX_MIN_DISTINCT else s
+
+# A long base64-ish blob. Only redacted when it actually LOOKS like entropy
+# (upper + lower + digit all present), so ordinary long words, file paths, and
+# slugs are left alone.
+_B64_RE = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _b64_sub(match):
+    s = match.group(0)
+    if not (any(c.islower() for c in s) and any(c.isupper() for c in s)
+            and any(c.isdigit() for c in s)):
+        return s          # a long ordinary word, not entropy
+    return REDACTED
+
+
+def _redact_shapes(text):
+    """Redact anything SHAPED like a credential, wherever it came from."""
+    out = _BEARER_RE.sub(lambda m: f"{m.group(1)} {REDACTED}", text)
+    out = _PREFIXED_RE.sub(REDACTED, out)
+    out = _JWT_RE.sub(REDACTED, out)
+    out = _NAMED_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", out)
+    out = _HEX_RE.sub(_hex_sub, out)
+    out = _B64_RE.sub(_b64_sub, out)
+    return out
 
 
 def _secret_values():
@@ -42,13 +141,21 @@ def _secret_values():
 
 
 def scrub(text):
-    """Redact any secret env value that leaked into `text` (e.g. inside a
-    third-party exception message)."""
+    """Redact secrets from `text` before it leaves this module.
+
+    TWO passes, both always run:
+      1. every secret-looking ENV VALUE that leaked into the text (a token this
+         process holds, echoed back by a third party);
+      2. every credential SHAPE (_redact_shapes) — the case env matching cannot
+         cover, because the secret is not ours: a provider quoting the key it
+         rejected, an upstream response body carrying its own Authorization
+         header, a signed URL inside a traceback.
+    """
     out = str(text)
     for value in _secret_values():
         if value in out:
-            out = out.replace(value, "[REDACTED]")
-    return out
+            out = out.replace(value, REDACTED)
+    return _redact_shapes(out)
 
 
 def _default_poster():

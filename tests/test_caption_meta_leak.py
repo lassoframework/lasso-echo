@@ -14,6 +14,11 @@ prompt?"). This is the worst client-facing leak class, so it is closed at FOUR l
   3. PUBLISH FINAL GATE — calendar_autopublish strips a clean meta SUFFIX and
      publishes the real body (self-heal, no human), or HOLDS + alerts when the whole
      caption is scaffolding. Runs unconditionally, not behind AGENT_CALENDAR_GRADE.
+  3b. THE WIRE — the same split runs inside zernio_publisher.publish, THE wire every
+     client gym posts through. Layer 3 lives inside publish_due, which three live
+     lanes never enter (approvals.approve's card, runner's LASSO auto-approve,
+     chat_publish's approve-in-chat), so each of those could still ship a "[why]"
+     block. Same shared split_meta_suffix, so the layers can never disagree.
   4. BOOK SWEEP — agent.jobs.caption_meta_sweep cleans waiting rows through the
      STATUS-PRESERVING caption patch (an approved row stays approved) and reports
      published carriers for a manual live-platform edit.
@@ -324,6 +329,99 @@ def test_gbp_worker_all_meta_caption_fails_rails():
                                      client=None, draft=True)
     assert out["ok"] is False
     assert "empty caption" in out["reject_reason"]
+
+
+# ==========================================================================
+# 3b. THE WIRE — zernio_publisher.publish, the lane every CLIENT gym posts
+#     through. Layer 3 sits inside calendar_autopublish.publish_due; the
+#     approve card (approvals.approve), the LASSO auto-approve path in
+#     runner, and approve-in-chat (chat_publish) all reach a publisher
+#     WITHOUT entering publish_due, so the rationale could still ship. These
+#     pin the strip at the wire itself, where no lane can route around it.
+# ==========================================================================
+
+class _FakeWireClient:
+    """Records exactly what would go over the network to Zernio."""
+
+    def __init__(self):
+        self.created = []
+
+    def list_accounts(self, profile_id):
+        return {"accounts": [{"_id": "ig_acct_1", "platform": "instagram"}]}
+
+    def create_post(self, account_id, body, media_urls=None, scheduled_for=None,
+                    page_id=None, platform=None, story=False):
+        self.created.append({"body": body, "media_urls": media_urls, "story": story})
+        return {"_id": "zpost_wire"}
+
+
+def _wire_publish(monkeypatch, caption, story=False, url="https://cdn/x.jpg"):
+    """Publish one draft through the real wire with a fake Zernio client."""
+    from agent import zernio_publisher
+    from agent.accounts import Account, Platform
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("AGENT_ZERNIO_PUBLISH", "true")
+
+    class D:
+        pass
+    d = D()
+    d.caption = caption
+    d.creative_public_url = url
+    d.is_story = story
+    acct = Account(key="eng_ig", display_name="ENG IG", platform=Platform.INSTAGRAM,
+                   token_env="T", target_id_env="G")
+    client = _FakeWireClient()
+    res = zernio_publisher.publish(d, acct, client=client,
+                                   profile_resolver=lambda k: "prof_eng")
+    return client, res
+
+
+def test_wire_strips_meta_suffix_so_the_card_lanes_cannot_leak_it(monkeypatch):
+    """The ENG leak shape, arriving through a lane that never ran layer 3."""
+    client, res = _wire_publish(monkeypatch, f"{CLEAN_BODY}\n\n{LEAKED_META}")
+    assert res.ok and res.mode == "published"
+    sent = client.created[0]["body"]
+    assert sent == CLEAN_BODY
+    assert "[why]" not in sent.lower()
+    assert "Removed word parents" not in sent
+
+
+def test_wire_meta_strip_is_idempotent(monkeypatch):
+    """A caption layer 3 already cleaned must be BYTE-IDENTICAL after the wire,
+    or the two layers disagree and captions quietly change shape between lanes."""
+    client, _ = _wire_publish(monkeypatch, CLEAN_BODY)
+    assert client.created[0]["body"] == CLEAN_BODY
+
+
+@pytest.mark.parametrize("caption", [
+    "Doors open at 5am. [7 day pass] is on the front desk, grab one today.",
+    "Bring a friend. Our [new] spring schedule drops Monday, come see it.",
+    "We train hard [and] we have fun doing it, every single morning.",
+])
+def test_wire_never_strips_legitimate_caption_text(monkeypatch, caption):
+    """Only the shared _EDIT_META_RE labels are scaffolding. A caption using
+    ordinary brackets is client copy and must go out untouched."""
+    client, _ = _wire_publish(monkeypatch, caption)
+    assert client.created[0]["body"] == caption
+
+
+def test_wire_all_meta_caption_is_refused_never_published_empty(monkeypatch):
+    """When the WHOLE caption is scaffolding the strip leaves nothing. That row is
+    held for a human (the caller reverts + alerts), never published as an empty
+    feed post and never published carrying the rationale."""
+    with pytest.raises(ValueError):
+        _wire_publish(monkeypatch, LEAKED_META)
+
+
+def test_wire_story_still_publishes_with_an_empty_body(monkeypatch):
+    """No regression on the STORY contract: a story sends body='' by design (the
+    caption is burned into the media, and a duplicate body 409s against the paired
+    feed). The meta strip must leave that alone."""
+    client, res = _wire_publish(monkeypatch, f"{CLEAN_BODY}\n\n{LEAKED_META}",
+                                story=True)
+    assert res.ok
+    assert client.created[0]["story"] is True
+    assert client.created[0]["body"] == ""
 
 
 # ==========================================================================

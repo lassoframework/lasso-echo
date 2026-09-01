@@ -22,6 +22,13 @@ ONE CLAMP, ONE PLACE:
     portal_calendar_store.insert_rows applies so no lane can STAGE a beyond-horizon
     row even if a caller forgot the clamp. Drops-with-log, one summary line per batch
     (the needs-media digest pattern), never per-row spam, never silent.
+  * select_retirable(rows, ...) — the RETIREMENT selector (audit item 2, 2026-08-31).
+    The clamp and the belt both only govern rows being CREATED; neither one has ever
+    looked at a row that was already there. Live evidence on 2026-08-31, three days
+    after the cap shipped: 68 non-exempt PENDING rows still sat beyond today+31
+    (LASSO platform 43, doctrine 17, b2b 7, podcast 1, out to 2026-12-04) — staged
+    before the belt existed and invisible to it forever after. This selector is the
+    belt's retroactive counterpart; agent/jobs/plan_horizon_sweep.py runs it nightly.
 
 DELIBERATE EXEMPTIONS (row-level, narrow — never a loophole every row can ride):
   * a row tied to a dated real-world EVENT (content_calendar.event_id set): gym event
@@ -31,11 +38,14 @@ DELIBERATE EXEMPTIONS (row-level, narrow — never a loophole every row can ride
     sprint cycles and the dated book/welcome offers are anchored to real dates
     (Summit is Nov 7-8).
 
-RAILS: already-approved/published rows are untouched everywhere — the cap governs what
-gets BUILT/STAGED, it is never a retroactive sweep (nothing here deletes or trims an
-existing row). AGENT_PLAN_HORIZON_DAYS=0 disables the cap entirely (emergency escape
-hatch: the flag exists to raise/lower the number, not to disable the principle).
-Nothing here publishes."""
+RAILS: already-approved/published rows are untouched everywhere. The clamp and the belt
+govern what gets BUILT/STAGED; the retirement sweep governs what is left OVER, and it
+only ever touches rows in a pre-approval, machine-owned status (pending / coach_review)
+that are also non-exempt and beyond the horizon. An approved, publishing, published,
+denied, killed, or failed row is never a candidate — the sweep cannot delete a decision
+a human made. AGENT_PLAN_HORIZON_DAYS=0 disables the cap entirely (emergency escape
+hatch: the flag exists to raise/lower the number, not to disable the principle), and
+with it the sweep. Nothing here publishes."""
 
 from datetime import date, timedelta
 
@@ -146,6 +156,55 @@ def belt_filter(account_key, rows, *, now=None, alert=None):
         except Exception:  # noqa: BLE001 - alerting never blocks staging
             pass
     return kept, dropped
+
+
+# ---- retirement (the belt's retroactive counterpart) --------------------------------
+
+# The ONLY statuses the retirement sweep may delete. Both are pre-approval,
+# machine-owned states: 'pending' waits for the gym, 'coach_review' waits for a LASSO
+# coach — neither is a decision anyone has made yet, and the next month build re-stages
+# the day when it comes inside the window. Everything else is explicitly out of reach:
+# approved / publishing / published are live or promised, and denied / killed / failed
+# are decisions a human already made. Widening this tuple would break that promise.
+RETIREABLE_STATUSES = ("pending", "coach_review")
+
+
+def select_retirable(rows, *, now=None, statuses=RETIREABLE_STATUSES):
+    """Split `rows` into what the retirement sweep may delete and what it must keep.
+
+    Returns (retire, exempt, protected):
+      retire    — beyond the horizon, status in `statuses`, NOT is_horizon_exempt.
+      exempt    — beyond the horizon but dated (event_id / the LASSO summit, book and
+                  welcome lanes). Reported, never touched.
+      protected — beyond the horizon but in a status the sweep may not touch
+                  (approved / publishing / published / denied / killed / failed).
+                  Reported, never touched.
+    Rows inside the horizon are not returned at all. A row with no/unparseable
+    post_date is never retired (same posture as belt_filter). Cap disabled
+    (AGENT_PLAN_HORIZON_DAYS=0) -> nothing is retirable, byte-for-byte.
+
+    PURE: no I/O, no writes. `now` is injectable for determinism."""
+    end = horizon_end(now)
+    retire, exempt, protected = [], [], []
+    if end is None:
+        return retire, exempt, protected
+    allowed = {str(s).lower() for s in (statuses or ())}
+    for row in (rows or []):
+        pd = str((row or {}).get("post_date") or "")[:10]
+        try:
+            d = date.fromisoformat(pd) if pd else None
+        except ValueError:
+            d = None
+        if d is None or d <= end:
+            continue
+        if is_horizon_exempt(row):
+            exempt.append(row)
+            continue
+        if str((row or {}).get("status") or "").strip().lower() not in allowed:
+            protected.append(row)
+            continue
+        retire.append(row)
+    return retire, exempt, protected
 
 
 def _default_alert(msg):

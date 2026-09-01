@@ -1258,23 +1258,11 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
     # Nothing here changes captions, creative, status, floors, or the approval
     # path: every row still lands 'pending'. Any failure degrades to unstamped
     # rows, byte-identical to flag-off behavior.
-    if config.learning_loop_enabled():
-        try:
-            from . import lever_stamp as _levers
-            from . import playbook as _pb
-            _playbook = _pb.load_playbook(account_key)
-            for _i, _row in enumerate(rows):
-                _levers.stamp_row(_row)
-                _pref = _pb.preferred_time_slot(_playbook, _i)
-                if _pref:
-                    _row["time_slot"] = _pref
-            _months_touched = sorted({r["post_date"][:7] for r in rows
-                                      if r.get("post_date")})
-            if _months_touched:
-                _pb.label_experiments(rows, account_key, _months_touched[0],
-                                      _playbook)
-        except Exception:
-            pass
+    # ONE definition, shared with the client lane (lever_stamp.apply_learning_stamps).
+    # It used to live inline here — LASSO only — which is why every client gym staged
+    # lever-less rows and gym_playbook never got a single row. See that function.
+    from . import lever_stamp as _levers
+    _levers.apply_learning_stamps(account_key, rows)
 
     # Reconcile the FULL planned span plus every month a real row lands in: DELETE all of
     # the gym's rows there first (demo and prior real), so a re-run is idempotent.

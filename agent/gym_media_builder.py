@@ -44,6 +44,18 @@ _MAX_ASSET_ATTEMPTS = 3      # validation/vision failures try the next asset, bo
 _SLOT_KIND = {"faces": "photo", "community": "photo", "results": "photo"}
 
 
+def _vision_alert(msg):
+    """One loud line for anything vision wants to say on this lane — the per-gym
+    monthly cap being hit, or an identity flag routed to review. Local log always,
+    ops alert best effort; alerting never blocks a stage."""
+    print(f"[gym-media-builder] {msg}")
+    try:
+        from . import ops_alerts
+        ops_alerts.alert(msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _PickedCreative:
     """The minimal 'creative' shape client_content.photo_grounding + the SB7
     generator expect: a local .path whose sidecar carries the vision analysis."""
@@ -150,8 +162,17 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # DAM sidecar; we mirror it into media_asset.vision_json.
             analysis = None
             if asset.get("kind") == _idx.KIND_PHOTO:
-                analysis = vision.analyze_and_store(str(local_for_vision),
-                                                    gym=gym_base)
+                # alert= is REQUIRED here (audit item 5, 2026-08-31). Without it the
+                # per-gym monthly runaway guard (vision.within_gym_budget) can only
+                # return False — it can never SAY anything — so a gym silently stops
+                # being analyzed the moment it hits the cap. That is exactly what
+                # happened to gritx: 400/400 burned for the month, analysis quietly
+                # paused, zero alerts in the kv, and nobody knew until an audit
+                # counted rows. The Drive lane is the ONLY vision caller that was
+                # missing this.
+                analysis = vision.analyze_and_store(
+                    str(local_for_vision), gym=gym_base,
+                    alert=_vision_alert)
                 _persist_vision(store, asset, analysis)
                 ok, reasons = vision.auto_plannable(analysis)
                 if not ok:

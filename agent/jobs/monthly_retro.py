@@ -148,6 +148,24 @@ def lever_stats(scored, now):
     return stats
 
 
+STAMPED_LEVERS = ("hook_family", "ask_type", "time_slot", "caption_len_band")
+
+
+def lever_coverage(scored):
+    """{"learnable": n, "stamped": n} over the posts the playbook is allowed to learn
+    from (internal, organic — external and is_ad posts never train it).
+
+    'stamped' counts posts carrying at least one of the Wave 7 lever columns. A month
+    with learnable posts and ZERO stamped is not a thin month — it is a BROKEN loop:
+    the levers were never written at stage time, so propose_changes cannot compare
+    anything and no playbook can ever move. Pure."""
+    learnable = [p for p in (scored or [])
+                 if not p.get("external") and not p.get("is_ad")]
+    stamped = [p for p in learnable
+               if any(p.get(lever) for lever in STAMPED_LEVERS)]
+    return {"learnable": len(learnable), "stamped": len(stamped)}
+
+
 def gym_baseline(scored, now):
     """The gym's rolling recency-weighted baseline score. External posts DO
     inform the baseline (the whole feed is the gym's reality) — they just never
@@ -596,6 +614,14 @@ def retro_for_gym(gym_id, month, store, now, notifier):
         "taint_signals": signals,
         "baseline": round(baseline, 4) if baseline is not None else None,
         "scored_posts": len(scored),
+        # LEVER COVERAGE (audit item 1, 2026-08-31). The retro can only learn levers
+        # it can SEE, and for three weeks it could see none: every content_calendar
+        # row staged by the client lane carried hook_family / ask_type / time_slot /
+        # caption_len_band NULL, so every post_metrics row did too, and
+        # propose_changes had nothing to compare. Recording that number here — and
+        # alerting on it in run() — is what makes that failure visible instead of
+        # looking like "the honesty guards held again".
+        "lever_coverage": lever_coverage(scored),
     }
     row = {
         "gym_id": gym_id,
@@ -638,7 +664,75 @@ def run(month=None, gyms=None, store=None, now=None, notifier=None):
         except Exception as exc:  # noqa: BLE001
             results.append({"gym_id": gym_id, "ok": False,
                             "reason": f"retro failed: {type(exc).__name__}"})
+    alert_unconsumed(results, month)
     return {"ok": True, "month": month, "gyms": results}
+
+
+def unconsumed_report(results):
+    """Fleet-level read of one retro run: did it produce anything the playbook could
+    consume? Returns {rows, learnable, stamped, playbooks_moved, gyms_with_evidence}.
+    Pure over the retro rows."""
+    rows = [r for r in (results or []) if isinstance(r, dict) and "findings" in r]
+    learnable = stamped = moved = with_evidence = 0
+    for r in rows:
+        cov = (r.get("findings") or {}).get("lever_coverage") or {}
+        learnable += int(cov.get("learnable") or 0)
+        stamped += int(cov.get("stamped") or 0)
+        if r.get("playbook_diff"):
+            moved += 1
+        if cov.get("stamped"):
+            with_evidence += 1
+    return {"rows": len(rows), "learnable": learnable, "stamped": stamped,
+            "playbooks_moved": moved, "gyms_with_evidence": with_evidence}
+
+
+def alert_unconsumed(results, month, alert=None, logger=None):
+    """MAKE THE GAP LOUD (audit item 1, 2026-08-31).
+
+    A retro that writes findings nothing can consume looks identical, from the
+    outside, to a retro whose honesty guards correctly held. That is exactly how this
+    went unnoticed: 17 monthly_retro rows written, gym_playbook empty since the day it
+    was created, and no signal anywhere. The two cases are NOT the same, so they get
+    different treatment:
+
+      * learnable posts but ZERO stamped -> a BROKEN loop. The lever columns were
+        never written at stage time, so no evidence can ever exist and no playbook
+        can ever move however long we wait. That is a defect: it ALERTS.
+      * stamped evidence present but no playbook moved -> the guards held on thin or
+        noisy data, which is the design working. That only logs.
+
+    Returns the report dict. Never raises."""
+    log = logger or (lambda m: print(f"[monthly-retro] {m}"))
+    rep = unconsumed_report(results)
+    if not rep["rows"]:
+        return rep
+    if rep["learnable"] and not rep["stamped"]:
+        msg = (f"monthly retro {month}: wrote {rep['rows']} findings row(s) over "
+               f"{rep['learnable']} learnable post(s) and NOTHING can consume them — "
+               "0 of those posts carry a Wave 7 lever (hook_family / ask_type / "
+               "time_slot / caption_len_band). post_metrics inherits those columns "
+               "from the staged content_calendar row, so an unstamped calendar means "
+               "the retro can never compare anything and gym_playbook can never get a "
+               "row. Check that AGENT_LEARNING_LOOP is on for the STAGING lane and "
+               "run: python -m agent.jobs.backfill_levers")
+        log(msg)
+        try:
+            (alert or _default_gap_alert)(msg)
+        except Exception:  # noqa: BLE001 - alerting never fails the retro
+            pass
+    elif not rep["playbooks_moved"]:
+        log(f"{month}: {rep['stamped']} stamped post(s) across "
+            f"{rep['gyms_with_evidence']} gym(s), no playbook moved — the honesty "
+            "guards held (thin or non-persistent evidence). Working as designed.")
+    return rep
+
+
+def _default_gap_alert(msg):
+    try:
+        from agent import ops_alerts
+        ops_alerts.alert(msg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

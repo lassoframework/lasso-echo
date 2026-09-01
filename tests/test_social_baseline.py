@@ -525,6 +525,111 @@ def test_cli_honest_skip_shows_the_reason(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# --all coverage: the fleet the sweep actually reaches (audit 2026-08-31)
+#
+# Coverage stood at 3 of the fleet because --all was built from
+# client_gym_bases() alone, which EXCLUDES the LASSO tenant (it has its own
+# Meta-direct PUBLISHING lane). Measurement is not publishing: LASSO's public
+# feed has the same before/after story, so the documented command could never
+# capture it. And one gym's exception aborted the whole run, leaving every gym
+# after it silently uncaptured on a manual rail that has no retry.
+# ---------------------------------------------------------------------------
+
+class _FakeAccount:
+    def __init__(self, key, platform):
+        self.key = key
+        self.platform = platform
+
+
+def _patch_fleet(monkeypatch, bases, accounts):
+    import agent.calendar_autopublish as cap
+    import agent.accounts as accounts_mod
+    monkeypatch.setattr(cap, "client_gym_bases", lambda: list(bases))
+    monkeypatch.setattr(accounts_mod, "all_accounts", lambda: list(accounts))
+
+
+def test_all_baseline_gyms_includes_lasso(monkeypatch):
+    _patch_fleet(monkeypatch, ["eng", "gritx"], [
+        _FakeAccount("lasso_ig", "instagram"),
+        _FakeAccount("eng_ig", "instagram"),
+        _FakeAccount("gritx_fb", "facebook_page"),
+    ])
+    assert sb.all_baseline_gyms() == ["lasso", "eng", "gritx"]
+
+
+def test_all_baseline_gyms_drops_non_social_registry_keys(monkeypatch):
+    _patch_fleet(monkeypatch, ["eng", "blake_personal"], [
+        _FakeAccount("lasso_ig", "instagram"),
+        _FakeAccount("eng_ig", "instagram"),
+        _FakeAccount("blake_personal", "personal"),
+    ])
+    assert sb.all_baseline_gyms() == ["lasso", "eng"]
+
+
+def test_all_baseline_gyms_dedupes_and_survives_an_unreadable_registry(monkeypatch):
+    import agent.calendar_autopublish as cap
+    import agent.accounts as accounts_mod
+
+    def _boom():
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(cap, "client_gym_bases", lambda: ["lasso", "eng", "eng"])
+    monkeypatch.setattr(accounts_mod, "all_accounts", _boom)
+    # No platform filtering rather than a silently shrunken fleet.
+    assert sb.all_baseline_gyms() == ["lasso", "eng"]
+
+
+def test_cli_all_captures_lasso_too(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_SOCIAL_BASELINE", "true")
+    _patch_fleet(monkeypatch, ["eng"], [
+        _FakeAccount("lasso_ig", "instagram"),
+        _FakeAccount("eng_ig", "instagram"),
+    ])
+
+    class _CaptureStore(FakeBaselineStore):
+        def insert_once(self, row):
+            ok, reason = super().insert_once(row)
+            return ok, reason
+
+    store = _CaptureStore()
+    sb.cli(["--all", "--capture"], client=FakeApify(posts=FIXTURE_POSTS),
+           store=FakeCalStore(first_published="2026-01-31"),
+           baseline_store=store, today=date(2026, 8, 28))
+    out = capsys.readouterr().out
+    assert "capture lasso: stored" in out
+    assert "capture eng: stored" in out
+    assert [r["gym_id"] for r in store.inserted] == ["lasso", "eng"]
+
+
+def test_cli_all_one_gym_exploding_does_not_abort_the_sweep(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_SOCIAL_BASELINE", "true")
+    _patch_fleet(monkeypatch, ["boom", "eng"], [
+        _FakeAccount("lasso_ig", "instagram"),
+        _FakeAccount("boom_ig", "instagram"),
+        _FakeAccount("eng_ig", "instagram"),
+    ])
+
+    class _ExplodingStore(FakeBaselineStore):
+        def get(self, gym_id):
+            if gym_id == "boom":
+                # A raw client error: its message can carry the request URL,
+                # and the Apify token rides in that query string.
+                raise RuntimeError("HTTPSConnectionPool ... ?token=SUPERSECRET")
+            return self.row
+
+    rc = sb.cli(["--all", "--capture"], client=FakeApify(posts=FIXTURE_POSTS),
+                store=FakeCalStore(first_published="2026-01-31"),
+                baseline_store=_ExplodingStore(), today=date(2026, 8, 28))
+    out = capsys.readouterr().out
+    assert rc == 1                                   # the failure is reported
+    assert "capture boom: capture failed: RuntimeError" in out
+    assert "SUPERSECRET" not in out                  # never the message
+    # The gyms AFTER the failure still ran — that is the whole fix.
+    assert "capture lasso: stored" in out
+    assert "capture eng: stored" in out
+
+
+# ---------------------------------------------------------------------------
 # since-echo digest block + monthly retro wiring
 # ---------------------------------------------------------------------------
 

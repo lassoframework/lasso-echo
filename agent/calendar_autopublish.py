@@ -936,8 +936,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # publish() -> treat as NOT published and revert the claim (retryable).
         if ok and mode == "published":
             try:
+                # Only a Zernio 409 content-hash dedup may be stamped published with no
+                # post id — Zernio told us the content is already live but named no id.
+                # Every other lane must carry a real id or the store refuses (see
+                # mark_published). The kwarg is passed ONLY in that case so the call
+                # keeps its historic 3-arg shape for every other store implementation.
+                _mp_kwargs = ({"allow_missing_post_id": True}
+                              if getattr(result, "dedup", False) else {})
                 store.mark_published(row_id, getattr(result, "media_id", ""),
-                                     _now_iso(now))
+                                     _now_iso(now), **_mp_kwargs)
             except Exception as e:
                 # The post went out but we could not record it. Do NOT revert (that
                 # would re-publish next run — it already published live). DEFECT 2

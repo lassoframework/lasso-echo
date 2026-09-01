@@ -1194,6 +1194,43 @@ def account_key_reconcile_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_RECONCILE", "false"))
 
 
+def zernio_failed_watch_enabled() -> bool:
+    """The Zernio FAILED-post watch (zernio_failed_watch.py): a nightly READ-ONLY sweep
+    that alerts when Zernio's own record marks a post FAILED — loudest when Echo has that
+    same post marked PUBLISHED in the portal.
+
+    WHY IT EXISTS: the client IG/FB lane treats a 2xx from POST /v1/posts as publication.
+    That is acceptance, not delivery. Zernio can fail a post afterwards (revoked token,
+    dropped page grant, rejected media) and NOTHING in Echo ever looked again — there was
+    no failed-post read in the client lane at all, and publish_confirm is advisory and
+    routes Zernio verification only for LASSO. So a client row could read "Published" with
+    a real post id while Zernio said FAILED, and no one would know.
+
+    OFF by default (house rule). It only READS and alerts: it never retries and never
+    republishes, because a post Zernio failed on one platform may be live on the other and
+    a blind retry double-posts."""
+    return _truthy(os.environ.get("AGENT_ZERNIO_FAILED_WATCH", "false"))
+
+
+def account_key_split_watch_enabled() -> bool:
+    """The account-key SPLIT watch (account_key_split_watch.py): a nightly READ-ONLY sweep
+    that alerts when the key the PORTAL recorded for a gym owns no calendar rows while a
+    DIFFERENT key resolving to the same gym owns them.
+
+    WHY IT EXISTS: Swift River CrossFit and CrossFit Sunnyside both onboarded 2026-08-31
+    and ended up with two keys each — the portal token pointed at an empty key while the
+    month, the media and the Zernio profile lived under another. No existing detector sees
+    it: the reconciler grades a non-collided key as "issued" and therefore OK, the doctor
+    only asks whether a base resolves to one gym (both keys do, to the same gym), and
+    onboarding_watch compares the token key to the intake key (both sides agreed). The
+    gyms would simply never have posted.
+
+    OFF by default (house rule: every new capability ships dark). It only ever READS and
+    alerts — it never repoints a key, which stays a deliberate human act through
+    account_key_reconcile."""
+    return _truthy(os.environ.get("AGENT_ACCOUNT_KEY_SPLIT_WATCH", "false"))
+
+
 def canonical_mint_enabled() -> bool:
     """Derive a NEWLY minted intake link's account_key canonically at onboard time
     (onboard.run -> canonical_account_key), so a fresh link can never carry an ad-hoc
@@ -3158,6 +3195,70 @@ def plan_horizon_days() -> int:
     except (TypeError, ValueError):
         val = 31
     return max(0, val)
+
+
+def vision_allowlist_watch_enabled() -> bool:
+    """Daily read-only VISION ALLOWLIST DRIFT report (AGENT_VISION_ALLOWLIST_WATCH,
+    default ON).
+
+    AGENT_VISION_GYMS gates the DAM sidecar lane, but the Google-Drive staging lane
+    (gym_media_builder -> vision.analyze_and_store) never consults it. On 2026-08-31
+    that meant crossfitreverb30b5b2 and hillcountry were burning vision calls without
+    being armed, while allowlisted district_h had nothing to analyze and gritx sat
+    silently at its monthly cap. This watch names both directions of the drift once a
+    month. It reads the env and the kv spend ledger; it arms nothing, disarms nothing,
+    and spends nothing."""
+    return _truthy(os.environ.get("AGENT_VISION_ALLOWLIST_WATCH", "true"))
+
+
+def posting_tz_watch_enabled() -> bool:
+    """Per-gym POSTING TIMEZONE backfill + watchdog (AGENT_POSTING_TZ_WATCH, default ON).
+
+    posting_timezone_for() falls back to the GLOBAL default when a gym's column is
+    empty, so an unset gym posts at Echo's default hour rather than its own. Nine of
+    sixteen gyms were NULL on 2026-08-31 and nothing had ever noticed. This flag arms
+    agent/jobs/posting_tz_backfill.py: it fills the column from real evidence only (a
+    CONNECTED Google Business location, else a city/state in the gym's own brand
+    bible), never overwrites a value a human set, never writes a guess, and alerts on
+    every gym it still cannot resolve. Default ON because both halves are safe: the
+    write only ever fills a NULL, and the watchdog is read-only."""
+    return _truthy(os.environ.get("AGENT_POSTING_TZ_WATCH", "true"))
+
+
+def media_repeat_sweep_enabled() -> bool:
+    """The nightly CROSS-DAY PHOTO REPEAT sweep (AGENT_MEDIA_REPEAT_SWEEP, default ON).
+
+    agent/media_guard.py stops a repeat at STAGE time. Rows already on the book are
+    invisible to it, and agent/jobs/media_repeat_sweep.py — built for exactly that,
+    working, tested — was never scheduled: on 2026-08-31, 35 live cross-day repeats
+    stood unswept (LASSO 29, CrossFit Zanshin 6). That is the defect a client noticed
+    ("the same photo across different weeks").
+
+    Default ON because it is a correctness sweep with hard rails already built into
+    the job: published/publishing rows are never touched, an APPROVED row's media is
+    never swapped (the gym approved that exact card), and a gym with no unused photo
+    left is reported as a small library rather than given fabricated media. Set to
+    false to stop the nightly run; the CLI (`python -m agent.jobs.media_repeat_sweep`)
+    still works by hand."""
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_SWEEP", "true"))
+
+
+def plan_horizon_sweep_enabled() -> bool:
+    """The RETIREMENT counterpart of the planning-horizon cap
+    (AGENT_PLAN_HORIZON_SWEEP, default ON).
+
+    horizon_clamp and belt_filter both govern rows being CREATED. Neither has ever
+    looked at a row that was already staged, so every row written BEFORE the cap
+    shipped (2026-08-28) sits beyond it permanently: 68 non-exempt PENDING rows were
+    still out past today+31 on 2026-08-31, LASSO's out to 2026-12-04. This flag arms
+    agent/jobs/plan_horizon_sweep.py, which deletes them nightly.
+
+    Default ON for the same reason the belt is: it PREVENTS token spend rather than
+    causing it, and it is strictly bounded — pending/coach_review rows only, never an
+    approved / publishing / published / denied / killed row, never a dated exempt row
+    (event arcs, the LASSO summit/book/welcome lanes). Set to false to disable the
+    sweep while keeping the build-time cap; AGENT_PLAN_HORIZON_DAYS=0 disables both."""
+    return _truthy(os.environ.get("AGENT_PLAN_HORIZON_SWEEP", "true"))
 
 
 def story_studio_music_shelf() -> str:

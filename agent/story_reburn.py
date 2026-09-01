@@ -31,6 +31,35 @@ def should_reburn(row):
     return bool((row or {}).get("source_media_url"))
 
 
+def stamp_source_media(draft):
+    """Record on a STORY draft the RAW hosted media its caption is (or would be) burned
+    onto, so `_real_row` persists content_calendar.source_media_url and a later caption
+    edit can RE-BURN immediately (portal save + the publish-lane self-heal).
+
+    Same convention as the client lane (client_month_run._maybe_format_story): the value
+    is the story's own PRE-BURN hosted url — never the paired feed card, which may be the
+    square autofit and would come back cropped. In LASSO's own lanes (the nano 9:16 story
+    render, the summit sprint's paired *_story render) the hosted render IS that raw
+    media, so source_media_url == the story's creative_public_url at stamp time.
+
+    Same gate as the client lane too: a no-op unless AGENT_STORY_SOURCE_MEDIA is on (the
+    column exists), so a pre-migration insert never carries an unknown column. Returns the
+    draft for call-site chaining; never raises."""
+    try:
+        if draft is None or not config.story_source_media_enabled():
+            return draft
+        if not getattr(draft, "is_story", False):
+            return draft
+        src = (getattr(draft, "source_media_url", "") or "").strip()
+        if not src:
+            src = (getattr(draft, "creative_public_url", "") or "").strip()
+        if src:
+            draft.source_media_url = src
+    except Exception:  # noqa: BLE001 - a metadata stamp must never sink a build
+        pass
+    return draft
+
+
 def _download(url, logger):
     """Download url to a temp file, returning its path (caller deletes) or None. The
     extension is taken from the url path so the burn picks the photo vs video branch."""

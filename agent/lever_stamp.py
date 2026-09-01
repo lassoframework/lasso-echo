@@ -158,3 +158,50 @@ def stamp_row(row: dict, scheduled_time: str | None = None) -> dict:
     if "has_member_face" not in row and isinstance(row.get("people"), bool):
         row["has_member_face"] = row["people"]
     return row
+
+
+# ---- the ONE stage-time entry point ------------------------------------------------
+
+def apply_learning_stamps(account_key, rows, logger=None):
+    """Stamp a WHOLE staged batch: levers, the playbook's preferred time slots, and the
+    month's labeled experiments. Returns `rows` (stamped in place).
+
+    THE BUG THIS EXISTS TO KILL (audit item 1, 2026-08-31). This block used to live
+    inline in agent/real_month_planner.py — LASSO's lane only. Every CLIENT gym stages
+    through agent/client_month_run.py, which never had it. Result: with
+    AGENT_LEARNING_LOOP=true and 17 monthly_retro rows written, content_calendar carried
+    1681 rows with hook_family, ask_type, time_slot and caption_len_band NULL on ALL of
+    them. metrics_sync copies those columns from the joined calendar row
+    (agent/metrics_sync.py:191-196), so every post_metrics row was lever-less too, and
+    monthly_retro.propose_changes — which compares hook_family, pillar and time_slot —
+    had literally nothing to compare. gym_playbook has never had a single row, and could
+    not have. The retro was recording, not learning.
+
+    ONE definition, called by every lane that stages calendar rows, so a new lane
+    inherits it instead of quietly re-opening the gap.
+
+    Behind AGENT_LEARNING_LOOP (flag OFF -> untouched rows, byte-identical). Never
+    changes captions, creative, status, dates, or the approval path: it only adds
+    classification columns. Any failure degrades to unstamped rows and says so — the
+    old silent `except: pass` is why nobody noticed for three weeks."""
+    from . import config
+    rows = rows or []
+    if not rows or not config.learning_loop_enabled():
+        return rows
+    log = logger or (lambda m: print(f"[lever-stamp] {m}"))
+    try:
+        from . import playbook as _pb
+        book = _pb.load_playbook(account_key)
+        for i, row in enumerate(rows):
+            stamp_row(row)
+            pref = _pb.preferred_time_slot(book, i)
+            if pref:
+                row["time_slot"] = pref
+        months = sorted({str(r.get("post_date"))[:7] for r in rows
+                         if r.get("post_date")})
+        if months:
+            _pb.label_experiments(rows, account_key, months[0], book)
+    except Exception as exc:  # noqa: BLE001 - stamping never blocks staging
+        log(f"{account_key}: lever stamping failed ({type(exc).__name__}: {exc}); "
+            "rows staged UNSTAMPED — the monthly retro cannot learn from them")
+    return rows

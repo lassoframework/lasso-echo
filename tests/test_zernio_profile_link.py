@@ -43,6 +43,15 @@ class _FakeDb:
     def kv_set(self, key, value):
         self.kv[key] = value
 
+    def gym_key_for_zernio_profile(self, profile_id):
+        """Reverse lookup the cross-tenant bind guard needs: which key already owns
+        this profile. Mirrors the real db module."""
+        pid = str(profile_id or "").strip()
+        for key, row in self.rows.items():
+            if str((row or {}).get("zernio_profile_id") or "").strip() == pid:
+                return key
+        return ""
+
 
 class _FakeZernio:
     def __init__(self, profiles, accounts=None, raise_for=None):
@@ -289,3 +298,39 @@ def test_no_media_never_starts_the_clock(armed, monkeypatch, tmp_path):
     db = _FakeDb({base: {"zernio_profile_id": ""}})
     zpl.link_client_profiles(bases=[base], zernio=_FakeZernio({}), db=db)
     assert db.kv_get(f"zernio_link_alerted_{base}") == ""
+
+
+# ---- cross-tenant bind guard on the UNATTENDED path -------------------------------
+# This sweep runs daily (run_daily) and hourly (listener), and it resolves the profile
+# with find_profile_id_any over display-name and IG/FB handle ALIASES. Two similarly
+# named gyms can therefore both match the SAME profile. The never-overwrite check above
+# only blocks REBIND-KEY; nothing blocked STEAL-PROFILE, so this path could wire one
+# gym's posts onto another gym's socials -- the exact leak account_key_guard exists to
+# stop, on the one binding path with no human in the loop.
+
+def test_steal_profile_bind_is_refused_on_the_unattended_sweep(armed, monkeypatch):
+    """A profile already owned by a DIFFERENT gym must never be bound to a second key."""
+    monkeypatch.setenv("AGENT_ACCOUNT_KEY_GUARD", "true")
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: alerts.append(msg))
+    # gymA already owns PID1. gymB's name matches the same Zernio profile.
+    db = _FakeDb({"gyma": {"zernio_profile_id": "PID1"},
+                  "gymb": {"zernio_profile_id": ""}})
+    out = zpl.link_client_profiles(bases=["gymb"], zernio=_FakeZernio({"gymb": "PID1"}),
+                                   db=db)
+    assert out["linked"] == 0, "a cross-tenant bind must never be counted as linked"
+    assert db.rows["gymb"].get("zernio_profile_id", "") == "", "no write may happen"
+    assert not [u for u in db.upserts if u[0] == "gymb"], "no upsert may be issued"
+    assert any("cross-tenant" in a for a in alerts), f"the guard must alert, got {alerts}"
+    assert any(r.get("status") == "bind_blocked" for r in out["results"])
+
+
+def test_a_tenant_safe_bind_still_links_normally(armed, monkeypatch):
+    """The guard must not break the happy path it wraps."""
+    monkeypatch.setenv("AGENT_ACCOUNT_KEY_GUARD", "true")
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: None)
+    db = _FakeDb({"gymb": {"zernio_profile_id": ""}})
+    out = zpl.link_client_profiles(bases=["gymb"], zernio=_FakeZernio({"gymb": "PIDFREE"}),
+                                   db=db)
+    assert out["linked"] == 1
+    assert db.rows["gymb"]["zernio_profile_id"] == "PIDFREE"

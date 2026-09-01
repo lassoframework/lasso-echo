@@ -226,6 +226,28 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
                 page_id = _fb_page_id(zernio.list_accounts(pid))
             except Exception:
                 page_id = ""
+            # CROSS-TENANT BIND GUARD. This sweep is the one profile-binding path that
+            # runs UNATTENDED (daily in run_daily, hourly in the listener), and it resolves
+            # the profile with find_profile_id_any over display names and IG/FB handle
+            # ALIASES — so two similarly-named gyms can both match the SAME profile and both
+            # bind to it, which is exactly the one-gym's-posts-on-another-gym's-socials leak
+            # (Bird Dog CrossFit / Bolton Club). The never-overwrite check above only stops
+            # REBIND-KEY; nothing here stopped STEAL-PROFILE. Route the write through the
+            # same guard _persist_profile_id uses so this path cannot cross tenants either.
+            from . import account_key_guard as _akg
+            _decision = _akg.check_bind(
+                base, str(pid),
+                existing_profile_for=lambda k: (db.gym_get(k) or {}).get("zernio_profile_id"),
+                # db is injectable; a store without the reverse lookup degrades to the
+                # rebind check rather than crashing the whole sweep.
+                key_for_profile=getattr(db, "gym_key_for_zernio_profile", None),
+            )
+            if not _decision:
+                # The guard already fired one loud ops alert. Do NOT write.
+                log(f"{base}: BIND BLOCKED -> {pid}: {_decision.reason}")
+                results.append({"gym": base, "status": "bind_blocked",
+                                "profile_id": str(pid), "reason": _decision.reason})
+                continue
             fields = {"zernio_profile_id": str(pid)}
             if page_id:
                 fields["zernio_default_fb_page_id"] = page_id

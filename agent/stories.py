@@ -145,7 +145,12 @@ def _premade_story_variant(feed_draft):
 
 def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
                  creative_public_url, fragments):
-    return Draft(
+    # Task #28 (§5c): stamp the story's RAW hosted media so content_calendar carries
+    # source_media_url and an edited story caption RE-BURNS (portal save + the
+    # publish-lane self-heal) instead of shipping the old text. Gated by
+    # AGENT_STORY_SOURCE_MEDIA inside the helper; a no-op while it is off.
+    from . import story_reburn
+    return story_reburn.stamp_source_media(Draft(
         draft_id=draft_id, account_key=account.key, platform=account.platform,
         # Stories carry minimal or no caption; Echo ships none and never invents one.
         caption="", hashtags=[],
@@ -156,4 +161,4 @@ def _story_draft(account, day_key, draft_id, feed_draft, creative_path,
         status=DraftStatus.PENDING,
         source_fragments=fragments,  # the same approved text the feed creative used
         is_story=True,
-    )
+    ))

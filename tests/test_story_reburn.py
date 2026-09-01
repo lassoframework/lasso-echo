@@ -133,3 +133,101 @@ def test_real_row_includes_source_media_only_when_present():
     # payload entirely, so a pre-migration insert never carries an unknown column.
     row_without = rcm._real_row("gritx", SimpleNamespace(source_media_url="", **base))
     assert "source_media_url" not in row_without
+
+
+# ---- LASSO's OWN story lanes stage source_media_url too -----------------------
+# The client lane (client_month_run._maybe_format_story) stamps the story's raw hosted
+# media, but LASSO builds its stories in its own lanes (the nano 9:16 story render and
+# the summit sprint's paired *_story render). Those omitted the stamp, so every LASSO
+# story row had source_media_url NULL and an edited LASSO story caption could never
+# re-burn (the old text shipped). These pin the stamp on both LASSO lanes.
+
+def _lasso_ig_account():
+    from types import SimpleNamespace
+    return SimpleNamespace(key="lasso_ig", platform="instagram", display_name="LASSO IG")
+
+
+def _pending_feed_draft():
+    from agent.drafter import Draft, DraftStatus
+    return Draft(draft_id="f1", account_key="lasso_ig", platform="instagram",
+                 caption="feed cap", hashtags=[],
+                 creative_path="/tmp/nano_hook.png",
+                 creative_public_url="https://r2/lasso_ig/nano_hook.png",
+                 scheduled_for="2026-09-01T18:00:00Z", status=DraftStatus.PENDING,
+                 source_fragments=["headline", "fact"])
+
+
+def _build_lasso_story(monkeypatch, story_url):
+    """Run stories.build_story_draft down the premade 9:16 lane, offline."""
+    from agent import stories
+    monkeypatch.setenv("AGENT_STORIES_ENABLED", "true")
+    monkeypatch.setenv("AGENT_STORY_PREMADE_ENABLED", "true")
+    monkeypatch.setattr(stories.schedule, "should_post_on", lambda day: True)
+    monkeypatch.setattr(stories.schedule, "scheduled_for",
+                        lambda day, slot=None: f"{day}T09:00:00Z")
+    monkeypatch.setattr(stories, "_premade_story_variant",
+                        lambda feed: "/tmp/nano_hook_story.png")
+    monkeypatch.setattr(stories.media_host, "host_media",
+                        lambda path, key, client=None: story_url)
+    return stories.build_story_draft(_lasso_ig_account(), "2026-09-01",
+                                     feed_draft=_pending_feed_draft())
+
+
+def test_lasso_nano_story_draft_carries_source_media_url(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "true")
+    url = "https://r2/lasso_ig/nano_story_hook.png"
+    draft = _build_lasso_story(monkeypatch, url)
+    assert draft is not None and draft.is_story is True
+    # the story's own hosted media is recorded as the raw source to re-burn from
+    assert getattr(draft, "source_media_url", "") == url
+    # ...and it survives into the content_calendar row the portal reads
+    from agent import real_calendar_mirror as rcm
+    row = rcm._real_row("lasso", draft)
+    assert row["format"] == "story"
+    assert row["source_media_url"] == url
+
+
+def test_lasso_nano_story_omits_source_media_when_flag_off(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    draft = _build_lasso_story(monkeypatch, "https://r2/lasso_ig/nano_story_hook.png")
+    assert draft is not None
+    assert not getattr(draft, "source_media_url", "")
+    from agent import real_calendar_mirror as rcm
+    assert "source_media_url" not in rcm._real_row("lasso", draft)
+
+
+def _summit_sprint_story(monkeypatch, story_url):
+    from agent import real_month_run as rmr
+    slot = {"filename": "06_room_a.png", "caption": "room a",
+            "scheduled_for": "2026-09-01T18:00:00Z"}
+    monkeypatch.setattr(rmr, "_sprint_slot_map",
+                        lambda posts_per_day=None: {("2026-09-01", 0): slot})
+    manifest = {"06_room_a.png": "https://r2/lasso_summit/06_room_a.png",
+                "06_room_a_story.png": story_url}
+    _feed, _story = rmr.sprint_builders(_lasso_ig_account(), manifest=manifest)
+    return _story(None, "2026-09-01", 0, _pending_feed_draft())
+
+
+def test_lasso_summit_sprint_story_carries_source_media_url(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "true")
+    url = "https://r2/lasso_summit/06_room_a_story.png"
+    draft = _summit_sprint_story(monkeypatch, url)
+    assert draft is not None and draft.is_story is True
+    assert getattr(draft, "source_media_url", "") == url
+    from agent import real_calendar_mirror as rcm
+    assert rcm._real_row("lasso", draft)["source_media_url"] == url
+
+
+def test_lasso_summit_sprint_story_omits_source_media_when_flag_off(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "false")
+    draft = _summit_sprint_story(monkeypatch,
+                                 "https://r2/lasso_summit/06_room_a_story.png")
+    assert draft is not None
+    assert not getattr(draft, "source_media_url", "")
+
+
+def test_stamp_source_media_never_touches_a_feed_draft(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "true")
+    feed = _pending_feed_draft()
+    story_reburn.stamp_source_media(feed)
+    assert not getattr(feed, "source_media_url", "")

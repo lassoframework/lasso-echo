@@ -17,8 +17,10 @@ class _Acct:
 
 def _wire(monkeypatch, analysis=None):
     """Stub vision + caption + hosting so the builder path is exercised offline."""
+    # `alert=` is REQUIRED by this lane (audit item 5): without it the per-gym monthly
+    # vision cap can refuse but never speak, which is how gritx sat silently at 400/400.
     monkeypatch.setattr("agent.vision.analyze_and_store",
-                        lambda path, gym=None: analysis or {
+                        lambda path, gym=None, alert=None: analysis or {
                             "version": 2, "quality": {"usable": True},
                             "safety_flags": [], "one_line": "three people at the gym"})
     monkeypatch.setattr("agent.vision.auto_plannable", lambda a: (True, []))

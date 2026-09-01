@@ -36,7 +36,7 @@ class _KV:
 
 
 def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
-          platforms=None, pages=None, names=None):
+          platforms=None, pages=None, names=None, voice=None):
     sources = sources or {}
     profiles = profiles or {}
     platforms = platforms or {}
@@ -46,6 +46,9 @@ def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
         "intake": lambda http=None: dict(intake or {}),
         "bases": lambda: list(bases),
         "approved_sources": lambda b: sources.get(b, []),
+        # voice=None means "every gym has a real bible", so every pre-existing case
+        # here keeps testing exactly what it was written to test.
+        "voice": lambda b: True if voice is None else bool(voice.get(b)),
         "profile_id": lambda b: profiles.get(b, ""),
         "platforms": lambda pid: set(platforms.get(pid, set())),
         "fb_page": lambda b: pages.get(b, ""),
@@ -138,6 +141,138 @@ def test_no_sources_and_no_profile_are_caught_together():
     deps = _deps(roster=[("g1", "g")], intake={"g1": "g"}, bases=["g"])
     out = ow.run(deps=deps, alert=lambda m: None, kv=_KV())
     assert out["g"] == [ow.REASON_NO_SOURCES, ow.REASON_NO_PROFILE]
+
+
+# ---- the bible that was never written (the expensive silent failure) ------------
+_BIBLE_COMMAND = "python -m agent social-intake-sync --base"
+
+
+def _no_bible(base="crossfitlocal", pid="p1"):
+    """Sources approved, Zernio profile connected, FB page stamped: every other check
+    in this file passes. The ONLY thing wrong is that no bible was ever produced."""
+    return _deps(roster=[("g1", base)], intake={"g1": base}, bases=[base],
+                 sources={base: ["a source"]}, profiles={base: pid},
+                 platforms={pid: {"instagram", "facebook"}}, pages={base: "1234"},
+                 voice={base: False})
+
+
+def test_a_gym_with_no_brand_bible_is_caught():
+    """THE most expensive silent failure in the system, and this watch could not see it:
+    check_gym never read the voice-doc path at all, so a gym with approved sources, a
+    connected profile and ZERO bible read as perfectly healthy while it silently never
+    drafted a single post, forever. ENG went this way; crossfitlocal, hillcountry and
+    theboltonclub all went the same way the week of 2026-08-31. The only nearby signal
+    (client_media_sync's _alert_stall no_voice) fires once ever, carries no next
+    command, and is unreachable for exactly these gyms."""
+    seen = []
+    out = ow.run(deps=_no_bible(), alert=seen.append, kv=_KV())
+    assert out == {"crossfitlocal": [ow.REASON_NO_VOICE]}
+    assert len(seen) == 1
+    assert seen[0].startswith("crossfitlocal:")            # the alert names the gym
+    # and it names the EXACT next command, under this gym's own key, so the operator
+    # copies it instead of retyping it under the wrong one.
+    assert f"{_BIBLE_COMMAND} crossfitlocal" in seen[0]
+
+
+def test_a_gym_with_a_real_bible_is_never_flagged():
+    """No false positives: the fleet's healthy gyms must stay silent, or the watch
+    trains everyone to ignore it (the key_mismatch lesson, 2026-08-30)."""
+    seen = []
+    deps = _healthy(base="eng")
+    deps["voice"] = lambda b: True
+    assert ow.run(deps=deps, alert=seen.append, kv=_KV()) == {}
+    assert seen == []
+
+
+def test_no_sources_still_wins_over_no_voice():
+    """A gym with no approved sources CANNOT have a bible: the bible is written FROM the
+    intake answers. So no_sources is the step that unblocks the bible, it leads the
+    alert, and no_voice is not piled on top as derived noise."""
+    deps = _deps(roster=[("g1", "g")], intake={"g1": "g"}, bases=["g"],
+                 sources={}, profiles={"g": "p1"},
+                 platforms={"p1": {"instagram"}}, pages={"g": "1"},
+                 voice={"g": False})
+    seen = []
+    out = ow.run(deps=deps, alert=seen.append, kv=_KV())
+    assert out["g"][0] == ow.REASON_NO_SOURCES, "no_sources must lead"
+    assert ow.REASON_NO_VOICE not in out["g"]
+    assert _BIBLE_COMMAND not in seen[0]     # the alert leads with the sources fix
+
+
+def test_no_voice_is_reported_before_no_profile():
+    """Ordering matters because no_profile RETURNS EARLY. If the profile check ran
+    first, a gym missing both would report only no_profile, and the day someone linked
+    the profile it would go straight back to reading healthy while still drafting
+    nothing. That is the exact invisibility this check exists to end."""
+    deps = _deps(roster=[("g1", "g")], intake={"g1": "g"}, bases=["g"],
+                 sources={"g": ["s"]}, profiles={}, voice={"g": False})
+    out = ow.run(deps=deps, alert=lambda m: None, kv=_KV())
+    assert out["g"] == [ow.REASON_NO_VOICE, ow.REASON_NO_PROFILE]
+
+
+def test_the_bible_fix_names_a_real_command():
+    assert ow.REASON_NO_VOICE in ow._FIX
+    assert ow.REASON_NO_VOICE in ow.REASONS
+    assert _BIBLE_COMMAND in ow._FIX[ow.REASON_NO_VOICE]
+    assert ow._fix_for(ow.REASON_NO_VOICE, "hillcountry").endswith(
+        f"{_BIBLE_COMMAND} hillcountry")
+
+
+# ---- a bible that is nothing but TODOs is the same as no bible ------------------
+def test_the_add_client_scaffold_counts_as_no_bible():
+    """onboard.VOICE_TEMPLATE writes a fully-TODO doc and NO writer ever clobbers an
+    existing file, so an unfilled scaffold is PERMANENT. It is non-empty, so load_voice
+    hands back a VoiceDoc and preflight passes it, while it carries no avatar, no
+    pillars, no CTAs and no hashtags. Reading it as a real bible is how a gym stays
+    silently dead while every check says ready."""
+    from agent.onboard import VOICE_TEMPLATE
+    assert ow.bible_is_hollow(VOICE_TEMPLATE.format(name="Hill Country Fitness")) is True
+    assert ow.bible_is_hollow("") is False      # empty is load_voice's job, not this
+
+
+def test_a_half_filled_bible_is_never_called_hollow():
+    """A human's work in progress must not page anyone: ONE real body line is enough."""
+    raw = ("# Hill Country Brand Bible\n\n"
+           "## 1. Who they are\n"
+           "A neighborhood gym for busy parents in Dripping Springs.\n\n"
+           "## 2. Voice and tone\n"
+           "TODO: words they say, words they never say.\n")
+    assert ow.bible_is_hollow(raw) is False
+
+
+def test_a_wrapped_todo_paragraph_does_not_look_like_content():
+    """VOICE_TEMPLATE's guardrails TODO runs three lines; only the first starts with
+    TODO. Counting the continuations as real content would make every scaffold look
+    filled, which is the whole bug."""
+    raw = ("## 4. Hard guardrails\n"
+           "TODO: client specific guardrails. House rules always apply: human approval\n"
+           "on every post, no invented facts or stats, no em dashes in published copy.\n")
+    assert ow.bible_is_hollow(raw) is True
+
+
+# ---- the live reader resolves the path the DRAFTER uses, not a made-up one -------
+def test_the_live_voice_reader_uses_the_durable_path(monkeypatch, tmp_path):
+    """PIN THE PATH. Production writes the bible to
+    <DATA_DIR>/brand_voice/<base>/lasso_voice.md (social_intake_reader), and the
+    drafter + preflight both resolve it through
+    client_media_sync._resolve_client_voice_path. onboard_verify checks
+    'brand_voice/<key>.md' instead, which nothing ever writes; copying that mistake
+    here would have this watch report the whole fleet wrong in one direction or the
+    other."""
+    monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "brand_voice"))
+    monkeypatch.setenv("AGENT_GYM_REGISTRY_PATH", str(tmp_path / "reg.json"))
+    voice = ow._live_deps()["voice"]
+    assert voice("theboltonclub") is False              # nothing written yet
+
+    from agent.onboard import VOICE_TEMPLATE
+    doc = tmp_path / "brand_voice" / "theboltonclub" / "lasso_voice.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(VOICE_TEMPLATE.format(name="The Bolton Club"), encoding="utf-8")
+    assert voice("theboltonclub") is False, "an all-TODO scaffold is not a bible"
+
+    doc.write_text("# The Bolton Club Brand Bible\n\n## 1. Who they are\n"
+                   "A strength and conditioning gym in Bolton.\n", encoding="utf-8")
+    assert voice("theboltonclub") is True
 
 
 # ---- alerting discipline ----------------------------------------------------

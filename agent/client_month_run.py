@@ -1215,6 +1215,16 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     months = sorted(span)
     clean_rows = [{k: v for k, v in r.items() if k != "id"}
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
+    # WAVE 7 LEVER STAMPING (audit item 1, 2026-08-31; behind AGENT_LEARNING_LOOP).
+    # This is the CLIENT month build — the lane that stages almost every row Echo
+    # owns — and it never stamped a lever. The stamping lived only in LASSO's
+    # planner, so content_calendar carried 1681 rows with hook_family / ask_type /
+    # time_slot / caption_len_band NULL on every single one, post_metrics inherited
+    # the nulls through the calendar join, and the monthly retro had nothing to
+    # compare: gym_playbook has never held a row. Classification columns only —
+    # captions, creative, status, dates and the approval path are untouched.
+    from . import lever_stamp as _levers
+    _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     deleted = inserted = 0
     try:
         # PRESERVE APPROVALS: drop any incoming row that would collide with a slot the
@@ -1447,6 +1457,10 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             r["status"] = "coach_review"
     clean_rows = [{k: v for k, v in r.items() if k != "id"}
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
+    # Same Wave 7 stamping as the month build above: a denied-slot replacement is a
+    # real post the retro should be able to learn from.
+    from . import lever_stamp as _levers
+    _levers.apply_learning_stamps(base_key, clean_rows, logger=log)
     try:
         inserted = len(insert_rows(base_key, clean_rows) or [])
     except Exception as exc:  # noqa: BLE001

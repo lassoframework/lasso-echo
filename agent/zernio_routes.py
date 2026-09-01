@@ -165,6 +165,32 @@ def _created_profile_id(created):
     return (created or {}).get("_id") or ((created or {}).get("profile") or {}).get("_id")
 
 
+class MalformedAccountKey(ValueError):
+    """A key that must never reach a profile find-or-CREATE. Raised by _ensure_profile_id."""
+
+
+def malformed_account_key_reason(account_key):
+    """Why `account_key` must never reach a profile find-or-CREATE, or "" when it is safe.
+
+    THE JUNK-PROFILE INCIDENT (live 2026-08-31): a mis-quoted CLI arg passed "gym instagram"
+    as ONE value. _ensure_profile_id find-or-CREATEs, so the typo minted junk Zernio profiles
+    and junk gyms rows, and handed out connect links filing accounts under the wrong profile.
+
+    The original fix checked this in connect_url_for only — ONE of the THREE doors into
+    _ensure_profile_id. The portal-facing door (handle_social_connect) and the ops door
+    (provision_gym) were both still open, so the same mis-quoted key could still mint. This
+    reason function is now consulted AT the choke point itself (_ensure_profile_id), which
+    every minting path must pass through, so no caller can route around it."""
+    if account_key is None:
+        return "missing account_key"
+    key = str(account_key)
+    if not key.strip():
+        return f"malformed account_key {key!r} (blank)"
+    if key != key.strip() or any(ch.isspace() for ch in key):
+        return f"malformed account_key {key!r} (whitespace)"
+    return ""
+
+
 def _ensure_profile_id(account_key, client):
     """Stored profile id, else REUSE an existing Zernio profile by name, else create one; persist it.
 
@@ -177,7 +203,14 @@ def _ensure_profile_id(account_key, client):
          to find-by-name.
     Only the connect path calls this; reads never provision, so a passive status poll never mutates
     Zernio.
+
+    MALFORMED-KEY GUARD (the choke point): a blank/whitespace key raises MalformedAccountKey
+    BEFORE any find or create, so no caller — CLI, portal, or ops — can mint a junk profile
+    from a mis-quoted argument. See malformed_account_key_reason.
     """
+    _reason = malformed_account_key_reason(account_key)
+    if _reason:
+        raise MalformedAccountKey(_reason)
     pid = _resolve_profile_id(account_key)
     if pid:
         return pid
@@ -236,6 +269,9 @@ def provision_gym(account_key, client=None):
         return False, "missing account_key"
     try:
         pid = _ensure_profile_id(account_key, _client(client))
+    except MalformedAccountKey as exc:
+        # Never mint from a mis-quoted arg. The choke-point guard refused before any create.
+        return False, str(exc)
     except _z.ZernioError as exc:
         return False, f"zernio {exc.status}: {exc.detail}"
     except Exception as exc:  # noqa: BLE001 - report, never crash the ops command
@@ -302,11 +338,12 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
     if not account_key:
         return False, "missing account_key"
     # A key with whitespace is always a mis-quoted CLI arg ("gym instagram" as one
-    # value). Refuse it: _ensure_profile_id find-or-CREATES, so a typo would mint a
-    # junk Zernio profile and a junk gyms row, and hand out a connect link that files
-    # the gym's accounts under the wrong profile.
-    if account_key != account_key.strip() or any(ch.isspace() for ch in account_key):
-        return False, f"malformed account_key {account_key!r} (whitespace)"
+    # value). Refuse it early for a friendly CLI error; _ensure_profile_id refuses the
+    # same key again AT the choke point, which is what also covers the portal door
+    # (handle_social_connect) and the ops door (provision_gym).
+    _malformed = malformed_account_key_reason(account_key)
+    if _malformed:
+        return False, _malformed
     if platform not in _z.CONNECT_PLATFORMS:
         return False, f"platform must be one of {', '.join(_z.CONNECT_PLATFORMS)}"
     c = _client(client)
@@ -364,6 +401,9 @@ def handle_social_connect(account_key, platform, client=None, redirect_url=None,
         if not pid:
             return 502, {"error": "could not resolve a Zernio profile for this gym"}
         data = c.connect_url(pid, platform, redirect_url=zernio_redirect)
+    except MalformedAccountKey as exc:
+        # 400, not 502: the caller sent a bad key. Refused BEFORE any profile was minted.
+        return 400, {"error": str(exc)}
     except _z.ZernioError as exc:
         return 502, {"error": f"zernio {exc.status}", "detail": exc.detail}
     except Exception as exc:  # network/parse: honest, never a fabricated URL

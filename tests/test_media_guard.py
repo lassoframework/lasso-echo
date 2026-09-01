@@ -155,10 +155,20 @@ def test_surviving_keys_flag_off_is_empty(monkeypatch):
 
 # ---- month build never re-picks a trailing published photo -------------------------
 def test_month_build_excludes_recently_published_photo(tmp_path):
+    """The publish date MUST sit in a PRIOR month (2026-07-28 against an August span).
+
+    FALSE PIN, caught 2026-08-31: this test used to publish photo_02 on 2026-08-05 for
+    a 2026-08-10..08-19 span — the SAME month. _locked_calendar_state reads exactly the
+    SPAN months and already put every published photo in `used` long before the guard
+    existed, so the assertion held with media_guard.surviving_keys neutered to an empty
+    set. It pinned nothing. Only a publish OUTSIDE the span months (still inside the
+    30-day trailing repeat window) reaches surviving_keys' extra read, which is the
+    behavior this test claims to protect."""
     _stock()
     lib = _lib(tmp_path, n=6)
-    # photo_02 published five days before the span starts (previous month's build).
-    store = _Store([_row("2026-08-05", "photo_02.jpg", "published")])
+    # photo_02 published 13 days before the span starts, in the PREVIOUS month: inside
+    # the trailing repeat window, outside every month _locked_calendar_state reads.
+    store = _Store([_row("2026-07-28", "photo_02.jpg", "published")])
     out = cmr.build_client_month(_account(), "gritx", "2026-08-10", days=10,
                                  voice=_voice(), library_path=lib, store=store,
                                  banned_words=())

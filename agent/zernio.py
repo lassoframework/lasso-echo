@@ -14,6 +14,7 @@ Field renames Echo owns (portal contract never changes): Zernio `authUrl`->`oaut
 """
 
 import os
+import re
 import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +32,70 @@ CONNECT_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 STATUS_PLATFORMS = ("instagram", "facebook", "googlebusiness")
 
 _VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi")
+
+
+# A canonical account_key is "<name-slug><6 hex chars of sha256(gym_id)>" (account_key.py),
+# optionally followed by a collision disambiguator (2, 3, ...) and optionally by an ig/fb lane
+# suffix. That exact shape is the ONLY thing allowed to sit between a Zernio profile's name and
+# the key Echo looks it up by. Mirrors _CANONICAL_TAIL in portal_calendar_store.py — deliberately
+# duplicated rather than imported: zernio.py is the low-level vendor client and must not depend
+# on the Supabase store module.
+_CANONICAL_TAIL = re.compile(r"^[0-9a-f]{6}[0-9]*(ig|fb)?$")
+
+
+def _norm_name(s):
+    """Alphanumerics only, lowercased. Zernio profile names are user-set, so 'CrossFit Reverb',
+    'crossfit_reverb' and 'crossfitreverb' all fold to the same comparable string."""
+    return "".join(c for c in str(s or "").lower() if c.isalnum())
+
+
+def _name_boundary_prefixes(raw):
+    """Every normalised prefix of profile name `raw` that ends on a WORD boundary, e.g.
+    'CrossFit ENG' -> {'crossfit', 'crossfiteng'}. A lookup alias may only be treated as a
+    prefix of a profile name at one of these, so a short alias can never swallow a longer
+    profile mid-word. Mirrors _slug_boundary_prefixes in portal_calendar_store.py."""
+    out = set()
+    acc = ""
+    for token in re.split(r"[^0-9A-Za-z]+", str(raw or "")):
+        token_norm = _norm_name(token)
+        if not token_norm:
+            continue
+        acc += token_norm
+        out.add(acc)
+    return out
+
+
+def _profile_containment(target, pname_raw, pname_norm):
+    """True iff normalised lookup `target` may be treated as the SAME tenant as the Zernio
+    profile named `pname_raw`. Deliberately narrow — see the cross-tenant note in
+    match_profile_id.
+
+    REVERSE (target longer, 'crossfitreverb30b5b2' vs profile 'CrossFit Reverb'): the target
+    must be the profile name PLUS a canonical-key tail and nothing else. This is the one shape
+    the containment tier exists to serve: every canonically minted key is its name-slug plus a
+    6-hex fingerprint, and ops pre-create the profile under the human name.
+
+    FORWARD (profile name longer, alias 'toughtemple' vs profile 'toughtemple52040e'): the
+    profile name must be the target PLUS a canonical-key tail, and — when the raw name is
+    MULTI-WORD — the split must also land on one of its word boundaries. Both conditions,
+    because on Zernio profile names a word boundary ALONE is not evidence of the same tenant:
+    'lasso' sits on a genuine word boundary of 'Lasso Fitness Carmel' and is a different gym,
+    so the tail shape carries the decision and the boundary only narrows it further (it is what
+    stops 'gritx' resolving onto a profile named 'Grit Xabcdef'). A single-token name has no
+    internal boundary to test, and '<slug><fingerprint>' is exactly how Echo names the profiles
+    it mints itself (toughtemple52040e, train7164ae502, swiftrivercrossfitd23567 are all live),
+    so requiring a boundary there would blind Echo to its own profiles.
+    """
+    if not target or not pname_norm:
+        return False
+    if target.startswith(pname_norm):
+        return bool(_CANONICAL_TAIL.match(target[len(pname_norm):]))
+    if pname_norm.startswith(target):
+        if not _CANONICAL_TAIL.match(pname_norm[len(target):]):
+            return False
+        prefixes = _name_boundary_prefixes(pname_raw or pname_norm)
+        return len(prefixes) <= 1 or target in prefixes
+    return False
 
 
 def match_profile_id(profiles, name):
@@ -67,22 +132,31 @@ def match_profile_id(profiles, name):
     # platforms connected the whole time. Compare alphanumerics only, then accept a
     # UNIQUE containment either way. Ambiguity returns None: never guess between two
     # gyms' profiles.
-    def _norm(s):
-        return "".join(c for c in str(s or "").lower() if c.isalnum())
-
-    target = _norm(want)
+    #
+    # WHY THE CONTAINMENT TIER IS NARROW NOW (cross-tenant leak, found 2026-08-31): it
+    # used a bare startswith in BOTH directions over profile NAMES. Reproduced live:
+    # match_profile_id([{CrossFit}, {Totally Different Gym}], 'CrossFit ENG') returned
+    # the 'CrossFit' profile, and 'lasso' returned a profile named 'Lasso Fitness
+    # Carmel'. That result is PERSISTED as the gym's publish binding (zernio_profile_link
+    # + the connect routes' find-or-create), so one gym's posts get wired onto another
+    # gym's socials — and nothing downstream catches it: account_id_for takes the first
+    # connected account of the platform under whatever profile it was handed, and
+    # publish_confirm only proves the post exists, never which account it landed on.
+    # Both callers are unattended (the daily/hourly profile-link sweep) or silently
+    # reuse a stranger's profile (connect find-or-create). Each direction is now allowed
+    # only in the shape it actually exists to serve; see _profile_containment.
+    target = _norm_name(want)
     if not target:
         return None
-    clean = [(str(p.get("_id") or p.get("id")), _norm(p.get("name")))
+    clean = [(str(p.get("_id") or p.get("id")), str(p.get("name")), _norm_name(p.get("name")))
              for p in (profiles or [])
              if isinstance(p, dict) and (p.get("_id") or p.get("id")) and p.get("name")]
-    exact = [pid for pid, n in clean if n == target]
+    exact = [pid for pid, _raw, n in clean if n == target]
     if len(exact) == 1:
         return exact[0]
     if exact:
         return None                      # ambiguous -> refuse to guess
-    contain = [pid for pid, n in clean
-               if n and (target.startswith(n) or n.startswith(target))]
+    contain = [pid for pid, raw, n in clean if _profile_containment(target, raw, n)]
     return contain[0] if len(contain) == 1 else None
 
 

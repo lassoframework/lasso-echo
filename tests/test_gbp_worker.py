@@ -252,7 +252,7 @@ def test_g3_publish_bumps_posts_published():
     rows = [dict(_row(), id="r1", gym_id="lasso")]
     store = _Store(rows, {"lasso": [_c()]})
     out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01",
-                             draft=True, alert=lambda m: None,
+                             draft=False, alert=lambda m: None,
                              now=__import__("datetime").datetime(
                                  2026, 9, 1, 9, 0, tzinfo=__import__("datetime").timezone.utc))
     assert out["published"] == 1
@@ -279,7 +279,7 @@ def test_publish_due_gbp_publishes_and_fails_correctly():
     ]
     store = _Store(rows, {"lasso": [_c()]})
     c = _FakeClient()
-    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=True,
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
                              alert=lambda m: None)
     assert out["published"] == 1 and out["failed"] == 1
     assert store.published and store.published[0][0] == "r1"
@@ -289,7 +289,7 @@ def test_publish_due_gbp_publishes_and_fails_correctly():
 def test_publish_due_gbp_holds_needs_reconnect():
     rows = [dict(_row(), id="r1", gym_id="eng")]
     store = _Store(rows, {"eng": [_c(status="needs_reconnect")]})
-    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True)
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=False)
     assert out["held"] == 1 and out["published"] == 0 and out["failed"] == 0
     assert store.published == [] and store.failed == []   # silent hold
 
@@ -354,7 +354,7 @@ def test_g6_lapsed_offer_reverts_to_pending():
                gbp_event={"schedule": {"startDate": "2026-09-01", "endDate": "2026-09-10"}})
     store = _Store([row], {"lasso": [_c_tz()]})
     alerts = []
-    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-15", draft=True,
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-15", draft=False,
                              now=now, alert=alerts.append)
     assert out["reverted"] == 1 and out["published"] == 0
     assert store.status == [("o1", "pending")]               # back to the owner
@@ -368,12 +368,12 @@ def test_g6_reslot_held_row_publishes_after_reconnect_in_window():
     row = dict(_row(), id="r1", gym_id="eng")
     # 1) needs_reconnect -> held, nothing sent
     s1 = _Store([row], {"eng": [_c(status="needs_reconnect")]})
-    out1 = gw.publish_due_gbp(s1, _FakeClient(), run_date="2026-09-01", draft=True,
+    out1 = gw.publish_due_gbp(s1, _FakeClient(), run_date="2026-09-01", draft=False,
                               now=datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc))
     assert out1["held"] == 1 and s1.published == []
     # 2) reconnected + in the 8-10am window -> publishes
     s2 = _Store([row], {"eng": [_c_tz()]})
-    out2 = gw.publish_due_gbp(s2, _FakeClient(), run_date="2026-09-01", draft=True,
+    out2 = gw.publish_due_gbp(s2, _FakeClient(), run_date="2026-09-01", draft=False,
                               now=datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc))
     assert out2["published"] == 1 and s2.published
 
@@ -383,7 +383,7 @@ def test_g5_publish_holds_outside_window():
     rows = [dict(_row(), id="r1", gym_id="lasso")]
     store = _Store(rows, {"lasso": [_c_tz()]})
     now = datetime(2026, 9, 1, 16, 0, tzinfo=timezone.utc)     # 12pm ET, outside 8-10am
-    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True,
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=False,
                              now=now, alert=lambda m: None)
     assert out["held"] == 1 and out["published"] == 0
     assert store.published == []                               # nothing sent off-window
@@ -394,7 +394,7 @@ def test_g5_publish_inside_window_sends():
     rows = [dict(_row(), id="r1", gym_id="lasso")]
     store = _Store(rows, {"lasso": [_c_tz()]})
     now = datetime(2026, 9, 1, 13, 0, tzinfo=timezone.utc)     # 9am ET, in window
-    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True,
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=False,
                              now=now, alert=lambda m: None)
     assert out["published"] == 1 and store.published
 
@@ -552,9 +552,51 @@ def test_publish_due_gbp_claims_before_send_and_skips_lost_claims():
             dict(_row(), id="r2", gym_id="lasso")]
     store = _ClaimStore(rows, {"lasso": [_c()]}, lose_ids={"r2"})
     c = _FakeClient()
-    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=True,
+    out = gw.publish_due_gbp(store, c, run_date="2026-09-01", draft=False,
                              alert=lambda m: None)
     assert store.claims == ["r1", "r2"]            # both claims attempted
     assert [rid for rid, _ in store.published] == ["r1"]   # only the won claim sent
     assert len(c.calls) == 1                        # the lost claim NEVER hit the network
     assert out["published"] == 1
+
+
+# ---- a DRAFT is not a PUBLISH (published-but-not-posted, the GBP flavour) ----------
+# THE BUG (audit 2026-08-31): publish_gbp_row returns status='published' for a DRAFT
+# too, carrying mode='draft' — but publish_one DROPPED the mode field, so
+# publish_due_gbp read `status` alone and could not tell a rehearsal from a real post.
+# With AGENT_GBP_PUBLISH armed while AGENT_PUBLISH_ENABLED was OFF (exactly what
+# listener does: draft = not publish_enabled()), Zernio stored a DRAFT, Echo stamped
+# the row Published, and the client's portal showed a live post that existed nowhere.
+# Worse, the lane's own tests asserted that behaviour, pinning the bug in place.
+
+def test_publish_one_carries_the_draft_mode_to_its_caller():
+    """The mode field is the ONLY signal separating a rehearsal from a live post.
+    Dropping it here is what made the bug invisible upstream."""
+    c = _FakeClient()
+    out = gw.publish_one(_row(), [_c()], client=c, draft=True)
+    assert out.get("mode") == "draft", "publish_one must not drop the draft signal"
+    live = gw.publish_one(_row(), [_c()], client=_FakeClient(), draft=False)
+    assert live.get("mode") == "live"
+
+
+def test_draft_mode_never_marks_a_gbp_row_published():
+    """A draft run is a rehearsal: it must leave the row exactly as it was, so the real
+    run can still claim and publish it. Marking it Published both lies to the client and
+    burns the row forever."""
+    rows = [dict(_row(), id="r1", gym_id="lasso")]
+    store = _Store(rows, {"lasso": [_c()]})
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=True,
+                             alert=lambda m: None)
+    assert out["published"] == 0, "a draft is not a publish"
+    assert store.published == [], "no row may be stamped published in draft mode"
+    assert store.failed == [], "and a draft is not a failure either"
+
+
+def test_the_armed_run_still_publishes_normally():
+    """The guard must not break the lane it protects."""
+    rows = [dict(_row(), id="r1", gym_id="lasso")]
+    store = _Store(rows, {"lasso": [_c()]})
+    out = gw.publish_due_gbp(store, _FakeClient(), run_date="2026-09-01", draft=False,
+                             alert=lambda m: None)
+    assert out["published"] == 1
+    assert [rid for rid, _ in store.published] == ["r1"]

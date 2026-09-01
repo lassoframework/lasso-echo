@@ -303,6 +303,12 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None):
               f"{res['reject_reason']}")
     return {"status": res["status"], "late_post_id": res["late_post_id"],
             "reject_reason": res["reject_reason"],
+            # CARRY THE MODE. publish_gbp_row returns status='published' for a DRAFT
+            # too, and the ONLY thing distinguishing a rehearsal from a real post is
+            # this field — which this dict used to drop on the floor. That is why
+            # publish_due_gbp could not tell them apart and stamped rows Published for
+            # posts that existed only as Zernio drafts.
+            "mode": res.get("mode", ""),
             "gbp_location_id": conn.get("gbp_location_id")}   # for the G3 metrics bump
 
 
@@ -365,6 +371,18 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                 if alert:
                     alert(f"GBP OFFER for {gym} row {row.get('id')} reverted to pending: "
                           "its offer window lapsed during an outage.")
+                continue
+            # A DRAFT IS NOT A PUBLISH (published-but-not-posted, the GBP flavour).
+            # publish_gbp_row returns status='published' for a DRAFT too, carrying
+            # mode='draft' — and this branch used to read `status` alone. So with
+            # AGENT_GBP_PUBLISH armed while AGENT_PUBLISH_ENABLED was OFF (the exact
+            # posture a draft-only day uses), Zernio stored a DRAFT, Echo stamped the
+            # row Published, and the client's portal showed a live post that existed
+            # nowhere. Draft mode is a rehearsal: leave the row exactly as it was so
+            # the real run can still claim and publish it.
+            if res["status"] == "published" and res.get("mode") == "draft":
+                print(f"[gbp] {gym} row {row.get('id')}: DRAFT accepted by Zernio; "
+                      "NOT marking published (draft mode).")
                 continue
             if res["status"] == "published":
                 published += 1

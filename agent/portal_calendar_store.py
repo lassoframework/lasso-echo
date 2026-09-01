@@ -78,6 +78,68 @@ def _slot_key(row):
     )
 
 
+# A canonical account_key is "<name-slug><6 hex chars of sha256(gym_id)>" (account_key.py),
+# optionally followed by a collision disambiguator (2, 3, ...) and optionally by an _ig/_fb
+# lane suffix, which normalisation strips to a bare "ig"/"fb". That exact shape is the ONLY
+# thing allowed to sit between a gym's slug and its base key in the reverse direction below.
+_CANONICAL_TAIL = __import__("re").compile(r"^[0-9a-f]{6}[0-9]*(ig|fb)?$")
+
+
+def _slug_boundary_prefixes(slug_norm, slug_raw):
+    """Every normalised prefix of `slug_raw` that ends on a WORD boundary, e.g.
+    'district-h-strength-fitness' -> {'district', 'districth', 'districthstrength',
+    'districthstrengthfitness'}. A base may only match a slug at one of these, so
+    'eng' can never be a "prefix" of 'engage-fitness-denver': 'eng' is mid-word."""
+    out = set()
+    acc = ""
+    for token in str(slug_raw or "").replace("_", "-").split("-"):
+        token_norm = "".join(c for c in token.lower() if c.isalnum())
+        if not token_norm:
+            continue
+        acc += token_norm
+        out.add(acc)
+    if slug_norm:
+        out.add(slug_norm)
+    return out
+
+
+def _containment_match(target, slug_norm, slug_raw="", name_raw=""):
+    """True iff normalised base `target` may be treated as the same gym as the row with
+    slug `slug_raw` / name `name_raw`. Deliberately narrow — see the cross-tenant note
+    in resolve_gym_uuid. Both the slug AND the display name are consulted, because a
+    registry string is often built from the NAME, not the slug ('hillcountrymvmt' for
+    the gym slugged 'hill-country' and named 'Hill Country MVMT').
+
+    FORWARD ('district_h' -> 'district-h-strength-fitness'): the base must equal a
+    prefix of the slug or the name that ends on a WORD boundary. Requiring the boundary
+    is what stops a short identifier swallowing an unrelated longer gym mid-word: with
+    a gym slugged 'eng', a bare startswith resolved 'engagefitnessdenver', 'england' and
+    'engine' onto it, and a one-letter slug swallowed the entire fleet.
+
+    REVERSE ('swiftrivercrossfitd23567' -> 'swift-river-crossfit'): the base must be the
+    slug or name PLUS a canonical-key tail and nothing else. That is the only reason the
+    reverse direction exists at all — every canonically minted key is its name-slug plus
+    a fingerprint — so pinning the tail shape keeps it while killing the false hits."""
+    if not target:
+        return False
+    forms = []
+    for raw, norm in ((slug_raw or slug_norm, slug_norm),
+                      (name_raw, "".join(c for c in (name_raw or "").lower()
+                                         if c.isalnum()))):
+        if norm:
+            forms.append((raw, norm))
+    for raw, norm in forms:
+        if target == norm:
+            return True
+        # Forward: a word-boundary prefix only.
+        if norm.startswith(target) and target in _slug_boundary_prefixes(norm, raw):
+            return True
+        # Reverse: the canonical <name-slug><fingerprint> shape only.
+        if target.startswith(norm) and _CANONICAL_TAIL.match(target[len(norm):]):
+            return True
+    return False
+
+
 class PortalStoreError(Exception):
     """A Supabase call failed. Detail is scrubbed of any secret before raising."""
 
@@ -844,13 +906,21 @@ class SupabaseCalendarStore:
             if len(exact) > 1:
                 return None  # ambiguous -> refuse to guess
             # tier 2b: PREFIX/containment ('district_h' -> 'district-h-strength-fitness',
-            # 'birddog' -> 'bird-dog-crossfit'). Only when EXACTLY ONE clean gym's normalised
-            # slug starts with the normalised base (or the base starts with the slug). A
-            # unique containment is a confident map; anything else is left None (never a guess).
+            # 'birddog' -> 'bird-dog-crossfit', 'swiftrivercrossfitd23567' ->
+            # 'swift-river-crossfit'). Only when EXACTLY ONE clean gym matches. A unique
+            # containment is a confident map; anything else is left None (never a guess).
+            #
+            # WHY THIS IS NARROW NOW: a bare `startswith` in BOTH directions silently
+            # resolved unrelated gyms onto each other. Measured against the live fleet:
+            # with a gym slugged 'eng', the bases 'engagefitnessdenver', 'england' and
+            # 'engine' ALL resolved to ENG's uuid, and a single-letter slug swallowed
+            # everything. That is a cross-tenant resolver — the wrong gym's Zernio
+            # profile, settings, GBP connection and calendar, with no error and no alert.
+            # Each direction is now allowed only in the shape it actually exists to serve.
             if target:
                 contain = [x for x in clean
-                           if _norm(x.get("slug")).startswith(target)
-                           or target.startswith(_norm(x.get("slug")))]
+                           if _containment_match(target, _norm(x.get("slug")),
+                                                 x.get("slug") or "", x.get("name") or "")]
                 if len(contain) == 1:
                     return contain[0]["id"]
             return None
@@ -1083,7 +1153,8 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
-    def mark_published(self, row_id, media_id, published_at):
+    def mark_published(self, row_id, media_id, published_at,
+                       allow_missing_post_id=False):
         """
         Record a successful publish: status='published', published_at=<now iso>,
         late_post_id=<media_id>. Filtered by id AND status='publishing' (audit
@@ -1092,7 +1163,23 @@ class SupabaseCalendarStore:
         must never be flipped to published), zero rows match and we RAISE so the
         caller reports it loudly (the post may be live; a human reconciles) instead
         of silently overwriting the client's decision. Returns the updated row.
+
+        NO POST ID = NOT PUBLISHED (published-but-not-posted, the recurring class).
+        This is the ONE write every publish lane funnels through, so the rule lives
+        here and no lane can route around it: a blank late_post_id means nothing can
+        ever verify, reconcile or link the post, and the portal shows "Published" for
+        something that may not exist. Refused by default.
+
+        allow_missing_post_id is the single documented exception: a Zernio 409
+        content-hash dedup, where Zernio itself told us this exact content is already
+        on the account but named no id. Callers pass it ONLY from that branch (see
+        zernio_publisher.PublishResult.dedup). It is never a general escape hatch.
         """
+        if not str(media_id or "").strip() and not allow_missing_post_id:
+            raise PortalStoreError(
+                422, f"row {row_id}: refusing to mark published with no platform post "
+                     "id. A post we cannot identify cannot be verified or reconciled; "
+                     "the row stays claimed and the caller reverts it for retry.")
         params = {"id": f"eq.{row_id}", "status": "eq.publishing"}
         r = self._client().patch(
             self._rest(_TABLE),
@@ -1224,6 +1311,12 @@ class SupabaseCalendarStore:
         from .plan_horizon import belt_filter as _horizon_belt
         payload, _ = _horizon_belt(account_key, payload)
         payload = _stage_belts(account_key, payload)
+        # CROSS-DAY MEDIA BELT (fleet audit, 2026-08-31; flag AGENT_MEDIA_CROSS_DAY_GUARD,
+        # the SAME flag media_guard already ships armed on). agent/media_guard.py calls
+        # itself "the shared cross-day media guard for every photo-assigning lane" and was
+        # wired into exactly TWO of them. This door is the one every staging lane walks
+        # through, so the rule lives here too. See _media_stage_belt.
+        payload = _media_stage_belt(self, account_key, payload)
         if not payload:
             return []
         all_keys = set()
@@ -1538,6 +1631,215 @@ def _stage_belts(account_key, payload):
                 pass
         kept.append(row)
     return kept
+
+
+# ---- CROSS-DAY MEDIA BELT ------------------------------------------------------
+# ONE PHOTO ONE DAY, enforced at the ONE DOOR every staging lane walks through.
+#
+# WHY IT LIVES HERE (fleet audit, 2026-08-31): agent/media_guard.py shipped with the
+# docstring "the shared cross-day media guard" for "every photo-assigning lane" and was
+# actually wired into TWO — client_month_run's day loop and calendar_autopublish's
+# expired auto-redate. Roughly eight other lanes assign an image and never consult it:
+# client_month_run.append_gym_drive_drafts (the Drive lane gets covered_days but no
+# guard_state), real_month_run -> rotation.choose (the LASSO month lane; rotation.choose
+# has no exclude parameter at all), event_calendar's event arc, story_studio,
+# client_infographic_fill, onboarding_demo, real_calendar_mirror. Every one of them ends
+# at SupabaseCalendarStore.insert_rows. Guarding THIS door turns "the same photo on two
+# different days" from "guarded on 2 lanes" into structurally impossible, and any lane
+# added tomorrow inherits the rule for free.
+#
+# The keying is NOT reimplemented here. media_guard.row_media_key (source_media_url
+# first, so an edited story keys by its RAW photo and not by its burned caption card),
+# media_guard.book_state and media_guard.blocked_keys are the primitives; blocked_keys
+# is also what carries the SAME-DATE SIBLING EXEMPTION — a feed, its FB mirror and its
+# paired story are ONE post and legitimately share the photo. Getting that wrong would
+# break every 2x day, so it is borrowed rather than restated.
+_MEDIA_REFRAME_SUFFIX = "__feed.jpg"
+
+
+def _media_alert(msg):
+    """One loud line: local log always, ops alert best effort (the digest posture the
+    horizon belt uses — a count and a span, never a line per row)."""
+    print(f"[portal-calendar-store] {msg}")
+    try:
+        from . import ops_alerts
+        ops_alerts.alert(msg)
+    except Exception:  # noqa: BLE001 - alerting never blocks staging
+        pass
+
+
+def _media_library_path(account_key):
+    """The gym's OWN media folder, used for one narrow purpose: resolving autofit
+    reframe names ('<sha12>__feed.jpg') back to the raw library basename so a reframed
+    feed card and its own raw photo are seen as the same photo (the zanshin repeats).
+
+    STRICT lookup only — the exact registry keys for this gym, and `library_prefix`
+    read DIRECTLY rather than through Account.library_path(), which falls back to the
+    shared LIBRARY_PATH parent when a gym's prefix is empty (the LASSO empty-prefix
+    client-photo leak). A wrong library here would hash another gym's photos and could
+    manufacture a false collision, so a miss returns '' and the belt simply matches
+    reframe-name to reframe-name, which is still exact for same-lane rows."""
+    try:
+        from . import accounts as _accounts
+        base = str(account_key or "")
+        for key in (base, f"{base}_ig", f"{base}_fb"):
+            acct = _accounts.get_account(key)
+            prefix = str(getattr(acct, "library_prefix", "") or "") if acct else ""
+            if prefix:
+                return prefix
+    except Exception:  # noqa: BLE001 - resolution is an optimization, never a gate
+        return ""
+    return ""
+
+
+class _ReadProbe:
+    """A read-only pass-through around the store that REMEMBERS whether any month read
+    raised. media_guard.book_state deliberately swallows a failed month and returns the
+    partial state it could gather — right for a planner that still has a rotation window
+    behind it, wrong for a belt that would then drop rows while blind. This is how the
+    belt learns it never saw the book. Exposes list_month only: the belt must not be
+    able to write through it."""
+
+    def __init__(self, store):
+        self._store = store
+        self.failed = ""            # the exception type name of the FIRST failure
+
+    def list_month(self, account_key, month):
+        try:
+            return self._store.list_month(account_key, month)
+        except Exception as exc:    # noqa: BLE001 - recorded, then re-raised to book_state
+            self.failed = self.failed or type(exc).__name__
+            raise
+
+
+def _media_stage_belt(store, account_key, payload, *, alert=None):
+    """Drop any incoming row whose photo already sits on a DIFFERENT day of this gym's
+    book. Returns the rows that may stage.
+
+    Gated on media_guard.enabled() (AGENT_MEDIA_CROSS_DAY_GUARD, already default ON —
+    no new flag, no changed default). Flag OFF => the batch passes through byte-for-byte
+    and NOT ONE extra read is issued.
+
+    IN-BATCH COLLISIONS COUNT. A month rebuild stages the whole month in one call, so
+    the rows that would repeat a photo are usually siblings inside THIS payload and not
+    yet in the book at all. Each accepted placement is folded into the state with
+    media_guard.note_placed, exactly as client_month_run does inside its day loop, so
+    photo_07 on the 3rd blocks photo_07 on the 17th of the same batch.
+
+    ONE READ PER CALL. book_state is fetched once for the batch's whole date span (a
+    month build is one call, so a per-row read would be ~90 month queries). The read is
+    skipped entirely when no row in the batch even has a guarded image.
+
+    FAILS OPEN, LOUDLY, AND COMPLETELY. A lookup hiccup must never sink a whole month's
+    staging. book_state swallows a failed month read and returns what it could get, so
+    the belt watches the reads through _ReadProbe: if ANY month read failed, the belt
+    has no ground truth for this gym and STANDS DOWN for the whole batch — including
+    the in-batch check, which would otherwise keep judging on a book it never saw. That
+    is media_guard's own stated posture ("the guard degrades open, never blocks planning
+    on a flaky read"), and the alternative — a belt that quietly drops half a month
+    because Supabase blinked — is strictly worse than the repeat it prevents. Every
+    stand-down prints a line; the per-lane guard and the cross-day repeat sweep remain
+    the backstop.
+
+    NOT this belt's business: a row with NO image at all (a different concern, owned
+    elsewhere) and GBP rows, which keep their own deliberate §3 reuse windows
+    (rotation.reuse_blocked) and are outside media_guard's scope by design."""
+    if not payload:
+        return payload
+    _say = alert or _media_alert
+    try:
+        from . import media_guard
+        if not media_guard.enabled():
+            return payload
+    except Exception:  # noqa: BLE001 - no flag read, no belt; staging is never blocked
+        return payload
+    from datetime import date as _date
+    try:
+        # Pass 1: the rows this belt may judge. A row with no key (no image) or no
+        # post_date is kept and never recorded — only same-photo-different-day
+        # collisions are this belt's concern.
+        keyed = []          # (index, media_key, post_date)
+        for idx, row in enumerate(payload):
+            acct = str((row or {}).get("account") or "").strip().lower()
+            if acct not in media_guard._GUARDED_ACCOUNTS:
+                continue    # GBP keeps its own reuse windows
+            key = media_guard.row_media_key(row)
+            pd = str((row or {}).get("post_date") or "")[:10]
+            if not key or not pd:
+                continue
+            keyed.append((idx, key, pd))
+        if not keyed:
+            return payload  # nothing to guard -> not one extra read
+
+        parsed = []
+        for _idx, _key, pd in keyed:
+            try:
+                parsed.append(_date.fromisoformat(pd))
+            except ValueError:
+                pass
+        if not parsed:
+            return payload
+        start, last = min(parsed), max(parsed)
+
+        # Reframe resolution costs a library hash walk, so pay for it ONLY when the
+        # batch actually carries autofit-named cards.
+        library_path = ""
+        if any(k.endswith(_MEDIA_REFRAME_SUFFIX) for _i, k, _d in keyed):
+            library_path = _media_library_path(account_key)
+
+        probe = _ReadProbe(store)
+        state = media_guard.book_state(
+            account_key, probe, start, (last - start).days + 1,
+            log=lambda m: print(f"[portal-calendar-store] media belt: {m}"),
+            library_path=library_path or None)
+        if probe.failed:
+            _say(f"cross-day media belt STOOD DOWN for {account_key}: the book read "
+                 f"failed ({probe.failed}), so the belt has no ground truth and this "
+                 "batch stages UNGUARDED rather than risk gutting a month; the "
+                 "per-lane guard and the cross-day repeat sweep remain the backstop")
+            return payload
+        rmap = (media_guard.reframe_map(library_path, [k for _i, k, _d in keyed])
+                if library_path else {})
+
+        dropped = {}        # index -> (post_date, media_key)
+        for idx, key, pd in keyed:
+            key = rmap.get(key, key)
+            if key in media_guard.blocked_keys(state, pd):
+                dropped[idx] = (pd, key)
+                continue
+            media_guard.note_placed(state, key, pd)
+        if not dropped:
+            return payload
+
+        # SMALL LIBRARIES NEVER BLOCK A CALENDAR (media_guard's own stated posture: the
+        # thin-library case falls back to maximum spacing and one digest, it does not
+        # stop posts). If EVERY guarded row of a MULTI-DAY batch collides, the gym has
+        # fewer photos than it has days, and dropping them all would hand the client an
+        # empty month — worse than a spaced repeat. Stage it and say so once, kv-deduped,
+        # in the needs-media language family.
+        # The multi-day condition is what keeps this from becoming the belt's loophole:
+        # a single-day insert (story_studio, client_infographic_fill, a deny backfill —
+        # exactly the one-row lanes this belt exists to cover) is NOT a month at risk,
+        # its slot refills on the next plan pass, and it obeys the rule like everyone
+        # else. A partial drop always drops: the days that keep a unique photo keep it.
+        days = sorted({pd for pd, _k in dropped.values()})
+        if len(dropped) == len(keyed) and len(days) > 1:
+            media_guard.alert_small_library(account_key, start.isoformat())
+            return payload
+
+        kept = [row for i, row in enumerate(payload) if i not in dropped]
+        span = days[0] if len(days) == 1 else f"{days[0]} to {days[-1]}"
+        sample = ", ".join(sorted({k for _d, k in dropped.values()})[:3])
+        _say(f"cross-day media belt: dropped {len(dropped)} {account_key} row(s) "
+             f"({span}) at stage time — that photo already sits on a DIFFERENT day of "
+             f"this gym's book (e.g. {sample}). ONE PHOTO ONE DAY; the day refills on "
+             "the next plan pass with another photo.")
+        return kept
+    except Exception as exc:  # noqa: BLE001 - a lookup hiccup never sinks a month
+        _say(f"cross-day media belt SKIPPED for {account_key} "
+             f"({type(exc).__name__}) — staging continued UNGUARDED; the per-lane "
+             "guard and the cross-day repeat sweep remain the backstop")
+        return payload
 
 
 def preserve_and_prune(store, account_key, months, rows):

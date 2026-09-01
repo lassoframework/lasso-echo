@@ -271,6 +271,116 @@ def test_publish_409_dedup_is_success_not_retry_loop(monkeypatch):
                                    profile_resolver=lambda k: "prof_eng")
     assert res.ok and res.mode == "published"
     assert "dedup" in res.detail
+    # The dedup flag is what lets mark_published accept a blank post id here and
+    # ONLY here. Without it this result would be refused by the store.
+    assert res.dedup is True
+
+
+def test_publish_with_no_post_id_is_never_reported_published(monkeypatch):
+    """PUBLISHED-BUT-NOT-POSTED, killed at the source.
+
+    A 2xx whose body carries no post id tells us Zernio ANSWERED, not that it
+    ACCEPTED the post. The old code returned ok=True with media_id='', which stamped
+    status='published' + an empty late_post_id: unverifiable by publish_confirm,
+    invisible to any reconcile, and identical in the portal to a post that really
+    went live. It must raise so the caller reverts and retries (safe: Zernio's own
+    24h content-hash dedup answers a genuine double-send with a 409)."""
+    import pytest
+    _arm(monkeypatch)
+    for empty_body in ({}, {"post": {}}, {"_id": ""}, {"_id": "   "}):
+        class BlankClient(FakeZernioClient):
+            def create_post(self, *a, **k):
+                return empty_body
+
+        with pytest.raises(zernio_publisher.ZernioPublishError):
+            zernio_publisher.publish(_draft(), _ig_account(), client=BlankClient(),
+                                     profile_resolver=lambda k: "prof_eng")
+
+
+def test_a_normal_publish_is_never_flagged_dedup(monkeypatch):
+    """The dedup escape hatch must stay shut on the ordinary path, or the blank-id
+    refusal in mark_published becomes bypassable by every publish."""
+    _arm(monkeypatch)
+    res = zernio_publisher.publish(_draft(), _ig_account(),
+                                   client=FakeZernioClient(post_id="zpost_OK"),
+                                   profile_resolver=lambda k: "prof_eng")
+    assert res.ok and res.media_id == "zpost_OK"
+    assert res.dedup is False
+
+
+# ---- NO PHOTO = NO POST (the "approved with no image" class) -----------------
+# zernio.create_post OMITS mediaItems when the url list is empty and Zernio then
+# publishes the caption as a TEXT-ONLY post to the gym's real feed. Every upstream
+# rail leaks it: the approve handler never reads image_url, set_status does not
+# either, due_rows' "image_url is not null" filter does NOT catch the EMPTY STRING
+# several lanes write, and publish_guard's MEDIA_MISSING only runs under
+# calendar_grade_enabled. This wire is where it has to stop, for every client gym.
+
+class CountingZernioClient(FakeZernioClient):
+    """Counts the account lookup too, so a refusal can be proven to cost NO network."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.list_calls = 0
+
+    def list_accounts(self, profile_id):
+        self.list_calls += 1
+        return super().list_accounts(profile_id)
+
+
+def test_feed_post_with_no_media_is_refused_before_any_network(monkeypatch):
+    """A photo-less client post must never reach a platform. The empty STRING and a
+    whitespace-only url are the live shapes (several lanes write exactly ""), and
+    they are exactly what the store-side 'image_url is not null' filter misses."""
+    import pytest
+    _arm(monkeypatch)
+    for url in (None, "", "   ", "\n\t "):
+        client = CountingZernioClient()
+        d = _draft(caption="Real caption words here", url="")
+        if url is None:
+            del d.creative_public_url          # attribute missing entirely
+        else:
+            d.creative_public_url = url
+        with pytest.raises(zernio_publisher.ZernioPublishError) as exc:
+            zernio_publisher.publish(d, _ig_account(), client=client,
+                                     profile_resolver=lambda k: "prof_eng")
+        assert "no media" in str(exc.value).lower()
+        assert client.created == [], "a photo-less post must never be created"
+        assert client.list_calls == 0, "the refusal must cost NO network call"
+
+
+def test_story_with_no_media_is_refused_too(monkeypatch):
+    """Stories are exempt from the empty-CAPTION rail (body='' by design) but NOT
+    from the media rail: a story with no image is nothing at all."""
+    import pytest
+    _arm(monkeypatch)
+    client = CountingZernioClient()
+    d = _draft(caption="Story!", url="")
+    d.is_story = True
+    with pytest.raises(zernio_publisher.ZernioPublishError):
+        zernio_publisher.publish(d, _ig_account(), client=client,
+                                 profile_resolver=lambda k: "prof_eng")
+    assert client.created == []
+
+
+def test_media_rail_scope_gbp_never_reaches_this_wire(monkeypatch):
+    """SCOPING PROOF for the blanket media refusal: the one legitimately media-less
+    Echo format is a Google Business text post, and it CANNOT be caught by that rail
+    because it never reaches this function — approvals._publisher_for sends
+    Platform.GOOGLE_BUSINESS to gbp_publisher (payload via zernio.create_post_raw).
+    Here it stops one step earlier still, on the platform map. If this ever starts
+    failing with a 'no media' message, GBP has been routed into this wire and the
+    refusal must be narrowed to feed/story/reel."""
+    import pytest
+    _arm(monkeypatch)
+    gbp = Account(key="eng_gbp", display_name="ENG GBP",
+                  platform=Platform.GOOGLE_BUSINESS, token_env="T", target_id_env="G")
+    client = CountingZernioClient()
+    with pytest.raises(zernio_publisher.ZernioPublishError) as exc:
+        zernio_publisher.publish(_draft(url=""), gbp, client=client,
+                                 profile_resolver=lambda k: "prof_eng")
+    assert "unsupported platform" in str(exc.value)
+    assert client.created == []
 
 
 def test_publish_fb_requires_and_sends_page(monkeypatch):
@@ -543,3 +653,38 @@ def test_sweep_under_threshold_stays_quiet():
                             "post_date": "2026-08-13"}]),
         kv=kv, now="2026-08-13T10:00:00-04:00", alert=alerts.append)
     assert out == [] and alerts == []
+
+
+# ---- the dedup contract must hold across EVERY publisher ---------------------------
+# THE REGRESSION THIS EXISTS TO STOP (caught in audit, same day it shipped):
+# mark_published refuses a blank platform post id, and calendar_autopublish grants the
+# one exception by reading `result.dedup` via getattr on WHICHEVER publisher ran. When
+# only zernio_publisher carried the field, meta_publisher's own 24h content-hash dedup
+# (which legitimately returns media_id="") fell through the getattr default of False,
+# hit the blank-id refusal, and stranded a LASSO Meta-direct row in 'publishing'
+# FOREVER behind a misleading "PUBLISHED live but the write failed" alert. Any publisher
+# that can return mode="published" with an empty media_id MUST carry `dedup`.
+
+def test_every_publisher_result_carries_the_dedup_contract():
+    """A publisher whose result lacks `dedup` cannot express the one legitimate
+    blank-post-id case, so its dedup path strands rows. Pin the field on all of them."""
+    from agent import meta_publisher, socialapi_publisher
+    for mod in (zernio_publisher, meta_publisher, socialapi_publisher):
+        result = mod.PublishResult(ok=True, mode="published")
+        assert hasattr(result, "dedup"), \
+            (f"{mod.__name__}.PublishResult must carry `dedup`: calendar_autopublish "
+             "reads it to allow the one legitimate blank late_post_id, and a publisher "
+             "without it strands its dedup rows in 'publishing' forever")
+        assert result.dedup is False, "dedup must default OFF on a normal publish"
+
+
+def test_meta_dedup_sets_the_flag_so_its_row_is_never_stranded(monkeypatch):
+    """meta_publisher's 24h dedup returns media_id='' on purpose (nothing was re-sent).
+    It must mark itself dedup, or mark_published's blank-id refusal eats the row."""
+    from agent import meta_publisher
+    monkeypatch.setenv("AGENT_PUBLISH_ENABLED", "true")
+    monkeypatch.setattr(meta_publisher, "_recent_duplicate", lambda *a, **k: "dedup")
+    res = meta_publisher.publish(_draft(), _ig_account())
+    assert res.ok and res.mode == "published" and res.media_id == ""
+    assert res.dedup is True, \
+        "the meta dedup short-circuit must be marked dedup or its row strands"

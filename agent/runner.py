@@ -981,6 +981,64 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"account-key doctor failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # ACCOUNT-KEY SPLIT WATCH (AGENT_ACCOUNT_KEY_SPLIT_WATCH, default OFF -> no-op):
+    # nightly READ-ONLY check that the key the PORTAL recorded for each gym is the key
+    # that actually owns that gym's calendar. Swift River + Sunnyside (2026-08-31) each
+    # carried TWO keys — the portal pointed at an empty one while the month and the
+    # Zernio profile sat under another — and NO existing detector could see it (the
+    # reconciler grades a non-collided key as issued/OK, the doctor only checks that a
+    # base resolves to one gym, and onboarding_watch compares the token key to the
+    # intake key, which agreed). Both gyms would have silently never posted. One
+    # throttled alert per gym per day, naming both keys and the exact repoint command.
+    # Read-only; isolated so a failure never blocks the draft run.
+    try:
+        from . import account_key_split_watch as _aks
+        _ssum = _aks.run()
+        _splits = _ssum.get("findings") or []
+        if _splits:
+            print(f"[account-key-split] {len(_splits)} split gym(s): "
+                  f"{', '.join(str(s.get('portal_key')) for s in _splits)}")
+    except Exception as e:
+        print(f"[account-key-split] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"account-key split watch failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
+    # BILLING-GATE SELF-REPORT (no flag of its own; it only speaks when
+    # AGENT_PUBLISH_BILLING_GATE is ARMED and the gate covers fewer gyms than it
+    # appears to). The gate decides on gyms.stripe_customer_id, and on the Echo side
+    # NOTHING WRITES THAT COLUMN — so an armed gate with no customer ids returns OK at
+    # its very first branch for every gym: no errors, no blocks, and no way to block.
+    # It reads as protection while being a no-op, which is worse than being off. This
+    # says the real reach out loud once a day. It does NOT wire billing (Blake's call)
+    # and writes nothing. Isolated: a self-report failure never blocks the draft run.
+    try:
+        from . import publish_billing_gate as _pbg
+        _bsum = _pbg.report_inertness()
+        if _bsum.get("reported"):
+            print(f"[billing-gate] {_bsum.get('message')}")
+    except Exception as e:
+        print(f"[billing-gate] self-report failed: {type(e).__name__}: {e}")
+
+    # ZERNIO FAILED-POST WATCH (AGENT_ZERNIO_FAILED_WATCH, default OFF -> no-op):
+    # nightly READ-ONLY check of what Zernio itself says happened to the posts Echo
+    # sent. The client lane treats a 2xx create as publication, but that is ACCEPTANCE,
+    # not delivery — Zernio can fail a post afterwards and nothing here ever looked
+    # again, so a row could read "Published" in the portal while Zernio said FAILED.
+    # Reports that case loudest, plus any failed pile-up (a dying connection nobody
+    # noticed). Never retries and never republishes: a post failed on one platform may
+    # be live on the other. Isolated: a failure never blocks the draft run.
+    try:
+        from . import zernio_failed_watch as _zfw
+        _fsum = _zfw.run()
+        _ff = _fsum.get("findings") or []
+        if _ff:
+            print(f"[zernio-failed-watch] {len(_ff)} finding(s): "
+                  f"{', '.join(str(f.get('base')) for f in _ff)}")
+    except Exception as e:
+        print(f"[zernio-failed-watch] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"Zernio failed-post watch failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     # INBOX ALERTS (flag AGENT_INBOX_ALERTS, default OFF -> no-op): daily
     # READ-ONLY sweep of unhandled comments/mentions/reviews per gym, one
     # coach-channel card per gym per day max (kv-stamped). Never replies,
@@ -1011,11 +1069,118 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"demographics sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # VISION ALLOWLIST DRIFT WATCH (audit item 5, 2026-08-31; flag
+    # AGENT_VISION_ALLOWLIST_WATCH, default ON). AGENT_VISION_GYMS gates the DAM
+    # sidecar lane but NOT the Google-Drive staging lane, so on 2026-08-31 two gyms
+    # were being analyzed without being armed while one armed gym had nothing to
+    # analyze and another sat silently at its monthly cap. Read-only: it reads the
+    # env and the kv spend ledger, arms nothing, and spends nothing. One deduped
+    # alert per drift set per month. Isolated: a failure never blocks the run.
+    if config.vision_allowlist_watch_enabled():
+        try:
+            from .jobs.vision_allowlist_watch import run as _vision_drift_run
+            _vision_drift_run()
+        except Exception as e:
+            print(f"[vision-watch] failed: {type(e).__name__}: {e}")
+
+    # POSTING TIMEZONE BACKFILL + WATCHDOG (audit item 4, 2026-08-31; flag
+    # AGENT_POSTING_TZ_WATCH, default ON). config.posting_timezone_for() falls back
+    # to the GLOBAL default when a gym's column is empty, so nine of sixteen gyms
+    # were scheduling at Echo's default hour instead of their own local hour — and
+    # nothing had ever noticed, because nothing but a human `set-timezone` ever
+    # wrote that column. This fills it from REAL evidence only (a connected Google
+    # Business location, else a city/state in the gym's own brand bible) and alerts
+    # on every gym it still cannot resolve. Never overwrites a human's value, never
+    # writes a guess, publishes nothing. Isolated: a failure never blocks the run.
+    if config.posting_tz_watch_enabled():
+        try:
+            from .jobs.posting_tz_backfill import run as _tz_run
+            _tzsum = _tz_run(apply=True)
+            if _tzsum.get("written"):
+                print(f"[posting-tz] backfilled {_tzsum['written']} gym timezone(s)")
+        except Exception as e:
+            print(f"[posting-tz] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"posting timezone backfill failed: {type(e).__name__}: "
+                             f"{e}. Gyms keep their current timezone; the draft run "
+                             "is unaffected.")
+
+    # PLAN HORIZON RETIREMENT SWEEP (audit item 2, 2026-08-31; flag
+    # AGENT_PLAN_HORIZON_SWEEP, default ON). The horizon cap that shipped on
+    # 2026-08-28 clamps BUILDS and filters INSERTS — both act on rows being
+    # CREATED, so every row staged before it existed sits past the horizon
+    # permanently. Three days later 68 non-exempt PENDING rows were still out
+    # there (LASSO platform 43, doctrine 17, b2b 7, podcast 1, to 2026-12-04):
+    # relearn churn that costs tokens to rebuild and inflates the forward book.
+    # This is the belt's retroactive counterpart. It DELETES pending/coach_review
+    # rows only; approved, publishing, published, denied and killed rows are out
+    # of reach, and dated rows (event arcs, LASSO summit/book/welcome) are kept
+    # on purpose and named in the digest. Nothing here publishes. Isolated: a
+    # sweep failure never blocks the draft run.
+    if config.plan_horizon_sweep_enabled():
+        try:
+            from .jobs.plan_horizon_sweep import run as _horizon_sweep_run
+            _hsum = _horizon_sweep_run(apply=True)
+            if _hsum.get("ok") and _hsum.get("retired"):
+                print(f"[plan-horizon-sweep] retired {_hsum['retired']} "
+                      "over-horizon row(s)")
+        except Exception as e:
+            print(f"[plan-horizon-sweep] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"plan horizon sweep failed: {type(e).__name__}: {e}. "
+                             "Over-horizon rows stay until the next run; the draft "
+                             "run is unaffected.")
+
+    # MEDIA REPEAT SWEEP (audit item 3, 2026-08-31; flag AGENT_MEDIA_REPEAT_SWEEP,
+    # default ON). agent/media_guard.py stops a repeat at STAGE time, but the
+    # existing rows it cannot see were never swept: 35 cross-day photo repeats
+    # were live on 2026-08-31 (LASSO 29, CrossFit Zanshin 6) with the job built,
+    # working, and scheduled nowhere — the exact defect a client noticed ("the
+    # same photo across different weeks"). This runs the guard's live counterpart
+    # nightly. It NEVER touches a published or publishing row and NEVER swaps an
+    # approved row's media (the gym approved that exact card) — those are reported
+    # only. A gym with no unused photo left is reported as a small library and
+    # left alone, never given fabricated media. Isolated: a sweep failure never
+    # blocks the draft run.
+    if config.media_repeat_sweep_enabled():
+        try:
+            from .jobs.media_repeat_sweep import run as _media_sweep_run
+            _msum = _media_sweep_run([], apply=True) or []
+            _mfixed = sum(r.get("rows_repointed", 0) for r in _msum)
+            if _mfixed:
+                print(f"[media-repeat-sweep] re-pointed {_mfixed} repeated-photo row(s)")
+        except Exception as e:
+            print(f"[media-repeat-sweep] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"media repeat sweep failed: {type(e).__name__}: {e}. "
+                             "Cross-day photo repeats stay until the next run; the "
+                             "draft run is unaffected.")
+
     # MONTHLY RETRO (Wave 7.8, TAP 3 closed 2026-08-26): on/after the 5th, run
     # the prior month's retro once (kv-stamped per month). Self-gates on
     # AGENT_LEARNING_LOOP. The 7.4 honesty guards protect every run: a tainted
     # or thin month is observed and stored but trains nothing — the playbook
     # only moves on clean evidence within the ±20% bound.
+    # LEVER BACKFILL (audit item 1, 2026-08-31): the NET under the stage-time
+    # stamping. lever_stamp.apply_learning_stamps now runs in both the LASSO and the
+    # client lane, but Echo stages calendar rows from several smaller lanes too
+    # (infographic fill, story studio, the GBP planner, the calendar mirror), and any
+    # lane that forgets it silently re-opens the gap that left content_calendar with
+    # 1681 lever-less rows and gym_playbook permanently empty. This sweep patches
+    # every row still missing hook_family, whatever wrote it — so the loop's evidence
+    # leg cannot go dark again. Idempotent (it only reads rows WHERE hook_family IS
+    # NULL), lever columns only, never touches a caption or a status, publishes
+    # nothing. Self-gates on AGENT_LEARNING_LOOP.
+    if config.learning_loop_enabled():
+        try:
+            from .jobs.backfill_levers import run as _levers_run
+            _lsum = _levers_run()
+            _lstamped = sum(g.get("stamped", 0) for g in (_lsum.get("gyms") or []))
+            if _lstamped:
+                print(f"[lever-backfill] stamped {_lstamped} calendar row(s)")
+        except Exception as e:
+            print(f"[lever-backfill] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"lever backfill failed: {type(e).__name__}: {e}. "
+                             "Unstamped rows stay invisible to the monthly retro; "
+                             "the draft run is unaffected.")
+
     if config.learning_loop_enabled():
         try:
             from datetime import date as _date

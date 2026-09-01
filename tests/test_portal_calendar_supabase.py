@@ -657,6 +657,37 @@ def test_mark_published_only_stamps_the_claimed_row(monkeypatch):
         pcs.SupabaseCalendarStore().mark_published("id-x", "M1", "2026-08-25T12:00:00Z")
 
 
+def test_mark_published_refuses_a_blank_platform_post_id(monkeypatch):
+    """NO POST ID = NOT PUBLISHED (published-but-not-posted, the recurring class).
+
+    mark_published is the ONE write every publish lane funnels through, so the rule
+    lives here and no lane can route around it. A blank late_post_id means nothing can
+    verify, reconcile or link the post while the portal shows 'Published'. The refusal
+    must happen BEFORE any HTTP call, so a bad publish cannot even touch the row."""
+    import pytest
+    for blank in (None, "", "   "):
+        http = _FakeHTTP(patch_resp=_Resp(200, [_row("id-p", gym_id="lasso",
+                                                     status="published")]))
+        monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+        with pytest.raises(pcs.PortalStoreError):
+            pcs.SupabaseCalendarStore().mark_published("id-p", blank,
+                                                       "2026-08-25T12:00:00Z")
+        assert http.calls == [], f"no write may be attempted for post id {blank!r}"
+
+
+def test_mark_published_allows_a_blank_id_only_for_the_zernio_dedup_case(monkeypatch):
+    """The single documented exception: a Zernio 409 content-hash dedup, where Zernio
+    itself said this exact content is already on the account but named no id. Callers
+    pass allow_missing_post_id ONLY from that branch — it is never a general escape."""
+    http = _FakeHTTP(patch_resp=_Resp(200, [_row("id-p", gym_id="lasso",
+                                                 status="published")]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+    row = pcs.SupabaseCalendarStore().mark_published(
+        "id-p", "", "2026-08-25T12:00:00Z", allow_missing_post_id=True)
+    assert row["status"] == "published"
+    assert http.calls, "the dedup case must still perform the write"
+
+
 # ---- due_rows ordering vs. the daily publish cap (2026-08-30 audit) ------------
 #
 # CONFIRMED DEFECT (fixed below): due_rows() used to order by created_at (STAGE
@@ -852,3 +883,144 @@ def test_swap_media_zero_match_returns_none(monkeypatch):
     assert pcs.SupabaseCalendarStore().swap_media("gritx", "id-m", "u") is None
     _m, _u, _params, _h, payload = http.calls[0]
     assert payload == {"image_url": "u"}   # source_media_url omitted when not given
+
+
+# ---- CROSS-DAY MEDIA BELT on insert_rows (fleet audit, 2026-08-31) -------------
+#
+# agent/media_guard.py shipped calling itself "the shared cross-day media guard for
+# every photo-assigning lane" and was wired into TWO of them (client_month_run's day
+# loop, calendar_autopublish's expired auto-redate). The Drive lane, the LASSO month
+# lane (rotation.choose has no exclude parameter at all), the event arc, story_studio,
+# client_infographic_fill, onboarding_demo and real_calendar_mirror all assign an image
+# and never consult it -- and every one of them ends at insert_rows. These pin the belt
+# that sits on that one door. Delete _media_stage_belt and each of them fails.
+
+def _mrow(post_date, image_url, account="instagram", fmt="feed", caption="c", **extra):
+    row = {"post_date": post_date, "account": account, "format": fmt,
+           "caption": caption, "image_url": image_url}
+    row.update(extra)
+    return row
+
+
+def _belt_store(monkeypatch, book_rows=(), get_status=200):
+    """A store whose list_month answers with `book_rows` for every month queried and
+    whose POST echoes nothing back (the belt only cares about what goes OUT)."""
+    http = _FakeHTTP(get_resp=_Resp(get_status, list(book_rows), text="boom"),
+                     post_resp=_Resp(201, []))
+    monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "true")
+    store = pcs.SupabaseCalendarStore(url="https://proj.supabase.co",
+                                      service_key="svc-key-secret", http=http)
+    return store, http
+
+
+def _staged(http):
+    posts = [c for c in http.calls if c[0] == "post"]
+    return posts[0][4] if posts else []
+
+
+def test_media_belt_refuses_a_photo_already_on_a_different_day_of_the_book(monkeypatch):
+    """The core rule: a photo COMMITTED on another day of this gym's forward book may
+    not be staged again. photo_07 already pends on 09-04, so the incoming 09-18 row
+    carrying it is dropped; the row with an unused photo still stages, and a row with
+    NO image at all is never this belt's business."""
+    book = [_row("b1", gym_id="gritx", post_date="2026-09-04", status="pending",
+                 image_url="https://cdn/photo_07.jpg")]
+    store, http = _belt_store(monkeypatch, book)
+    rows = [_mrow("2026-09-18", "https://cdn/photo_07.jpg"),   # collides with the book
+            _mrow("2026-09-19", "https://cdn/photo_11.jpg"),   # free
+            _mrow("2026-09-20", "")]                           # no image: not our concern
+    store.insert_rows("gritx", rows)
+    sent = _staged(http)
+    dates = sorted(r["post_date"] for r in sent)
+    assert dates == ["2026-09-19", "2026-09-20"], \
+        "only the photo already on ANOTHER day of the book may be refused"
+
+    # And a ONE-ROW insert (story_studio, client_infographic_fill, a deny backfill --
+    # exactly the lanes that never consulted media_guard) obeys the rule like everyone
+    # else: the small-library escape is for a whole month at risk, never a single slot.
+    store2, http2 = _belt_store(monkeypatch, book)
+    assert store2.insert_rows(
+        "gritx", [_mrow("2026-09-18", "https://cdn/photo_07.jpg")]) == []
+    assert not [c for c in http2.calls if c[0] == "post"], "no POST for a refused row"
+
+
+def test_media_belt_refuses_the_same_photo_twice_inside_one_batch(monkeypatch):
+    """A month rebuild stages the WHOLE month in one insert_rows call, so the rows that
+    repeat a photo are usually siblings inside the payload and not in the book yet. Each
+    accepted placement is folded back with media_guard.note_placed, so the second day
+    sees the first.
+
+    The 09-25 story also pins the KEYING: its image_url is a burned caption card with
+    its own unique name, and only media_guard.row_media_key's source_media_url-first
+    rule sees that it is photo_08, already placed on the 18th."""
+    store, http = _belt_store(monkeypatch, [])
+    rows = [_mrow("2026-09-03", "https://cdn/photo_07.jpg"),
+            _mrow("2026-09-17", "https://cdn/photo_07.jpg?v=2"),   # same photo, new day
+            _mrow("2026-09-18", "https://cdn/photo_08.jpg"),
+            _mrow("2026-09-25", "https://cdn/story_burned_z.jpg", fmt="story",
+                  caption="", source_media_url="https://cdn/photo_08.jpg")]
+    store.insert_rows("gritx", rows)
+    dates = sorted(r["post_date"] for r in _staged(http))
+    assert dates == ["2026-09-03", "2026-09-18"], \
+        "the query string is not identity, and a burned story card is not identity"
+
+
+def test_media_belt_allows_same_date_siblings_to_share_the_photo(monkeypatch):
+    """SAME-DATE SIBLINGS ARE ONE POST. A feed, its FB mirror and its paired story all
+    carry the same photo on the same date by design -- dropping any of them would break
+    every 2x day and every cross-post. The story keys by source_media_url (its own
+    image_url is a burned caption card with a different name), which is exactly why the
+    belt borrows media_guard.row_media_key instead of reading image_url."""
+    store, http = _belt_store(monkeypatch, [])
+    rows = [
+        _mrow("2026-09-09", "https://cdn/photo_07.jpg"),
+        _mrow("2026-09-09", "https://cdn/photo_07.jpg", account="facebook"),
+        _mrow("2026-09-09", "https://cdn/story_burned_abc.jpg", fmt="story",
+              caption="", source_media_url="https://cdn/photo_07.jpg"),
+    ]
+    store.insert_rows("gritx", rows)
+    assert len(_staged(http)) == 3, "a feed, its FB mirror and its story are ONE post"
+
+
+def test_media_belt_fails_open_and_says_so_when_the_book_read_fails(monkeypatch):
+    """A lookup hiccup must NEVER sink a whole month's staging, and it must stand the
+    belt down COMPLETELY -- the in-batch check included. book_state swallows a failed
+    month read and hands back a partial state, so a belt that kept judging would drop
+    rows on a book it never saw. Half a month quietly missing because Supabase blinked
+    is strictly worse than the repeat the belt prevents. The read is attempted (that IS
+    the belt running), it fails, and everything stages."""
+    seen = []
+
+    def _boom(self, key, month):
+        seen.append(month)
+        raise pcs.PortalStoreError(500, "upstream down")
+
+    store, http = _belt_store(monkeypatch, [
+        _row("b1", gym_id="gritx", post_date="2026-09-04", status="pending",
+             image_url="https://cdn/photo_07.jpg")])
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "list_month", _boom)
+    rows = [_mrow("2026-09-18", "https://cdn/photo_07.jpg"),   # the book would block it
+            _mrow("2026-09-19", "https://cdn/photo_11.jpg"),
+            _mrow("2026-09-20", "https://cdn/photo_11.jpg")]   # in-batch repeat
+    store.insert_rows("gritx", rows)
+    assert seen, "the belt must actually attempt the book read"
+    assert len(_staged(http)) == 3, "a failed lookup fails OPEN, never blocks a month"
+
+
+def test_media_belt_rides_the_existing_flag_and_costs_nothing_when_off(monkeypatch):
+    """Gated on the SAME flag media_guard already ships armed on
+    (AGENT_MEDIA_CROSS_DAY_GUARD, default ON). No new flag, no changed default. OFF
+    restores the pre-belt behavior byte-for-byte AND issues not one extra read."""
+    rows = [_mrow("2026-09-03", "https://cdn/photo_07.jpg"),
+            _mrow("2026-09-17", "https://cdn/photo_07.jpg")]
+
+    store_on, http_on = _belt_store(monkeypatch, [])
+    store_on.insert_rows("gritx", rows)
+    assert len(_staged(http_on)) == 1, "flag ON: the cross-day repeat is refused"
+
+    store_off, http_off = _belt_store(monkeypatch, [])
+    monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
+    store_off.insert_rows("gritx", rows)
+    assert len(_staged(http_off)) == 2, "flag OFF: the batch passes through untouched"
+    assert not [c for c in http_off.calls if c[0] == "get"], \
+        "flag OFF must not pay for a single book read"

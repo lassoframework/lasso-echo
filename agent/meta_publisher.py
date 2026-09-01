@@ -57,6 +57,15 @@ class PublishResult:
     mode: str          # "published" or "would_publish"
     media_id: str = ""
     detail: str = ""
+    # True only for the 24h content-hash dedup short-circuit below, where an identical
+    # (account, caption, media) post already went out and we deliberately did NOT re-send.
+    # That is the ONE case where "published" is honest with no media_id of our own, so it
+    # is the only case portal_calendar_store.mark_published accepts a blank late_post_id
+    # for. MUST mirror zernio_publisher.PublishResult.dedup: calendar_autopublish reads
+    # this field via getattr on WHICHEVER publisher ran, so a publisher missing it would
+    # send its dedup result into mark_published's blank-id refusal and strand the row in
+    # 'publishing' forever. Never set on a normal publish.
+    dedup: bool = False
 
 
 # requests is imported lazily so draft-only mode has zero network dependency
@@ -153,7 +162,8 @@ def publish(draft, account, http=None):
             ok=True, mode="published", media_id="" if prior == "dedup" else prior,
             detail="meta dedup: identical (account, caption, media) published "
                    "within 24h; NOT re-sent (release_dedup() is the explicit "
-                   "human override)")
+                   "human override)",
+            dedup=True)
 
     result = _publish_gated(draft, account, http)
     if result.ok and result.mode == "published":

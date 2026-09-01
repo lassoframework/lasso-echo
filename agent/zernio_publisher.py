@@ -41,6 +41,11 @@ class PublishResult:
     media_id: str = ""   # the Zernio post id (what postlog / late_post_id stores)
     detail: str = ""
     permalink: str = ""
+    # True only for a Zernio 409 content-hash dedup: Zernio told us this exact content
+    # ALREADY exists on the account. That is the ONE case where "published" is honest
+    # without a post id of our own, so it is the only case mark_published accepts a
+    # blank late_post_id for. Never set on a normal create.
+    dedup: bool = False
 
 
 class ZernioPublishError(Exception):
@@ -102,6 +107,34 @@ def publish(draft, account, client=None, scheduled_for=None,
     if not platform:
         raise ZernioPublishError(f"unsupported platform for {account.key}")
 
+    # NO PHOTO = NO POST (the "approved with no image" class, closed at the wire).
+    # zernio.create_post simply OMITS mediaItems when the url list is empty, and Zernio
+    # cheerfully publishes the caption as a TEXT-ONLY post to the gym's real feed. Every
+    # upstream rail leaks this one: portal_social._handle_approve_supabase never reads
+    # image_url, the store's set_status does not either, due_rows' "image_url is not
+    # null" filter does NOT catch the EMPTY STRING several lanes write, and the one real
+    # rail (publish_guard MEDIA_MISSING) is reachable only under calendar_grade_enabled.
+    # So the refusal belongs HERE, the one wire every client gym publishes through
+    # (preflight: every client row is Zernio-routed), mirroring meta_publisher's
+    # long-standing "Instagram needs a PUBLIC media URL" raise.
+    #
+    # SCOPE — this is a blanket refusal ON PURPOSE, and it is still precise: the ONLY
+    # formats reaching this function are IG/FB feed, story and reel (the _PLATFORM map
+    # above admits instagram + facebook_page and hard-raises on anything else), and all
+    # three REQUIRE media on the platform side. The one legitimately media-less Echo
+    # format, a Google Business text post, never touches this function: GBP is
+    # Platform.GOOGLE_BUSINESS, approvals._publisher_for routes it to gbp_publisher, and
+    # its payload goes out through zernio.create_post_raw (a different call) — so no GBP
+    # row can be caught by this guard. Raised BEFORE any network call so a photo-less
+    # post costs nothing and the caller's revert + alert path owns it.
+    url = (getattr(draft, "creative_public_url", "") or "").strip()
+    media_urls = [url] if url else []
+    if not media_urls:
+        raise ZernioPublishError(
+            f"{account.key}: refusing to publish a {platform} post with NO media "
+            "(empty creative url). Zernio would publish it as a caption-only text "
+            "post to the gym's real feed. Attach the image or hold the row.")
+
     profile_resolver = profile_resolver or _default_profile_resolver
     page_resolver = page_resolver or _default_page_resolver
     client = client or zernio.ZernioClient()
@@ -125,11 +158,6 @@ def publish(draft, account, client=None, scheduled_for=None,
             raise ZernioPublishError(
                 f"{account.key}: no Facebook page selected; the gym must pick a page.")
 
-    media_urls = []
-    url = getattr(draft, "creative_public_url", "") or ""
-    if url:
-        media_urls.append(url)
-
     # STORY: the draft's own type decides the Zernio contentType (IG/FB Story vs feed).
     story = bool(getattr(draft, "is_story", False)) or (
         (getattr(draft, "draft_type", "") or "").strip().lower() == "story")
@@ -139,6 +167,33 @@ def publish(draft, account, client=None, scheduled_for=None,
     # the same account — Zernio's 24h content-hash dedup then 409'd and the story was
     # NEVER created while Echo marked it published (Dale's missing IG story, 2026-08-13).
     body = "" if story else (getattr(draft, "caption", "") or "")
+
+    # EDIT-RATIONALE STRIP, AT THE WIRE (CrossFit ENG, live FB post 2026-08-23 00:02
+    # ET: a caption published ending "[why] Removed word parents and added people ...",
+    # called out by a member in the comments). Layer 3 of the four-layer strip lives in
+    # calendar_autopublish._strip_or_hold_meta — INSIDE publish_due, which three live
+    # lanes never enter: approvals.approve (the Slack/portal approve card), runner's
+    # LASSO auto-approve (live under AGENT_AUTO_APPROVE_ENABLED) and chat_publish's
+    # approve-in-chat. Each of those calls a publisher DIRECTLY, so a "[why] ..." block
+    # could still ride a caption onto a real feed. Moving the same split to the wire
+    # closes all three at once.
+    #
+    # Same function, never a second regex: post_quality.split_meta_suffix is the single
+    # shared definition of what a meta block IS (the stage gate, the drafter's parser,
+    # layer 3 and the book sweep all read it), so this layer can never disagree with
+    # them. IDEMPOTENT by construction — a caption layer 3 already cleaned carries no
+    # label, split_meta_suffix finds no match and returns it byte-identical.
+    # An ALL-META caption strips to an empty body and is deliberately NOT published:
+    # the empty-body refusal below raises, and the caller's revert + alert path holds
+    # the row for a human (never silently emptied). Stories send body="" by design and
+    # are untouched.
+    if body:
+        from .post_quality import split_meta_suffix
+        _clean, _meta = split_meta_suffix(body)
+        if _meta:
+            print(f"[zernio-publish] {account.key}: stripped an internal "
+                  "edit-rationale block off the caption at the publish wire")
+            body = _clean
 
     # BELT AND BRACES (publish_guard wiring, 2026-08-27): a FEED payload with an
     # empty/invisible body must never reach the API — an emoji-only or '...'
@@ -224,9 +279,25 @@ def publish(draft, account, client=None, scheduled_for=None,
         if getattr(exc, "status", None) == 409:
             existing = _existing_post_id(getattr(exc, "detail", ""))
             return PublishResult(ok=True, mode="published", media_id=existing,
-                                 detail="zernio dedup: identical post already exists")
+                                 detail="zernio dedup: identical post already exists",
+                                 dedup=True)
         raise
     post_id = zernio.post_id_of(resp)
+    # NO POST ID = NOT A PUBLISH (published-but-not-posted, the recurring class).
+    # A 2xx whose body we cannot parse tells us Zernio answered, NOT that it accepted
+    # the post. Returning ok=True here stamped status='published' with an empty
+    # late_post_id: unverifiable by publish_confirm, invisible to any reconcile, and
+    # indistinguishable in the portal from a post that really went live. Refuse it.
+    # The caller reverts the claim and retries next run, which is SAFE because Zernio's
+    # own 24h content-hash dedup answers a genuine double-send with a 409 that IS
+    # handled as published above. Failing closed can at worst re-ask; the old behaviour
+    # could silently lose a post forever.
+    if not str(post_id or "").strip():
+        raise ZernioPublishError(
+            f"{account.key}: Zernio returned no post id for this create "
+            "(2xx with an unparseable body). Refusing to mark it published — a post "
+            "we cannot identify cannot be verified or reconciled. The row reverts and "
+            "retries; Zernio's 24h dedup makes the retry safe.")
     return PublishResult(ok=True, mode="published", media_id=post_id,
                          detail="scheduled" if scheduled_for else "published now")
 

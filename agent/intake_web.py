@@ -864,10 +864,24 @@ def handle_portal_onboard(body):
       display_name  - required, non-empty gym name
 
     On success returns 200 with:
-      account_key  - the slug
+      account_key  - the CANONICAL slug onboard.run actually stood the gym up under
+                     (see the split-brain note below), NOT necessarily the passed one
       raw_token    - the signed intake token (the portal encrypts + stores it)
       publish_off  - always True (publishing is OFF for every new gym)
       onboarded    - always True
+
+    CANONICAL KEY IS THE ONLY KEY (Swift River / Sunnyside split-brain fix):
+    onboard.run() re-keys the gym through account_key_mint.derive_mint_key, which folds
+    the portal gyms.id UUID into the key, and reports the key it actually used back in
+    result["account_key"]. This handler used to ignore that and echo the PASSED key while
+    ALSO re-minting the idempotent-branch token from the PASSED key. The portal then stored
+    account_key="swiftriver" next to a token that authenticates as
+    "swiftrivercrossfit6e87f3": the gym row, voice doc, brain file, trust kv and publish kv
+    all landed under the canonical key while every portal lookup used the other one. Uploads
+    went to one key, the calendar and the Zernio profile to the other, and the gym silently
+    never posted. So: read the canonical key out of the result and use that ONE string for
+    the token, for the response, and for the idempotent recovery path. Never sign or return
+    the passed key once a canonical key was derived.
 
     IDEMPOTENT: mint() is deterministic (HMAC-SHA256 of the lowercased key under the
     shared signing secret), so onboarding an already-onboarded gym returns the SAME
@@ -906,20 +920,35 @@ def handle_portal_onboard(body):
         else:
             os.environ[_AUTOMINT] = _prev
 
+    # THE canonical key: whatever onboard.run actually keyed this gym under. It equals the
+    # passed key in every fallback case derive_mint_key documents (flag off, existing local
+    # gym row, unresolved portal uuid, blank display name, rejected derivation), so this is a
+    # no-op on a dev host with no Supabase and never changes behaviour for those paths. A
+    # missing / non-string / blank result key means a caller shape we do not recognise, and
+    # in that case we honestly fall back to the passed key rather than guessing.
+    canonical_key = result.get("account_key")
+    if not isinstance(canonical_key, str) or not canonical_key.strip():
+        canonical_key = account_key
+    else:
+        canonical_key = canonical_key.strip()
+
     # onboard.run sets token_minted to the raw token on a fresh mint, False on an
     # idempotent re-run (DB-backed mode), or None when minting was skipped. Since
     # mint() is deterministic, we ALWAYS recover the current live token from the
     # key so an idempotent re-run returns the same valid token, never nothing.
+    # That recovery MUST use the canonical key: minting from the passed key here is
+    # exactly how the idempotent branch handed the portal a token for a second, phantom
+    # gym that no onboarding artifact was ever written under.
     raw_token = result.get("token_minted")
     if not isinstance(raw_token, str) or not raw_token:
-        raw_token = _current_token_for(account_key)
+        raw_token = _current_token_for(canonical_key)
     if not raw_token:
         # No signing secret configured: onboarding cannot mint a link.
-        print(f"[portal] onboard for {account_key}: no signing secret, token unavailable")
+        print(f"[portal] onboard for {canonical_key}: no signing secret, token unavailable")
         return 500, {"error": "onboard failed"}
 
     return 200, {
-        "account_key": account_key,
+        "account_key": canonical_key,
         "raw_token": raw_token,
         "publish_off": True,
         "onboarded": True,

@@ -114,7 +114,7 @@ def test_builder_stamps_asset_id_end_to_end(monkeypatch, tmp_path):
     from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_asset
 
     monkeypatch.setattr("agent.vision.analyze_and_store",
-                        lambda path, gym=None: {"version": 2,
+                        lambda path, gym=None, alert=None: {"version": 2,
                                                 "quality": {"usable": True},
                                                 "safety_flags": [],
                                                 "one_line": "a class"})

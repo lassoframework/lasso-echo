@@ -155,6 +155,94 @@ def test_match_profile_id_pure():
     assert z.match_profile_id([], "x") is None
 
 
+# ---- the containment tier is a TENANT BOUNDARY, not a convenience -----------------
+# THE CROSS-TENANT PROFILE MATCH (found 2026-08-31): the containment tier used a bare
+# two-way startswith over profile NAMES, so 'CrossFit ENG' resolved onto a profile merely
+# named 'CrossFit', and 'lasso' onto 'Lasso Fitness Carmel'. That id is PERSISTED as the
+# gym's publish binding (zernio_profile_link's unattended daily/hourly sweep, and the
+# connect path's find-or-create, which silently REUSES the stranger's profile), and
+# nothing downstream catches it: account_id_for returns the first connected account of
+# that platform under whatever profile it was handed, and publish_confirm only proves the
+# post exists, never which account it landed on. One gym's posts, another gym's socials.
+
+def test_match_profile_id_refuses_a_prefix_collision_across_tenants():
+    """The two live repros. Both MUST be None: a guess here is a cross-tenant bind."""
+    assert z.match_profile_id(
+        [{"_id": "p_crossfit", "name": "CrossFit"},
+         {"_id": "p_other", "name": "Totally Different Gym"}],
+        "CrossFit ENG") is None
+    assert z.match_profile_id(
+        [{"_id": "p_lasso_fit", "name": "Lasso Fitness Carmel"}], "lasso") is None
+    # ...and the same shape against the real fleet's short profile names.
+    fleet = [{"_id": "p_eng", "name": "eng"}, {"_id": "p_gritx", "name": "gritx"},
+             {"_id": "p_district", "name": "district"}, {"_id": "p_lasso", "name": "lasso"},
+             {"_id": "p_default", "name": "Default"},
+             {"_id": "p_train", "name": "train7164ae502"}]
+    for stranger in ("engagefitnessdenver", "england", "gritxtreme", "districthouse",
+                     "lassofitness", "trainhard", "Default Gym Co"):
+        assert z.match_profile_id(fleet, stranger) is None, \
+            f"{stranger!r} must never resolve onto an unrelated gym's profile"
+
+
+def test_match_profile_id_keeps_the_canonical_key_alias_it_exists_for():
+    """The containment tier's ONE job: a canonically minted key is its name-slug plus a
+    6-hex fingerprint (account_key.py), while ops pre-create the profile under the human
+    name. CrossFit Reverb was live-dark on 2026-08-30 for exactly this. Both directions of
+    the canonical shape must survive, or the fix trades a leak for a fleet-wide blackout."""
+    profiles = [{"_id": "p_reverb", "name": "CrossFit Reverb"},
+                {"_id": "p_tough", "name": "toughtemple52040e"},
+                {"_id": "p_other", "name": "Totally Different Gym"}]
+    # reverse: account_key -> human-named profile
+    assert z.match_profile_id(profiles, "crossfitreverb30b5b2") == "p_reverb"
+    assert z.match_profile_id(profiles, "crossfitreverb30b5b2ig") == "p_reverb"
+    # forward: short base / display alias -> the key-named profile Echo minted itself
+    assert z.match_profile_id(profiles, "toughtemple") == "p_tough"
+    # a non-canonical tail in either direction is still refused
+    assert z.match_profile_id(profiles, "crossfitreverbcity") is None
+    assert z.match_profile_id(profiles, "toughtemplebar") is None
+
+
+def test_match_profile_id_ambiguity_still_returns_none():
+    """Unchanged contract: two candidates is never a coin flip."""
+    both = [{"_id": "p_a", "name": "CrossFit Reverb"}, {"_id": "p_b", "name": "crossfitreverb"}]
+    assert z.match_profile_id(both, "crossfitreverb30b5b2") is None
+    dupes = [{"_id": "p_a", "name": "Reverb Gym"}, {"_id": "p_b", "name": "reverb gym"}]
+    assert z.match_profile_id(dupes, "reverbgym") is None
+
+
+def test_find_profile_id_any_still_resolves_the_live_fleet():
+    """End to end through the ALIAS path the sweep and connect route actually call, over
+    the real 2026-08-31 profile list. Zanshin/Reverb resolve by display-name alias; every
+    other live key resolves on its own. 'lasso' must not be pulled onto 'Default' or
+    'district'."""
+    names = ["Default", "district", "lasso", "eng", "gritx", "topfuel", "district_h",
+             "piercefitness", "hillcountry", "theboltonclub", "CrossFit Zanshin",
+             "CrossFit Reverb", "toughtemple52040e", "train7164ae502", "crossfitnewtown",
+             "crossfitlocal", "swiftrivercrossfitd23567", "crossfitsunnyside2616ac"]
+    http = _FakeHttp([{"_id": "p_" + n.replace(" ", "_"), "name": n} for n in names])
+    c = z.ZernioClient(api_key="sk", base="https://api.zernio.com", http=http)
+    for key, aliases, expect in (
+        ("crossfitlocal", (), "crossfitlocal"),
+        ("crossfitnewtown", (), "crossfitnewtown"),
+        ("crossfitreverb30b5b2", ("CrossFit Reverb",), "CrossFit Reverb"),
+        ("crossfitsunnyside2616ac", (), "crossfitsunnyside2616ac"),
+        ("district_h", (), "district_h"),
+        ("eng", (), "eng"),
+        ("gritx", (), "gritx"),
+        ("hillcountry", (), "hillcountry"),
+        ("lasso", (), "lasso"),
+        ("piercefitness", (), "piercefitness"),
+        ("swiftrivercrossfitd23567", (), "swiftrivercrossfitd23567"),
+        ("theboltonclub", (), "theboltonclub"),
+        ("topfuel", (), "topfuel"),
+        ("toughtemple52040e", (), "toughtemple52040e"),
+        ("train7164ae502", (), "train7164ae502"),
+        ("zanshinfitness630e22", ("CrossFit Zanshin",), "CrossFit Zanshin"),
+    ):
+        assert c.find_profile_id_any(key, *aliases) == "p_" + expect.replace(" ", "_"), \
+            f"live account_key {key!r} must still resolve to {expect!r}"
+
+
 def test_find_profile_id_any_prefers_earlier_alias_and_falls_back():
     # Two profiles exist; the account_key does NOT match, but the display name does. Trying aliases in
     # order (account_key, display_name, ...) must find the human-named profile rather than miss.
@@ -400,6 +488,46 @@ def test_connect_url_for_rejects_whitespace_key(db_env):
         ok, err = zr.connect_url_for(bad, "instagram", client=fake)
         assert ok is False and "malformed account_key" in err
     assert not getattr(fake, "created_profiles", []), "no profile may be minted"
+
+
+# ---- the malformed-key guard lives AT the choke point, not on one door -------------
+# The junk-profile incident (2026-08-31) was fixed only in connect_url_for, which is ONE
+# of the THREE callers of _ensure_profile_id. These tests pin all three doors plus the
+# choke point itself, so deleting the guard from _ensure_profile_id fails a test.
+
+_MALFORMED_KEYS = ("gymA instagram", " gymA", "gymA\t", "  ", "")
+
+
+def test_ensure_profile_id_refuses_malformed_key_before_any_zernio_call(db_env):
+    """THE CHOKE POINT. Every minting path goes through _ensure_profile_id, so the guard
+    lives here. It must refuse BEFORE find_profile_id_any or create_profile is called."""
+    for bad in _MALFORMED_KEYS:
+        fake = _FakeClient()
+        with pytest.raises(zr.MalformedAccountKey):
+            zr._ensure_profile_id(bad, fake)
+        assert fake.calls == [], f"no Zernio call may be made for {bad!r}, got {fake.calls}"
+
+
+def test_handle_social_connect_never_mints_from_malformed_key(db_env):
+    """THE PORTAL DOOR — the higher-traffic one, previously unguarded."""
+    for bad in ("gymA instagram", " gymA", "gymA\t"):
+        fake = _FakeClient()
+        status, body = zr.handle_social_connect(bad, "instagram", client=fake)
+        assert status == 400, f"{bad!r} should be a 400, got {status} {body}"
+        assert "malformed account_key" in body.get("error", "")
+        assert not [c for c in fake.calls if c[0] == "create"], \
+            f"no profile may be minted for {bad!r}, got {fake.calls}"
+
+
+def test_provision_gym_never_mints_from_malformed_key(db_env):
+    """THE OPS DOOR — previously unguarded."""
+    for bad in ("  junk key  ", "gymA instagram", "gymA\t"):
+        fake = _FakeClient()
+        ok, err = zr.provision_gym(bad, client=fake)
+        assert ok is False, f"{bad!r} must be refused"
+        assert "malformed account_key" in err
+        assert not [c for c in fake.calls if c[0] == "create"], \
+            f"no profile may be minted for {bad!r}, got {fake.calls}"
 
 
 def test_connect_url_for_dark_without_key(tmp_path, monkeypatch):

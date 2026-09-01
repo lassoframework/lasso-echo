@@ -20,6 +20,12 @@ WHAT IT CATCHES (each its own reason code, so an alert names the actual next act
                   so its answers land where no reader looks (Reverb:
                   crossfitreverb30b5b2 vs crossfitreverb6cdf33)
   no_sources      registered, but no approved sources -> cannot draft anything
+  no_voice        intake completed but NO brand bible was ever produced (or the
+                  add-client scaffold's TODOs were never filled), so voice.load_voice
+                  returns nothing, the drafter blocks every card and the gym silently
+                  never posts. ENG went this way, and crossfitlocal / hillcountry /
+                  theboltonclub went the same way the week of 2026-08-31: sources
+                  approved, Zernio connected, everything green, zero posts forever.
   no_profile      no Zernio profile resolves -> cannot publish anywhere
   not_connected   a profile, but ZERO platforms connected (connection_watch skips this
                   case by design: it only reports PARTIAL connections)
@@ -31,6 +37,7 @@ approves or publishes anything: a human reads the alert and acts. ONE alert per 
 distinct issue-set per day. Behind AGENT_ONBOARDING_WATCH, default OFF.
 """
 
+import os
 from datetime import date
 
 from . import config
@@ -40,9 +47,17 @@ from . import config
 REASON_NOT_REGISTERED = "not_registered"
 REASON_KEY_MISMATCH = "key_mismatch"
 REASON_NO_SOURCES = "no_sources"
+REASON_NO_VOICE = "no_voice"
 REASON_NO_PROFILE = "no_profile"
 REASON_NOT_CONNECTED = "not_connected"
 REASON_NO_FB_PAGE = "no_fb_page"
+
+# The full set, in check order. Anything summarising this watch (the onboarding-audit
+# screen) should iterate THIS rather than its own hand-listed tuple, so a new reason
+# code can never be invisible in the summary the way no_voice was invisible for months.
+REASONS = (REASON_NOT_REGISTERED, REASON_KEY_MISMATCH, REASON_NO_SOURCES,
+           REASON_NO_VOICE, REASON_NO_PROFILE, REASON_NOT_CONNECTED,
+           REASON_NO_FB_PAGE)
 
 _FIX = {
     REASON_NOT_REGISTERED:
@@ -55,6 +70,12 @@ _FIX = {
     REASON_NO_SOURCES:
         "no approved sources, so Echo cannot draft anything without inventing facts. "
         "Check the gym completed intake and that it landed on this key.",
+    REASON_NO_VOICE:
+        "NO brand bible: <DATA_DIR>/brand_voice/<base>/lasso_voice.md is missing, "
+        "empty, or still the all-TODO add-client scaffold, so the drafter blocks "
+        "every card and this gym never posts, silently and forever. Produce it from "
+        "the gym's OWN intake answers (never write one by hand for them): "
+        "python -m agent social-intake-sync --base <base>",
     REASON_NO_PROFILE:
         "no Zernio profile resolves for this gym, so nothing can publish. Run "
         "zernio_profile_link, or stamp gyms.zernio_profile_id by hand when the "
@@ -78,6 +99,48 @@ _NOT_CLIENTS = ("lasso", "blake_personal")
 
 def enabled():
     return config.onboarding_watch_enabled()
+
+
+def _fix_for(reason, base_key):
+    """The fix line with THIS gym's key already substituted for the <base> slot, so the
+    operator copies a runnable command out of the alert instead of retyping it under
+    the wrong key. Only the <base> placeholder is filled: the older fixes say <key>
+    (an ACCOUNT key, not always the base) and are left exactly as written."""
+    return _FIX[reason].replace("<base>", base_key)
+
+
+def bible_is_hollow(raw):
+    """True when a bible file EXISTS but is only the add-client scaffold: every body
+    line is a TODO placeholder.
+
+    WHY THIS COUNTS AS NO BIBLE: onboard.VOICE_TEMPLATE writes a fully-TODO doc, and
+    every writer (social_intake_reader._write_doc, website_intake) refuses to clobber a
+    file that already exists. So a scaffolded gym that never had its TODOs filled keeps
+    that hollow doc FOREVER, and because the file is non-empty, load_voice returns a
+    VoiceDoc and preflight passes it. There is no avatar, no pillars, no CTAs and no
+    hashtags in it, so it is functionally identical to having no bible at all.
+
+    Deliberately conservative: headings and the scaffold's blockquote are ignored, a
+    wrapped TODO paragraph counts as one placeholder (VOICE_TEMPLATE's guardrails TODO
+    runs three lines), and ONE real body line anywhere makes the doc real. A
+    half-filled bible is a human's work in progress, never a false alarm here."""
+    in_todo = False
+    saw_body = False
+    for line in str(raw or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            in_todo = False          # a blank line or heading ends the TODO paragraph
+            continue
+        if s.startswith(">"):
+            continue                 # the scaffold's own "nothing here is approved" note
+        if s.upper().startswith("TODO"):
+            in_todo, saw_body = True, True
+            continue
+        if in_todo:
+            saw_body = True          # continuation of the wrapped TODO paragraph
+            continue
+        return False                 # real content: a human filled something in
+    return saw_body
 
 
 def is_client_gym(base_key):
@@ -157,6 +220,27 @@ def check_gym(base_key, gym_id="", intake_key="", *, bases=None, deps=None):
         issues.append(REASON_KEY_MISMATCH)
     if not has_sources:
         issues.append(REASON_NO_SOURCES)
+    # THE MOST EXPENSIVE SILENT FAILURE IN THE SYSTEM, and until now nothing in this
+    # file even looked at it: the intake completes, sources land approved, Zernio
+    # connects, every check above and below passes, and NO brand bible was ever
+    # produced. voice.load_voice returns None, the drafter blocks every card, and the
+    # gym posts nothing forever while reading as perfectly healthy (ENG, then
+    # crossfitlocal / hillcountry / theboltonclub in one week). The only existing
+    # signal, client_media_sync's _alert_stall(base, "no_voice"), fires once ever,
+    # names no next command, and is unreachable for exactly these gyms because
+    # scan_and_generate returns early with no sources or no media.
+    #
+    # POSITION: after no_sources, because a gym with no sources cannot have a bible
+    # (the bible is written FROM the intake answers), so no_sources is the step that
+    # unblocks this one. BEFORE no_profile, deliberately, for two reasons: (1) the
+    # bible is a BUILD-lane requirement and the profile is a PUBLISH-lane one, and a
+    # gym with a perfect profile and no bible still posts nothing, so the bible is the
+    # more blocking of the two; (2) no_profile RETURNS EARLY, so ordering it first
+    # would hide the missing bible entirely, and the day the profile gets linked the
+    # gym would go straight back to reading healthy while still never drafting. That
+    # is the exact invisibility this check exists to end.
+    if has_sources and not d["voice"](base_key):
+        issues.append(REASON_NO_VOICE)
     profile_id = d["profile_id"](base_key)
     if not profile_id:
         issues.append(REASON_NO_PROFILE)
@@ -270,7 +354,8 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
         except Exception:  # noqa: BLE001
             pass
         lead = issues[0]
-        alert(f"{base_key}: not set up to post ({', '.join(issues)}). {_FIX[lead]}")
+        alert(f"{base_key}: not set up to post ({', '.join(issues)}). "
+              f"{_fix_for(lead, base_key)}")
         try:
             kv.set(stamp, "alerted")
         except Exception:  # noqa: BLE001
@@ -288,6 +373,35 @@ def _live_deps():
     def _approved(base):
         from . import client_sources
         return client_sources.approved_sources(f"{base}_ig")
+
+    def _voice(base):
+        """True when this gym has a USABLE brand bible, resolved exactly the way the
+        live readers do. The path is NOT hardcoded here: client_media_sync's
+        _resolve_client_voice_path is the same resolver the drafting lane and preflight
+        use, durable <DATA_DIR>/brand_voice/<base>/lasso_voice.md first with the
+        account's repo-relative voice_doc as fallback. onboard_verify checks
+        'brand_voice/<key>.md', which is not a path anything writes; copying that would
+        have made this whole check report the fleet wrong.
+
+        Unreadable -> True (assume fine). A reader that fails open cannot page the
+        whole fleet the way an unreadable registry would."""
+        from .voice import load_voice
+        from .client_media_sync import _resolve_client_voice_path  # noqa: SLF001
+        repo_path = os.path.join("brand_voice", base, "lasso_voice.md")
+        try:
+            from . import accounts
+            acct = accounts.get_account(f"{base}_ig") or accounts.get_account(base)
+            if acct is not None:
+                repo_path = acct.voice_doc_path() or repo_path
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            doc = load_voice(_resolve_client_voice_path(base, repo_path))
+        except Exception:  # noqa: BLE001
+            return True
+        if doc is None:
+            return False
+        return not bible_is_hollow(doc.raw)
 
     def _profile(base):
         from . import zernio_publisher
@@ -334,5 +448,5 @@ def _live_deps():
             return ""
 
     return {"roster": portal_keys, "intake": intake_keys, "bases": _bases,
-            "approved_sources": _approved, "profile_id": _profile,
+            "approved_sources": _approved, "voice": _voice, "profile_id": _profile,
             "platforms": _platforms, "fb_page": _fb_page, "gym_name": _gym_name}

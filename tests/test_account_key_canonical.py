@@ -473,6 +473,54 @@ def test_resolve_gym_uuid_unknown_base_is_none_never_a_guess():
     assert s.resolve_gym_uuid("") is None
 
 
+def test_resolve_gym_uuid_never_resolves_an_unrelated_gym_onto_a_short_slug():
+    """THE CROSS-TENANT RESOLVER (found 2026-08-31).
+
+    The containment tier used a bare startswith in BOTH directions. Against this very
+    fixture, the gym slugged 'eng' swallowed every base that merely began with those
+    three letters, so a brand new gym called Engage Fitness Denver would silently read
+    ENG's uuid — and therefore ENG's Zernio profile, settings, GBP connection and
+    calendar. No error, no alert, wrong tenant. These bases share a prefix with a real
+    gym and are NOT that gym; each must resolve to None rather than a guess."""
+    s = _store()
+    for stranger in ("engagefitnessdenver", "england", "engineering",
+                     "gritxtreme", "birddogwalking", "boltonclubhouse"):
+        assert s.resolve_gym_uuid(stranger) is None, \
+            f"{stranger!r} must never resolve onto an unrelated gym"
+
+
+def test_resolve_gym_uuid_still_maps_a_canonical_key_back_to_its_gym():
+    """The reverse direction exists for exactly one shape: a canonically minted key is
+    its name-slug PLUS a 6-hex fingerprint (account_key.py). That must keep resolving,
+    or every canonically keyed gym goes dark — which is the opposite failure."""
+    s = _store()
+    for gym_id, name, expected in (
+        ("uuid-topfuel", "Top Fuel", "uuid-topfuel"),
+        ("uuid-birddog", "Bird Dog CrossFit", "uuid-birddog"),
+        ("uuid-hillcountry", "Hill Country MVMT", "uuid-hillcountry"),
+    ):
+        key = ak.canonical_account_key(gym_id, name)
+        assert s.resolve_gym_uuid(key) == expected, \
+            f"canonical key {key!r} must resolve back to {expected}"
+
+
+def test_containment_match_is_boundary_and_shape_precise():
+    """Unit-pins the two narrow rules directly, so deleting either one fails here even
+    if the resolver's fixture happens to hide it."""
+    import agent.portal_calendar_store as pcs
+    cm = pcs._containment_match
+    # forward: word-boundary prefix of the slug is fine, mid-word is not
+    assert cm("districth", "districthstrengthfitness", "district-h-strength-fitness", "")
+    assert not cm("distric", "districthstrengthfitness", "district-h-strength-fitness", "")
+    assert not cm("eng", "engagefitnessdenver", "engage-fitness-denver", "")
+    # reverse: only the canonical <slug><6 hex> tail
+    assert cm("topfuela1b2c3", "topfuel", "top-fuel", "Top Fuel")
+    assert not cm("topfuelinjection", "topfuel", "top-fuel", "Top Fuel")
+    # the name is a legitimate second source (hillcountrymvmt -> 'Hill Country MVMT')
+    assert cm("hillcountrymvmt", "hillcountry", "hill-country", "Hill Country MVMT")
+    assert not cm("hillcountryclub", "hillcountry", "hill-country", "Hill Country MVMT")
+
+
 def test_canonical_key_is_stable_across_the_disagreeing_identifiers():
     """The whole point: hillcountry and hillcountrymvmt (two registry strings, one gym)
     resolve to the SAME uuid and therefore the SAME canonical key."""

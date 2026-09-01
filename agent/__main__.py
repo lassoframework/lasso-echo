@@ -207,6 +207,8 @@ def _status():
     print(f"  intake_sync    : {config.social_intake_sync_enabled()}  (env AGENT_SOCIAL_INTAKE_SYNC)")
     print(f"  dynamic_accts  : {config.dynamic_accounts_enabled()}  (env AGENT_DYNAMIC_ACCOUNTS)")
     print(f"  acctkey_guard  : {config.account_key_guard_enabled()}  (env AGENT_ACCOUNT_KEY_GUARD; refuse a cross-tenant account_key -> Zernio profile rebind at _persist_profile_id + fire one ops alert; OFF => today's bind behaviour unchanged)")
+    print(f"  zernio_failwatch: {config.zernio_failed_watch_enabled()}  (env AGENT_ZERNIO_FAILED_WATCH; nightly READ-ONLY alert on posts Zernio marks FAILED, loudest when Echo calls the same post PUBLISHED)")
+    print(f"  acctkey_split  : {config.account_key_split_watch_enabled()}  (env AGENT_ACCOUNT_KEY_SPLIT_WATCH; nightly READ-ONLY alert when the key the PORTAL recorded for a gym owns no calendar while another key for the SAME gym does — the Swift River / Sunnyside split-brain class)")
     print(f"  acctkey_reconc : {config.account_key_reconcile_enabled()}  (env AGENT_ACCOUNT_KEY_RECONCILE; gates the account-key reconciler's --apply WRITE only; OFF => even --apply is a dry-run; the plan always reads)")
     print(f"  canonical_mint : {config.canonical_mint_enabled()}  (env AGENT_CANONICAL_MINT; onboard.run derives a NEW intake link's account_key canonically from the portal gyms.id UUID + name so a fresh link can't carry an ad-hoc key that later disagrees with gyms.slug/the Zernio handle; DEFAULTS ON — only affects NEW links, existing signed tokens self-decode their own key so their resolution is untouched; unresolvable uuid => passed key kept verbatim, never fabricated)")
     print(f"  acctkey_doctor : {config.account_key_doctor_alerts_enabled()}  (env AGENT_ACCOUNT_KEY_DOCTOR_ALERTS; gates ONLY the account-key doctor's ops ALERT on a social-product gym that fails to resolve — UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY — throttled per base; the read-only 'account-key-doctor' report always runs regardless)")
@@ -253,6 +255,10 @@ def _status():
     print(f"  mentions       : {config.mentions_enabled()}  (env AGENT_MENTIONS; Wave 4 tag_allowlist @mention tagging, default OFF)")
     print(f"  metrics_sync   : {config.metrics_sync_enabled()}  (env AGENT_METRICS_SYNC; Wave 7 nightly Zernio analytics -> post_metrics snapshots, read only, default OFF)")
     print(f"  learning_loop  : {config.learning_loop_enabled()}  (env AGENT_LEARNING_LOOP; Wave 7 lever stamping + gym_playbook consumption + monthly retro, default OFF)")
+    print(f"  horizon_sweep  : {config.plan_horizon_sweep_enabled()}  (env AGENT_PLAN_HORIZON_SWEEP; nightly retirement of pending rows already past today+{config.plan_horizon_days()} — the belt's retroactive counterpart, exempt dated lanes kept, default ON)")
+    print(f"  media_repeat   : {config.media_repeat_sweep_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP; nightly cross-day same-photo sweep, published/approved rows never touched, default ON)")
+    print(f"  posting_tz     : {config.posting_tz_watch_enabled()}  (env AGENT_POSTING_TZ_WATCH; backfill gyms.posting_timezone from GBP/brand-bible evidence + alert on any gym still without one, default ON)")
+    print(f"  vision_drift   : {config.vision_allowlist_watch_enabled()}  (env AGENT_VISION_ALLOWLIST_WATCH; read-only report when AGENT_VISION_GYMS and the gyms actually burning vision calls disagree, default ON)")
     print(f"  inbox_alerts   : {config.inbox_alerts_enabled()}  (env AGENT_INBOX_ALERTS; daily read-only comments/mentions/reviews sweep -> one coach card per gym per day, default OFF)")
     print(f"  audience_demos : {config.audience_demographics_enabled()}  (env AGENT_AUDIENCE_DEMOGRAPHICS; weekly IG follower + engaged demographics -> gym_audience_demographics, read only, default OFF)")
     print(f"  cadence_2x     : {config.cadence_2x_enabled()}  (env ECHO_CADENCE_2X_ENABLED; per-gym posts_per_day toggle honored at 2x, slot times {config.cadence_slot_times()}, default OFF)")
@@ -884,6 +890,8 @@ _COMMANDS = {
         ("zernio-connect-url", "print a gym's OAuth connect link for a platform (--account <key> --platform instagram|facebook|googlebusiness)"),
         ("social-before-after", "BEFORE/AFTER social metrics: the gym's public Instagram feed before Echo started vs the last 90 days, same rubric via Apify (AGENT_SOCIAL_BASELINE + APIFY_TOKEN) — (--gym <base> | --all) [--capture]"),
         ("account-key-reconcile", "find gyms with the social product but a missing/duplicate/collided account_key; print a canonical-key PLAN (dry-run) — (--gym <gym_id> | --all) [--apply]"),
+        ("zernio-failed-watch", "read-only: posts Zernio marks FAILED, loudest when Echo has the same post marked PUBLISHED in the portal (the published-but-not-posted class); never retries"),
+        ("account-key-split-watch", "read-only: which gyms have a PORTAL key that owns no calendar while a DIFFERENT key for the same gym does (the split-brain class that silently stops a gym posting); names both keys and the repoint command"),
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
@@ -1850,9 +1858,10 @@ def main(argv=None):
         _ok = sum(1 for _, i in _rows if not i)
         print()
         print(f"ready to post: {_ok} / {len(_rows)}")
-        for _reason in (_ow.REASON_NOT_REGISTERED, _ow.REASON_KEY_MISMATCH,
-                        _ow.REASON_NO_SOURCES, _ow.REASON_NO_PROFILE,
-                        _ow.REASON_NOT_CONNECTED, _ow.REASON_NO_FB_PAGE):
+        # Iterate the module's own REASONS tuple, never a hand-listed copy: a hand-listed
+        # tuple silently omits every reason code added later (no_voice was invisible here
+        # the day it shipped).
+        for _reason in _ow.REASONS:
             _hit = [b for b, i in _rows if _reason in i]
             if _hit:
                 print(f"  {_reason}: {', '.join(_hit)}")
@@ -1922,10 +1931,25 @@ def main(argv=None):
                     "SELECT MAX(published_at) AS lp FROM posts WHERE account_key=? "
                     "AND mode='published'", (a.key,)).fetchone()
                 last_pub = (row["lp"] or "never")[:16]
+                # LAST ERROR, HONESTLY (audit item 7, 2026-08-31). This line used to
+                # print `reason[:40]` with no date, so lasso_fb's month-old
+                # "ModuleNotFoundError: No module named 'google'" (2026-07-31, a
+                # transient deploy whose venv lacked the already-declared google-genai
+                # /boto3 wheels — long since rebuilt, and lasso_fb has published every
+                # day since) rendered as a live-looking "No module named 'go…". Two
+                # fixes: show the WHOLE reason with its timestamp, and mark it (stale)
+                # when the account has published successfully since the error, so a
+                # healed failure can never read as a current one.
                 err = conn.execute(
-                    "SELECT reason FROM audit WHERE kind='account_error' AND "
+                    "SELECT ts, reason FROM audit WHERE kind='account_error' AND "
                     "account_key=? ORDER BY id DESC LIMIT 1", (a.key,)).fetchone()
-                last_err = (err["reason"][:40] if err else "none")
+                if not err:
+                    last_err = "none"
+                else:
+                    ts = str(err["ts"] or "")[:16]
+                    stale = bool(row["lp"] and str(err["ts"] or "") < str(row["lp"]))
+                    last_err = (f"{ts} {'(stale) ' if stale else ''}"
+                                f"{err['reason']}")
                 print(f"{a.key:<16} trust L{int(_level(a))}  runway {str(rw):>6}d  "
                       f"last publish {last_pub:<16}  last error {last_err}")
     elif cmd == "audit":
@@ -2908,6 +2932,25 @@ def main(argv=None):
         #   railway run /opt/venv/bin/python -m agent account-key-doctor
         from . import account_key_doctor as _akd
         _akd.cli(argv[1:])
+    elif cmd == "account-key-split-watch":
+        # ACCOUNT-KEY SPLIT WATCH: does the key the PORTAL recorded for each gym actually
+        # own that gym's calendar? Swift River + Sunnyside each carried TWO keys (portal
+        # pointing at an empty one, the month and the Zernio profile under another) and no
+        # other detector could see it. READ-ONLY; the nightly sweep additionally fires one
+        # throttled alert per gym per day (gated by AGENT_ACCOUNT_KEY_SPLIT_WATCH). Run on
+        # the worker (Supabase creds live there):
+        #   railway run /opt/venv/bin/python -m agent account-key-split-watch
+        from . import account_key_split_watch as _aks
+        _aks.print_report(_aks.run())
+    elif cmd == "zernio-failed-watch":
+        # ZERNIO FAILED-POST WATCH: what does Zernio itself say happened to the posts Echo
+        # sent? A 2xx create is ACCEPTANCE, not delivery, and nothing in the client lane
+        # ever looked again — so a row could read "Published" while Zernio said FAILED.
+        # READ-ONLY; never retries, never republishes. The nightly sweep additionally
+        # alerts (gated by AGENT_ZERNIO_FAILED_WATCH). Run on the worker:
+        #   railway run /opt/venv/bin/python -m agent zernio-failed-watch
+        from . import zernio_failed_watch as _zfw
+        _zfw.print_report(_zfw.run())
     elif cmd == "lasso-zernio-setup":
         # LASSO-via-Zernio setup (AGENT_LASSO_VIA_ZERNIO): stamp the 'lasso' gyms row
         # with its Zernio profile id + Facebook page (auto-pick, or --page <id> when

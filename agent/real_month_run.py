@@ -226,13 +226,17 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
             # honestly skip the story. A story is NEVER a cropped feed card.
             return None
         did = _sq._draft_id(acct_key, f"sprint_story|{story_file}|{slot_index}", day_key)
-        return Draft(
+        # Task #28 (§5c): stamp the sprint story's RAW hosted render so the calendar row
+        # carries source_media_url and an edited story caption RE-BURNS instead of
+        # shipping the old text. Gated by AGENT_STORY_SOURCE_MEDIA inside the helper.
+        from . import story_reburn as _sr
+        return _sr.stamp_source_media(Draft(
             draft_id=did, account_key=acct_key, platform=platform,
             caption="", hashtags=[],
             creative_path=story_file, creative_public_url=url,
             scheduled_for=info["scheduled_for"], status=DraftStatus.PENDING,
             day_key=day_key, is_story=True, draft_type="story", category="summit",
-            source_fragments=list(getattr(feed_draft, "source_fragments", []) or []))
+            source_fragments=list(getattr(feed_draft, "source_fragments", []) or [])))
 
     return _feed, _story
 

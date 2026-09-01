@@ -657,6 +657,55 @@ def since_echo_lines(gym, *, result=None, client=None, store=None,
 # ---------------------------------------------------------------------------
 
 
+# The LASSO tenant is excluded from client_gym_bases() because it has its own
+# Meta-direct PUBLISHING lane — but measurement is not publishing. Its public
+# Instagram feed carries the same BEFORE/AFTER story as any client's, and Echo
+# posts for it. Building --all from client_gym_bases() alone meant LASSO's own
+# baseline could never be captured by the documented command, at any time.
+LASSO_BASE = "lasso"
+
+# Registry keys that are gym tenants for social purposes: an account on a social
+# platform. Anything else in the registry (a personal account, a non-social key)
+# has no public feed to measure and only ever produced a skip + exit code 1,
+# which masks the real failures --all is supposed to surface.
+_SOCIAL_PLATFORMS = ("instagram", "facebook_page")
+
+
+def all_baseline_gyms():
+    """Every tenant `--all` should try: the client gym bases PLUS LASSO, minus
+    registry keys that are not social tenants at all. Stable order, deduped.
+    Read-only over the account registry; falls back to no platform filtering if
+    the registry cannot be read, so a registry hiccup never silently shrinks the
+    fleet."""
+    from .calendar_autopublish import client_gym_bases
+
+    social = set()
+    try:
+        from .accounts import all_accounts
+        for a in all_accounts():
+            if str(getattr(a, "platform", "") or "").lower() not in _SOCIAL_PLATFORMS:
+                continue
+            k = a.key or ""
+            for suf in ("_ig", "_fb"):
+                if k.endswith(suf):
+                    k = k[: -len(suf)]
+                    break
+            if k:
+                social.add(k)
+    except Exception:  # noqa: BLE001 — registry unreadable: do not filter
+        social = set()
+
+    out, seen = [], set()
+    for gym in [LASSO_BASE] + list(client_gym_bases() or []):
+        if not gym or gym in seen:
+            continue
+        if social and gym not in social:
+            continue
+        seen.add(gym)
+        out.append(gym)
+    return out
+
+
 def cli(argv, *, client=None, store=None, baseline_store=None, today=None):
     """python -m agent social-before-after (--gym <base> | --all) [--capture]
 
@@ -686,24 +735,37 @@ def cli(argv, *, client=None, store=None, baseline_store=None, today=None):
               "(--gym <base> | --all) [--capture]")
         return 1
     if do_all:
-        from .calendar_autopublish import client_gym_bases
-        gyms = client_gym_bases()
+        gyms = all_baseline_gyms()
         if not gyms:
             print("no client gym bases found")
             return 1
 
     exit_code = 0
     for gym in gyms:
+        # FAULT ISOLATION: one gym's failure must never abort the sweep. This is
+        # a manual, run-once rail with no retry — an exception escaping here
+        # (a store 5xx, a socket timeout) left every gym AFTER it silently
+        # uncaptured. Only the exception TYPE is printed: a raw requests error
+        # can carry the full request URL, and the Apify token rides in the query
+        # string, so the message itself is never safe to print.
         if do_capture:
-            cap = capture_baseline(gym, client=client, store=store,
-                                   baseline_store=baseline_store, today=today)
+            try:
+                cap = capture_baseline(gym, client=client, store=store,
+                                       baseline_store=baseline_store, today=today)
+            except Exception as exc:  # noqa: BLE001
+                cap = {"ok": False, "captured": False,
+                       "reason": f"capture failed: {type(exc).__name__}"}
             print(f"capture {gym}: "
                   f"{'stored' if cap.get('captured') else cap.get('reason')}")
             if not cap.get("ok"):
                 exit_code = 1
                 continue
-        res = before_after(gym, client=client, store=store,
-                           baseline_store=baseline_store, today=today)
+        try:
+            res = before_after(gym, client=client, store=store,
+                               baseline_store=baseline_store, today=today)
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "gym": gym,
+                   "reason": f"report failed: {type(exc).__name__}"}
         for line in render_table(res):
             print(line)
         if not res.get("ok"):

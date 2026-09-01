@@ -471,7 +471,7 @@ def _arm_drive_pool(monkeypatch, assets, gym="gritx"):
     monkeypatch.setattr("agent.integrations.drive_client.DriveClient",
                         lambda *a, **k: drive)
     monkeypatch.setattr("agent.vision.analyze_and_store",
-                        lambda path, gym=None: {
+                        lambda path, gym=None, alert=None: {
                             "version": 2, "quality": {"usable": True},
                             "safety_flags": [], "one_line": "members in a class"})
     monkeypatch.setattr("agent.vision.auto_plannable", lambda a: (True, []))

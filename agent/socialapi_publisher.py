@@ -37,6 +37,15 @@ class PublishResult:
     media_id: str = ""   # the platform post id (what postlog stores)
     detail: str = ""
     permalink: str = ""  # public URL to the live post, when the vendor returns one
+    # Part of the shared publisher contract, mirroring zernio_publisher and
+    # meta_publisher: True ONLY when a vendor-side content dedup says an identical post
+    # already exists, which is the one case "published" is honest with no post id of our
+    # own and the only case portal_calendar_store.mark_published accepts a blank
+    # late_post_id for. This lane polls to a terminal state and normally carries a real
+    # id, so nothing sets it today — but the FIELD must exist, because
+    # calendar_autopublish reads it via getattr on whichever publisher ran, and a
+    # publisher missing it strands any future blank-id result in 'publishing' forever.
+    dedup: bool = False
 
 
 class SocialApiPublishError(Exception):
