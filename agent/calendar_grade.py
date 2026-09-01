@@ -102,6 +102,11 @@ _MENTION_RE = re.compile(r"@\w+")
 _SOFT_FLAG_MAX_PENALTY = 12
 _ASK_MAX_PENALTY = 7
 
+# Fewest posts for the 25% mix cap to be a measurable question. At 12 posts a
+# pillar may hold 3, so a four-pillar month satisfies it; at 7 posts it may hold
+# 1, which demands seven distinct pillars and marks a gym down for arithmetic.
+_MIX_CAP_MIN_POSTS = 12
+
 
 @dataclass
 class CalendarGrade:
@@ -152,7 +157,8 @@ def _eligible_posts(rows, exempt, rule):
 def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
     scores, defects, exempt = {}, [], {}
     scores["consistency"]    = _consistency(rows, defects)
-    scores["content_mix"]    = _content_mix(rows, profile, quotas, defects)
+    scores["content_mix"]    = _content_mix(rows, profile, quotas, defects,
+                                            exempt=exempt)
     scores["caption_craft"]  = _caption_craft(rows, defects, exempt=exempt)
     if profile == "B2B":
         # B2B grades proof numbers under the visual_match leg (unchanged).
@@ -244,7 +250,7 @@ def _consistency(rows, defects) -> int:
 # Leg: content_mix (max 20)
 # ---------------------------------------------------------------------------
 
-def _content_mix(rows, profile, quotas, defects) -> int:
+def _content_mix(rows, profile, quotas, defects, exempt=None) -> int:
     score = 20
     n = len(rows)
     if n == 0:
@@ -295,12 +301,27 @@ def _content_mix(rows, profile, quotas, defects) -> int:
     )
     denom = len(capped_posts) or len(post_groups) or n
 
-    # Each category over 25% of the CAP-ELIGIBLE rows: -3
-    for cat, count in cat_counts.items():
-        pct = count / denom
-        if pct > 0.25:
-            defects.append(("content_mix", cat, f"{cat} is {pct:.0%} of posts (over 25%)"))
-            score -= 3
+    # Each category over 25% of the CAP-ELIGIBLE posts: -3.
+    #
+    # SMALL BOOKS ARE EXEMPT, EXPLICITLY (2026-08-31). The cap asks "is this
+    # MONTH dominated by one pillar", and that question is only well posed for
+    # a month-sized book. On a 7-post book the cap allows floor(0.25 * 7) = 1
+    # post per pillar, so satisfying it needs SEVEN distinct pillars; sunnyside
+    # and topfuel were being marked down for arithmetic no repair could ever
+    # clear, which is exactly the kind of unfixable flag that makes the nightly
+    # loop look broken. Below _MIX_CAP_MIN_POSTS the cap is not measured, the
+    # exemption is COUNTED, and the digest says so.
+    if denom < _MIX_CAP_MIN_POSTS:
+        if exempt is not None:
+            exempt["content_mix: 25% cap not measurable below "
+                   f"{_MIX_CAP_MIN_POSTS} posts"] = denom
+    else:
+        for cat, count in cat_counts.items():
+            pct = count / denom
+            if pct > 0.25:
+                defects.append(("content_mix", cat,
+                                f"{cat} is {pct:.0%} of posts (over 25%)"))
+                score -= 3
 
     # Check unbacked proof/results slots. LIVE-SHAPE FIX (2026-08-31): the old check
     # read `vision_derived` / `media_kind`, which are NOT columns on content_calendar

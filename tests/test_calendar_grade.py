@@ -417,10 +417,12 @@ def test_content_mix_sprint_summit_is_exempt():
 def test_content_mix_off_sprint_summit_still_capped():
     """Summit OUTSIDE any sprint window is capped exactly as before (regression)."""
     from agent import calendar_grade as cg
-    rows = [{"pillar": "summit", "post_date": "2026-12-10", "caption": "x", "format": "feed"}
-            for _ in range(10)]
-    rows += [{"pillar": "doctrine", "post_date": "2026-12-11", "caption": "x", "format": "feed"}
-             for _ in range(10)]
+    # Month-sized and on DISTINCT dates: the cap is only measured at or above
+    # _MIX_CAP_MIN_POSTS posts, and same-date same-caption rows are ONE post.
+    rows = [{"pillar": "summit", "post_date": f"2026-12-{d:02d}",
+             "caption": f"x{d}", "format": "feed"} for d in range(10, 20)]
+    rows += [{"pillar": "doctrine", "post_date": f"2026-12-{d:02d}",
+              "caption": f"y{d}", "format": "feed"} for d in range(20, 30)]
     defects = []
     cg._content_mix(rows, "B2B", None, defects)
     assert any(d[1] == "summit" for d in defects), "off-sprint summit must still cap"
@@ -463,3 +465,33 @@ def test_proof_slot_backing_judged_from_real_row_shape():
     g = grade_month(rows, profile="GYM")
     unbacked = [d for d in g.defects if "unbacked" in str(d[2])]
     assert len(unbacked) == 1 and unbacked[0][1] == "2026-09-03"
+
+
+# ---------------------------------------------------------------------------
+# The 25% mix cap is only measurable on a month-sized book
+# ---------------------------------------------------------------------------
+
+def test_mix_cap_exempt_on_a_book_too_small_to_satisfy_it():
+    """On a 7-post book the cap allows floor(0.25 * 7) = 1 post per pillar, so
+    satisfying it needs SEVEN pillars. sunnyside and topfuel were marked down
+    for arithmetic no repair could clear. Exempt, and COUNTED so the digest
+    can say so."""
+    rows = [_make_row(post_date=f"2026-09-{(i + 1):02d}",
+                      caption=_perfect_caption(i),
+                      pillar=["service", "about", "service"][i % 3])
+            for i in range(7)]
+    g = grade_month(rows, profile="GYM")
+    assert not [d for d in g.defects if "over 25%" in d[2]], g.defects
+    assert any("25% cap not measurable" in k for k in g.exempt), g.exempt
+    assert g.scores["content_mix"] == 20
+
+
+def test_mix_cap_still_applies_to_a_month_sized_book():
+    """Regression: a real month is still capped exactly as before."""
+    rows = [_make_row(post_date=f"2026-09-{(i + 1):02d}",
+                      caption=_perfect_caption(i),
+                      pillar="service" if i < 8 else "about")
+            for i in range(16)]
+    g = grade_month(rows, profile="GYM")
+    assert [d for d in g.defects if "over 25%" in d[2]], g.defects
+    assert g.scores["content_mix"] < 20

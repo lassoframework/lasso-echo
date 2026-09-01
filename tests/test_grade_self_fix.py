@@ -356,9 +356,12 @@ def test_held_alert_fires_once_then_dedups(_self_fix_on, monkeypatch):
     assert r1["held"] == ["gritx"]
     held = [a for a in alerts1 if a.startswith("calendar grade: gritx")]
     assert len(held) == 1
-    # <= 3 lines: score, auto-fixed, remaining
-    assert held[0].count("\n") <= 2
+    # <= 4 lines: score, auto-fixed, remaining, and the exemption line when the
+    # grade held any posts out of a rule (a score that quietly excluded posts
+    # without saying so is the dishonesty this grader exists to end).
+    assert held[0].count("\n") <= 3
     assert "Auto-fixed:" in held[0] and "Remaining:" in held[0]
+    assert "Exempt by rule" in held[0], held[0]
     summary = [a for a in alerts1 if a.startswith("grade sweep:")]
     assert len(summary) == 1
     assert "0 self-fixed to A" in summary[0] and "gritx" in summary[0]
@@ -702,13 +705,18 @@ def test_overcap_stops_honestly_when_no_headroom(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _multi_pass_book():
-    """9 consecutive days; one caption repeated on days 1..5 (consistency 0 +
-    dup cap -> 59) and a 3-of-9 community pillar (mix defect that no pass
-    fixes). Un-dupping one day at a time walks the score 59 -> 78 -> 87 -> A."""
-    pillars = ["community", "community", "community", "education", "coach",
-               "invite", "story", "offer", "welcome"]
+    """13 consecutive days; one caption repeated on days 1..5 (consistency 0 +
+    dup cap -> 59) and a 4-of-13 community pillar (mix defect that no pass
+    fixes). Un-dupping one day at a time walks the score 59 -> 78 -> 87 -> A.
+
+    Month-sized on purpose: the 25% mix cap is only measured at or above
+    _MIX_CAP_MIN_POSTS posts, and this fixture NEEDS its mix defect to stand so
+    the sweep has a reason to keep passing."""
+    pillars = ["community", "community", "community", "community", "education",
+               "coach", "invite", "story", "offer", "welcome", "faq", "tips",
+               "faces"]
     rows = []
-    for i in range(9):
+    for i in range(13):
         cap = _a_caption(1) if i < 5 else _a_caption(i + 1)
         rows.append(_row(i + 1, f"2026-09-{(i + 1):02d}", cap,
                          pillar=pillars[i]))

@@ -327,10 +327,16 @@ def test_build_client_month_leaves_approved_far_future_rows(tmp_path, _client_fl
         _account(), "gritx", TODAY.isoformat(), days=60, voice=_voice(),
         library_path=lib, store=store, banned_words=(), logger=lambda m: None)
     assert out["ok"] is True
-    # NEVER a retroactive sweep: the approved far-future row is byte-for-byte intact
-    # and its month was never even in the (clamped) delete span.
+    # NEVER a retroactive sweep: the approved far-future row is byte-for-byte intact.
     assert approved_far in store.rows
-    assert _d(45)[:7] not in store.deleted_months or _d(45)[:7] == TODAY.isoformat()[:7]
+    # ...and nothing was staged past the horizon. The delete span is a MONTH list,
+    # so whenever today+31 crosses a month boundary the far row's month is legitimately
+    # in it (2026-09-01: horizon 2026-10-01, approved row 2026-10-16). Asserting the
+    # month was untouched therefore only held on dates where the horizon stayed inside
+    # one month, and it went red on the 1st of the month rather than on a real
+    # regression. The guarantee that matters is the one above plus this.
+    assert all(r["post_date"] <= (TODAY + timedelta(days=31)).isoformat()
+               for r in store.rows if r.get("status") == "pending")
 
 
 def test_backfill_never_reaches_beyond_horizon(tmp_path, _client_flags, monkeypatch):
