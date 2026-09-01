@@ -19,8 +19,21 @@ _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit
 _FILLER_OPENERS = re.compile(
     r"^(we're excited|we are excited|exciting news|just a reminder|don't forget|happy \w+day)\b", re.I)
 
+# The booking ask, as gyms actually write it. The article and the noun are almost never
+# adjacent in real copy ("Book a FREE NO SWEAT intro", "Book your FIRST class"), and the
+# original adjacent-only pattern read every one of those as having NO ASK. That single
+# false negative was the dominant defect code across the whole fleet on 2026-08-31 and
+# left gyms with a perfectly good CTA stuck below grade. Up to three modifier words are
+# allowed between them; more than that is a sentence, not an ask.
+_ASK_NOUN = r"(call|intro|class|spot|session|consult|consultation|visit|trial|tour|assessment)"
+_ASK_MODS = r"(?: [\w'-]+){0,3}"
+
 ASK_RE = re.compile(
-    r"(link in (our )?bio|book (a|your) (call|intro|class|spot)|dm us|dm \"?\w+\"?|message us|"
+    r"(link in (our )?bio"
+    rf"|book (a|your|an){_ASK_MODS} {_ASK_NOUN}"
+    rf"|schedule (a|your|an){_ASK_MODS} {_ASK_NOUN}"
+    rf"|start with (a|your|an){_ASK_MODS} {_ASK_NOUN}"
+    r"|dm us|dm \"?\w+\"?|message us|"
     r"comment \"?\w+\"?|sign up|get started|claim your|reserve your|try a (free )?class|"
     r"schedule (a|your)|start (here|today|your))", re.I)
 

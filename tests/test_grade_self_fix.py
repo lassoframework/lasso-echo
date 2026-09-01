@@ -58,9 +58,12 @@ def _a_caption(i):
     """A clean A-grade caption: short hook line, 150+ chars, booking ask, no dashes."""
     hook = f"Feeling stuck at {i + 20}? Real change starts small."
     body = (
+        # EXACTLY ONE ask. Before 2026-09-01 this read "Get started today and book
+        # your free intro class", which is TWO asks — the second was invisible only
+        # because ASK_RE required the article and the noun to be adjacent.
         "\nBusy parents and working professionals thrive in our 30-minute "
         "format. No experience needed and every class is beginner friendly. "
-        f"Get started today and book your free intro class. Post {i}."
+        f"Book your free intro class. Post {i}."
     )
     return hook + body
 

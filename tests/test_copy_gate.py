@@ -187,3 +187,30 @@ def test_no_local_dash_regex_definitions():
         "Local dash-regex definitions found outside copy_gate.py. "
         "Migrate them to copy_gate:\n" + "\n".join(violations_found)
     )
+
+
+def test_ask_detects_the_booking_ask_as_gyms_actually_write_it():
+    """The article and the noun are almost never adjacent in real gym copy. The old
+    adjacent-only pattern read every one of these as having NO ASK, which was the
+    dominant grading defect across the fleet on 2026-08-31."""
+    for text in (
+        "Book a Free No Sweat Intro",
+        "Book your free intro this week",
+        "Book an intro session",
+        "Start With a Free No Sweat Intro today",
+        "Schedule your first visit",
+        "Claim Your Free Consultation",
+        "Book a call",
+    ):
+        assert copy_gate.ASK_RE.search(text), f"should read as an ask: {text!r}"
+
+
+def test_ask_does_not_fire_on_prose_that_merely_contains_the_words():
+    """Loosening the pattern must not turn ordinary sentences into asks."""
+    for text in (
+        "We booked a room for the party and everyone came to the class",
+        "Our members love the community here",
+        "The book a coach wrote about the class of 2020 changed my whole intro",
+        "She had a great first session with her friend",
+    ):
+        assert not copy_gate.ASK_RE.search(text), f"should NOT be an ask: {text!r}"
