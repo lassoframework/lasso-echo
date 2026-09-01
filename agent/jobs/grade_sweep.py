@@ -96,6 +96,83 @@ def _write_grade(store_or_db, gym_id: str, window: str, grade) -> None:
               f"{type(exc).__name__}: {exc}")
 
 
+def _previous_grade(store_or_db, gym_id: str, window: str):
+    """The most recently STORED total for this gym+window, or None.
+
+    Read BEFORE the current grade is written, so it is genuinely the previous
+    run's number. Fail-open: any error returns None and the drop guard simply
+    stays quiet rather than crying wolf."""
+    try:
+        if hasattr(store_or_db, "latest_grade"):
+            rec = store_or_db.latest_grade(gym_id, window)
+            return None if rec is None else int(rec.get("total"))
+        from agent import config
+        url = config.supabase_url()
+        key = config.supabase_service_key()
+        if not url or not key:
+            return None
+        import urllib.parse
+        import urllib.request
+        q = urllib.parse.urlencode({
+            "gym_id": f"eq.{gym_id}",
+            "window": f"eq.{window}",
+            "select": "total,graded_at",
+            "order": "graded_at.desc",
+            "limit": "1",
+        })
+        req = urllib.request.Request(
+            f"{url}/rest/v1/gym_social_grades?{q}",
+            headers={"apikey": key, "Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode() or "[]")
+        if not rows:
+            return None
+        return int(rows[0].get("total"))
+    except Exception:  # noqa: BLE001 - the guard never breaks the sweep
+        return None
+
+
+def _should_alert_drop(gym_id: str, prev_total: int, total: int,
+                       today_str: str, db=None) -> bool:
+    """Drop guard dedup: at most one drop alert per gym per day.
+
+    Durable-or-silent, the same convention the held alert uses: a process
+    without durable kv would re-alert every run, so it stays silent."""
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        if hasattr(_db, "kv_is_durable") and not _db.kv_is_durable():
+            return False
+        key = f"grade_drop_state_{gym_id}"
+        raw = _db.kv_get(key, "")
+        state = json.loads(raw) if raw else {}
+        if state.get("date") == today_str:
+            return False
+        _db.kv_set(key, json.dumps({"date": today_str, "from": prev_total,
+                                    "to": total}))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _drop_alert_text(gym_id: str, prev_total: int, grade) -> str:
+    """The signal Blake actually needs: not 'this book is bad' (which fires
+    nightly until everyone stops reading it) but 'this book got WORSE than it
+    was', which means something is RE-CREATING defects the repair already
+    cleared. Names the top new defects so the culprit build is findable."""
+    top = [str(d[2]) for d in (grade.defects or [])[:3]]
+    return (
+        f"calendar grade DROPPED: {gym_id} forward book went "
+        f"{prev_total} -> {grade.total} ({grade.letter}) since the last run.\n"
+        f"A drop means new defects are being BUILT into the book faster than "
+        f"the nightly repair clears them.\n"
+        f"Top defects now: {top}"
+    )
+
+
 def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
     """Fire one ops alert when a grade drops below B (80). LEGACY path: only
     used when AGENT_GRADE_SELF_FIX is OFF (byte-for-byte today's behavior)."""
@@ -115,7 +192,8 @@ def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
 _MAX_FIX_PASSES = 3
 
 _FIX_COUNT_KEYS = ("captions_fixed", "repillared", "craft_fixed",
-                   "craft_attempted", "booking_asks_added", "skipped")
+                   "craft_attempted", "booking_asks_added", "audience_fixed",
+                   "audience_attempted", "skipped")
 
 
 def _merge_fix(agg: dict, step: dict) -> dict:
@@ -173,15 +251,25 @@ def _should_alert_held(gym_id: str, grade, today_str: str, db=None) -> bool:
 
 
 def _held_alert_text(gym_id: str, grade, fix: dict) -> str:
-    """<= 3 lines: score, what self-fix repaired, what remains."""
+    """<= 4 lines: score, what self-fix repaired, what remains, what was exempt.
+
+    The exemption line is not optional. Caption-less posts (a story whose
+    caption is burned onto its media, a GBP photo post) are held OUT of the
+    caption legs, and a score that quietly excluded rows without saying so
+    would be exactly the kind of dishonesty this grader is meant to end."""
     fixed_txt = "; ".join((fix or {}).get("actions") or []) or "nothing auto-fixable"
     remaining = [str(d[2]) for d in (grade.defects or [])[:3]]
-    return (
+    lines = [
         f"calendar grade: {gym_id} forward book held at {grade.total} "
-        f"({grade.letter}) after self-fix.\n"
-        f"Auto-fixed: {fixed_txt}.\n"
-        f"Remaining: {remaining}"
-    )
+        f"({grade.letter}) after self-fix.",
+        f"Auto-fixed: {fixed_txt}.",
+        f"Remaining: {remaining}",
+    ]
+    exempt = getattr(grade, "exempt", None) or {}
+    if exempt:
+        parts = "; ".join(f"{v} post(s) {k}" for k, v in sorted(exempt.items()))
+        lines.append(f"Exempt by rule (not defects): {parts}")
+    return "\n".join(lines)
 
 
 def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
@@ -237,6 +325,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     # per-gym-per-window alert path below runs byte-for-byte as today.
     self_fix = config.grade_self_fix_enabled()
     fixed_gyms, held_gyms, alerted_gyms = [], [], []
+    dropped_gyms = []
 
     results = {}
     for gym_id in gyms:
@@ -263,6 +352,9 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
         # --- forward book ---
         forward_rows = _fetch_rows(store, gym_id, today_str, forward_end)
         if forward_rows:
+            # Read the last stored total BEFORE writing this run's, so the drop
+            # guard compares against the genuinely previous run.
+            prev_total = _previous_grade(store, gym_id, "forward_book")
             f_grade = grade_month(forward_rows, profile=profile)
             fix = None
             if self_fix and f_grade.total < A_THRESHOLD:
@@ -271,8 +363,10 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                 # is still below A. The FINAL grade is what gets stored.
                 fix = {"ok": True, "passes": 0, "gap_fill": "none",
                        "actions": []}
+                fix["trajectory"] = [(f_grade.total, len(f_grade.defects or []))]
                 for _pass in range(_MAX_FIX_PASSES):
                     prev_total = f_grade.total
+                    prev_defects = len(f_grade.defects or [])
                     try:
                         from agent.jobs import grade_fix
                         step = grade_fix.remediate_forward_book(
@@ -286,9 +380,20 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                     forward_rows = _fetch_rows(store, gym_id, today_str,
                                                forward_end) or forward_rows
                     f_grade = grade_month(forward_rows, profile=profile)
+                    fix["trajectory"].append(
+                        (f_grade.total, len(f_grade.defects or [])))
+                    # CONVERGENCE CONTRACT (2026-08-31): keep going while the
+                    # pass is still making the book better by EITHER measure —
+                    # a higher score or strictly fewer defects. The old test
+                    # looked at the score alone, so a pass that cleared real
+                    # defects without yet moving a floored leg was read as "no
+                    # progress" and the loop stopped one step short of the
+                    # improvement. Stopping when neither moves IS the floor.
+                    improved = (f_grade.total > prev_total
+                                or len(f_grade.defects or []) < prev_defects)
                     if (not step.get("ok")
                             or f_grade.total >= A_THRESHOLD
-                            or f_grade.total <= prev_total):
+                            or not improved):
                         break
             _write_grade(store, gym_id, "forward_book", f_grade)
             if not self_fix:
@@ -304,10 +409,23 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                                                               today_str):
                         alert_fn(_held_alert_text(gym_id, f_grade, fix))
                         alerted_gyms.append(gym_id)
+            # REGRESSION GUARD: a book that got WORSE than its last run means a
+            # build is re-creating defects. That fires whatever the letter is —
+            # a book sliding from A to B is the early warning that the below-B
+            # alert would not give until it was far too late.
+            if prev_total is not None and f_grade.total < prev_total:
+                dropped_gyms.append((gym_id, prev_total, f_grade.total))
+                if _should_alert_drop(gym_id, prev_total, f_grade.total,
+                                      today_str):
+                    alert_fn(_drop_alert_text(gym_id, prev_total, f_grade))
+                    alerted_gyms.append(gym_id)
+
             gym_result["forward_book"] = {
                 "total": f_grade.total,
                 "letter": f_grade.letter,
                 "rows": len(forward_rows),
+                "posts_exempt": dict(getattr(f_grade, "exempt", {}) or {}),
+                "previous_total": prev_total,
             }
             if fix is not None:
                 gym_result["self_fix"] = fix
@@ -331,6 +449,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     if self_fix:
         out["self_fixed"] = fixed_gyms
         out["held"] = held_gyms
+    out["dropped"] = dropped_gyms
     return out
 
 

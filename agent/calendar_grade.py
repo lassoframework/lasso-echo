@@ -21,6 +21,30 @@ feed is cross-posted to Instagram AND Facebook, and its paired story carries
 the same caption on the same date. Same-date rows sharing a caption hash are
 therefore ONE post, never a repeat; a hash that appears on MORE THAN ONE
 post_date is a true duplicate and is penalized per extra date.
+
+POSTS, NOT ROWS (2026-08-31). The duplicate leg has always known that one post
+spans several rows, but every OTHER caption-judged leg scored per ROW — so a
+single caption missing its ask was counted two or three times (ENG's one HYROX
+hook produced 3 defects; gritx's 30 flagged posts produced 88). Every
+caption-judged leg (caption_craft, path_to_join, right_audience, content_mix)
+now scores POSTS via posts_of(). The histogram stops lying and the score stops
+depending on how many platforms a gym cross-posts to.
+
+CAPTION-LESS POSTS ARE EXEMPT, EXPLICITLY (2026-08-31). A story carries its
+caption BURNED ON THE MEDIA and a GBP photo post has no caption at all. Judging
+those by feed-caption rules invents defects that no repair can ever clear —
+51 of LASSO's 80 forward posts were held that way. Such posts are exempt from
+the caption legs, COUNTED in CalendarGrade.exempt, and named in the digest.
+They are never silently dropped.
+
+RATE, NOT RAW COUNT (2026-08-31). caption_craft and path_to_join used to
+subtract a fixed amount PER defective row, so a 168-row book and a 14-row book
+were judged against the same absolute budget and any large book floored out at
+the first handful of defects. A book that repaired 27 of its 30 bad posts
+scored exactly the same as one that repaired none, which is precisely why the
+nightly repair loop looked stuck. Those legs now deduct in proportion to the
+SHARE of eligible posts that are defective, with the same worst-case penalty as
+before, so partial progress actually moves the number.
 """
 from __future__ import annotations
 
@@ -71,6 +95,13 @@ _NUMBER_RE = re.compile(r"[0-9]+")
 # @mention in caption
 _MENTION_RE = re.compile(r"@\w+")
 
+# Worst-case deductions for the rate-scored legs. These reproduce the OLD
+# floors exactly at a 100% defect rate (caption_craft floored at 8 = 20 - 12;
+# path_to_join's ask check could take the leg to the floor), so a fully broken
+# book scores what it always scored — only PARTIAL progress now registers.
+_SOFT_FLAG_MAX_PENALTY = 12
+_ASK_MAX_PENALTY = 7
+
 
 @dataclass
 class CalendarGrade:
@@ -78,20 +109,59 @@ class CalendarGrade:
     letter: str
     scores: dict           # leg -> points
     defects: list = field(default_factory=list)   # (leg, row_ref, reason)
+    exempt: dict = field(default_factory=dict)    # rule -> posts explicitly exempted
+
+
+def posts_of(rows):
+    """Group calendar ROWS into POSTS.
+
+    One post deliberately spans several rows: an Instagram feed row, its
+    Facebook mirror, and the paired story all carry the SAME caption on the
+    SAME date. Scoring a caption per row therefore counts one defect two or
+    three times. Every caption-judged leg groups first through here.
+
+    Returns [((post_date, caption_hash), [row, ...]), ...] in stable row order.
+    """
+    groups: dict = {}
+    for r in rows or []:
+        key = (str(r.get("post_date") or "")[:10],
+               caption_hash(r.get("caption") or ""))
+        groups.setdefault(key, []).append(r)
+    return list(groups.items())
+
+
+def _has_caption(group) -> bool:
+    """A post is judged by caption rules only when it HAS a caption.
+
+    An empty caption is not a defect: a story's caption is burned onto its
+    media and a GBP photo post carries none at all. See the module docstring —
+    these posts are exempt explicitly and counted, never silently dropped."""
+    return bool((group[0].get("caption") or "").strip())
+
+
+def _eligible_posts(rows, exempt, rule):
+    """The posts a caption rule may judge, recording how many it exempted."""
+    posts = posts_of(rows)
+    eligible = [(k, g) for k, g in posts if _has_caption(g)]
+    skipped = len(posts) - len(eligible)
+    if exempt is not None and skipped:
+        exempt[rule] = skipped
+    return eligible
 
 
 def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
-    scores, defects = {}, []
+    scores, defects, exempt = {}, [], {}
     scores["consistency"]    = _consistency(rows, defects)
     scores["content_mix"]    = _content_mix(rows, profile, quotas, defects)
-    scores["caption_craft"]  = _caption_craft(rows, defects)
+    scores["caption_craft"]  = _caption_craft(rows, defects, exempt=exempt)
     if profile == "B2B":
         # B2B grades proof numbers under the visual_match leg (unchanged).
         scores["visual_match"] = _proof_numbers(rows, defects)
     # GYM: NO visual_match leg. Clients upload their own media; Echo controls
     # captions and mix only, so image quality is never graded (Blake, 2026-08-27).
-    scores["right_audience"] = _right_audience(rows, profile, defects)
-    scores["path_to_join"]   = _path(rows, profile, defects)
+    scores["right_audience"] = _right_audience(rows, profile, defects,
+                                               exempt=exempt)
+    scores["path_to_join"]   = _path(rows, profile, defects, exempt=exempt)
     raw = sum(scores.values())
     if profile == "B2B":
         total = raw
@@ -110,7 +180,7 @@ def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
         total = min(total, 59)
 
     letter = next(l for floor, l in BANDS if total >= floor)
-    return CalendarGrade(total, letter, scores, defects)
+    return CalendarGrade(total, letter, scores, defects, exempt)
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +282,18 @@ def _content_mix(rows, profile, quotas, defects) -> int:
         cat = (r.get("pillar") or r.get("category") or "")
         if cat == "summit" and str(r.get("post_date") or "")[:10] in _sprint:
             return False  # intended sprint concentration, not a defect
+
         return True
 
-    capped_rows = [r for r in rows if _counts_toward_cap(r)]
-    cats = [r.get("pillar") or r.get("category") or "" for r in capped_rows]
-    cat_counts = Counter(cats)
-    denom = len(capped_rows) or n
+    # Mix is a property of POSTS, not rows: a gym that cross-posts one photo to
+    # IG + FB + a story has not published three servings of that pillar.
+    post_groups = posts_of(rows)
+    capped_posts = [grp for _k, grp in post_groups if _counts_toward_cap(grp[0])]
+    cat_counts = Counter(
+        (grp[0].get("pillar") or grp[0].get("category") or "")
+        for grp in capped_posts
+    )
+    denom = len(capped_posts) or len(post_groups) or n
 
     # Each category over 25% of the CAP-ELIGIBLE rows: -3
     for cat, count in cat_counts.items():
@@ -234,16 +310,18 @@ def _content_mix(rows, profile, quotas, defects) -> int:
     # carries: it is unbacked only when it has NO real media attached (empty image_url)
     # and no Drive-sourced asset. Rows that DO carry vision_derived/media_kind (test
     # fakes, a future migration) still honor them.
-    for row in rows:
+    for _k, grp in post_groups:
+        row = grp[0]
         cat = (row.get("pillar") or row.get("category") or "").lower()
         if cat in ("proof", "results", "social_proof"):
-            if row.get("vision_derived", False):
+            if any(r.get("vision_derived", False) for r in grp):
                 continue
-            media_kind = row.get("media_kind", "")
-            if media_kind in ("photo", "video"):
+            if any(r.get("media_kind", "") in ("photo", "video") for r in grp):
                 continue
-            has_media = bool((row.get("image_url") or "").strip()
-                             or (row.get("source_media_asset_id") or "").strip())
+            # A post is backed when ANY of its rows carries real media.
+            has_media = any(bool((r.get("image_url") or "").strip()
+                                 or (r.get("source_media_asset_id") or "").strip())
+                            for r in grp)
             if not has_media:
                 defects.append(("content_mix", row.get("post_date", ""),
                                 "proof/results slot unbacked (no media on the row)"))
@@ -256,7 +334,7 @@ def _content_mix(rows, profile, quotas, defects) -> int:
 # Leg: caption_craft (max 20)
 # ---------------------------------------------------------------------------
 
-def _caption_craft(rows, defects) -> int:
+def _caption_craft(rows, defects, exempt=None) -> int:
     # Hard block: ANY row with violations -> 0 for the whole leg
     for row in rows:
         cap = row.get("caption") or ""
@@ -267,29 +345,31 @@ def _caption_craft(rows, defects) -> int:
             return 0
 
     score = 20
+    eligible = _eligible_posts(rows, exempt, "caption_craft: caption-less posts")
+    if not eligible:
+        return score
 
-    # Soft flags: -1 each, floor at 8
-    total_soft = 0
-    for row in rows:
-        cap = row.get("caption") or ""
-        flags = copy_gate.soft_flags(cap)
-        for f in flags:
-            defects.append(("caption_craft", row.get("post_date", ""),
-                            f"soft flag: {f}"))
-            total_soft += 1
+    # Soft flags, scored PER POST at a RATE (see module docstring). A book where
+    # every post is flagged lands on the same floor of 8 it always did; a book
+    # that repaired most of its posts now scores like it.
+    flagged = 0
+    for (day, _h), grp in eligible:
+        flags = copy_gate.soft_flags(grp[0].get("caption") or "")
+        if flags:
+            flagged += 1
+            for f in flags:
+                defects.append(("caption_craft", day, f"soft flag: {f}"))
+    score -= int(round(_SOFT_FLAG_MAX_PENALTY * flagged / len(eligible)))
 
-    score = max(8, score - total_soft)
-
-    # Median caption length < 150: -4
-    lengths = [len(r.get("caption") or "") for r in rows]
-    if lengths:
-        try:
-            med = statistics.median(lengths)
-        except statistics.StatisticsError:
-            med = lengths[0] if lengths else 0
-        if med < 150:
-            defects.append(("caption_craft", "", f"median caption length {med:.0f} < 150"))
-            score -= 4
+    # Median caption length < 150: -4 (over posts, not rows)
+    lengths = [len(grp[0].get("caption") or "") for _k, grp in eligible]
+    try:
+        med = statistics.median(lengths)
+    except statistics.StatisticsError:
+        med = lengths[0]
+    if med < 150:
+        defects.append(("caption_craft", "", f"median caption length {med:.0f} < 150"))
+        score -= 4
 
     return max(0, score)
 
@@ -378,23 +458,28 @@ def _proof_numbers(rows, defects) -> int:
 # Leg: right_audience (max 15)
 # ---------------------------------------------------------------------------
 
-def _right_audience(rows, profile, defects) -> int:
+def _right_audience(rows, profile, defects, exempt=None) -> int:
+    """Avatar leaks are scored PER POST, not per row. One off-avatar hook is one
+    brand mistake, not three, however many platforms it is mirrored to. The
+    per-post penalty is unchanged (-5 athlete, -2 elite), so a book with several
+    genuinely off-avatar posts still loses the leg."""
     score = 15
 
-    for row in rows:
-        cap = row.get("caption") or ""
+    for (day, _h), grp in _eligible_posts(rows, exempt,
+                                          "right_audience: caption-less posts"):
+        cap = grp[0].get("caption") or ""
         first_line = cap.strip().splitlines()[0] if cap.strip() else ""
 
         if profile == "GYM":
             # Athlete-avatar leak: -5 each
             if _ATHLETE_WORDS.search(first_line):
-                defects.append(("right_audience", row.get("post_date", ""),
+                defects.append(("right_audience", day,
                                 f"athlete-avatar leak in hook: {first_line[:60]}"))
                 score -= 5
 
         # Hook intent mismatch: elite language: -2 each
         if _ELITE_WORDS.search(first_line):
-            defects.append(("right_audience", row.get("post_date", ""),
+            defects.append(("right_audience", day,
                             f"elite/advanced hook: {first_line[:60]}"))
             score -= 2
 
@@ -405,47 +490,55 @@ def _right_audience(rows, profile, defects) -> int:
 # Leg: path_to_join (max 10)
 # ---------------------------------------------------------------------------
 
-def _path(rows, profile, defects) -> int:
+def _path(rows, profile, defects, exempt=None) -> int:
     score = 10
-    n = len(rows)
+    eligible = _eligible_posts(rows, exempt, "path_to_join: caption-less posts")
+    n = len(eligible)
+    if not n:
+        return score
 
-    # 100% of rows carry exactly one ask (ASK_RE match)
-    for row in rows:
-        cap = row.get("caption") or ""
+    # Every post carries an ask. Scored at a RATE so repairing most of a book
+    # actually moves the leg (see module docstring); a book where NO post asks
+    # still loses the same worst case it always did.
+    missing = 0
+    for (day, _h), grp in eligible:
+        cap = grp[0].get("caption") or ""
         if not copy_gate.ASK_RE.search(cap):
-            defects.append(("path_to_join", row.get("post_date", ""),
-                            "no ask in caption"))
-            score -= 1
+            defects.append(("path_to_join", day, "no ask in caption"))
+            missing += 1
+    score -= int(round(_ASK_MAX_PENALTY * missing / n))
 
-    # GYM: >= 5 rows pointing at booking-specific terms
+    # GYM: >= 5 posts pointing at booking-specific terms
     if profile != "B2B":
         want_booking = min(5, n)
-        booking_rows = sum(
-            1 for r in rows if _BOOKING_RE.search(r.get("caption") or "")
+        booking_posts = sum(
+            1 for _k, grp in eligible
+            if _BOOKING_RE.search(grp[0].get("caption") or "")
         )
-        missing_booking = max(0, want_booking - booking_rows)
+        missing_booking = max(0, want_booking - booking_posts)
         for _ in range(missing_booking):
             defects.append(("path_to_join", "",
                             "not enough booking-specific asks"))
             score -= 1
 
-    # B2B: >= 12 rows with call ask
+    # B2B: >= 12 posts with call ask
     if profile == "B2B":
         want_call = min(12, n)
-        call_rows = sum(
-            1 for r in rows if _B2B_CALL_RE.search(r.get("caption") or "")
+        call_posts = sum(
+            1 for _k, grp in eligible
+            if _B2B_CALL_RE.search(grp[0].get("caption") or "")
         )
-        missing_call = max(0, want_call - call_rows)
+        missing_call = max(0, want_call - call_posts)
         for _ in range(missing_call):
             defects.append(("path_to_join", "",
                             "not enough B2B call asks"))
             score -= 1
 
     # Bare typed URL as only ask
-    for row in rows:
-        cap = (row.get("caption") or "").strip()
+    for (day, _h), grp in eligible:
+        cap = (grp[0].get("caption") or "").strip()
         if _BARE_URL_RE.search(cap) and not copy_gate.ASK_RE.search(cap):
-            defects.append(("path_to_join", row.get("post_date", ""),
+            defects.append(("path_to_join", day,
                             "bare URL at end, no ask text"))
             score -= 1
 

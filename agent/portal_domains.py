@@ -98,14 +98,33 @@ _REGISTRY = {
 }
 
 
+def _compact(name):
+    """The space-free form of a normalized name: 'the bolton club' -> 'theboltonclub'.
+    Echo's BASE KEYS are exactly this shape, so a record filed under a human name is
+    still reachable when a caller passes the gym's base key (the base-key-vs-human-name
+    miss that left The Bolton Club without a voice bible on 2026-08-31)."""
+    return _norm(name).replace(" ", "")
+
+
+# Base-key index, built once: compact name -> record. An entry whose compact form
+# collides with another is dropped from this index so an ambiguous base key resolves to
+# nothing rather than to the wrong gym; the exact-name lookup still finds both.
+_COMPACT_INDEX = {}
+for _k, _v in _REGISTRY.items():
+    _ck = _compact(_k)
+    _COMPACT_INDEX[_ck] = None if _ck in _COMPACT_INDEX else _v
+_COMPACT_INDEX = {k: v for k, v in _COMPACT_INDEX.items() if v is not None}
+
+
 def record_for(name):
-    """The full registry record for a gym name, or None when it is not recorded."""
-    return _REGISTRY.get(_norm(name))
+    """The full registry record for a gym name OR base key, or None when unrecorded."""
+    return _REGISTRY.get(_norm(name)) or _COMPACT_INDEX.get(_compact(name))
 
 
 def domain_for(name, gym_id=None):
-    """The recorded, real domain for a gym name, or "" when it is not recorded. `gym_id`
-    is accepted for a future id-keyed override but name is the current key. An empty return
-    keeps the caller on its needs_logo path (never a fabricated domain)."""
-    rec = _REGISTRY.get(_norm(name))
+    """The recorded, real domain for a gym name or base key, or "" when it is not
+    recorded. `gym_id` is accepted for a future id-keyed override but name is the current
+    key. An empty return keeps the caller on its needs_logo path (never a fabricated
+    domain)."""
+    rec = record_for(name)
     return (rec.get("domain") or "") if rec else ""

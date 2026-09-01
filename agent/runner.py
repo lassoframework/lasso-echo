@@ -1092,6 +1092,27 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # Business location, else a city/state in the gym's own brand bible) and alerts
     # on every gym it still cannot resolve. Never overwrites a human's value, never
     # writes a guess, publishes nothing. Isolated: a failure never blocks the run.
+    # BILLING CUSTOMER SYNC (audit follow-up, 2026-08-31; flag
+    # AGENT_BILLING_CUSTOMER_SYNC, default OFF). The publish billing gate decides on
+    # gyms.stripe_customer_id and NOTHING on the Echo side ever wrote it, so the gate
+    # was armed in production and structurally inert. This copies the portal's
+    # gym_billing customer id onto Echo's own row so the gate can reach Stripe. It
+    # reads the portal plane and writes Echo's column only; it never touches a client's
+    # Stripe account or subscription, and the gate keeps its own fail-OPEN contract.
+    # Isolated: a sync failure leaves the gate exactly as it was.
+    if config.billing_customer_sync_enabled():
+        try:
+            from .jobs.billing_customer_sync import run as _billing_sync_run
+            _bsum = _billing_sync_run(apply=True)
+            if _bsum.get("written"):
+                print(f"[billing-sync] mapped {_bsum['written']} gym(s) to a Stripe "
+                      "customer id")
+        except Exception as e:
+            print(f"[billing-sync] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"billing customer sync failed: {type(e).__name__}: {e}. "
+                             "The publish billing gate keeps its current reach; "
+                             "publishing is unaffected.")
+
     if config.posting_tz_watch_enabled():
         try:
             from .jobs.posting_tz_backfill import run as _tz_run

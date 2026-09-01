@@ -3281,3 +3281,17 @@ def story_music_dir() -> str:
     licensed music we cannot evidence). Blake arms this by hand once licensed files
     + license refs are dropped in — never fabricate either."""
     return (os.environ.get("AGENT_STORY_MUSIC_DIR", "") or "").strip()
+
+
+def billing_customer_sync_enabled() -> bool:
+    """AGENT_BILLING_CUSTOMER_SYNC: copy the portal's gym_billing.stripe_customer_id
+    onto Echo's own gyms row so the publish billing gate can actually reach Stripe.
+
+    Default OFF (house rule). The 2026-08-31 audit found the gate armed in production
+    and structurally inert: nothing on the Echo side had ever written that column, so
+    every gym answered "unknown customer" and passed at the gate's first branch. This
+    sync is the missing wire, not a new policy — the gate keeps its own contract (fail
+    OPEN, hold only on positive Stripe cancellation evidence, one deduped alert per
+    flip). Reads the portal plane and writes ECHO's column only; it never touches a
+    client's Stripe account, subscription, or billing setup."""
+    return _truthy(os.environ.get("AGENT_BILLING_CUSTOMER_SYNC", "false"))

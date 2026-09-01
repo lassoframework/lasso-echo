@@ -63,6 +63,30 @@ _CAPTION_MIN, _CAPTION_MAX = 150, 500   # regen acceptance band (grader median w
 _HOOK_MAX = 125                          # copy_gate hook_too_long band
 _OVERCAP_MAX_ITER = 6                    # bounded convergence for the over-cap pass
 
+# LLM WALL-CLOCK BUDGET PER GYM PER PASS (2026-08-31). Measured live: one
+# _clean_draft_for_day regen costs 6 to 8 SECONDS. gritx alone has 30 flagged
+# posts, so the old "LLM first, always" craft pass cost ~4 minutes for ONE gym
+# and the nightly sweep across ten gyms could never finish — which is why five
+# of seven books sat at C or worse with a repair that "runs" every night.
+# The deterministic mechanical repair clears the same bar for the overwhelming
+# majority of rows in ~0 seconds, so it is now tried FIRST and the LLM is the
+# fallback, under a budget. When the budget is spent the pass keeps going on
+# mechanics alone: a bounded pass that always finishes beats an unbounded one
+# that never does.
+_LLM_BUDGET_S = 90.0
+
+
+def _deadline(budget_s=None):
+    """A monotonic wall-clock deadline for this pass's LLM spend."""
+    import time
+    return time.monotonic() + (float(budget_s) if budget_s is not None
+                               else _LLM_BUDGET_S)
+
+
+def _budget_left(deadline) -> bool:
+    import time
+    return deadline is None or time.monotonic() < deadline
+
 
 def _default_db():
     from agent import db
@@ -80,7 +104,8 @@ def _is_wipeable(row) -> bool:
 
 def remediate_forward_book(gym_id, rows, store, *, profile, defects,
                            today_iso, caption_regen=None, gap_filler=None,
-                           booking_cta=None, db=None, logger=None) -> dict:
+                           booking_cta=None, db=None, logger=None,
+                           llm_budget_s=None) -> dict:
     """Best-effort self-remediation for one gym's forward book.
 
     Args:
@@ -113,8 +138,10 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     actions = []
     result = {"ok": True, "captions_fixed": 0, "repillared": 0,
               "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
+              "audience_fixed": 0, "audience_attempted": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
+    deadline = _deadline(llm_budget_s)
 
     if caption_regen is None:
         caption_regen = _default_caption_regen(gym_id, profile, log)
@@ -143,7 +170,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # ---- d) caption craft + path (booking asks) ------------------------------
     craft_fixed, craft_attempted, booking_added = _fix_craft(
         gym_id, rows, store, profile, caption_regen, avoid, log,
-        booking_cta=booking_cta)
+        booking_cta=booking_cta, deadline=deadline)
     result["craft_fixed"] = craft_fixed
     result["craft_attempted"] = craft_attempted
     result["booking_asks_added"] = booking_added
@@ -152,6 +179,16 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
         actions.append(f"rewrote {craft_fixed} caption(s) that tripped craft flags (ask/hook/length)")
     if booking_added:
         actions.append(f"carried the gym's real booking CTA onto {booking_added} day(s)")
+
+    # ---- e) off-avatar hooks (right_audience) -------------------------------
+    aud_fixed, aud_attempted = _fix_audience(
+        gym_id, rows, store, profile, caption_regen, avoid, log,
+        deadline=deadline)
+    result["audience_fixed"] = aud_fixed
+    result["audience_attempted"] = aud_attempted
+    result["skipped"] += max(0, aud_attempted - aud_fixed)
+    if aud_fixed:
+        actions.append(f"rewrote {aud_fixed} off-avatar hook(s) back onto the gym's avatar")
 
     # ---- b) day gaps ---------------------------------------------------------
     gap_dates = [str(d[1])[:10] for d in (defects or [])
@@ -434,22 +471,34 @@ def _mechanical_repair(caption, cta):
 
 
 def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
-               booking_cta=None):
-    """Regenerate the caption of every fully wipeable day that trips a craft
-    flag (no_ask / thin_caption / hook_too_long), on the SAME photo, through
-    the same gated builder machinery. A fresh caption lands only when it
-    clears _clears_craft; otherwise the day keeps its caption (tracked as
-    attempted-but-not-fixed). While the book is short of booking-term asks,
-    a regenerated day whose fresh caption carries no ask gets the gym's REAL
-    booking CTA appended as its single ask (approved copy only). Days that
-    already pass are never touched. B2B/LASSO is out of scope by design (its
-    gaps are content supply, owned by the pillar builders).
+               booking_cta=None, deadline=None):
+    """Repair the caption of every fully wipeable day that trips a craft flag
+    (no_ask / thin_caption / hook_too_long), on the SAME photo. A fresh caption
+    lands only when it clears _clears_craft; otherwise the day keeps its caption
+    (tracked as attempted-but-not-fixed). While the book is short of booking-term
+    asks, a repaired day whose caption carries no ask gets the gym's REAL booking
+    CTA appended as its single ask (approved copy only). Days that already pass
+    are never touched.
+
+    CANDIDATE ORDER (2026-08-31, the convergence fix). The MECHANICAL repair is
+    tried FIRST and the LLM regen second. Mechanics costs nothing, fabricates
+    nothing (it only moves a line break and appends the gym's own approved CTA),
+    and measured live it clears the bar for 30/30 gritx, 28/29 hillcountry,
+    20/20 zanshin and 30/30 reverb posts. The old order paid 6 to 8 seconds of
+    LLM per post BEFORE trying it, which is what stopped the nightly pass from
+    ever finishing. The LLM now runs only where mechanics genuinely cannot help
+    (chiefly thin_caption, which needs real content), and only while the pass
+    still has wall-clock budget.
+
+    B2B (LASSO) gets the MECHANICAL lane too: re-lineating a hook and appending
+    LASSO's own approved booking CTA is zero-fabrication and honest for any
+    profile. Only the LLM regen stays GYM-only, because a B2B caption's content
+    is owned by the pillar builders.
     Returns (days_fixed, days_attempted, booking_asks_added)."""
-    if profile == "B2B" or caption_regen is None:
-        return 0, 0, 0
+    llm_ok = caption_regen is not None and profile != "B2B"
 
     deficit = _booking_deficit(rows)
-    if deficit and booking_cta is None:
+    if booking_cta is None:
         booking_cta = _booking_cta_for(gym_id, log)
 
     # One post spans same-date rows sharing a caption (IG feed + FB mirror +
@@ -466,44 +515,47 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
         if any(not _is_wipeable(r) for r in grp):
             continue                            # human-owned day: never touched
         cap = grp[0].get("caption") or ""
+        if not cap.strip():
+            continue        # caption-less story / GBP photo post: nothing to craft
         if not _craft_flags(cap):
             continue                            # already passes: never touched
         attempted += 1
-        out = None
-        try:
-            out = caption_regen(grp[0], avoid, "")
-        except Exception as exc:  # noqa: BLE001
-            log(f"{gym_id} {d}: craft regen raised {type(exc).__name__}")
-        # Candidate order: the LLM regen first (a genuinely fresh caption), then the
-        # MECHANICAL repair of the current caption (re-lineated hook / appended
-        # approved CTA — zero fabrication) as the fallback that always exists. The
-        # first candidate to clear the bar wins; none clearing keeps the caption.
-        candidates = []
-        new_cat = None
-        if out:
-            regen_cap, new_cat = out
-            regen_cap = (regen_cap or "").strip()
-            carried_cta = False
-            if (deficit > 0 and booking_cta
-                    and not _BOOKING_RE.search(regen_cap)
-                    and _ask_count(regen_cap) == 0):
-                # The already-flagged day is the honest place to carry the gym's
-                # real booking CTA: it becomes the caption's single ask.
-                regen_cap = f"{regen_cap}\n{booking_cta}".strip()
-                carried_cta = True
-            if regen_cap:
-                candidates.append((regen_cap, new_cat, carried_cta))
-        if booking_cta is None:
-            booking_cta = _booking_cta_for(gym_id, log)
+
+        # --- candidate 1: the free, deterministic, zero-fabrication repair ---
         repaired = _mechanical_repair(cap, booking_cta)
+        candidates = []
         if repaired and repaired != cap:
             candidates.append((repaired, None,
                                _ask_count(cap) == 0 and _ask_count(repaired) == 1))
         winner = next(((c, cat, cta_used) for c, cat, cta_used in candidates
                        if c and c not in avoid and _clears_craft(c)), None)
+
+        # --- candidate 2: the LLM regen, only when mechanics could not help ---
+        if winner is None and llm_ok and _budget_left(deadline):
+            out = None
+            try:
+                out = caption_regen(grp[0], avoid, "")
+            except Exception as exc:  # noqa: BLE001
+                log(f"{gym_id} {d}: craft regen raised {type(exc).__name__}")
+            if out:
+                regen_cap, new_cat = out
+                regen_cap = (regen_cap or "").strip()
+                carried_cta = False
+                if (deficit > 0 and booking_cta
+                        and not _BOOKING_RE.search(regen_cap)
+                        and _ask_count(regen_cap) == 0):
+                    # The already-flagged day is the honest place to carry the
+                    # gym's real booking CTA: it becomes the caption's single ask.
+                    regen_cap = f"{regen_cap}\n{booking_cta}".strip()
+                    carried_cta = True
+                if (regen_cap and regen_cap not in avoid
+                        and _clears_craft(regen_cap)):
+                    winner = (regen_cap, new_cat, carried_cta)
+
         if winner is None:
-            log(f"{gym_id} {d}: neither the regenerated nor the mechanically "
-                "repaired caption clears the craft bar; keeping the current caption")
+            log(f"{gym_id} {d}: neither the mechanically repaired nor the "
+                "regenerated caption clears the craft bar; keeping the current "
+                "caption")
             continue
         new_cap, new_cat, carried_cta = winner
         if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
@@ -514,6 +566,73 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
                 if carried_cta:
                     booking_added += 1
     return fixed, attempted, booking_added
+
+
+# ---------------------------------------------------------------------------
+# e) off-avatar hooks (right_audience)
+# ---------------------------------------------------------------------------
+
+def _fix_audience(gym_id, rows, store, profile, caption_regen, avoid, log,
+                  deadline=None):
+    """Rewrite the caption of every fully wipeable day whose HOOK leaks the
+    wrong avatar (the grader's right_audience leg: competitive-athlete language
+    for a GYM book, elite/advanced language anywhere).
+
+    Added 2026-08-31: this defect class had NO repair path at all, so a book
+    could sit one caption short of an A forever. There is no mechanical fix —
+    the hook has to say something different — so this is the one pass that must
+    use the regen, and it runs under the same wall-clock budget. A gym without a
+    regen context is an honest skip. Returns (days_fixed, days_attempted)."""
+    from agent.calendar_grade import _ATHLETE_WORDS, _ELITE_WORDS
+    if caption_regen is None:
+        return 0, 0
+
+    def _leaks(caption):
+        cap = (caption or "").strip()
+        if not cap:
+            return False
+        first = cap.splitlines()[0]
+        if profile != "B2B" and _ATHLETE_WORDS.search(first):
+            return True
+        return bool(_ELITE_WORDS.search(first))
+
+    groups: dict = {}
+    for r in rows:
+        d = str(r.get("post_date") or "")[:10]
+        h = caption_hash(r.get("caption") or "")
+        groups.setdefault((d, h), []).append(r)
+
+    fixed = attempted = 0
+    for (d, _h), grp in sorted(groups.items()):
+        if any(not _is_wipeable(r) for r in grp):
+            continue
+        cap = grp[0].get("caption") or ""
+        if not _leaks(cap):
+            continue
+        if not _budget_left(deadline):
+            break
+        attempted += 1
+        out = None
+        try:
+            out = caption_regen(grp[0], avoid, "")
+        except Exception as exc:  # noqa: BLE001
+            log(f"{gym_id} {d}: audience regen raised {type(exc).__name__}")
+        if not out:
+            continue
+        new_cap, new_cat = out
+        new_cap = (new_cap or "").strip()
+        # Replace ONLY with a caption that is both on-avatar and craft-clean:
+        # never trade an off-avatar hook for a worse caption.
+        if not new_cap or new_cap in avoid or _leaks(new_cap):
+            log(f"{gym_id} {d}: the regenerated hook still leaks the wrong "
+                "avatar; keeping the current caption")
+            continue
+        if not _clears_craft(new_cap):
+            continue
+        if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
+            fixed += 1
+            avoid.add(new_cap)
+    return fixed, attempted
 
 
 # ---------------------------------------------------------------------------

@@ -532,19 +532,30 @@ def test_craft_mirrors_move_together(monkeypatch):
     assert rows[0]["caption"] == rows[1]["caption"] == rows[2]["caption"] == _a_caption(44)
 
 
-def test_craft_pass_skips_b2b(monkeypatch):
-    """LASSO/B2B is out of scope by design: its gaps are content supply."""
+def test_craft_pass_b2b_gets_mechanics_but_never_the_llm_regen(monkeypatch):
+    """B2B/LASSO: the LLM regen stays out of scope (its caption CONTENT is owned
+    by the pillar builders), but the MECHANICAL repair now runs — re-lineating a
+    hook and appending LASSO's OWN approved CTA invents nothing, and B2B having
+    no repair path at all is what left 116 of LASSO's 121 forward rows flagged
+    'no ask' with nothing able to clear them (2026-08-31)."""
     monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
-    original = _thin_caption(5)
-    rows = [_row(1, "2026-09-01", original, gym_id="lasso")]
+    cta = "Book a call and we will look at your numbers."
+    calls = []
+
+    def _regen(r, a, c=""):
+        calls.append(r)                      # must never happen on a B2B book
+        return (_a_caption(45), "education")
+
+    rows = [_row(1, "2026-09-01", _no_ask_caption(5), gym_id="lasso")]
     store = _FakeStore(rows)
     out = grade_fix.remediate_forward_book(
         "lasso", rows, store, profile="B2B", defects=[], today_iso=TODAY,
-        caption_regen=lambda r, a, c="": (_a_caption(45), "education"),
-        gap_filler=lambda *a, **k: "none",
-        booking_cta="Book your intro class this week.")
-    assert out["craft_attempted"] == 0 and out["craft_fixed"] == 0
-    assert rows[0]["caption"] == original
+        caption_regen=_regen, gap_filler=lambda *a, **k: "none",
+        booking_cta=cta)
+    assert calls == [], "B2B must never spend an LLM regen on caption craft"
+    assert out["craft_fixed"] == 1
+    assert rows[0]["caption"].endswith(cta)
+    assert grade_fix._ask_count(rows[0]["caption"]) == 1
 
 
 def test_craft_flag_off_is_noop():
@@ -585,18 +596,33 @@ def test_booking_cta_carried_onto_flagged_rows(monkeypatch):
         assert grade_fix._BOOKING_RE.search(r["caption"])
 
 
-def test_booking_cta_not_added_when_caption_already_has_ask(monkeypatch):
-    """A fresh caption with its own single ask is accepted as-is; the CTA is
-    only appended to an ask-free caption (exactly-one-ask stays true)."""
+def test_mechanics_repair_an_ask_free_day_without_calling_the_llm(monkeypatch):
+    """THE CONVERGENCE FIX (2026-08-31). A measured LLM regen costs 6 to 8
+    SECONDS; the deterministic mechanical repair costs nothing and clears the
+    same bar for the overwhelming majority of flagged days. So mechanics is
+    tried FIRST and the regen is consulted only where mechanics genuinely
+    cannot help. The old order paid the LLM on every flagged day before trying
+    the free fix, which is why a nightly pass across ten gyms never finished.
+
+    Exactly-one-ask still holds: the ask-free day ends with the gym's approved
+    booking CTA as its single ask."""
     monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    cta = "Book your intro class this week."
+    calls = []
+
+    def _regen(r, a, c=""):
+        calls.append(r)
+        return (_a_caption(62), "education")
+
     rows = [_row(1, "2026-09-01", _no_ask_caption(1))]
     store = _FakeStore(rows)
-    out = _remediate(rows, store,
-                     lambda r, a, c="": (_a_caption(62), "education"),
-                     booking_cta="Book your intro class this week.")
+    out = _remediate(rows, store, _regen, booking_cta=cta)
     assert out["craft_fixed"] == 1
-    assert out["booking_asks_added"] == 0
-    assert rows[0]["caption"] == _a_caption(62)
+    assert calls == [], (
+        "mechanics cleared this day, so the LLM regen must not have been called")
+    assert rows[0]["caption"].endswith(cta)
+    assert grade_fix._ask_count(rows[0]["caption"]) == 1
+    assert out["booking_asks_added"] == 1
 
 
 def test_booking_cta_never_invented(monkeypatch):
@@ -801,3 +827,156 @@ def test_booking_cta_falls_back_to_approved_source_sentence(monkeypatch, tmp_pat
     # voice doc resolution will find nothing (no bible on disk for gymz)
     cta = _booking_cta_for("gymz", lambda m: None)
     assert cta == "Book your intro session today?"
+
+
+# ---------------------------------------------------------------------------
+# THE CONVERGENCE CONTRACT (Blake, 2026-08-31: "run it repeatedly and the
+# defect count strictly decreases to a floor, and that floor is documented")
+# ---------------------------------------------------------------------------
+
+def _book_needing_repair(gym_id="gritx", n=12):
+    """A forward book whose every day is ask-free: exactly the shape that held
+    five of seven live gyms at C or worse."""
+    return [_row(i, f"2026-09-{(i + 1):02d}", _no_ask_caption(i), gym_id=gym_id)
+            for i in range(n)]
+
+
+def test_repair_loop_strictly_decreases_defects_then_holds_a_floor(monkeypatch):
+    """Repair -> regrade -> repair -> regrade must MONOTONICALLY reduce defects
+    and then stop moving. A loop that oscillates (topfuel went 74 -> 64 -> 67 ->
+    71 -> 74 across live runs) or that plateaus above its real floor is the bug
+    this pins shut."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import grade_month
+    rows = _book_needing_repair()
+    store = _FakeStore(rows)
+    cta = "Book your intro class this week."
+
+    counts = [len(grade_month(rows, profile="GYM").defects)]
+    for _ in range(4):
+        grade_fix.remediate_forward_book(
+            "gritx", rows, store, profile="GYM",
+            defects=grade_month(rows, profile="GYM").defects, today_iso=TODAY,
+            caption_regen=None, gap_filler=lambda *a, **k: "none",
+            booking_cta=cta)
+        counts.append(len(grade_month(rows, profile="GYM").defects))
+
+    assert counts[0] > 0, "the fixture must start with real defects"
+    # strictly non-increasing, and the first pass must make real progress
+    assert all(b <= a for a, b in zip(counts, counts[1:])), counts
+    assert counts[1] < counts[0], f"first pass made no progress: {counts}"
+    # and it settles: once it stops improving it never climbs again
+    assert counts[-1] == min(counts), counts
+
+
+def test_repair_loop_reaches_A_on_a_book_mechanics_can_fully_fix(monkeypatch):
+    """The floor is only honest if the loop actually lands an A when nothing
+    blocks it. Mechanics alone (no LLM) must take an ask-free book to A."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import A_THRESHOLD, grade_month
+    rows = _book_needing_repair()
+    store = _FakeStore(rows)
+    for _ in range(3):
+        grade_fix.remediate_forward_book(
+            "gritx", rows, store, profile="GYM",
+            defects=grade_month(rows, profile="GYM").defects, today_iso=TODAY,
+            caption_regen=None, gap_filler=lambda *a, **k: "none",
+            booking_cta="Book your intro class this week.")
+    g = grade_month(rows, profile="GYM")
+    assert g.total >= A_THRESHOLD, f"{g.total} ({g.letter}) scores={g.scores} defects={g.defects[:5]}"
+
+
+def test_approved_rows_are_the_documented_floor(monkeypatch):
+    """A human-approved row is NEVER rewritten (pierce: 29 of 35 flagged posts
+    are approved). The loop must reach that floor and stop there, leaving the
+    approved captions byte-for-byte intact rather than churning forever."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import grade_month
+    locked = _no_ask_caption(99)
+    rows = _book_needing_repair(n=6)
+    rows.append(_row(90, "2026-09-20", locked, status="approved"))
+    store = _FakeStore(rows)
+    counts = []
+    for _ in range(3):
+        grade_fix.remediate_forward_book(
+            "gritx", rows, store, profile="GYM",
+            defects=grade_month(rows, profile="GYM").defects, today_iso=TODAY,
+            caption_regen=None, gap_filler=lambda *a, **k: "none",
+            booking_cta="Book your intro class this week.")
+        counts.append(len(grade_month(rows, profile="GYM").defects))
+    assert rows[-1]["caption"] == locked, "an approved caption must never be rewritten"
+    assert counts[-1] == counts[-2], f"loop must settle at its floor, got {counts}"
+
+
+def test_llm_budget_exhausted_still_runs_mechanics(monkeypatch):
+    """A spent wall-clock budget must not stop the pass: mechanics is free and
+    keeps working. A bounded pass that always finishes beats an unbounded one
+    that never does."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    calls = []
+
+    def _regen(r, a, c=""):
+        calls.append(r)
+        return (_a_caption(70), "education")
+
+    rows = _book_needing_repair(n=4)
+    store = _FakeStore(rows)
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, store, profile="GYM", defects=[], today_iso=TODAY,
+        caption_regen=_regen, gap_filler=lambda *a, **k: "none",
+        booking_cta="Book your intro class this week.", llm_budget_s=-1)
+    assert calls == [], "no LLM spend once the budget is gone"
+    assert out["craft_fixed"] == 4, "mechanics must still repair every day"
+
+
+# ---------------------------------------------------------------------------
+# Grader honesty: caption-less posts are exempt EXPLICITLY, never dropped
+# ---------------------------------------------------------------------------
+
+def test_captionless_posts_are_exempt_and_counted_not_silently_dropped():
+    """A story's caption is burned onto its media and a GBP photo post carries
+    none. Judging them by feed-caption rules invented 51 unfixable defects on
+    LASSO's book. They are exempt AND counted, so the digest can say so."""
+    from agent.calendar_grade import grade_month
+    rows = []
+    for d in range(1, 11):
+        day = f"2026-09-{d:02d}"
+        rows.append(_row(d, day, _a_caption(d)))
+        rows.append(_row(100 + d, day, "", fmt="story"))       # burned caption
+    g = grade_month(rows, profile="GYM")
+    assert not [x for x in g.defects if "no ask" in str(x[2])], g.defects
+    assert g.exempt, "the exemption must be REPORTED, not silent"
+    assert any(v == 10 for v in g.exempt.values()), g.exempt
+    assert g.total >= 90, f"{g.total} {g.scores} {g.defects}"
+
+
+def test_one_caption_mirrored_to_three_rows_is_one_defect_not_three():
+    """ENG's single HYROX hook produced 3 right_audience defects because the IG
+    feed, its FB mirror and the paired story were each judged separately."""
+    from agent.calendar_grade import grade_month
+    bad = "You signed up for HYROX but haven't trained.\n" + _a_caption(3)
+    rows = [
+        _row(1, "2026-09-01", bad),
+        _row(2, "2026-09-01", bad, account="facebook"),
+        _row(3, "2026-09-01", bad, fmt="story"),
+    ]
+    g = grade_month(rows, profile="GYM")
+    leaks = [d for d in g.defects if d[0] == "right_audience"]
+    assert len(leaks) == 1, f"one post, one defect; got {leaks}"
+
+
+def test_partial_repair_moves_the_score(monkeypatch):
+    """The absolute per-row penalties meant a book that repaired 27 of its 30
+    bad posts scored exactly the same as one that repaired none, so the nightly
+    loop looked stuck even when it was working. Rate scoring must register it."""
+    from agent.calendar_grade import grade_month
+    def _book(bad):
+        rows = [_row(i, f"2026-09-{(i + 1):02d}", _no_ask_caption(i))
+                for i in range(bad)]
+        rows += [_row(50 + i, f"2026-10-{(i + 1):02d}", _a_caption(i))
+                 for i in range(30 - bad)]
+        return rows
+    all_bad = grade_month(_book(30), profile="GYM").total
+    mostly_fixed = grade_month(_book(3), profile="GYM").total
+    assert mostly_fixed > all_bad, (
+        f"repairing 27 of 30 posts must raise the score: {all_bad} -> {mostly_fixed}")
