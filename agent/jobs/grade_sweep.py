@@ -365,7 +365,10 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                        "actions": []}
                 fix["trajectory"] = [(f_grade.total, len(f_grade.defects or []))]
                 for _pass in range(_MAX_FIX_PASSES):
-                    prev_total = f_grade.total
+                    # NB: deliberately NOT named prev_total — that holds the
+                    # PREVIOUS RUN's stored score for the drop guard below, and
+                    # reusing the name here silently disarmed it.
+                    pass_prev_total = f_grade.total
                     prev_defects = len(f_grade.defects or [])
                     try:
                         from agent.jobs import grade_fix
@@ -389,7 +392,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                     # defects without yet moving a floored leg was read as "no
                     # progress" and the loop stopped one step short of the
                     # improvement. Stopping when neither moves IS the floor.
-                    improved = (f_grade.total > prev_total
+                    improved = (f_grade.total > pass_prev_total
                                 or len(f_grade.defects or []) < prev_defects)
                     if (not step.get("ok")
                             or f_grade.total >= A_THRESHOLD

@@ -1005,3 +1005,77 @@ def test_overcap_pass_respects_the_llm_budget(monkeypatch):
     assert calls == [], "no LLM spend on the over-cap pass once the budget is gone"
     assert out["repillared"] == 0
     assert out["ok"] is True, "a spent budget is an honest stop, not a failure"
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION GUARD: alert when a book's grade DROPS between runs
+# ---------------------------------------------------------------------------
+
+class _GradeHistoryStore(_FakeStore):
+    """A store that can answer 'what did this gym score last run?' — the real
+    Supabase store is queried over REST for the same thing."""
+
+    def latest_grade(self, gym_id, window):
+        rows = [g for g in self.grades
+                if g["gym_id"] == gym_id and g["window"] == window]
+        return rows[-1] if rows else None
+
+
+def _clean_book(gym_id="gritx", n=8):
+    return [_row(i, f"2026-09-{(i + 1):02d}", _a_caption(i), gym_id=gym_id)
+            for i in range(n)]
+
+
+def test_alert_fires_when_a_books_grade_drops_between_runs(_self_fix_on):
+    """The failure mode Blake named: 'the alert fires nightly and everyone
+    stops reading it'. Below-B is a standing condition; a DROP is an event —
+    it means a build is re-creating defects faster than the repair clears
+    them (topfuel went 74 -> 64 -> 67 -> 71 -> 74 live and nothing said so)."""
+    rows = _clean_book()
+    store = _GradeHistoryStore(rows)
+    alerts = []
+    _sweep(store, alerts)
+    first = [g for g in store.grades if g["window"] == "forward_book"][-1]["total"]
+    assert not [a for a in alerts if "DROPPED" in a], alerts
+
+    # A later build lands off-avatar hooks on days that were clean.
+    for r in rows[:3]:
+        r["caption"] = "Compete with the best athletes in town.\n" + _a_caption(9)
+    alerts.clear()
+    _sweep(store, alerts)
+    second = [g for g in store.grades if g["window"] == "forward_book"][-1]["total"]
+    assert second < first, f"fixture must actually get worse: {first} -> {second}"
+    drops = [a for a in alerts if "DROPPED" in a]
+    assert len(drops) == 1, alerts
+    assert f"{first} -> {second}" in drops[0], drops[0]
+
+
+def test_drop_alert_does_not_fire_when_a_book_improves(_self_fix_on):
+    """A book that got BETTER must never trip the regression guard."""
+    rows = [_row(i, f"2026-09-{(i + 1):02d}",
+                 "Compete with the best athletes in town.\n" + _a_caption(i))
+            for i in range(8)]
+    store = _GradeHistoryStore(rows)
+    alerts = []
+    _sweep(store, alerts)
+    for i, r in enumerate(rows):
+        r["caption"] = _a_caption(i)
+    alerts.clear()
+    _sweep(store, alerts)
+    assert not [a for a in alerts if "DROPPED" in a], alerts
+
+
+def test_drop_alert_is_deduped_to_once_per_gym_per_day(_self_fix_on):
+    """One drop, one alert. The guard must not become the nightly noise it
+    exists to replace."""
+    rows = _clean_book()
+    store = _GradeHistoryStore(rows)
+    alerts = []
+    _sweep(store, alerts)
+    for r in rows[:3]:
+        r["caption"] = "Compete with the best athletes in town.\n" + _a_caption(9)
+    alerts.clear()
+    _sweep(store, alerts)
+    _sweep(store, alerts)
+    _sweep(store, alerts)
+    assert len([a for a in alerts if "DROPPED" in a]) == 1, alerts

@@ -41,13 +41,43 @@ WHAT IT FIXES (never fabricates, never publishes, never auto-approves):
      ever invented, and a missing CTA is an honest skip). Days that already
      pass are never touched.
 
+  e. Off-avatar hooks (right_audience): a wipeable day whose HOOK leaks the
+     wrong avatar (competitive-athlete language on a GYM book, elite/advanced
+     language anywhere) is regenerated. Added 2026-08-31 — this defect class
+     had NO repair path at all, so a book could sit one caption short of an A
+     forever. The replacement lands only when it is BOTH on-avatar and
+     craft-clean; an off-avatar hook is never traded for a worse caption.
+
 HARD GUARANTEES:
   * Only WIPEABLE (pending/draft/queued) rows are ever patched. The store's
     patch_pending_plan carries a server-side status filter, so an approved /
     published / denied row can never be modified even on a caller bug.
   * Every patched row stays 'pending' — it re-enters the human approval queue.
   * No caption is invented here: every fresh caption comes from the gym's own
-    approved sources via the existing gated builder path.
+    approved sources via the existing gated builder path. The MECHANICAL repair
+    moves a line break and appends copy the gym already approved; it writes no
+    new words at all.
+
+THE FLOOR — what this module deliberately CANNOT repair, and why. A converging
+loop needs a documented floor, otherwise "still below A" reads as failure when
+it is actually the honest limit:
+
+  1. APPROVED ROWS. A human approved that caption; Echo does not rewrite it.
+     This is the single largest floor on a mature book (measured 2026-08-31:
+     29 of pierce's 35 flagged posts and 9 of topfuel's 10 were approved).
+     It clears the moment the gym re-approves or denies those days.
+  2. NO APPROVED BOOKING CTA. The no_ask repair carries the gym's OWN booking
+     CTA; a gym whose bible CTA rotation is an onboarding TODO and whose
+     approved sources contain no booking-ask sentence gets an honest skip
+     rather than an invented CTA. Fixed by filling the bible, not by code.
+  3. THIN CAPTIONS. Mechanics cannot add content, so a too-short caption needs
+     the regen, which needs enough approved source material. A gym with a thin
+     library stays thin.
+  4. CONTENT SUPPLY. A day gap with no unused media, and a category over-cap
+     with no other approved source to move to, are supply problems. The lanes
+     are asked once and an unfillable gap is recorded once, never re-announced.
+  5. B2B CAPTION CONTENT. LASSO's captions come from the pillar builders; only
+     the mechanical repair applies here, never the regen.
 """
 from __future__ import annotations
 
