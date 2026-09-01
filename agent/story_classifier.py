@@ -284,3 +284,138 @@ def _int(v):
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+# ---- REAL, LIVE probes (2026-09-01 hardening) --------------------------------
+# The proof run found 3 already-finished, captioned clips (2 with a mid-screen
+# burned caption on top of a real gym recording, 1 a fully composited fake-SMS
+# marketing graphic over dimmed footage) sitting in a gym's raw pool with
+# eligible=true. Root cause (confirmed, not guessed): agent/jobs/sync_gym_media.py
+# called gather_signals(asset) with NO ocr_reader / cut_probe, so has_burned_text
+# and cut_density were ALWAYS None in production — the two signals this module's
+# own header promised layer 2 would use never actually ran. These two functions
+# are the real, live probes, wired into the sync job's existing budgeted download
+# (agent/jobs/sync_gym_media.py sync_source step 5) — no new download path, no new
+# provider. OCR reuses the SAME Gemini vision transcription agent/ocr_check.py
+# already uses for the headline-quality guard (no new API, no new cost path);
+# cut density reuses ffmpeg, already a hard dependency (nixpacks.toml) for the
+# HEVC transcode + video probe. Both degrade to None (never a fabricated verdict)
+# when ffmpeg or the vision reader is unavailable — exactly the existing
+# "unknown signal pushes toward AMBIGUOUS" contract this module already documents.
+def _probe_duration(local_path):
+    """ffprobe duration in seconds, or None (never raises)."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(local_path)],
+            capture_output=True, text=True, timeout=20)
+        return float((proc.stdout or "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _extract_frame(local_path, ts):
+    """One downscaled PNG frame at ts seconds (or the first frame when ts is
+    None), as a temp file path the caller must remove. None on any failure."""
+    import subprocess
+    import tempfile
+    fd, out_path = tempfile.mkstemp(suffix=".png", prefix="story_ocr_frame_")
+    os.close(fd)
+    cmd = ["ffmpeg", "-y"]
+    if ts is not None:
+        cmd += ["-ss", str(max(0.0, ts))]
+    cmd += ["-i", str(local_path), "-frames:v", "1", "-vf", "scale=480:-1", out_path]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        print(f"[story-classifier] frame extract failed: {type(e).__name__}: {e}")
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        return None
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+    return None
+
+
+def _meaningful_text(text):
+    """A real threshold, not a bare truthiness check: a stray OCR artifact (one
+    stray character, whitespace) must not read as 'burned-in text found'."""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text or "")
+    return len(cleaned) >= 4
+
+
+def default_ocr_reader(local_path):
+    """Real burned-in-text detection for a downloaded video file.
+
+    Samples 2 frames (20% and 60% of duration; the first frame when duration is
+    unknown) and transcribes each with the SAME Gemini vision reader
+    agent/ocr_check.py already uses for the headline quality guard. True when
+    either sampled frame carries meaningful rendered text (the P1-1 / P1-3 /
+    R2-dark class: a caption, a benefit list, a fake-SMS bubble — all text-heavy),
+    False when both come back clean, None when the read could not run at all (no
+    ffmpeg, no vision reader armed, every attempt errored) — an unknown signal
+    that pushes a borderline file to AMBIGUOUS, never a fabricated verdict.
+    """
+    from . import ocr_check as _ocr
+
+    try:
+        reader = _ocr._default_reader()  # noqa: SLF001 - the same lazy Gemini client
+    except Exception as e:  # noqa: BLE001
+        print(f"[story-classifier] OCR reader unavailable: {type(e).__name__}: {e}")
+        return None
+    if reader is None:
+        return None
+    dur = _probe_duration(local_path)
+    fractions = (0.2, 0.6) if dur else (None,)
+    ran_any = False
+    for frac in fractions:
+        ts = None if frac is None else max(0.3, dur * frac)
+        frame = _extract_frame(local_path, ts)
+        if not frame:
+            continue
+        ran_any = True
+        try:
+            text = _ocr.rendered_read(frame, reader=reader)
+        except Exception as e:  # noqa: BLE001
+            print(f"[story-classifier] OCR frame read failed: {type(e).__name__}: {e}")
+            text = ""
+        finally:
+            try:
+                os.remove(frame)
+            except OSError:
+                pass
+        if _meaningful_text(text):
+            return True
+    return False if ran_any else None
+
+
+def default_cut_probe(local_path):
+    """Real cut-density signal: ffmpeg's scene-change filter counts hard cuts;
+    cuts / duration = cuts per second. Backs the ALREADY-SCORED cut_density signal
+    in score_signals(), which had no live probe wired to it before this hardening.
+    None when ffmpeg is unavailable or the probe fails; never a fabricated number.
+    """
+    import subprocess
+    dur = _probe_duration(local_path)
+    if not dur or dur <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-i", str(local_path), "-filter:v",
+             "select='gt(scene,0.35)',showinfo", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=45)
+    except Exception as e:  # noqa: BLE001
+        print(f"[story-classifier] cut probe failed: {type(e).__name__}: {e}")
+        return None
+    log = proc.stderr or ""
+    if "Parsed_showinfo" not in log and proc.returncode not in (0,):
+        return None  # ffmpeg could not read this file at all
+    cuts = log.count("Parsed_showinfo")
+    return round(cuts / dur, 4)

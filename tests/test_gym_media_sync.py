@@ -240,3 +240,62 @@ def test_auto_resolve_failure_falls_back_to_human_queue(monkeypatch):
                         lambda g, a, lane, resolved_by="": (None, "store down"))
     n = sync._sort_ambiguous([_ambiguous_asset()], "pierce", lambda m: None)
     assert n == 1, "a failed auto-decision must fall back to the human queue, never vanish"
+
+
+# ---- 2026-09-01: a confident FINISHED verdict is QUARANTINED, not discarded ----
+# The proof-run gap: a FINISHED verdict (direct, or an echo-auto-sort resolution)
+# used to be computed and thrown away, with zero effect on media_asset.eligible.
+# story_candidates._eligible_raw / gym_media_selector.pick_media both fail closed
+# on eligible is not True, so a real write here is what actually keeps a finished
+# clip out of the raw pool.
+
+def _finished_asset(aid="fin1", title="movie.mp4"):
+    # 9:16 in-band duration + OCR text found -> a confident, direct FINISHED verdict.
+    return {"id": aid, "title": title, "kind": "video", "content_hash": "",
+            "width": 1080, "height": 1920, "duration_sec": 12.0, "eligible": True}
+
+
+def test_direct_finished_verdict_quarantines_out_of_pool(monkeypatch):
+    from agent import gym_media_index as _idx
+    from tests.gym_media_fakes import FakeMediaStore
+    store = FakeMediaStore(assets=[_finished_asset()])
+    ocr_signals = {"fin1": (True, None)}   # the real, live OCR probe found text
+    n = sync._sort_ambiguous([_finished_asset()], "pierce", lambda m: None,
+                             store=store, ocr_signals=ocr_signals)
+    assert n == 0, "a direct FINISHED verdict never queues for a human"
+    assert store.assets["fin1"]["eligible"] is False
+    assert store.assets["fin1"]["reject_reason"] == _idx.REJECT_FINISHED_CONTENT
+
+
+def test_auto_sort_finished_resolution_also_quarantines(monkeypatch):
+    monkeypatch.setenv("AGENT_SORT_AMBIGUOUS_DEFAULT", "true")
+    from agent import gym_media_index as _idx
+    from agent import story_sort_queue as q
+    from tests.gym_media_fakes import FakeMediaStore
+    monkeypatch.setattr(q, "enqueue", lambda g, a, **k: True)
+    monkeypatch.setattr(
+        q, "resolve", lambda g, a, lane, resolved_by="": (lane, None))
+    # an edit-suite export name is a real finished signal; with no dims/duration
+    # this classifies AMBIGUOUS at the metadata stage and auto-sorts to "finished".
+    asset = {"id": "amb3", "title": "final_export_v2", "kind": "photo",
+             "content_hash": "", "eligible": True}
+    from agent import story_classifier as sc
+    sig = sc.gather_signals(asset)
+    verdict = sc.classify(sig)
+    assert verdict.verdict == sc.AMBIGUOUS  # sanity: this is the auto-sort path
+    store = FakeMediaStore(assets=[asset])
+    sync._sort_ambiguous([asset], "pierce", lambda m: None, store=store)
+    assert store.assets["amb3"]["eligible"] is False
+    assert store.assets["amb3"]["reject_reason"] == _idx.REJECT_FINISHED_CONTENT
+
+
+def test_raw_verdict_never_touches_eligibility(monkeypatch):
+    from tests.gym_media_fakes import FakeMediaStore
+    # camera-native landscape long clip -> confident RAW, no store write at all.
+    asset = {"id": "raw9", "title": "IMG_4021.MOV", "kind": "video",
+             "content_hash": "", "width": 1920, "height": 1080,
+             "duration_sec": 180, "eligible": True}
+    store = FakeMediaStore(assets=[asset])
+    sync._sort_ambiguous([asset], "pierce", lambda m: None, store=store)
+    assert store.updates == []
+    assert store.assets["raw9"]["eligible"] is True

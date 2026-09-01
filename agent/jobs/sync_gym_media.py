@@ -74,18 +74,51 @@ def _drop_reingested(rows, gym_id, log):
     return kept, skipped_titles
 
 
-def _sort_ambiguous(assets, gym_id, log):
-    """STORY_CLASSIFIER pass (default ON, spec §0): classify every freshly-indexed
-    asset raw / finished / ambiguous and enqueue the AMBIGUOUS ones into the
-    "Sort these" queue for a human (never auto-decided). Returns the count enqueued.
+def _quarantine_finished(store, asset, verdict, gym_id, log, *, source=""):
+    """Quarantine a confidently-FINISHED asset out of the raw pool THE SAME WAY any
+    other ineligible asset is quarantined: eligible=False + reject_reason (never a
+    delete, never a new gate — story_candidates._eligible_raw and
+    gym_media_selector.pick_media both already fail closed on eligible is not True).
 
-    It ONLY sorts — it posts nothing, stages nothing, composes nothing. A declared
-    upload lane / Drive folder mapping would override the classifier (intent beats
-    inference), but the nightly Drive walk has no per-file declaration, so unmapped
-    files run the inference path here. Signals come from row metadata alone
-    (title/aspect/duration/content_hash), offline-safe: an unprobed video with no
-    strong signal correctly lands AMBIGUOUS (fail toward the human), never a wrong
-    guess. Best effort: a classifier / queue failure never sinks the sync."""
+    2026-09-01 fix: this write is the actual gap the proof run found. A FINISHED
+    verdict (direct, or an echo-auto-sort resolution of an ambiguous file) was
+    computed correctly and then thrown away — nothing downstream ever consulted it.
+    Returns True when the write happened (skips an already-ineligible asset)."""
+    if store is None or asset.get("eligible") is False:
+        return False
+    try:
+        store.update_asset(asset.get("id") or "", {
+            "eligible": False, "reject_reason": _idx.REJECT_FINISHED_CONTENT})
+    except Exception as e:  # noqa: BLE001 - one bad write never sinks the sort
+        log(f"quarantine write failed for {asset.get('title')!r}: "
+            f"{type(e).__name__}: {e}")
+        return False
+    log(f"classifier[{source}]: {asset.get('title')!r} is FINISHED content "
+        f"(reasons: {'; '.join(verdict.reasons) or 'none'}) -> quarantined out of "
+        f"the raw pool for {gym_id}")
+    return True
+
+
+def _sort_ambiguous(assets, gym_id, log, *, store=None, ocr_signals=None):
+    """STORY_CLASSIFIER pass (default ON, spec §0): classify every freshly-indexed
+    asset raw / finished / ambiguous. AMBIGUOUS enqueues to the "Sort these" queue
+    for a human (never auto-decided) unless echo-auto-sort is armed. A CONFIDENT
+    FINISHED verdict — direct, or an echo-auto-sort resolution — is QUARANTINED
+    out of the raw pool (see _quarantine_finished): this is the 2026-09-01 fix for
+    the gap the proof run found, where a FINISHED verdict was computed and then
+    discarded with no effect on eligibility. Returns the count enqueued for a human.
+
+    It never posts, stages, or composes. A declared upload lane / Drive folder
+    mapping would override the classifier (intent beats inference), but the
+    nightly Drive walk has no per-file declaration, so unmapped files run the
+    inference path here. `ocr_signals`, when given, is {asset_id: (has_burned_text,
+    cut_density)} from the LIVE probes (agent/story_classifier.default_ocr_reader /
+    default_cut_probe) already run this pass on the SAME downloaded bytes the
+    ffprobe step used (agent/jobs/sync_gym_media.py sync_source step 5) — no
+    duplicate download. Without it (e.g. an existing already-probed asset never
+    re-downloaded this run), the classifier still decides from real metadata alone,
+    offline-safe. Best effort: a classifier / queue / quarantine failure never
+    sinks the sync."""
     if not config.story_classifier_enabled():
         return 0
     try:
@@ -94,23 +127,34 @@ def _sort_ambiguous(assets, gym_id, log):
         return 0
     enqueued = 0
     auto_sorted = 0
+    quarantined = 0
     default_on = config.sort_ambiguous_default_enabled()
     for a in assets:
         try:
-            sig = _sc.gather_signals(a)                 # metadata only (no OCR/probe here)
+            sig = _sc.gather_signals(a)                 # metadata baseline
+            extra = (ocr_signals or {}).get(a.get("id") or "")
+            if extra is not None:
+                sig.has_burned_text, sig.cut_density = extra  # real, live signals
             verdict = _sc.classify(sig)                 # ledger guard runs inside classify
+            if verdict.verdict == _sc.FINISHED:
+                # A confident, non-ambiguous FINISHED verdict (metadata alone, or
+                # OCR/cut-density backed): quarantine it directly, no human queue.
+                if _quarantine_finished(store, a, verdict, gym_id, log,
+                                        source="direct"):
+                    quarantined += 1
+                continue
             if verdict.verdict == _sc.AMBIGUOUS:
                 # SELF-RUNNING SORT (Blake 2026-08-31: "the only human thing should be
                 # the gym approving the post" — a 774-file 'Sort these' queue is a staff
                 # task). When armed, Echo DECIDES ambiguous files instead of queueing:
                 # lean finished only on a real finished signal (edit-suite filename, or
                 # a finished score actually beating raw); everything else is treated as
-                # RAW — the safe side, because a finished graphic mis-read as raw is
-                # still caught downstream by the infographic guard before any caption
-                # burn, while a raw clip mis-read as finished would post unedited. The
-                # decision is written through the SAME resolve path a human tap uses
-                # (audited as echo-auto-sort), and the portal media tab remains a
-                # per-file OVERRIDE, not a chore.
+                # RAW — the safe side. The decision is written through the SAME resolve
+                # path a human tap uses (audited as echo-auto-sort), and the portal
+                # media tab remains a per-file OVERRIDE, not a chore. A "finished"
+                # auto-sort resolution is ALSO quarantined the same way a direct
+                # FINISHED verdict is (2026-09-01: this used to only touch the sort
+                # queue and never the pool itself).
                 if default_on:
                     lane = "finished" if (
                         _sc.edited_filename(a.get("title") or "")
@@ -125,6 +169,9 @@ def _sort_ambiguous(assets, gym_id, log):
                         enqueued += 1
                     else:
                         auto_sorted += 1
+                        if lane == "finished" and _quarantine_finished(
+                                store, a, verdict, gym_id, log, source="auto-sort"):
+                            quarantined += 1
                     continue
                 if _q.enqueue(gym_id, a.get("id") or "", reasons=verdict.reasons):
                     enqueued += 1
@@ -134,6 +181,11 @@ def _sort_ambiguous(assets, gym_id, log):
     if auto_sorted:
         log(f"auto-sorted {auto_sorted} ambiguous file(s) (echo-auto-sort; portal "
             "media tab can re-tag any of them)")
+    if quarantined:
+        log(f"classifier quarantined {quarantined} finished-content file(s) out of "
+            f"the raw pool for {gym_id} (eligible=false, reject_reason="
+            f"{_idx.REJECT_FINISHED_CONTENT!r}; portal media tab can restore any "
+            "of them)")
     return enqueued
 
 
@@ -312,12 +364,32 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
                   and a.get("eligible") is not False]
     probed = newly_eligible = 0
     reject_counts = Counter()
+    # LIVE classifier signals (2026-09-01 hardening): the OCR / cut-density probes
+    # ride the SAME downloaded bytes this loop already fetches for ffprobe — no
+    # second download, no new budget. {asset_id: (has_burned_text, cut_density)}.
+    # Gated on story_classifier_enabled (the classifier's own flag; this closes a
+    # gap in an already-armed lane, not a new capability) AND on the classifier's
+    # OCR reader actually being armed (agent/ocr_check reuses the existing Gemini
+    # vision path, itself gated on AGENT_NANO_ENABLED) — a no-op, not a crash, when
+    # that is off.
+    ocr_signals = {}
+    run_ocr = config.story_classifier_enabled()
     for asset in candidates[:budget]:
         tmp_dir = tempfile.mkdtemp(prefix="gymprobe_")
         tmp_path = Path(tmp_dir) / "probe.bin"
         try:
             drive.download(asset["id"], tmp_path)
             info = probe_fn(tmp_path)
+            if run_ocr and info:
+                try:
+                    from .. import story_classifier as _sc
+                    has_text = _sc.default_ocr_reader(str(tmp_path))
+                    cuts = _sc.default_cut_probe(str(tmp_path))
+                    if has_text is not None or cuts is not None:
+                        ocr_signals[asset["id"]] = (has_text, cuts)
+                except Exception as e:  # noqa: BLE001 - a probe failure never blocks
+                    log(f"classifier probe failed for {asset.get('title')!r}: "
+                        f"{type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001 - one bad file never sinks the pass
             log(f"probe failed for {asset.get('title')!r}: {type(e).__name__}: {e}")
             info = None
@@ -352,12 +424,16 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             reject_counts[r["reject_reason"]] += 1
 
     # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
-    # finished / ambiguous and queue the ambiguous ones for a human. Uses the
-    # post-probe view (merged) so a probed video classifies on real aspect/duration.
-    # Only NEW rows are sorted (a re-sync never re-queues a file a coach already
-    # resolved). Sorts only; posts/stages/composes nothing.
+    # finished / ambiguous. AMBIGUOUS queues for a human (or auto-sorts); a
+    # CONFIDENT FINISHED verdict is quarantined out of the raw pool (see
+    # _sort_ambiguous / _quarantine_finished — the 2026-09-01 fix). Uses the
+    # post-probe view (merged) so a probed video classifies on real aspect/duration
+    # AND the live OCR/cut signals gathered above. Only NEW rows are sorted (a
+    # re-sync never re-queues a file a coach already resolved). Sorts + quarantines
+    # only; posts/stages/composes nothing.
     to_sort = [merged.get(r["id"], r) for r in new_rows]
-    queued_ambiguous = _sort_ambiguous(to_sort, gym_id, log)
+    queued_ambiguous = _sort_ambiguous(to_sort, gym_id, log, store=store,
+                                       ocr_signals=ocr_signals)
 
     photos = sum(1 for r in rows if r["kind"] == _idx.KIND_PHOTO)
     videos = sum(1 for r in rows if r["kind"] == _idx.KIND_VIDEO)

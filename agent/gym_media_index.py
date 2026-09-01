@@ -60,6 +60,16 @@ REJECT_UNREADABLE = "unreadable_image"
 REJECT_REMOVED = "removed_from_drive"
 REJECT_HIDDEN = "media_hidden"
 REJECT_CONVERT_UNAVAILABLE = "conversion_unavailable"     # heic/hevc but no converter
+# 2026-09-01 hardening (the finished-content-in-raw-pool proof-run miss): a
+# confident story_classifier FINISHED verdict quarantines the SAME way any other
+# ineligible asset does (eligible=False + reject_reason) so the EXISTING gates
+# (story_candidates._eligible_raw, gym_media_selector.pick_media) exclude it —
+# never a delete, never a new gate to keep in sync.
+REJECT_FINISHED_CONTENT = "classifier_finished_content"
+# A human/consent review flag (e.g. a minor visible in the frame). Set by hand or
+# by a targeted sweep, never inferred by the raw/finished classifier itself (that
+# is a different judgment than raw-vs-finished framing).
+REJECT_CONSENT_REVIEW = "consent_review_required"
 
 # HEIC / HEVC detection (both mime and extension, since Drive mislabels HEIC as
 # image/heic OR the generic application/octet-stream depending on the client).
@@ -271,6 +281,13 @@ def build_rows(files, source_id, gym_id, now_iso=None, log=None):
             "excluded_by_coach": False,
             "used_count": 0,
             "indexed_at": now_iso,
+            # PROVENANCE (2026-09-01): stamped ONCE, at true insert time, and never
+            # touched by the changed-field PATCH path (it is deliberately absent
+            # from sync_gym_media._OWNED_FIELDS) — unlike indexed_at, which is
+            # bumped on every re-sync PATCH and so answers "last touched", not
+            # "first seen". Answers a real "where/when did this footage first show
+            # up" question with a fact Echo actually knows, not a guess.
+            "first_indexed_at": now_iso,
         }
         if kind == KIND_PHOTO:
             # Native photo: gate from Drive dims when present, else leave NULL for
@@ -465,3 +482,48 @@ def clear_alert_stamp(stamp_key):
 def default_store():
     from . import media_source_store
     return media_source_store.default_store()
+
+
+def asset_provenance(asset, source=None, *, store=None):
+    """Where this pool item's footage actually came from, from data Echo already
+    has at ingest time (2026-09-01, per-clip provenance): the Drive folder
+    (media_source.folder_name / folder_id), the original filename (title), when
+    Drive last touched the file (drive_modified), and when Echo first indexed it
+    (first_indexed_at — NOT indexed_at, which is bumped on every re-sync PATCH and
+    so answers 'last touched', not 'first seen'). No new collection: every field
+    here was already known, just not assembled into one answer before.
+
+    `source` may be passed in (a media_source row) to avoid a lookup when the
+    caller already has it (e.g. a per-source sweep); otherwise it is looked up
+    via `store` (default_store()). Never raises: a lookup failure just leaves the
+    folder fields blank rather than losing the fields Echo DOES know."""
+    asset = asset or {}
+    folder_name = folder_id = None
+    source_id = asset.get("source_id")
+    if source is None and source_id:
+        try:
+            store = store or default_store()
+            for s in store.list_sources():
+                if s.get("id") == source_id:
+                    source = s
+                    break
+        except Exception as e:  # noqa: BLE001
+            print(f"[gym-media] provenance source lookup failed: "
+                  f"{type(e).__name__}: {e}")
+    if source:
+        folder_name = source.get("folder_name")
+        folder_id = source.get("folder_id")
+    # first_indexed_at may be absent on rows inserted before this column existed
+    # (backfilled from indexed_at, a lower bound: the true first-seen time for
+    # those rows is not recoverable, so this is the earliest fact Echo has).
+    first_seen = asset.get("first_indexed_at") or asset.get("indexed_at")
+    return {
+        "asset_id": asset.get("id"),
+        "title": asset.get("title"),
+        "source_id": source_id,
+        "drive_folder_name": folder_name,
+        "drive_folder_id": folder_id,
+        "drive_modified": asset.get("drive_modified"),
+        "first_indexed_at": first_seen,
+        "first_indexed_is_estimate": not bool(asset.get("first_indexed_at")),
+    }
