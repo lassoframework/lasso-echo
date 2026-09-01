@@ -168,7 +168,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     actions = []
     result = {"ok": True, "captions_fixed": 0, "repillared": 0,
               "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
-              "audience_fixed": 0, "audience_attempted": 0,
+              "audience_fixed": 0, "audience_attempted": 0, "scrubbed": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
     deadline = _deadline(llm_budget_s)
@@ -180,6 +180,12 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # collide with an existing one (or another fresh one from this pass).
     avoid = {(r.get("caption") or "").strip()
              for r in rows if (r.get("caption") or "").strip()}
+
+    # ---- f) hard copy violations (scrubbed, deterministically) -------------
+    scrubbed = _fix_violations(gym_id, rows, store, log)
+    result["scrubbed"] = scrubbed
+    if scrubbed:
+        actions.append(f"scrubbed banned dashes from {scrubbed} caption(s)")
 
     # ---- a) true duplicate captions (same hash on more than one date) ------
     dup_fixed, dup_skipped = _fix_duplicates(
@@ -243,6 +249,39 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 
 
 # ---------------------------------------------------------------------------
+# f) hard copy violations — the house scrubber, not a rewrite
+# ---------------------------------------------------------------------------
+
+def _fix_violations(gym_id, rows, store, log) -> int:
+    """Scrub banned dashes and intraword hyphens out of wipeable captions.
+
+    A copy violation is a HARD block: calendar_grade zeroes the ENTIRE
+    caption_craft leg (20 points) for the whole book on the first offending
+    row. Measured 2026-08-31, ONE row with an intraword hyphen was costing
+    LASSO its whole craft leg and no pass could clear it, because every other
+    repair path only ever looked at soft flags.
+
+    copy_gate.scrub is the house scrubber and its documented contract is
+    'rewrite, never reject': long dashes become ', ', intraword hyphens become
+    a space, and URLs, @handles and #tags pass through untouched. It writes no
+    new words, so this is a formatting fix, not a caption rewrite — the safest
+    repair in the module. Returns the number of rows scrubbed."""
+    fixed = 0
+    for r in rows:
+        cap = r.get("caption") or ""
+        if not cap.strip() or not copy_gate.violations(cap):
+            continue
+        if not _is_wipeable(r):
+            continue                    # human-owned copy is never rewritten
+        clean = copy_gate.scrub(cap)
+        if not clean or clean == cap or copy_gate.violations(clean):
+            continue                    # scrubber could not honestly clear it
+        if _patch_date_rows(gym_id, [r], store, clean, None, log):
+            fixed += 1
+    return fixed
+
+
+# ---------------------------------------------------------------------------
 # a) duplicate captions
 # ---------------------------------------------------------------------------
 
@@ -299,13 +338,28 @@ def _cat_of(row):
     return (row.get("pillar") or row.get("category") or "")
 
 
+def _cat_posts(rows):
+    """The book as (post_key, rows) pairs — the SAME grouping the grader uses.
+
+    2026-08-31: the grader counts mix per POST (one photo cross-posted to IG,
+    FB and a story is one serving of its pillar), but this pass still counted
+    ROWS. The arithmetic disagreed, so the headroom guard believed a target
+    category had room it did not have, and a 'repair' moved 3 sunnyside days
+    out of an over-cap pillar straight into a NEW over-cap pillar: 71 (C) ->
+    67 (D). A repair must never be able to lower the grade."""
+    from agent.calendar_grade import posts_of
+    return posts_of(rows)
+
+
 def _over_cap_cats(rows):
-    """Categories currently above 25% of the book (the grader's own bar)."""
+    """Categories currently above 25% of the book, counted in POSTS exactly as
+    calendar_grade._content_mix counts them."""
     from collections import Counter
-    n = len(rows)
+    posts = _cat_posts(rows)
+    n = len(posts)
     if not n:
         return []
-    counts = Counter(_cat_of(r) for r in rows)
+    counts = Counter(_cat_of(grp[0]) for _k, grp in posts)
     return sorted(cat for cat, count in counts.items() if count / n > 0.25)
 
 
@@ -350,22 +404,20 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
     a move that would push the TARGET category itself over 25% is skipped so
     the loop converges instead of ping-ponging. Returns (days_fixed, days_skipped)."""
     from collections import Counter
-    n = len(rows) or 1
-    counts = Counter(_cat_of(r) for r in rows)
+    posts = _cat_posts(rows)
+    n = len(posts) or 1
+    counts = Counter(_cat_of(grp[0]) for _k, grp in posts)
 
     fixed = skipped = 0
     for cat in over_cats:
         excess = counts.get(cat, 0) - int(0.25 * n)
         if excess <= 0:
             continue
-        by_date: dict = {}
-        for r in rows:
-            if _cat_of(r) == cat:
-                by_date.setdefault(str(r.get("post_date") or "")[:10], []).append(r)
-        for d in sorted(by_date, reverse=True):
+        mine = [((day, h), grp) for (day, h), grp in posts
+                if _cat_of(grp[0]) == cat]
+        for (day, _h), grp in sorted(mine, key=lambda kv: kv[0][0], reverse=True):
             if excess <= 0:
                 break
-            grp = by_date[d]
             if any(not _is_wipeable(r) for r in grp):
                 continue                       # human-owned day is never re-pointed
             if not _budget_left(deadline):
@@ -374,7 +426,7 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
             try:
                 out = caption_regen(grp[0], avoid, cat)
             except Exception as exc:  # noqa: BLE001
-                log(f"{gym_id} {d}: over-cap regen raised {type(exc).__name__}")
+                log(f"{gym_id} {day}: over-cap regen raised {type(exc).__name__}")
             if not out:
                 skipped += 1
                 continue
@@ -382,15 +434,17 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
             if not new_cat or str(new_cat).lower() == str(cat).lower():
                 skipped += 1                   # the content does not support a move
                 continue
-            moved = len(grp)
-            if (counts.get(new_cat, 0) + moved) / n > 0.25:
+            # Headroom in POST space, the same units the grader scores in: a
+            # move that would push the TARGET over 25% trades one defect for
+            # another and is never worth making.
+            if (counts.get(new_cat, 0) + 1) / n > 0.25:
                 skipped += 1                   # target has no headroom: honest skip
                 continue
             if _patch_date_rows(gym_id, grp, store, new_cap, new_cat, log):
                 fixed += 1
-                excess -= moved
-                counts[cat] -= moved
-                counts[new_cat] = counts.get(new_cat, 0) + moved
+                excess -= 1
+                counts[cat] -= 1
+                counts[new_cat] = counts.get(new_cat, 0) + 1
                 avoid.add(new_cap.strip())
             else:
                 skipped += 1

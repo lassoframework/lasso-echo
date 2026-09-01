@@ -1079,3 +1079,104 @@ def test_drop_alert_is_deduped_to_once_per_gym_per_day(_self_fix_on):
     _sweep(store, alerts)
     _sweep(store, alerts)
     assert len([a for a in alerts if "DROPPED" in a]) == 1, alerts
+
+
+# ---------------------------------------------------------------------------
+# Hard copy violations: one bad dash zeroed a whole book's craft leg
+# ---------------------------------------------------------------------------
+
+def test_one_banned_dash_zeroes_the_leg_and_the_scrub_pass_clears_it(monkeypatch):
+    """calendar_grade hard-zeroes the ENTIRE caption_craft leg (20 points) on
+    the first offending row, and every other repair path only looked at soft
+    flags — so a single intraword hyphen cost LASSO its whole craft leg with
+    nothing able to clear it. The house scrubber fixes it deterministically."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import grade_month
+    rows = [_row(i, f"2026-09-{(i + 1):02d}", _a_caption(i)) for i in range(6)]
+    rows[2]["caption"] = _a_caption(2).replace("Real change", "Real—change")
+    before = grade_month(rows, profile="GYM")
+    assert before.scores["caption_craft"] == 0, "one dash must zero the leg"
+
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, store := _FakeStore(rows), profile="GYM", defects=[],
+        today_iso=TODAY, caption_regen=None, gap_filler=lambda *a, **k: "none")
+    assert out["scrubbed"] == 1
+    after = grade_month(rows, profile="GYM")
+    assert after.scores["caption_craft"] == 20, after.defects
+    assert after.total > before.total
+    # zero fabrication: only the dash changed
+    assert "change" in rows[2]["caption"] and "—" not in rows[2]["caption"]
+
+
+def test_scrub_pass_never_touches_an_approved_caption(monkeypatch):
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    dirty = _a_caption(1).replace("Real change", "Real—change")
+    rows = [_row(1, "2026-09-01", dirty, status="approved")]
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, _FakeStore(rows), profile="GYM", defects=[],
+        today_iso=TODAY, caption_regen=None, gap_filler=lambda *a, **k: "none")
+    assert out["scrubbed"] == 0
+    assert rows[0]["caption"] == dirty
+
+
+# ---------------------------------------------------------------------------
+# THE INVARIANT: a repair pass must never LOWER the grade
+# ---------------------------------------------------------------------------
+
+def test_overcap_move_never_creates_a_new_over_cap_category(monkeypatch):
+    """Live 2026-08-31: sunnyside went 71 (C) -> 67 (D) BECAUSE of a repair.
+    The grader counts mix per POST; this pass counted ROWS, so its headroom
+    guard believed a target pillar had room it did not have and moved 3 days
+    out of one over-cap pillar straight into a new one. Post-space arithmetic
+    on both sides, and the guard holds."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import grade_month
+    # 7 posts, each mirrored to IG + FB + story: row space is 3x post space.
+    rows = []
+    for i in range(7):
+        day = f"2026-09-{(i + 1):02d}"
+        cap = _a_caption(i)
+        rows.append(_row(i * 3, day, cap, pillar="service"))
+        rows.append(_row(i * 3 + 1, day, cap, pillar="service", account="facebook"))
+        rows.append(_row(i * 3 + 2, day, cap, pillar="service", fmt="story"))
+    before = grade_month(rows, profile="GYM")
+    out = grade_fix.remediate_forward_book(
+        "gritx", rows, _FakeStore(rows), profile="GYM",
+        defects=[("content_mix", "service", "service is 100% of posts (over 25%)")],
+        today_iso=TODAY,
+        # every regen offers the SAME target pillar, so only the first move
+        # could ever be honest and the rest must be refused for lack of headroom
+        caption_regen=lambda r, a, c="": (_a_caption(90 + len(a)), "educational"),
+        gap_filler=lambda *a, **k: "none")
+    after = grade_month(rows, profile="GYM")
+    assert after.total >= before.total, (
+        f"a repair must never lower the grade: {before.total} -> {after.total}; "
+        f"repillared={out['repillared']}, defects={after.defects}")
+    cats = {r.get("pillar") for r in rows}
+    assert "educational" not in cats or after.scores["content_mix"] >= before.scores["content_mix"]
+
+
+def test_repair_never_lowers_the_grade_across_repeated_passes(monkeypatch):
+    """The general contract, not one shape: run the loop and the score must be
+    monotonically non-decreasing pass over pass."""
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    from agent.calendar_grade import grade_month
+    rows = []
+    for i in range(9):
+        day = f"2026-09-{(i + 1):02d}"
+        cap = _no_ask_caption(i) if i % 2 else _a_caption(i)
+        pillar = ["service", "about", "service"][i % 3]
+        rows.append(_row(i * 2, day, cap, pillar=pillar))
+        rows.append(_row(i * 2 + 1, day, cap, pillar=pillar, account="facebook"))
+    store = _FakeStore(rows)
+    totals = [grade_month(rows, profile="GYM").total]
+    for _ in range(3):
+        g = grade_month(rows, profile="GYM")
+        grade_fix.remediate_forward_book(
+            "gritx", rows, store, profile="GYM", defects=g.defects,
+            today_iso=TODAY,
+            caption_regen=lambda r, a, c="": (_a_caption(200 + len(a)), "education"),
+            gap_filler=lambda *a, **k: "none",
+            booking_cta="Book your intro class this week.")
+        totals.append(grade_month(rows, profile="GYM").total)
+    assert all(b >= a for a, b in zip(totals, totals[1:])), totals
