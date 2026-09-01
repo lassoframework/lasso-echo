@@ -273,6 +273,12 @@ def deny(request_id, gym_id, reason="", *, store=None, cal_store=None):
         if store.available():
             store.update_request(request_id, {"status": STATUS_DENIED,
                                               "deny_reason": reason})
+            # The RENDER row too. story_render.status is constrained to exactly
+            # ('pending','denied') and nothing ever wrote 'denied', so every denied
+            # render still read PENDING forever: the calendar card said denied, the
+            # request said denied, and the render row disagreed with both. Anything
+            # counting pending Story Studio work saw phantoms.
+            store.update_render(request_id, {"status": STATUS_DENIED})
     except Exception as e:  # noqa: BLE001
         print(f"[story-studio] deny request update failed: {type(e).__name__}: {e}")
     db.audit("story_studio", request_id, f"denied: {reason} (segments returned to pool)")

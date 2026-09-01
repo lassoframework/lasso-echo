@@ -38,6 +38,12 @@ class _FakeStore:
                 r.update(fields)
         return True
 
+    def update_render(self, rid, fields):
+        for r in self.renders:
+            if r.get("id") == rid:
+                r.update(fields)
+        return True
+
 
 class _RealPathLibrary(sm.StubMusicLibrary):
     """A hype track whose audio file actually exists on disk (so the burn is not held
@@ -120,6 +126,45 @@ def test_staged_draft_is_pending(monkeypatch, tmp_path):
     assert res["status"] == "staged"
     assert res["draft"].status == DraftStatus.PENDING
     assert res["draft"].is_story is True
+
+
+def test_create_story_hands_the_validated_overlay_to_the_renderer(monkeypatch, tmp_path):
+    """THE call-site guard for page 4's bug. story_composer has a test proving it
+    burns overlay_frames when it receives them, and _default_end_frame refuses to
+    drop a requested ask -- but NOTHING pinned the hand-off itself. Delete
+    `overlay_frames=overlay.frames, ask_frame_lines=overlay.ask_frame` from
+    story_studio.create_story and every other test still passed while every Story
+    rendered with no hook, no anchor and no ask: exactly the shipped bug. This test
+    asserts the validated OverlaySpec actually reaches the renderer."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"ID3fake")
+    seen = {}
+
+    def _capture_render(plan, *, output_dir, ask_frame_text="", ask_frame_lines=None,
+                        overlay_frames=None, music_path="", **_k):
+        from agent import story_composer as comp
+        seen.update(ask_frame_text=ask_frame_text, ask_frame_lines=ask_frame_lines,
+                    overlay_frames=overlay_frames)
+        return comp.ComposeResult(plan=plan, output_path=f"{output_dir}/final.mp4")
+
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0", "a1"],
+         "brief": "Kitchener mornings hit different at Pierce Fitness",
+         "identity_tokens": ["Pierce Fitness", "Kitchener"], "requested_by": "coach1"},
+        candidates=_cands("pierce"), assets_by_id={},
+        store=_FakeStore(), music_library=_RealPathLibrary(str(audio)),
+        render_fn=_capture_render, output_dir=str(tmp_path))
+
+    assert res["status"] == "staged"
+    assert seen["overlay_frames"], \
+        "create_story staged a Story without handing the hook frames to the renderer"
+    assert seen["ask_frame_lines"], \
+        "create_story staged a Story without handing the validated ask frame over"
+    flat = " ".join(ln for fr in seen["overlay_frames"] for ln in fr)
+    assert "KITCHENER" in flat, "the identity anchor never reached the burn"
+    assert all(ln == ln.upper() for fr in seen["overlay_frames"] for ln in fr)
+    assert seen["ask_frame_text"], "the ask text never reached the renderer"
 
 
 def test_render_stores_track_id_and_license_ref(monkeypatch, tmp_path):
@@ -248,6 +293,30 @@ def test_deny_rolls_back_and_logs(monkeypatch, tmp_path):
     plan_assets = set(rec.get("asset_ids") or [])
     assert plan_assets                                  # at least the used segments
     assert plan_assets.issubset({f"a{i}" for i in range(6)})
+
+
+def test_deny_also_denies_the_render_row(monkeypatch, tmp_path):
+    """story_render.status is constrained to exactly ('pending','denied') and deny()
+    never wrote 'denied' — so every denied render's row still read PENDING forever
+    while its request and its calendar card both said denied. Found by querying live
+    Supabase after 10 verification renders: 12 phantom pending story_render rows."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    store = _FakeStore()
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0", "a1"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
+        candidates=_cands("pierce"), store=store,
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    rid = res["request_id"]
+    assert [r["status"] for r in store.renders] == [ss.STATUS_PENDING]
+
+    ss.deny(rid, "pierce", reason="off brand", store=store)
+    assert [r["status"] for r in store.renders] == [ss.STATUS_DENIED], \
+        "deny() left the story_render row claiming pending"
+    assert [r["status"] for r in store.requests] == [ss.STATUS_DENIED]
 
 
 # ---- the approval row is REALLY written (the lane used to only return a Draft) -----
