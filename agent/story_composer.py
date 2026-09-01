@@ -49,6 +49,12 @@ ROUTE_OPUS = "opus"
 HOOK_FRAME_MIN_SEC = 3.0
 ASK_FRAME_SEC = 3.0
 
+# The ONE video profile every segment is re-encoded to before the concat demuxer
+# joins them (see _default_normalize). Mixed frame rates / timebases across phone
+# clips silently truncate the concatenated VIDEO track, so both are pinned.
+CONCAT_FPS = 30
+CONCAT_TIMESCALE = 15360        # 512 * 30: an exact 30fps mp4 timescale
+
 
 @dataclass
 class Segment:
@@ -277,7 +283,19 @@ def _default_reframe(segment, out_dir):
 def _default_normalize(paths):
     """Loudness (EBU R128) + color normalize per segment across phones (spec §3).
     Real ffmpeg: loudnorm=I=-16:TP=-1.5:LRA=11 + a color normalize, re-encoded
-    H.264/AAC so every segment shares one loudness + codec profile before concat.
+    H.264/AAC so every segment shares ONE loudness + codec profile before concat.
+
+    "One profile" is literal and load-bearing: the concat demuxer adopts the FIRST
+    input's frame rate, timebase and pixel format and reinterprets every later
+    segment's timestamps in it. Phone clips arrive at 29.98 / 29.99 / 30.09 fps with
+    timebases like 1/71400, 1/48900 and 1/11856, so segments 2..n produced
+    non-monotonic timestamps and ffmpeg DROPPED most of their frames: a 3-clip
+    montage muxed 29.6s of audio over a 13.4s video track (the container still
+    reported 29.6s, so nothing looked wrong until a frame was pulled past 13.4s).
+    So FPS, timebase, pixel format and the audio rate/layout are all pinned here —
+    without that, this function's own "one profile" promise was not true and every
+    multi-clip Story shipped a truncated video track.
+
     Reuses clipper_render's ffmpeg guard (raises when the render flag is OFF or
     ffmpeg is absent -> the compose HOLDS honestly, never a silent bad render)."""
     from . import clipper_render
@@ -288,10 +306,14 @@ def _default_normalize(paths):
         dst = f"{root}_norm{ext or '.mp4'}"
         clipper_render._run([
             clipper_render._ffmpeg(), "-y", "-i", p,
-            "-vf", "normalize=blackpt=black:whitept=white",
+            # fps + format pin the video profile the concat demuxer needs; yuv420p is
+            # also the only pixel format the social platforms reliably accept.
+            "-vf", f"normalize=blackpt=black:whitept=white,fps={CONCAT_FPS},"
+                   f"format=yuv420p",
             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
             "-c:v", "libx264", "-crf", "22", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "128k",
+            "-video_track_timescale", str(CONCAT_TIMESCALE),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
             dst,
         ], "story_normalize")
         out.append(dst)

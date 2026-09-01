@@ -163,6 +163,43 @@ def test_default_end_frame_refuses_to_drop_a_requested_ask(tmp_path):
         _default_end_frame("/tmp/in.mp4", str(tmp_path), "BOOK NOW", ask_lines=None)
 
 
+def test_normalize_pins_one_profile_for_the_concat_demuxer(monkeypatch, tmp_path):
+    """REGRESSION GUARD: phone clips arrive at 29.98 / 29.99 / 30.09 fps with
+    timebases like 1/71400 and 1/11856. The concat demuxer adopts the FIRST input's
+    profile and reinterprets later segments in it, so unpinned segments produced
+    non-monotonic timestamps and ffmpeg DROPPED most of segments 2..n: a real 3-clip
+    montage muxed 29.6s of audio over a 13.4s video track while the container still
+    reported 29.6s. _default_normalize's whole job is to hand concat ONE profile, so
+    fps, pixel format, mp4 timescale and the audio rate/layout must all be pinned."""
+    from agent import clipper_render
+    cmds = []
+    monkeypatch.setattr(clipper_render, "_require_render", lambda: None)
+    monkeypatch.setattr(clipper_render, "_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(clipper_render, "_run", lambda cmd, label="": cmds.append(cmd))
+
+    out = comp._default_normalize([f"{tmp_path}/a.mp4", f"{tmp_path}/b.mp4"])
+    assert len(out) == 2 and all(p.endswith("_norm.mp4") for p in out)
+    for cmd in cmds:
+        vf = cmd[cmd.index("-vf") + 1]
+        assert f"fps={comp.CONCAT_FPS}" in vf, "frame rate not pinned before concat"
+        assert "format=yuv420p" in vf, "pixel format not pinned before concat"
+        assert "-video_track_timescale" in cmd, "mp4 timebase not pinned before concat"
+        assert cmd[cmd.index("-video_track_timescale") + 1] == str(comp.CONCAT_TIMESCALE)
+        assert "-ar" in cmd and "-ac" in cmd, "audio rate/layout not pinned"
+
+
+def test_extract_frame_png_raises_when_ffmpeg_writes_no_frame(monkeypatch, tmp_path):
+    """ffmpeg EXITS 0 and writes NOTHING when a seek lands past the last video frame,
+    so _run cannot catch it and the failure surfaced as a bare PIL FileNotFoundError
+    three frames up the stack. It must be a loud, honest RenderError instead."""
+    from agent import clipper_render
+    monkeypatch.setattr(clipper_render, "_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(clipper_render, "_run", lambda cmd, label="": None)
+    with pytest.raises(clipper_render.RenderError, match="no video frame exists"):
+        clipper_render._extract_frame_png("/tmp/in.mp4", 14.65,
+                                          str(tmp_path / "missing.png"))
+
+
 def test_render_burns_music_when_provided(tmp_path):
     t = tmpl.get("hype_montage")
     plan = comp.plan_compose(_cands("pierce", 6, seg=10.0), "pierce", t)

@@ -447,10 +447,22 @@ def probe_duration(path):
 
 def _extract_frame_png(input_path, at_t, out_png):
     """Extract one real frame at at_t seconds to out_png. Used only to SAMPLE actual
-    backdrop pixels for the contrast math — never a stand-in for the burned output."""
+    backdrop pixels for the contrast math — never a stand-in for the burned output.
+
+    ffmpeg EXITS 0 when a seek lands past the last video frame and simply writes no
+    file ("Output file is empty, nothing was encoded"), so _run cannot catch it. That
+    turned a real upstream defect (a truncated video track) into a bare PIL
+    FileNotFoundError three frames up the stack. Check for the file and say what
+    actually happened."""
     cmd = [_ffmpeg(), "-y", "-ss", str(max(0.0, float(at_t))), "-i", input_path,
           "-frames:v", "1", out_png]
     _run(cmd, "extract_frame")
+    if not os.path.isfile(out_png) or os.path.getsize(out_png) == 0:
+        raise RenderError(
+            f"no video frame exists at t={float(at_t):.2f}s in {input_path} "
+            f"(ffmpeg encoded nothing and exited 0). The clip's VIDEO track is "
+            f"shorter than the duration its container reports, so the overlay "
+            f"cannot be timed against it; render HELD, nothing burned")
     return out_png
 
 
