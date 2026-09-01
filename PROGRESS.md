@@ -3791,6 +3791,18 @@ Portal CC reads this to build: intake wizard, media upload hand-off, calendar di
 
 ---
 
+## Product backlog (Blake, 2026-09-01 — real follow-up, deliberately not built tonight)
+- Page 7 owner-preview proof used the documented no-Clerk owner-equivalent code path (real
+  production rows, no real session) because this environment has no Clerk credentials.
+  Accepted as valid proof. Re-verify once with a real Clerk session when credentials exist.
+- `was_edited` / edit-distance is tracked (real column + trigger) but has no UI surface
+  anywhere, staff or client. Deck says Echo TRACKS it, which is true — leave the deck. Surfacing
+  it (a coach-facing "what Echo is learning from your edits" view) is real product work.
+- Story Studio has no persisted GET endpoint to re-fetch a story_render's music/overlay data
+  after creation (agent/story_studio_store.py's get_render/list_requests/update_render have
+  zero callers) and no staff Command Center Story Studio surface. Needed to show music/overlay
+  info on an OLD approval, not just at creation time.
+
 ## Open risks / watch items
 - Repo divergence: deployed repo has commits from other agents (ruvnet, Manus); the
   reference sandbox may differ. Code ships as a behavior-described Claude Code prompt,
