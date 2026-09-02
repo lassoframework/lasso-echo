@@ -347,7 +347,8 @@ def _cli_finalize_return_url(account_key, dest):
         return ""
 
 
-def connect_url_for(account_key, platform, client=None, redirect_url=None):
+def connect_url_for(account_key, platform, client=None, redirect_url=None,
+                    headless=True):
     """OPS: the OAuth CONNECT url for a gym + platform (instagram|facebook|googlebusiness),
     find-or-creating the Zernio profile first. This is the same URL the portal handler returns;
     exposed for the CLI so ops can hand a gym owner a direct connect link (e.g. a Google
@@ -387,6 +388,19 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
         if not pid:
             return False, "could not resolve a Zernio profile for this gym"
         zernio_redirect = _connect_redirect_url(redirect_url)
+        if not headless:
+            # STANDARD MODE (2026-09-02, The Bolton Club): Zernio hosts the selection UI
+            # and creates the account itself, so NONE of Echo's headless machinery is in
+            # the path -- no finalize return leg, no branded picker, no page JS. Use it
+            # when a gym is stuck in the headless flow: it is Zernio's own default and it
+            # handles zero / one / many locations natively, including telling the owner
+            # plainly when the Google account they used manages no listing at all. The
+            # owner briefly sees a Zernio-branded picker instead of ours, which is a fair
+            # trade for a gym that cannot connect otherwise.
+            data = c.connect_url(pid, platform, redirect_url=zernio_redirect,
+                                 headless=False)
+            url = (data or {}).get("authUrl") or ""
+            return (True, url) if url else (False, "zernio returned no authUrl")
         if platform != "instagram":
             leg = _cli_finalize_return_url(account_key, zernio_redirect)
             if leg:

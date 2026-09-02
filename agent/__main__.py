@@ -2988,7 +2988,10 @@ def main(argv=None):
         # link (e.g. Google Business). Run on the worker (ZERNIO_API_KEY lives there):
         #   railway ssh --service echo /opt/venv/bin/python -m agent zernio-connect-url \
         #     --account eng --platform googlebusiness
-        account_key, platform = "", "googlebusiness"
+        # --standard: mint a ZERNIO-HOSTED connect link (headless=false). Use it when a
+        # gym is stuck in our own headless selection flow — Zernio hosts the picker and
+        # creates the account itself, so none of Echo's finalize/JS path is involved.
+        account_key, platform, headless = "", "googlebusiness", True
         args_rest = argv[1:]
         i = 0
         while i < len(args_rest):
@@ -2996,15 +2999,19 @@ def main(argv=None):
                 account_key = args_rest[i + 1]; i += 2; continue
             if args_rest[i] == "--platform" and i + 1 < len(args_rest):
                 platform = args_rest[i + 1]; i += 2; continue
+            if args_rest[i] == "--standard":
+                headless = False; i += 1; continue
             i += 1
         if not account_key:
             print("usage: python -m agent zernio-connect-url --account <key> "
-                  "[--platform instagram|facebook|googlebusiness]")
+                  "[--platform instagram|facebook|googlebusiness] [--standard]")
         else:
             from .zernio_routes import connect_url_for
-            ok, info = connect_url_for(account_key, platform)
+            ok, info = connect_url_for(account_key, platform, headless=headless)
             if ok:
-                print(f"{account_key} {platform} connect url:")
+                mode = "headless (Echo-hosted picker)" if headless \
+                    else "STANDARD (Zernio-hosted picker)"
+                print(f"{account_key} {platform} connect url [{mode}]:")
                 print(info)
             else:
                 print(f"connect-url FAILED for {account_key} {platform}: {info}")

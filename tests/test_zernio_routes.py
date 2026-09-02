@@ -817,3 +817,28 @@ def test_connect_rejects_untrusted_redirect_origin(db_env, monkeypatch):
     zr.handle_social_connect("gymA", "instagram", client=fake2,
                              redirect_url="https://ops.lassoframework.com/my/social")
     assert _connect_call(fake2)[3] == "https://ops.lassoframework.com/my/social"
+
+
+def test_standard_mode_bypasses_the_finalize_leg_entirely(db_env, monkeypatch):
+    """--standard hands Zernio the plain portal redirect and headless=False, so Zernio
+    hosts the picker and creates the account itself. None of Echo's headless machinery is
+    in the path, which is the point: it is the escape hatch when a gym cannot get through
+    our own selection flow (The Bolton Club, 2026-09-02)."""
+    called = []
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: called.append(base) or "SHOULD_NOT_BE_USED")
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=9"})
+    ok, url = zr.connect_url_for("gymA", "googlebusiness", client=fake, headless=False)
+    assert ok is True and url.startswith("https://accounts.google.com/")
+    assert called == [], "standard mode must never build the finalize return leg"
+    call = _connect_call(fake)
+    assert "/connect/return" not in call[3], "standard mode uses the plain redirect"
+    assert call[4] is False, "headless must be False so Zernio hosts the picker"
+
+
+def test_headless_stays_the_default(db_env, monkeypatch):
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: "https://echo.test/portal/TOK/connect/return")
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/x"})
+    zr.connect_url_for("gymA", "googlebusiness", client=fake)
+    assert _connect_call(fake)[4] is True
