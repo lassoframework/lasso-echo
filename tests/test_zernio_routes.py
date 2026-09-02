@@ -345,7 +345,14 @@ def test_connect_allows_google_business(db_env):
     assert any(c[:3] == ("connect", "new_profile", "googlebusiness") for c in fake.calls)
 
 
-def test_connect_url_for_google_business(db_env):
+def test_connect_url_for_google_business(db_env, monkeypatch):
+    # CONTRACT CHANGED 2026-09-02: a google/facebook link is only minted when Echo's
+    # finalize return leg can be built (Zernio's headless grant is dropped without it --
+    # The Bolton Club looped through Google for days). Tests carry no intake signing
+    # secret, so the leg is injected here; the refusal path is pinned separately by
+    # test_cli_refuses_to_mint_a_google_link_it_knows_would_drop_the_grant.
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: "https://echo.test/portal/TOK/connect/return")
     fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=2"})
     ok, url = zr.connect_url_for("gymA", "googlebusiness", client=fake)
     assert ok is True and url.startswith("https://accounts.google.com/")
@@ -478,6 +485,59 @@ def test_client_connect_url_includes_headless_and_redirect(db_env):
 def test_connect_url_for_rejects_bad_platform(db_env):
     ok, err = zr.connect_url_for("gymA", "tiktok", client=_FakeClient())
     assert ok is False and "platform must be" in err
+
+
+# ---- the CLI door must hand out the FINALIZE leg, not the bare portal url -------------
+# The Bolton Club, 2026-09-02: "I can't get my GMB page to connect. Whenever it seems like
+# it's going to connect it just takes me back to the starting page." Zernio always runs
+# headless -- after the owner approves it bounces back with step/tempToken and does NOT
+# create the account, so a link whose redirect is the bare portal page drops the grant
+# every single time. handle_social_connect got the finalize leg on 2026-08-28 (it derives
+# it from the request's portal token); connect_url_for, the door ops uses to hand a gym a
+# link by hand, did not.
+
+def test_cli_google_link_carries_echos_finalize_return_leg(db_env, monkeypatch):
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: "https://echo.test/portal/TOK/connect/return"
+                                           f"?dest={dest}")
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/o/oauth2/auth?x=2"})
+    ok, url = zr.connect_url_for("gymA", "googlebusiness", client=fake)
+    assert ok is True
+    redirect = _connect_call(fake)[3]
+    assert "/connect/return" in redirect, (
+        "a Google link must return through Echo's finalize leg or the grant is dropped")
+
+
+def test_cli_facebook_link_also_carries_the_finalize_leg(db_env, monkeypatch):
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: "https://echo.test/portal/TOK/connect/return")
+    fake = _FakeClient(connect={"authUrl": "https://www.facebook.com/dialog/oauth?x=1"})
+    ok, _ = zr.connect_url_for("gymA", "facebook", client=fake)
+    assert ok is True and "/connect/return" in _connect_call(fake)[3]
+
+
+def test_cli_instagram_link_is_unchanged_no_finalize_leg_needed(db_env, monkeypatch):
+    # Instagram lands the account directly (no page/location select step), so it keeps the
+    # portal redirect exactly as before. The leg builder must not even be consulted.
+    called = []
+    monkeypatch.setattr(zr, "_cli_finalize_return_url",
+                        lambda base, dest: called.append(base) or "x")
+    fake = _FakeClient(connect={"authUrl": "https://api.instagram.com/oauth?x=1"})
+    ok, _ = zr.connect_url_for("gymA", "instagram", client=fake)
+    assert ok is True
+    assert called == [], "instagram must not be routed through the finalize leg"
+    assert "/connect/return" not in _connect_call(fake)[3]
+
+
+def test_cli_refuses_to_mint_a_google_link_it_knows_would_drop_the_grant(
+        db_env, monkeypatch):
+    """Fail LOUDLY rather than hand ops a link that silently loops the owner forever."""
+    monkeypatch.setattr(zr, "_cli_finalize_return_url", lambda base, dest: "")
+    fake = _FakeClient(connect={"authUrl": "https://accounts.google.com/x"})
+    ok, err = zr.connect_url_for("gymA", "googlebusiness", client=fake)
+    assert ok is False
+    assert "finalize return leg" in err and "nothing connected" in err
+    assert not any(c[0] == "connect" for c in fake.calls), "no link may be minted"
 
 
 def test_connect_url_for_rejects_whitespace_key(db_env):

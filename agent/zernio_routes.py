@@ -324,6 +324,29 @@ def portal_dest_url(dest):
     return _connect_redirect_url(dest)
 
 
+def _cli_finalize_return_url(account_key, dest):
+    """Echo's token-scoped /portal/<token>/connect/return for this gym, or '' when one
+    cannot be built.
+
+    The portal door gets its token from the request path; this CLI door has no request, so
+    it mints the gym's own intake token the same single way everything else does
+    (intake_tokens.mint via intake_web) and builds the identical leg
+    (intake_web._connect_return_url), carrying `dest` through as ?dest= so the owner still
+    lands back in the LASSO portal after the server-side finalize. Never raises: any failure
+    returns '' and the caller refuses to mint a link rather than mint a broken one."""
+    try:
+        from . import intake_web as _iw
+        from . import intake_tokens as _it
+        token = _it.mint(account_key)
+        if not token:
+            return ""
+        return _iw._connect_return_url(token, dest)
+    except Exception as exc:  # noqa: BLE001 - report via the empty string, never crash ops
+        print(f"[zernio-routes] finalize leg could not be built for {account_key}: "
+              f"{type(exc).__name__}")
+        return ""
+
+
 def connect_url_for(account_key, platform, client=None, redirect_url=None):
     """OPS: the OAuth CONNECT url for a gym + platform (instagram|facebook|googlebusiness),
     find-or-creating the Zernio profile first. This is the same URL the portal handler returns;
@@ -332,7 +355,19 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
     zernio_enabled() (ZERNIO_API_KEY) — run on the worker where the key lives.
 
     redirect_url is threaded to Zernio so the gym owner returns to the LASSO portal after
-    approving, never the Zernio dashboard; a missing one falls back to the portal origin."""
+    approving, never the Zernio dashboard; a missing one falls back to the portal origin.
+
+    FINALIZE LEG (2026-09-02, The Bolton Club): for facebook / googlebusiness this MUST hand
+    Zernio Echo's own token-scoped /portal/<token>/connect/return, not the bare portal url.
+    Zernio always runs headless: after the owner approves it bounces back with step/tempToken
+    and does NOT create the account, so a link that returns straight to the portal drops the
+    grant silently and the owner lands on their start page with nothing connected, every time
+    they try. handle_social_connect got that fix on 2026-08-28 (it derives the leg from the
+    request's portal token); this CLI door did not, so every connect link ops handed a gym by
+    hand was quietly broken for exactly the two platforms that need the finalize. The
+    docstring above used to claim this returned "the same URL the portal handler returns" —
+    that stopped being true then, and is true again now. Instagram is unaffected (it lands the
+    account directly, no page/location select step)."""
     if not config.zernio_enabled():
         return False, "zernio disabled (ZERNIO_API_KEY not set on this host)"
     if not account_key:
@@ -351,7 +386,20 @@ def connect_url_for(account_key, platform, client=None, redirect_url=None):
         pid = _ensure_profile_id(account_key, c)
         if not pid:
             return False, "could not resolve a Zernio profile for this gym"
-        data = c.connect_url(pid, platform, redirect_url=_connect_redirect_url(redirect_url))
+        zernio_redirect = _connect_redirect_url(redirect_url)
+        if platform != "instagram":
+            leg = _cli_finalize_return_url(account_key, zernio_redirect)
+            if leg:
+                zernio_redirect = leg
+            else:
+                # Never hand out a link we know drops the grant. Better an honest ops
+                # error than a gym owner looping through Google for days.
+                return False, (
+                    f"cannot build the finalize return leg for {account_key} "
+                    f"({platform} needs it or Zernio's headless grant is dropped and the "
+                    "owner lands back on their start page with nothing connected). Check "
+                    "AGENT_UPLOAD_BASE_URL and the intake signing secret on this host.")
+        data = c.connect_url(pid, platform, redirect_url=zernio_redirect)
     except _z.ZernioError as exc:
         return False, f"zernio {exc.status}: {exc.detail}"
     except Exception as exc:  # noqa: BLE001 - report, never crash the ops command
