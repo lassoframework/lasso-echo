@@ -2889,6 +2889,31 @@ def build_server(port=None):
     return server
 
 
+def line_buffer_stdio():
+    """Force line-buffered stdout/stderr so this service's logs actually REACH Railway.
+
+    2026-09-02, found chasing a live client bug: `railway logs --service echo-intake-web`
+    returned nothing but container-start lines, so The Bolton Club's failed Google connect
+    attempt was completely unreadable on a service that serves clients. Cause: Python
+    block-buffers stdout when it is not a TTY, this service prints rarely (11 sites, none
+    with flush=True), and a low-traffic HTTP server never fills an 8KB buffer -- so its
+    logs were written to a buffer that in practice never flushed. The `echo` worker only
+    looked healthier because it is chatty enough to fill the buffer in chunks.
+
+    PYTHONUNBUFFERED=1 is also set on the service, which is the normal fix; this is the
+    belt so a lost env var cannot silently blind the service again. Idempotent, and a
+    Python too old for reconfigure() degrades to today's behavior rather than crashing
+    the process on boot."""
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:  # noqa: BLE001 - never let logging setup stop the service
+            pass
+
+
 def serve(port=None):  # pragma: no cover - blocking loop over build_server
     """Run the intake web service (its OWN process/service; R2 only, no /data)."""
+    line_buffer_stdio()
+    print("[intake-web] starting; stdout is line buffered", flush=True)
     build_server(port).serve_forever()
