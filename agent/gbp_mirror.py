@@ -231,14 +231,50 @@ def resolve_context(base_key, *, store=None, address_fn=None, logger=None):
 
 # ---- image + caption (the two things that are not a dict copy) ------------------------
 
+def _localized_dir():
+    """Where a remote photo is cached after being pulled down for the Google crop.
+    Under the durable data dir when there is one, else /tmp."""
+    try:
+        base = config.data_dir() or "/tmp"
+    except Exception:  # noqa: BLE001
+        base = "/tmp"
+    d = os.path.join(base, "gbp_mirror_src")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = "/tmp"
+    return d
+
+
+def stable_local_name(url, ext) -> str:
+    """A DETERMINISTIC filename for a remote photo, derived from its own url.
+
+    2026-09-02, why this is not tempfile.mkstemp: the whole crop-and-host chain is keyed
+    on FILENAME, not just content. media_host._build_key is
+    echo/<tenant>/<sha1-of-bytes>/<basename>, and gbp_planner's crop cache is
+    "<account>_<basename>_gbp.jpg". Localizing a Drive photo to a random temp name meant
+    a different basename on every single build, so:
+      * the local crop cache never hit (re-crop every build), and
+      * the R2 key never matched the previous build's, so host_media's content dedupe
+        was defeated and every rebuild wrote a BRAND NEW R2 object for byte-identical
+        pixels -- unbounded storage growth, one object per mirrored post per build.
+    A url-derived name makes both caches actually work: same photo, same name, same key.
+    """
+    import hashlib
+    h = hashlib.sha1(str(url or "").encode("utf-8")).hexdigest()[:16]
+    return f"src_{h}{ext or '.jpg'}"
+
+
 def _local_still(draft, library_path, log):
     """(path, cleanup_path): a LOCAL still image to crop for Google, or (None, None).
 
     A photo creative is used directly. A VIDEO's poster frame is used instead (the frame
     the portal already shows for that post) and only when the video itself is local — a
     remote video is not downloaded at build time. A remote photo (the Drive lane) IS
-    localized from its hosted url, the same way the story burn does it, and the temp file
-    is reported back for cleanup."""
+    localized from its hosted url under a DETERMINISTIC, url-derived name (see
+    stable_local_name) and KEPT, so the next build reuses it instead of re-downloading
+    and re-hosting. cleanup_path is always None now: nothing here is a throwaway temp.
+    """
     path = (getattr(draft, "creative_path", "") or "").strip()
     if path and path.lower().endswith(_VIDEO_EXTS):
         if not os.path.isfile(path) or not library_path:
@@ -256,18 +292,22 @@ def _local_still(draft, library_path, log):
     url = (getattr(draft, "creative_public_url", "") or "").strip()
     if not url or url.split("?")[0].lower().endswith(_VIDEO_EXTS):
         return None, None
+    ext = os.path.splitext(path)[1] or os.path.splitext(url.split("?")[0])[1] or ".jpg"
+    dest = os.path.join(_localized_dir(), stable_local_name(url, ext))
+    # already pulled down on an earlier build: reuse it, no fetch, and the crop cache +
+    # R2 key downstream stay identical to last time.
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest, None
     try:
-        import tempfile
         from . import media_host
         data = media_host.download_bytes(url)
         if not data:
             return None, None
-        ext = os.path.splitext(path)[1] or \
-            os.path.splitext(url.split("?")[0])[1] or ".jpg"
-        fd, tmp = tempfile.mkstemp(suffix=ext)
-        with os.fdopen(fd, "wb") as fh:
+        tmp = f"{dest}.part"
+        with open(tmp, "wb") as fh:
             fh.write(data)
-        return tmp, tmp
+        os.replace(tmp, dest)          # atomic: a killed build never leaves a half file
+        return dest, None
     except Exception as exc:  # noqa: BLE001 - never block a build on a fetch
         log(f"could not localize hosted media for the Google crop "
             f"({type(exc).__name__})")
@@ -295,13 +335,74 @@ def cropped_url(draft, ctx, library_path, log):
                 pass
 
 
-def gbp_caption(draft, ctx, caption_fn=None):
+def _caption_cache_dir():
+    try:
+        base = config.data_dir() or "/tmp"
+    except Exception:  # noqa: BLE001
+        base = "/tmp"
+    d = os.path.join(base, "gbp_mirror_captions")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = "/tmp"
+    return d
+
+
+def _voice_fingerprint(voice) -> str:
+    """A cheap, stable fingerprint of the gym's voice doc, so EDITING the bible
+    invalidates its cached captions instead of serving copy written from the old one.
+    Best effort: any of the doc's own text attributes, else its repr. Never raises."""
+    import hashlib
+    for attr in ("raw", "text", "body", "content"):
+        try:
+            v = getattr(voice, attr, None)
+            if isinstance(v, str) and v:
+                return hashlib.sha1(v.encode("utf-8", "ignore")).hexdigest()[:12]
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return hashlib.sha1(repr(voice).encode("utf-8", "ignore")).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def caption_cache_key(base_key, fact, city, voice) -> str:
+    """Content address for one generated Google caption. Same gym, same approved fact,
+    same city and same voice doc => same caption, so a rebuild need not pay for it
+    again."""
+    import hashlib
+    material = "\x1f".join([str(base_key or ""), str(city or ""),
+                            _voice_fingerprint(voice), str(fact or "")])
+    return hashlib.sha256(material.encode("utf-8", "ignore")).hexdigest()[:32]
+
+
+def gbp_caption(draft, ctx, caption_fn=None, base_key="", cache=True):
     """The mirrored row's caption: a Google-native caption generated from the gym's
     already-approved feed caption (its facts only) plus the gym's voice doc, which must
-    clear the SAME figure gate and A+ gate the planner enforces. None => skip the row."""
+    clear the SAME figure gate and A+ gate the planner enforces. None => skip the row.
+
+    CACHED (2026-09-02) on a content address of gym+fact+city+voice. The mirror runs one
+    caption generation per FEED POST per build (~268 fleet-wide) and a month rebuild
+    re-runs all of them, so without this every rebuild re-pays for copy it already wrote
+    from identical inputs. One file per key, written atomically, so concurrent builds
+    cannot corrupt it. ONLY gate-clearing captions are cached: a rejected one is left
+    uncached so a later build gets a fresh attempt rather than being stuck with a skip.
+    """
     fact = source_fact(getattr(draft, "caption", ""))
     if not fact:
         return None
+    key = None
+    if cache and caption_fn is None:
+        try:
+            key = caption_cache_key(base_key, fact, ctx["city"], ctx["voice"])
+            hit = os.path.join(_caption_cache_dir(), f"{key}.txt")
+            if os.path.isfile(hit):
+                with open(hit, "r", encoding="utf-8") as fh:
+                    cached = fh.read().strip()
+                if cached and not gbp.caption_issues(cached, city=ctx["city"]):
+                    return cached          # still clears the gate today: reuse it
+        except Exception:  # noqa: BLE001 - a cache miss is never a failure
+            key = key if isinstance(key, str) else None
     if caption_fn is not None:
         cap = caption_fn(fact)
     else:
@@ -314,6 +415,15 @@ def gbp_caption(draft, ctx, caption_fn=None):
     # off a client's Google listing.
     if gbp.caption_issues(cap, city=ctx["city"]):
         return None
+    if key:
+        try:                                # atomic write: never a half-read by a peer
+            path = os.path.join(_caption_cache_dir(), f"{key}.txt")
+            tmp = f"{path}.{os.getpid()}.part"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(cap)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 - failing to cache never fails the caption
+            pass
     return cap
 
 
@@ -360,7 +470,7 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
             if not img_url:
                 skipped_media += 1
                 continue
-            cap = gbp_caption(draft, ctx, caption_fn=caption_fn)
+            cap = gbp_caption(draft, ctx, caption_fn=caption_fn, base_key=base_key)
             if not cap:
                 skipped_caption += 1
                 continue

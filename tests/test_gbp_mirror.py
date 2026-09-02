@@ -96,6 +96,95 @@ def test_active_for_is_case_and_blank_safe():
     assert config.gbp_mirror_active_for(None) is False
 
 
+# ---- per-build cost: the caches that make a rebuild nearly free -----------------------
+# The mirror runs one crop AND one caption generation per FEED POST per build (~268
+# fleet-wide), and a month rebuild re-runs every one of them. Three separate caches make
+# a rebuild cheap; each is pinned here because a silent cache miss is invisible except on
+# the bill.
+
+def test_a_remote_photo_gets_a_deterministic_name_not_a_random_temp(monkeypatch):
+    # THE cost leak this fixes: media_host._build_key is
+    # echo/<tenant>/<sha1-of-bytes>/<basename>, so a random temp basename changed the R2
+    # key every build, defeating content dedupe and writing a NEW object for identical
+    # pixels on every rebuild. A url-derived name makes the key stable.
+    a = gm.stable_local_name("https://cdn.test/eng/photo-one.jpg", ".jpg")
+    b = gm.stable_local_name("https://cdn.test/eng/photo-one.jpg", ".jpg")
+    c = gm.stable_local_name("https://cdn.test/eng/photo-two.jpg", ".jpg")
+    assert a == b, "same photo must localize to the same filename across builds"
+    assert a != c, "different photos must not collide"
+    assert a.endswith(".jpg") and "tmp" not in a
+
+
+def test_an_already_localized_photo_is_not_downloaded_again(monkeypatch, tmp_path):
+    monkeypatch.setattr(gm, "_localized_dir", lambda: str(tmp_path))
+    url = "https://cdn.test/eng/already-here.jpg"
+    # pre-seed the cache exactly as a previous build would have left it
+    (tmp_path / gm.stable_local_name(url, ".jpg")).write_bytes(b"realphotobytes")
+    calls = []
+    monkeypatch.setattr("agent.media_host.download_bytes",
+                        lambda u: calls.append(u) or b"x")
+    d = _draft(creative_path="")
+    d.creative_public_url = url
+    path, cleanup = gm._local_still(d, None, lambda m: None)
+    assert path and open(path, "rb").read() == b"realphotobytes"
+    assert calls == [], "a cached photo must never be re-fetched"
+    assert cleanup is None, "a cached source is kept, never deleted as a temp"
+
+
+def test_a_gate_clearing_caption_is_cached_and_reused_without_a_second_model_call(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(gm, "_caption_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr("agent.gbp.caption_issues", lambda cap, city=None: [])
+    calls = []
+
+    def _gen(fact, voice, city):
+        calls.append(fact)
+        return "Get stronger in Cape Coral. Real coaching, real results."
+
+    monkeypatch.setattr("agent.gbp_planner.generate_gbp_caption", _gen)
+    d, ctx = _draft(), _ctx()
+    first = gm.gbp_caption(d, ctx, base_key="eng")
+    second = gm.gbp_caption(d, ctx, base_key="eng")
+    assert first and first == second
+    assert len(calls) == 1, "the rebuild must reuse the cached caption, not regenerate"
+
+
+def test_a_rejected_caption_is_never_cached_so_a_later_build_retries(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(gm, "_caption_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr("agent.gbp.caption_issues", lambda cap, city=None: ["too long"])
+    monkeypatch.setattr("agent.gbp_planner.generate_gbp_caption",
+                        lambda f, v, c: "a caption the gate rejects")
+    assert gm.gbp_caption(_draft(), _ctx(), base_key="eng") is None
+    assert list(tmp_path.iterdir()) == [], "a skip must not be cached as an answer"
+
+
+def test_editing_the_voice_doc_invalidates_its_cached_captions():
+    ctx_a, ctx_b = _ctx(), _ctx()
+    ctx_a["voice"] = types.SimpleNamespace(raw="voice version one")
+    ctx_b["voice"] = types.SimpleNamespace(raw="voice version TWO, rewritten")
+    k1 = gm.caption_cache_key("eng", "same fact", "Cape Coral", ctx_a["voice"])
+    k2 = gm.caption_cache_key("eng", "same fact", "Cape Coral", ctx_b["voice"])
+    assert k1 != k2, "a rewritten bible must not serve copy from the old one"
+
+
+def test_the_cache_key_separates_gyms_and_cities():
+    v = types.SimpleNamespace(raw="one voice")
+    base = gm.caption_cache_key("eng", "fact", "Cape Coral", v)
+    assert gm.caption_cache_key("topfuel", "fact", "Cape Coral", v) != base
+    assert gm.caption_cache_key("eng", "fact", "Valparaiso", v) != base
+    assert gm.caption_cache_key("eng", "other fact", "Cape Coral", v) != base
+
+
+def test_an_injected_caption_fn_is_never_cached(monkeypatch, tmp_path):
+    # tests and callers that inject a generator must not pollute the real cache
+    monkeypatch.setattr(gm, "_caption_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setattr("agent.gbp.caption_issues", lambda cap, city=None: [])
+    gm.gbp_caption(_draft(), _ctx(), caption_fn=lambda f: "injected copy",
+                   base_key="eng")
+    assert list(tmp_path.iterdir()) == []
+
+
 # ---- what mirrors, and what must never ------------------------------------------------
 
 def test_a_feed_post_mirrors_to_a_googlebusiness_row(monkeypatch):

@@ -127,11 +127,22 @@ def _cropped_image_url(account_key, image, day_key):
         cache = "/tmp/gbp_crops"
     os.makedirs(cache, exist_ok=True)
     out = os.path.join(cache, f"{account_key}_{os.path.basename(image.path)}_gbp.jpg")
+    # CROP CACHE (2026-09-02): re-cropping a photo whose 1200x900 output is already on
+    # disk and newer than its source produces byte-identical pixels, so skip the work.
+    # This matters now that the mirror crops one photo per FEED POST on every build
+    # (~268 fleet-wide) rather than a handful per planned month. A source edited after
+    # its crop still re-crops, because the mtime comparison fails.
     try:
-        gbp.crop_4x3(image.path, out)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[gbp-planner] crop failed for {image.path}: {type(exc).__name__}")
-        return None
+        fresh = (os.path.isfile(out) and os.path.getsize(out) > 0
+                 and os.path.getmtime(out) >= os.path.getmtime(image.path))
+    except OSError:
+        fresh = False
+    if not fresh:
+        try:
+            gbp.crop_4x3(image.path, out)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gbp-planner] crop failed for {image.path}: {type(exc).__name__}")
+            return None
     if config.hosting_enabled():
         hosted = media_host.host_media(out, account_key)
         if hosted:
