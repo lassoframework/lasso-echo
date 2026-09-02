@@ -184,8 +184,37 @@ def alert(message, poster=None, force=False):
     text = "ECHO ALERT: " + scrub(message)
     poster = poster or _default_poster()
     try:
-        return poster.post_notice(text)
+        result = poster.post_notice(text)
     except Exception as e:
         # An alert must never take the pipeline down with it.
         print(f"[ops-alerts] failed to post alert: {type(e).__name__}: {scrub(e)}")
         return None
+    _maybe_cross_post_ops_fix(text, poster)
+    return result
+
+
+def _maybe_cross_post_ops_fix(alert_text, poster):
+    """Cross-post a NEEDS_TRIAGE alert into #echosupport as an OPS-FIX REQUEST
+    (Blake, 2026-09-02: "it should go to echo support that is already wired" --
+    #echosupport already gets live Slack events and already has a proven relay to
+    headless Claude Code; #echoclaude, where every alert still posts unchanged
+    above, does not).
+
+    Best-effort and silent-safe by construction: OFF unless
+    config.ops_fix_triage_enabled() is armed; a classification failure or a Slack
+    failure here is logged and swallowed, never raised into the caller -- the
+    primary alert already posted and must not be affected by this side effect.
+    """
+    if not config.ops_fix_triage_enabled():
+        return
+    try:
+        channel = config.support_channel_id()
+        if not channel:
+            return
+        from . import ops_triage
+        if ops_triage.classify(alert_text) != ops_triage.NEEDS_TRIAGE:
+            return
+        poster._chat_post(text=f"OPS-FIX REQUEST: {alert_text}", blocks=None,
+                          channel=channel)
+    except Exception as e:  # noqa: BLE001 - a side effect must never affect the caller
+        print(f"[ops-alerts] ops-fix cross-post failed: {type(e).__name__}: {scrub(e)}")

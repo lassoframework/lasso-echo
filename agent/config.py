@@ -1749,6 +1749,19 @@ def ops_alerts_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_ALERTS_ENABLED", "false"))
 
 
+def ops_fix_triage_enabled() -> bool:
+    """
+    Cross-post switch (Blake, 2026-09-02): when a live ops alert (ops_alerts.alert())
+    classifies as NEEDS_TRIAGE (agent/ops_triage.py), ALSO post it into the #echosupport
+    channel (support_channel_id()) as "OPS-FIX REQUEST: ...", where scout-listener's
+    ops-fix-triage.js relays it to headless Claude Code with real fix-and-ship authority.
+    OFF by default -- #echoclaude keeps receiving every alert exactly as it does today
+    either way; this only adds the cross-post. Inert without support_channel_id() set,
+    same as the gym support inbox.
+    """
+    return _truthy(os.environ.get("AGENT_OPS_FIX_TRIAGE_ENABLED", "false"))
+
+
 def support_inbox_enabled() -> bool:
     """
     Gym-facing support inbox switch. OFF by default = the /portal/<token>/support

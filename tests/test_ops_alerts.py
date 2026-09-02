@@ -24,9 +24,14 @@ from agent.store import PendingStore  # noqa: E402
 class RecordingPoster:
     def __init__(self):
         self.notices = []
+        self.chat_posts = []  # (text, channel) — the ops-fix cross-post path
 
     def post_notice(self, text):
         self.notices.append(text)
+        return {"ok": True}
+
+    def _chat_post(self, text, blocks=None, channel=None, thread_ts=None):
+        self.chat_posts.append((text, channel))
         return {"ok": True}
 
 
@@ -107,6 +112,93 @@ def test_failed_alert_post_only_logs(monkeypatch, capsys):
     monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
     assert ops_alerts.alert("boom", poster=ExplodingPoster()) is None  # no raise
     assert "[ops-alerts]" in capsys.readouterr().out
+
+
+# ---- 3b. ops-fix cross-post to #echosupport (2026-09-02) -----------------------
+# Blake: "it should go to echo support that is already wired." A NEEDS_TRIAGE alert
+# additionally cross-posts into #echosupport as "OPS-FIX REQUEST: ...", where
+# scout-listener's ops-fix-triage.js relays it. #echoclaude keeps getting every
+# alert unchanged either way (asserted below) — this is purely additive.
+
+def _wire_ops_fix(monkeypatch, support_channel="C_ECHOSUPPORT"):
+    rec = _wire(monkeypatch)
+    monkeypatch.setenv("AGENT_OPS_FIX_TRIAGE_ENABLED", "true")
+    monkeypatch.setattr(config, "support_channel_id", lambda: support_channel)
+    return rec
+
+
+def test_ops_fix_flag_defaults_off(monkeypatch):
+    monkeypatch.delenv("AGENT_OPS_FIX_TRIAGE_ENABLED", raising=False)
+    assert config.ops_fix_triage_enabled() is False
+
+
+def test_needs_triage_alert_cross_posts_when_armed(monkeypatch):
+    rec = _wire_ops_fix(monkeypatch)
+    # a real needs_triage shape from tonight (see tests/test_ops_triage.py)
+    ops_alerts.alert("intake ingest ABORTED for piercefitness: InternalError")
+    assert rec.notices == ["ECHO ALERT: intake ingest ABORTED for piercefitness: "
+                           "InternalError"], "the ORIGINAL #echoclaude post is unchanged"
+    assert len(rec.chat_posts) == 1
+    text, channel = rec.chat_posts[0]
+    assert channel == "C_ECHOSUPPORT"
+    assert text.startswith("OPS-FIX REQUEST: ECHO ALERT: intake ingest ABORTED")
+
+
+def test_noise_alert_never_cross_posts(monkeypatch):
+    rec = _wire_ops_fix(monkeypatch)
+    ops_alerts.alert("gritx: re-dated 4 expired row(s) into open day(s) "
+                     "2026-10-01..2026-10-02 (approvals preserved). No action needed.")
+    assert len(rec.notices) == 1, "#echoclaude still gets it"
+    assert rec.chat_posts == [], "but noise never reaches #echosupport"
+
+
+def test_cross_post_off_when_flag_unset(monkeypatch):
+    rec = _wire(monkeypatch)  # AGENT_OPS_FIX_TRIAGE_ENABLED left unset
+    monkeypatch.setattr(config, "support_channel_id", lambda: "C_ECHOSUPPORT")
+    ops_alerts.alert("intake ingest ABORTED for piercefitness")
+    assert rec.chat_posts == []
+
+
+def test_cross_post_off_when_no_support_channel_configured(monkeypatch):
+    rec = _wire(monkeypatch)
+    monkeypatch.setenv("AGENT_OPS_FIX_TRIAGE_ENABLED", "true")
+    monkeypatch.setattr(config, "support_channel_id", lambda: "")
+    ops_alerts.alert("intake ingest ABORTED for piercefitness")
+    assert rec.chat_posts == []
+
+
+def test_cross_post_failure_never_affects_the_primary_alert(monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_OPS_ALERTS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_OPS_FIX_TRIAGE_ENABLED", "true")
+    monkeypatch.setattr(config, "support_channel_id", lambda: "C_ECHOSUPPORT")
+
+    class FlakyOnChatPost:
+        def __init__(self):
+            self.notices = []
+
+        def post_notice(self, text):
+            self.notices.append(text)
+            return {"ok": True}
+
+        def _chat_post(self, **kwargs):
+            raise RuntimeError("echosupport post failed")
+
+    poster = FlakyOnChatPost()
+    result = ops_alerts.alert("intake ingest ABORTED for piercefitness", poster=poster)
+    assert result is not None, "the primary #echoclaude post still succeeded"
+    assert poster.notices == ["ECHO ALERT: intake ingest ABORTED for piercefitness"]
+    assert "[ops-alerts]" in capsys.readouterr().out
+
+
+def test_force_bypassed_alert_still_cross_posts(monkeypatch):
+    # force=True (self-gated callers) still reaches the primary post; the cross-post
+    # rides that same success path, independent of AGENT_OPS_ALERTS_ENABLED itself.
+    monkeypatch.delenv("AGENT_OPS_ALERTS_ENABLED", raising=False)
+    monkeypatch.setenv("AGENT_OPS_FIX_TRIAGE_ENABLED", "true")
+    monkeypatch.setattr(config, "support_channel_id", lambda: "C_ECHOSUPPORT")
+    rec = RecordingPoster()
+    ops_alerts.alert("intake ingest ABORTED for piercefitness", poster=rec, force=True)
+    assert len(rec.chat_posts) == 1
 
 
 # ---- 4. call site: media hosting failure ---------------------------------------

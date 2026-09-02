@@ -191,6 +191,9 @@ def _status():
     print(f"  support_inbox  : {config.support_inbox_enabled()}  (env AGENT_SUPPORT_INBOX; "
           f"gym support -> Slack channel {config.support_channel_id() or 'unset'}, "
           f"token env AGENT_SUPPORT_SLACK_BOT_TOKEN falls back to AGENT_SLACK_BOT_TOKEN)")
+    print(f"  ops_fix_triage : {config.ops_fix_triage_enabled()}  (env AGENT_OPS_FIX_TRIAGE_ENABLED; "
+          f"a NEEDS_TRIAGE alert additionally cross-posts to #echosupport as an OPS-FIX "
+          f"REQUEST for scout-listener's ops-fix-triage.js to relay)")
     print(f"  publish_confirm: {config.publish_confirm_enabled()}  (env AGENT_PUBLISH_CONFIRM_ENABLED)")
     print(f"  token_watchdog : {config.token_watchdog_enabled()}  (env AGENT_TOKEN_WATCHDOG_ENABLED, "
           f"warn at {config.token_warn_days()} days)")
