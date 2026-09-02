@@ -3896,3 +3896,73 @@ The Roxx overlay burn shipped and failed a 10-render pixel-measured proof 0/10 (
   — 6/6 pass (one automated false-positive on R2 traced to the gym's own tan door-frame color
   at the frame's un-scrimmed margin, confirmed by visual inspection, not real clipping).
   Full suite green (4704 passed, 11 skipped) before push.
+
+## Story classifier: the OCR signal measured "this room has words in it" (2026-09-01)
+The fleet-wide sweep (above, `story_classifier_sweep.py`) first ran with the OCR "burned
+text" signal answering "is there any legible text on this frame" — quarantined 31 of
+CrossFit Reverb's 34 real raw clips, because a CrossFit box's walls are covered in
+whiteboards/signage/timers. Root cause + fix: `agent/ocr_check.py` now asks the vision
+model the RIGHT question (`_OVERLAY_PROMPT`: was this text composited on in an editor, or
+physically in front of the lens — replies OVERLAY/SCENE/NONE, strictly parsed); the
+"9:16 AND 3..60s -> finished" signal (spec §0.2) is DROPPED outright (described nearly
+every raw phone clip); camera-native filename raised to 0.5 so it clears the decision
+floor alone and a single vision call can no longer flip a phone original to FINISHED —
+that now takes a second, independent finished signal (corroboration falls out of the
+weights, not a special case); cut density gated to clips >= 8s (a 3.4s clip's one false
+scene-detect hit was clearing the threshold on camera-whip noise alone). Re-run on real
+production data post-fix: Reverb 47/47 RAW (0 wrongly quarantined, was 31), Pierce still
+correctly quarantines both original known-bad fixtures + 18 more genuinely-produced clips.
+Applied for real (`--apply`, verified independently against the database): 28 total
+quarantined across ENG/Pierce/Zanshin, 0 for Reverb. Full sweep numbers, per-gym, are in
+the "Two New Engines" reliability report artifact.
+
+## Ops-alert noise + auto-fix triage loop (Blake, 2026-09-02)
+Blake: "I do not want all these messages every morning... if anything is broken or needs
+fixed... it should be a loop that things get fixed on their own without me."
+
+Root cause of the flood: `ops_alerts.py` has 168 flat call sites, one channel, zero
+severity — a self-heal ("no action needed") and a genuine break post identically.
+
+- **`agent/ops_triage.py`** (new) — `classify(text) -> NOISE | NEEDS_TRIAGE`. Default
+  NEEDS_TRIAGE (fail toward more eyes, never fewer); NOISE only on an explicit, narrow,
+  tested pattern (the "no action needed" / "not blocked" convention alert authors already
+  write, informational summary prefixes, a held-not-dropped A/B/C grade after self-fix — an
+  F/D held state or a DROPPED regression always stays surfaced). Proven against every real
+  `ops_alert` audit row from 2026-09-02 production: 14 of 35 correctly suppressed, 21
+  surfaced, zero false negatives against manual review. CLI seam:
+  `python -m agent ops-triage-classify "<text>"` — the relay in `~/scout-listener` shells
+  out to this rather than duplicating the pattern set in JS.
+- Two real bugs surfaced while building the pattern set from tonight's real alerts, both
+  fixed and tested: `zernio_profile_link.py` only ever backfilled `zernio_default_fb_page_id`
+  as a side effect of a first-time profile link, so a gym with an already-linked profile but
+  no page selected (`onboarding_watch`'s `no_fb_page`, live on Reverb/Bolton/Swift River) sat
+  unfixed forever — now backfills the page id alone for an already-linked profile, verified
+  live in production (both flagged gyms now carry a real page id). `gbp_conn_sync
+  ._tz_from_address` failed on "64 Hobbs Street #3, Conway, New Hampshire": New Hampshire was
+  simply absent from `_STATE_NAMES`, and separately the word-matching split every address
+  segment into individual words before comparing, so a two-word state name (New Hampshire,
+  New York, New Jersey, the Carolinas) could never match regardless of whether it was even in
+  the dict — fixed both.
+- **`~/scout-listener/src/ops-triage.js`** (new, separate repo) — a POLL loop (#echoclaude
+  gets no live message event; only `message.groups` is subscribed and #echoclaude is public,
+  same reason `brief.js` already reads it via `conversations.history` rather than an event
+  handler) that classifies each of Echo's own alert lines via the CLI above and relays
+  NEEDS_TRIAGE ones to headless Claude Code over this repo with a NEW preamble
+  (`docs/ops-fix-preamble.md`) — real authority this time (Write/Edit/Bash, may commit and
+  push; push = deploy), not `support-triage.js`'s read-only + one whitelisted command. The
+  preamble is the actual safety model: root-cause-before-fixing discipline, full suite green
+  before any push, a hard-forbidden list (billing/Stripe/pixel/CAPI/secrets/env vars, any
+  approval or publish gate, ENG's pending story, force-push, disabling a test to pass it),
+  and an explicit ESCALATE path (a business action only Blake can take, low confidence in the
+  root cause, a fix that's large or touches a forbidden surface) — diagnose plainly rather
+  than force a guess through.
+- **Ships OFF** (`OPS_TRIAGE_ENABLED` unset in scout-listener's `.env`) — not armed by the
+  commit that built it, on the same "every new capability ships OFF" discipline as everything
+  else in this repo. Arming needs: `OPS_TRIAGE_ENABLED=on`, `ECHO_CHANNEL_ID` set, the Echo
+  app tokens present (`ECHO_SLACK_APP_TOKEN`/`ECHO_SLACK_BOT_TOKEN` — `echoBotId` reuses
+  `scoutOwnBotId`, which only resolves to Echo's real identity when those are set; without
+  them the whole loop stays permanently inert by construction, never a looser bot match), and
+  `launchctl kickstart -k gui/$(id -u)/com.lasso.scout-listener` to pick up the new code.
+- **Open, deliberately not decided by me:** the very first live run of an autonomous
+  code-fixing loop deserves Blake watching it, not a silent 3am arm. Flagged for his own
+  go/no-go rather than armed in this same push.
