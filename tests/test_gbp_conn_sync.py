@@ -153,6 +153,27 @@ def test_tz_inference_precise_no_token_collision():
     assert gcs._tz_from_address("") is None
 
 
+# ---- multi-word state names (2026-09-02, Swift River CrossFit) --------------------------
+# "64 Hobbs Street #3, Conway, New Hampshire" came back unparseable in production. Root
+# cause was two bugs, both real: New Hampshire was simply absent from _STATE_NAMES, and
+# separately the word-matching split each address segment into individual words BEFORE
+# comparing, so a two-word dict key ("NEWHAMPSHIRE", "NEWYORK", ...) could never match
+# ANY address, regardless of whether the name was in the dict. These pin both fixes.
+
+def test_tz_multi_word_state_names_now_resolve():
+    # the exact production address that surfaced this.
+    assert gcs._tz_from_address(
+        "64 Hobbs Street #3, Conway, New Hampshire") == "America/New_York"
+    assert gcs._tz_from_address("1 Main St, Buffalo, New York") == "America/New_York"
+    assert gcs._tz_from_address("1 Main St, Newark, New Jersey") == "America/New_York"
+    assert gcs._tz_from_address("1 Main St, Providence, Rhode Island") == "America/New_York"
+    assert gcs._tz_from_address("1 Main St, Fargo, North Dakota") == "America/Chicago"
+    assert gcs._tz_from_address("1 Main St, Sioux Falls, South Dakota") == "America/Chicago"
+    assert gcs._tz_from_address("1 Main St, Charleston, West Virginia") == "America/New_York"
+    # still no false positives from an unrelated two-word street/city name.
+    assert gcs._tz_from_address("1 New Street, Anytown, Ontario") is None
+
+
 def test_no_profile_is_skipped():
     store = FakeStore()
     z = FakeZernio({}, {})           # no profile for eng

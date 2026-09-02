@@ -105,11 +105,49 @@ def test_links_empty_gym_with_fb_page(armed):
 
 
 def test_never_overwrites_a_set_id(armed):
-    db = _FakeDb({"eng": {"zernio_profile_id": "ALREADY"}})
+    # a gym whose page id is ALSO already set: nothing to backfill, no writes at all.
+    db = _FakeDb({"eng": {"zernio_profile_id": "ALREADY",
+                          "zernio_default_fb_page_id": "PAGE_ALREADY"}})
     z = _FakeZernio({"eng": "SHOULD_NOT_WIN"})
     out = zpl.link_client_profiles(bases=["eng"], zernio=z, db=db)
-    assert out["already"] == 1 and out["linked"] == 0
+    assert out["already"] == 1 and out["linked"] == 0 and out["page_backfilled"] == 0
     assert db.rows["eng"]["zernio_profile_id"] == "ALREADY"
+    assert db.upserts == []
+
+
+# ---- page-id backfill for an already-linked profile (2026-09-02, no_fb_page) -------------
+
+def test_backfills_page_id_for_an_already_linked_profile(armed):
+    # onboarding_watch's REASON_NO_FB_PAGE case: profile_id is set (Facebook connected),
+    # but no page was ever selected. The profile id must NOT change; only the page id fills.
+    db = _FakeDb({"theboltonclub": {"zernio_profile_id": "PID_EXISTING",
+                                    "zernio_default_fb_page_id": ""}})
+    z = _FakeZernio(
+        {}, accounts={"PID_EXISTING": {"accounts": [
+            {"platform": "facebook", "metadata": {"selectedPageId": "PAGE99"}}]}})
+    out = zpl.link_client_profiles(bases=["theboltonclub"], zernio=z, db=db)
+    assert out["page_backfilled"] == 1 and out["linked"] == 0
+    assert db.rows["theboltonclub"]["zernio_profile_id"] == "PID_EXISTING"  # untouched
+    assert db.rows["theboltonclub"]["zernio_default_fb_page_id"] == "PAGE99"
+
+
+def test_page_backfill_writes_nothing_when_no_page_is_resolvable(armed):
+    db = _FakeDb({"crossfitnewtown": {"zernio_profile_id": "PID2",
+                                      "zernio_default_fb_page_id": ""}})
+    z = _FakeZernio({}, accounts={"PID2": {"accounts": [{"platform": "instagram"}]}})
+    out = zpl.link_client_profiles(bases=["crossfitnewtown"], zernio=z, db=db)
+    assert out["page_backfilled"] == 0
+    assert db.upserts == []
+
+
+def test_page_backfill_never_touches_profile_id_and_skips_when_page_already_set(armed):
+    db = _FakeDb({"gritx": {"zernio_profile_id": "PID3",
+                            "zernio_default_fb_page_id": "ALREADY_SET"}})
+    z = _FakeZernio({}, accounts={"PID3": {"accounts": [
+        {"platform": "facebook", "metadata": {"selectedPageId": "DIFFERENT"}}]}})
+    out = zpl.link_client_profiles(bases=["gritx"], zernio=z, db=db)
+    assert out["page_backfilled"] == 0
+    assert db.rows["gritx"]["zernio_default_fb_page_id"] == "ALREADY_SET"  # untouched
     assert db.upserts == []
 
 

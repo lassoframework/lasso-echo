@@ -898,6 +898,7 @@ _COMMANDS = {
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
+        ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
     ],
     "trust & approvals": [
         ("trust", "show trust level for an account (--account <key>)"),
@@ -3005,6 +3006,12 @@ def main(argv=None):
         #   python -m agent lasso-remap [--month YYYY-MM] [--gym lasso] [--write]
         from .lasso_remap import cli as _lasso_remap_cli
         _lasso_remap_cli(argv[1:])
+    elif cmd == "ops-triage-classify":
+        # Classify one ops-alert line as noise/needs_triage. Argument or stdin; prints
+        # exactly "noise" or "needs_triage". The shell-out seam for scout-listener's
+        # ops-triage relay: python -m agent ops-triage-classify "<alert text>"
+        from .ops_triage import main as _ops_triage_main
+        sys.exit(_ops_triage_main(argv[1:]))
     elif cmd in ("help", "--help", "-h"):
         _usage()
     else:

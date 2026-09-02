@@ -38,6 +38,12 @@ for weeks). Two real bugs, both fixed here:
      find_profile_id_any (one /v1/profiles read for every candidate, the same alias-matching
      helper written for the Zanshin/Pete profile-duplication fix) instead of one HTTP round
      trip per candidate.
+
+2026-09-02: also backfills zernio_default_fb_page_id for a gym whose profile is ALREADY
+linked. Before this, "already have a profile_id" always meant "skip, nothing to do" -- so a
+gym that connected Facebook without a page selection (onboarding_watch's no_fb_page reason,
+live on Reverb, The Bolton Club, Swift River) sat forever unfixed by the one job whose own
+fix text told an operator to run it. Never touches an already-set profile id or page id.
 """
 
 from datetime import datetime, timezone
@@ -150,14 +156,37 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
         from .calendar_autopublish import client_gym_bases
         bases = client_gym_bases()
 
-    linked = already = no_profile = errors = 0
+    linked = already = no_profile = errors = page_backfilled = 0
     results = []
     for base in bases:
         try:
             row = db.gym_get(base)
-            if row and (row.get("zernio_profile_id") or "").strip():
+            existing_pid = (row.get("zernio_profile_id") or "").strip() if row else ""
+            if existing_pid:
+                # PAGE-ID BACKFILL (2026-09-02): a gym can have its profile linked (Facebook
+                # itself connected) with zernio_default_fb_page_id still empty -- onboarding_
+                # watch's REASON_NO_FB_PAGE case (Reverb, The Bolton Club, Swift River). This
+                # loop's own "never overwrite" guard above used to `continue` on ANY set
+                # profile_id, so a gym stuck exactly here was silently skipped by the one job
+                # whose fix text (_FIX[REASON_NO_FB_PAGE]) says to run it. The profile id is
+                # never touched here -- only a genuinely EMPTY page id gets filled, using the
+                # gym's OWN already-confirmed profile_id (no name matching, so the cross-
+                # tenant bind guard does not apply: we are not choosing which profile owns
+                # this key, only reading the page under a profile this key already owns).
                 already += 1
-                continue                                  # never overwrite a set id
+                if (row.get("zernio_default_fb_page_id") or "").strip():
+                    continue
+                try:
+                    page_id = _fb_page_id(zernio.list_accounts(existing_pid))
+                except Exception:
+                    page_id = ""
+                if page_id:
+                    db.gym_upsert(base, zernio_default_fb_page_id=page_id)
+                    page_backfilled += 1
+                    results.append({"gym": base, "status": "page_backfilled",
+                                    "fb_page_id": page_id})
+                    log(f"{base}: backfilled zernio_default_fb_page_id={page_id}")
+                continue                                  # never overwrite a set profile id
             # Match the Zernio profile by the base key FIRST (named gyms: eng, topfuel,
             # piercefitness), then every name candidate from BOTH the gyms-table row and the
             # dynamic account registry (display name, ig_handle, fb_page — see
@@ -262,4 +291,5 @@ def link_client_profiles(bases=None, zernio=None, db=None, logger=None):
             log(f"{base}: link failed: {type(e).__name__}: {e}")
 
     return {"ok": True, "linked": linked, "already": already,
-            "no_profile": no_profile, "errors": errors, "results": results}
+            "no_profile": no_profile, "errors": errors,
+            "page_backfilled": page_backfilled, "results": results}

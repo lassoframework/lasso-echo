@@ -91,6 +91,12 @@ _STATE_NAMES = {
     "NEWJERSEY": "NJ",
     "TEXAS": "TX", "TENNESSEE": "TN", "KENTUCKY": "KY", "KANSAS": "KS",
     "NEBRASKA": "NE", "IDAHO": "ID", "VERMONT": "VT", "DELAWARE": "DE",
+    # 2026-09-02 (Swift River CrossFit): every multi-word state name was simply absent
+    # here, so ANY gym in one of these five states fell all the way to the HQ-default
+    # fallback -- not a rare edge case, five real states. Every key below already has a
+    # zone in _STATE_TZ; only the name mapping was missing.
+    "NEWHAMPSHIRE": "NH", "RHODEISLAND": "RI", "NORTHDAKOTA": "ND",
+    "SOUTHDAKOTA": "SD", "WESTVIRGINIA": "WV",
 }
 
 
@@ -114,7 +120,17 @@ def _tz_from_address(address):
         if city in upper:
             return tz
     # 1. full state name (e.g. "... Cape Coral, Florida") — word-boundary, space-collapsed.
+    #
+    # 2026-09-02 (Swift River CrossFit, "64 Hobbs Street #3, Conway, New Hampshire"): this
+    # used to build `words` from p.split() ALONE -- splitting "New Hampshire" into "NEW"
+    # and "HAMPSHIRE" as two separate set members BEFORE the space-strip ran, so a
+    # two-word dict key like "NEWHAMPSHIRE" could never match anything, no matter which
+    # state it named. The docstring always promised "space-collapsed"; the code never
+    # did it. Fixed by ALSO collapsing each whole comma-part into one token (in addition
+    # to the per-word tokens single-word states still need), so "New Hampshire" ->
+    # "NEWHAMPSHIRE" alongside "NEW" and "HAMPSHIRE".
     words = {re.sub(r"[^A-Z]", "", w.upper()) for p in parts for w in p.split()}
+    words |= {re.sub(r"[^A-Z]", "", p.upper()) for p in parts}
     for name, st in _STATE_NAMES.items():
         if name in words and st in _STATE_TZ:
             return _STATE_TZ[st]
