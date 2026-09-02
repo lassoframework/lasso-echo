@@ -778,6 +778,30 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"GBP connection sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # GBP MONTH SWEEP (AGENT_GBP_MONTH_SWEEP, OFF by default): plan a month of Google
+    # Business content for EVERY gym whose GBP connection is 'connected'. Runs right after
+    # the connection sync above so it sees today's connection truth. Until this existed,
+    # plan_gbp_month was reachable ONLY from the manual one-gym gbp_dogfood entrypoint, so
+    # GBP content went out only when a human ran it by hand (ENG: zero published GBP posts
+    # ever, on a healthy connection). Writes PENDING rows only — never publishes, never
+    # coach_review — and is idempotent per gym. Fully isolated: a failure never takes the
+    # draft run down.
+    if config.gbp_month_sweep_enabled():
+        try:
+            from .jobs.gbp_month_sweep import run as _gbp_sweep_run
+            ssum = _gbp_sweep_run(alert=ops_alerts.alert)
+            if ssum.get("ok"):
+                print(f"[gbp-month-sweep] {ssum['gyms_planned']} gym(s) planned "
+                      f"({ssum['planned']} rows), {ssum['skipped_existing']} already "
+                      f"planned, {ssum['no_city']} no city, {ssum['blocked']} blocked, "
+                      f"{ssum['errors']} error(s)")
+            else:
+                print(f"[gbp-month-sweep] skipped: {ssum.get('reason')}")
+        except Exception as e:
+            print(f"[gbp-month-sweep] sweep failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"GBP month sweep failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # PARTIAL-CONNECTION WATCH (Hill Country 2026-08-26): alert staff when a gym has
     # connected some platforms but not all three past the grace window — the owner
     # completed one OAuth and reasonably believed all were connected; the CLIENT had to

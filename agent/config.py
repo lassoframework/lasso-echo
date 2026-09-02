@@ -1348,6 +1348,20 @@ def gbp_offer_confirmed_gyms() -> set:
     return {p.strip().lower() for p in raw.split(",") if p.strip()}
 
 
+def gbp_month_sweep_enabled() -> bool:
+    """Scheduled fleet-wide GBP planning (Blake, 2026-09-02: "all gyms that are connected
+    to google should get this ... and yes wire it").
+
+    WHY IT EXISTS: gbp_planner.plan_gbp_month was only reachable from the manual, one-gym
+    gbp_dogfood entrypoint, so Google Business content only ever went out when a human ran
+    it by hand -- ENG had ZERO published GBP posts in its entire history despite a healthy
+    connection. This arms the daily lane to plan a month for EVERY gym whose GBP connection
+    is 'connected'. Nothing publishes: rows land 'pending' and wait for the gym's own
+    approval, same as any feed post. Idempotent per gym (a gym with future GBP rows is
+    never re-planned)."""
+    return _truthy(os.environ.get("AGENT_GBP_MONTH_SWEEP", "false"))
+
+
 def gbp_coach_screen_enabled() -> bool:
     """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
     is written in the withheld 'coach_review' status so the OWNER never sees or approves it

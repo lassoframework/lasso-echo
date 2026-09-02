@@ -191,6 +191,10 @@ def _status():
     print(f"  support_inbox  : {config.support_inbox_enabled()}  (env AGENT_SUPPORT_INBOX; "
           f"gym support -> Slack channel {config.support_channel_id() or 'unset'}, "
           f"token env AGENT_SUPPORT_SLACK_BOT_TOKEN falls back to AGENT_SLACK_BOT_TOKEN)")
+    print(f"  gbp_month_sweep: {config.gbp_month_sweep_enabled()}  (env AGENT_GBP_MONTH_SWEEP; "
+          f"plans a PENDING GBP month for EVERY 'connected' gym on the daily lane — "
+          f"plan_gbp_month was manual/one-gym-only before this, so GBP never ran on a "
+          f"schedule for anyone)")
     print(f"  ops_fix_triage : {config.ops_fix_triage_enabled()}  (env AGENT_OPS_FIX_TRIAGE_ENABLED; "
           f"a NEEDS_TRIAGE alert additionally cross-posts to #echosupport as an OPS-FIX "
           f"REQUEST for scout-listener's ops-fix-triage.js to relay)")
