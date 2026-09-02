@@ -778,6 +778,23 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"GBP connection sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # LISTENER WATCH: alert when a DESKTOP service Echo depends on has stopped checking
+    # in. scout-listener (which picks support tickets and ops-fix requests out of
+    # #echosupport) crash-looped 47 times on 2026-09-02 with nobody told: client tickets
+    # sat untriaged and the only evidence was a stderr file no human reads. Echo screams
+    # when a GYM's calendar breaks; nothing screamed when the reader of those alerts was
+    # itself face down. Absence of a heartbeat IS the signal. Alerts once per episode and
+    # announces recovery once. No flag: a watchdog that ships off is a watchdog that was
+    # never armed, and this one only ever READS a kv stamp and posts an alert.
+    try:
+        from . import listener_watch as _lw
+        _lwsum = _lw.sweep(alert=ops_alerts.alert)
+        if _lwsum.get("down") or _lwsum.get("recovered"):
+            print(f"[listener-watch] {_lwsum['down']} down, "
+                  f"{_lwsum['recovered']} recovered, {_lwsum['healthy']} healthy")
+    except Exception as e:
+        print(f"[listener-watch] sweep failed: {type(e).__name__}: {e}")
+
     # GBP MONTH SWEEP (AGENT_GBP_MONTH_SWEEP, OFF by default): plan a month of Google
     # Business content for EVERY gym whose GBP connection is 'connected'. Runs right after
     # the connection sync above so it sees today's connection truth. Until this existed,

@@ -2363,6 +2363,41 @@ def build_server(port=None):
             self.end_headers()
 
         def do_POST(self):
+            # LISTENER HEARTBEAT: POST /ops/heartbeat {source, ts, sig}
+            #
+            # A desktop service Echo depends on (scout-listener, which picks support
+            # tickets and ops-fix requests out of #echosupport) checks in here so ECHO can
+            # notice when it dies. It crash-looped 47 times on 2026-09-02 and nobody knew:
+            # client tickets sat untriaged and the only evidence was a stderr file no human
+            # reads. A dead process cannot report its own death and a sleeping Mac cannot
+            # alert anyone, so the ping goes inward and ABSENCE is the signal
+            # (agent/listener_watch.sweep).
+            #
+            # Auth: HMAC over "<source>:<ts>" keyed on Echo's OWN Slack bot token, which
+            # the listener already holds to post as Echo. No new secret to distribute onto
+            # a machine whose .env this service cannot write, and the token never travels.
+            # A forged ping could only SUPPRESS a down alert, which is why it is signed.
+            if self.path.split("?")[0] == "/ops/heartbeat":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 4096:
+                    return self._deny(413, "too large")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    return self._send_json({"error": "invalid JSON"}, 400)
+                from . import listener_watch as _lw
+                source = str(body.get("source") or "").strip()
+                if source not in _lw.SOURCES:
+                    # unknown source: refuse rather than let a typo mint a watch that can
+                    # never go green (or a permanent alert for something never deployed).
+                    return self._send_json({"error": "unknown source"}, 400)
+                if not _lw.verify(source, body.get("ts"), body.get("sig"),
+                                  os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")):
+                    return self._send_json({"error": "unauthorized"}, 401)
+                ok = _lw.record(source)
+                return self._send_json({"ok": bool(ok)}, 200 if ok else 503)
+
             # Self-serve onboard: POST /portal/onboard {account_key, display_name}.
             # Auth: X-Portal-Key must equal AGENT_PORTAL_ONBOARD_KEY (constant-time
             # compare). Missing/wrong key -> 401. Also gated by AGENT_PORTAL_APPROVALS
