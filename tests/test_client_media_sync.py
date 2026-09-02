@@ -667,6 +667,75 @@ def test_sample_rows_never_block_the_real_build():
     assert not any(is_sample_row(r) for r in store.inserted)
 
 
+class SampleAwareStore(FakeStore):
+    """FakeStore plus delete_rows, so onboarding_demo.clear() can actually run
+    (clear() no-ops on a store without it). Rows carry ids the way the live
+    Supabase store returns them."""
+
+    def __init__(self, rows=None):
+        super().__init__()
+        self.rows = []
+        for i, r in enumerate(rows or []):
+            row = dict(r)
+            row.setdefault("id", f"seed{i}")
+            self.rows.append(row)
+        self.deleted_ids = []
+
+    def list_month(self, base_key, month):
+        return [r for r in self.rows
+                if str(r.get("post_date", ""))[:7] == month
+                and r.get("gym_id") == base_key]
+
+    def delete_rows(self, base_key, ids):
+        self.deleted_ids.extend(ids)
+        self.rows = [r for r in self.rows if r.get("id") not in set(ids)]
+        return len(ids)
+
+
+def test_real_build_clears_the_sample_rows():
+    """The Bolton Club, 2026-09-02 (second half of the same incident): after the
+    real build finally ran, the gym had 79 real rows AND 11 leftover
+    "SAMPLE: ..." STORY cards sitting on those same days in the client's
+    portal. crossfitsunnysidef574c0 had been showing 39 of them beside real
+    content for days.
+
+    Root cause: onboarding_demo.clear() ("called the moment real content is
+    about to land") had ZERO production callers, and the rebuild's own
+    delete-then-insert only prunes what it re-plans, so sample rows it does not
+    re-plan (stories, past dates) survived forever.
+
+    Fix: scan_and_generate calls onboarding_demo.clear() after a real build
+    lands. clear() only ever removes is_sample_row() rows."""
+    from agent.onboarding_demo import SAMPLE_PILLAR, SAMPLE_PREFIX, is_sample_row
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=6)
+    seeded = []
+    for i in range(6):
+        day = f"2026-09-{i + 2:02d}"
+        # a sample feed the rebuild WILL re-plan over, and a sample story it will not
+        seeded.append({"gym_id": "gritx", "account": "instagram", "format": "feed",
+                       "post_date": day, "status": "draft", "pillar": SAMPLE_PILLAR,
+                       "caption": f"{SAMPLE_PREFIX}feed placeholder {i}",
+                       "image_url": None})
+        seeded.append({"gym_id": "gritx", "account": "instagram", "format": "story",
+                       "post_date": day, "status": "pending", "pillar": SAMPLE_PILLAR,
+                       "caption": f"{SAMPLE_PREFIX}story placeholder {i}",
+                       "image_url": None})
+    store = SampleAwareStore(seeded)
+
+    from datetime import date
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 9, 2), days=30)
+    assert out["ok"] is True and out["generated"] == 1
+    # every sample row is gone: none survives next to the real content
+    assert not [r for r in store.rows if is_sample_row(r)], (
+        "sample rows must not survive a real build (old bug: onboarding_demo."
+        "clear() had no production caller, so SAMPLE story cards sat beside "
+        "real posts in the client's portal)")
+    assert store.deleted_ids, "the sample rows must be deleted, not just hidden"
+
+
 def test_denied_post_triggers_replacement_generation():
     """Dale / ENG: a denied post must NOT block its own replacement.
 

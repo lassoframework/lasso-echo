@@ -1087,6 +1087,25 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                         _db.kv_set(f"cadence_applied_{base}", str(ppd))
                 except Exception:  # noqa: BLE001
                     pass
+                # REAL CONTENT HAS LANDED, SO THE SAMPLES MUST GO. onboarding_demo.clear
+                # was written for exactly this moment ("called the moment real content is
+                # about to land") and had ZERO production callers, so no gym's samples
+                # were ever cleared by anything. The rebuild's own delete-then-insert only
+                # prunes what it re-plans, so sample STORY rows and past-dated sample rows
+                # survived it and sat beside the real posts in the client's portal: The
+                # Bolton Club finished this build with 79 real rows AND 11 "SAMPLE: A look
+                # at today's session goes here." story cards on those same days, and
+                # crossfitsunnysidef574c0 had been showing 39 of them next to real content
+                # for days. clear() only ever deletes rows is_sample_row() identifies, so a
+                # real row can never be touched; it is a no-op for a gym with no samples.
+                # Deliberately NOT gated on onboarding_demo.enabled(): a sample must never
+                # sit next to real content, including after the seeding flag is disarmed.
+                if not (built.get("noop_shrink") or built.get("noop_empty")):
+                    try:
+                        from . import onboarding_demo as _demo
+                        _demo.clear(base, store=store, log=log)
+                    except Exception as exc:  # noqa: BLE001 - never sink a real build
+                        log(f"{base}: sample clear skipped ({type(exc).__name__})")
                 results.append({"base": base, "status": "generated",
                                 "synced": sync.get("synced", 0),
                                 "upserted": built.get("upserted", 0)})
