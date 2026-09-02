@@ -624,6 +624,7 @@ def _existing_feed_count(store, base_key, start, days):
     if list_month is None:
         return 0, False
     from datetime import timedelta
+    from .onboarding_demo import is_sample_row
     months = sorted({(start + timedelta(days=i)).isoformat()[:7] for i in range(days)})
     feed_dates = set()
     for month in months:
@@ -639,6 +640,19 @@ def _existing_feed_count(store, base_key, start, days):
             # as "placed". Without this, a denied post blocks its own replacement
             # (existing_feeds stays at build_target so no rebuild fires).
             if status in ("denied", "killed", "deleted"):
+                continue
+            # SAMPLE ROWS ARE NOT "PLACED" (The Bolton Club, 2026-09-02): onboarding_demo
+            # seeds a clearly-labelled SAMPLE month (pillar='sample') for a gym whose
+            # real content is not built yet. Those rows are draft/wipeable and carry no
+            # real image, but before this guard they still counted as feeds here — so a
+            # gym whose sample feed count happened to reach its media/day cap
+            # (existing_feeds >= build_target) read as "already built out" FOREVER and
+            # the scanner never called the builder at all. The gym had a real voice doc,
+            # 4 approved sources and 12 real photos, and still never posted: it just sat
+            # on 36 SAMPLE rows because this count could not tell them apart from real
+            # ones. Exclude them exactly like denied/killed/deleted, so a sample-only
+            # calendar reads as zero existing feeds and the real build runs.
+            if is_sample_row(row):
                 continue
             fmt = str(row.get("format", "")).lower()
             acct = str(row.get("account", "")).lower()

@@ -623,6 +623,50 @@ def test_equal_media_and_feeds_is_idempotent_skip():
     assert store.inserted == [] and store.deleted == []
 
 
+def test_sample_rows_never_block_the_real_build():
+    """The Bolton Club, 2026-09-02: a gym with a real (non-hollow) voice doc, 4
+    approved sources and 12 real photos still sat on 36 onboarding SAMPLE rows
+    forever, showing the client "SAMPLE: ..." captions and blank image cards on
+    every card. Root cause: onboarding_demo seeded a sample feed row for each of
+    its 12 real photos (one feed row per day), and _existing_feed_count counted
+    those SAMPLE rows as "placed" feeds. existing_feeds (12) == build_target
+    (min(days*ppd, 12) == 12) read as "already built out", so scan_and_generate
+    skipped calling the builder and the real content was never generated.
+
+    Fix: _existing_feed_count excludes onboarding_demo.is_sample_row() rows the
+    same way it excludes denied/killed/deleted ones, so a sample-only calendar
+    reads as zero existing feeds and the real build actually runs.
+
+    Uses the "gritx" fixture account (the repo's static test gym) to model The
+    Bolton Club's exact shape: real voice doc, real approved sources, 12 real
+    photos, 12 pre-existing SAMPLE feed rows (one per photo)."""
+    from agent.onboarding_demo import SAMPLE_PILLAR, SAMPLE_PREFIX
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    r2 = _r2_with_uploads("gritx", n=12)
+    sample_rows = [
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": f"2026-09-{i + 1:02d}", "status": "draft",
+         "pillar": SAMPLE_PILLAR, "caption": f"{SAMPLE_PREFIX}placeholder {i}",
+         "image_url": None}
+        for i in range(12)
+    ]
+    store = FakeStore(existing={("gritx", "2026-09"): sample_rows})
+
+    from datetime import date
+    out = cms.scan_and_generate(clients=["gritx"], store=store, r2=r2,
+                                now=date(2026, 9, 2), days=30)
+    assert out["ok"] is True
+    assert out["generated"] == 1, (
+        "a sample-only calendar must never read as already-built-out; the real "
+        "build must run")
+    ig_feeds = _feed_ig_rows(store.inserted)
+    assert len(ig_feeds) == 12
+    # every inserted row is real content, never a sample
+    from agent.onboarding_demo import is_sample_row
+    assert not any(is_sample_row(r) for r in store.inserted)
+
+
 def test_denied_post_triggers_replacement_generation():
     """Dale / ENG: a denied post must NOT block its own replacement.
 
