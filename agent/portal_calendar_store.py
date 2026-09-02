@@ -1583,6 +1583,21 @@ def _stage_belts(account_key, payload):
     def _is_story(row):
         return str((row or {}).get("format") or "").strip().lower() == "story"
 
+    def _is_gbp_photo_drop(row):
+        """True for a Google Business PHOTO drop, which is image-only BY DESIGN.
+
+        2026-09-02: the empty-caption guard below exists because "a feed post may not
+        ship without real words". A GBP photo drop is not a feed post: gbp_planner
+        builds it with caption="" deliberately (format='photo', 4 per month per the
+        §5.1 cadence) because Google takes it as a photo upload on the listing. The
+        guard was dropping every one of them at stage time -- the first real fleet run
+        planned 12 rows for ENG and persisted 8, silently losing a third of the month.
+        Exempt it exactly the way a story already is: both are legitimate caption-less
+        post types, and nothing else about the guard changes."""
+        r = row or {}
+        return (str(r.get("account") or "").strip().lower() == "googlebusiness"
+                and str(r.get("format") or "").strip().lower() == "photo")
+
     def _alert(msg):
         print(f"[portal-calendar-store] {msg}")
         try:
@@ -1596,7 +1611,7 @@ def _stage_belts(account_key, payload):
     for row in payload:
         caption = str(row.get("caption") or "")
         post_date = str(row.get("post_date") or "")[:10]
-        if _is_story(row):
+        if _is_story(row) or _is_gbp_photo_drop(row):
             kept.append(row)
             continue
         if empty_guard:
