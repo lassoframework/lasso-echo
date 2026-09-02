@@ -1132,11 +1132,22 @@ def _maybe_format_feed(account, feed, library_path, log):
     if not config.feed_autofit_enabled():
         return
     path = (getattr(feed, "creative_path", "") or "").strip()
-    if not path:
+    hosted_src = (getattr(feed, "creative_public_url", "") or "").strip()
+    if not path and not hosted_src:
         return
     try:
-        from . import feed_image, media_host
-        asset = feed_image.get_or_make_feed_image(path, library_path, logger=log)
+        from . import feed_image, media_host, media_localize
+        # DRIVE LANE (2026-09-02, The Bolton Club): a Drive-sourced creative carries a
+        # creative_path in the record but NOTHING on disk at this point, so every autofit
+        # died on FileNotFoundError and logged "posting the raw photo". All 36 of Bolton's
+        # Drive photos did exactly that, which meant the reframe silently never ran for ANY
+        # Drive-lane gym and every out-of-spec photo fell through to the publish-time belt
+        # instead of the cached build path. Localize from the creative's OWN hosted url
+        # (deterministic name, kept for the next build) before autofitting.
+        src = media_localize.local_source_for(path, hosted_src, logger=log)
+        if not src:
+            return                                    # nothing local to reframe: keep raw
+        asset = feed_image.get_or_make_feed_image(src, library_path, logger=log)
         if not asset:
             return                                    # in-spec / video / render skipped
         if not config.hosting_enabled():
@@ -1146,9 +1157,13 @@ def _maybe_format_feed(account, feed, library_path, log):
             feed.creative_public_url = hosted
             if getattr(feed, "thumbnail_url", ""):
                 feed.thumbnail_url = ""               # the reframe IS the media
-            log(f"feed autofit applied for {os.path.basename(path)} (odd ratio -> 1080x1080)")
+            log(f"feed autofit applied for {os.path.basename(src)} "
+                "(odd ratio -> 1080x1080)")
     except Exception as exc:  # noqa: BLE001 - never crash the build; keep the raw photo
-        log(f"feed autofit lane failed for {os.path.basename(path)}: {type(exc).__name__}")
+        # name whichever source we actually had: a Drive creative has no local path.
+        label = os.path.basename(path) or os.path.basename(hosted_src.split("?")[0]) \
+            or "(no local path)"
+        log(f"feed autofit lane failed for {label}: {type(exc).__name__}")
 
 
 def _display_name_for(account):

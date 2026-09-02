@@ -116,7 +116,11 @@ def test_a_remote_photo_gets_a_deterministic_name_not_a_random_temp(monkeypatch)
 
 
 def test_an_already_localized_photo_is_not_downloaded_again(monkeypatch, tmp_path):
-    monkeypatch.setattr(gm, "_localized_dir", lambda: str(tmp_path))
+    # the cache seam lives in the SHARED module now (agent/media_localize), which the
+    # feed-autofit lane uses too -- patch it there, not on gbp_mirror's delegate.
+    from agent import media_localize
+    monkeypatch.setattr(media_localize, "cache_dir",
+                        lambda subdir=media_localize.DEFAULT_SUBDIR: str(tmp_path))
     url = "https://cdn.test/eng/already-here.jpg"
     # pre-seed the cache exactly as a previous build would have left it
     (tmp_path / gm.stable_local_name(url, ".jpg")).write_bytes(b"realphotobytes")

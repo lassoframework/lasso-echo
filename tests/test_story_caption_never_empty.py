@@ -180,7 +180,16 @@ def test_maybe_format_feed_swaps_when_reframed(monkeypatch, tmp_path):
     monkeypatch.setattr(feed_image, "get_or_make_feed_image",
                         lambda p, lib, logger=None: str(tmp_path / "reframed__feed.jpg"))
     monkeypatch.setattr(media_host, "host_media", lambda p, k: "https://cdn/x__feed.jpg")
-    feed = _Draft("cap", str(tmp_path / "tall.jpg"))
+    # the creative must actually EXIST on disk for this lane to reframe it. Before
+    # 2026-09-02 a missing file still reached the (stubbed) reframer; now
+    # _maybe_format_feed resolves a real local source first and keeps the raw photo when
+    # there is none, which is the correct behavior for a Drive creative with no local
+    # copy (see test_feed_image.py's Drive-lane tests). Write a real file so this test
+    # exercises what it is actually about: a produced reframe replaces the raw url.
+    tall = tmp_path / "tall.jpg"
+    from PIL import Image
+    Image.new("RGB", (600, 1600), "navy").save(tall)
+    feed = _Draft("cap", str(tall))
     client_month_run._maybe_format_feed(_Acct(), feed, tmp_path, lambda m: None)
     assert feed.creative_public_url == "https://cdn/x__feed.jpg"   # swapped to the reframe
 

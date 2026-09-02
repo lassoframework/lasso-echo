@@ -101,3 +101,59 @@ def test_make_feed_safe_from_bytes_leaves_in_spec_alone(tmp_path):
 def test_make_feed_safe_from_bytes_never_raises_on_garbage(tmp_path):
     assert feed_image.make_feed_safe_from_bytes(b"\xff\xd8not-an-image",
                                                 str(tmp_path / "o.jpg")) is None
+
+
+# ---- the Drive lane (2026-09-02, The Bolton Club) -------------------------------------
+# All 36 of Bolton's Drive photos logged "feed autofit failed ... FileNotFoundError;
+# posting the raw photo": a Drive-sourced creative carries a creative_path in the record
+# but nothing on disk at build time, so the reframe silently never ran for ANY Drive-lane
+# gym and every out-of-spec photo fell through to the publish-time belt instead of the
+# cached build path. _maybe_format_feed now localizes from the creative's OWN hosted url.
+
+def test_maybe_format_feed_localizes_a_drive_creative_and_reframes_it(monkeypatch, tmp_path):
+    import types
+    from agent import client_month_run as cmr, config, media_localize
+
+    monkeypatch.setattr(config, "feed_autofit_enabled", lambda: True)
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(media_localize, "cache_dir",
+                        lambda subdir=media_localize.DEFAULT_SUBDIR: str(tmp_path))
+    # the hosted bytes are a REAL out-of-spec image, so the reframe has something to do
+    from PIL import Image
+    src = tmp_path / "wide.jpg"
+    Image.new("RGB", (1600, 600), "navy").save(src)
+    raw = src.read_bytes()
+    monkeypatch.setattr("agent.media_host.download_bytes", lambda u: raw)
+    hosted_calls = []
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda p, tenant: hosted_calls.append(p) or "https://cdn/fit.jpg")
+
+    feed = types.SimpleNamespace(
+        creative_path="/data/content_library/theboltonclub/not_on_disk.jpg",
+        creative_public_url="https://cdn.test/theboltonclub/real.jpg",
+        thumbnail_url="")
+    account = types.SimpleNamespace(key="theboltonclub_ig", display_name="The Bolton Club")
+    logs = []
+    cmr._maybe_format_feed(account, feed, str(tmp_path), logs.append)
+
+    assert feed.creative_public_url == "https://cdn/fit.jpg", (
+        "the reframed 1080x1080 card must replace the raw Drive photo")
+    assert hosted_calls, "the reframe was hosted"
+    assert not any("FileNotFoundError" in m for m in logs)
+
+
+def test_maybe_format_feed_keeps_the_raw_photo_when_nothing_can_be_localized(
+        monkeypatch, tmp_path):
+    import types
+    from agent import client_month_run as cmr, config, media_localize
+    monkeypatch.setattr(config, "feed_autofit_enabled", lambda: True)
+    monkeypatch.setattr(media_localize, "cache_dir",
+                        lambda subdir=media_localize.DEFAULT_SUBDIR: str(tmp_path))
+    monkeypatch.setattr("agent.media_host.download_bytes", lambda u: None)
+    feed = types.SimpleNamespace(creative_path="/gone.jpg",
+                                 creative_public_url="https://cdn.test/gone.jpg",
+                                 thumbnail_url="")
+    account = types.SimpleNamespace(key="g_ig", display_name="G")
+    before = feed.creative_public_url
+    cmr._maybe_format_feed(account, feed, str(tmp_path), lambda m: None)
+    assert feed.creative_public_url == before, "ENHANCE-only: never drop or blank the post"
