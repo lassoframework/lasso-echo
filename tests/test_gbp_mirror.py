@@ -61,8 +61,39 @@ def test_flag_defaults_off():
 
 def test_flag_off_is_byte_for_byte_inert(monkeypatch):
     monkeypatch.delenv("AGENT_GBP_MIRROR", raising=False)
+    monkeypatch.delenv("AGENT_GBP_MIRROR_GYMS", raising=False)
     # no ctx, no image_fn, no caption_fn: if anything ran it would blow up or do I/O.
     assert gm.rows_for("eng", [_draft()], logger=lambda m: None) == []
+
+
+# ---- per-gym rollout rung (same shape as vision_gyms / story_studio_render_gyms) ------
+
+def test_the_pilot_allowlist_arms_only_the_named_gym(monkeypatch):
+    monkeypatch.delenv("AGENT_GBP_MIRROR", raising=False)
+    monkeypatch.setenv("AGENT_GBP_MIRROR_GYMS", "eng")
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.gbp.caption_issues", lambda cap, city=None: [])
+    kw = dict(ctx=_ctx(), image_fn=lambda d, day: "https://cdn.test/x.jpg",
+              caption_fn=lambda fact: "real copy", logger=lambda m: None)
+    assert len(gm.rows_for("eng", [_draft()], **kw)) == 1
+    # a gym NOT on the list stays completely inert, same build, same call
+    assert gm.rows_for("piercefitness", [_draft()], **kw) == []
+
+
+def test_the_global_flag_arms_every_gym_and_ignores_the_allowlist(monkeypatch):
+    monkeypatch.setenv("AGENT_GBP_MIRROR", "true")
+    monkeypatch.setenv("AGENT_GBP_MIRROR_GYMS", "someothergym")
+    monkeypatch.setattr(config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr("agent.gbp.caption_issues", lambda cap, city=None: [])
+    rows = gm.rows_for("eng", [_draft()], ctx=_ctx(),
+                       image_fn=lambda d, day: "https://cdn.test/x.jpg",
+                       caption_fn=lambda fact: "real copy", logger=lambda m: None)
+    assert len(rows) == 1
+
+
+def test_active_for_is_case_and_blank_safe():
+    assert config.gbp_mirror_active_for("") is False
+    assert config.gbp_mirror_active_for(None) is False
 
 
 # ---- what mirrors, and what must never ------------------------------------------------

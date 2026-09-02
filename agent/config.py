@@ -1381,8 +1381,34 @@ def gbp_mirror_enabled() -> bool:
     gyms whose GBP connection is 'connected' are mirrored. Stories are never mirrored
     (Instagram-only in Echo, exactly like the Facebook mirror).
 
-    Default OFF. Arm with AGENT_GBP_MIRROR=true on the `echo` service."""
+    Default OFF, and rolled out PER GYM (see gbp_mirror_gyms) exactly the way Echo Vision
+    and the Story Studio render lane were: this touches the core month build every gym
+    flows through, and the crop / caption / localize paths only ever meet real Drive media,
+    real R2 hosting and a real caption model in production. One gym proves it, then all."""
     return _truthy(os.environ.get("AGENT_GBP_MIRROR", "false"))
+
+
+def gbp_mirror_gyms() -> set:
+    """Pilot allowlist of base gym keys the Google Business mirror is armed for
+    (AGENT_GBP_MIRROR_GYMS, comma list, e.g. 'eng'). When AGENT_GBP_MIRROR is OFF but
+    this set is non-empty, the mirror runs for ONLY these gyms. When AGENT_GBP_MIRROR is
+    ON, every gym is eligible and this set is ignored. Empty + flag OFF => inert.
+
+    Same shape as story_studio_render_gyms / vision_gyms. A per-gym rung exists because
+    arming globally would turn a never-production-run crop+caption path loose on all 16
+    gyms' month builds at once."""
+    raw = os.environ.get("AGENT_GBP_MIRROR_GYMS", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+def gbp_mirror_active_for(gym_id) -> bool:
+    """True when the Google Business mirror is armed for THIS gym: either the global
+    AGENT_GBP_MIRROR flag is ON, or the gym's base key is in the pilot allowlist. The
+    single gate agent/gbp_mirror.rows_for consults per gym."""
+    if gbp_mirror_enabled():
+        return True
+    base = str(gym_id or "").strip().lower()
+    return bool(base) and base in gbp_mirror_gyms()
 
 
 def gbp_coach_screen_enabled() -> bool:

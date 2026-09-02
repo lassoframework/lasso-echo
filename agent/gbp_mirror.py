@@ -331,7 +331,11 @@ def rows_for(base_key, drafts, *, library_path=None, store=None, ctx=None,
     publish time), and its status is 'pending' — the owner's tap, never a coach screen.
     """
     log = logger or (lambda m: print(f"[gbp-mirror] {m}"))
-    if not config.gbp_mirror_enabled():
+    # PER-GYM ROLLOUT (same rung Echo Vision and the Story Studio render lane use): the
+    # global flag arms every gym, or a gym is named in AGENT_GBP_MIRROR_GYMS. Checked per
+    # gym rather than once, so one gym can prove the crop / caption / localize paths
+    # against real production media before all 16 gyms' month builds run them.
+    if not config.gbp_mirror_active_for(base_key):
         return []
     try:
         candidates = eligible_drafts(drafts)
