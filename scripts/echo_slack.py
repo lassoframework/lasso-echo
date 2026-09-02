@@ -12,9 +12,16 @@ Railway service). This script pulls it into memory and never prints or stores it
 Usage:
     python3 scripts/echo_slack.py <channel_id> <message_file>
     python3 scripts/echo_slack.py --whoami
+    python3 scripts/echo_slack.py --open-dm <user_id1,user_id2,...>
 
 Find a channel id with the Slack search tools (a group DM id looks like C0BTPBQD6SJ).
 Write the message to a file first so the text is reviewable before it goes out.
+
+--open-dm opens (or reuses) a group DM with the given Slack user ids as ECHO and
+prints the resulting channel id, so a client-facing send can go out as a private
+message with a LASSO teammate included (Blake's standing pattern: never DM a gym
+contact 1:1 without a teammate looped in). Pass the printed channel id to the normal
+two-arg send.
 """
 import json
 import subprocess
@@ -52,6 +59,18 @@ def main(argv):
     if argv and argv[0] == "--whoami":
         who = _api(tok, "auth.test")
         print("sending as:", who.get("user"), who.get("user_id"))
+        return 0
+    if argv and argv[0] == "--open-dm":
+        if len(argv) != 2 or not argv[1].strip():
+            print(__doc__)
+            return 2
+        users = argv[1].strip()
+        resp = _api(tok, "conversations.open", {"users": users})
+        if not resp.get("ok"):
+            print(f"open-dm failed | error: {resp.get('error')}")
+            return 1
+        channel = (resp.get("channel") or {}).get("id", "")
+        print(f"channel: {channel}")
         return 0
     if len(argv) != 2:
         print(__doc__)
