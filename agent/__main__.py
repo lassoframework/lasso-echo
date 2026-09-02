@@ -191,6 +191,11 @@ def _status():
     print(f"  support_inbox  : {config.support_inbox_enabled()}  (env AGENT_SUPPORT_INBOX; "
           f"gym support -> Slack channel {config.support_channel_id() or 'unset'}, "
           f"token env AGENT_SUPPORT_SLACK_BOT_TOKEN falls back to AGENT_SLACK_BOT_TOKEN)")
+    print(f"  gbp_mirror     : {config.gbp_mirror_enabled()}  (env AGENT_GBP_MIRROR; every "
+          f"FEED post a gym builds also lands on its Google Business listing, the same "
+          f"build-time cross-post the Facebook leg does — 1200x900 crop hosted before "
+          f"approval, Google-native caption that must clear the A+ gate or the row is "
+          f"skipped, connected gyms only, always the owner's own 'pending' tap)")
     print(f"  gbp_month_sweep: {config.gbp_month_sweep_enabled()}  (env AGENT_GBP_MONTH_SWEEP; "
           f"plans a PENDING GBP month for EVERY 'connected' gym on the daily lane — "
           f"plan_gbp_month was manual/one-gym-only before this, so GBP never ran on a "

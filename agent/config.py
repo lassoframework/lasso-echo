@@ -1362,6 +1362,29 @@ def gbp_month_sweep_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_GBP_MONTH_SWEEP", "false"))
 
 
+def gbp_mirror_enabled() -> bool:
+    """CROSS-POST EVERY FEED POST TO GOOGLE BUSINESS (Blake, 2026-09-02: "yes use GBP
+    planner tha anytime you post to ig, fb or whatever goes to google as well").
+
+    WHY IT EXISTS: Google Business content came ONLY from the separate monthly planner
+    (gbp_planner via the month sweep), which draws from its own rotation namespace and
+    reached 6 of the 10 Google-connected gyms. Meanwhile every feed post already
+    cross-posts IG -> Facebook at BUILD time. This arms the same mechanism for Google: a
+    gym's IG feed row also emits a googlebusiness row, so the gym's real month is what
+    lands on its Google listing.
+
+    Nothing about GBP changes downstream: the mirrored row is built in the planner's own
+    shape (gbp_planner._row), its image is cropped to 1200x900 and hosted at BUILD time
+    (the owner approves the exact pixels that publish), its caption must clear
+    gbp.caption_issues or the row is SKIPPED (A+ or nothing), it lands 'pending' and waits
+    for the gym's own approval, and it publishes through the existing GBP worker. Only
+    gyms whose GBP connection is 'connected' are mirrored. Stories are never mirrored
+    (Instagram-only in Echo, exactly like the Facebook mirror).
+
+    Default OFF. Arm with AGENT_GBP_MIRROR=true on the `echo` service."""
+    return _truthy(os.environ.get("AGENT_GBP_MIRROR", "false"))
+
+
 def gbp_coach_screen_enabled() -> bool:
     """GATE 2 (coach-screens-first-month): when ON (the DEFAULT), a gym's FIRST GBP month
     is written in the withheld 'coach_review' status so the OWNER never sees or approves it

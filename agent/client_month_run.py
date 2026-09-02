@@ -882,8 +882,23 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             r["status"] = "coach_review"
         log(f"{base_key}: FIRST month -> written 'coach_review' (withheld from owner "
             "until a coach releases it; GATE 2)")
+    # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF; Blake 2026-09-02: "anytime
+    # you post to ig, fb or whatever goes to google as well"). The same build-time
+    # cross-post the Facebook leg does, with the two things a Google post cannot share
+    # with an Instagram post done properly: a 1200x900 crop hosted BEFORE approval, and a
+    # Google-native caption that must clear the A+ gate or the row is skipped. Appended
+    # AFTER the GATE 2 loop on purpose: a GBP row is never 'coach_review' (Blake ruled it
+    # out for Google), it is always the owner's own 'pending' tap. See agent/gbp_mirror.py.
+    from . import gbp_mirror as _gbp_mirror
+    # NOTE: no store= is passed. `store` here is the calendar store; the mirror needs a
+    # GbpStore (connection posture + the CTA link live only there) and builds its own.
+    _gbp_rows = _gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
+                                     logger=log)
+    if _gbp_rows:
+        rows.extend(_gbp_rows)
     result = _apply(base_key, rows, start, days, store, log,
                     locked_days=locked_feed_days, allow_reshape=allow_reshape)
+    result["gbp_mirrored"] = len(_gbp_rows)
     result["days"] = built_days
     result["feeds"] = built_feeds
     result["posts_per_day"] = slots_per_day
@@ -1455,6 +1470,12 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             and _is_first_month(base_key, store, log)):
         for r in rows:
             r["status"] = "coach_review"
+    # GOOGLE BUSINESS MIRROR (AGENT_GBP_MIRROR, default OFF): a denied-slot replacement is
+    # a real feed post, so it mirrors to Google exactly like a month-build post. Appended
+    # after the GATE 2 loop so the GBP row stays 'pending' (never 'coach_review').
+    from . import gbp_mirror as _gbp_mirror
+    rows.extend(_gbp_mirror.rows_for(base_key, drafts, library_path=library_path,
+                                     logger=log))
     clean_rows = [{k: v for k, v in r.items() if k != "id"}
                   for r in rows if str(r.get("gym_id")) == str(base_key)]
     # Same Wave 7 stamping as the month build above: a denied-slot replacement is a
