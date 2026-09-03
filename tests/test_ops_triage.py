@@ -206,3 +206,51 @@ def test_main_classifies_stdin(capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("ECHO ALERT: intake ingest ABORTED"))
     ot.main([])
     assert capsys.readouterr().out.strip() == "needs_triage"
+
+
+# ---- systemic detection (2026-09-02 storm) ---------------------------------------------
+# Supabase's REST layer wedged and EVERY gym raised 'calendar_unreadable' at once. Each
+# alert cross-posted an ops-fix request, each request spawned a Claude Code session that
+# ran live database diagnostics against the database that was already down. Seven sessions
+# for one cause, accelerating. A shared-dependency failure is ONE incident.
+
+def test_the_real_stall_alerts_from_the_storm_are_systemic():
+    for gym in ("district_h", "topfuel", "piercefitness", "theboltonclub",
+                "crossfitlocal", "hillcountry", "train7164ae502"):
+        msg = (f"ECHO ALERT: gym {gym} is STALLED at 'calendar_unreadable': the shared "
+               "calendar could not be read (Supabase creds/network); no rebuild will run "
+               "until it reads again — its content pipeline cannot advance until a human "
+               "fixes this.")
+        assert ot.is_systemic(msg) is True, gym
+        # still needs a human: systemic never means silent
+        assert ot.classify(msg) == ot.NEEDS_TRIAGE, gym
+
+
+def test_the_real_readtimeout_alert_is_systemic():
+    msg = ("ECHO ALERT: GBP lane failed: ReadTimeout: HTTPSConnectionPool("
+           "host='ooqcvmcjspeltuuhcvlh.supabase.co', port=443): Read timed out. "
+           "(read timeout=30). The draft run is unaffected.")
+    assert ot.is_systemic(msg) is True
+
+
+def test_a_single_gym_content_problem_is_NOT_systemic():
+    """The distinction that matters: one gym's own content defect must still fan out
+    normally, or collapsing would hide real per-gym work."""
+    for msg in (
+        "ECHO ALERT: theboltonclub: not set up to post (no_fb_page). Facebook is connected "
+        "but no PAGE is selected.",
+        "ECHO ALERT: crossfitnine782f21b: not set up to post (key_mismatch, no_sources).",
+        "ECHO ALERT: calendar grade DROPPED: lasso forward book went 43 -> 40 (F).",
+        "ECHO ALERT: publish guard: row f75c19e9 (gym lasso) blocked at the publish "
+        "boundary (multi_ask); reverted to pending with reject_reason.",
+    ):
+        assert ot.is_systemic(msg) is False, msg[:60]
+
+
+def test_is_systemic_is_prefix_and_case_tolerant_and_never_raises():
+    bare = ("gym x is STALLED at 'calendar_unreadable': the shared calendar could not be "
+            "read (Supabase creds/network)")
+    assert ot.is_systemic(bare) is True
+    assert ot.is_systemic(bare.upper()) is True
+    assert ot.is_systemic("") is False
+    assert ot.is_systemic(None) is False

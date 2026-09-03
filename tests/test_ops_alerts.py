@@ -320,3 +320,77 @@ def test_store_write_failure_alerts_once_and_still_raises(monkeypatch, tmp_path)
     alerts = _alerts(rec)
     assert len(alerts) == 1
     assert "store write failed" in alerts[0]
+
+
+# ---- systemic collapse: one incident, not one per gym (2026-09-02) ---------------------
+
+class _KvDb:
+    def __init__(self, kv=None):
+        self.kv = dict(kv or {})
+
+    def kv_get(self, key, default=""):
+        return self.kv.get(key, default)
+
+    def kv_set(self, key, value):
+        self.kv[key] = value
+
+
+def _stall(gym):
+    return (f"gym {gym} is STALLED at 'calendar_unreadable': the shared calendar could "
+            "not be read (Supabase creds/network)")
+
+
+def test_seven_gyms_stalling_on_one_outage_escalate_ONCE(monkeypatch):
+    """THE storm, replayed: seven gyms, one underlying cause. Exactly one ops-fix request
+    may leave, or seven Claude Code sessions pile onto the database that is already down."""
+    rec = _wire_ops_fix(monkeypatch)
+    real = ops_alerts._claim_systemic_slot      # bind BEFORE patching, or it calls itself
+    db = _KvDb()
+    monkeypatch.setattr(ops_alerts, "_claim_systemic_slot", lambda: real(db=db))
+    for gym in ("district_h", "topfuel", "piercefitness", "theboltonclub",
+                "crossfitlocal", "hillcountry", "train7164ae502"):
+        ops_alerts.alert(_stall(gym))
+    assert len(rec.notices) == 7, "#echoclaude still gets EVERY gym's alert, unchanged"
+    assert len(rec.chat_posts) == 1, "but only ONE ops-fix request fans out"
+
+
+def test_a_per_gym_problem_still_fans_out_normally(monkeypatch):
+    rec = _wire_ops_fix(monkeypatch)
+    ops_alerts.alert("theboltonclub: not set up to post (no_fb_page). Facebook is "
+                     "connected but no PAGE is selected.")
+    ops_alerts.alert("crossfitlocal: not set up to post (not_connected).")
+    assert len(rec.chat_posts) == 2, "collapsing must not swallow real per-gym work"
+
+
+def test_the_window_reopens_for_a_genuinely_new_incident():
+    from datetime import datetime, timedelta, timezone
+    db = _KvDb()
+    t0 = datetime(2026, 9, 2, 23, 20, tzinfo=timezone.utc)
+    assert ops_alerts._claim_systemic_slot(db=db, now=t0) is True
+    assert ops_alerts._claim_systemic_slot(
+        db=db, now=t0 + timedelta(minutes=5)) is False
+    assert ops_alerts._claim_systemic_slot(
+        db=db, now=t0 + timedelta(minutes=31)) is True
+
+
+def test_the_dedupe_fails_OPEN_when_kv_is_unavailable():
+    """A dedupe that silently swallows an outage escalation is worse than a duplicate."""
+    class _Broken:
+        def kv_get(self, *a, **k):
+            raise RuntimeError("kv down")
+
+        def kv_set(self, *a, **k):
+            raise RuntimeError("kv down")
+
+    assert ops_alerts._claim_systemic_slot(db=_Broken()) is True
+
+
+def test_the_stamp_survives_a_restart_mid_incident():
+    """A worker that restarts during an outage must not re-fan-out the whole fleet."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 9, 2, 23, 20, tzinfo=timezone.utc)
+    db = _KvDb()
+    ops_alerts._claim_systemic_slot(db=db, now=t0)
+    fresh = _KvDb(db.kv)          # same persisted kv, brand new process
+    assert ops_alerts._claim_systemic_slot(
+        db=fresh, now=t0 + timedelta(minutes=2)) is False

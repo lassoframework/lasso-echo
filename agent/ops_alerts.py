@@ -193,6 +193,40 @@ def alert(message, poster=None, force=False):
     return result
 
 
+# One systemic escalation per window. 30 minutes is long enough that a multi-gym outage
+# escalates ONCE, short enough that a genuinely new incident half an hour later is not
+# swallowed. Deliberately stamped in the same kv the rest of this repo's alert-once
+# watches use, so it survives a restart mid-incident (a worker that restarts during an
+# outage must not re-fan-out the whole fleet).
+SYSTEMIC_ESCALATION_WINDOW = 30 * 60
+_SYSTEMIC_KEY = "ops_fix_systemic_escalated_at"
+
+
+def _claim_systemic_slot(db=None, now=None) -> bool:
+    """True when THIS systemic alert is the one that gets escalated this window (and the
+    slot is claimed). False when another already escalated recently.
+
+    Fails OPEN: if the stamp cannot be read or written, the alert escalates. A dedupe that
+    silently swallows an outage escalation is far worse than one duplicate request."""
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+    try:
+        if db is None:
+            from . import db as db
+        raw = db.kv_get(_SYSTEMIC_KEY) or ""
+        if raw:
+            last = datetime.fromisoformat(raw)
+            if not last.tzinfo:
+                last = last.replace(tzinfo=timezone.utc)
+            if (now - last).total_seconds() < SYSTEMIC_ESCALATION_WINDOW:
+                return False
+        db.kv_set(_SYSTEMIC_KEY, now.isoformat())
+        return True
+    except Exception as e:  # noqa: BLE001 - never swallow an escalation over a kv problem
+        print(f"[ops-alerts] systemic dedupe unavailable ({type(e).__name__}); escalating")
+        return True
+
+
 def _maybe_cross_post_ops_fix(alert_text, poster):
     """Cross-post a NEEDS_TRIAGE alert into #echosupport as an OPS-FIX REQUEST
     (Blake, 2026-09-02: "it should go to echo support that is already wired" --
@@ -213,6 +247,17 @@ def _maybe_cross_post_ops_fix(alert_text, poster):
             return
         from . import ops_triage
         if ops_triage.classify(alert_text) != ops_triage.NEEDS_TRIAGE:
+            return
+        # SYSTEMIC COLLAPSE (2026-09-02): a shared-dependency failure fires once per gym
+        # for ONE underlying cause. On the night Supabase's REST layer wedged, seven gyms
+        # each raised 'calendar_unreadable', each cross-posted, and each spawned a fix
+        # session that ran live database diagnostics against the database that was already
+        # down -- competing with the recovery for the exact resource that was exhausted.
+        # Collapse to ONE cross-post per window. The per-gym alerts still land in
+        # #echoclaude in full; only the fix-request fan-out is deduped.
+        if ops_triage.is_systemic(alert_text) and not _claim_systemic_slot():
+            print("[ops-alerts] systemic alert already escalated this window; "
+                  "not fanning out another ops-fix request")
             return
         poster._chat_post(text=f"OPS-FIX REQUEST: {alert_text}", blocks=None,
                           channel=channel)

@@ -26,6 +26,42 @@ import re
 NOISE = "noise"
 NEEDS_TRIAGE = "needs_triage"
 
+# ---- SYSTEMIC failures: one incident, not one incident per gym -----------------------
+#
+# 2026-09-02, the storm this exists to stop: Supabase's REST layer wedged, so EVERY gym's
+# calendar became unreadable at once. Echo alerted per gym -- district_h, topfuel,
+# piercefitness, theboltonclub, crossfitlocal, hillcountry, train7164ae502 -- each alert
+# cross-posted an OPS-FIX REQUEST, and each request spawned a headless Claude Code session
+# that ran LIVE DATABASE DIAGNOSTICS against the very database that was already face down.
+# Seven sessions, accelerating (7:20, 7:21, 7:24, 7:24, 7:25, 7:26, 7:27), all diagnosing
+# one shared cause.
+#
+# The lesson is not "alert less". It is that a SHARED-DEPENDENCY failure is ONE incident,
+# and fanning it out per tenant turns a bad minute into a self-amplifying storm that
+# competes with the recovery for the resource that is already exhausted.
+#
+# These alerts are still NEEDS_TRIAGE -- a human must absolutely hear about them -- but
+# ops_alerts collapses them to one cross-post per window instead of one per gym.
+_SYSTEMIC_MARKERS = (
+    "calendar_unreadable",
+    "the shared calendar could not be read",
+    "readtimeout",
+    "read timed out",
+    "connection pool",
+    "httpsconnectionpool",
+    "connection terminated",
+    "supabase creds/network",
+    "max retries exceeded",
+)
+
+
+def is_systemic(text) -> bool:
+    """True when an alert describes a SHARED dependency failing (the database, the network),
+    not one gym's own content problem. Such an alert is real and must be surfaced, but it
+    fires once per gym for a single underlying cause, so the cross-post is collapsed."""
+    t = _ALERT_PREFIX_RE.sub("", str(text or "")).lower()
+    return any(m in t for m in _SYSTEMIC_MARKERS)
+
 # Explicit self-heal / no-action phrasing. Alert authors already write this convention
 # deliberately (see ops_alerts.py's own docstring examples) -- trust it, it is the single
 # strongest signal in the whole corpus. Case-insensitive.
