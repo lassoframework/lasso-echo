@@ -1825,6 +1825,26 @@ def ops_fix_triage_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_FIX_TRIAGE_ENABLED", "false"))
 
 
+def ops_alerts_noise_filter_enabled() -> bool:
+    """
+    Slack noise gate (Blake, 2026-09-02 and again 2026-09-03: "i do not want all these
+    messages every morning all i want is if anything is broken or needs fixed").
+
+    When ON, an alert that ops_triage.classify() calls NOISE is NOT posted to Slack. It
+    is still written to the audit table first (ops_alerts.alert audits BEFORE any gate),
+    so nothing is lost and the full record stays queryable -- only Blake's morning feed
+    gets quieter.
+
+    Safe because the classifier is deliberately asymmetric: an alert shape it has never
+    seen is NEEDS_TRIAGE by construction, and every NOISE pattern is narrow and pinned to
+    a real production line in tests/test_ops_triage.py. So a new alert call site can never
+    be silently swallowed by this gate; it has to be explicitly, testably declared noise.
+
+    OFF by default, per the repo rule that every new capability ships inert.
+    """
+    return _truthy(os.environ.get("AGENT_OPS_ALERTS_NOISE_FILTER", "false"))
+
+
 def support_inbox_enabled() -> bool:
     """
     Gym-facing support inbox switch. OFF by default = the /portal/<token>/support

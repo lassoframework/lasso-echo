@@ -29,9 +29,9 @@ jobs:
       - name: Run tests
         # Deselect two tests that assert local-dev env state (ffmpeg present /
         # faster-whisper absent). CI has both installed, so the assertions are
-        # meaningless here — the detect_prereqs logic is covered by the other tests.
+        # inverted here — the detect_prereqs logic is covered by the other tests.
         run: |
-          python -m pytest -x -q \
+          python -m pytest -q \
             --deselect tests/test_clipper_phase0.py::test_detect_prereqs_ffmpeg_present \
             --deselect tests/test_clipper_phase0.py::test_detect_prereqs_faster_whisper_absent
         env:

@@ -181,6 +181,19 @@ def alert(message, poster=None, force=False):
         pass
     if not force and not config.ops_alerts_enabled():
         return None
+    # SLACK NOISE GATE (Blake, 2026-09-03). Of ~20 alerts in one morning, two were real
+    # breaks; the rest were self-describing informational lines ("Nothing was written and
+    # nothing was fabricated", "advisory gate", "it is in the build lane"). The audit
+    # write above already happened, so a suppressed line is still on the record and still
+    # queryable -- it just does not wake anyone. `force` callers (the token watchdog, the
+    # listener watchdog) bypass this, same as they bypass the master flag.
+    if not force and config.ops_alerts_noise_filter_enabled():
+        try:
+            from . import ops_triage
+            if ops_triage.classify(message) == ops_triage.NOISE:
+                return None
+        except Exception:  # noqa: BLE001 - a classifier fault must never eat an alert
+            pass
     text = "ECHO ALERT: " + scrub(message)
     poster = poster or _default_poster()
     try:

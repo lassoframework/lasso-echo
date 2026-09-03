@@ -182,6 +182,18 @@ def _to_utc_iso(iso_ts):
     return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# How much of an error body to keep. This was 200 chars, which is shorter than the
+# BOILERPLATE of a nested provider error: Zernio wraps Google Business Profile's own JSON,
+# so the first ~200 characters are '{"error":"Invalid request to Google Business Profile:
+# {"error": {"code": 400, "message": "Request contains an invalid argument.", "status":
+# "INVALID_ARGUMENT", "details"...' and the ACTUAL reason lives in the details array that
+# got cut off. A live GBP photo failure on crossfitnine7f7dadc (2026-09-03) was therefore
+# undiagnosable from the row, the alert, and the logs all three. Bounded, not unbounded:
+# callers still scrub() before surfacing, because a provider error can quote the
+# credential it rejected.
+_ERR_BODY_CHARS = 1200
+
+
 class ZernioError(Exception):
     def __init__(self, status, detail=""):
         self.status = status
@@ -214,7 +226,7 @@ class ZernioClient:
             timeout=30,
         )
         if r.status_code >= 400:
-            raise ZernioError(r.status_code, (r.text or "")[:200])
+            raise ZernioError(r.status_code, (r.text or "")[:_ERR_BODY_CHARS])
         return r.json()
 
     def _post(self, path, payload, headers=None):
@@ -228,7 +240,7 @@ class ZernioClient:
             timeout=30,
         )
         if r.status_code >= 400:
-            raise ZernioError(r.status_code, (r.text or "")[:200])
+            raise ZernioError(r.status_code, (r.text or "")[:_ERR_BODY_CHARS])
         return r.json()
 
     def _delete(self, path):
@@ -238,7 +250,7 @@ class ZernioClient:
             timeout=30,
         )
         if r.status_code >= 400:
-            raise ZernioError(r.status_code, (r.text or "")[:200])
+            raise ZernioError(r.status_code, (r.text or "")[:_ERR_BODY_CHARS])
         # a 204/empty body is a valid success for a delete
         try:
             return r.json()
@@ -699,7 +711,7 @@ class ZernioClient:
                                    headers={"Content-Type": str(content_type)},
                                    timeout=600)
         if r.status_code >= 400:
-            raise ZernioError(r.status_code, (r.text or "")[:200])
+            raise ZernioError(r.status_code, (r.text or "")[:_ERR_BODY_CHARS])
         return True
 
     def media_check_upload_status(self, public_url, tries=5, wait=2.0,

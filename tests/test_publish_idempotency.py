@@ -214,6 +214,9 @@ def test_interrupted_draw_alerts_once_and_never_refires(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_SCHEDULER_STATE_DIR", str(tmp_path))
     sent = []
     monkeypatch.setattr(ops_alerts, "alert", lambda m, **k: sent.append(m))
+    # coverage check must not hit a real DB in tests; return None (unknown) so the
+    # alert always lands on the noisy branch that includes --force
+    monkeypatch.setattr(listener, "_gyms_short_on", lambda day: None)
     # simulate: the day was claimed + started, the worker died mid-draw
     listener._write_last_run_date("2026-08-27")
     listener._mark_draw_started("2026-08-27")

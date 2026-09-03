@@ -92,7 +92,28 @@ def is_systemic(text) -> bool:
 # strongest signal in the whole corpus. Case-insensitive.
 _EXPLICIT_NO_ACTION_RE = re.compile(
     r"no action needed|not blocked;|approvals preserved"
-    r"|slot refills on the next plan pass",
+    r"|slot refills on the next plan pass"
+    # 2026-09-03, the morning Blake asked "are these true errors": three more shapes that
+    # say outright that nothing happened and nothing is wrong. Each is quoted verbatim
+    # from a real line in tests/test_ops_triage.py.
+    #
+    #   "GBP month sweep: <gym> is connected to Google Business but its month could not be
+    #    planned (nothing planned (no A+ captions or media)). Nothing was written and
+    #    nothing was fabricated."
+    # Fired for 4 gyms every day. It is the KNOWN no-local-photos gap, and the sentence is
+    # the content rail REPORTING ITSELF WORKING: it refused to invent captions. There is no
+    # code fix, so escalating it to a fix session produced four no-ops.
+    r"|nothing was written and nothing was fabricated"
+    # "event arc top-up: ... grades 88 (B) after remediation; staging anyway (advisory
+    #  gate -- top-up of an already-admitted client event; rows land pending)"
+    # Advisory BY NAME, and "rows land pending" means the approval gate still owns them.
+    r"|advisory gate"
+    # "<gym>: registered into Echo's account registry as 'CrossFit Nine 7' so it is in the
+    #  build lane. It still needs its own intake, connection and media before anything
+    #  real can post."
+    # A registration receipt. The gym's ACTUAL blockers arrive as their own
+    # 'not set up to post' alerts, which stay NEEDS_TRIAGE because they name real work.
+    r"|it is in the build lane",
     re.IGNORECASE)
 
 # Pure summary / log lines: not alerts about a problem at all, just a count.

@@ -153,14 +153,20 @@ def test_hamming_distance():
 def test_near_duplicate_images_cluster_far_from_different():
     from PIL import Image
     buf1, buf2, buf3 = io.BytesIO(), io.BytesIO(), io.BytesIO()
-    base = [(x * 4) % 256 for y in range(64) for x in range(64)]
-    Image.new("L", (64, 64)); img1 = Image.new("L", (64, 64)); img1.putdata(base)
+    # Base gradient with headroom (maxes at ~200) so the +8 near-dupe never clips.
+    # A clipping shift lands the hash on the DCT median boundary, where a 1-level
+    # resize difference between x86 (CI) and arm64 (dev) flips several bits and the
+    # test flakes across architectures. With no clipping a global brightness shift
+    # leaves every AC coefficient unchanged, so the near-dupe clusters at ~0 hamming
+    # on any platform. The <=6 / >6 thresholds (ruling 3) are unchanged.
+    base = [(x * 3) % 200 for y in range(64) for x in range(64)]
+    img1 = Image.new("L", (64, 64)); img1.putdata(base)
     img1.save(buf1, format="PNG")
-    # a JPEG-ish near-dupe: same content, tiny brightness shift
-    img2 = Image.new("L", (64, 64)); img2.putdata([min(255, p + 8) for p in base])
+    # a JPEG-ish near-dupe: same content, tiny brightness shift (no clipping)
+    img2 = Image.new("L", (64, 64)); img2.putdata([p + 8 for p in base])
     img2.save(buf2, format="PNG")
-    # a clearly different image
-    img3 = Image.new("L", (64, 64)); img3.putdata([(y * 4) % 256 for y in range(64) for x in range(64)])
+    # a clearly different image (transposed gradient)
+    img3 = Image.new("L", (64, 64)); img3.putdata([(y * 3) % 200 for y in range(64) for x in range(64)])
     img3.save(buf3, format="PNG")
     h1, h2, h3 = (vision.dct_phash(b.getvalue()) for b in (buf1, buf2, buf3))
     assert vision.hamming(h1, h2) <= 6      # near-dupe clusters

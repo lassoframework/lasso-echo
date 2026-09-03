@@ -103,13 +103,55 @@ def _mark_draw_finished(day):
     _write_state(d)
 
 
+def _gyms_short_on(day):
+    """Registry gyms with ZERO calendar rows dated `day`. Returns None when coverage
+    cannot be read, so the caller can say "unknown" rather than imply "fine".
+
+    Best effort by design: this only ever decides how LOUD an alert is, never whether
+    content is published, so a read failure must degrade to the noisier branch."""
+    try:
+        from . import db
+        from .portal_calendar_store import SupabaseCalendarStore
+        store = SupabaseCalendarStore()
+        short = []
+        checked = 0
+        for gym in (db.gym_list() or []):
+            base = str(gym.get("account_key") or "").strip()
+            if not base:
+                continue
+            rows = store.list_month(base, str(day)[:7]) or []
+            checked += 1
+            if not any(str(r.get("post_date") or "")[:10] == str(day)[:10] for r in rows):
+                short.append(base)
+        if not checked:
+            # NOT an empty "short" list. Checking zero gyms makes "no gym is short"
+            # vacuously true, which would report a total registry read failure as
+            # "everything is fine" -- the worst possible direction for this alert to
+            # fail. Unknown is unknown.
+            return None
+        return short
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler] day-coverage read failed: {type(e).__name__}: {e}")
+        return None
+
+
 def alert_interrupted_draw():
     """One deduped ops alert when the last daily draw STARTED but never FINISHED
     (a deploy/restart killed the worker mid-draw). The draw is NOT auto-refired —
     refiring the whole draw on restart is exactly what triple-published LASSO IG
     and burst five welcomes on 2026-08-27. Fail closed: a human decides whether
     to run `python -m agent run-daily` by hand. Called once at scheduler start;
-    best effort, never raises."""
+    best effort, never raises.
+
+    ANSWERS ITS OWN QUESTION (2026-09-03). This used to say "run it by hand if the day
+    is short" without ever checking whether the day WAS short, so every deploy that
+    landed mid-draw produced an alarming alert that a human then had to go and diagnose
+    by hand. Three of my own deploys tripped it in one morning while all 18 gyms in fact
+    had a full day of rows. Interrupted is not the same as incomplete: the draw is
+    idempotent per gym, so a restart near the end costs nothing. When nothing is missing
+    the alert now says so in the phrasing the triage classifier already treats as noise,
+    which keeps a harmless restart out of Slack entirely; a genuinely short day still
+    names the gyms and still shouts."""
     try:
         d = _read_state()
         started = d.get("draw_started")
@@ -120,14 +162,25 @@ def alert_interrupted_draw():
         if db.kv_get(key):
             return False
         db.kv_set(key, "1")
-        ops_alerts.alert(
-            f"the daily draw for {started} was INTERRUPTED mid-run (deploy or "
-            "restart). It is NOT auto-refired (fail closed: a blind refire is "
-            "what triple-published LASSO IG on 2026-08-27; per-draft claims + "
-            "the 24h meta dedup also guard it). Check #echoclaude for missing "
-            "cards; run `python -m agent run-daily --force` by hand if the day "
-            "is short (plain run-daily no-ops today because last_run_date is "
-            "already stamped).")
+        short = _gyms_short_on(started)
+        head = (f"the daily draw for {started} was INTERRUPTED mid-run (deploy or "
+                "restart). It is NOT auto-refired (fail closed: a blind refire is "
+                "what triple-published LASSO IG on 2026-08-27; per-draft claims + "
+                "the 24h meta dedup also guard it).")
+        if short is None:
+            tail = (" Could not read today's coverage, so this needs a human look: "
+                    "check #echoclaude for missing cards, and run `python -m agent "
+                    "run-daily --force` if the day is short.")
+        elif short:
+            tail = (f" {len(short)} gym(s) have NO rows for {started}: "
+                    f"{', '.join(sorted(short))}. Run `python -m agent run-daily "
+                    "--force` (plain run-daily no-ops because last_run_date is already "
+                    "stamped).")
+        else:
+            tail = (" Every registry gym still has rows for that day, so the draw had "
+                    "already placed the day's content before it was cut off. No action "
+                    "needed.")
+        ops_alerts.alert(head + tail)
         return True
     except Exception as e:
         print(f"[scheduler] interrupted-draw check failed: {type(e).__name__}: {e}")

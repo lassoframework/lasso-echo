@@ -220,11 +220,21 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None):
         resp = client.create_gmb_media(connection["zernio_account_id"],
                                        row["image_url"])
     except Exception as e:  # noqa: BLE001 - synchronous: an error IS the outcome
+        # CARRY THE MESSAGE, not just the class (2026-09-03). This recorded only
+        # type(e).__name__, so the live failure on crossfitnine7f7dadc read "photo
+        # upload: ZernioError" in the row AND in the alert -- naming the exception
+        # while discarding the one thing that says WHY (a rejected image size, an
+        # unlinked location, an expired grant all arrive as the same class). Nothing
+        # else logged it either, so the cause was unrecoverable after the fact.
+        # scrub() is what makes this safe to surface: a provider error can quote the
+        # credential it rejected.
+        from .ops_alerts import scrub
+        detail = scrub(f"{type(e).__name__}: {e}")[:900]
         if alert:
             alert(f"GBP photo drop failed for {row.get('gym_id')} "
-                  f"row {row.get('id')}: {type(e).__name__}")
+                  f"row {row.get('id')}: {detail}")
         return {"ok": False, "status": "failed", "late_post_id": "",
-                "reject_reason": f"photo upload: {type(e).__name__}", "mode": ""}
+                "reject_reason": f"photo upload: {detail}"[:400], "mode": ""}
     from .zernio import post_id_of
     return {"ok": True, "status": "published", "late_post_id": post_id_of(resp),
             "reject_reason": "", "mode": "live"}
