@@ -488,20 +488,68 @@ def _planned_mentions(caption, gym_id, category):
     return handles
 
 
-def _alert_publish_blocked(gym_id, row_id, code):
+def _revert_to_pending(store, row_id, reject_reason=""):
+    """Revert a row out of the 'publishing' claim after a PRE-NETWORK block.
+
+    Returns True only when the row is genuinely back in pending.
+
+    Why a failure here must never be swallowed: the atomic claim flips a row to
+    'publishing' BEFORE the guard runs, and mark_publishing only ever re-claims a
+    pending/approved row. So a revert that fails silently strands the row forever --
+    nothing retries it, and sweep_stuck_publishing deliberately only ALERTS, because
+    in the general case the post may already be live and a blind revert could
+    double-post.
+
+    This path is the one case where that ambiguity does not exist: the caption
+    cooldown and publish_guard both block BEFORE any network call, so the post
+    provably never went out and reverting is always safe. That is worth shouting
+    about rather than passing over -- it is exactly how rows d4574f62 and f75c19e9
+    (gym lasso) were stranded when the store was unreachable during the 2026-09-02
+    outage, one of them for five days.
+    """
+    try:
+        try:
+            store.mark_publish_failed(row_id, revert_status="pending",
+                                      reject_reason=reject_reason)
+        except TypeError:
+            # older store / test fakes without the reject_reason kwarg
+            store.mark_publish_failed(row_id, revert_status="pending")
+        return True
+    except Exception as e:  # noqa: BLE001 - a stranded row must never be silent
+        try:
+            from . import ops_alerts
+            ops_alerts.alert(
+                f"calendar row {row_id} is STRANDED in 'publishing': it was blocked "
+                f"BEFORE any publish attempt ({reject_reason or 'caption cooldown'}) "
+                f"but the revert to pending failed ({type(e).__name__}). The post did "
+                f"NOT go out, so flipping this row back to pending is safe and cannot "
+                f"double-post. Until then the row is invisible to the publish lane.")
+        except Exception:
+            pass
+        return False
+
+
+def _alert_publish_blocked(gym_id, row_id, code, reverted=True):
     """ONE deduped ops alert per (gym, violation code): kv key
     publish_blocked:<gym>:<code> fires once and stays quiet until the state
     changes (_clear_publish_blocked re-arms it when a row for the gym passes
-    the guard). Best effort; never raises into the lane."""
+    the guard). Best effort; never raises into the lane.
+
+    `reverted` reports what actually happened. It used to claim "reverted to pending"
+    unconditionally, which read as a completed action even on the nights the revert
+    threw and the row was left stranded in 'publishing'."""
     try:
         from . import db, ops_alerts
         key = f"publish_blocked:{gym_id}:{code}"
         if db.kv_get(key):
             return
         db.kv_set(key, str(row_id or "1"))
+        _state = ("reverted to pending with reject_reason" if reverted else
+                  "REVERT FAILED -- the row is stranded in 'publishing' and the "
+                  "publish lane can no longer see it")
         ops_alerts.alert(
             f"publish guard: row {row_id} (gym {gym_id}) blocked at the publish "
-            f"boundary ({code}); reverted to pending with reject_reason. Further "
+            f"boundary ({code}); {_state}. Further "
             f"'{code}' blocks for this gym stay quiet until a post publishes clean.")
     except Exception:
         pass
@@ -831,15 +879,14 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             # block (caption_ledger same-date rule).
             if _cl.is_blocked(gym_id, _cap, row.get("post_date", ""),
                               db=None):
-                try:
-                    store.mark_publish_failed(
-                        row_id, revert_status="pending")
-                except Exception:
-                    pass
-                _oa.alert(
-                    f"publish recheck: row {row_id} caption on cooldown, "
-                    f"reverted to pending"
-                )
+                if _revert_to_pending(row_id=row_id, store=store,
+                                      reject_reason="caption cooldown"):
+                    _oa.alert(
+                        f"publish recheck: row {row_id} caption on cooldown, "
+                        f"reverted to pending"
+                    )
+                # a failed revert already alerted (loudly, and with the fact that
+                # the post never went out) inside _revert_to_pending
                 failed.append(row_id)
                 continue
             _payload = _pg.PublishPayload(
@@ -852,19 +899,11 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             _viols = _pg.check(_payload)
             if _viols:
                 _reason = "publish_guard: " + ", ".join(_viols)
-                try:
-                    store.mark_publish_failed(row_id, revert_status="pending",
-                                              reject_reason=_reason)
-                except TypeError:
-                    # older store/test fakes without the reject_reason kwarg
-                    try:
-                        store.mark_publish_failed(row_id, revert_status="pending")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                _reverted = _revert_to_pending(row_id=row_id, store=store,
+                                               reject_reason=_reason)
                 for _code in _viols:
-                    _alert_publish_blocked(gym_id, row_id, _code)
+                    _alert_publish_blocked(gym_id, row_id, _code,
+                                           reverted=_reverted)
                 failed.append(row_id)
                 continue
             # Guard passed: the block state changed, so re-arm the deduped

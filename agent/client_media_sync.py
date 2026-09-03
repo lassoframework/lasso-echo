@@ -751,6 +751,23 @@ def _alert_stall(base_key, stage, detail, log):
         log(f"{base_key}: stall alert failed: {type(exc).__name__}")
 
 
+def _clear_stall(base_key, stage):
+    """Re-arm the deduped stall alert for one gym+stage, so a stage that RESOLVES can
+    alert again if it recurs. Mirrors _clear_publish_blocked.
+
+    Only call this for a stage that genuinely heals on its own (calendar_unreadable).
+    A durable stage -- no_voice, no_sources, no_account -- must KEEP its latch: those
+    stay broken until a human acts, and re-arming them would restore the every-scan
+    storm _alert_stall exists to prevent. Best-effort; never raises into the scan."""
+    try:
+        from . import db
+        key = f"gym_stall_alerted_{base_key}_{stage}"
+        if db.kv_get(key):
+            db.kv_set(key, "")
+    except Exception:  # noqa: BLE001 - re-arming must never break a good scan
+        pass
+
+
 def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                       logger=None):
     """For each onboarded client gym: sync its uploaded media, then build its DRAFT
@@ -923,6 +940,16 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
             # build_target (30) -> SKIP, no rebuild. A GENUINE media increase below the
             # cap still grows; a library already at/over the cap never churns again.
             existing_feeds, read_ok = _existing_feed_count(store, base, start, days)
+            if read_ok:
+                # RE-ARM ON RECOVERY (2026-09-02). calendar_unreadable is the one stall
+                # stage that heals ITSELF: it means a shared dependency (Supabase) was
+                # unreachable, not that this gym is misconfigured. The dedup latch is
+                # right for a durable per-gym stage (no_voice stays broken until a human
+                # acts) and exactly wrong here -- after the outage cleared, 14 gyms were
+                # left holding a permanent gym_stall_alerted_*_calendar_unreadable key,
+                # so the NEXT outage would have been completely silent for every one of
+                # them. Clearing on a good read makes it alert once per EPISODE.
+                _clear_stall(base, "calendar_unreadable")
             if not read_ok:
                 # Could not read reliably: do NOT risk a duplicate/rebuild this pass.
                 skipped_existing += 1

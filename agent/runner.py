@@ -786,14 +786,13 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # itself face down. Absence of a heartbeat IS the signal. Alerts once per episode and
     # announces recovery once. No flag: a watchdog that ships off is a watchdog that was
     # never armed, and this one only ever READS a kv stamp and posts an alert.
-    try:
-        from . import listener_watch as _lw
-        _lwsum = _lw.sweep(alert=ops_alerts.alert)
-        if _lwsum.get("down") or _lwsum.get("recovered"):
-            print(f"[listener-watch] {_lwsum['down']} down, "
-                  f"{_lwsum['recovered']} recovered, {_lwsum['healthy']} healthy")
-    except Exception as e:
-        print(f"[listener-watch] sweep failed: {type(e).__name__}: {e}")
+    # NOT SWEPT HERE. The sweep must run on the service that RECORDS the heartbeat, and
+    # that is echo-intake-web (POST /ops/heartbeat -> its own volume's kv). This worker has
+    # a different volume, so sweeping here read an empty kv, found never_seen, and stayed
+    # silent forever -- the watchdog was inert from the moment it shipped (verification
+    # audit 2026-09-02, finding A). It now runs in
+    # agent/intake_web.start_listener_watch_thread(). Do not re-add it here unless this
+    # service starts recording heartbeats itself.
 
     # GBP MONTH SWEEP (AGENT_GBP_MONTH_SWEEP, OFF by default): plan a month of Google
     # Business content for EVERY gym whose GBP connection is 'connected'. Runs right after

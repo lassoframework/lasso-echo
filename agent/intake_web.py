@@ -2921,7 +2921,73 @@ def build_server(port=None):
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Intake web online on :{server.server_address[1]} "
           f"(enabled: {config.intake_enabled()})")
+    start_listener_watch_thread()
     return server
+
+
+# How often the watchdog thread below re-checks. Five minutes matches the listener's own
+# ping interval, so a death is noticed within one DEFAULT_STALE_AFTER window plus one tick.
+LISTENER_SWEEP_SECONDS = 5 * 60
+
+
+def start_listener_watch_thread(*, interval=None, once=False):
+    """Run listener_watch.sweep() ON THIS SERVICE, in a daemon thread.
+
+    THE SPLIT BRAIN THIS FIXES (found by the 2026-09-02 verification audit, finding A):
+    the heartbeat is RECORDED here -- POST /ops/heartbeat lands in this service's kv, on
+    echo-intake-web's volume -- but the sweep was wired into the `echo` worker's periodic
+    lane, which has a DIFFERENT volume. echo therefore saw no listener_* keys at all, and
+    because listener_watch treats a never-seen source as silent by design, the watchdog
+    reported never_seen forever and could not fire. It shipped inert: the exact "a muted
+    watch is worse than none" case its own docstring warns about.
+
+    The sweep must live wherever record() writes, and it cannot be driven by the heartbeat
+    request itself -- a dead listener sends no request, so the absence would never be
+    evaluated. Hence a timer, not a route.
+
+    Alerting: this service has the Slack bot token and the SUPPORT channel id, but not the
+    ops channel id or AGENT_OPS_ALERTS_ENABLED, so the default ops poster would be a silent
+    no-op here. We post through ops_alerts (keeping its secret scrubbing) with an explicit
+    support-channel poster and force=True -- this watchdog is deliberately unflagged, since
+    a watchdog that ships off was never armed.
+    """
+    import threading
+
+    def _alert(message):
+        from . import ops_alerts
+        from .slack_surface import SlackPoster
+        channel = config.support_channel_id()
+        if not channel:
+            print("[listener-watch] no support channel configured; alert dropped")
+            return None
+        return ops_alerts.alert(message, poster=SlackPoster(channel=channel), force=True)
+
+    def _tick():
+        from . import listener_watch as lw
+        summary = lw.sweep(alert=_alert)
+        if summary.get("down") or summary.get("recovered"):
+            print(f"[listener-watch] {summary['down']} down, "
+                  f"{summary['recovered']} recovered, {summary['healthy']} healthy")
+        return summary
+
+    if once:                      # tests drive one pass synchronously
+        return _tick()
+
+    secs = interval or LISTENER_SWEEP_SECONDS
+
+    def _loop():
+        import time
+        while True:
+            time.sleep(secs)
+            try:
+                _tick()
+            except Exception as e:  # noqa: BLE001 - the watchdog must outlive its own bugs
+                print(f"[listener-watch] sweep failed: {type(e).__name__}: {e}")
+
+    t = threading.Thread(target=_loop, name="listener-watch", daemon=True)
+    t.start()
+    print(f"[listener-watch] armed on this service, every {secs}s")
+    return t
 
 
 def line_buffer_stdio():

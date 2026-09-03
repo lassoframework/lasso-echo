@@ -42,25 +42,50 @@ NEEDS_TRIAGE = "needs_triage"
 #
 # These alerts are still NEEDS_TRIAGE -- a human must absolutely hear about them -- but
 # ops_alerts collapses them to one cross-post per window instead of one per gym.
+# Phrases that NAME the shared dependency outright -- systemic on their own.
 _SYSTEMIC_MARKERS = (
     "calendar_unreadable",
     "the shared calendar could not be read",
+    "supabase creds/network",
+)
+
+# Transport failures. These are systemic ONLY when the text also names a shared host
+# below. The exception CLASS says nothing about blast radius: the identical
+# "ReadTimeout: HTTPSConnectionPool(...)" is a fleet-wide event when the host is
+# Supabase and ONE GYM'S problem when the host is graph.facebook.com. Keying on the
+# class alone let a single gym's Meta timeout claim the systemic slot and then
+# suppress the escalation for a genuine database outage for the next 30 minutes
+# (found by the 2026-09-02 verification audit, scenario G).
+_TRANSPORT_MARKERS = (
     "readtimeout",
     "read timed out",
     "connection pool",
     "httpsconnectionpool",
     "connection terminated",
-    "supabase creds/network",
     "max retries exceeded",
+)
+
+# The dependencies EVERY gym shares. A transport failure naming one of these is one
+# incident for the whole fleet; naming anything else it is that gym's own incident.
+_SHARED_HOSTS = (
+    "supabase.co",
+    "supabase.in",
 )
 
 
 def is_systemic(text) -> bool:
     """True when an alert describes a SHARED dependency failing (the database, the network),
     not one gym's own content problem. Such an alert is real and must be surfaced, but it
-    fires once per gym for a single underlying cause, so the cross-post is collapsed."""
+    fires once per gym for a single underlying cause, so the cross-post is collapsed.
+
+    Fails toward FANNING OUT: a transport error with no recognisable host is treated as
+    per-gym, so an unfamiliar shape gets more eyes rather than being collapsed away."""
     t = _ALERT_PREFIX_RE.sub("", str(text or "")).lower()
-    return any(m in t for m in _SYSTEMIC_MARKERS)
+    if any(m in t for m in _SYSTEMIC_MARKERS):
+        return True
+    if any(m in t for m in _TRANSPORT_MARKERS):
+        return any(h in t for h in _SHARED_HOSTS)
+    return False
 
 # Explicit self-heal / no-action phrasing. Alert authors already write this convention
 # deliberately (see ops_alerts.py's own docstring examples) -- trust it, it is the single
