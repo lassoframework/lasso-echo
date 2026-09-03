@@ -5,6 +5,7 @@ DCT perceptual hash, and the caption-eligibility / auto-plannable routing. Offli
 
 import io
 import os
+import random
 import sys
 
 import pytest
@@ -153,39 +154,47 @@ def test_hamming_distance():
 def test_near_duplicate_images_cluster_far_from_different():
     from PIL import Image
     buf1, buf2, buf3 = io.BytesIO(), io.BytesIO(), io.BytesIO()
-    # THIRD version of this fixture; the first two both flaked on the x86 CI runner
-    # while passing on arm64 dev, for two DIFFERENT reasons layered on top of each
-    # other. Both are worth keeping straight, because either one alone looks like a
-    # fix and is not:
+    # FOURTH version of this fixture. The first three all flaked on the x86 CI runner
+    # while passing on arm64 dev. Each earlier attempt fixed a REAL contributing
+    # factor and still missed the actual root cause:
     #
-    #   1. The original fixture used (x * 3) % 200 -- a SAWTOOTH, not a gradient.
-    #      Adding 8 moved the wrap discontinuity (198 -> 206, 0 -> 8), and resampling
-    #      that sharp edge rings differently across architectures.
-    #   2. Switching to a smooth ramp was not enough on its own, because dct_phash
-    #      RESIZES the image down to _DCT_N (32) first, and a real 64->32
-    #      interpolation is NOT bit-exact across platforms -- Pillow's resampling
-    #      uses SIMD code paths that round individual pixels by +-1 differently on
-    #      x86 vs arm64, which is enough to flip sign bits near the DCT median.
-    #      "resize is linear so a DC shift survives exactly" is true in real-number
-    #      math; it is not true of Pillow's fixed-point resampling kernel.
+    #   1. The original fixture used (x * 3) % 200 -- a SAWTOOTH. Adding 8 moved the
+    #      wrap discontinuity, and resampling a sharp edge rings differently across
+    #      architectures.
+    #   2. A smooth ramp removed the sawtooth, but dct_phash resizes 64 -> _DCT_N
+    #      first, and that interpolation is not bit-exact across platforms.
+    #   3. Building the source already at _DCT_N x _DCT_N made resize() a verified
+    #      no-op (Pillow's own short-circuit for matching dimensions), removing
+    #      resampling as a variable entirely -- and CI STILL failed, hamming 8.
     #
-    # The fix that is actually architecture-independent: build the source images
-    # AT _DCT_N x _DCT_N already, so resize(N, N) on an (N, N) image is a verified
-    # pixel-identical no-op (Image.resize short-circuits equal dimensions) rather
-    # than a real interpolation whose rounding differs by platform. With no resize
-    # step at all, a pure DC shift changes nothing but the DC coefficient, which the
-    # median excludes (flat[1:]) -- so the near-dupe hashes come out byte-identical
-    # (hamming 0) on every architecture, not merely "usually close enough".
+    # The actual cause, found by inspecting the coefficients directly: a smooth
+    # linear ramp is close to a PURE single DCT basis function, so 56 of its 63 AC
+    # coefficients come out within 1e-6 of the median -- essentially exact ties. The
+    # DCT here is pure Python summing _COS, a table built from math.cos() at import
+    # time, and cos() is not required to be bit-identical across libm
+    # implementations (glibc vs Apple's libm differ by a few ULP). That is normally
+    # invisible, but summed through 32 terms and compared against 56 near-zero ties,
+    # it is enough to flip sign bits -- nothing to do with resize or the pixel
+    # pattern's shape, and no fixture built from a smooth analytic function can avoid
+    # it: smoothness IS spectral concentration IS median degeneracy.
+    #
+    # The fix: give the fixture real TEXTURE, the way an actual photo has. A
+    # deterministically seeded pseudo-random image spreads DCT energy across most
+    # coefficients with real magnitude -- checked directly: the 8 closest to the
+    # median sit 20 to 1500+ units away, dwarfing any plausible floating-point noise
+    # by many orders of magnitude. This is also the more honest test: production
+    # images are never DCT-degenerate, so a fixture that risks it was testing a
+    # regime the classifier will never actually see.
     N = vision.dct_phash.__globals__["_DCT_N"]
-    base = [int(x * 190 / (N - 1)) for y in range(N) for x in range(N)]
+    rng = random.Random(20260902)                       # reproducible; date-stamped
+    base = [rng.randint(40, 210) for _ in range(N * N)]
     img1 = Image.new("L", (N, N)); img1.putdata(base)
     img1.save(buf1, format="PNG")
-    # a JPEG-ish near-dupe: same content, pure brightness shift, no clipping
+    # a JPEG-ish near-dupe: same texture, pure brightness shift, no clipping (max 210+8)
     img2 = Image.new("L", (N, N)); img2.putdata([p + 8 for p in base])
     img2.save(buf2, format="PNG")
-    # a clearly different image: the same ramp transposed (varies down, not across)
-    img3 = Image.new("L", (N, N))
-    img3.putdata([int(y * 190 / (N - 1)) for y in range(N) for x in range(N)])
+    # a clearly different image: independent texture from the same generator
+    img3 = Image.new("L", (N, N)); img3.putdata([rng.randint(40, 210) for _ in range(N * N)])
     img3.save(buf3, format="PNG")
     h1, h2, h3 = (vision.dct_phash(b.getvalue()) for b in (buf1, buf2, buf3))
     assert vision.hamming(h1, h2) <= 6      # near-dupe clusters
