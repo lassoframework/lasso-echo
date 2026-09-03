@@ -1,0 +1,34 @@
+name: echo-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -x -q
+        env:
+          # Tests that need live Supabase/Slack are expected to skip when creds
+          # are absent. Dummy values prevent import-time crashes on env reads.
+          SUPABASE_URL: "https://placeholder.supabase.co"
+          SUPABASE_SERVICE_ROLE_KEY: "placeholder"
+          AGENT_SLACK_BOT_TOKEN: "xoxb-placeholder"
+          AGENT_SLACK_CHANNEL_ID: "placeholder"
