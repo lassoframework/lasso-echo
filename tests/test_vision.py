@@ -153,28 +153,39 @@ def test_hamming_distance():
 def test_near_duplicate_images_cluster_far_from_different():
     from PIL import Image
     buf1, buf2, buf3 = io.BytesIO(), io.BytesIO(), io.BytesIO()
-    # A SMOOTH linear ramp, 0..190. The headroom keeps the +8 near-dupe from clipping,
-    # but headroom alone was not the problem: the old fixture used (x * 3) % 200, which
-    # is a SAWTOOTH, not a gradient. Adding 8 to a sawtooth is not a pure brightness
-    # shift -- it moves the wrap discontinuity (198 -> 206, 0 -> 8), and resampling a
-    # sharp edge down to the DCT grid rings differently on x86 (CI) than on arm64 (dev),
-    # which flipped bits near the median and failed CI at hamming 10 while passing
-    # locally.
+    # THIRD version of this fixture; the first two both flaked on the x86 CI runner
+    # while passing on arm64 dev, for two DIFFERENT reasons layered on top of each
+    # other. Both are worth keeping straight, because either one alone looks like a
+    # fix and is not:
     #
-    # A smooth ramp makes the invariant EXACT rather than approximate: resize() is a
-    # linear operation, so resized(base + 8) == resized(base) + 8, a change confined to
-    # the DC coefficient. The median is taken over the AC coefficients only (flat[1:]),
-    # so every threshold comparison is bit-identical and the near-dupe clusters at
-    # hamming 0 on any architecture. The <=6 / >6 thresholds (ruling 3) are unchanged.
-    base = [int(x * 190 / 63) for y in range(64) for x in range(64)]
-    img1 = Image.new("L", (64, 64)); img1.putdata(base)
+    #   1. The original fixture used (x * 3) % 200 -- a SAWTOOTH, not a gradient.
+    #      Adding 8 moved the wrap discontinuity (198 -> 206, 0 -> 8), and resampling
+    #      that sharp edge rings differently across architectures.
+    #   2. Switching to a smooth ramp was not enough on its own, because dct_phash
+    #      RESIZES the image down to _DCT_N (32) first, and a real 64->32
+    #      interpolation is NOT bit-exact across platforms -- Pillow's resampling
+    #      uses SIMD code paths that round individual pixels by +-1 differently on
+    #      x86 vs arm64, which is enough to flip sign bits near the DCT median.
+    #      "resize is linear so a DC shift survives exactly" is true in real-number
+    #      math; it is not true of Pillow's fixed-point resampling kernel.
+    #
+    # The fix that is actually architecture-independent: build the source images
+    # AT _DCT_N x _DCT_N already, so resize(N, N) on an (N, N) image is a verified
+    # pixel-identical no-op (Image.resize short-circuits equal dimensions) rather
+    # than a real interpolation whose rounding differs by platform. With no resize
+    # step at all, a pure DC shift changes nothing but the DC coefficient, which the
+    # median excludes (flat[1:]) -- so the near-dupe hashes come out byte-identical
+    # (hamming 0) on every architecture, not merely "usually close enough".
+    N = vision.dct_phash.__globals__["_DCT_N"]
+    base = [int(x * 190 / (N - 1)) for y in range(N) for x in range(N)]
+    img1 = Image.new("L", (N, N)); img1.putdata(base)
     img1.save(buf1, format="PNG")
     # a JPEG-ish near-dupe: same content, pure brightness shift, no clipping
-    img2 = Image.new("L", (64, 64)); img2.putdata([p + 8 for p in base])
+    img2 = Image.new("L", (N, N)); img2.putdata([p + 8 for p in base])
     img2.save(buf2, format="PNG")
     # a clearly different image: the same ramp transposed (varies down, not across)
-    img3 = Image.new("L", (64, 64))
-    img3.putdata([int(y * 190 / 63) for y in range(64) for x in range(64)])
+    img3 = Image.new("L", (N, N))
+    img3.putdata([int(y * 190 / (N - 1)) for y in range(N) for x in range(N)])
     img3.save(buf3, format="PNG")
     h1, h2, h3 = (vision.dct_phash(b.getvalue()) for b in (buf1, buf2, buf3))
     assert vision.hamming(h1, h2) <= 6      # near-dupe clusters
