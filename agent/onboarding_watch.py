@@ -302,6 +302,20 @@ def autoregister(base_key, gym_id, *, deps=None, alert=None):
         alert(f"{base_key}: registered into Echo's account registry as '{name}' so it "
               "is in the build lane. It still needs its own intake, connection and "
               "media before anything real can post.")
+    # THE NEXT GAP (2026-09-03): registration alone leaves a gym with ZERO platforms
+    # connected, and sending that first connect link was ALWAYS a separate manual
+    # step -- register_gym's own docstring says tokens are "never written here, by
+    # hand", and it turned out the notification was never automated either. Five
+    # gyms sat with a real Zernio profile and no connection ever attempted because
+    # of exactly this gap. OFF unless config.auto_connect_link_enabled(); never lets
+    # a notify failure affect the registration this function just made real.
+    try:
+        from . import connect_link_notify
+        connect_link_notify.notify_new_gym(base_key, gym_id, name, alert=alert)
+    except Exception as exc:  # noqa: BLE001 - the gym is registered either way
+        if alert:
+            alert(f"{base_key}: auto connect-link notify crashed "
+                  f"({type(exc).__name__}: {exc}). Send the connect link by hand.")
     return True
 
 

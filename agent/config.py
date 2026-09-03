@@ -1845,6 +1845,38 @@ def ops_alerts_noise_filter_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_ALERTS_NOISE_FILTER", "false"))
 
 
+def auto_connect_link_enabled() -> bool:
+    """
+    AUTO CONNECT-LINK (AGENT_AUTO_CONNECT_LINK). Default OFF.
+
+    onboarding_autoregister_enabled() closes "who puts a new gym into the account
+    registry". It leaves the gym with ZERO platforms connected -- a DIFFERENT gap
+    that was never automated: register_gym's own docstring says "Tokens are NEVER
+    written here (env, by hand)", and it turns out the notification was never
+    written anywhere either.
+
+    Verified live 2026-09-03: five gyms (CrossFit Sunnyside, CrossFit Local,
+    CrossFit Newtown, District H, MFLH) each had a real Zernio profile and ZERO
+    connection attempts EVER logged in Zernio's 90-day retained activity log --
+    not a broken connect flow (it worked for five OTHER gyms that same week), just
+    nothing that ever prompted the owner to click it. Two of those five
+    (CrossFit Local, CrossFit Newtown) had ALREADY cost a manual registration fix
+    once before (see onboarding_autoregister_enabled's docstring) -- the same gym
+    hitting the same class of silent gap twice, at two different steps.
+
+    When ON: connect_link_notify.notify_new_gym() is called right after
+    onboarding_watch.autoregister() successfully registers a NEW gym. It mints the
+    gym's connect link and sends it as an Echo Slack DM to the owner, resolved from
+    the portal's OWN records (gym_assignments joined to app_users, client_owner
+    relationship) -- never a guess, never an invented contact. Fires ONCE per gym
+    ever (kv-stamped). Any resolution failure (no single owner on file, no Slack
+    match, no bot token) ESCALATES a NEEDS_TRIAGE ops alert rather than doing
+    nothing silently -- a silent gap here would just recreate the exact bug this
+    flag exists to close.
+    """
+    return _truthy(os.environ.get("AGENT_AUTO_CONNECT_LINK", "false"))
+
+
 def support_inbox_enabled() -> bool:
     """
     Gym-facing support inbox switch. OFF by default = the /portal/<token>/support
