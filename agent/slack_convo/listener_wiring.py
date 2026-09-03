@@ -143,9 +143,15 @@ class ConvoWiring:
     def _boot_checks(self):
         # V-m1: the fixer channel is where every escalation and hold card lands. Unset, the
         # hold lane is a black hole. Say so at boot, not at the first held row.
-        if not config.fixer_channel_id():
-            self.log(f"[slack-convo/{self.identity.name}] WARNING AGENT_FIXER_CHANNEL_ID is "
-                     "unset: escalations and hold cards will mark failed until it is set")
+        # DV1 (2026-09-03): this used to check the global AGENT_FIXER_CHANNEL_ID regardless
+        # of identity, so a non-Echo identity with its OWN fixer_channel_env set (D29) got a
+        # false "will mark failed" warning even though outbox._channel_for's fallback made
+        # delivery work fine. Checks self.identity's own resolution now, same as delivery.
+        if not (self.identity.fixer_channel() or config.fixer_channel_id()):
+            self.log(f"[slack-convo/{self.identity.name}] WARNING "
+                     f"{self.identity.fixer_channel_env} (and the AGENT_FIXER_CHANNEL_ID "
+                     "fallback) are both unset: escalations and hold cards will mark failed "
+                     "until one is set")
         if not config.ops_fix_channel_id():
             self.log(f"[slack-convo/{self.identity.name}] WARNING no ops-fix channel: fixer "
                      "requests will mark failed until AGENT_OPS_FIX_CHANNEL_ID is set")

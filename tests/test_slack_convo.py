@@ -91,6 +91,10 @@ class FakeBus:
     def count_tickets_for_user_today(self, slack_user_id):
         return sum(1 for t in self.tickets.values() if t["slack_user_id"] == slack_user_id)
 
+    def find_recent_ticket_for_user_today(self, slack_user_id):
+        mine = [t for t in self.tickets.values() if t["slack_user_id"] == slack_user_id]
+        return dict(mine[-1]) if mine else None
+
     # messages
     def record_inbound(self, **kw):
         self.calls.append("record_inbound")
@@ -608,6 +612,77 @@ def test_staff_are_exempt_from_the_cap():
     assert not d.rate_limited
 
 
+def test_rate_limit_actually_stops_minting_new_tickets_once_capped():
+    """RB2/D25 (2026-09-03, MAJOR): the cap used to gate only classification while
+    get_or_create_ticket ran unconditionally -- a capped user could still mint a brand new
+    ticket, with a fresh per-ticket noise allowance, on every message. Past the cap, no new
+    ticket is created; the user's own messages attach to whatever ticket they already have."""
+    bus = FakeBus()
+    deps = _deps(bus, cap=2)
+    for i in range(2):
+        A.handle_event(_ev("posts broken", channel=f"G{i}", ts=f"{i}.0"), f"G{i}:{i}.0", deps)
+    assert len(bus.tickets) == 2
+    for i in range(10):
+        A.handle_event(_ev(f"posts still broken {i}", channel=f"G{i + 10}", ts=f"{i + 10}.0"),
+                       f"G{i + 10}:{i + 10}.0", deps)
+    assert len(bus.tickets) == 2, "past the cap, no message mints a fresh ticket"
+
+
+def test_unknown_identity_cannot_mint_unlimited_tickets_via_fresh_channel_mentions():
+    """RB2/D25: the same guarantee, for a fully unresolved stranger @mentioning the bot with
+    a non-threaded top-level message each time -- the exploit both re-audits reproduced
+    directly (no portal identity needed at all)."""
+    bus = FakeBus()
+    deps = _deps(bus, who=IG.UNKNOWN, cap=3, client_armed=False)
+    for i in range(20):
+        A.handle_event(_ev(f"help me please, message {i}", channel="C_ROOM",
+                           channel_type="channel", etype="app_mention", ts=f"{i}.0"),
+                       f"C_ROOM:{i}.0", deps)
+    assert len(bus.tickets) <= 3, "the daily cap actually bounds ticket count for UNKNOWN too"
+    total_escalations = sum(1 for m in bus.msgs if m["direction"] == "outbound"
+                            and (m["attachments"] or {}).get("kind") == A.KIND_ESCALATION)
+    # bounded by (tickets minted) * (per-ticket escalation cap), a small finite ceiling --
+    # not 20 messages -> 20 tickets -> 20+ escalations, the pre-fix behavior.
+    assert total_escalations <= 3 * A.MAX_UNKNOWN_ESCALATIONS_PER_TICKET_PER_DAY
+
+
+def test_reused_ticket_from_a_rate_limited_burst_is_never_demoted():
+    """A ticket a client already has in flight must not be reset to hold just because the
+    SAME client's over-cap burst happens to reuse it."""
+    bus = FakeBus()
+    deps = _deps(bus, cap=1)
+    d1 = A.handle_event(_ev("my facebook posts are broken", channel="G0", ts="0.0"),
+                        "G0:0.0", deps)
+    bus.set_ticket(d1.ticket_id, status="fixing", escalated=False)
+    A.handle_event(_ev("another totally different thing", channel="G1", ts="1.0"),
+                   "G1:1.0", deps)
+    assert len(bus.tickets) == 1, "over cap: reused the one ticket, minted no second"
+    assert bus.tickets[d1.ticket_id]["status"] == "fixing", "never demoted by the reuse"
+
+
+def test_answer_body_is_slack_escaped_before_it_can_reach_the_client(monkeypatch):
+    """DV4 (2026-09-03, MAJOR): an answer is model-generated from a transcript that includes
+    the client's own words -- a successful prompt injection had no defense once it left the
+    model. Every conversational body is now escaped once, at the single point it is written."""
+    bus = FakeBus()
+    ans = lambda t, w, m, q: {"body": "Yes <!channel> connected, ask <@U0EVIL> for details.",
+                              "grounding": {"ig": "connected"}}
+    d = A.handle_event(_ev("are my accounts connected?"), "k", _deps(bus, answer=ans))
+    row = _rows(bus, d.ticket_id, A.KIND_ANSWER)[0]
+    assert "<!channel>" not in row["body"] and "<@U0EVIL>" not in row["body"]
+    assert "&lt;!channel&gt;" in row["body"] and "&lt;@U0EVIL&gt;" in row["body"]
+
+
+def test_fixer_request_preamble_escapes_account_key_and_user():
+    """RB1 (2026-09-03, MAJOR): account_key/user sit OUTSIDE the fence, read as trusted
+    operator context rather than an untrusted report -- a polluted value there would be a
+    STRONGER injection than the one already fixed for the client's fenced message text."""
+    who = _who(IG.CLIENT, uid="U_CLIENT", account_key="crossfit<!channel>&fake")
+    row = A.fixer_request_text(IDS.get("echo"), "t1", "posts broken", who, "U_CLIENT")
+    assert "<!channel>" not in row
+    assert "&lt;!channel&gt;" in row and "&amp;fake" in row
+
+
 # ======================================================================================
 # the outbox gates
 # ======================================================================================
@@ -972,20 +1047,42 @@ def test_two_consumers_racing_the_same_row_only_one_posts(monkeypatch):
 
 
 def test_stale_posting_row_is_reclaimed_to_ready_on_the_next_run(monkeypatch):
-    """N4: a row stuck in 'posting' at the START of a run (the poster crashed between claim
-    and mark) is orphaned -- claim/post/mark is synchronous within one call, so nothing
-    legitimate is ever mid-flight across two calls -- and is swept back to ready."""
+    """N4/D26: a row stuck in 'posting' well past CLAIM_TIMEOUT_SECONDS (the poster crashed
+    between claim and mark) is orphaned and is swept back to ready."""
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("please look at my account, something is wrong"), "k",
                        _deps(bus, who=IG.UNKNOWN))
     row = _rows(bus, d.ticket_id, A.KIND_ESCALATION)[0]
     bus.claim_message(row["id"])                     # simulate a crash mid-flight
+    stale_claim = datetime.now(timezone.utc) - timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
+    bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale_claim.isoformat()})
     assert bus.message(row["id"])["delivery_status"] == "posting"
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
     assert s["reclaimed"] == 1
     assert bus.message(row["id"])["delivery_status"] == "posted", "reclaimed, then delivered"
+
+
+def test_a_row_just_claimed_is_not_reclaimed_out_from_under_a_live_post(monkeypatch):
+    """D26: the exact race a prior re-audit found -- two consumers of the same row (a
+    redeploy overlap, a second Wrangler per D2). A row claimed moments ago (genuinely still
+    in flight) must NOT be swept back to ready and re-posted by a concurrent sweep."""
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    d = A.handle_event(_ev("please look at my account, something is wrong"), "k",
+                       _deps(bus, who=IG.UNKNOWN))
+    row = _rows(bus, d.ticket_id, A.KIND_ESCALATION)[0]
+    bus.claim_message(row["id"])
+    bus.mark_message(row["id"], "posting",
+                     meta_update={"claimed_at": datetime.now(timezone.utc).isoformat()})
+    post, calls = _posted()
+    s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert s["reclaimed"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posting", \
+        "a fresh claim must survive a concurrent sweep, not be stolen and reposted"
+    assert not any(c["text"] == row["body"] for c in calls), \
+        "the frozen row's own text must not be posted a second time"
 
 
 def test_fixer_request_neutralises_forged_fence_and_slack_markup():
@@ -1375,7 +1472,9 @@ def test_inbound_events_run_on_a_bounded_pool(monkeypatch):
         def action(self, *a, **k):
             return lambda f: f
     bus = FakeBus()
-    w = W.ConvoWiring(_App(), IDS.get("echo"), _deps(bus), post=lambda *a, **k: "1",
+    # cap high enough that the daily ticket cap (a correctness feature, RB2/D25) never
+    # engages here -- this test is about the pool, not about rate limiting.
+    w = W.ConvoWiring(_App(), IDS.get("echo"), _deps(bus, cap=100), post=lambda *a, **k: "1",
                       log=lambda *a: None).register()
     assert isinstance(w._pool, ThreadPoolExecutor)
     assert w._pool._max_workers == W.MAX_CONCURRENT_EVENTS

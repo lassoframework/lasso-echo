@@ -101,7 +101,8 @@ def _parse_ts(value):
 
 def _age_seconds(row, now=None):
     att = row.get("attachments") or {}
-    born = _parse_ts(att.get("released_at")) or _parse_ts(row.get("created_at"))
+    born = (_parse_ts(att.get("claimed_at")) or _parse_ts(att.get("released_at"))
+           or _parse_ts(row.get("created_at")))
     if born is None:
         return 0
     return ((now or datetime.now(timezone.utc)) - born).total_seconds()
@@ -124,22 +125,42 @@ def hold_notice_blocks(row):
     return blocks
 
 
+CLAIM_TIMEOUT_SECONDS = 90
+
+
 def _claim(bus, row, log):
-    """Ready/held -> posting, a conditional PATCH only one caller can win (N4)."""
+    """Ready/held -> posting, a conditional PATCH only one caller can win (N4). Also stamps
+    claimed_at (a second, non-atomic write, but safe: we already exclusively own the row --
+    the CAS matched only for us) so _recover_stale_claims can tell a row that just started
+    posting from one truly orphaned by a crash (D26)."""
     try:
-        return bus.claim_message(row["id"])
+        if not bus.claim_message(row["id"]):
+            return False
     except AttributeError:
         return True  # a bus without claim support (older fakes): best effort, no CAS
     except Exception as e:  # noqa: BLE001
         log(f"[slack-convo/outbox] claim failed for row {row['id']}: {type(e).__name__}")
         return False
+    try:
+        bus.mark_message(row["id"], "posting",
+                         meta_update={"claimed_at": datetime.now(timezone.utc).isoformat()})
+    except Exception:  # noqa: BLE001 - best-effort stamp; the claim itself already succeeded
+        pass
+    return True
 
 
-def _recover_stale_claims(bus, identity, log):
-    """Any row still 'posting' at the START of a run -- before this call has claimed
-    anything -- is orphaned from a prior attempt that crashed between claim and post/mark
-    (the sequence is synchronous within one call, so nothing legitimate is ever mid-flight
-    across two calls). Swept back to 'ready' so it is retried rather than stuck forever."""
+def _recover_stale_claims(bus, identity, log, now=None):
+    """A row still 'posting' after CLAIM_TIMEOUT_SECONDS is orphaned -- either a crash
+    between claim and mark in THIS process, or (D26, the scenario the claim step exists for)
+    a redeploy overlap / second consumer per D2 that crashed mid-post. Swept back to 'ready'
+    so it is retried rather than stuck forever.
+
+    D26 (2026-09-03, MAJOR): this used to sweep EVERY 'posting' row unconditionally, with no
+    staleness check. Under exactly the multi-consumer scenario it exists to protect against,
+    a row genuinely mid-flight in process A (a slow Slack API call) would be un-claimed by
+    process B's very next 5-second sweep and re-posted while A was still in flight -- a
+    duplicate post, the opposite of the guarantee. The timeout is generous over realistic
+    post() latency so a live post is never stolen out from under it."""
     try:
         stuck = bus.outbox("posting", limit=200, identity=identity.name)
     except TypeError:
@@ -151,6 +172,8 @@ def _recover_stale_claims(bus, identity, log):
         return 0
     n = 0
     for row in stuck:
+        if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
+            continue  # plausibly still in flight; do not steal it
         try:
             bus.mark_message(row["id"], "ready", meta_update={"reclaimed_stale_posting": True})
             n += 1
@@ -165,7 +188,7 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None):
     Returns a summary dict. Never raises out of the loop."""
     summary = {"posted": 0, "held": 0, "suppressed": 0, "failed": 0, "skipped": 0,
                "resolved": 0, "reclaimed": 0}
-    summary["reclaimed"] = _recover_stale_claims(bus, identity, log)
+    summary["reclaimed"] = _recover_stale_claims(bus, identity, log, now=now)
     try:
         rows = bus.outbox("ready", limit=limit, identity=identity.name)
     except TypeError:  # a bus without the identity filter (older fakes)

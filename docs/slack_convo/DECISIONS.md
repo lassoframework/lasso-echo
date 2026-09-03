@@ -241,3 +241,79 @@ channel. Ranger, Scout, Wrangler and Lainey now each carry their own env name
   file is outside this repo and Blake was mid-edit in it; not touched.
 - RT-M1: lasso-echo `main` has no branch protection; the ops-fix worker preamble claims
   "tested" before any test runs. Both live in GitHub settings / ~/scout-listener.
+
+---
+
+# Audit wave 3 (2026-09-03): fresh re-verification of wave 2's fixes
+
+Two fresh VERIFIER agents (not the wave-2 fixers) re-checked D24-D29 and RA-M1/M2/M3/m5
+against commit 203d260. Both independently found the SAME root cause behind a different
+symptom each had flagged: the daily ticket cap gated dispatch, not ticket creation --
+`get_or_create_ticket` ran unconditionally regardless of `rate_limited`, and an UNKNOWN
+identity's branch returned before the rate-limit check was ever reached. Combined: 0
+CRITICAL, 3 MAJOR (D30-D32, one confirmed by both agents independently), 2 minor.
+
+## D30 (RB2/D25-STILL-BROKEN, MAJOR, confirmed by BOTH re-audits independently). The daily
+## cap now actually stops ticket creation, for every identity kind
+Wave 2's per-ticket noise caps (D25) only bound REPEAT noise on a ticket that already
+exists. They did nothing against a user who simply gets a FRESH ticket every message: a
+non-threaded `app_mention` never matches an open ticket (only IM/MPIM do), and
+`get_or_create_ticket` ran with no regard for `rate_limited` -- so every message, capped or
+not, known or fully UNKNOWN (whose branch returned before the rate-limit check was ever
+reached), minted a new ticket with a fresh per-ticket allowance. Both re-audits reproduced
+this directly against FakeBus: 20 fresh `@mention`s from an unresolved stranger produced 20
+tickets and 20 escalations to #fixer -- the same "unbounded noise" failure D25 claimed
+closed, via a different trigger.
+
+Fixed at the root: the daily cap now gates ticket CREATION itself, for every identity kind.
+Once a user (any kind, staff exempt as before) is at the cap, no new ticket is minted --
+`Bus.find_recent_ticket_for_user_today` finds whatever ticket they already have today and
+the message attaches there, so it inherits that ticket's existing per-ticket noise caps
+(D25) instead of a fresh allowance. Total worst-case noise per user per day is now hard-
+bounded at roughly `daily_cap() * per-ticket cap`, not unbounded. A reused ticket is never
+demoted (status only gets forced to hold on the rare path where the reuse lookup itself
+fails and one ticket has to be minted).
+
+## D31 (D26-STILL-BROKEN, MAJOR). The stale-claim sweep can no longer steal a live post
+D26's `_recover_stale_claims` swept EVERY row in 'posting' back to 'ready' with no
+staleness check at all. Under the exact multi-consumer scenario the claim step exists to
+protect against (a redeploy overlap, a second Wrangler per D2), a row genuinely mid-flight
+in one process (a slow Slack API call) would be un-claimed by another process's very next
+5-second sweep and re-posted while the first was still in flight -- a duplicate post, the
+opposite of the guarantee. Fixed: `claim_message` now also stamps `claimed_at`; the sweep
+only reclaims a row that has been 'posting' for more than `CLAIM_TIMEOUT_SECONDS` (90s,
+generous over realistic post latency), so a live claim survives a concurrent sweep and only
+a genuinely orphaned one (from a real crash) is recovered.
+
+## D32 (DV4 + RB1, MAJOR). Client-facing and preamble text are now Slack-escaped too
+D27 escaped only the client's raw text inside the fixer_request fence. Two paths were still
+raw: (1) a QUESTION's answer body is model-generated from a transcript that includes the
+client's own words -- a successful prompt injection had no defense once it left the model,
+and would have posted live `<!channel>` / `<@U...>` markup straight into the real client
+conversation (DV4); (2) `user` and `who.account_key` sit in the fixer_request/hold_notice
+PREAMBLE, outside the fence, read as trusted operator context rather than an untrusted
+report -- a polluted value there is a STRONGER injection than the one already closed, since
+it needs no fence-breakout at all (RB1). Fixed: every CONVERSATIONAL body is Slack-escaped
+once, at the single point `emit()` writes the row (covers both the eventual post() and any
+hold_notice card built from it); `user`/`account_key` are escaped in both preamble builders.
+
+## Minor, fixed alongside the above
+- DV1: the boot-time channel warning checked the global `AGENT_FIXER_CHANNEL_ID` regardless
+  of which identity was booting, so a non-Echo identity with its own channel set (D29) got
+  a false warning. Now checks the same resolution `outbox._channel_for` actually uses.
+
+## Not fixed, deliberately, with reasoning
+- DV5 (latent, not currently reachable): `write_hold_notice`'s own prefix plus a
+  near-8000-char body could in theory lose its tail to `bus.record_outbound`'s truncation.
+  Not reachable today -- `KIND_ANSWER` bodies are bounded by the LLM's `max_tokens=400`
+  and `fixer_request_text` is capped to ~4000 chars, both well clear of 8000. Would resurface
+  if either bound is loosened; noted for whoever loosens one.
+- RB3: a second, unrelated `OPS-FIX REQUEST:` builder exists in `agent/ops_alerts.py`, but
+  every caller passes internally-generated text (account keys, exception names), never a
+  Slack stranger's free text -- a different trust boundary, out of this feature's scope.
+
+## Verification loop status
+Two independent re-audits against this fix (D30-D32) are the natural next step per Blake's
+"fix, re-audit to zero" instruction, but the finding class is now narrow (escaping
+completeness, cap edge cases) rather than structural. Suite green at 5055; flags unchanged,
+all OFF. Reported to Blake as the closing wave unless a further audit finds otherwise.

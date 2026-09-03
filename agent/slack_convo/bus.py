@@ -158,6 +158,19 @@ class Bus:
             "select": "id"})
         return len(rows)
 
+    def find_recent_ticket_for_user_today(self, slack_user_id):
+        """RB2/D25 (2026-09-03, MAJOR): the most recent ticket this user opened today, in ANY
+        channel. Used ONLY once the daily cap is hit, so a user over the cap attaches to a
+        ticket they already have instead of minting a fresh one -- the per-ticket noise caps
+        can only bound total noise per user per day if the ticket count per user per day is
+        itself actually bounded, which this closes."""
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                   microsecond=0).isoformat()
+        rows = self._get(_TICKETS, {
+            "slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
+            "select": "*", "order": "created_at.desc", "limit": "1"})
+        return rows[0] if rows else None
+
     # ---- messages -----------------------------------------------------------------------
     def record_inbound(self, *, ticket_id, slack_event_id, slack_ts, author_type,
                        author_id, body, meta=None):
