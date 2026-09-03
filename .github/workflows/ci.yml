@@ -27,12 +27,17 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
-        # Deselect two tests that assert local-dev env state (ffmpeg present /
-        # faster-whisper absent). CI has both installed, so the assertions are
-        # inverted here — the detect_prereqs logic is covered by the other tests.
+        # Deselect ONE test that asserts local-dev env state: faster-whisper is a
+        # real requirements.txt dependency, so CI installs it and
+        # test_detect_prereqs_faster_whisper_absent's "absent" assertion is
+        # genuinely inverted here. test_detect_prereqs_ffmpeg_present was
+        # ALSO deselected here until an independent audit (2026-09-03) found
+        # it was never actually failing: this workflow installs ffmpeg via
+        # apt-get above, so the "present" assertion is true in CI too. Verify
+        # against `Install system dependencies` (ffmpeg) and requirements.txt
+        # (faster-whisper) before touching this list again.
         run: |
           python -m pytest -q \
-            --deselect tests/test_clipper_phase0.py::test_detect_prereqs_ffmpeg_present \
             --deselect tests/test_clipper_phase0.py::test_detect_prereqs_faster_whisper_absent
         env:
           # Tests that need live Supabase/Slack are expected to skip when creds
