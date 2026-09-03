@@ -24,8 +24,13 @@ It reads rows in delivery_status='ready' and, for each, re-checks EVERY gate at 
      worse than silence (V-m2). Internal rows never go stale; a human still needs them.
   5. TRUST LADDER. A conversational reply to a client posts only if the identity's
      client-reply flag is armed; to staff only if the staff flag is armed. Otherwise the row
-     is moved to 'held' AND a tap notice is written (V-M8), so nothing sits held unseen.
-  6. DESTINATION. Internal kinds (escalation, hold_notice) go to the fixer channel and
+     is moved to 'held' AND a tap notice is written (V-M8), so nothing sits held unseen. A
+     row Blake has explicitly released (release_held stamped released_by) skips this recheck
+     once -- his tap IS the approval the trust ladder exists to collect (N2).
+  6. CLAIM. The row is moved ready/held->posting with a conditional PATCH only one caller
+     can win, immediately before post() (N4). This is what makes two consumers of the same
+     row safe.
+  7. DESTINATION. Internal kinds (escalation, hold_notice) go to the fixer channel and
      fixer_request goes to the ops-fix intake channel the existing worker watches. They
      never enter the person's thread. Conversational kinds go to the ticket's own channel:
      top-level in a DM or group DM (people do not thread there), in-thread for a mention or
@@ -33,10 +38,34 @@ It reads rows in delivery_status='ready' and, for each, re-checks EVERY gate at 
 
 Every SUPPRESSION writes an escalation row, so a human sees what the bot declined to say
 (V-M5). A hold notice posts with a Block Kit button (action id slack_convo_release, value =
-the held row id) so the tap actually exists (V-M2 / RT-m5). When an answer posts, its ticket
-is marked resolved -- the ticket closes when the person has the answer, not before (V-M4).
+the held row id) so the tap actually exists (V-M2 / RT-m5), rendered across as many sections
+as the full body needs (RA-M2: Blake must review exactly the text that will post on release,
+never a truncated prefix of it). When an answer posts, its ticket is marked resolved -- the
+ticket closes when the person has the answer, not before (V-M4).
 
 A post failure marks the row 'failed' and moves on; one bad row never stalls the queue.
+
+HARDENING (2026-09-03 re-audit wave 2):
+  N2  Blake's tap on a held row used to be swallowed silently: release_held flipped it to
+      'ready', but gate 5 re-read the SAME flag that had held it, found it still off (that
+      IS why it was held), and held it again -- writing a fresh card each time, forever. A
+      released row now skips the trust-ladder recheck once.
+  N4  Read-then-post-then-mark had no claim step: two consumers (a redeploy overlap, a
+      second Wrangler pointed at the same rows per D2) could post the same row twice, and a
+      mark_message failure after a successful post left the row in 'ready' to be reposted
+      forever. Every row is now claimed (ready/held -> posting, a conditional PATCH only one
+      caller can win) immediately before post(); any row still in 'posting' at the START of
+      a run_once call is orphaned from a crashed prior attempt (claim -> post -> mark is
+      synchronous within one call, so nothing legitimate is ever mid-flight across calls)
+      and is swept back to 'ready'.
+  RA-M2  hold_notice_blocks used to show only the first 2900 characters while release posted
+      the full row -- an injected tail could sit invisible to the reviewer. Now it renders
+      as many sections as the body needs; what Blake reviews is what posts.
+  RA-m5  fixer_request always used the shared ops-fix worker channel (ground truth: only one
+      worker exists, and it only trusts Echo's bot_id -- a cross-identity ruling for Blake,
+      D10). escalation / hold_notice now honour the identity's OWN fixer_channel_env when
+      set, instead of always the global default, so a second identity's holds do not land
+      in Echo's channel.
 """
 from datetime import datetime, timezone
 
@@ -46,12 +75,13 @@ from .. import config
 STALE_AFTER_SECONDS = 6 * 3600
 RELEASE_ACTION_ID = "slack_convo_release"
 _REENTRY_PREFIX = "OPS-FIX REQUEST"
+_BLOCK_TEXT_CHARS = 2900
 
 
-def _channel_for(kind):
+def _channel_for(kind, identity):
     if kind == _a.KIND_FIXER_REQUEST:
         return config.ops_fix_channel_id()
-    return config.fixer_channel_id()
+    return identity.fixer_channel() or config.fixer_channel_id()
 
 
 def _recipient_armed(identity, recipient_kind):
@@ -78,12 +108,15 @@ def _age_seconds(row, now=None):
 
 
 def hold_notice_blocks(row):
-    """Block Kit for a hold notice: the text plus ONE button whose value is the held row id.
-    listener_wiring routes that action id to release_held, operator-gated."""
+    """Block Kit for a hold notice: the FULL text across as many sections as it needs (RA-M2
+    -- what Blake reviews before tapping must be everything that will post, never a
+    truncated prefix), plus ONE button whose value is the held row id. listener_wiring
+    routes that action id to release_held, operator-gated."""
+    body = row.get("body") or ""
     att = row.get("attachments") or {}
     mid = att.get("held_message_id") or ""
-    blocks = [{"type": "section",
-               "text": {"type": "mrkdwn", "text": (row.get("body") or "")[:2900]}}]
+    chunks = [body[i:i + _BLOCK_TEXT_CHARS] for i in range(0, len(body), _BLOCK_TEXT_CHARS)] or [""]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks]
     if mid:
         blocks.append({"type": "actions", "elements": [{
             "type": "button", "action_id": RELEASE_ACTION_ID, "value": str(mid),
@@ -91,12 +124,48 @@ def hold_notice_blocks(row):
     return blocks
 
 
+def _claim(bus, row, log):
+    """Ready/held -> posting, a conditional PATCH only one caller can win (N4)."""
+    try:
+        return bus.claim_message(row["id"])
+    except AttributeError:
+        return True  # a bus without claim support (older fakes): best effort, no CAS
+    except Exception as e:  # noqa: BLE001
+        log(f"[slack-convo/outbox] claim failed for row {row['id']}: {type(e).__name__}")
+        return False
+
+
+def _recover_stale_claims(bus, identity, log):
+    """Any row still 'posting' at the START of a run -- before this call has claimed
+    anything -- is orphaned from a prior attempt that crashed between claim and post/mark
+    (the sequence is synchronous within one call, so nothing legitimate is ever mid-flight
+    across two calls). Swept back to 'ready' so it is retried rather than stuck forever."""
+    try:
+        stuck = bus.outbox("posting", limit=200, identity=identity.name)
+    except TypeError:
+        try:
+            stuck = bus.outbox("posting", limit=200)
+        except Exception:  # noqa: BLE001
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for row in stuck:
+        try:
+            bus.mark_message(row["id"], "ready", meta_update={"reclaimed_stale_posting": True})
+            n += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
 def run_once(bus, post, *, identity, log=print, limit=50, now=None):
     """Process up to `limit` ready rows for THIS identity.
     post(channel, text, thread_ts=None, blocks=None) -> slack ts.
     Returns a summary dict. Never raises out of the loop."""
     summary = {"posted": 0, "held": 0, "suppressed": 0, "failed": 0, "skipped": 0,
-               "resolved": 0}
+               "resolved": 0, "reclaimed": 0}
+    summary["reclaimed"] = _recover_stale_claims(bus, identity, log)
     try:
         rows = bus.outbox("ready", limit=limit, identity=identity.name)
     except TypeError:  # a bus without the identity filter (older fakes)
@@ -158,13 +227,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
 
     # ---- internal kinds: fixer / ops-fix channels, never the person's thread ---------
     if kind in _a.INTERNAL_KINDS:
-        channel = _channel_for(kind)
+        channel = _channel_for(kind, identity)
         if not channel:
             log(f"[slack-convo/outbox] no channel configured for {kind}; row "
                 f"{row['id']} marked failed (set AGENT_FIXER_CHANNEL_ID / the ops-fix "
                 "channel)")
             bus.mark_message(row["id"], "failed")
             summary["failed"] += 1
+            return
+        if not _claim(bus, row, log):
+            summary["skipped"] += 1
             return
         blocks = hold_notice_blocks(row) if kind == _a.KIND_HOLD_NOTICE else None
         ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
@@ -194,9 +266,10 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
         _suppress(bus, row, ticket, identity,
                   f"row sat in ready for over {STALE_AFTER_SECONDS // 3600}h", log, summary)
         return
-    # 5. trust ladder, re-checked at post time; held rows always get a card (V-M8)
+    # 5. trust ladder, re-checked at post time; held rows always get a card (V-M8). A row
+    # Blake has explicitly released is the one exception: his tap already IS the approval.
     recipient_kind = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
-    if not _recipient_armed(identity, recipient_kind):
+    if not att.get("released_by") and not _recipient_armed(identity, recipient_kind):
         bus.mark_message(row["id"], "held", meta_update={"held_why": "flag off at post time"})
         summary["held"] += 1
         _a.write_hold_notice(
@@ -205,7 +278,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             body=row.get("body") or "", held_message_id=row["id"],
             surface=att.get("surface") or "", why="flag off at post time")
         return
-    # 6. destination
+    # 6. claim, immediately before posting
+    if not _claim(bus, row, log):
+        summary["skipped"] += 1
+        return
+    # 7. destination
     channel = ticket.get("slack_channel_id")
     surface = att.get("surface") or ""
     thread_ts = None if surface in (_a.SURFACE_IM, _a.SURFACE_MPIM) else ticket.get("slack_thread_ts")
@@ -226,7 +303,8 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
     """A human tap on a hold notice: flip that held row to ready and stamp the ticket.
     Returns True when a held row was released. Refuses anything not currently held, any
     kind that is not a reply or fixer request, and (when `identity` is given) any row
-    another bot wrote (V-m10). The release is stamped so the freshness clock restarts."""
+    another bot wrote (V-m10). The release is stamped (N2: read by gate 5 above to skip the
+    trust-ladder recheck exactly once for this row) and restarts the freshness clock."""
     row = bus.message(message_id)
     if not row or row.get("delivery_status") != "held":
         return False

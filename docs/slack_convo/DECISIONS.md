@@ -157,3 +157,87 @@ the address and matches case-insensitively with an exact post-filter.
 - RT-M1 (new): lasso-echo `main` has no branch protection, and the ops-fix worker preamble
   claims "tested" before any test runs. Both are in ~/scout-listener / GitHub settings, not
   this repo; Blake is mid-edit there, so nothing was touched.
+
+---
+
+# Audit wave 2 (2026-09-03): two fresh independent re-audits of the wave-1 fix
+
+Re-audit A ("any path where the bot replies without a row or without verification") and
+re-audit B ("how could a stranger in Slack make this bot do something") ran again against
+the wave-1 fix. Combined: 1 CRITICAL (portal side, D23), 6 MAJOR (D24-D29), several minor.
+Every MAJOR+ is fixed below with a test. Ids are the auditors' own (N = re-audit A, RA =
+re-audit B).
+
+## D23 (N1, CRITICAL). franchise_overseer is a franchise tenant, not LASSO staff
+Portal `isStaffRole()` (`src/lib/support/client-visible.ts`) listed `franchise_overseer`.
+That role is a FRANCHISE TENANT (`src/lib/auth/roles.ts:13` -- "sees ONLY its own
+franchise's data"). The support messages route used `isStaffRole()` to decide whether to
+skip the client filter, so a franchise owner reading their own gym's ticket got every row:
+held drafts, suppressed answers, escalation text, fixer_request cards. Migration 0310's RLS
+has no role clause at all, so this route was MORE permissive than direct DB access for this
+one role. Fixed: role removed from `isStaffRole()`. Portal PR #544.
+
+## D24 (N2, MAJOR). A release now actually delivers
+`release_held` flipped a row to ready, but the outbox's trust-ladder gate re-read the SAME
+flag that had held it in the first place, found it still off, and held it again -- writing
+a fresh card every tap, forever. A row `release_held` has stamped `released_by` now skips
+that recheck once: Blake's tap on a specific row IS the approval the hold lane collects.
+
+## D25 (N3/RA-M3, MAJOR). Noise from a ticket that already exists is bounded
+The daily cap only ever gated ticket CREATION. Once an unknown user's hold ticket, or a
+client's parked/capped-out follow-up ticket, existed, every further message re-escalated
+and re-templated with no bound (30 stranger messages became 60+ posts into #fixer in the
+audit's repro). Now: the unknown-identity template is written once ever per ticket (the
+spec's own words, "one templated reply"); escalations from an unresolved-identity ticket
+cap at 3/ticket/day; escalations (and the accompanying ack) from a parked or fixer-capped
+follow-up ticket cap at 5/ticket/day. The inbound row is always recorded regardless -- only
+the outbound noise is bounded.
+
+## D26 (N4, MAJOR). Every row is claimed before it posts
+Read -> post -> mark had no claim step: two consumers of the same row (a redeploy overlap,
+or a future Wrangler service per D2 pointed at the same rows) could both post it, and a
+mark_message failure after a successful post left the row 'ready' to be reposted forever.
+Every row is now claimed (ready -> posting, a conditional PATCH only one caller's WHERE
+clause can match) immediately before post(); a row still 'posting' at the START of a run is
+orphaned from a crashed prior attempt (the claim/post/mark sequence is synchronous within
+one call) and is swept back to ready.
+
+## D27 (RT-M1/RA-M1, MAJOR). The untrusted report cannot forge the fence or Slack markup
+A client's raw words were fenced verbatim. The literal closing token could appear inside
+their own message, letting injected text read as an "instruction" sitting outside the
+fence; separately, `<!channel>` / `<@U...>` in their words would render as live Slack
+markup in #fixer. Both close with one change: the untrusted text is Slack-escaped
+(&,<,> -> entities -- the same escaping every Slack API client must apply before posting)
+before it is fenced. Escaping disarms the fence delimiters (both use literal < / >) and
+Slack markup in the same pass. The escaped text is also bounded to 3500 chars so the
+closing fence can never be lost to the bus's 8000-char row truncation.
+
+## D28 (RA-M2, MAJOR). The card Blake reviews is what will actually post
+`hold_notice_blocks` showed only the first 2900 characters (one Slack block) of the row,
+while a release posts the FULL row. An injected tail past that cutoff was invisible to the
+reviewer. Now the card renders across as many sections as the body needs; concatenating
+every section reproduces the row exactly.
+
+## D29 (RA-m5, minor, fixed while D28 was open). Each identity gets its own fixer channel
+Every `BotIdentity` defaulted `fixer_channel_env` to the SAME env name
+(`AGENT_FIXER_CHANNEL_ID`), so a second identity's holds/escalations would land in Echo's
+channel. Ranger, Scout, Wrangler and Lainey now each carry their own env name
+(`RANGER_FIXER_CHANNEL_ID` etc.); Echo keeps the deployed default.
+
+## Not fixed, deliberately, with reasoning (both re-audits agreed these are acceptable)
+- N5/N6/N7/N8/N10, RA-m1/m2/m4: minor, no exploit path, or already fail in the safe
+  direction (documented inline in bus.py / adapter.py / listener_wiring.py where relevant).
+- RA-m1 (fixer-retrigger cap undercount past 200 rows): the day-cap helper now used by
+  BOTH the follow-up retrigger cap AND the new noise caps queries the server directly
+  (`Bus.count_outbound_kind_since`), so this is actually closed as a side effect of D25/D26,
+  not left open.
+
+## Rulings still needed from Blake (unchanged)
+- D2: a real Wrangler service taking over the outbox rows.
+- D3: a Railway-hosted Claude Code executor so fixes do not depend on Blake's Mac being on.
+- D10: consolidating Wrangler/Scout desktop listeners into this process; also now the home
+  for RA-m5's other half -- the ops-fix worker (`~/scout-listener`) only trusts Echo's
+  bot_id, so a second identity's fixer_request, even released, is not executed today. That
+  file is outside this repo and Blake was mid-edit in it; not touched.
+- RT-M1: lasso-echo `main` has no branch protection; the ops-fix worker preamble claims
+  "tested" before any test runs. Both live in GitHub settings / ~/scout-listener.

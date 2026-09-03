@@ -199,6 +199,34 @@ class Bus:
         rows = self._get(_MESSAGES, {"id": f"eq.{message_id}", "select": "*", "limit": "1"})
         return rows[0] if rows else None
 
+    def claim_message(self, message_id):
+        """Atomic compare-and-swap: ready -> posting, in ONE round trip (WHERE id=... AND
+        delivery_status='ready'). Returns True only if THIS call won the row -- PostgREST
+        returns the updated row(s) with Prefer: return=representation, empty when the WHERE
+        matched nothing because someone else already moved it. This is what makes two
+        concurrent consumers of the same row (a redeploy overlap, a second Wrangler pointed
+        at the same rows per D2) safe: at most one of them gets a non-empty result (N4)."""
+        r = self._client().patch(self._rest(_MESSAGES),
+                                 params={"id": f"eq.{message_id}", "delivery_status": "eq.ready"},
+                                 data=json.dumps({"delivery_status": "posting"}),
+                                 headers=self._headers({"Prefer": "return=representation"}),
+                                 timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, (r.text or "")[:200])
+        data = r.json() or []
+        return bool(data)
+
+    def count_outbound_kind_since(self, ticket_id, kind, since_iso):
+        """Server-side count of outbound rows of one `kind` on a ticket since a timestamp.
+        Used for the daily noise caps (N3/RA-M3): a client-side scan of bus.messages(tid,
+        limit=200) undercounts once a ticket has more than 200 rows today (a chatty or
+        long-lived thread), which silently loosens every cap built on it."""
+        rows = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "attachments->>kind": f"eq.{kind}", "created_at": f"gte.{since_iso}",
+            "select": "id"})
+        return len(rows)
+
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
         bot wrote (attachments.identity), so two identities' loops never read each other's

@@ -36,7 +36,11 @@ class BotIdentity:
     allowed_lanes: tuple = ("hold",)   # lanes this identity's tickets may take
     default_lane: str = "hold"
     reply_voice_doc: str = ""      # path, relative to the repo, of the reply voice rules
-    fixer_channel_env: str = "AGENT_FIXER_CHANNEL_ID"  # where holds / escalations go
+    fixer_channel_env: str = "AGENT_FIXER_CHANNEL_ID"  # where holds / escalations go.
+    # RA-m5 (2026-09-03 re-audit): every identity used to fall through to this SAME default,
+    # so a second identity's holds landed in Echo's channel with no way to tell them apart.
+    # Each non-Echo identity below overrides it with its own env name; Echo keeps the
+    # default (it is the one already deployed).
     # Defaults for the flag NAMES; the values are read live by config.slack_convo_*.
     flag_suffix: str = ""          # computed from name when empty
 
@@ -74,6 +78,7 @@ IDENTITIES = {
         bot_user_id_env="RANGER_SLACK_BOT_USER_ID",
         allowed_lanes=("hold",), default_lane="hold",
         reply_voice_doc="docs/slack_convo/ranger_reply_voice.md",
+        fixer_channel_env="RANGER_FIXER_CHANNEL_ID",
     ),
     "scout": BotIdentity(
         name="scout", product="scout",
@@ -82,6 +87,7 @@ IDENTITIES = {
         bot_user_id_env="SCOUT_SLACK_BOT_USER_ID",
         allowed_lanes=("hold",), default_lane="hold",
         reply_voice_doc="docs/slack_convo/scout_reply_voice.md",
+        fixer_channel_env="SCOUT_FIXER_CHANNEL_ID",
     ),
     "wrangler": BotIdentity(
         name="wrangler", product="wrangler",
@@ -90,6 +96,7 @@ IDENTITIES = {
         bot_user_id_env="WRANGLER_SLACK_BOT_USER_ID",
         allowed_lanes=("hold",), default_lane="hold",
         reply_voice_doc="docs/slack_convo/wrangler_reply_voice.md",
+        fixer_channel_env="WRANGLER_FIXER_CHANNEL_ID",
     ),
     "lainey": BotIdentity(
         name="lainey", product="lainey",
@@ -98,6 +105,7 @@ IDENTITIES = {
         bot_user_id_env="LAINEY_SLACK_BOT_USER_ID",
         allowed_lanes=("hold",), default_lane="hold",
         reply_voice_doc="docs/slack_convo/lainey_reply_voice.md",
+        fixer_channel_env="LAINEY_FIXER_CHANNEL_ID",
     ),
 }
 
