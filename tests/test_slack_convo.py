@@ -88,11 +88,13 @@ class FakeBus:
         self.tickets[tid].update(fields)
         return dict(self.tickets[tid])
 
-    def count_tickets_for_user_today(self, slack_user_id):
-        return sum(1 for t in self.tickets.values() if t["slack_user_id"] == slack_user_id)
+    def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
+        return sum(1 for t in self.tickets.values() if t["slack_user_id"] == slack_user_id
+                   and (bot_identity is None or t["bot_identity"] == bot_identity))
 
-    def find_recent_ticket_for_user_today(self, slack_user_id):
-        mine = [t for t in self.tickets.values() if t["slack_user_id"] == slack_user_id]
+    def find_recent_ticket_for_user_today(self, slack_user_id, bot_identity=None):
+        mine = [t for t in self.tickets.values() if t["slack_user_id"] == slack_user_id
+                and (bot_identity is None or t["bot_identity"] == bot_identity)]
         return dict(mine[-1]) if mine else None
 
     # messages
@@ -644,6 +646,28 @@ def test_unknown_identity_cannot_mint_unlimited_tickets_via_fresh_channel_mentio
     # bounded by (tickets minted) * (per-ticket escalation cap), a small finite ceiling --
     # not 20 messages -> 20 tickets -> 20+ escalations, the pre-fix behavior.
     assert total_escalations <= 3 * A.MAX_UNKNOWN_ESCALATIONS_PER_TICKET_PER_DAY
+
+
+def test_rate_limit_reuse_never_crosses_bot_identity():
+    """E1 (2026-09-03, MAJOR, 4th audit): a user capped on Echo while also messaging Ranger
+    must never reuse RANGER's ticket for an Echo message -- a row written to a ticket whose
+    bot_identity differs from attachments.identity is stranded: no outbox loop's ownership
+    check (_dispatch_one) would ever match it, forever."""
+    bus = FakeBus()
+    d_ranger = A.handle_event(_ev("pause the ads", channel="G0", ts="0.0"), "G0:0.0",
+                              _deps(bus, identity="ranger", cap=1))
+    d_echo = A.handle_event(_ev("posts broken", channel="G1", ts="1.0"), "G1:1.0",
+                            _deps(bus, identity="echo", cap=1))
+    assert bus.tickets[d_ranger.ticket_id]["bot_identity"] == "ranger"
+    assert bus.tickets[d_echo.ticket_id]["bot_identity"] == "echo"
+    assert d_ranger.ticket_id != d_echo.ticket_id, \
+        "each identity's own cap and reuse lookup must stay scoped to its own tickets"
+    for row in bus.msgs:
+        if row["direction"] != "outbound":
+            continue
+        owning_ticket = bus.tickets[row["ticket_id"]]
+        assert row["attachments"].get("identity") == owning_ticket["bot_identity"], \
+            "every outbound row's identity stamp must match the ticket it lives on"
 
 
 def test_reused_ticket_from_a_rate_limited_burst_is_never_demoted():

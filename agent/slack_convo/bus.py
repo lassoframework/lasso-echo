@@ -150,25 +150,39 @@ class Bus:
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
 
-    def count_tickets_for_user_today(self, slack_user_id):
+    def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                    microsecond=0).isoformat()
-        rows = self._get(_TICKETS, {
-            "slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
-            "select": "id"})
+        params = {"slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
+                  "select": "id"}
+        if bot_identity:
+            params["bot_identity"] = f"eq.{bot_identity}"
+        rows = self._get(_TICKETS, params)
         return len(rows)
 
-    def find_recent_ticket_for_user_today(self, slack_user_id):
+    def find_recent_ticket_for_user_today(self, slack_user_id, bot_identity=None):
         """RB2/D25 (2026-09-03, MAJOR): the most recent ticket this user opened today, in ANY
         channel. Used ONLY once the daily cap is hit, so a user over the cap attaches to a
         ticket they already have instead of minting a fresh one -- the per-ticket noise caps
         can only bound total noise per user per day if the ticket count per user per day is
-        itself actually bounded, which this closes."""
+        itself actually bounded, which this closes.
+
+        E1 (2026-09-03, MAJOR, 4th audit): scoped by `bot_identity` -- one Slack user can be
+        capped on Echo while also messaging Ranger. Without this scope, a message could reuse
+        the OTHER identity's ticket (same user, wrong bot_identity); every row written to it
+        would carry the calling identity's own `attachments.identity` while the ticket's
+        `bot_identity` stayed the other bot's, and _dispatch_one's ownership check means
+        NEITHER identity's outbox loop would ever pick the row up -- a row and its hold_notice
+        stranded in 'ready' forever, with no error and no alert. `bot_identity` is optional
+        only so an older caller that predates this fix still runs (unscoped, the old bug);
+        the adapter always passes its own identity name."""
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                    microsecond=0).isoformat()
-        rows = self._get(_TICKETS, {
-            "slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
-            "select": "*", "order": "created_at.desc", "limit": "1"})
+        params = {"slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
+                  "select": "*", "order": "created_at.desc", "limit": "1"}
+        if bot_identity:
+            params["bot_identity"] = f"eq.{bot_identity}"
+        rows = self._get(_TICKETS, params)
         return rows[0] if rows else None
 
     # ---- messages -----------------------------------------------------------------------

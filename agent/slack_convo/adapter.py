@@ -283,10 +283,16 @@ def handle_event(event, event_id, deps):
     # Once a user is over the cap, no new ticket is minted -- the message attaches to
     # whatever ticket they already have today, so the per-ticket noise caps (D25) actually
     # bound total noise per user per day, for every identity kind including UNKNOWN.
+    # E1 (2026-09-03, MAJOR, 4th audit): both lookups are scoped to THIS identity's own
+    # tickets. Unscoped, a Slack user capped on Echo while also messaging Ranger could reuse
+    # Ranger's ticket for an Echo message -- every row written to it would carry
+    # attachments.identity="echo" while ticket.bot_identity stayed "ranger", and
+    # _dispatch_one's ownership check means NEITHER identity's outbox loop would ever pick
+    # the row up. Stranded in 'ready' forever, no error, no alert.
     rate_limited = False
     if existing is None and not _is_staffish(who):
         try:
-            if deps.bus.count_tickets_for_user_today(user) >= deps.daily_cap():
+            if deps.bus.count_tickets_for_user_today(user, ident.name) >= deps.daily_cap():
                 rate_limited = True
         except Exception as e:  # noqa: BLE001 - a counting failure fails CLOSED
             deps.log(f"[slack-convo] rate-limit read failed ({type(e).__name__}); "
@@ -294,7 +300,7 @@ def handle_event(event, event_id, deps):
             rate_limited = True
         if rate_limited:
             try:
-                existing = deps.bus.find_recent_ticket_for_user_today(user)
+                existing = deps.bus.find_recent_ticket_for_user_today(user, ident.name)
             except Exception as e:  # noqa: BLE001 - fall back to minting one ticket
                 deps.log(f"[slack-convo] rate-limit reuse lookup failed "
                          f"({type(e).__name__}); minting a ticket instead")

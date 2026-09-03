@@ -317,3 +317,38 @@ Two independent re-audits against this fix (D30-D32) are the natural next step p
 "fix, re-audit to zero" instruction, but the finding class is now narrow (escaping
 completeness, cap edge cases) rather than structural. Suite green at 5055; flags unchanged,
 all OFF. Reported to Blake as the closing wave unless a further audit finds otherwise.
+
+---
+
+# Audit wave 4 (2026-09-03): narrow closing verification of D30-D32
+
+One fresh VERIFIER agent, scoped only to D30/D31/D32's blast radius (per Blake: a narrower
+closing check once the finding class had shrunk from structural to edge-case). D30 and D32
+confirmed fixed outright. D31 confirmed fixed with one narrow, low-probability caveat (E2,
+tracked below, not blocking). One fresh MAJOR (E1), reproduced live against the real code.
+
+## D33 (E1, MAJOR). The reuse lookup is scoped to the calling identity's own tickets
+`find_recent_ticket_for_user_today` / `count_tickets_for_user_today` filtered only by
+`slack_user_id`, across ALL bot identities. A Slack user capped on Echo while also
+messaging Ranger could have a message reuse RANGER's ticket for an ECHO message: the row
+would carry `attachments.identity="echo"` while the ticket's own `bot_identity` stayed
+"ranger". `_dispatch_one`'s ownership check (`ticket.bot_identity != identity.name`) means
+NEITHER identity's outbox loop would ever pick that row up -- it, and its hold_notice card,
+would sit in `delivery_status="ready"` forever: no error, no alert, invisible. Reproduced
+live against the real adapter/bus/outbox (not the test harness) by the auditing agent.
+Fixed: both bus methods take an optional `bot_identity` param; the adapter always passes
+its own `ident.name`.
+
+## Tracked, not blocking
+- E2 (minor): `_claim`'s `claimed_at` stamp is a second, best-effort write after the atomic
+  CAS. If it silently fails on a row claimed long after a stale `released_at` (only
+  plausible if the outbox loop itself was down across that gap -- the same redeploy-overlap
+  window D31 already targets), `_age_seconds` falls back to the old `released_at` and a
+  just-claimed row could misread as stale. Narrow, low-probability, same root cause D31
+  already accepts (best-effort secondary write); not fixed separately.
+
+## Verification loop status
+Suite green at 5056; flags unchanged, all OFF. Four audit rounds (wave 1-4) run; findings
+per round: wave 1 (2 CRITICAL + 10 MAJOR), wave 2 (1 CRITICAL + 6 MAJOR), wave 3 (3 MAJOR,
+all one root cause), wave 4 (1 MAJOR, narrow and now closed). Per Blake's "fix, re-audit to
+zero" with a narrowing finding class, this is reported as the closing wave.
