@@ -193,6 +193,42 @@ def _to_utc_iso(iso_ts):
 # credential it rejected.
 _ERR_BODY_CHARS = 1200
 
+# Google Business photo categories (Zernio gmb-media docs). Google REQUIRES one.
+GMB_PHOTO_CATEGORIES = ("COVER", "PROFILE", "LOGO", "EXTERIOR", "INTERIOR",
+                        "FOOD_AND_DRINK", "MENU", "PRODUCT", "TEAMS", "ADDITIONAL")
+
+# ADDITIONAL is the only safe default: it is the general gallery bucket, so a scheduled
+# photo drop ADDS to the gym's photos. Three of the categories above are destructive by
+# nature -- COVER, PROFILE and LOGO REPLACE the gym's existing branding on its own Google
+# listing, which is emphatically not something an automated daily drop may do. The rest
+# (INTERIOR, FOOD_AND_DRINK, MENU...) would be Echo asserting what is IN the photo, which
+# it does not know.
+GBP_GALLERY_CATEGORY = "ADDITIONAL"
+
+# Categories an automated drop must never select on its own, even if asked.
+_GMB_BRANDING_CATEGORIES = frozenset({"COVER", "PROFILE", "LOGO"})
+
+
+def _gmb_category(category=None):
+    """Validate a GBP photo category, defaulting to the safe gallery bucket.
+
+    Rejects the three branding slots outright: a caller reaching this code path is a
+    scheduled content drop, and silently overwriting a client's cover photo or logo is
+    not a recoverable mistake. An unknown value raises rather than being passed through,
+    so a typo fails loudly here instead of arriving as an opaque Google 400."""
+    if category is None:
+        return GBP_GALLERY_CATEGORY
+    value = str(category).strip().upper()
+    if value in _GMB_BRANDING_CATEGORIES:
+        raise ValueError(
+            f"refusing GBP photo category {value}: it REPLACES the gym's own "
+            "branding on its Google listing. Automated drops use "
+            f"{GBP_GALLERY_CATEGORY}.")
+    if value not in GMB_PHOTO_CATEGORIES:
+        raise ValueError(f"unknown GBP photo category {value!r}; expected one of "
+                         f"{', '.join(GMB_PHOTO_CATEGORIES)}")
+    return value
+
 
 class ZernioError(Exception):
     def __init__(self, status, detail=""):
@@ -511,12 +547,21 @@ class ZernioClient:
         the GBP reconcile poll (§7.2) reads this hourly for 48h after publish."""
         return self._get(f"/v1/posts/{post_id}")
 
-    def create_gmb_media(self, account_id, image_url):
+    def create_gmb_media(self, account_id, image_url, category=None, description=""):
         """POST /v1/accounts/{accountId}/gmb-media — add a photo to a GBP location's
         gallery (§6.4 photo drop). SYNCHRONOUS: no webhook, no draft mode; a 2xx means
         the photo is live. The GBP worker only calls this in ARMED live mode; in the
-        draft build the worker simulates it and never touches this endpoint."""
-        payload = {"mediaFormat": "PHOTO", "sourceUrl": image_url}
+        draft build the worker simulates it and never touches this endpoint.
+
+        CATEGORY IS REQUIRED BY GOOGLE. Omitting it returned 400 INVALID_ARGUMENT,
+        "Photo must specify either category or price list item id" -- the live failure on
+        crossfitnine7f7dadc (2026-09-03) that was invisible until the error body stopped
+        being truncated. Defaults to GBP_GALLERY_CATEGORY.
+        """
+        payload = {"mediaFormat": "PHOTO", "sourceUrl": image_url,
+                   "category": _gmb_category(category)}
+        if description:
+            payload["description"] = description
         headers = {"x-request-id": str(_uuid.uuid4())}
         return self._post(f"/v1/accounts/{account_id}/gmb-media", payload,
                           headers=headers)

@@ -153,20 +153,28 @@ def test_hamming_distance():
 def test_near_duplicate_images_cluster_far_from_different():
     from PIL import Image
     buf1, buf2, buf3 = io.BytesIO(), io.BytesIO(), io.BytesIO()
-    # Base gradient with headroom (maxes at ~200) so the +8 near-dupe never clips.
-    # A clipping shift lands the hash on the DCT median boundary, where a 1-level
-    # resize difference between x86 (CI) and arm64 (dev) flips several bits and the
-    # test flakes across architectures. With no clipping a global brightness shift
-    # leaves every AC coefficient unchanged, so the near-dupe clusters at ~0 hamming
-    # on any platform. The <=6 / >6 thresholds (ruling 3) are unchanged.
-    base = [(x * 3) % 200 for y in range(64) for x in range(64)]
+    # A SMOOTH linear ramp, 0..190. The headroom keeps the +8 near-dupe from clipping,
+    # but headroom alone was not the problem: the old fixture used (x * 3) % 200, which
+    # is a SAWTOOTH, not a gradient. Adding 8 to a sawtooth is not a pure brightness
+    # shift -- it moves the wrap discontinuity (198 -> 206, 0 -> 8), and resampling a
+    # sharp edge down to the DCT grid rings differently on x86 (CI) than on arm64 (dev),
+    # which flipped bits near the median and failed CI at hamming 10 while passing
+    # locally.
+    #
+    # A smooth ramp makes the invariant EXACT rather than approximate: resize() is a
+    # linear operation, so resized(base + 8) == resized(base) + 8, a change confined to
+    # the DC coefficient. The median is taken over the AC coefficients only (flat[1:]),
+    # so every threshold comparison is bit-identical and the near-dupe clusters at
+    # hamming 0 on any architecture. The <=6 / >6 thresholds (ruling 3) are unchanged.
+    base = [int(x * 190 / 63) for y in range(64) for x in range(64)]
     img1 = Image.new("L", (64, 64)); img1.putdata(base)
     img1.save(buf1, format="PNG")
-    # a JPEG-ish near-dupe: same content, tiny brightness shift (no clipping)
+    # a JPEG-ish near-dupe: same content, pure brightness shift, no clipping
     img2 = Image.new("L", (64, 64)); img2.putdata([p + 8 for p in base])
     img2.save(buf2, format="PNG")
-    # a clearly different image (transposed gradient)
-    img3 = Image.new("L", (64, 64)); img3.putdata([(y * 3) % 200 for y in range(64) for x in range(64)])
+    # a clearly different image: the same ramp transposed (varies down, not across)
+    img3 = Image.new("L", (64, 64))
+    img3.putdata([int(y * 190 / 63) for y in range(64) for x in range(64)])
     img3.save(buf3, format="PNG")
     h1, h2, h3 = (vision.dct_phash(b.getvalue()) for b in (buf1, buf2, buf3))
     assert vision.hamming(h1, h2) <= 6      # near-dupe clusters
