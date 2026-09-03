@@ -125,7 +125,9 @@ def alert_interrupted_draw():
             "restart). It is NOT auto-refired (fail closed: a blind refire is "
             "what triple-published LASSO IG on 2026-08-27; per-draft claims + "
             "the 24h meta dedup also guard it). Check #echoclaude for missing "
-            "cards; run `python -m agent run-daily` by hand if the day is short.")
+            "cards; run `python -m agent run-daily --force` by hand if the day "
+            "is short (plain run-daily no-ops today because last_run_date is "
+            "already stamped).")
         return True
     except Exception as e:
         print(f"[scheduler] interrupted-draw check failed: {type(e).__name__}: {e}")

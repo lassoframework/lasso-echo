@@ -220,6 +220,9 @@ def test_interrupted_draw_alerts_once_and_never_refires(tmp_path, monkeypatch):
     assert listener.alert_interrupted_draw() is True
     assert listener.alert_interrupted_draw() is False        # deduped
     assert len(sent) == 1 and "NOT auto-refired" in sent[0]
+    # Alert must include --force: plain run-daily would no-op because
+    # last_run_date is stamped before the draw starts.
+    assert "--force" in sent[0]
     # the day stays claimed: a restart does NOT refire the draw
     assert listener._read_last_run_date() == "2026-08-27"
     # a finished draw is quiet

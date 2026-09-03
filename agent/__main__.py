@@ -1525,7 +1525,7 @@ def main(argv=None):
     argv = argv or sys.argv[1:]
     cmd = argv[0] if argv else "status"
     if cmd == "run-daily":
-        from .listener import _read_last_run_date, _write_last_run_date
+        from .listener import _read_last_run_date, _write_last_run_date, _mark_draw_finished
         import datetime as _dt
         _today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
         _force = "--force" in argv
@@ -1534,6 +1534,9 @@ def main(argv=None):
             sys.exit(0)
         out = run_daily()
         _write_last_run_date(_today)
+        # Stamp draw_finished so a subsequent restart does not see a stale
+        # draw_started != draw_finished after a manual --force refire.
+        _mark_draw_finished(_today)
         _print_run_daily(out)
     elif cmd == "scheduler-status":
         _scheduler_status()
