@@ -875,6 +875,18 @@ def run_listener():
         except Exception:
             pass
 
+    # SLACK CONVERSATIONAL ADAPTER (a FIXER intake adapter; Blake 2026-09-03). Attaches
+    # its own `message` / `app_mention` listeners to THIS same Bolt app, alongside
+    # on_chat_message above -- Bolt runs every matching listener independently, so nothing
+    # above changes behaviour. Inert unless SLACK_CONVO_ENABLED (and the per-identity flag):
+    # with the flags off, attach() registers nothing and this app is exactly as it was.
+    try:
+        from .slack_convo import listener_wiring as _convo
+        _convo.attach(app, "echo")
+        _convo.start_additional_identities()
+    except Exception as _ce:  # noqa: BLE001 - the adapter must never take the listener down
+        print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
+
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
         print("Daily scheduler started.")

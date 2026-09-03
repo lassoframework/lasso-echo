@@ -206,6 +206,14 @@ def _status():
     print(f"  alert_noise_flt: {config.ops_alerts_noise_filter_enabled()}  "
           f"(env AGENT_OPS_ALERTS_NOISE_FILTER; an alert ops_triage calls NOISE is not "
           f"posted to Slack, still audited)")
+    print(f"  slack_convo    : {config.slack_convo_enabled()}  (env SLACK_CONVO_ENABLED; the Slack "
+          f"Conversational Adapter, a FIXER intake: a DM/group DM/@mention/thread reply to a "
+          f"bot becomes a support_tickets row, every message a support_messages row first)")
+    for _ident in ("echo", "ranger", "scout", "wrangler", "lainey"):
+        print(f"    {_ident:<12}: enabled={config.slack_convo_identity_enabled(_ident)} "
+              f"client_reply={config.slack_convo_client_reply_armed(_ident)} "
+              f"staff_reply={config.slack_convo_staff_reply_armed(_ident)}  "
+              f"(env SLACK_CONVO_{_ident.upper()}_ENABLED / _CLIENT_REPLY / _STAFF_REPLY)")
     print(f"  auto_connect  : {config.auto_connect_link_enabled()}  (env AGENT_AUTO_CONNECT_LINK; "
           f"a newly auto-registered gym's connect link is sent as an Echo Slack DM to its "
           f"owner, once, resolved from the portal's own client_owner record)")

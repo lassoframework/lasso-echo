@@ -1845,6 +1845,92 @@ def ops_alerts_noise_filter_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_ALERTS_NOISE_FILTER", "false"))
 
 
+# ---- Slack Conversational Adapter (FIXER intake adapter) -----------------------------
+#
+# Blake, 2026-09-03: a person replies to a bot in Slack the way they would to a colleague,
+# and that conversation becomes a support_tickets row, every message a support_messages row
+# first, then mirrored. Flag names follow FIXER Stage A (scout-listener/src/fixer/flags.js):
+# a global master, then per-IDENTITY switches. Everything defaults OFF.
+#
+# "Flags off equals today" (Blake's spec, test list) is stricter than Stage A's "record the
+# bus regardless of flags": recording a client's DMs is itself a behaviour change, so with
+# the master or the identity flag off NOTHING is written and nothing replies -- byte for
+# byte what the listener does today (its own chat handler is untouched).
+
+def slack_convo_enabled() -> bool:
+    """SLACK_CONVO_ENABLED — global master for the Slack Conversational Adapter. OFF by
+    default. Off = the adapter's handlers return before reading anything; no row is
+    written, no reply is drafted, the existing listener behaviour is unchanged."""
+    return _truthy(os.environ.get("SLACK_CONVO_ENABLED", "false"))
+
+
+def slack_convo_identity_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_ENABLED — per-bot switch (ECHO, RANGER, SCOUT, WRANGLER,
+    LAINEY). OFF by default. Requires the master too."""
+    if not slack_convo_enabled():
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_ENABLED", "false"))
+
+
+def slack_convo_client_reply_armed(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CLIENT_REPLY — may this bot post a reply to a CLIENT on its
+    own? OFF by default ("staff first"). Off = every client-facing reply, including the
+    acknowledgement, is written as a held row and drafted to the fixer channel for a human
+    tap. The trust ladder per identity."""
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CLIENT_REPLY", "false"))
+
+
+def slack_convo_staff_reply_armed(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_STAFF_REPLY — may this bot post replies to LASSO staff in a
+    thread directly? OFF by default."""
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_STAFF_REPLY", "false"))
+
+
+def slack_convo_daily_ticket_cap() -> int:
+    """SLACK_CONVO_DAILY_TICKET_CAP — max new tickets one Slack user may open per UTC day.
+    Default 10 (Blake's spec). The cap-th-plus-one message gets one templated 'queued for
+    the team' reply and routes to Blake; no worker runs for it."""
+    try:
+        return max(1, int(os.environ.get("SLACK_CONVO_DAILY_TICKET_CAP", "10")))
+    except ValueError:
+        return 10
+
+
+def slack_convo_model() -> str:
+    """AGENT_SLACK_CONVO_MODEL — the model behind the answer lane and the LLM fallback of
+    the classifier. Client-facing, grounded on live state, so the default is the current
+    Sonnet rather than a small model."""
+    return os.environ.get("AGENT_SLACK_CONVO_MODEL", "claude-sonnet-5")
+
+
+def slack_convo_open_window_days() -> int:
+    """SLACK_CONVO_OPEN_WINDOW_DAYS — in a DM or group DM, people do not thread; they just
+    type the next message. A top-level message in a conversation with an OPEN ticket whose
+    last activity is within this window is a follow-up on that ticket, not a new one.
+    Default 7."""
+    try:
+        return max(1, int(os.environ.get("SLACK_CONVO_OPEN_WINDOW_DAYS", "7")))
+    except ValueError:
+        return 7
+
+
+def fixer_channel_id() -> str:
+    """AGENT_FIXER_CHANNEL_ID — the #fixer channel: holds, drafts awaiting a tap,
+    unknown-identity escalations. Empty = those rows are written but marked failed at
+    dispatch, loudly, so a missing channel is never a silent black hole."""
+    return os.environ.get("AGENT_FIXER_CHANNEL_ID", "").strip()
+
+
+def ops_fix_channel_id() -> str:
+    """AGENT_OPS_FIX_CHANNEL_ID — where a code-fix request card is posted so the FIXER
+    worker picks it up. Ground truth 2026-09-03: the only Claude Code executor that exists
+    is scout-listener's ops-fix-triage.js, which watches #echosupport for messages prefixed
+    'OPS-FIX REQUEST: ' from Echo's own bot. So this defaults to the support channel. When
+    the worker moves (to #fixer, or to a Railway executor), this is one env var."""
+    return (os.environ.get("AGENT_OPS_FIX_CHANNEL_ID", "").strip()
+            or support_channel_id())
+
+
 def auto_connect_link_enabled() -> bool:
     """
     AUTO CONNECT-LINK (AGENT_AUTO_CONNECT_LINK). Default OFF.
