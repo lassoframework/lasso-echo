@@ -187,6 +187,25 @@ def test_empty_and_none_default_to_needs_triage_never_crash():
     assert ot.classify(None) == ot.NEEDS_TRIAGE
 
 
+def test_empty_caption_guard_drop_is_noise():
+    # The guard fires, drops the row, and the slot self-heals -- this is NOISE, not
+    # NEEDS_TRIAGE. The phrase "slot refills on the next plan pass" is the self-heal marker.
+    assert ot.classify(
+        "ECHO ALERT: empty caption guard: dropped a zanshinfitness630e22 feed row for "
+        "2026-09-23 at stage time (a feed post may not ship without real words); "
+        "the slot refills on the next plan pass"
+    ) == ot.NOISE
+
+
+def test_caption_dedup_drop_is_noise():
+    # The dedup guard fires with the same self-heal suffix -- also NOISE.
+    assert ot.classify(
+        "ECHO ALERT: caption dedup: dropped a zanshinfitness630e22 feed row for "
+        "2026-09-23 at stage time (verbatim duplicate of a caption used within 14 days); "
+        "the slot refills on the next plan pass with a fresh caption"
+    ) == ot.NOISE
+
+
 def test_a_no_action_phrase_wins_even_inside_an_unfamiliar_alert():
     # the explicit-phrasing convention is trusted broadly, by design (see module
     # docstring) -- any alert author who writes it means it.

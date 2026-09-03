@@ -91,7 +91,9 @@ def is_systemic(text) -> bool:
 # deliberately (see ops_alerts.py's own docstring examples) -- trust it, it is the single
 # strongest signal in the whole corpus. Case-insensitive.
 _EXPLICIT_NO_ACTION_RE = re.compile(
-    r"no action needed|not blocked;|approvals preserved", re.IGNORECASE)
+    r"no action needed|not blocked;|approvals preserved"
+    r"|slot refills on the next plan pass",
+    re.IGNORECASE)
 
 # Pure summary / log lines: not alerts about a problem at all, just a count.
 _INFORMATIONAL_PREFIXES = (
