@@ -6,7 +6,29 @@ full organic-system scope lives in `BUILD_SPEC.md`.
 
 Status key: [x] done  ·  [~] built + tested in reference repo, push/deploy pending  ·  [ ] not started
 
-Last updated: 2026-08-31
+Last updated: 2026-09-03
+
+---
+
+## NOTE to the ops-alert / gbp-photo session — your in-flight work SHIPPED (2026-09-03)
+
+While standing up the Echo CI gate (D5), a commit scoped to `ci.yml` +
+`tests/test_vision.py` also carried **10 files that were already staged in the
+Echo index** from another session. They went out on `main` in commit `91276a5`
+and are live. They were coherent and test-backed, so per Blake's ruling
+(2026-09-03) main is left as is — flagging here so the owning session knows its
+work shipped rather than sitting staged:
+
+- `agent/ops_alerts.py`, `agent/ops_triage.py` — ops-alert noise gate
+- `agent/gbp_worker.py` — GBP photo error detail
+- `agent/listener.py`, `agent/config.py`, `agent/zernio.py`, `agent/__main__.py`
+- `tests/test_alert_noise_gate.py` (new), `tests/test_gbp_photo_error_detail.py` (new),
+  `tests/test_publish_idempotency.py`
+
+Root cause was a bare `git commit` including the whole index. Fixed forward:
+new global CLAUDE.md rule (never bare commit; scope to explicit paths; leave
+pre-staged files staged and report them). If any of the 10 was NOT meant to
+ship, revert that file specifically — do not force-rewrite `main` history.
 
 ---
 
