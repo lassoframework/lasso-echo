@@ -24,9 +24,10 @@ both a `message` and an `app_mention` event (a mention in a channel does both), 
 id would let one message become two rows. channel:ts is the identity of a message in Slack;
 it also catches redelivery and replay. The raw event_id is kept in the row's attachments.
 """
+import re
 import threading
-import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 from .. import config
 from . import adapter as _adapter
@@ -57,12 +58,23 @@ def _slack_user_info_factory(bot_token):
     return _info
 
 
+_EMAIL_OK = re.compile(r"^[A-Za-z0-9._+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
 def _portal_lookup_factory(bus):
     """email -> {role, gyms:[{gym_id, relationship, account_key}]} from the portal's own
-    tables, via the same Supabase REST the bus uses. None when unknown."""
+    tables, via the same Supabase REST the bus uses. None when unknown.
+
+    V-m10: the match is case-insensitive (Slack and Clerk disagree on case for the same
+    person) and the value is validated as a plain address first, so no PostgREST wildcard
+    (`*`, `%`) or operator can ride in on a profile email."""
     def _lookup(email):
-        users = bus._get("app_users", {"email": f"eq.{email}", "select": "id,role",
-                                       "limit": "1"})
+        e = (email or "").strip()
+        if not e or not _EMAIL_OK.match(e):
+            return None
+        users = bus._get("app_users", {"email": f"ilike.{e}", "select": "id,role,email",
+                                       "limit": "2"})
+        users = [u for u in users or [] if (u.get("email") or "").lower() == e.lower()]
         if not users:
             return None
         u = users[0]
@@ -94,8 +106,8 @@ def live_deps(identity, *, bus=None, log=print):
         return _ig.resolve(uid, slack_user_info=info, portal_lookup=lookup,
                            operator_ids=operators)
 
-    def answer(ticket, who, messages):
-        return _answer.answer(ticket, who, messages, identity=identity)
+    def answer(ticket, who, messages, question=None):
+        return _answer.answer(ticket, who, messages, question, identity=identity)
 
     return _adapter.Deps(
         bus=bus, identity=identity, resolve_identity=resolve,
@@ -120,17 +132,31 @@ class ConvoWiring:
         self.deps = deps
         self.log = log
         self.counts = Counter()
-        self._sem = threading.Semaphore(MAX_CONCURRENT_EVENTS)
+        # RT-m4: a bounded pool, not a thread per event. A burst of events queues here
+        # instead of spawning without limit; the Socket Mode ack is still immediate.
+        self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EVENTS,
+                                        thread_name_prefix=f"slack-convo-{identity.name}")
         self._post = post or self._default_post()
         self._stop = threading.Event()
+        self._boot_checks()
+
+    def _boot_checks(self):
+        # V-m1: the fixer channel is where every escalation and hold card lands. Unset, the
+        # hold lane is a black hole. Say so at boot, not at the first held row.
+        if not config.fixer_channel_id():
+            self.log(f"[slack-convo/{self.identity.name}] WARNING AGENT_FIXER_CHANNEL_ID is "
+                     "unset: escalations and hold cards will mark failed until it is set")
+        if not config.ops_fix_channel_id():
+            self.log(f"[slack-convo/{self.identity.name}] WARNING no ops-fix channel: fixer "
+                     "requests will mark failed until AGENT_OPS_FIX_CHANNEL_ID is set")
 
     def _default_post(self):
         from ..slack_surface import SlackPoster
         token = self.identity.env(self.identity.bot_token_env)
         poster = SlackPoster(token=token)
 
-        def post(channel, text, thread_ts=None):
-            res = poster._chat_post(text=text, blocks=None, channel=channel,
+        def post(channel, text, thread_ts=None, blocks=None):
+            res = poster._chat_post(text=text, blocks=blocks, channel=channel,
                                     thread_ts=thread_ts)
             if not (res or {}).get("ok"):
                 raise RuntimeError(f"slack post failed: {(res or {}).get('error')}")
@@ -139,18 +165,17 @@ class ConvoWiring:
 
     # -- inbound --
     def _process(self, event, raw_event_id):
-        with self._sem:
-            try:
-                d = _adapter.handle_event(event, dedupe_key(event), self.deps)
-                self.counts[f"decision:{d.action}:{d.reason}"] += 1
-                if not d.ignored:
-                    self.log(f"[slack-convo/{self.identity.name}] {d.reason} ticket={d.ticket_id} "
-                             f"created={d.created} class={d.classification or '-'} "
-                             f"out={','.join(d.outbound_kinds)} raw_event={raw_event_id}")
-            except Exception as e:  # noqa: BLE001 - loud, never silent, never crashes Bolt
-                self.counts["decision:error"] += 1
-                self.log(f"[slack-convo/{self.identity.name}] handle_event FAILED "
-                         f"{type(e).__name__}: {e}")
+        try:
+            d = _adapter.handle_event(event, dedupe_key(event), self.deps)
+            self.counts[f"decision:{d.action}:{d.reason}"] += 1
+            if not d.ignored:
+                self.log(f"[slack-convo/{self.identity.name}] {d.reason} ticket={d.ticket_id} "
+                         f"created={d.created} class={d.classification or '-'} "
+                         f"out={','.join(d.outbound_kinds)} raw_event={raw_event_id}")
+        except Exception as e:  # noqa: BLE001 - loud, never silent, never crashes Bolt
+            self.counts["decision:error"] += 1
+            self.log(f"[slack-convo/{self.identity.name}] handle_event FAILED "
+                     f"{type(e).__name__}: {e}")
 
     def _on_event(self, body, event, etype):
         ev = dict(event or {})
@@ -160,7 +185,7 @@ class ConvoWiring:
             return  # flags off = today: count it, touch nothing
         raw_id = (body or {}).get("event_id") or ""
         ev["_raw_event_id"] = raw_id
-        threading.Thread(target=self._process, args=(ev, raw_id), daemon=True).start()
+        self._pool.submit(self._process, ev, raw_id)
 
     def register(self):
         app, identity = self.app, self.identity
@@ -173,15 +198,19 @@ class ConvoWiring:
         def _on_mention(body, event):
             self._on_event(body, event, "app_mention")
 
-        @app.action("slack_convo_release")
+        @app.action(_outbox.RELEASE_ACTION_ID)
         def _on_release(ack, body, action):
             ack()
             actor = (body.get("user") or {}).get("id", "")
-            if actor != config.APPROVER_SLACK_ID:
+            if not config.APPROVER_SLACK_ID or actor != config.APPROVER_SLACK_ID:
                 self.counts["release:refused_non_operator"] += 1
                 return
+            if not self.deps.identity_enabled():
+                self.counts["release:refused_flag_off"] += 1
+                return
             mid = (action or {}).get("value") or ""
-            ok = _outbox.release_held(self.deps.bus, mid, approved_by=actor, log=self.log)
+            ok = _outbox.release_held(self.deps.bus, mid, approved_by=actor,
+                                      identity=identity, log=self.log)
             self.counts[f"release:{'ok' if ok else 'noop'}"] += 1
 
         self.log(f"[slack-convo/{identity.name}] registered (enabled="
@@ -258,6 +287,12 @@ def start_additional_identities(*, exclude=("echo",), log=print):
         return started
     for ident in _ids.startable():
         if ident.name in exclude:
+            continue
+        # V-M9: tokens present is not consent. The per-identity flag gates the socket itself,
+        # so an identity with config shipped and its flag OFF opens no connection at all.
+        if not config.slack_convo_identity_enabled(ident.name):
+            log(f"[slack-convo/{ident.name}] tokens present but "
+                f"SLACK_CONVO_{ident.name.upper()}_ENABLED is off; not started")
             continue
         app = App(token=ident.env(ident.bot_token_env))
         w = ConvoWiring(app, ident, live_deps(ident, log=log), log=log).register().start_loops()

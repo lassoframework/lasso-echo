@@ -59,6 +59,27 @@ _REQUEST_TYPE_RULES = (
 
 _VALID = frozenset({QUESTION, CODE_FIX, ACTION_REQUEST, FOLLOW_UP})
 
+# RT-M2: a breakage word alone is a hair trigger ("I can't make Thursday", "my bad, my
+# error"). A code fix needs the breakage to be ABOUT something we run. Word-bounded.
+_DOMAIN_RE = re.compile(
+    r"\b(post|posts|posting|posted|publish|published|publishing|story|stories|reel|reels|"
+    r"caption|captions|calendar|schedule|scheduled|instagram|ig|facebook|fb|page|google|"
+    r"gbp|business profile|connect|connection|connected|connecting|link|upload|uploads|"
+    r"photo|photos|video|videos|media|approve|approval|approvals|portal|login|log in|"
+    r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder)\b", re.IGNORECASE)
+
+# V-m4: greetings, thanks, acknowledgements. Never a ticket, never a page.
+_CHATTER_RE = re.compile(
+    r"^\s*(hey|hi|hello|yo|thanks|thank you|thx|ty|ok|okay|k|got it|sounds good|great|"
+    r"perfect|awesome|cool|nice|will do|on it|done|yep|yes|no|nope|sure|np|no problem|"
+    r"lol|haha|👍|🙏|✅)[\s!.,]*(\S+[\s!.,]*){0,3}$", re.IGNORECASE)
+
+
+def is_chatter(text):
+    """A greeting / thanks / one-word acknowledgement, up to a few trailing words."""
+    t = (text or "").strip()
+    return bool(t) and len(t) <= 60 and bool(_CHATTER_RE.match(t))
+
 
 def request_type_for(text):
     """Ranger request_type for an action request, or 'other'."""
@@ -81,7 +102,8 @@ def classify(text, *, has_open_ticket, identity_product, llm=None):
         return FOLLOW_UP
     if identity_product == "ranger" and _ACTION_RE.search(t):
         return ACTION_REQUEST
-    if _BREAKAGE_RE.search(t):
+    # RT-M2: breakage AND an Echo-domain noun. Breakage alone escalates to a human.
+    if _BREAKAGE_RE.search(t) and _DOMAIN_RE.search(t):
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION

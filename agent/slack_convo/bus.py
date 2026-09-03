@@ -195,13 +195,30 @@ class Bus:
         return self._get(_MESSAGES, {"ticket_id": f"eq.{ticket_id}", "select": "*",
                                      "order": "created_at.asc", "limit": str(int(limit))})
 
-    def outbox(self, status="ready", limit=50):
-        return self._get(_MESSAGES, {"direction": "eq.outbound",
-                                     "delivery_status": f"eq.{status}", "select": "*",
-                                     "order": "created_at.asc", "limit": str(int(limit))})
+    def message(self, message_id):
+        rows = self._get(_MESSAGES, {"id": f"eq.{message_id}", "select": "*", "limit": "1"})
+        return rows[0] if rows else None
 
-    def mark_message(self, message_id, delivery_status, slack_ts=None):
+    def outbox(self, status="ready", limit=50, identity=None):
+        """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
+        bot wrote (attachments.identity), so two identities' loops never read each other's
+        queue (V-M8); rows with no identity stamp are returned to every caller and the
+        outbox suppresses them (V-M7: fail closed, never post an unattributed row)."""
+        params = {"direction": "eq.outbound", "delivery_status": f"eq.{status}",
+                  "select": "*", "order": "created_at.asc", "limit": str(int(limit))}
+        if identity:
+            params["or"] = f"(attachments->>identity.eq.{identity},attachments->>identity.is.null)"
+        return self._get(_MESSAGES, params)
+
+    def mark_message(self, message_id, delivery_status, slack_ts=None, meta_update=None):
+        """Move a row between delivery states. `meta_update` merges keys into attachments
+        (read-merge-write; jsonb PATCH replaces the whole value otherwise)."""
         fields = {"delivery_status": delivery_status}
         if slack_ts:
             fields["slack_ts"] = slack_ts
+        if meta_update:
+            cur = self.message(message_id) or {}
+            att = dict(cur.get("attachments") or {})
+            att.update(meta_update)
+            fields["attachments"] = att
         return self._patch(_MESSAGES, {"id": f"eq.{message_id}"}, fields)
