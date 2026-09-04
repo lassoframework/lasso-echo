@@ -150,6 +150,26 @@ class Bus:
     def set_ticket(self, ticket_id, **fields):
         return self._patch(_TICKETS, {"id": f"eq.{ticket_id}"}, fields)
 
+    def find_new_tickets(self, *, product, source, limit=20):
+        """D46: the portal-ticket worker's poll query. A non-Slack-sourced ticket
+        (product/source given explicitly, never a wildcard) that has not been classified
+        yet -- `status=eq.new` AND `classification=is.null` together are what "not yet
+        picked up by anything" means for this bus; a ticket already routed to a
+        classification (question/code_fix/action_request) or otherwise past 'new' is
+        never re-fetched here, so a slow worker restart can never double-process one."""
+        return self._get(_TICKETS, {
+            "product": f"eq.{product}", "source": f"eq.{source}", "status": "eq.new",
+            "classification": "is.null", "select": "*",
+            "order": "created_at.asc", "limit": str(int(limit))})
+
+    def find_fixing_tickets(self, *, product, limit=20):
+        """The second-stage poll: code_fix tickets already dispatched to the fixer
+        worker (status='fixing', set by the worker that wrote the fixer_request), whose
+        verification the worker may or may not have written back yet."""
+        return self._get(_TICKETS, {
+            "product": f"eq.{product}", "status": "eq.fixing", "select": "*",
+            "order": "created_at.asc", "limit": str(int(limit))})
+
     def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                    microsecond=0).isoformat()
