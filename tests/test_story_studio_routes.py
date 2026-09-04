@@ -325,3 +325,109 @@ def test_a_store_read_failure_is_a_502_not_a_crash(monkeypatch):
     assert status == 502
     assert body["ok"] is False
     assert "RuntimeError" in body["error"]
+
+
+# ---- REBUILD with edited copy (Blake 2026-09-04) ----------------------------
+# The 2026-09-01 backlog asked for an "inline overlay TEXT EDITOR". That cannot exist:
+# the copy is burned into pixels and no pre-burn artifact is persisted for a Story
+# Studio reel, so changing the words means re-rendering the same clips. These pin the
+# two things that make that safe -- the coach's text still passes every gate, and the
+# original is never destroyed by an edit that did not land.
+def _rebuildable(monkeypatch, tmp_path, gym="pierce", account="pierce_ig"):
+    store, body = _staged_story(monkeypatch, tmp_path, gym=gym, account=account)
+    # the persisted request is what a rebuild reads its clips back out of.
+    assert store.requests and store.requests[0].get("asset_ids")
+    return store, body
+
+
+def test_rebuild_restages_with_the_edited_copy_and_retires_the_old_card(monkeypatch, tmp_path):
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"x")
+    status, body = routes.handle_rebuild_story(
+        "pierce_ig", original["request_id"],
+        {"overlay_text": "friday night crew went hard", "identity_tokens": ["Pierce"]},
+        actor_id="coach1", store=store, candidates=_cands("pierce"),
+        music_library=_RealPathLibrary(str(audio)), render_fn=_fake_render)
+    assert status == 200, body
+    assert body["status"] == "staged"
+    assert body["request_id"] != original["request_id"], "a rebuild is a NEW request"
+    assert body["replaced_request_id"] == original["request_id"]
+    # the coach's words drove the overlay (through copy_gate + the ALL-CAPS layout).
+    assert "FRIDAY NIGHT CREW" in (body["overlay"] or "")
+    # and it answers in the SAME shape create does, so the portal needs no special case.
+    assert "clips" in body and "clip_bounds" in body and "music" in body
+
+
+def test_a_held_rebuild_leaves_the_ORIGINAL_story_intact(monkeypatch, tmp_path):
+    """The ordering guarantee. Denying first would mean a copy_gate breach in the
+    coach's own wording destroyed the story they already had."""
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    # no music library -> the render HOLDS on the missing ops audio asset.
+    status, body = routes.handle_rebuild_story(
+        "pierce_ig", original["request_id"],
+        {"overlay_text": "a different line", "identity_tokens": ["Pierce"]},
+        actor_id="coach1", store=store, candidates=_cands("pierce"),
+        render_fn=_fake_render)
+    assert status == 200
+    assert body["status"] == "held"
+    assert body["original_kept"] is True
+    assert body["replaced_request_id"] is None
+    # the original request was never marked denied.
+    assert str(store.requests[0].get("status") or "").lower() != "denied"
+
+
+def test_rebuild_refuses_empty_or_oversized_copy(monkeypatch, tmp_path):
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    rid = original["request_id"]
+    assert routes.handle_rebuild_story("pierce_ig", rid, {"overlay_text": "   "},
+                                       store=store)[0] == 400
+    assert routes.handle_rebuild_story("pierce_ig", rid, {}, store=store)[0] == 400
+    long = {"overlay_text": "x" * 301, "identity_tokens": ["Pierce"]}
+    assert routes.handle_rebuild_story("pierce_ig", rid, long, store=store)[0] == 400
+
+
+def test_rebuild_refuses_without_an_identity_anchor(monkeypatch, tmp_path):
+    """Echo will not burn a Story with no anchor. Refusing BEFORE re-rendering saves
+    the work and gives an honest reason instead of a post-render hold."""
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    status, body = routes.handle_rebuild_story(
+        "pierce_ig", original["request_id"], {"overlay_text": "new words"}, store=store)
+    assert status == 400
+    assert "identity anchor" in body["error"]
+
+
+def test_rebuild_404s_for_another_gyms_request_id(monkeypatch, tmp_path):
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    monkeypatch.setenv("STORY_STUDIO_RENDER_GYMS", "pierce,northgate")
+    status, body = routes.handle_rebuild_story(
+        "northgate_ig", original["request_id"],
+        {"overlay_text": "not yours", "identity_tokens": ["Northgate"]}, store=store)
+    assert status == 404
+    assert body["ok"] is False
+
+
+def test_rebuild_refuses_an_already_denied_story(monkeypatch, tmp_path):
+    store, original = _rebuildable(monkeypatch, tmp_path)
+    store.requests[0]["status"] = "denied"
+    status, body = routes.handle_rebuild_story(
+        "pierce_ig", original["request_id"],
+        {"overlay_text": "too late", "identity_tokens": ["Pierce"]}, store=store)
+    assert status == 409
+    assert "already denied" in body["error"]
+
+
+def test_rebuild_is_off_when_the_gym_is_not_armed(monkeypatch):
+    monkeypatch.delenv("STORY_STUDIO_RENDER", raising=False)
+    monkeypatch.delenv("STORY_STUDIO_RENDER_GYMS", raising=False)
+    assert routes.handle_rebuild_story("pierce_ig", "sr_1", {"overlay_text": "x"})[0] == 403
+
+
+def test_asset_ids_of_reads_jsonb_as_a_list_or_a_string():
+    """PostgREST hands jsonb back either way depending on the client; a rebuild must
+    not re-render from a guess when it can read neither."""
+    assert routes._asset_ids_of({"asset_ids": ["a", "b"]}) == ["a", "b"]
+    assert routes._asset_ids_of({"asset_ids": '["a","b"]'}) == ["a", "b"]
+    assert routes._asset_ids_of({"asset_ids": "not json"}) == []
+    assert routes._asset_ids_of({"asset_ids": None}) == []
+    assert routes._asset_ids_of({}) == []
