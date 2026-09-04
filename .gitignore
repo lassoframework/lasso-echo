@@ -38,7 +38,10 @@ brand_voice/*
 # agent tooling + local worktrees + runtime/cache state (never commit)
 .agents/
 .claude/
-brains/
+brains/*
+!brains/support/
+brains/support/*
+!brains/support/*.md
 content_library/welcome_bg/
 content_library/welcome_bg_local/
 content_library/welcome_client/
