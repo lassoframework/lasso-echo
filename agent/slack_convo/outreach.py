@@ -37,7 +37,7 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
 from dataclasses import dataclass
 
 from . import identity_gate as _ig
-from .adapter import _slack_escape
+from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
 # Same operator id as CLAUDE.md / the portal's digest-dm.ts (Approver Slack id, LASSO
 # co-founder Blake Ruff). Included on every outreach group DM, no exceptions.
@@ -66,8 +66,11 @@ class OutreachResult:
     reason: str = ""
 
 
-def eligible(ticket, who):
-    """Pure gate check, no Slack call, no bus write. Returns (ok: bool, reason: str).
+def _base_eligible(ticket, who):
+    """Every eligibility gate EXCEPT provenance (D42). Pure, no Slack call, no bus write.
+    Returns (ok: bool, reason: str). Split out (D45, Blake's ruling 2026-09-04) so a
+    ticket that fails only the provenance check can still be offered to a human via
+    `request_approval()` instead of being refused outright with no path forward at all.
 
     `ticket` is a support_tickets row (dict-like: source, reporter, slack_user_id).
     `who` is an identity_gate.Identity already resolved for the would-be recipient.
@@ -120,24 +123,46 @@ def eligible(ticket, who):
     if not (matches_reporter or matches_slack_id):
         return False, "reporter_mismatch"
 
-    # D42 (CRITICAL, Frame 2 audit finding, ruling still open -- see DECISIONS.md).
-    # `reporter` matching `who`'s email/slack_user_id only proves the TICKET is
-    # internally consistent; it proves nothing about whether the person who actually
-    # typed the intake form owns that email. None of NON_SLACK_SOURCES has a producer in
-    # this repo yet, so none of them can set this today -- which is exactly the point:
-    # this gate fails closed until a real producer positively asserts provenance
-    # (a confirmed magic-link click, an authenticated portal session, etc.) by setting
-    # `ticket["reporter_verified"] = True`. A ticket without that flag refuses here,
-    # even if every other check above passed.
-    # Closing-audit finding: this used to be a truthiness check (`if not ...get(...)`),
-    # which a future producer could defeat by accident -- setting reporter_verified to a
-    # token string, a timestamp, or any other truthy-but-not-boolean value would have
-    # silently passed. The whole point of D42's fail-closed design is that only the
-    # literal boolean True, set deliberately, ever opens this gate.
+    return True, "eligible"
+
+
+def eligible(ticket, who):
+    """Full gate for AUTONOMOUS outreach (no human in the loop): every _base_eligible
+    check, plus provenance (D42/D45).
+
+    D42 (CRITICAL, Frame 2 audit finding). `reporter` matching `who`'s email/slack_user_id
+    only proves the TICKET is internally consistent; it proves nothing about whether the
+    person who actually typed the intake form owns that email.
+
+    D45 (Blake's ruling, 2026-09-04, resolving D42's open question): rather than build a
+    real authentication mechanism for three intake producers that do not exist yet (a
+    speculative, larger project), or block outreach on that work indefinitely, this
+    system already has a proven, audited pattern for exactly this shape of problem --
+    a human tap in #fixer gates anything that cannot verify itself (D20's hold-card +
+    Release button, already used for fixer_request and held replies). `eligible()` stays
+    the FAST path for a future strongly-authenticated producer that sets
+    `ticket["reporter_verified"] = True` and genuinely does not need a human in the loop.
+    Every OTHER ticket that clears `_base_eligible` but not this -- which today is every
+    ticket, since nothing sets that flag -- is not a dead end: `request_approval()` below
+    offers it to Blake as a tap instead of refusing it outright. The literal boolean
+    `True` check (closing-audit fix, not a truthiness check) is unchanged."""
+    ok, reason = _base_eligible(ticket, who)
+    if not ok:
+        return ok, reason
     if (ticket or {}).get("reporter_verified") is not True:
         return False, "reporter_not_verified"
-
     return True, "eligible"
+
+
+def eligible_for_approval_request(ticket, who):
+    """D45: the gate for OFFERING a human the choice, not for acting autonomously.
+    Every _base_eligible check, EXCEPT provenance -- a human's own tap is what asserts
+    provenance on this path, so `reporter_verified` is not required here. Still refuses
+    everything `_base_eligible` refuses: an unresolved identity, a staff/coach
+    "recipient", a reporter/who mismatch, an already-outreached ticket. A ticket this
+    permits is a candidate for a #fixer card, never a reason to skip eligible()'s own
+    checks anywhere else."""
+    return _base_eligible(ticket, who)
 
 
 def first_message_text(ticket, ident):
@@ -207,7 +232,19 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
     if not ok:
         log(f"[outreach] refused ticket={(ticket or {}).get('id')} reason={reason}")
         return OutreachResult(opened=False, reason=reason)
+    return _send(ticket, who, ident, open_group_dm=open_group_dm,
+                post_first_message=post_first_message, record_outbound=record_outbound,
+                stamp_ticket=stamp_ticket, message_text=message_text,
+                mark_message=mark_message, claim_message=claim_message, log=log)
 
+
+def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
+         stamp_ticket=None, message_text=None, message_text_already_escaped=False,
+         mark_message=None, claim_message=None, log=print):
+    """The actual Slack side of outreach, with NO eligibility check of its own -- every
+    caller (`initiate()` after the autonomous `eligible()` gate, `release_approved_outreach()`
+    after a human tap) has already decided this send is authorized, by a different route.
+    Never call this directly from anywhere that has not itself gated the decision."""
     # D41 (CRITICAL): a caller-supplied `message_text` gets the SAME escaping treatment
     # as the default template, since either can carry untrusted content. Escaped here,
     # not inside first_message_text() twice -- that function already escapes its own
@@ -215,8 +252,18 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
     # double-encode it (a closing-audit finding: the original version of this line
     # unconditionally re-escaped the already-escaped default text, turning "&lt;" into
     # "&amp;lt;" -- cosmetic, never a live-markup regression, but wrong).
-    text = (_slack_escape(message_text) if message_text is not None
-           else first_message_text(ticket, ident))
+    #
+    # D45: `message_text_already_escaped` covers a THIRD case neither of the above two
+    # anticipated -- release_approved_outreach() re-sends the EXACT body a held row
+    # already stored, which request_approval() escaped once when it wrote that row. That
+    # stored text must never be escaped again here, for the identical double-encoding
+    # reason; it is also not the "default template" path, so first_message_text() must
+    # not be called either.
+    if message_text_already_escaped:
+        text = message_text or ""
+    else:
+        text = (_slack_escape(message_text) if message_text is not None
+               else first_message_text(ticket, ident))
 
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):
@@ -294,3 +341,125 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
                 f"{type(e).__name__}")
 
     return OutreachResult(opened=True, channel_id=channel_id, reason="ok")
+
+
+# ---- D45: the human-tap path (Blake's ruling, 2026-09-04, resolving D42) -----------------
+#
+# A ticket that clears every _base_eligible check but has no reporter_verified=True (which
+# is every ticket today -- no producer sets that flag) is not refused with no path forward.
+# It is offered to Blake as a #fixer card, reusing the SAME hold-notice + Release button
+# pattern this system already built and audited for fixer_request/held replies (D20), not
+# a new mechanism. His tap IS the provenance a real intake producer can't supply yet.
+# KIND_OUTREACH_REQUEST lives in adapter.py alongside the other KIND_ constants
+# (imported above) so write_hold_notice's label logic can recognize it too.
+
+
+@dataclass
+class ApprovalRequestResult:
+    requested: bool
+    held_message_id: str = ""
+    reason: str = ""
+
+
+def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
+                     message_text=None, log=print):
+    """Write the held outreach content (the actual first-message text, kind
+    KIND_OUTREACH_REQUEST, delivery_status='held' -- it is never postable by the normal
+    outbox loop, since that loop does not know how to open_group_dm; only
+    `release_approved_outreach()` below, itself only reachable from a validated Slack
+    button tap, can act on it) and a hold-notice card describing it in #fixer.
+
+    `record_outbound` is the same bus.record_outbound shape used everywhere else.
+    `write_hold_notice` is adapter.write_hold_notice, called with kind=KIND_OUTREACH_REQUEST
+    so the card's own release button (RELEASE_ACTION_ID) can route a tap here rather than
+    to outbox.release_held (which does not know how to open a DM and would refuse this
+    kind outright -- see outbox.py's own allowed-kinds check)."""
+    ok, reason = eligible_for_approval_request(ticket, who)
+    if not ok:
+        log(f"[outreach] approval request refused ticket={(ticket or {}).get('id')} "
+            f"reason={reason}")
+        return ApprovalRequestResult(requested=False, reason=reason)
+
+    text = (_slack_escape(message_text) if message_text is not None
+           else first_message_text(ticket, ident))
+    tid = (ticket or {}).get("id")
+
+    held = record_outbound(
+        ticket_id=tid, author_type=getattr(ident, "name", "system"), body=text,
+        delivery_status="held", kind=KIND_OUTREACH_REQUEST,
+        meta={"identity": getattr(ident, "name", ""), "outreach": True,
+              "recipient_kind": who.kind, "slack_user_id": who.slack_user_id})
+    held_id = (held or {}).get("id")
+    if held_id is None:
+        log(f"[outreach] approval request: held row write returned no id ticket={tid}")
+        return ApprovalRequestResult(requested=False, reason="write_failed")
+
+    write_hold_notice(
+        ident_name=getattr(ident, "name", ""), tid=tid, recipient_kind=who.kind,
+        user=who.slack_user_id or "", account_key=who.account_key or "",
+        kind=KIND_OUTREACH_REQUEST, body=text, held_message_id=held_id,
+        surface="outreach",
+        why="proposed outreach to a client from a non-Slack ticket, no verified "
+            "provenance yet -- tap to send")
+    return ApprovalRequestResult(requested=True, held_message_id=held_id, reason="held")
+
+
+def release_approved_outreach(message_id, ticket, who, ident, *, get_held_message,
+                              open_group_dm, post_first_message, record_outbound,
+                              stamp_ticket=None, mark_message=None, claim_message=None,
+                              log=print):
+    """The tap handler: validates a held KIND_OUTREACH_REQUEST row belongs to THIS ticket
+    and THIS identity before doing anything Blake's tap did not actually authorize, then
+    calls `_send()` -- the tap itself is the provenance _base_eligible's stricter sibling,
+    `eligible()`, could not get from the ticket alone. Refuses (never raises) for every
+    validation failure; a caller wires this to the SAME action-id dispatch RELEASE_ACTION_ID
+    already uses for other held kinds, keyed on `attachments.held_kind`.
+
+    `get_held_message(message_id) -> row | None` is bus.message's shape."""
+    row = get_held_message(message_id)
+    if not row or row.get("delivery_status") != "held":
+        log(f"[outreach] release refused: row {message_id} not held")
+        return OutreachResult(opened=False, reason="not_held")
+    att = row.get("attachments") or {}
+    if att.get("kind") != KIND_OUTREACH_REQUEST:
+        log(f"[outreach] release refused: row {message_id} kind {att.get('kind')!r} "
+            f"is not an outreach request")
+        return OutreachResult(opened=False, reason="wrong_kind")
+    if row.get("ticket_id") != (ticket or {}).get("id"):
+        log(f"[outreach] release refused: row {message_id} belongs to a different ticket")
+        return OutreachResult(opened=False, reason="ticket_mismatch")
+    if (att.get("identity") or "") != getattr(ident, "name", ""):
+        log(f"[outreach] release refused: row {message_id} belongs to identity "
+            f"{att.get('identity')!r} not {getattr(ident, 'name', '')!r}")
+        return OutreachResult(opened=False, reason="identity_mismatch")
+    # Re-run the base gates (NOT provenance -- the tap replaces that) at release time too,
+    # not just at request time: the ticket could have been outreached by a second path,
+    # or the identity resolution could have changed, in the window between the card
+    # posting and Blake's tap.
+    ok, reason = eligible_for_approval_request(ticket, who)
+    if not ok:
+        log(f"[outreach] release refused at tap time: {reason}")
+        return OutreachResult(opened=False, reason=reason)
+
+    result = _send(ticket, who, ident, open_group_dm=open_group_dm,
+                  post_first_message=post_first_message, record_outbound=record_outbound,
+                  stamp_ticket=stamp_ticket, message_text=row.get("body"),
+                  message_text_already_escaped=True,
+                  mark_message=mark_message, claim_message=claim_message, log=log)
+
+    # D45 closing-audit finding: _send() always writes a NEW row for the actual DM (the
+    # held row is never itself postable, see request_approval's docstring), so without
+    # this the held KIND_OUTREACH_REQUEST row sat at delivery_status='held' forever even
+    # after a successful send -- not a duplicate-send risk (the ticket-level
+    # already_outreached check still covers that), but an orphaned row nothing ever
+    # closes. Best-effort, same as every other mark_message call in this module: the
+    # real DM is already sent, a bookkeeping-close failure here must never look like the
+    # send itself failed.
+    if result.opened and mark_message is not None:
+        try:
+            mark_message(message_id, "posted")
+        except Exception as e:  # noqa: BLE001 - the send already succeeded
+            log(f"[outreach] held row {message_id} close-out failed (send itself "
+                f"succeeded): {type(e).__name__}")
+
+    return result

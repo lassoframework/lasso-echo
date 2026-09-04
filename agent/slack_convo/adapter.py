@@ -81,6 +81,7 @@ KIND_STATUS = "status"           # plain-language status as the ticket moves
 KIND_ESCALATION = "escalation"   # to the fixer channel: a human must look
 KIND_FIXER_REQUEST = "fixer_request"  # to the ops-fix channel: a code fix for the worker
 KIND_HOLD_NOTICE = "hold_notice"      # to the fixer channel: a row awaits a tap
+KIND_OUTREACH_REQUEST = "outreach_request"  # a proposed client DM awaiting a tap (D45)
 
 # Delivered to the fixer / ops-fix channel, never into the person's thread.
 INTERNAL_KINDS = frozenset({KIND_ESCALATION, KIND_FIXER_REQUEST, KIND_HOLD_NOTICE})
@@ -586,7 +587,17 @@ def write_hold_notice(bus, *, ident_name, tid, recipient_kind, user, account_key
     there would have been a STRONGER injection than the one already fixed for the client's
     own message text -- sitting outside any fence, read as trusted operator context rather
     than an untrusted report. Escaped here too, for the same reason and the same fix."""
-    label = "FIXER REQUEST" if kind == KIND_FIXER_REQUEST else "REPLY"
+    # D45 closing-audit finding: this used to fall through to "REPLY" for an outreach
+    # request too, so the #fixer card read "HELD REPLY awaiting your tap" for what is
+    # actually a brand new outbound DM to a client, not a reply. The why= text
+    # (outreach.py's request_approval) still clarified it, but the label itself should
+    # not be misleading on its own.
+    if kind == KIND_FIXER_REQUEST:
+        label = "FIXER REQUEST"
+    elif kind == KIND_OUTREACH_REQUEST:
+        label = "OUTREACH REQUEST"
+    else:
+        label = "REPLY"
     safe_user = _slack_escape(user)
     safe_key = _slack_escape(account_key) if account_key else ""
     return bus.record_outbound(
