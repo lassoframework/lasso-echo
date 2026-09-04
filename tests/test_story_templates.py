@@ -26,7 +26,7 @@ def test_no_template_defaults_to_chill():
 def test_every_template_has_plan_slots_ask():
     for tmpl in t.TEMPLATES.values():
         assert tmpl.segment_plan.min_segments >= 2
-        assert tmpl.segment_plan.max_segments <= 6
+        assert tmpl.segment_plan.max_segments <= 10
         assert tmpl.overlay_slots
         assert tmpl.overlay_slots[-1] == "ask"       # ends on exactly one ask
         assert tmpl.ask_style
@@ -63,3 +63,16 @@ def test_invalid_declared_falls_back_to_vision():
                                    analysis={"mood": "celebrate"})
     assert name == "member_win"
     assert src == "vision"
+
+
+def test_no_template_ceiling_forces_a_sub_floor_cut():
+    """max_segments raised to 8/9/10 (Blake 2026-09-04). The real bound is the 3s
+    per-segment floor: sharing a template's total window across its own maximum cut
+    count must never land under SEG_MIN_SEC, or the composer could plan a reel of
+    cuts too short to watch."""
+    for name, tmpl in t.TEMPLATES.items():
+        plan = tmpl.segment_plan
+        share = plan.total_max_sec / plan.max_segments
+        assert share >= plan.seg_min_sec, (
+            f"{name}: {plan.max_segments} cuts of {plan.total_max_sec}s is "
+            f"{share:.2f}s each, under the {plan.seg_min_sec}s floor")

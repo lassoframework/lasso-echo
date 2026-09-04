@@ -32,13 +32,13 @@ class _FakeStore:
         self.renders.append(dict(row))
         return dict(row)
 
-    def update_request(self, rid, fields):
+    def update_request(self, rid, fields, gym_id=None):
         for r in self.requests:
             if r.get("id") == rid:
                 r.update(fields)
         return True
 
-    def update_render(self, rid, fields):
+    def update_render(self, rid, fields, gym_id=None):
         for r in self.renders:
             if r.get("id") == rid:
                 r.update(fields)

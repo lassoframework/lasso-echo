@@ -30,13 +30,31 @@ def test_short_small_raw_enters_story_lane():
         comp.ROUTE_STORY
 
 
-def test_plan_routes_whole_request_to_opus_when_source_too_long():
+def test_one_over_cap_source_is_skipped_and_the_rest_still_build():
+    """Blake 2026-09-04: one long clip must not kill the whole reel now that a coach
+    can pick a dozen. The over-cap clip is dropped WITH its reason (never silently)
+    and the montage is built from the rest."""
     t = tmpl.get("hype_montage")
     cands = _cands("pierce", 4)
     assets = {"a0": {"duration_sec": 400, "size_bytes": 10}}  # one source over cap
     plan = comp.plan_compose(cands, "pierce", t, assets_by_id=assets)
+    assert plan.held is False
+    assert plan.route == comp.ROUTE_STORY
+    assert [s.asset_id for s in plan.segments] == ["a1", "a2", "a3"]
+    assert [k["asset_id"] for k in plan.skipped] == ["a0"]
+    assert "opus" in plan.skipped[0]["reason"].lower()
+
+
+def test_plan_routes_whole_request_to_opus_when_every_source_is_too_long():
+    """The Opus lane still owns a request whose sources are ALL over cap — that is
+    what it is for. Only the mixed case changed."""
+    t = tmpl.get("hype_montage")
+    cands = _cands("pierce", 3)
+    assets = {f"a{i}": {"duration_sec": 400, "size_bytes": 10} for i in range(3)}
+    plan = comp.plan_compose(cands, "pierce", t, assets_by_id=assets)
     assert plan.route == comp.ROUTE_OPUS
     assert plan.held is True
+    assert len(plan.skipped) == 3
 
 
 # ---- tenant isolation ------------------------------------------------------
@@ -213,3 +231,49 @@ def test_render_burns_music_when_provided(tmp_path):
         music_burn_fn=lambda p, m, d: (burned.append(m), f"{d}/withmusic.mp4")[1])
     assert res.output_path.endswith("withmusic.mp4")
     assert burned == ["/lib/hype001.mp3"]
+
+
+# ---- most cuts first (Blake 2026-09-04) ------------------------------------
+def test_ten_clips_become_ten_cuts_not_four_long_ones():
+    """The whole point of lifting the portal's 3-clip cap: hand Echo ten clips and ten
+    of them land in the reel, sharing the 60s window as 6s cuts, instead of four
+    15s cuts and six clips ignored."""
+    t = tmpl.get("hype_montage")
+    plan = comp.plan_compose(_cands("pierce", 10, seg=15.0), "pierce", t)
+    assert plan.held is False
+    assert len(plan.segments) == 10
+    assert plan.total_sec <= t.segment_plan.total_max_sec
+    for s in plan.segments:
+        assert comp.SEG_MIN_SEC <= s.duration <= comp.SEG_MAX_SEC
+
+
+def test_a_share_under_the_floor_drops_to_fewer_cuts():
+    """25 clips cannot all land in a 60s reel and clear the 3s floor, so the count
+    walks down until it fits — here to the template's own ceiling (10 cuts of 6s),
+    never to 25 cuts of 2.4s."""
+    t = tmpl.get("hype_montage")
+    plan = comp.plan_compose(_cands("pierce", 25, seg=15.0), "pierce", t)
+    assert plan.held is False
+    assert len(plan.segments) == t.segment_plan.max_segments
+    for s in plan.segments:
+        assert s.duration >= comp.SEG_MIN_SEC
+
+
+def test_the_highest_scoring_clips_are_the_ones_kept():
+    """Trimming shares the window; it never reorders the pick. _cands scores 90, 89,
+    88... so a 3-cut fit keeps a0/a1/a2."""
+    t = tmpl.get("athlete_stat")           # min 2, max 8, total 15..40
+    segs = comp.select_segments(_cands("pierce", 5, seg=15.0), "pierce",
+                                {"min_segments": 2, "max_segments": 3,
+                                 "total_min_sec": 15, "total_max_sec": 40})
+    assert [s.asset_id for s in segs] == ["a0", "a1", "a2"]
+    assert round(sum(s.duration for s in segs), 2) <= 40
+
+
+def test_a_short_pool_still_holds_with_an_honest_count():
+    """When nothing fits the total floor the plan still reports how much footage was
+    usable (the fallback pick), so the coach gets a real reason, not '0 segments'."""
+    t = tmpl.get("hype_montage")           # total_min 20
+    plan = comp.plan_compose(_cands("pierce", 2, seg=4.0), "pierce", t)
+    assert plan.held is True
+    assert "2 usable segment(s) totaling 8s" in plan.hold_reason

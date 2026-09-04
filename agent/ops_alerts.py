@@ -194,6 +194,23 @@ def alert(message, poster=None, force=False):
                 return None
         except Exception:  # noqa: BLE001 - a classifier fault must never eat an alert
             pass
+    # SLACK REPEAT GATE (Blake, 2026-09-04: "why do i keep getting this?"). The gate
+    # above asks whether a human ever needs this shape; this one asks whether a human has
+    # already been told this exact thing recently and nothing has changed. Runs LAST of
+    # the two so a NOISE line is never charged a repeat slot it did not use, and after
+    # the audit write so a suppressed alert is still on the record.
+    #
+    # A SYSTEMIC alert is exempt by construction: a shared-dependency outage recurring
+    # three days later is news, not a repeat, and its fan-out is already collapsed to one
+    # cross-post per 30-minute window below. `force` callers bypass this exactly as they
+    # bypass the master flag and the noise gate.
+    if not force:
+        try:
+            from . import ops_triage as _triage, alert_repeat as _repeat
+            if not _triage.is_systemic(message) and not _repeat.should_fire(message):
+                return None
+        except Exception:  # noqa: BLE001 - a gate fault must never eat an alert
+            pass
     text = "ECHO ALERT: " + scrub(message)
     poster = poster or _default_poster()
     try:

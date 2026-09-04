@@ -1845,6 +1845,38 @@ def ops_alerts_noise_filter_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_OPS_ALERTS_NOISE_FILTER", "false"))
 
 
+def alert_repeat_gate_enabled() -> bool:
+    """
+    Slack REPEAT gate (Blake, 2026-09-04: "why do i keep getting this?").
+
+    When ON, a NEEDS_TRIAGE alert whose exact condition was already announced inside the
+    window (alert_repeat_window_hours(), default 72h) is NOT re-posted. It still lands in
+    the audit table -- ops_alerts.alert audits BEFORE any gate -- so nothing is lost.
+
+    This is NOT the noise filter and does not overlap it. The noise filter drops shapes a
+    human never needs; this one drops the SECOND, THIRD and FOURTH telling of something a
+    human does need and has already been told. A change in the alert's own text (a new
+    count, a new grade, a different gym) re-fires it immediately without waiting out the
+    window, and a systemic alert is exempt entirely -- see agent/alert_repeat.py.
+
+    OFF by default, per the repo rule that every new capability ships inert.
+    """
+    return _truthy(os.environ.get("AGENT_ALERT_REPEAT_GATE", "false"))
+
+
+def alert_repeat_window_hours() -> float:
+    """How long an unchanged NEEDS_TRIAGE alert stays quiet. 72h by default: long enough
+    that human onboarding work (a gym owner clicking a connect link) gets a working week
+    to happen without a daily nag, short enough that a condition nobody acted on is still
+    raised twice a week. A value that cannot be parsed falls back to the default rather
+    than silencing alerts forever."""
+    try:
+        hours = float(os.environ.get("AGENT_ALERT_REPEAT_WINDOW_HOURS", "72"))
+    except (TypeError, ValueError):
+        return 72.0
+    return hours if hours > 0 else 72.0
+
+
 # ---- Slack Conversational Adapter (FIXER intake adapter) -----------------------------
 #
 # Blake, 2026-09-03: a person replies to a bot in Slack the way they would to a colleague,
