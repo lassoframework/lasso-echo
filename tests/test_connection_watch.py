@@ -150,11 +150,29 @@ def test_connect_page_says_each_platform_needs_its_own_approval():
 def test_connect_page_opens_oauth_in_new_tab_and_polls_on_focus():
     """OAuth must open in _blank so the original page stays alive to detect return.
     Hill Country 2026-08-26: window.location.href navigated the same tab away,
-    leaving no mechanism to update the connected badges afterward."""
+    leaving no mechanism to update the connected badges afterward.
+
+    CrossFit Sunnyside 2026-09-04 ("I click the connect button and nothing happens"):
+    this used to assert `window.open(url, "_blank"` — the call made INSIDE the fetch
+    .then, i.e. a later task than the click. Browsers only honour window.open during
+    the click's transient activation, so that call was silently blocked and returned
+    null; the page then took its success branch anyway and did nothing visible. The
+    assertion was pinning the defect. What must be true is the ORDERING: the tab is
+    claimed synchronously on the click, and steered once the url arrives."""
     from agent.intake_web import CONNECT_PAGE
-    # New tab — NOT same-tab navigation
-    assert 'window.open(url, "_blank"' in CONNECT_PAGE
-    assert "window.location.href = url" not in CONNECT_PAGE
+    # The tab is claimed in the click handler itself, before any fetch.
+    assert 'var win = window.open("", "_blank")' in CONNECT_PAGE
+    assert CONNECT_PAGE.index('var win = window.open("", "_blank")') < \
+        CONNECT_PAGE.index('fetch(base + "/social-connect'), \
+        "the tab must be opened BEFORE the fetch, or the browser blocks it"
+    # noopener would make window.open return null and hand us no tab to steer.
+    assert "noopener" not in CONNECT_PAGE
+    # ...and then steered to the real url, never left blank.
+    assert "win.location.replace(url)" in CONNECT_PAGE
+    # Same-tab navigation survives ONLY as the popup-blocked fallback, never as the
+    # first choice (that is the Hill Country regression this test was written for).
+    assert CONNECT_PAGE.count("window.location.href = url") == 1
+    assert "else { window.location.href = url; return; }" in CONNECT_PAGE
     # Focus listener re-polls when user returns from the OAuth window
     assert 'addEventListener("focus"' in CONNECT_PAGE
     assert "refreshStatus" in CONNECT_PAGE

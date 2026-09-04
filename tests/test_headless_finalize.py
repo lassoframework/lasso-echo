@@ -348,8 +348,12 @@ def test_connect_page_handles_the_return_leg():
     assert "does not manage any" in CONNECT_PAGE
     # never any vendor branding in front of a client
     assert "zernio" not in CONNECT_PAGE.lower()
-    # existing behaviors preserved (test_connection_watch invariants)
-    assert 'window.open(url, "_blank"' in CONNECT_PAGE
+    # existing behaviors preserved (test_connection_watch invariants). The tab is
+    # claimed synchronously on the click and steered afterwards -- see
+    # test_connect_page_opens_oauth_in_new_tab_and_polls_on_focus for why asserting the
+    # old post-fetch `window.open(url, ...)` was pinning a silently blocked popup.
+    assert 'var win = window.open("", "_blank")' in CONNECT_PAGE
+    assert "win.location.replace(url)" in CONNECT_PAGE
     assert 'addEventListener("focus"' in CONNECT_PAGE
     assert "setInterval" in CONNECT_PAGE
 
