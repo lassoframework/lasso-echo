@@ -13,10 +13,9 @@ from dataclasses import dataclass
 from . import config
 from .slack_convo import adapter as _a
 from .slack_convo import answer_lane as _al
+from .slack_convo import identities as _ids
 from .slack_convo.bus import Bus
 from .slack_surface import SlackPoster
-
-_ECHO_BOT_TOKEN_ENV = "AGENT_SLACK_BOT_TOKEN"
 
 
 def _slack_lookup_email_factory(poster):
@@ -77,14 +76,26 @@ class Deps:
     fixed_kwargs: dict
 
 
-def live_deps(*, bus=None, log=print):
-    """Everything echo_ticket_worker.intake_pass()/fixed_pass() need, wired to real
-    services: Echo's own bot token (never Blake's, matching every other outbound path
-    in this system), the real bus, the real answer-lane grounding + LLM."""
+def live_deps(*, product=None, source=None, identity_name="echo", bus=None, log=print):
+    """Everything echo_ticket_worker.intake_pass()/fixed_pass() need for the given
+    (product, identity) pair, wired to real services: that identity's OWN bot token
+    (never Blake's, matching every other outbound path in this system, and never a
+    different identity's token -- D47 generalized this from Echo-only to any
+    registered identity via identities.py's own bot_token_env, the same lookup
+    listener_wiring.py's live_deps() already uses), the real bus, the real
+    answer-lane grounding + LLM. product/source default to None so the worker's own
+    PRODUCT/SOURCE defaults apply when this is called for Echo (unchanged call site);
+    a caller wiring the portal->scout pass passes both explicitly."""
     bus = bus or Bus()
-    import os
-    token = os.environ.get(_ECHO_BOT_TOKEN_ENV, "")
+    ident = _ids.IDENTITIES[identity_name]
+    token = ident.env(ident.bot_token_env)
     poster = SlackPoster(token=token)
+
+    routing_kwargs = {"identity_name": identity_name}
+    if product is not None:
+        routing_kwargs["product"] = product
+    if source is not None:
+        routing_kwargs["source"] = source
 
     shared = dict(
         open_group_dm=_open_group_dm_factory(poster),
@@ -95,6 +106,7 @@ def live_deps(*, bus=None, log=print):
         log=log,
     )
     intake_kwargs = dict(shared)
+    intake_kwargs.update(routing_kwargs)
     intake_kwargs.update(
         slack_lookup_email=_slack_lookup_email_factory(poster),
         account_key_for_gym=_account_key_for_gym_factory(bus),
@@ -102,4 +114,6 @@ def live_deps(*, bus=None, log=print):
         fetch_state=_al.default_fetch_state,
         llm=_al.default_llm,
     )
-    return Deps(bus=bus, intake_kwargs=intake_kwargs, fixed_kwargs=dict(shared))
+    fixed_kwargs = dict(shared)
+    fixed_kwargs.update({k: v for k, v in routing_kwargs.items() if k != "source"})
+    return Deps(bus=bus, intake_kwargs=intake_kwargs, fixed_kwargs=fixed_kwargs)

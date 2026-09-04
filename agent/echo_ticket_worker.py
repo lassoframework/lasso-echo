@@ -42,6 +42,12 @@ from .slack_convo import identities as _ids
 from .slack_convo import identity_gate as _ig
 from .slack_convo import outreach as _out
 
+# D47 (Blake, 2026-09-04): generalized from Echo-only to any (product, identity) pair
+# routed through the identity map -- portal tickets (product='portal', the generic
+# Website tab form's default) route to Scout, not Ranger's ad-engine-specific
+# fixer-lane.ts, which never had a reason to see a non-ranger ticket in the first
+# place. Every call site defaults to Echo so existing behavior and tests are
+# unchanged; a caller wiring a second (product, identity) pair passes them explicitly.
 PRODUCT = "echo"
 SOURCE = "website_tab"
 
@@ -84,26 +90,31 @@ def _verified_ticket_dict(ticket):
     return d
 
 
-def _escalate_unresolved(bus, ticket, *, reason, log=print):
+def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print):
     tid = ticket.get("id")
     bus.set_ticket(tid, status="escalated", escalated=True)
     bus.record_outbound(
         ticket_id=tid, author_type="system",
-        body=f"Portal Echo ticket {tid} could not be routed automatically: {reason}. "
-             f"Raw message: {(ticket.get('raw_text') or '')[:300]}",
+        body=f"Portal ticket {tid} ({identity_name}) could not be routed "
+             f"automatically: {reason}. Raw message: "
+             f"{(ticket.get('raw_text') or '')[:300]}",
         delivery_status="ready", kind=_a.KIND_ESCALATION,
-        meta={"identity": "echo", "surface": "portal_echo_ticket"})
-    log(f"[echo-ticket-worker] escalated ticket={tid} reason={reason}")
+        meta={"identity": identity_name, "surface": "portal_ticket_bridge"})
+    log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
 
 
 def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
-               post_first_message, write_hold_notice, fetch_state=None, llm=None,
-               mark_message=None, claim_message=None, stamp_ticket=None, log=print):
-    """First pass: NEW, unclassified tickets. Never runs if the config flag is off."""
+               post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
+               identity_name="echo", fetch_state=None, llm=None, mark_message=None,
+               claim_message=None, stamp_ticket=None, log=print):
+    """First pass: NEW, unclassified tickets for (product, source), dispatched under
+    identity_name. Never runs if the config flag is off. Defaults preserve the
+    original Echo-only behavior; D47 generalized this for a second (product,
+    identity) pair (portal -> scout) without touching Echo's call site."""
     if not config.portal_echo_tickets_enabled():
         return {"processed": 0}
-    ident = _ids.IDENTITIES["echo"]
-    tickets = bus.find_new_tickets(product=PRODUCT, source=SOURCE)
+    ident = _ids.IDENTITIES[identity_name]
+    tickets = bus.find_new_tickets(product=product, source=source)
     processed = 0
     for ticket in tickets:
         tid = ticket["id"]
@@ -114,12 +125,13 @@ def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
         bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
                            author_type="client", author_id=ticket.get("reporter") or "",
                            body=ticket.get("raw_text") or "",
-                           meta={"surface": "portal_echo_ticket"})
+                           meta={"surface": "portal_ticket_bridge"})
 
         who = resolve_client_identity(ticket, slack_lookup_email=slack_lookup_email,
                                       account_key_for_gym=account_key_for_gym, log=log)
         if who.kind != _ig.CLIENT:
-            _escalate_unresolved(bus, ticket, reason=f"identity_{who.kind}", log=log)
+            _escalate_unresolved(bus, ticket, reason=f"identity_{who.kind}",
+                                identity_name=identity_name, log=log)
             continue
 
         # Persisted so fixed_pass (a later poll, possibly after a redeploy) can
@@ -127,7 +139,7 @@ def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
         bus.set_ticket(tid, slack_user_id=who.slack_user_id)
 
         classification = _cls.classify(ticket.get("raw_text") or "", has_open_ticket=False,
-                                       identity_product=PRODUCT, llm=llm)
+                                       identity_product=ident.product, llm=llm)
 
         if classification == _cls.QUESTION:
             answer = None
@@ -154,30 +166,35 @@ def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
                     log(f"[echo-ticket-worker] outreach refused ticket={tid} "
                         f"reason={result.reason}")
             else:
-                _escalate_unresolved(bus, ticket, reason="question_not_groundable", log=log)
+                _escalate_unresolved(bus, ticket, reason="question_not_groundable",
+                                    identity_name=identity_name, log=log)
             continue
 
         if classification == _cls.CODE_FIX:
             # Same HELD fixer_request path every Slack-sourced code_fix uses (D14) --
             # a client's code_fix is ALWAYS held behind Blake's #fixer tap, no exception
             # for this source. This worker only automates the NOTIFY step once the
-            # existing worker (ops-fix-triage.js) has actually verified a fix.
+            # existing worker (ops-fix-triage.js) has actually verified a fix. NOTE
+            # (D10, unchanged): that desktop worker trusts only Echo's bot_id today, so
+            # a non-Echo identity's fixer_request will queue correctly here but not yet
+            # execute -- the same documented limitation every other non-Echo code_fix
+            # path in this system already carries.
             bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
             text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
                                         who.slack_user_id)
             row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
                                       delivery_status="held", kind=_a.KIND_FIXER_REQUEST,
-                                      meta={"identity": "echo",
-                                            "surface": "portal_echo_ticket",
+                                      meta={"identity": identity_name,
+                                            "surface": "portal_ticket_bridge",
                                             "recipient_kind": who.kind})
-            write_hold_notice(ident_name="echo", tid=tid, recipient_kind=who.kind,
+            write_hold_notice(ident_name=identity_name, tid=tid, recipient_kind=who.kind,
                               user=who.slack_user_id, account_key=who.account_key or "",
                               kind=_a.KIND_FIXER_REQUEST, body=text,
                               held_message_id=(row or {}).get("id"),
-                              surface="portal_echo_ticket")
+                              surface="portal_ticket_bridge")
             continue
 
-        _escalate_unresolved(bus, ticket,
+        _escalate_unresolved(bus, ticket, identity_name=identity_name,
                             reason=f"classification_{classification or 'none'}", log=log)
     return {"processed": processed}
 
@@ -192,15 +209,16 @@ def _fix_summary_text(verification):
     return "Fixed it and confirmed the change is live before sending this."
 
 
-def fixed_pass(bus, *, open_group_dm, post_first_message, mark_message=None,
-              claim_message=None, stamp_ticket=None, log=print):
+def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
+              identity_name="echo", mark_message=None, claim_message=None,
+              stamp_ticket=None, log=print):
     """Second pass: code_fix tickets already dispatched, whose verification has landed.
     A ticket the fixer worker has not finished yet is left exactly as-is -- polled
     again next cycle. Never runs if the config flag is off."""
     if not config.portal_echo_tickets_enabled():
         return {"notified": 0}
-    ident = _ids.IDENTITIES["echo"]
-    tickets = bus.find_fixing_tickets(product=PRODUCT)
+    ident = _ids.IDENTITIES[identity_name]
+    tickets = bus.find_fixing_tickets(product=product)
     notified = 0
     for ticket in tickets:
         tid = ticket["id"]
@@ -210,9 +228,10 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, mark_message=None,
         who = _ig.Identity(_ig.CLIENT, ticket.get("slack_user_id") or "",
                            email=ticket.get("reporter") or "", account_key="",
                            gym_id=ticket.get("client_id") or "",
-                           reason="portal echo ticket, previously resolved")
+                           reason="portal ticket, previously resolved")
         if not who.slack_user_id:
-            _escalate_unresolved(bus, ticket, reason="fixed_but_no_slack_user_id", log=log)
+            _escalate_unresolved(bus, ticket, reason="fixed_but_no_slack_user_id",
+                                identity_name=identity_name, log=log)
             continue
         result = _out.initiate(
             _verified_ticket_dict(ticket), who, ident,
@@ -224,6 +243,6 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, mark_message=None,
             bus.set_ticket(tid, status="resolved")
             notified += 1
         else:
-            log(f"[echo-ticket-worker] fixed-pass outreach refused ticket={tid} "
-                f"reason={result.reason}")
+            log(f"[ticket-worker/{identity_name}] fixed-pass outreach refused "
+                f"ticket={tid} reason={result.reason}")
     return {"notified": notified}
