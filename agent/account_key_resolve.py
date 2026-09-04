@@ -49,7 +49,7 @@ _MAX_PAGES = 20       # 20k gyms is far beyond the fleet; hitting it means "unkn
 _READ_TIMEOUT = 8     # bounded: this runs before a request is served
 
 # state: {"at": float, "ok": bool, "live": frozenset, "map": dict}
-_cache = {"at": 0.0, "ok": False, "live": frozenset(), "map": {}}
+_cache = {"at": 0.0, "ok": False, "live": frozenset(), "map": {}, "by_gym": {}}
 
 
 def _norm(value):
@@ -107,7 +107,7 @@ def _build(get=None):
     tokens, t_ok = _read_all("echo_intake_tokens", "gym_id,echo_account_key", get=get)
     gyms, g_ok = _read_all("gyms", "id,name", get=get)
     if not (t_ok and g_ok):
-        return frozenset(), {}, False
+        return frozenset(), {}, {}, False
 
     # A gym_id with more than one token row cannot be resolved: we cannot tell which key is
     # current, and picking wrong sends a write to the wrong place. Drop it from the map (its
@@ -143,17 +143,18 @@ def _build(get=None):
         mapping[derived] = live_key
     for key in collided:
         mapping.pop(key, None)
-    return live, mapping, True
+    resolvable = {gid: k for gid, k in by_gym.items() if gid not in dupes}
+    return live, mapping, resolvable, True
 
 
 def _state(now_fn=None, get=None):
     now = (now_fn or time.time)()
     ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
     if _cache["at"] and now - _cache["at"] < ttl:
-        return _cache["live"], _cache["map"], _cache["ok"]
-    live, mapping, ok = _build(get=get)
-    _cache.update({"at": now, "ok": ok, "live": live, "map": mapping})
-    return live, mapping, ok
+        return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+    live, mapping, by_gym, ok = _build(get=get)
+    _cache.update({"at": now, "ok": ok, "live": live, "map": mapping, "by_gym": by_gym})
+    return live, mapping, by_gym, ok
 
 
 def resolve(account_key, now_fn=None, get=None):
@@ -165,7 +166,7 @@ def resolve(account_key, now_fn=None, get=None):
     if not key:
         return account_key
     try:
-        live, mapping, ok = _state(now_fn=now_fn, get=get)
+        live, mapping, _by_gym, ok = _state(now_fn=now_fn, get=get)
     except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
         print(f"[key-resolve] unavailable: {type(e).__name__}: {e}")
         return account_key
@@ -174,6 +175,30 @@ def resolve(account_key, now_fn=None, get=None):
     return mapping.get(key, account_key)
 
 
+def portal_key_for_gym(gym_id, now_fn=None, get=None):
+    """The account key the PORTAL has already issued to this gym, or "".
+
+    This is the anti-divergence primitive. The portal is where a gym is created and where
+    its key is first minted (social-onboard.ts deriveAccountKey); Echo deriving its OWN key
+    from the same gym_id is what produced two live keys per gym in the first place. Any
+    Echo code that is about to mint or derive a key MUST ask this first and use the answer
+    when there is one.
+
+    "" on any uncertainty (unreadable or truncated plane, unknown gym, a gym whose token
+    rows disagree), so a caller falls back to its existing behaviour rather than acting on
+    a half-read."""
+    gid = _norm(gym_id)
+    if not gid:
+        return ""
+    try:
+        _live, _map, by_gym, ok = _state(now_fn=now_fn, get=get)
+    except Exception as e:  # noqa: BLE001
+        print(f"[key-resolve] portal key lookup unavailable: {type(e).__name__}: {e}")
+        return ""
+    return by_gym.get(gid, "") if ok else ""
+
+
 def reset_cache():
     """Tests only."""
-    _cache.update({"at": 0.0, "ok": False, "live": frozenset(), "map": {}})
+    _cache.update({"at": 0.0, "ok": False, "live": frozenset(), "map": {},
+                   "by_gym": {}})

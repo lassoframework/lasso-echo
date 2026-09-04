@@ -118,11 +118,24 @@ def derive_mint_key(account_key, display_name, *, resolve_uuid=None, gym_exists=
         info["reason"] = "no display name (key kept, no fabrication)"
         return passed, info
 
-    try:
-        canonical = canonical_account_key(str(gym_uuid), display_name)
-    except (ValueError, RuntimeError):
-        info["reason"] = "canonical derivation rejected (key kept)"
-        return passed, info
+    # THE PORTAL'S KEY WINS (2026-09-04). The portal is where a gym is created and where
+    # its key is first minted (social-onboard.ts deriveAccountKey = slug + rawUUID[:6]).
+    # Echo deriving its OWN key from the same gym_id (slug + sha256(gym_id)[:6]) is exactly
+    # what gave one gym two live keys -- CrossFit Reverb ran as crossfitreverb30b5b2 in the
+    # portal and crossfitreverb6cdf33 in Echo, and Dean got "93 posts drafted" over an empty
+    # approve list. Deriving here at all is only correct when the portal has issued nothing.
+    from . import account_key_resolve as _akr
+    portal_key = _akr.portal_key_for_gym(str(gym_uuid))
+    if portal_key:
+        canonical = portal_key
+        info["source"] = "portal"
+    else:
+        try:
+            canonical = canonical_account_key(str(gym_uuid), display_name)
+        except (ValueError, RuntimeError):
+            info["reason"] = "canonical derivation rejected (key kept)"
+            return passed, info
+        info["source"] = "derived"
 
     # Preserve the _ig / _fb suffix convention the mint / env-suffix layer expects: the
     # canonical key is a base; if the caller passed a suffixed key, re-apply the suffix so
@@ -133,6 +146,10 @@ def derive_mint_key(account_key, display_name, *, resolve_uuid=None, gym_exists=
             break
 
     info["derived"] = (canonical != passed)
-    info["reason"] = "canonical (portal uuid folded in)" if info["derived"] \
-        else "already canonical"
+    if not info["derived"]:
+        info["reason"] = "already canonical"
+    elif info.get("source") == "portal":
+        info["reason"] = "portal's issued key (authoritative; Echo never re-derives)"
+    else:
+        info["reason"] = "canonical (portal uuid folded in)"
     return canonical, info
