@@ -206,6 +206,11 @@ def _status():
     print(f"  alert_noise_flt: {config.ops_alerts_noise_filter_enabled()}  "
           f"(env AGENT_OPS_ALERTS_NOISE_FILTER; an alert ops_triage calls NOISE is not "
           f"posted to Slack, still audited)")
+    print(f"  alert_repeat   : {config.alert_repeat_gate_enabled()}  "
+          f"(env AGENT_ALERT_REPEAT_GATE, window {config.alert_repeat_window_hours()}h via "
+          f"AGENT_ALERT_REPEAT_WINDOW_HOURS; an unchanged NEEDS_TRIAGE alert already told "
+          f"inside the window is not re-posted, still audited. A changed alert or a "
+          f"systemic one always fires)")
     print(f"  slack_convo    : {config.slack_convo_enabled()}  (env SLACK_CONVO_ENABLED; the Slack "
           f"Conversational Adapter, a FIXER intake: a DM/group DM/@mention/thread reply to a "
           f"bot becomes a support_tickets row, every message a support_messages row first)")
