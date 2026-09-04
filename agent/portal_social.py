@@ -1223,6 +1223,32 @@ def handle_cadence(account_key, posts_per_day, actor_id=None, reader=None):
 # GET /portal/<token>/metrics  -> the Part D report SHAPE (null values until Part C/D)
 # ==========================================================================
 
+def _baseline_posts_per_week(account_key):
+    """The gym's pre-Echo posting cadence, as (posts_per_week, captured_at).
+
+    LOCAL SQLite first (a worker that has one keeps working exactly as before), then the
+    SHARED plane, which is where the Apify capture actually writes it. The fallback is the
+    load-bearing half: db.set_baseline_posts_per_week has no production caller (only test
+    helpers), while agent/social_baseline.py writes every real measurement to Supabase
+    social_baseline. So the local read was always empty in production, the portal rendered
+    "capturing your baseline" forever, and every before/after pair came back
+    {before: null} -- which is why the cards read "with Echo so far" instead of the real
+    "Before Echo -> With Echo". The intake-web service has no volume, so it can ONLY see
+    the shared plane. Never raises: a baseline is a nice-to-have, not a reason to 500 a
+    metrics read.
+    """
+    try:
+        ppw, at = _db.get_baseline_posts_per_week(account_key)
+        if ppw is not None:
+            return ppw, at
+    except Exception:
+        pass
+    try:
+        return _pcs.SupabaseCalendarStore().social_baseline_posts_per_week(account_key)
+    except Exception:
+        return None, None
+
+
 def _metrics_shape(account_key, days):
     """The Part D metrics payload SHAPE. Part C wires the real Zernio analytics
     numbers into this exact shape; Part D assembles the before/after story. Until then
@@ -1234,7 +1260,7 @@ def _metrics_shape(account_key, days):
     Availability booleans reflect the flags: analytics_available reads
     AGENT_ZERNIO_ANALYTICS_ENABLED, report_available reads AGENT_MONTHLY_REPORT_ENABLED.
     Both OFF today, so the portal shows the report as pending, honestly."""
-    baseline_ppw, baseline_at = _db.get_baseline_posts_per_week(account_key)
+    baseline_ppw, baseline_at = _baseline_posts_per_week(account_key)
     return {
         "account_key": account_key,
         "window_days": days,
@@ -1317,7 +1343,7 @@ def _live_metrics(account_key, days, zclient):
         analytics_json = client.analytics_window(pid, days)
         if not (analytics_json or {}).get("hasAnalyticsAccess"):
             return None
-        baseline_ppw, baseline_at = _db.get_baseline_posts_per_week(account_key)
+        baseline_ppw, baseline_at = _baseline_posts_per_week(account_key)
         payload = _za.map_metrics(analytics_json, days, baseline_ppw, baseline_at,
                                   account_key=account_key)
         # Overlay the flags the pure mapper leaves to the caller (report flag; gaps note

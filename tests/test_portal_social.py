@@ -719,3 +719,56 @@ def test_http_autonomy_flag_off_is_404(tmp_path, monkeypatch):
         assert ei.value.code == 404
     finally:
         server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Baseline read falls back to the SHARED plane (Blake, 2026-09-04).
+# db.set_baseline_posts_per_week has no production caller -- only test helpers -- while
+# agent/social_baseline.py writes every real Apify measurement to Supabase
+# social_baseline. So the local-only read was always empty in production: the portal said
+# "capturing your baseline" forever and every before/after pair came back {before: null},
+# which made the cards read "with Echo so far" instead of "Before Echo -> With Echo".
+# ---------------------------------------------------------------------------
+
+def test_baseline_falls_back_to_shared_plane(monkeypatch):
+    from agent import portal_social as ps
+
+    monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", lambda k: (None, None))
+
+    class _Store:
+        def social_baseline_posts_per_week(self, account_key):
+            assert account_key == "eng"
+            return 6.77, "2026-08-28T20:02:21Z"
+
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda: _Store())
+    ppw, at = ps._baseline_posts_per_week("eng")
+    assert ppw == 6.77
+    assert at == "2026-08-28T20:02:21Z"
+
+
+def test_baseline_prefers_local_when_present(monkeypatch):
+    from agent import portal_social as ps
+
+    monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", lambda k: (4.0, "local-ts"))
+
+    def _boom():
+        raise AssertionError("shared plane must not be consulted when local has a value")
+
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", _boom)
+    assert ps._baseline_posts_per_week("eng") == (4.0, "local-ts")
+
+
+def test_baseline_never_raises(monkeypatch):
+    """A baseline is a nice-to-have; it must never 500 a metrics read."""
+    from agent import portal_social as ps
+
+    def _local_boom(_k):
+        raise RuntimeError("no local db")
+
+    class _Store:
+        def social_baseline_posts_per_week(self, account_key):
+            raise RuntimeError("supabase down")
+
+    monkeypatch.setattr(ps._db, "get_baseline_posts_per_week", _local_boom)
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda: _Store())
+    assert ps._baseline_posts_per_week("eng") == (None, None)
