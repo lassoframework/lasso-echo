@@ -107,9 +107,21 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                                             analysis=analysis)
 
     # 3. overlay (copy_gate + per-gym avatar rail + safe zones). A breach HOLDS.
+    #    IDENTITY ANCHOR (2026-09-04): story_overlay refuses to burn a Story without a
+    #    city/brand token and carries no default of its own -- correct for a coach tap,
+    #    where the portal supplies it, but impossible for a request Echo builds
+    #    SERVER-side. The event story offer is exactly that, and it HELD every single
+    #    time. So when the request omits the anchor we read the gym's OWN row for it.
+    #    This invents nothing (gyms.name + the city half of gyms.market), and a gym with
+    #    no name still resolves to nothing and still HOLDS -- the rail is untouched, it
+    #    just stops firing on gyms that do have a name.
+    tokens = request.get("identity_tokens") or ()
+    if not tokens:
+        from . import gym_identity
+        tokens = gym_identity.tokens_for(gym_id)
     try:
         overlay = story_overlay.build_overlay(
-            grounding.text, identity_tokens=request.get("identity_tokens") or (),
+            grounding.text, identity_tokens=tokens,
             gym=gym_id, ask=request.get("ask") or template.ask_style,
             grounded_from=grounding.source,
             low_confidence=grounding.low_confidence,
