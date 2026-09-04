@@ -652,6 +652,48 @@ class SupabaseCalendarStore:
         rows = r.json() or []
         return rows[0] if rows else None
 
+    def social_baseline_posts_per_week(self, account_key):
+        """The gym's PRE-ECHO posting cadence, read from the SHARED plane.
+
+        social_baseline is written by the Apify capture (agent/social_baseline.py) over
+        PostGREST and is keyed by the ACCOUNT KEY (gym_id is text here: 'eng', 'topfuel'),
+        not the gyms UUID. Returns (posts_per_week, captured_at) or (None, None).
+
+        Why this exists: Part D's before/after reads the baseline through
+        db.get_baseline_posts_per_week, which only ever consulted the worker's LOCAL
+        SQLite -- and the only writer of that column is a test helper. So every gym's
+        measured baseline sat in Supabase while the portal read an empty local table and
+        rendered "capturing your baseline" forever, and every before/after pair came back
+        {before: null} so the cards said "with Echo so far" instead of the real
+        "Before Echo -> With Echo" story. The intake-web service has no volume at all,
+        so a SQLite-only write could never have fixed it there; the shared plane is the
+        only store both services can see. Same reasoning as _shared_profile_id.
+        Read-only.
+        """
+        r = self._client().get(
+            self._rest("social_baseline"),
+            params={
+                "gym_id": f"eq.{account_key}",
+                "select": "captured_at,measures",
+                "order": "captured_at.desc",
+                "limit": "1",
+            },
+            headers=self._headers(),
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        if not rows:
+            return None, None
+        measures = rows[0].get("measures") or {}
+        ppw = measures.get("posts_per_week")
+        try:
+            ppw = float(ppw) if ppw is not None else None
+        except (TypeError, ValueError):
+            ppw = None
+        return ppw, rows[0].get("captured_at")
+
     def gym_autonomy(self, gym_slug):
         """The portal's per-gym Autonomous toggle for one gym, read from Supabase:
         base -> gyms.id -> echo_gym_settings.autonomous. Returns True/False, or None
