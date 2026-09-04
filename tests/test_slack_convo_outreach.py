@@ -408,3 +408,46 @@ def test_initiate_does_not_double_escape_the_default_first_message_text():
     assert "&lt;!channel&gt;" in posted_text
     assert "&amp;lt;" not in posted_text
     assert "&amp;amp;" not in posted_text
+
+
+def test_initiate_claims_the_row_before_posting_when_claim_message_is_injected():
+    """D44 (MINOR, Frame 2 closing-audit finding): initiate() posted directly without
+    ever claiming the row, leaving it in 'ready' for the whole duration of the post --
+    the exact window a concurrently-armed outbox loop could also see it. claim_message
+    (the same ready->posting CAS the outbox itself uses) is now called right after the
+    row is written and before the post, closing that window."""
+    log, open_dm, post, record = _calls()
+    claims = []
+
+    def claim_message(message_id):
+        claims.append(message_id)
+        return True
+
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=post, record_outbound=record,
+                               claim_message=claim_message)
+    assert result.opened is True and result.reason == "ok"
+    assert claims == ["m-1"]
+
+
+def test_initiate_backs_off_without_posting_when_the_claim_is_lost():
+    log, open_dm, post, record = _calls()
+
+    def losing_claim(message_id):
+        return False
+
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=post, record_outbound=record,
+                               claim_message=losing_claim)
+    assert result.reason == "lost_claim"
+    assert log["posted"] == [], "a lost claim must never still post -- another consumer has this row"
+
+
+def test_initiate_without_claim_message_injected_still_works_backward_compatible():
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=post, record_outbound=record)
+    assert result.opened is True and result.reason == "ok"

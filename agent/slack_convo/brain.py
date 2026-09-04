@@ -171,7 +171,19 @@ def append_resolution(agent_name: str, *, ticket_id: str, asked: str = "", broke
 
 
 def _clip(s: str, n: int = 160) -> str:
-    s = (s or "").strip().replace("\n", " ")
+    """D44 (MAJOR, Frame 2 closing-audit finding): stripping only '\\n' was not enough.
+    A bare '\\r' survives this function unstripped, gets written to the brain .md file,
+    and Python's universal-newline text mode translates it BACK into '\\n' the next time
+    the file is opened for read -- reintroducing a real line break `_parse()` had no
+    reason to expect from single-line client text. That let a crafted client_phrasing
+    inject a fake '## Classification hints' heading plus a fake phrase->label line,
+    reproduced live: a hint from one client's own words poisoning classification for a
+    DIFFERENT client's future message on the same agent. Every newline-shaped character
+    universal-newline translation cares about ('\\r\\n', '\\r', '\\n') is stripped here,
+    not just the literal one this function's caller happens to produce."""
+    s = (s or "").strip()
+    for ch in ("\r\n", "\r", "\n"):
+        s = s.replace(ch, " ")
     return s[:n]
 
 

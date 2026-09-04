@@ -164,7 +164,8 @@ def first_message_text(ticket, ident):
 
 
 def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
-            stamp_ticket=None, message_text=None, mark_message=None, log=print):
+            stamp_ticket=None, message_text=None, mark_message=None, claim_message=None,
+            log=print):
     """The one outbound-first call this whole adapter makes.
 
     `open_group_dm(user_ids: list[str]) -> {"ok": bool, "channel_id": str}` and
@@ -234,6 +235,25 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
         meta={"identity": getattr(ident, "name", ""), "outreach": True,
               "recipient_kind": who.kind})
     row_id = (row or {}).get("id")
+
+    # D44 (MINOR, Frame 2 closing-audit finding): the row sat in 'ready' for the whole
+    # duration of the post call, the exact window an identity's own armed outbox loop
+    # could also see it and race this function (its first-contact gate always passes
+    # on a fresh outreach ticket, since inbound_count is 0). claim_message is the same
+    # bus.claim_message CAS (ready -> posting) the outbox itself uses -- calling it here
+    # closes that window to effectively zero. Optional, same pattern as mark_message,
+    # for a dry-run caller with no real bus; a caller that DOES pass it and loses the
+    # claim (return value falsy) means some other consumer already has this exact row,
+    # so this call backs off rather than risk posting the DM a second time.
+    if claim_message is not None and row_id is not None:
+        try:
+            claimed = claim_message(row_id)
+        except Exception as e:  # noqa: BLE001 - a claim failure refuses, never guesses
+            log(f"[outreach] claim_message failed row={row_id}: {type(e).__name__}")
+            return OutreachResult(opened=True, channel_id=channel_id, reason="claim_failed")
+        if not claimed:
+            log(f"[outreach] row={row_id} already claimed by another consumer, backing off")
+            return OutreachResult(opened=True, channel_id=channel_id, reason="lost_claim")
 
     posted = post_first_message(channel_id, text)
     if not posted or not posted.get("ok"):
