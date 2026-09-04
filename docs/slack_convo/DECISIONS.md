@@ -577,3 +577,73 @@ scout-listener: `feat/fixer-service-rename` branch, 570/570 tests green in an is
 worktree, opened as a PR (not merged) per instruction. Frame 1 / Frame 2 adversarial
 audits are intentionally NOT run by this build -- per the Big Build Protocol, that is a
 separate, independent pass.
+
+---
+
+# Frame 1 / Frame 2 audit wave (2026-09-04): two fresh independent agents, PR #23 + scout-listener PR #1
+
+Frame 1 ("row first, verification first") and Frame 2 ("how does a client get a message
+they should not have") ran with zero shared context, per Blake's "fix, re-audit to zero".
+Both converged on the same module: `outreach.py`, the one new outbound-first path in
+this build. Combined: 2 CRITICAL confirmed by both frames independently, 1 CRITICAL
+found only by Frame 2, 1 MAJOR, 1 informational (outreach.py has zero production callers
+today -- none of this was live-reachable, but had to be fixed before any caller wires it
+in). No finding on the pre-existing Slack-sourced path (D1-D33 holds); no finding on the
+scout-listener rename.
+
+## D41 (CRITICAL x2 + MAJOR, both frames). Outreach's message was unescaped, the row was
+## never closed, and there was no idempotency guard
+Three findings in `outreach.py`, one fix each:
+- **Unescaped client text** (`first_message_text`): `ticket["raw_text"]` from a
+  non-Slack, unauthenticated intake source was interpolated into the first DM message
+  with no Slack-escaping, reopening the exact live-markup injection class D27/D32
+  already closed on the Slack-sourced path -- worse here, since a public portal form is
+  a LOWER-trust origin than a Slack workspace member. Fixed: `_slack_escape` (reused
+  from `adapter.py`, not reimplemented) applied to `ask` inside `first_message_text`,
+  and again unconditionally in `initiate()` so a caller-supplied `message_text` gets the
+  same treatment.
+- **Row never closed** (`initiate`): the ack row was written `delivery_status="ready"`
+  and posted directly, but never claimed or marked `posted`/`failed` afterward -- so
+  once the owning identity's normal outbox loop is armed, its next poll finds the SAME
+  row still sitting in `ready` and reposts the identical first message a second time
+  into a live client conversation the moment the client replies once (Frame 1 traced
+  the exact gate, `inbound_count &lt; 1`, that stops protecting it). Fixed: a new optional
+  `mark_message` injected param, called with `"posted"` + the real Slack ts on success,
+  `"failed"` (matching `outbox.py`'s own convention) on a failed post -- never left in
+  `ready` for a second consumer to find.
+- **No idempotency** (`eligible`): a retry after a transient failure had nothing
+  stopping it from re-recording and re-posting. Fixed: `eligible()` now refuses outright
+  if the ticket already has a `slack_channel_id` stamped (which only `stamp_ticket()`
+  ever sets, only after a successful open+post) -- reason `already_outreached`.
+
+## D42 (CRITICAL, Frame 2 only, RULING STILL OPEN). Reporter-match proves internal
+## consistency, not provenance -- fails closed until a real producer can assert it
+Frame 2 constructed the sharper attack the reporter-match gate didn't cover: matching
+`ticket.reporter` to the resolved recipient's email/slack_user_id only proves the ticket
+is self-consistent, never that the person who actually submitted the intake form owns
+that email. None of `NON_SLACK_SOURCES` (portal_form, engage_tenant_event,
+website_intake) has a producer built in this repo yet, so none of them have any
+mechanism to prove the submitter's identity today. A stranger who knows or guesses a
+real client's email could submit a form as them and have a real client's real Slack
+account contacted with attacker-chosen content.
+
+Fixed narrowly and conservatively: `eligible()` now also requires
+`ticket["reporter_verified"] is True`, a flag no current producer can set -- this makes
+outreach eligible for literally nothing today (fully fail-closed), by design, until a
+real producer positively asserts provenance.
+
+**Ruling needed from Blake before any NON_SLACK_SOURCES producer is built**: which
+provenance mechanism sets `reporter_verified`? The two shapes Frame 2 suggested: (a) the
+intake requires a confirmed step tying the submission to an authenticated identity (a
+magic-link click, an authenticated portal session) before the ticket is even created, or
+(b) outreach never fires autonomously for a non-Slack source at all -- it goes through a
+human tap first, the same hold-lane pattern the fixer_request cards already use. Neither
+is implemented; the gate above simply refuses until one is and a producer sets the flag.
+
+## Verification loop status (Frame 1/2 wave)
+All three D41 fixes plus the D42 gate landed in `agent/slack_convo/outreach.py`, with 8
+new tests (escaping x2, idempotency x1, row-lifecycle x3, D42 x2) alongside the 24
+pre-existing outreach tests, all updated to assert `reporter_verified: True` in the base
+fixture so they keep testing what they said they test. `tests/test_slack_convo_outreach.py`:
+32/32 green. Full suite green (see commit for exact count). outreach.py remains
+unwired to any production caller -- D42's open ruling should be resolved before it is.

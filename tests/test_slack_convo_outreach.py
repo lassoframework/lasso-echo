@@ -26,6 +26,11 @@ def _ticket(**over):
     row = {
         "id": "t-1", "source": "portal_form", "reporter": "owner@gym.com",
         "slack_user_id": "U_CLIENT", "raw_text": "my page shows the wrong hours",
+        # D42: a real producer must positively assert provenance. The base fixture
+        # asserts it so the PRE-EXISTING tests below (unresolved identity, reporter
+        # mismatch, etc.) keep testing exactly what they said they test; the dedicated
+        # D42 tests further down override this back to missing/False.
+        "reporter_verified": True,
     }
     row.update(over)
     return row
@@ -279,3 +284,98 @@ def test_initiate_still_reports_opened_true_if_the_post_itself_fails():
     assert result.reason == "post_failed"
     # The row was still recorded (row-first) even though the live post failed.
     assert len(log["recorded"]) == 1
+
+
+# ---- D41/D42 fixes, Frame 1/2 audit wave -------------------------------------------------
+
+def test_first_message_text_escapes_slack_markup_in_the_untrusted_raw_text():
+    ident = ids.IDENTITIES["wrangler"]
+    ticket = _ticket(raw_text="<!channel> click <http://evil.example|here> to fix it")
+    text = outreach.first_message_text(ticket, ident)
+    assert "<!channel>" not in text
+    assert "<http://evil.example|here>" not in text
+    assert "&lt;!channel&gt;" in text
+    assert "&lt;http://evil.example|here&gt;" in text
+
+
+def test_initiate_escapes_a_caller_supplied_message_text_too():
+    """The escaping must not be first_message_text()-only -- a caller-supplied
+    message_text is untrusted the same way."""
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                      post_first_message=post, record_outbound=record,
+                      message_text="<@U_EVIL> pay now")
+    assert log["posted"][0][1] == "&lt;@U_EVIL&gt; pay now"
+    assert log["recorded"][0]["body"] == "&lt;@U_EVIL&gt; pay now"
+
+
+def test_eligible_refuses_a_ticket_that_was_already_outreached():
+    """D41 idempotency: a stamped slack_channel_id means outreach already happened --
+    a retry, a re-queued job, or a re-fired caller can never open or post again."""
+    ticket = _ticket(slack_channel_id="G_ALREADY")
+    ok, reason = outreach.eligible(ticket, _client())
+    assert ok is False and reason == "already_outreached"
+
+
+def test_initiate_marks_the_row_posted_with_the_real_slack_ts_on_success():
+    """D41 CRITICAL fix: a row left in 'ready' forever is exactly what lets an armed
+    outbox re-post the same first message a second time. mark_message must be called
+    with 'posted' and the real ts on a successful post."""
+    log, open_dm, post, record = _calls()
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None):
+        marks.append((message_id, delivery_status, slack_ts))
+
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=post, record_outbound=record,
+                               mark_message=mark_message)
+    assert result.opened is True and result.reason == "ok"
+    assert marks == [("m-1", "posted", "9999.1")]
+
+
+def test_initiate_marks_the_row_failed_never_leaves_it_ready_when_the_post_fails():
+    log, open_dm, _post, record = _calls()
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None):
+        marks.append((message_id, delivery_status, slack_ts))
+
+    def failing_post(channel_id, text):
+        return {"ok": False}
+
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=failing_post, record_outbound=record,
+                               mark_message=mark_message)
+    assert result.reason == "post_failed"
+    assert marks == [("m-1", "failed", None)]
+
+
+def test_initiate_without_mark_message_injected_still_works_backward_compatible():
+    """mark_message is optional so existing/dry-run callers keep working; the row-
+    lifecycle fix is additive, not a breaking change to the injected-deps shape."""
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
+                               post_first_message=post, record_outbound=record)
+    assert result.opened is True and result.reason == "ok"
+
+
+def test_eligible_refuses_an_unverified_reporter_even_when_everything_else_matches():
+    """D42 CRITICAL fix: a ticket.reporter matching who's email/slack_user_id only
+    proves internal consistency, not that the intake submitter owns that identity.
+    No current NON_SLACK_SOURCES producer can set reporter_verified, so this fails
+    closed for everyone until a real producer positively asserts provenance."""
+    ticket = _ticket(reporter_verified=False)
+    ok, reason = outreach.eligible(ticket, _client())
+    assert ok is False and reason == "reporter_not_verified"
+
+
+def test_eligible_refuses_when_reporter_verified_key_is_entirely_absent():
+    ticket = _ticket()
+    del ticket["reporter_verified"]
+    ok, reason = outreach.eligible(ticket, _client())
+    assert ok is False and reason == "reporter_not_verified"

@@ -37,6 +37,7 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
 from dataclasses import dataclass
 
 from . import identity_gate as _ig
+from .adapter import _slack_escape
 
 # Same operator id as CLAUDE.md / the portal's digest-dm.ts (Approver Slack id, LASSO
 # co-founder Blake Ruff). Included on every outreach group DM, no exceptions.
@@ -71,6 +72,14 @@ def eligible(ticket, who):
     `ticket` is a support_tickets row (dict-like: source, reporter, slack_user_id).
     `who` is an identity_gate.Identity already resolved for the would-be recipient.
     """
+    # D41 (idempotency, closing a MAJOR from the Frame 1/2 audit wave): stamp_ticket()
+    # is the ONLY writer of slack_channel_id on a ticket that started from a non-Slack
+    # source, and it only runs after a successful open+post. A ticket that already has
+    # one refuses outright -- a retry, a re-fired caller, or a re-queued job can never
+    # re-open the DM or re-post the first message a second time.
+    if str((ticket or {}).get("slack_channel_id") or "").strip():
+        return False, "already_outreached"
+
     source = str((ticket or {}).get("source") or "")
     if source not in NON_SLACK_SOURCES:
         return False, "not_a_non_slack_source"
@@ -111,15 +120,36 @@ def eligible(ticket, who):
     if not (matches_reporter or matches_slack_id):
         return False, "reporter_mismatch"
 
+    # D42 (CRITICAL, Frame 2 audit finding, ruling still open -- see DECISIONS.md).
+    # `reporter` matching `who`'s email/slack_user_id only proves the TICKET is
+    # internally consistent; it proves nothing about whether the person who actually
+    # typed the intake form owns that email. None of NON_SLACK_SOURCES has a producer in
+    # this repo yet, so none of them can set this today -- which is exactly the point:
+    # this gate fails closed until a real producer positively asserts provenance
+    # (a confirmed magic-link click, an authenticated portal session, etc.) by setting
+    # `ticket["reporter_verified"] = True`. A ticket without that flag refuses here,
+    # even if every other check above passed.
+    if not (ticket or {}).get("reporter_verified"):
+        return False, "reporter_not_verified"
+
     return True, "eligible"
 
 
 def first_message_text(ticket, ident):
     """Plain language, no dashes (Blake's exact words -- 'plain language, no dashes').
     Restates what they asked and that the agent is on it. Bounded so a very long raw
-    intake body cannot blow past Slack's message size or the bus's own truncation."""
+    intake body cannot blow past Slack's message size or the bus's own truncation.
+
+    D41 (CRITICAL, Frame 1/2 audit wave): `raw_text` on a ticket from one of
+    NON_SLACK_SOURCES is submitted through an intake with no character-class validation
+    (a public portal form, an engage tenant_event, a website intake) -- a LOWER-trust
+    origin than a Slack workspace member, not a higher one, and the D27/D32 escaping this
+    system already applies to every other client-facing body was missing here entirely.
+    `ask` is Slack-escaped before it ever reaches the template, closing the same class of
+    live-markup injection (`<!channel>`, `<@U...>`, a masked `<url|label>` link) those two
+    decisions already closed on the Slack-sourced path."""
     ask = str((ticket or {}).get("raw_text") or "").strip().replace("\n", " ")
-    ask = ask[:400]
+    ask = _slack_escape(ask[:400])
     name = (getattr(ident, "name", "") or "agent").capitalize()
     if ask:
         return (f"Hi, this is {name} from LASSO. I saw you asked about: {ask}. "
@@ -129,7 +159,7 @@ def first_message_text(ticket, ident):
 
 
 def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
-            stamp_ticket=None, message_text=None, log=print):
+            stamp_ticket=None, message_text=None, mark_message=None, log=print):
     """The one outbound-first call this whole adapter makes.
 
     `open_group_dm(user_ids: list[str]) -> {"ok": bool, "channel_id": str}` and
@@ -148,7 +178,21 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
     existing MPIM matching (match_surface -> find_open_ticket_in_conversation) finds
     this ticket for the client's NEXT message purely by slack_channel_id, with no new
     matching logic needed. Optional so callers that only want the DM opened (e.g. a
-    dry run) can omit it; live wiring always passes it.
+    dry run) can omit it; live wiring always passes it. It is also what makes
+    `eligible()`'s idempotency gate (D41) work: a ticket without a stamped
+    slack_channel_id looks re-eligible, so a caller that wires this in for real must
+    always pass it.
+
+    `mark_message(message_id, delivery_status, slack_ts=None)` is the same
+    bus.mark_message shape the outbox uses (D41, closing a CRITICAL from the Frame 1/2
+    audit wave): this function posts directly rather than going through outbox.py's
+    claim/dispatch loop, so it must ALSO close the row's lifecycle itself -- a row left
+    sitting in 'ready' after this function already posted it is exactly the same row an
+    identity's normal armed outbox loop would later claim and post AGAIN. On a
+    successful post the row is marked 'posted' with the real Slack ts immediately; on a
+    failed post it is marked 'failed' (the same convention outbox.py itself uses), never
+    left in 'ready' for another consumer to find. Optional only so a caller doing a pure
+    dry run (no real bus) can omit it; live wiring always passes it.
 
     Refuses (returns OutreachResult(opened=False, ...)) rather than raising for every
     business reason; only a bus write failure propagates (the caller decides how to log
@@ -158,7 +202,11 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
         log(f"[outreach] refused ticket={(ticket or {}).get('id')} reason={reason}")
         return OutreachResult(opened=False, reason=reason)
 
-    text = message_text if message_text is not None else first_message_text(ticket, ident)
+    # D41 (CRITICAL): escaped unconditionally here too, not only inside
+    # first_message_text() -- a caller-supplied `message_text` must get the same
+    # treatment as the default template, since either can carry untrusted content.
+    text = _slack_escape(message_text if message_text is not None
+                         else first_message_text(ticket, ident))
 
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):
@@ -176,12 +224,29 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
         body=text, delivery_status="ready", kind="ack",
         meta={"identity": getattr(ident, "name", ""), "outreach": True,
               "recipient_kind": who.kind})
+    row_id = (row or {}).get("id")
 
     posted = post_first_message(channel_id, text)
     if not posted or not posted.get("ok"):
         log(f"[outreach] first-message post failed ticket={(ticket or {}).get('id')} "
             f"channel={channel_id}")
+        if mark_message is not None and row_id is not None:
+            try:
+                mark_message(row_id, "failed")
+            except Exception as e:  # noqa: BLE001 - the failure is already logged above
+                log(f"[outreach] mark_message(failed) itself failed row={row_id}: "
+                    f"{type(e).__name__}")
         return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed")
+
+    if mark_message is not None and row_id is not None:
+        try:
+            mark_message(row_id, "posted", slack_ts=posted.get("ts") or None)
+        except Exception as e:  # noqa: BLE001 - the message already sent; never undo it,
+                                # but a stuck 'ready' row is exactly D41's finding, so this
+                                # is logged loudly rather than swallowed quietly.
+            log(f"[outreach] CRITICAL: mark_message(posted) failed row={row_id} "
+                f"ticket={(ticket or {}).get('id')} -- row will still show 'ready' and "
+                f"may be re-posted by the armed outbox: {type(e).__name__}")
 
     # "The group DM thread becomes the ticket thread": stamp the ticket with this
     # channel (and the client's own slack_user_id / this ticket's owning bot_identity)
