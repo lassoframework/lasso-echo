@@ -1173,8 +1173,12 @@ def test_escalation_and_hold_notice_honour_the_identitys_own_fixer_channel(monke
 # ======================================================================================
 
 def test_all_five_identities_exist_in_config_and_only_echo_is_startable_by_default(monkeypatch):
-    for n in ("echo", "ranger", "scout", "wrangler", "lainey"):
+    # D34/D35 (2026-09-03, Blake's routing ruling): Wrangler's product is deliberately
+    # retargeted to "websites" (lassoframework-site / lasso-gym-sites tickets), not
+    # self-referential like the other four. See agent/slack_convo/routing.py.
+    for n in ("echo", "ranger", "scout", "lainey"):
         assert IDS.get(n).product == n
+    assert IDS.get("wrangler").product == "websites"
     for n in ("RANGER", "SCOUT", "WRANGLER", "LAINEY"):
         monkeypatch.delenv(f"{n}_SLACK_BOT_TOKEN", raising=False)
         monkeypatch.delenv(f"{n}_SLACK_APP_TOKEN", raising=False)

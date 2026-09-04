@@ -77,7 +77,7 @@ class _FakeStore:
     def insert_render(self, row):
         self.renders.append(dict(row)); return dict(row)
 
-    def update_request(self, rid, fields):
+    def update_request(self, rid, fields, gym_id=None):
         for r in self.requests:
             if r.get("id") == rid:
                 r.update(fields)

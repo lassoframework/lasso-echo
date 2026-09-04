@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 
 from . import classifier as _cls
 from . import identity_gate as _ig
+from . import brain as _brain
 
 SURFACE_IM = "im"
 SURFACE_MPIM = "mpim"
@@ -312,9 +313,13 @@ def handle_event(event, event_id, deps):
     classification = None
     request_type = None
     if who.is_human_known and not rate_limited:
+        try:
+            hint = _brain.load_hint(ident.name)
+        except Exception:  # noqa: BLE001 - a brain read failure never blocks classification
+            hint = None
         classification = _cls.classify(text, has_open_ticket=has_open,
                                        identity_product=ident.product,
-                                       llm=deps.classify_llm)
+                                       llm=deps.classify_llm, brain_hint=hint)
         if classification == _cls.ACTION_REQUEST:
             request_type = _cls.request_type_for(text)
 

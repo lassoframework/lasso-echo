@@ -90,7 +90,7 @@ IDENTITIES = {
         fixer_channel_env="SCOUT_FIXER_CHANNEL_ID",
     ),
     "wrangler": BotIdentity(
-        name="wrangler", product="wrangler",
+        name="wrangler", product="websites",
         bot_token_env="WRANGLER_SLACK_BOT_TOKEN",
         app_token_env="WRANGLER_SLACK_APP_TOKEN",
         bot_user_id_env="WRANGLER_SLACK_BOT_USER_ID",

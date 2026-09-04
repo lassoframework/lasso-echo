@@ -30,10 +30,15 @@ ASK_JOIN = "START THIS WEEK"
 
 @dataclass
 class SegmentPlan:
-    """How many segments the composer pulls and their length window (spec §3: 2..6
-    segments, 3..15s each, total 15..60s)."""
+    """How many segments the composer pulls and their length window (spec §3: 3..15s
+    each, total 15..60s).
+
+    max_segments raised from 6 to 10 (Blake 2026-09-04): a coach who hands Echo ten
+    clips should see ten clips in the reel. The real bound is the 3s per-segment floor
+    against each template's total window (total_max / max_segments must stay >= 3s), so
+    each template's ceiling below is set from ITS own total window, not a flat number."""
     min_segments: int = 2
-    max_segments: int = 6
+    max_segments: int = 10
     seg_min_sec: float = 3.0
     seg_max_sec: float = 15.0
     total_min_sec: float = 15.0
@@ -58,31 +63,31 @@ class Template:
 TEMPLATES = {
     "athlete_stat": Template(
         name="athlete_stat",
-        segment_plan=SegmentPlan(min_segments=2, max_segments=4,
+        segment_plan=SegmentPlan(min_segments=2, max_segments=8,
                                  total_min_sec=15, total_max_sec=40),
         overlay_slots=["hook", "stat_card", "ask"],
         music_mood=_music.SHELF_HYPE, ask_style=ASK_JOIN, card_kind="stat"),
     "member_win": Template(
         name="member_win",
-        segment_plan=SegmentPlan(min_segments=2, max_segments=4,
+        segment_plan=SegmentPlan(min_segments=2, max_segments=8,
                                  total_min_sec=15, total_max_sec=40),
         overlay_slots=["hook", "stat_card", "ask"],
         music_mood=_music.SHELF_HYPE, ask_style=ASK_CELEBRATE, card_kind="stat"),
     "event": Template(
         name="event",
-        segment_plan=SegmentPlan(min_segments=2, max_segments=5,
+        segment_plan=SegmentPlan(min_segments=2, max_segments=9,
                                  total_min_sec=15, total_max_sec=50),
         overlay_slots=["hook", "event_card", "ask"],
         music_mood=_music.SHELF_HYPE, ask_style=ASK_EVENT, card_kind="event"),
     "class_promo": Template(
         name="class_promo",
-        segment_plan=SegmentPlan(min_segments=2, max_segments=5,
+        segment_plan=SegmentPlan(min_segments=2, max_segments=9,
                                  total_min_sec=15, total_max_sec=50),
         overlay_slots=["hook", "ask"],
         music_mood=_music.SHELF_HYPE, ask_style=ASK_BOOK, card_kind=""),
     "hype_montage": Template(
         name="hype_montage",
-        segment_plan=SegmentPlan(min_segments=3, max_segments=6,
+        segment_plan=SegmentPlan(min_segments=3, max_segments=10,
                                  total_min_sec=20, total_max_sec=60),
         overlay_slots=["hook", "ask"],
         music_mood=_music.SHELF_HYPE, ask_style=ASK_JOIN, card_kind=""),
@@ -94,6 +99,29 @@ DEFAULT_TEMPLATE = "hype_montage"
 def get(name):
     """The Template by name, or None."""
     return TEMPLATES.get(str(name or "").strip().lower())
+
+
+def selection_bounds():
+    """The clip-picker's REAL bounds, derived from the templates themselves — the ONE
+    source of truth a client picker reads instead of hardcoding its own numbers
+    (same rule as story_layout.MAX_CHARS_PER_LINE for the overlay editor, Blake
+    2026-09-01).
+
+    min_clips: the fewest any template can compose from (below this nothing stages).
+    max_used_clips: the most cuts any template will actually put in one reel. A coach
+      may select MORE than this — extra clips are not wasted, they widen the pool the
+      composer picks the best moments from — so this is a "we will use up to N" number,
+      never a cap on selection.
+    """
+    plans = [t.segment_plan for t in TEMPLATES.values()]
+    return {
+        "min_clips": min(p.min_segments for p in plans),
+        "max_used_clips": max(p.max_segments for p in plans),
+        "seg_min_sec": min(p.seg_min_sec for p in plans),
+        "seg_max_sec": max(p.seg_max_sec for p in plans),
+        "total_min_sec": min(p.total_min_sec for p in plans),
+        "total_max_sec": max(p.total_max_sec for p in plans),
+    }
 
 
 def choose_from_vision(analysis):

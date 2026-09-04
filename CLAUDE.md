@@ -51,3 +51,29 @@ it sends. Note: ~/scout-listener's Slack token is a DIFFERENT app (scout2), not 
 - No em dashes, en dashes, or hyphens in any published marketing copy or on-image text.
 - Two open decisions are logged in PROGRESS.md (brand palette; publish path). Do not
   silently resolve them; flag them.
+
+## Process guard: never run a destructive git command in a shared checkout (Blake, 2026-09-04)
+
+Born from the third cross-session collision this week: a build agent ran `git checkout
+origin/main -- .` inside a shared checkout that was on another session's in-flight
+branch, believing it was cleaning its own scratch work. No data was actually lost that
+time (the real WIP was already stashed and untouched), but the failure mode is real and
+will eventually destroy something.
+
+**Never run `git checkout <ref> -- .`, `git checkout <ref> -- <paths>`, `git reset --hard`,
+`git restore`, `git clean -f`, or any other command that overwrites tracked files or the
+index in a checkout you did not create for this task.** This applies to every shared
+checkout on this machine (a repo's primary directory, e.g. `~/scout-listener`,
+`~/lasso-echo-work`), not just ones with visible uncommitted changes — another session's
+work can land there at any moment.
+
+**If a task needs a clean tree, create a worktree.** `git worktree add <path> -b
+<new-branch> origin/<base>` gives an isolated, disposable working directory backed by the
+same repo. Do all work there. Never clean, reset, or destructively check out the shared
+directory to get a clean starting point — branch a worktree from the ref you actually
+want instead.
+
+**Before touching any shared checkout at all**, run `git status --short` and `git branch
+--show-current` first. If the branch is not the one you expect, or the tree is not clean,
+stop and ask, or work in a worktree instead. Assume any shared checkout may belong, right
+now, to a session you cannot see.

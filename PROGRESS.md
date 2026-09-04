@@ -3988,3 +3988,77 @@ severity — a self-heal ("no action needed") and a genuine break post identical
 - **Open, deliberately not decided by me:** the very first live run of an autonomous
   code-fixing loop deserves Blake watching it, not a silent 3am arm. Flagged for his own
   go/no-go rather than armed in this same push.
+
+## Clip selection lifted + the Story Studio READ lane (Blake, 2026-09-04)
+Blake, from the portal: "they can only select three video to make a reel they should be
+able to select as many as possible to make the best reel possible!"
+
+**The 3-clip cap was never Echo's.** The engine's create route imposed no count at all;
+the ceiling lived in FOUR places in lasso-ops-portal (`src/lib/echo/story-studio-logic.ts`
+MAX_CLIPS, `src/app/my/story-studio-logic.ts` STORY_MAX_CLIPS, StoryStudio.tsx's `atCap`,
+and the API route's 400) plus a test asserting the 3.
+
+- **Most cuts first** (`story_composer.select_segments`, rewritten). The old greedy loop
+  took the top-scoring clips at their FULL 15s window until the total cap was reached, so
+  a 60s reel was four long cuts and every clip past the fourth was ignored no matter how
+  many the coach picked. It now tries the LARGEST cut count that fits and walks down,
+  sharing the total window evenly (60s / 10 = 6s cuts) and trimming a clip longer than its
+  share from its opening. What actually bounds the count is the 3s per-segment floor, not
+  an arbitrary maximum — so a longer selection makes a faster-paced reel. Falls back to the
+  old greedy pick when no count clears the total floor, so a HELD plan still reports
+  honestly how many usable seconds the gym had (a `0 segments` message would have been a
+  regression in candour).
+- **Ceilings raised from their own windows, not a flat number:** MAX_SEGMENTS 6 -> 10;
+  per template athlete_stat/member_win 4 -> 8, event/class_promo 5 -> 9, hype_montage
+  6 -> 10. Each satisfies total_max / max_segments >= 3s, and a test asserts that property
+  rather than the numbers, so a future template cannot set a ceiling that forces sub-3s cuts.
+- **One over-cap clip no longer kills the reel** (Blake's ruling). `plan_compose` skips an
+  over-cap source and builds from the rest, carrying `{asset_id, reason}` out on
+  `ComposePlan.skipped`; only when EVERY selected source is over cap does the request still
+  route to the Opus lane. Note the LIVE tap never reached that hold anyway —
+  `story_candidates._eligible_raw` already filtered over-cap assets out of both the
+  candidate list and assets_by_id — so this aligns the injected-pool path (gym_event, the
+  suite) with the live one instead of leaving them disagreeing.
+- **Clip accounting is now visible.** `create_story` returns used/requested/skipped and the
+  route returns a `clips` block plus `clip_bounds`; the portal renders "Echo used 10 of your
+  12 clips to make the best reel" and names any clip it could not use. Once a coach can hand
+  Echo a dozen clips, the two that lose look like a bug unless the choice is legible.
+- **`story_templates.selection_bounds()`** is the ONE source of truth for the picker's
+  bounds (min_clips, max_used_clips, the length windows), derived from the templates
+  themselves — the same rule as `story_layout.MAX_CHARS_PER_LINE` for the overlay editor
+  (Blake 2026-09-01). The portal's constants are now a fallback, not a retyped magic number.
+- Portal: MAX_CLIPS 3 -> 20 (the most cuts a 60s reel could hold at the 3s floor, so nothing
+  above it could ever reach the reel), MAX_USED_CLIPS 10, copy rewritten ("Pick as many of
+  your raw video clips as you like"; past 10, "Echo will cut the best 10 into your reel").
+
+**The READ lane** (the 2026-09-01 backlog item: "Story Studio has no persisted GET endpoint
+... get_render/list_requests/update_render have zero callers, and no staff Command Center
+surface"). Echo was persisting every render's burned overlay, licensed track and segment
+plan and then never reading them back: that evidence lived only in the create response, so
+an OLDER approval had nothing to show.
+- `GET /portal/<token>/studio/story` -> this gym's history, newest first, + clip_bounds.
+- `GET /portal/<token>/studio/story/<id>` -> one story's persisted detail.
+  Both READ-ONLY by construction (they only read the gym-scoped store — no render, stage,
+  approve or publish path exists on them) and gated by the same per-gym render flag. create
+  POSTs the SAME /studio/story path; the VERB separates them in intake_web's dispatch, which
+  a test pins by making a GET that reaches handle_create_story an outright failure.
+- **A real tenant hole closed on the way.** story_studio_store's docstring claimed "every
+  read REQUIRES a gym_id and filters on it", but only `list_requests` did: `get_request`,
+  `get_render`, `update_request` and `update_render` addressed a row by id ALONE. So a
+  request id belonging to another gym resolved — and through `deny`, whose every other step
+  is gym-scoped, could be PATCHED to denied by whoever held the id. All four now take the
+  gym, `deny` passes it, and `tests/test_story_studio_store.py` (new) drives the real store
+  against a fake http to assert the filter reaches PostgREST on every single-row read and
+  write. Added `render_for_request` (looks the render up by its FK, so "render id == request
+  id in this build" stays an implementation detail) and `list_renders`.
+- **Staff surface:** `/command-center/story-studio` (owner + exec, same gate as Social
+  Intake, registered in nav-registry). Gym picker, then each story's status, template, brief,
+  burned overlay + flags, music evidence, the clips it was cut from, and the approval row it
+  staged. Read-only on purpose: approvals stay in the gym's own queue and in Slack, so this
+  surface has no tap that could bypass the human gate.
+
+Suite: 5178 passed, 1 deselected (the known local-env faster_whisper prereq test) on Echo;
+portal typecheck + lint clean, story-studio-panel 38 checks.
+STILL OPEN from that backlog item: the approval-card inline overlay TEXT EDITOR (a portal
+convenience, backlogged 2026-09-01 and not part of this) and the `was_edited` coach-facing
+"what Echo is learning from your edits" view.

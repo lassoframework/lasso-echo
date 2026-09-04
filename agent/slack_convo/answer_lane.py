@@ -122,9 +122,33 @@ def _voice_rules(identity):
         import os
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         with open(os.path.join(root, identity.reply_voice_doc), "r", encoding="utf-8") as fh:
-            return fh.read()[:4000]
+            doc = fh.read()[:4000]
     except Exception:  # noqa: BLE001 - a missing voice doc means default voice only
+        doc = ""
+    return doc + _brain_tone_notes(identity.name)
+
+
+def _brain_tone_notes(agent_name):
+    """D40 (wiring D34-D38's brain.py in): tone notes ONLY, appended alongside the
+    reply-voice doc, never in place of it. This is the entire surface area brain.py is
+    allowed into answer_lane.py through -- `BrainHint.tone_notes` is a tuple of short
+    style phrases, structurally incapable of carrying a fact (see brain.py's own
+    docstring: the dataclass has no field that could hold one). This function is never
+    called anywhere near `facts`, `grounding`, or the FACTS block of the user prompt in
+    answer() below -- tests/test_support_brain.py asserts that structural separation
+    directly (a poisoned tone_notes entry cannot appear in the facts dict or grounding),
+    which is the actual enforcement now, replacing D36's original "no import at all" rule
+    (logged as D39 in DECISIONS.md: that blanket rule made wiring style guidance in at all
+    impossible, which was never Blake's intent -- "shapes classification and reply style
+    only, never facts" always meant a narrower, structural boundary, not zero import)."""
+    try:
+        from . import brain as _brain
+        notes = _brain.load_hint(agent_name).tone_notes
+    except Exception:  # noqa: BLE001 - a brain read failure never blocks a reply
         return ""
+    if not notes:
+        return ""
+    return "\n\nAdditional tone notes for this agent:\n" + "\n".join(f"- {n}" for n in notes)
 
 
 _HYPHEN_IN_WORD = re.compile(r"(?<=\w)-(?=\w)")
