@@ -204,3 +204,78 @@ def test_resolve_sort_item_dispatches(_arm, monkeypatch):
     inst.do_POST()
     assert called.get("args") == ("gritx", "amb_9", "raw", "coach2")
     assert cap.get("json", (None,))[0] == 200
+
+
+# ---- GET the story READ lane (2026-09-04) ----------------------------------
+# create-story POSTs the SAME /studio/story path, so these pin that a GET reaches the
+# READ handlers and never the create handler.
+def test_get_story_list_dispatches(_arm, monkeypatch):
+    token = _arm
+    called = {}
+
+    def _fake_list(account_key, **_k):
+        called["list"] = account_key
+        return 200, {"ok": True, "stories": [], "clip_bounds": {"min_clips": 2}}
+
+    def _boom_create(*_a, **_k):            # a GET must NEVER reach create
+        raise AssertionError("a GET on /studio/story reached handle_create_story")
+
+    monkeypatch.setattr("agent.story_studio_routes.handle_list_stories", _fake_list)
+    monkeypatch.setattr("agent.story_studio_routes.handle_create_story", _boom_create)
+    inst, cap = _make(f"/portal/{token}/studio/story",
+                      {"Host": "portal.lassoframework.com"})
+    inst.do_GET()
+    assert called.get("list") == "gritx"
+    assert cap.get("json", (None,))[0] == 200
+
+
+def test_get_one_story_dispatches_with_the_request_id(_arm, monkeypatch):
+    token = _arm
+    called = {}
+
+    def _fake_get(account_key, request_id, **_k):
+        called["args"] = (account_key, request_id)
+        return 200, {"ok": True, "story": {"request_id": request_id}}
+
+    monkeypatch.setattr("agent.story_studio_routes.handle_get_story", _fake_get)
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_abc-1.2",
+                      {"Host": "portal.lassoframework.com"})
+    inst.do_GET()
+    assert called.get("args") == ("gritx", "sr_abc-1.2")
+    assert cap.get("json", (None,))[0] == 200
+
+
+def test_get_story_revoked_404(_arm, monkeypatch):
+    token = _arm
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda c, r2=None: True)
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_1",
+                      {"Host": "portal.lassoframework.com"})
+    inst.do_GET()
+    assert cap.get("deny", (None,))[0] == 404
+    assert "json" not in cap                # never reached a handler
+
+
+def test_get_story_unknown_token_404(_arm, monkeypatch):
+    inst, cap = _make("/portal/notarealtoken123/studio/story",
+                      {"Host": "portal.lassoframework.com"})
+    inst.do_GET()
+    assert cap.get("deny", (None,))[0] == 404
+    assert "json" not in cap
+
+
+def test_deny_path_still_wins_over_the_get_story_pattern(_arm, monkeypatch):
+    """/studio/story/<id>/deny must keep routing to deny, not read as a story id."""
+    token = _arm
+    called = {}
+
+    def _fake_deny(account_key, request_id, reason="", **_k):
+        called["args"] = (account_key, request_id)
+        return 200, {"ok": True, "returned": True}
+
+    monkeypatch.setattr("agent.story_studio_routes.handle_deny_story", _fake_deny)
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_9/deny",
+                      {"Host": "portal.lassoframework.com", "Origin":
+                       "https://portal.lassoframework.com", "Content-Length": "2"},
+                      body=b"{}")
+    inst.do_POST()
+    assert called.get("args") == ("gritx", "sr_9")

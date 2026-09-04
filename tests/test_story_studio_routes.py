@@ -44,6 +44,9 @@ def _ss_cal(monkeypatch):
 
 
 class _FakeStore:
+    """Mirrors SupabaseStoryStudioStore, INCLUDING its gym scoping: every read filters
+    on gym_id, so a test that forgets to scope fails here the way it would in prod."""
+
     def __init__(self):
         self.requests = []
         self.renders = []
@@ -59,8 +62,35 @@ class _FakeStore:
         self.renders.append(dict(row))
         return dict(row)
 
-    def update_request(self, rid, fields):
+    def update_request(self, rid, fields, gym_id=None):
         return True
+
+    def update_render(self, rid, fields, gym_id=None):
+        return True
+
+    def get_request(self, request_id, gym_id=None):
+        assert gym_id, "get_request must be gym-scoped"
+        for r in self.requests:
+            if str(r.get("id")) == str(request_id) and r.get("gym_id") == gym_id:
+                return dict(r)
+        return None
+
+    def render_for_request(self, request_id, gym_id):
+        assert gym_id, "render_for_request must be gym-scoped"
+        for r in self.renders:
+            if str(r.get("request_id")) == str(request_id) and r.get("gym_id") == gym_id:
+                return dict(r)
+        return None
+
+    def list_renders(self, gym_id, status=None):
+        assert gym_id, "list_renders must be gym-scoped"
+        return [dict(r) for r in self.renders if r.get("gym_id") == gym_id
+                and (status is None or r.get("status") == status)]
+
+    def list_requests(self, gym_id, status=None):
+        assert gym_id, "list_requests must be gym-scoped"
+        return [dict(r) for r in self.requests if r.get("gym_id") == gym_id
+                and (status is None or r.get("status") == status)]
 
 
 class _RealPathLibrary(sm.StubMusicLibrary):
@@ -184,3 +214,114 @@ def test_resolve_bad_lane_is_400(monkeypatch):
     monkeypatch.setattr("agent.config.supabase_service_key", lambda: "")
     status, body = routes.handle_resolve_sort_item("westgate_ig", "x", "banana")
     assert status == 400
+
+
+# ---- the READ lane (2026-09-04) ---------------------------------------------
+# Before this, story_studio_store's get/list readers had NO callers: a story's music
+# and overlay were visible only in the create response, so reopening an older approval
+# lost them. These tests pin that the lane reads, stays read-only, and stays scoped.
+def _staged_story(monkeypatch, tmp_path, gym="pierce", account="pierce_ig"):
+    """Create one real staged story through the normal handler and hand back the store
+    it persisted into, so the read tests read genuinely-written rows."""
+    _arm(monkeypatch, gym=gym)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"x")
+    store = _FakeStore()
+    status, body = routes.handle_create_story(
+        account, {"asset_ids": ["a0", "a1"], "brief": "Members crushed today",
+                  "identity_tokens": [gym]},
+        actor_id="coach1", candidates=_cands(gym), store=store,
+        music_library=_RealPathLibrary(str(audio)), render_fn=_fake_render)
+    assert status == 200 and body["status"] == "staged", body
+    return store, body
+
+
+def test_get_story_returns_the_persisted_music_and_overlay(monkeypatch, tmp_path):
+    store, created = _staged_story(monkeypatch, tmp_path)
+    status, body = routes.handle_get_story("pierce_ig", created["request_id"],
+                                           store=store)
+    assert status == 200
+    story = body["story"]
+    # the SAME evidence the create response carried, now readable after the fact.
+    assert story["overlay"] == created["overlay"]
+    assert story["music"]["track_id"] == "hype_test"
+    assert story["music"]["license_ref"] == "lasso-lib:LIC-TEST"
+    assert story["segments"], "the segment plan must survive the round trip"
+    assert story["clip_count"] == len(story["segments"])
+    assert story["brief"] == "Members crushed today"
+    assert story["calendar_row_id"]
+
+
+def test_get_story_404s_for_another_gyms_request_id(monkeypatch, tmp_path):
+    """Tenant isolation at the read boundary: holding a real request id from ANOTHER
+    gym must read as absent, never as content."""
+    store, created = _staged_story(monkeypatch, tmp_path)
+    monkeypatch.setenv("STORY_STUDIO_RENDER_GYMS", "pierce,northgate")
+    status, body = routes.handle_get_story("northgate_ig", created["request_id"],
+                                           store=store)
+    assert status == 404
+    assert body["ok"] is False
+
+
+def test_get_story_404s_on_an_unknown_id(monkeypatch, tmp_path):
+    store, _created = _staged_story(monkeypatch, tmp_path)
+    status, _body = routes.handle_get_story("pierce_ig", "sr_nope", store=store)
+    assert status == 404
+
+
+def test_list_stories_returns_history_newest_first_with_bounds(monkeypatch, tmp_path):
+    store, created = _staged_story(monkeypatch, tmp_path)
+    status, body = routes.handle_list_stories("pierce_ig", store=store)
+    assert status == 200
+    assert [s["request_id"] for s in body["stories"]] == [created["request_id"]]
+    # the picker's bounds come from Echo, not a number retyped in the client.
+    b = body["clip_bounds"]
+    assert b["min_clips"] == 2
+    assert b["max_used_clips"] >= 10
+    assert b["seg_min_sec"] == 3.0
+
+
+def test_list_stories_never_shows_another_gyms_renders(monkeypatch, tmp_path):
+    store, _created = _staged_story(monkeypatch, tmp_path)
+    monkeypatch.setenv("STORY_STUDIO_RENDER_GYMS", "pierce,northgate")
+    status, body = routes.handle_list_stories("northgate_ig", store=store)
+    assert status == 200
+    assert body["stories"] == []
+
+
+def test_read_lane_is_off_when_the_gym_is_not_armed(monkeypatch):
+    monkeypatch.delenv("STORY_STUDIO_RENDER", raising=False)
+    monkeypatch.delenv("STORY_STUDIO_RENDER_GYMS", raising=False)
+    assert routes.handle_list_stories("pierce_ig")[0] == 403
+    assert routes.handle_get_story("pierce_ig", "sr_1")[0] == 403
+
+
+def test_list_stories_answers_bounds_even_with_no_store(monkeypatch):
+    """The picker asks for bounds on mount. An environment with no story store must
+    still answer them (empty history), not break the picker."""
+    _arm(monkeypatch)
+
+    class _Unavailable:
+        def available(self):
+            return False
+
+    status, body = routes.handle_list_stories("pierce_ig", store=_Unavailable())
+    assert status == 200
+    assert body["stories"] == []
+    assert body["clip_bounds"]["max_used_clips"] >= 10
+
+
+def test_a_store_read_failure_is_a_502_not_a_crash(monkeypatch):
+    _arm(monkeypatch)
+
+    class _Broken:
+        def available(self):
+            return True
+
+        def list_renders(self, gym_id, status=None):
+            raise RuntimeError("postgrest down")
+
+    status, body = routes.handle_list_stories("pierce_ig", store=_Broken())
+    assert status == 502
+    assert body["ok"] is False
+    assert "RuntimeError" in body["error"]

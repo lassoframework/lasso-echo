@@ -252,7 +252,14 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
 
     return {"status": "staged", "reason": "", "draft": draft,
             "story_render": story_render, "request_id": request_id,
-            "calendar_row_id": row_id}
+            "calendar_row_id": row_id,
+            # Clip accounting (Blake 2026-09-04): a coach who picks 12 clips and gets a
+            # 10-cut reel must be told which 10 were used and why the other 2 were not.
+            # Selection is a real editorial decision now, not a rubber stamp on a
+            # 3-clip pick, so it stops being invisible.
+            "used_clips": [s.asset_id for s in plan.segments],
+            "requested_clips": [str(a) for a in (request.get("asset_ids") or [])],
+            "skipped_clips": list(getattr(plan, "skipped", []) or [])}
 
 
 def deny(request_id, gym_id, reason="", *, store=None, cal_store=None):
@@ -271,14 +278,17 @@ def deny(request_id, gym_id, reason="", *, store=None, cal_store=None):
     store = store or _default_store()
     try:
         if store.available():
+            # gym_id scopes the PATCH (2026-09-04): every other step in this deny is
+            # gym-scoped, but these two addressed the row by id alone, so a request id
+            # belonging to another gym would be denied by whoever held it.
             store.update_request(request_id, {"status": STATUS_DENIED,
-                                              "deny_reason": reason})
+                                              "deny_reason": reason}, gym_id=base)
             # The RENDER row too. story_render.status is constrained to exactly
             # ('pending','denied') and nothing ever wrote 'denied', so every denied
             # render still read PENDING forever: the calendar card said denied, the
             # request said denied, and the render row disagreed with both. Anything
             # counting pending Story Studio work saw phantoms.
-            store.update_render(request_id, {"status": STATUS_DENIED})
+            store.update_render(request_id, {"status": STATUS_DENIED}, gym_id=base)
     except Exception as e:  # noqa: BLE001
         print(f"[story-studio] deny request update failed: {type(e).__name__}: {e}")
     db.audit("story_studio", request_id, f"denied: {reason} (segments returned to pool)")

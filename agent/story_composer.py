@@ -1,10 +1,17 @@
 """
 story_composer.py — the multi-clip composer (spec §3).
 
-Pick 2..6 segments (3..15s each, total 15..60s) from the SAME gym's raw pool via
+Pick 2..10 segments (3..15s each, total 15..60s) from the SAME gym's raw pool via
 opus scoring, 9:16 subject-aware reframe (REUSE clipper_render), loudness + color
 normalize across segments (they were shot on different phones), assemble, and cap a
 brand end-frame with exactly ONE ask. Every render lands PENDING (staging is Wave 6).
+
+SEGMENT COUNT (Blake, 2026-09-04): the coach picks as many clips as they like and the
+composer uses AS MANY as fit — it fits the most cuts it can inside the total window by
+sharing that window across the top-scoring clips (10 clips in a 60s reel = 6s cuts),
+rather than taking 4 long ones and ignoring the rest. The per-segment floor (3s) is
+what bounds the count, so a longer selection makes a faster-paced reel, never a
+choppier-than-watchable one.
 
 RAILS (never move):
   * INPUT CAPS: a raw asset enters the story lane only when it is <= 5 min AND
@@ -39,7 +46,7 @@ SEG_MAX_SEC = 15.0
 TOTAL_MIN_SEC = 15.0
 TOTAL_MAX_SEC = 60.0
 MIN_SEGMENTS = 2
-MAX_SEGMENTS = 6
+MAX_SEGMENTS = 10        # raised from 6, Blake 2026-09-04
 
 ROUTE_STORY = "story"
 ROUTE_OPUS = "opus"
@@ -79,6 +86,10 @@ class ComposePlan:
     held: bool = False
     hold_reason: str = ""
     total_sec: float = 0.0
+    # Clips dropped before selection, as [{asset_id, reason}] — an over-cap source no
+    # longer holds the whole request (Blake 2026-09-04), so the reason has to travel
+    # out to the coach instead of vanishing.
+    skipped: list = field(default_factory=list)
 
 
 @dataclass
@@ -125,17 +136,56 @@ def _score_candidate(cand):
     return float(cand.get("score") or 0.0)
 
 
+def _floor2(x):
+    """Floor to 2 decimals. Rounding a shared window UP would push n cuts past the
+    total cap (10 x 6.67 = 66.7s in a 60s reel), so every share floors."""
+    return int(float(x) * 100) / 100.0
+
+
+def _trim_to(seg, share):
+    """A copy of seg no longer than `share`, cut from its start (the opening of a clip
+    is the part the scorer actually looked at). Never returns a sub-floor segment:
+    callers only pass a share >= SEG_MIN_SEC."""
+    if seg.duration <= share:
+        return seg
+    return Segment(asset_id=seg.asset_id, gym_id=seg.gym_id, start_ts=seg.start_ts,
+                   end_ts=round(seg.start_ts + _floor2(share), 2), score=seg.score,
+                   source_path=seg.source_path)
+
+
+def _greedy(usable, max_seg, total_max):
+    """The long-cut pick: take the top-scoring clips at their full window until the
+    total cap is reached. Used as the fallback when no cut count fits the total floor,
+    so a HELD plan can still report honestly how much footage was actually usable."""
+    chosen, total = [], 0.0
+    for seg in usable:
+        if len(chosen) >= max_seg:
+            break
+        if total + seg.duration > total_max:
+            continue
+        chosen.append(seg)
+        total += seg.duration
+    return chosen
+
+
 def select_segments(candidates, gym_id, plan_bounds, *, seed=None):
-    """Pick 2..max segments from the SAME gym's candidate slices to fill the total
+    """Pick min..max segments from the SAME gym's candidate slices to fill the total
     window. `candidates` is a list of dicts {asset_id, gym_id, start_ts, end_ts,
     score}. Enforces the per-segment length window (3..15s) and the total window
     (15..60s) AND the tenant assertion on every pick. Returns a list of Segment.
 
-    Deterministic: candidates are ranked by score (desc), then by asset_id for a
-    stable tiebreak, and greedily added until the total window is satisfied or the max
-    segment count is hit. Raises TenantMismatch if any candidate is cross-gym."""
-    max_seg = plan_bounds.get("max_segments", MAX_SEGMENTS)
-    min_seg = plan_bounds.get("min_segments", MIN_SEGMENTS)
+    MOST CUTS FIRST (Blake 2026-09-04): a coach who hands Echo ten clips should see ten
+    clips in the reel, not the four longest. So we try the LARGEST cut count that fits
+    and walk down — each count shares the total window evenly (60s / 10 = 6s cuts) and
+    a clip longer than its share is trimmed from its opening. A count whose share would
+    fall under the 3s floor is skipped, which is what actually bounds the count: the
+    floor, not an arbitrary maximum.
+
+    Deterministic: candidates are ranked by score (desc), then asset_id, then start_ts
+    for a stable tiebreak; the count search is a plain descending walk. Raises
+    TenantMismatch if any candidate is cross-gym."""
+    max_seg = int(plan_bounds.get("max_segments", MAX_SEGMENTS))
+    min_seg = int(plan_bounds.get("min_segments", MIN_SEGMENTS))
     total_max = plan_bounds.get("total_max_sec", TOTAL_MAX_SEC)
     total_min = plan_bounds.get("total_min_sec", TOTAL_MIN_SEC)
 
@@ -151,27 +201,37 @@ def select_segments(candidates, gym_id, plan_bounds, *, seed=None):
 
     usable.sort(key=lambda s: (-s.score, s.asset_id, s.start_ts))
 
-    chosen, total = [], 0.0
-    for seg in usable:
-        if len(chosen) >= max_seg:
-            break
-        if total + seg.duration > total_max:
-            continue
-        chosen.append(seg)
-        total += seg.duration
-        if total >= total_min and len(chosen) >= min_seg:
-            # enough to satisfy the window; keep going only if we are still short of a
-            # good montage length, capped by max_seg (handled above).
-            if total >= total_min:
-                pass
-    return chosen
+    ceiling = min(len(usable), max_seg)
+    for n in range(ceiling, max(min_seg, 1) - 1, -1):
+        share = total_max / n
+        if share < SEG_MIN_SEC:
+            continue          # n cuts could not each clear the per-segment floor
+        picked = [_trim_to(s, share) for s in usable[:n]]
+        if round(sum(s.duration for s in picked), 2) >= total_min:
+            return picked
+
+    # Nothing fit the total floor: hand back the honest best-effort pick so the caller's
+    # hold reason can name how many usable seconds the gym actually had.
+    return _greedy(usable, max_seg, total_max)
 
 
 def plan_compose(candidates, gym_id, template, *, assets_by_id=None):
     """Build a ComposePlan for one request. Applies input-cap routing on each source
-    asset (a source over the caps routes the WHOLE request to the Opus lane), the
-    per-segment + total windows, and the tenant assertion. Returns a ComposePlan that
-    is HELD (with a reason) when it cannot assemble a valid 15..60s / 2..6 montage."""
+    asset, the per-segment + total windows, and the tenant assertion. Returns a
+    ComposePlan that is HELD (with a reason) when it cannot assemble a valid montage.
+
+    OVER-CAP SOURCES (Blake 2026-09-04): one clip over the caps SKIPS that clip and
+    builds from the rest — it no longer holds the whole request. That was tolerable
+    when a coach could only pick 3 clips; once they can pick a dozen, one long clip
+    killing the reel is the wrong answer. The skipped clips ride out on
+    ComposePlan.skipped so the coach is told which ones and why, never silently
+    dropped. Only when EVERY selected source is over cap does the whole request
+    legitimately route to the Opus reel lane, which is what it is for.
+
+    Note the live tap never reaches the skip path: story_candidates._eligible_raw
+    already filters over-cap assets out of both the candidate list and assets_by_id.
+    This is the same rule applied one layer in, for callers that inject their own
+    pool (gym_event, the suite) so the two paths cannot disagree."""
     assets_by_id = assets_by_id or {}
     bounds = {
         "min_segments": template.segment_plan.min_segments,
@@ -180,29 +240,43 @@ def plan_compose(candidates, gym_id, template, *, assets_by_id=None):
         "total_max_sec": template.segment_plan.total_max_sec,
     }
 
-    # input caps: any source asset over the caps routes to the Opus reel lane.
+    # input caps: an over-cap source is dropped from the pool with its reason kept.
+    kept, skipped = [], []
     for c in candidates:
         a = assets_by_id.get(c.get("asset_id"))
         if a is not None:
             route, reason = route_asset(a)
             if route == ROUTE_OPUS:
-                return ComposePlan(gym_id=gym_id, route=ROUTE_OPUS, held=True,
-                                   hold_reason=reason)
+                skipped.append({"asset_id": str(c.get("asset_id") or ""),
+                                "reason": reason})
+                continue
+        kept.append(c)
+
+    if candidates and not kept:
+        # every selected source is over the caps: this genuinely IS the Opus lane's job.
+        return ComposePlan(gym_id=gym_id, route=ROUTE_OPUS, held=True,
+                           skipped=skipped,
+                           hold_reason=(skipped[0]["reason"] if skipped
+                                        else "no usable source in the story lane"))
 
     try:
-        segments = select_segments(candidates, gym_id, bounds)
+        segments = select_segments(kept, gym_id, bounds)
     except TenantMismatch as e:
-        return ComposePlan(gym_id=gym_id, held=True, hold_reason=str(e))
+        return ComposePlan(gym_id=gym_id, held=True, hold_reason=str(e),
+                           skipped=skipped)
 
     total = round(sum(s.duration for s in segments), 2)
     if len(segments) < bounds["min_segments"] or total < TOTAL_MIN_SEC:
+        tail = (f" ({len(skipped)} clip(s) skipped: {skipped[0]['reason']})"
+                if skipped else "")
         return ComposePlan(
             gym_id=gym_id, segments=segments, total_sec=total, held=True,
+            skipped=skipped,
             hold_reason=(f"only {len(segments)} usable segment(s) totaling {total:g}s; "
                          f"need >= {bounds['min_segments']} segments and "
-                         f">= {TOTAL_MIN_SEC:g}s. Nothing staged."))
+                         f">= {TOTAL_MIN_SEC:g}s. Nothing staged.{tail}"))
     return ComposePlan(gym_id=gym_id, segments=segments, total_sec=total,
-                       route=ROUTE_STORY)
+                       route=ROUTE_STORY, skipped=skipped)
 
 
 # ---- render (injectable heavy steps; HELD on a missing renderer) ------------

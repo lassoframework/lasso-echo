@@ -2034,9 +2034,13 @@ def build_server(port=None):
               deny-story          POST /portal/<token>/studio/story/<id>/deny  (arg=id)
               sort-queue          GET  /portal/<token>/studio/sort-queue
               resolve-sort-item   POST /portal/<token>/studio/sort-queue/<asset_id>/resolve (arg=asset_id)
+              list-stories        GET  /portal/<token>/studio/story
+              get-story           GET  /portal/<token>/studio/story/<id>  (arg=id)
             The render lane (create/deny) is gated per gym by
             story_studio_render_active_for (default OFF, pilot allowlist) INSIDE the
-            handler; the sort queue (list/resolve) by STORY_CLASSIFIER (default ON)."""
+            handler; the sort queue (list/resolve) by STORY_CLASSIFIER (default ON).
+            list-stories/get-story share the /studio/story path with create-story and
+            are told apart by VERB at the call site, exactly like the events lane."""
             path = self.path.split("?")[0]
             pat = r"^/portal/([A-Za-z0-9_.-]{8,})/studio/"
             m = re.match(pat + r"sort-queue$", path)
@@ -2048,6 +2052,9 @@ def build_server(port=None):
             m = re.match(pat + r"story/([A-Za-z0-9_.-]+)/deny$", path)
             if m:
                 return m.group(1), "deny-story", m.group(2)
+            m = re.match(pat + r"story/([A-Za-z0-9_.-]+)$", path)
+            if m:
+                return m.group(1), "get-story", m.group(2)
             m = re.match(pat + r"story$", path)
             if m:
                 return m.group(1), "create-story", None
@@ -2158,6 +2165,26 @@ def build_server(port=None):
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 status, body = _ss.handle_list_sort_queue(account_key)
+                return self._send_json(body, status)
+
+            # Story Studio READ lane (2026-09-04): GET /portal/<token>/studio/story
+            # (this gym's story history + the clip-picker bounds) and
+            # GET /portal/<token>/studio/story/<id> (one story's persisted overlay,
+            # licensed track and segment plan). Token->account_key; revoked = 404.
+            # READ-ONLY: the handlers only read the gym-scoped store, so this lane can
+            # never render, stage or publish. Note create-story POSTs the SAME
+            # /studio/story path -- the verb is what separates them, and this is the
+            # GET branch.
+            if ss_token is not None and ss_kind in ("list-stories", "get-story",
+                                                    "create-story"):
+                account_key = client_for_token(ss_token)
+                if account_key is None or is_revoked(account_key):
+                    return self._deny(404)
+                if ss_kind == "get-story":
+                    status, body = _ss.handle_get_story(account_key, _ss_arg)
+                else:
+                    # a GET on /studio/story is the LIST read (create-story is a POST).
+                    status, body = _ss.handle_list_stories(account_key)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;
