@@ -52,16 +52,27 @@ PRODUCT = "echo"
 SOURCE = "website_tab"
 
 
-def resolve_client_identity(ticket, *, slack_lookup_email, account_key_for_gym, log=print):
+def resolve_client_identity(ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
+                            operator_ids=(), log=print):
     """ticket['reporter'] is a real, server-authenticated email (D42's provenance).
-    ticket['client_id'] is the gym's portal uuid. Resolve both into a CLIENT identity,
-    or UNKNOWN on any lookup failure -- identity_gate.py's own rule (a lookup failure is
-    never promoted to a client) applies here too, even though this path never calls
-    identity_gate.resolve() directly (that function is keyed the OPPOSITE direction,
-    Slack-user-id -> account; here we start from an authenticated email instead)."""
+    ticket['client_id'] is the gym id the PORTAL ROUTE'S URL PARAM claimed, which is
+    NOT itself proof of any relationship -- the portal's own access check
+    (canReadGym) grants coach/executive/owner roles read on ANY gym, not just their
+    own, so an authenticated staff account hitting a different gym's ticket endpoint
+    would previously be treated as THAT gym's verified client (Frame 2 audit finding,
+    2026-09-04: this let staff impersonate any client and trigger the no-tap
+    autonomous outreach path meant only for a real gym owner).
+
+    Fixed by routing through identity_gate.resolve() -- the SAME staff/coach/client
+    classification the Slack-initiated path already trusts -- rather than a separate,
+    looser check. STAFF and COACH are never promoted to CLIENT here (identity_gate's
+    own rule), and a CLIENT's gym_id comes from THEIR OWN gym_assignments row, never
+    from the ticket's client_id. The two are then compared explicitly: a real
+    client_owner whose OWN gym does not match the ticket's claimed client_id is
+    UNKNOWN here too, not a guess in either gym's favor."""
     email = (ticket.get("reporter") or "").strip()
-    gym_id = ticket.get("client_id") or ""
-    if not email or not gym_id:
+    claimed_gym_id = ticket.get("client_id") or ""
+    if not email or not claimed_gym_id:
         return _ig.Identity(_ig.UNKNOWN, "", reason="ticket missing reporter or client_id")
     try:
         slack_user_id = slack_lookup_email(email)
@@ -71,13 +82,18 @@ def resolve_client_identity(ticket, *, slack_lookup_email, account_key_for_gym, 
     if not slack_user_id:
         return _ig.Identity(_ig.UNKNOWN, "", email=email,
                             reason="no Slack account for this authenticated email")
-    try:
-        account_key = account_key_for_gym(gym_id) or ""
-    except Exception as e:  # noqa: BLE001
-        log(f"[echo-ticket-worker] account_key lookup failed: {type(e).__name__}")
-        account_key = ""
-    return _ig.Identity(_ig.CLIENT, slack_user_id, email=email, account_key=account_key,
-                        gym_id=gym_id, reason="portal echo ticket, authenticated session")
+    identity = _ig.resolve(slack_user_id, slack_user_info=slack_user_info,
+                           portal_lookup=portal_lookup, operator_ids=operator_ids)
+    if identity.kind != _ig.CLIENT:
+        # STAFF/COACH/UNKNOWN, exactly as identity_gate already defines them --
+        # never promoted to CLIENT just because they authenticated to SOME account.
+        return identity
+    if identity.gym_id != claimed_gym_id:
+        return _ig.Identity(_ig.UNKNOWN, slack_user_id, email=email,
+                            reason=f"authenticated client owns a different gym "
+                                   f"than this ticket's client_id "
+                                   f"({identity.gym_id!r} != {claimed_gym_id!r})")
+    return identity
 
 
 def _verified_ticket_dict(ticket):
@@ -103,10 +119,10 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
     log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
 
 
-def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
+def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
-               identity_name="echo", fetch_state=None, llm=None, mark_message=None,
-               claim_message=None, stamp_ticket=None, log=print):
+               identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
+               mark_message=None, claim_message=None, stamp_ticket=None, log=print):
     """First pass: NEW, unclassified tickets for (product, source), dispatched under
     identity_name. Never runs if the config flag is off. Defaults preserve the
     original Echo-only behavior; D47 generalized this for a second (product,
@@ -118,85 +134,121 @@ def intake_pass(bus, *, slack_lookup_email, account_key_for_gym, open_group_dm,
     processed = 0
     for ticket in tickets:
         tid = ticket["id"]
-        processed += 1
-        # Row-first: the client's original words are recorded as an inbound message
-        # before anything else touches this ticket -- the portal insert only wrote the
-        # TICKET, not a support_messages row, unlike a Slack-sourced ticket.
-        bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
-                           author_type="client", author_id=ticket.get("reporter") or "",
-                           body=ticket.get("raw_text") or "",
-                           meta={"surface": "portal_ticket_bridge"})
-
-        who = resolve_client_identity(ticket, slack_lookup_email=slack_lookup_email,
-                                      account_key_for_gym=account_key_for_gym, log=log)
-        if who.kind != _ig.CLIENT:
-            _escalate_unresolved(bus, ticket, reason=f"identity_{who.kind}",
-                                identity_name=identity_name, log=log)
-            continue
-
-        # Persisted so fixed_pass (a later poll, possibly after a redeploy) can
-        # reconstruct who to notify without re-resolving.
-        bus.set_ticket(tid, slack_user_id=who.slack_user_id)
-
-        classification = _cls.classify(ticket.get("raw_text") or "", has_open_ticket=False,
-                                       identity_product=ident.product, llm=llm)
-
-        if classification == _cls.QUESTION:
-            answer = None
-            try:
-                from .slack_convo import answer_lane as _al
-                answer = _al.answer(ticket, who, [], ticket.get("raw_text") or "",
-                                    identity=ident, fetch_state=fetch_state, llm=llm)
-            except Exception as e:  # noqa: BLE001 - escalates, never invents
-                log(f"[echo-ticket-worker] answer lane failed ticket={tid}: "
-                    f"{type(e).__name__}")
-            if answer and answer.get("body") and answer.get("grounding"):
-                bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
-                               verification_before=answer["grounding"],
-                               verification_after=answer["grounding"])
-                result = _out.initiate(
-                    _verified_ticket_dict(ticket), who, ident,
-                    open_group_dm=open_group_dm, post_first_message=post_first_message,
-                    record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
-                    message_text=answer["body"], mark_message=mark_message,
-                    claim_message=claim_message, log=log)
-                if result.opened:
-                    bus.set_ticket(tid, status="resolved")
-                else:
-                    log(f"[echo-ticket-worker] outreach refused ticket={tid} "
-                        f"reason={result.reason}")
-            else:
-                _escalate_unresolved(bus, ticket, reason="question_not_groundable",
-                                    identity_name=identity_name, log=log)
-            continue
-
-        if classification == _cls.CODE_FIX:
-            # Same HELD fixer_request path every Slack-sourced code_fix uses (D14) --
-            # a client's code_fix is ALWAYS held behind Blake's #fixer tap, no exception
-            # for this source. This worker only automates the NOTIFY step once the
-            # existing worker (ops-fix-triage.js) has actually verified a fix. NOTE
-            # (D10, unchanged): that desktop worker trusts only Echo's bot_id today, so
-            # a non-Echo identity's fixer_request will queue correctly here but not yet
-            # execute -- the same documented limitation every other non-Echo code_fix
-            # path in this system already carries.
-            bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
-            text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
-                                        who.slack_user_id)
-            row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
-                                      delivery_status="held", kind=_a.KIND_FIXER_REQUEST,
-                                      meta={"identity": identity_name,
-                                            "surface": "portal_ticket_bridge",
-                                            "recipient_kind": who.kind})
-            write_hold_notice(ident_name=identity_name, tid=tid, recipient_kind=who.kind,
-                              user=who.slack_user_id, account_key=who.account_key or "",
-                              kind=_a.KIND_FIXER_REQUEST, body=text,
-                              held_message_id=(row or {}).get("id"),
-                              surface="portal_ticket_bridge")
-            continue
-
-        _escalate_unresolved(bus, ticket, identity_name=identity_name,
-                            reason=f"classification_{classification or 'none'}", log=log)
+        try:
+            _intake_one(bus, ticket,
+                        slack_lookup_email=slack_lookup_email,
+                        slack_user_info=slack_user_info,
+                        portal_lookup=portal_lookup,
+                        operator_ids=operator_ids,
+                        open_group_dm=open_group_dm,
+                        post_first_message=post_first_message,
+                        write_hold_notice=write_hold_notice, ident=ident,
+                        identity_name=identity_name, fetch_state=fetch_state, llm=llm,
+                        mark_message=mark_message, claim_message=claim_message,
+                        stamp_ticket=stamp_ticket, log=log)
+            processed += 1
+        except Exception as e:  # noqa: BLE001 -- one bad ticket must never starve the rest
+            log(f"[echo-ticket-worker] intake failed ticket={tid}: "
+                f"{type(e).__name__}: {e}")
     return {"processed": processed}
+
+
+def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
+                operator_ids, open_group_dm, post_first_message, write_hold_notice,
+                ident, identity_name, fetch_state, llm, mark_message, claim_message,
+                stamp_ticket, log):
+    tid = ticket["id"]
+    # Row-first: the client's original words are recorded as an inbound message
+    # before anything else touches this ticket -- the portal insert only wrote the
+    # TICKET, not a support_messages row, unlike a Slack-sourced ticket.
+    bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id=ticket.get("reporter") or "",
+                       body=ticket.get("raw_text") or "",
+                       meta={"surface": "portal_ticket_bridge"})
+
+    # D46/D47 audit fix (Frame 1, CRITICAL): outbox.py's dispatch gate refuses to post
+    # ANY row whose parent ticket's bot_identity does not match the identity currently
+    # running (outbox.py's own cross-identity-leak guard, D33). A portal-inserted ticket
+    # never passes through get_or_create_ticket, the only other place that stamps this
+    # column, so without this line every held fixer_request card and every escalation
+    # row this worker writes was silently unreachable forever -- no error, no alert,
+    # just a ticket that sits in "fixing"/"escalated" and never reaches a human. Stamped
+    # unconditionally, before any dispatch decision, so both of those branches (and any
+    # future one) are covered, not just the one path (QUESTION) that happens to bypass
+    # outbox.py entirely.
+    bus.set_ticket(tid, bot_identity=identity_name)
+
+    who = resolve_client_identity(ticket, slack_lookup_email=slack_lookup_email,
+                                  slack_user_info=slack_user_info,
+                                  portal_lookup=portal_lookup,
+                                  operator_ids=operator_ids, log=log)
+    if who.kind != _ig.CLIENT:
+        _escalate_unresolved(bus, ticket, reason=f"identity_{who.kind}",
+                            identity_name=identity_name, log=log)
+        return
+
+    # Persisted so fixed_pass (a later poll, possibly after a redeploy) can
+    # reconstruct who to notify without re-resolving.
+    bus.set_ticket(tid, slack_user_id=who.slack_user_id)
+
+    classification = _cls.classify(ticket.get("raw_text") or "", has_open_ticket=False,
+                                   identity_product=ident.product, llm=llm)
+
+    if classification == _cls.QUESTION:
+        answer = None
+        try:
+            from .slack_convo import answer_lane as _al
+            answer = _al.answer(ticket, who, [], ticket.get("raw_text") or "",
+                                identity=ident, fetch_state=fetch_state, llm=llm)
+        except Exception as e:  # noqa: BLE001 - escalates, never invents
+            log(f"[echo-ticket-worker] answer lane failed ticket={tid}: "
+                f"{type(e).__name__}")
+        if answer and answer.get("body") and answer.get("grounding"):
+            bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
+                           verification_before=answer["grounding"],
+                           verification_after=answer["grounding"])
+            result = _out.initiate(
+                _verified_ticket_dict(ticket), who, ident,
+                open_group_dm=open_group_dm, post_first_message=post_first_message,
+                record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
+                message_text=answer["body"], mark_message=mark_message,
+                claim_message=claim_message, log=log)
+            if result.opened:
+                bus.set_ticket(tid, status="resolved")
+            else:
+                log(f"[echo-ticket-worker] outreach refused ticket={tid} "
+                    f"reason={result.reason}")
+        else:
+            _escalate_unresolved(bus, ticket, reason="question_not_groundable",
+                                identity_name=identity_name, log=log)
+        return
+
+    if classification == _cls.CODE_FIX:
+        # Same HELD fixer_request path every Slack-sourced code_fix uses (D14) --
+        # a client's code_fix is ALWAYS held behind Blake's #fixer tap, no exception
+        # for this source. This worker only automates the NOTIFY step once the
+        # existing worker (ops-fix-triage.js) has actually verified a fix. NOTE
+        # (D10, unchanged): that desktop worker trusts only Echo's bot_id today, so
+        # a non-Echo identity's fixer_request will queue correctly here but not yet
+        # execute -- the same documented limitation every other non-Echo code_fix
+        # path in this system already carries.
+        bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
+        text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
+                                    who.slack_user_id)
+        row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
+                                  delivery_status="held", kind=_a.KIND_FIXER_REQUEST,
+                                  meta={"identity": identity_name,
+                                        "surface": "portal_ticket_bridge",
+                                        "recipient_kind": who.kind})
+        write_hold_notice(ident_name=identity_name, tid=tid, recipient_kind=who.kind,
+                          user=who.slack_user_id, account_key=who.account_key or "",
+                          kind=_a.KIND_FIXER_REQUEST, body=text,
+                          held_message_id=(row or {}).get("id"),
+                          surface="portal_ticket_bridge")
+        return
+
+    _escalate_unresolved(bus, ticket, identity_name=identity_name,
+                        reason=f"classification_{classification or 'none'}", log=log)
 
 
 def _fix_summary_text(verification):
