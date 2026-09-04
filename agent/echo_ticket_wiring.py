@@ -14,6 +14,7 @@ from . import config
 from .slack_convo import adapter as _a
 from .slack_convo import answer_lane as _al
 from .slack_convo import identities as _ids
+from .slack_convo import listener_wiring as _lw
 from .slack_convo.bus import Bus
 from .slack_surface import SlackPoster
 
@@ -45,13 +46,6 @@ def _post_first_message_factory(poster):
     return post_first_message
 
 
-def _account_key_for_gym_factory(bus):
-    def account_key_for_gym(gym_id):
-        rows = bus._get("echo_intake_tokens", {"gym_id": f"eq.{gym_id}",
-                                               "select": "echo_account_key",
-                                               "limit": "1"})
-        return (rows[0].get("echo_account_key") if rows else "") or ""
-    return account_key_for_gym
 
 
 def _write_hold_notice_factory(bus):
@@ -105,11 +99,21 @@ def live_deps(*, product=None, source=None, identity_name="echo", bus=None, log=
         stamp_ticket=_stamp_ticket_factory(bus),
         log=log,
     )
+    # D46/D47 audit fix (Frame 2, MAJOR): identity resolution for a portal ticket now
+    # reuses THE SAME staff/coach/client classification and gym-assignment lookup the
+    # Slack-initiated path already trusts (identity_gate.resolve() via
+    # listener_wiring.py's own factories), instead of a separate, looser check that
+    # treated any authenticated email as "the client" for whatever gym_id the portal
+    # route's URL param claimed -- the portal's own access check lets coach/executive/
+    # owner roles read ANY gym, so that looser check let staff impersonate any client.
+    operator_ids = tuple(x for x in [config.APPROVER_SLACK_ID] if x)
     intake_kwargs = dict(shared)
     intake_kwargs.update(routing_kwargs)
     intake_kwargs.update(
         slack_lookup_email=_slack_lookup_email_factory(poster),
-        account_key_for_gym=_account_key_for_gym_factory(bus),
+        slack_user_info=_lw._slack_user_info_factory(token),
+        portal_lookup=_lw._portal_lookup_factory(bus),
+        operator_ids=operator_ids,
         write_hold_notice=_write_hold_notice_factory(bus),
         fetch_state=_al.default_fetch_state,
         llm=_al.default_llm,
