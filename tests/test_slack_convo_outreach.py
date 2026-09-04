@@ -451,3 +451,152 @@ def test_initiate_without_claim_message_injected_still_works_backward_compatible
     result = outreach.initiate(_ticket(), _client(), ident, open_group_dm=open_dm,
                                post_first_message=post, record_outbound=record)
     assert result.opened is True and result.reason == "ok"
+
+
+# ---- D45: the human-tap path (Blake's ruling, resolving D42) ---------------------------
+
+def _hold_calls():
+    log = {"held": [], "notices": []}
+
+    def record_outbound(**kwargs):
+        log["held"].append(kwargs)
+        return {"id": "hold-1"}
+
+    def write_hold_notice(**kwargs):
+        log["notices"].append(kwargs)
+        return {"id": "card-1"}
+
+    return log, record_outbound, write_hold_notice
+
+
+def test_request_approval_holds_a_ticket_that_fails_only_on_provenance():
+    """A ticket that clears every base gate but has no reporter_verified is NOT a dead
+    end -- it can be offered to a human instead of refused outright."""
+    log, record, notice = _hold_calls()
+    ident = ids.IDENTITIES["wrangler"]
+    ticket = _ticket(reporter_verified=False)
+    result = outreach.request_approval(ticket, _client(), ident, record_outbound=record,
+                                       write_hold_notice=notice)
+    assert result.requested is True
+    assert result.held_message_id == "hold-1"
+    assert log["held"][0]["delivery_status"] == "held"
+    assert log["held"][0]["kind"] == outreach.KIND_OUTREACH_REQUEST
+    assert log["notices"][0]["held_message_id"] == "hold-1"
+    assert log["notices"][0]["kind"] == outreach.KIND_OUTREACH_REQUEST
+
+
+def test_request_approval_still_refuses_every_base_gate():
+    """Provenance is the ONE gate this path skips -- every other refusal reason from
+    eligible() still applies identically."""
+    log, record, notice = _hold_calls()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.request_approval(_ticket(source="slack_conversation"), _client(),
+                                       ident, record_outbound=record,
+                                       write_hold_notice=notice)
+    assert result.requested is False and result.reason == "not_a_non_slack_source"
+    assert log["held"] == [] and log["notices"] == []
+
+    result2 = outreach.request_approval(_ticket(), _unknown(), ident,
+                                        record_outbound=record, write_hold_notice=notice)
+    assert result2.requested is False and result2.reason == "identity_unresolved"
+
+    result3 = outreach.request_approval(_ticket(), _staff(), ident,
+                                        record_outbound=record, write_hold_notice=notice)
+    assert result3.requested is False and result3.reason == "reporter_is_staff_not_client"
+
+    mismatched = _ticket(reporter="someone-else@gym.com", slack_user_id="U_OTHER")
+    result4 = outreach.request_approval(mismatched, _client(), ident,
+                                        record_outbound=record, write_hold_notice=notice)
+    assert result4.requested is False and result4.reason == "reporter_mismatch"
+
+    result5 = outreach.request_approval(_ticket(slack_channel_id="G_ALREADY"), _client(),
+                                        ident, record_outbound=record,
+                                        write_hold_notice=notice)
+    assert result5.requested is False and result5.reason == "already_outreached"
+
+
+def test_request_approval_escapes_the_held_text():
+    log, record, notice = _hold_calls()
+    ident = ids.IDENTITIES["wrangler"]
+    ticket = _ticket(raw_text="<!channel> urgent", reporter_verified=False)
+    outreach.request_approval(ticket, _client(), ident, record_outbound=record,
+                              write_hold_notice=notice)
+    assert "<!channel>" not in log["held"][0]["body"]
+    assert "&lt;!channel&gt;" in log["held"][0]["body"]
+
+
+def _held_row(**over):
+    row = {"id": "hold-1", "ticket_id": "t-1", "delivery_status": "held",
+          "body": "Hi, this is Wrangler from LASSO. I am on it and will follow up here.",
+          "attachments": {"kind": outreach.KIND_OUTREACH_REQUEST, "identity": "wrangler",
+                          "recipient_kind": "client", "slack_user_id": "U_CLIENT"}}
+    row.update(over)
+    return row
+
+
+def test_release_approved_outreach_sends_a_validly_held_row():
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(reporter_verified=False), _client(), ident,
+        get_held_message=lambda mid: _held_row(),
+        open_group_dm=open_dm, post_first_message=post, record_outbound=record)
+    assert result.opened is True and result.reason == "ok"
+    # The stored (already-escaped) body is what gets posted verbatim -- not re-escaped,
+    # not regenerated from first_message_text().
+    assert log["posted"][0][1] == _held_row()["body"]
+
+
+def test_release_approved_outreach_refuses_a_row_not_currently_held():
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(), _client(), ident,
+        get_held_message=lambda mid: _held_row(delivery_status="ready"),
+        open_group_dm=lambda *a: None, post_first_message=lambda *a: None,
+        record_outbound=lambda **k: None)
+    assert result.opened is False and result.reason == "not_held"
+
+
+def test_release_approved_outreach_refuses_the_wrong_kind():
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(), _client(), ident,
+        get_held_message=lambda mid: _held_row(attachments={"kind": "ack"}),
+        open_group_dm=lambda *a: None, post_first_message=lambda *a: None,
+        record_outbound=lambda **k: None)
+    assert result.opened is False and result.reason == "wrong_kind"
+
+
+def test_release_approved_outreach_refuses_a_ticket_id_mismatch():
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(id="t-DIFFERENT"), _client(), ident,
+        get_held_message=lambda mid: _held_row(),
+        open_group_dm=lambda *a: None, post_first_message=lambda *a: None,
+        record_outbound=lambda **k: None)
+    assert result.opened is False and result.reason == "ticket_mismatch"
+
+
+def test_release_approved_outreach_refuses_an_identity_mismatch():
+    """A held row stamped for one identity's tap must never be releasable by a
+    different identity -- same discipline as V-m10 elsewhere in this adapter."""
+    scout_ident = ids.IDENTITIES["scout"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(), _client(), scout_ident,
+        get_held_message=lambda mid: _held_row(),  # attachments say identity=wrangler
+        open_group_dm=lambda *a: None, post_first_message=lambda *a: None,
+        record_outbound=lambda **k: None)
+    assert result.opened is False and result.reason == "identity_mismatch"
+
+
+def test_release_approved_outreach_re_checks_base_eligibility_at_tap_time():
+    """The ticket could have changed between the card posting and the tap (e.g. a
+    second outreach path already stamped it) -- re-check, don't just trust the card."""
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    result = outreach.release_approved_outreach(
+        "hold-1", _ticket(slack_channel_id="G_ALREADY"), _client(), ident,
+        get_held_message=lambda mid: _held_row(),
+        open_group_dm=open_dm, post_first_message=post, record_outbound=record)
+    assert result.opened is False and result.reason == "already_outreached"
+    assert log["opened"] == []
