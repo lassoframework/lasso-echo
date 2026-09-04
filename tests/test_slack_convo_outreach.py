@@ -547,6 +547,66 @@ def test_release_approved_outreach_sends_a_validly_held_row():
     assert log["posted"][0][1] == _held_row()["body"]
 
 
+def test_release_approved_outreach_closes_out_the_held_row_on_success():
+    """Closing-audit finding: the held row must not sit at delivery_status='held'
+    forever after a successful send -- _send() always writes a NEW row for the actual
+    DM, so nothing else ever closes the original held row without this."""
+    log, open_dm, post, record = _calls()
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None):
+        marks.append((message_id, delivery_status))
+
+    ident = ids.IDENTITIES["wrangler"]
+    outreach.release_approved_outreach(
+        "hold-1", _ticket(reporter_verified=False), _client(), ident,
+        get_held_message=lambda mid: _held_row(),
+        open_group_dm=open_dm, post_first_message=post, record_outbound=record,
+        mark_message=mark_message)
+    # The new ack row (id "m-1" from _calls()'s fake record_outbound) is marked posted,
+    # AND the original held row ("hold-1") is separately closed out too.
+    assert ("hold-1", "posted") in marks
+    assert ("m-1", "posted") in marks
+
+
+def test_release_approved_outreach_does_not_close_the_held_row_on_refusal():
+    """A refused release (wrong kind, mismatch, etc.) must never mark the held row
+    posted -- it was never sent."""
+    marks = []
+
+    def mark_message(message_id, delivery_status, slack_ts=None):
+        marks.append((message_id, delivery_status))
+
+    ident = ids.IDENTITIES["wrangler"]
+    outreach.release_approved_outreach(
+        "hold-1", _ticket(), _client(), ident,
+        get_held_message=lambda mid: _held_row(attachments={"kind": "ack"}),
+        open_group_dm=lambda *a: None, post_first_message=lambda *a: None,
+        record_outbound=lambda **k: None, mark_message=mark_message)
+    assert marks == []
+
+
+def test_outreach_request_card_label_is_not_the_generic_reply_label():
+    """Closing-audit finding: the #fixer card for a proposed outreach must not read
+    'HELD REPLY awaiting your tap' -- that's the label for an actual reply to an
+    existing conversation, not a brand new outbound DM to a client."""
+    from agent.slack_convo import adapter as A
+
+    calls = []
+
+    class FakeBus:
+        def record_outbound(self, **kwargs):
+            calls.append(kwargs)
+            return {"id": "card-1"}
+
+    A.write_hold_notice(FakeBus(), ident_name="wrangler", tid="t-1",
+                        recipient_kind="client", user="U_CLIENT", account_key="",
+                        kind=outreach.KIND_OUTREACH_REQUEST, body="hi",
+                        held_message_id="hold-1", surface="outreach")
+    assert "OUTREACH REQUEST" in calls[0]["body"]
+    assert "HELD REPLY" not in calls[0]["body"]
+
+
 def test_release_approved_outreach_refuses_a_row_not_currently_held():
     ident = ids.IDENTITIES["wrangler"]
     result = outreach.release_approved_outreach(

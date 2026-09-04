@@ -37,7 +37,7 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
 from dataclasses import dataclass
 
 from . import identity_gate as _ig
-from .adapter import _slack_escape
+from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
 # Same operator id as CLAUDE.md / the portal's digest-dm.ts (Approver Slack id, LASSO
 # co-founder Blake Ruff). Included on every outreach group DM, no exceptions.
@@ -350,8 +350,8 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
 # It is offered to Blake as a #fixer card, reusing the SAME hold-notice + Release button
 # pattern this system already built and audited for fixer_request/held replies (D20), not
 # a new mechanism. His tap IS the provenance a real intake producer can't supply yet.
-
-KIND_OUTREACH_REQUEST = "outreach_request"
+# KIND_OUTREACH_REQUEST lives in adapter.py alongside the other KIND_ constants
+# (imported above) so write_hold_notice's label logic can recognize it too.
 
 
 @dataclass
@@ -441,8 +441,25 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
         log(f"[outreach] release refused at tap time: {reason}")
         return OutreachResult(opened=False, reason=reason)
 
-    return _send(ticket, who, ident, open_group_dm=open_group_dm,
-                post_first_message=post_first_message, record_outbound=record_outbound,
-                stamp_ticket=stamp_ticket, message_text=row.get("body"),
-                message_text_already_escaped=True,
-                mark_message=mark_message, claim_message=claim_message, log=log)
+    result = _send(ticket, who, ident, open_group_dm=open_group_dm,
+                  post_first_message=post_first_message, record_outbound=record_outbound,
+                  stamp_ticket=stamp_ticket, message_text=row.get("body"),
+                  message_text_already_escaped=True,
+                  mark_message=mark_message, claim_message=claim_message, log=log)
+
+    # D45 closing-audit finding: _send() always writes a NEW row for the actual DM (the
+    # held row is never itself postable, see request_approval's docstring), so without
+    # this the held KIND_OUTREACH_REQUEST row sat at delivery_status='held' forever even
+    # after a successful send -- not a duplicate-send risk (the ticket-level
+    # already_outreached check still covers that), but an orphaned row nothing ever
+    # closes. Best-effort, same as every other mark_message call in this module: the
+    # real DM is already sent, a bookkeeping-close failure here must never look like the
+    # send itself failed.
+    if result.opened and mark_message is not None:
+        try:
+            mark_message(message_id, "posted")
+        except Exception as e:  # noqa: BLE001 - the send already succeeded
+            log(f"[outreach] held row {message_id} close-out failed (send itself "
+                f"succeeded): {type(e).__name__}")
+
+    return result
