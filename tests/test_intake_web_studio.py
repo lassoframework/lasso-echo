@@ -279,3 +279,51 @@ def test_deny_path_still_wins_over_the_get_story_pattern(_arm, monkeypatch):
                       body=b"{}")
     inst.do_POST()
     assert called.get("args") == ("gritx", "sr_9")
+
+
+def test_rebuild_story_dispatches_with_the_request_id(_arm, monkeypatch):
+    """/studio/story/<id>/rebuild is a POST and must not be read as the get-story
+    pattern (which matches story/<id> and would swallow it on the GET side)."""
+    token = _arm
+    called = {}
+
+    def _fake_rebuild(account_key, request_id, body, actor_id="", **_k):
+        called["args"] = (account_key, request_id, body.get("overlay_text"), actor_id)
+        return 200, {"ok": True, "status": "staged", "request_id": "sr_new"}
+
+    monkeypatch.setattr("agent.story_studio_routes.handle_rebuild_story", _fake_rebuild)
+    payload = b'{"overlay_text":"friday crew went hard","actor_id":"coach1"}'
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_9/rebuild",
+                      {"Host": "portal.lassoframework.com",
+                       "Origin": "https://portal.lassoframework.com",
+                       "Content-Length": str(len(payload))}, body=payload)
+    inst.do_POST()
+    assert called.get("args") == ("gritx", "sr_9", "friday crew went hard", "coach1")
+    assert cap.get("json", (None,))[0] == 200
+
+
+def test_rebuild_story_rejects_cross_origin(_arm, monkeypatch):
+    token = _arm
+    monkeypatch.setattr("agent.story_studio_routes.handle_rebuild_story",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("reached the handler cross-origin")))
+    payload = b'{"overlay_text":"x"}'
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_9/rebuild",
+                      {"Host": "portal.lassoframework.com",
+                       "Origin": "https://evil.example",
+                       "Content-Length": str(len(payload))}, body=payload)
+    inst.do_POST()
+    assert cap.get("deny", (None,))[0] == 403
+    assert "json" not in cap
+
+
+def test_rebuild_story_revoked_404(_arm, monkeypatch):
+    token = _arm
+    monkeypatch.setattr("agent.intake_web.is_revoked", lambda c, r2=None: True)
+    payload = b'{"overlay_text":"x"}'
+    inst, cap = _make(f"/portal/{token}/studio/story/sr_9/rebuild",
+                      {"Host": "portal.lassoframework.com",
+                       "Origin": "https://portal.lassoframework.com",
+                       "Content-Length": str(len(payload))}, body=payload)
+    inst.do_POST()
+    assert cap.get("deny", (None,))[0] == 404

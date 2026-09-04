@@ -2056,6 +2056,7 @@ def build_server(port=None):
               resolve-sort-item   POST /portal/<token>/studio/sort-queue/<asset_id>/resolve (arg=asset_id)
               list-stories        GET  /portal/<token>/studio/story
               get-story           GET  /portal/<token>/studio/story/<id>  (arg=id)
+              rebuild-story       POST /portal/<token>/studio/story/<id>/rebuild (arg=id)
             The render lane (create/deny) is gated per gym by
             story_studio_render_active_for (default OFF, pilot allowlist) INSIDE the
             handler; the sort queue (list/resolve) by STORY_CLASSIFIER (default ON).
@@ -2072,6 +2073,9 @@ def build_server(port=None):
             m = re.match(pat + r"story/([A-Za-z0-9_.-]+)/deny$", path)
             if m:
                 return m.group(1), "deny-story", m.group(2)
+            m = re.match(pat + r"story/([A-Za-z0-9_.-]+)/rebuild$", path)
+            if m:
+                return m.group(1), "rebuild-story", m.group(2)
             m = re.match(pat + r"story/([A-Za-z0-9_.-]+)$", path)
             if m:
                 return m.group(1), "get-story", m.group(2)
@@ -2608,7 +2612,8 @@ def build_server(port=None):
             # (default ON). Every create stages PENDING or HOLDS; nothing publishes.
             ss_token, ss_kind, ss_arg = self._studio_route()
             if ss_token is not None and ss_kind in (
-                    "create-story", "deny-story", "resolve-sort-item"):
+                    "create-story", "deny-story", "resolve-sort-item",
+                    "rebuild-story"):
                 allowed, _origin = self._origin_ok()
                 if not allowed:
                     return self._deny(403, "forbidden")
@@ -2632,6 +2637,12 @@ def build_server(port=None):
                 elif ss_kind == "deny-story":
                     status, resp = _ss.handle_deny_story(
                         account_key, ss_arg, reason=str((body or {}).get("reason") or ""))
+                elif ss_kind == "rebuild-story":
+                    # A coach edited the burned copy: re-render the SAME clips with the
+                    # new words and stage a fresh PENDING draft. Still never publishes,
+                    # and the old card is only denied once the new one is staged.
+                    status, resp = _ss.handle_rebuild_story(
+                        account_key, ss_arg, body, actor_id=actor_id)
                 else:  # resolve-sort-item
                     status, resp = _ss.handle_resolve_sort_item(
                         account_key, ss_arg, str((body or {}).get("lane") or ""),
