@@ -55,6 +55,9 @@ class FakeBus:
         self.inbound.append(kwargs)
         return ({"id": f"in-{len(self.inbound)}"}, False)
 
+    def inbound_count(self, ticket_id):
+        return len([m for m in self.inbound if m.get("ticket_id") == ticket_id])
+
     def record_outbound(self, **kwargs):
         row = {"id": f"out-{len(self.outbound)}", **kwargs}
         self.outbound.append(row)
@@ -261,7 +264,8 @@ def test_intake_pass_escalates_rather_than_impersonates_a_cross_tenant_staff_tic
     W.intake_pass(bus, slack_lookup_email=lookup, slack_user_info=info,
                  portal_lookup=portal, operator_ids=(), open_group_dm=open_dm,
                  post_first_message=post, write_hold_notice=notice)
-    assert bus.tickets["t-1"]["status"] == "escalated"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
     assert log["opened"] == []  # never an autonomous DM to/about the wrong gym
 
 
@@ -273,7 +277,8 @@ def test_intake_pass_escalates_an_unresolved_identity_never_dispatches():
     _, notice = _notices()
     W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
                  write_hold_notice=notice, **_no_account_deps())
-    assert bus.tickets["t-1"]["status"] == "escalated"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
     assert log["opened"] == []
     assert any(o["kind"] == A.KIND_ESCALATION for o in bus.outbound)
 
@@ -379,7 +384,8 @@ def test_intake_pass_escalates_a_question_that_cannot_be_grounded():
     W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
                  write_hold_notice=notice, fetch_state=fetch_state,
                  llm=lambda s, u: "irrelevant", **_client_deps())
-    assert bus.tickets["t-1"]["status"] == "escalated"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
     assert log["opened"] == []
 
 
@@ -432,7 +438,8 @@ def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
                           verification_after={"fix_pr_url": "x"})])
     log, open_dm, post = _calls()
     W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
-    assert bus.tickets["t-1"]["status"] == "escalated"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
     assert log["opened"] == []
 
 
