@@ -40,14 +40,36 @@ def _social_gyms(records):
     return [r for r in records if r.get("has_social_product")]
 
 
-def build_plan(records):
+def build_plan(records, *, canonical_owns_data=None):
     """Pure planner. `records` is the full gym list (dicts with gym_id, name, account_key,
     has_social_product). Returns a list of per-gym plan rows, each:
-        {gym_id, name, current, canonical, status, change}
-    status in {OK, MISSING, COLLIDED, MISMATCH, ERROR}; change True iff current != canonical.
+        {gym_id, name, current, derived, canonical, status, change}
+    status in {OK, MISSING, COLLIDED, SPLIT, MISMATCH, ERROR}; change True iff current != canonical.
 
     Collision detection is done over the SOCIAL gyms only, on the CURRENT keys, so a key held
-    by two different gym_ids marks BOTH as COLLIDED and each is disambiguated independently."""
+    by two different gym_ids marks BOTH as COLLIDED and each is disambiguated independently.
+
+    WHY A SPLIT USED TO GRADE AS *OK* (fixed 2026-09-04). The idempotency rule below treats ANY
+    non-collided current key as ISSUED and hands it to canonical_account_key, which returns an
+    issued key VERBATIM (account_key.py:91). So `canonical` came back equal to `current` and the
+    row scored OK — for a gym whose SECOND key was quietly holding every one of its calendar rows.
+    Measured on prod 2026-09-04: Sunnyside, Nine 7 and Chateau were all split and all three graded
+    OK, which is why the split survived. Collision detection could never see it either: a split is
+    ONE gym_id owning TWO keys, the mirror image of the two-gym_ids-one-key case it looks for.
+
+    The fix separates two questions the issued-key shortcut had fused:
+      * `derived`   — what a FRESH derivation yields for this (gym_id, name), ignoring what is
+                      issued. Computed unconditionally, so a drifted key can always be SEEN.
+      * `canonical` — the TARGET key, still honoring issued_key, so idempotency and the --apply
+                      behaviour are byte-for-byte unchanged (`change` is still driven by this).
+    current != derived is therefore never OK again. It grades SPLIT when the derived key actually
+    OWNS content (two live identities: a human must decide, and merging can double-post), and
+    MISMATCH when it does not (harmless drift; the issued key rightly stays put).
+
+    canonical_owns_data: optional callable(derived_key) -> bool, "does that OTHER key own content".
+    Injected (never called here directly) so the planner stays pure and offline-testable. When it
+    is None the planner cannot tell live from empty and reports the honest weaker MISMATCH — never
+    OK, and never an unfounded SPLIT."""
     social = _social_gyms(records)
 
     # Which current keys are shared by more than one distinct gym_id -> a real collision.
@@ -89,23 +111,45 @@ def build_plan(records):
                 issued_key=issued,
             )
         except (ValueError, RuntimeError) as exc:
-            row.update({"canonical": "(error)", "status": "ERROR", "change": False,
-                        "error": f"{type(exc).__name__}: {exc}"})
+            row.update({"canonical": "(error)", "derived": "(error)", "status": "ERROR",
+                        "change": False, "error": f"{type(exc).__name__}: {exc}"})
             plan.append(row)
             continue
+
+        # THE KEY A FRESH DERIVATION YIELDS, with NO issued_key shortcut. This is the value the
+        # issued-key rule above structurally cannot show us, and it is the whole reason a split
+        # gym used to grade OK. Computed separately so `canonical` (the write target) keeps its
+        # idempotency contract untouched while the STATUS can still see the drift.
+        try:
+            derived = canonical_account_key(gid, name)
+        except (ValueError, RuntimeError):
+            derived = ""
 
         # Reserve the assigned key so the next gym's disambiguation avoids it.
         taken.add(canonical)
 
+        drifted = bool(derived) and derived != cur
         if not cur:
             status = "MISSING"
         elif cur in collided_keys:
             status = "COLLIDED"
+        elif drifted:
+            # A drifted key is NEVER OK. It is a SPLIT when the other key actually owns content
+            # (two live identities for one gym: a human must decide, and blindly merging the two
+            # calendars would double-post the month), and a plain MISMATCH when it owns nothing
+            # or we cannot tell.
+            owns = False
+            if canonical_owns_data is not None:
+                try:
+                    owns = bool(canonical_owns_data(derived))
+                except Exception:  # noqa: BLE001 - an unreadable probe is not a SPLIT claim
+                    owns = False
+            status = "SPLIT" if owns else "MISMATCH"
         elif cur == canonical:
             status = "OK"
         else:
             status = "MISMATCH"
-        row.update({"canonical": canonical, "status": status,
+        row.update({"canonical": canonical, "derived": derived or "(error)", "status": status,
                     "change": canonical != cur})
         plan.append(row)
     return plan
@@ -246,6 +290,21 @@ def blocking_data(account_key, *, counter=None):
             "(--apply moves the pointer, never the data). Migrate first.")
 
 
+def key_owns_content(account_key, *, counter=None):
+    """True iff this key OWNS shared-plane content (calendar rows or client sources).
+
+    Used to tell a real SPLIT (the other key is LIVE — two identities for one gym, so merging the
+    calendars would double-post the month) from harmless key drift (the other key is empty). Only
+    the shared-plane signals count: the brand-voice doc and media library that existing_data_for
+    also reports are LOCAL to whichever Echo host runs the probe, so they say nothing about which
+    identity owns the gym's content.
+
+    Follows this module's standing rule that an unreadable probe reports PRESENT (-1 is truthy):
+    the safe answer to "does this key hold data" is "assume it does"."""
+    d = existing_data_for(account_key, counter=counter)
+    return bool(d.get("sources")) or bool(d.get("calendar"))
+
+
 def _default_writer(plan_row):
     """Live writer for --apply. Behind AGENT_ACCOUNT_KEY_RECONCILE (default OFF): a no-op
     return when the flag is dark, so --apply is safe even if run by accident. When armed,
@@ -306,7 +365,12 @@ def reconcile(gym_id=None, apply=False, *, reader=None, writer=None, logger=None
             log(f"no social-product gym found for gym_id={gid}")
             return {"ok": True, "apply": bool(apply), "plan": [], "applied": []}
 
-    plan = build_plan(records)
+    # The live sweep can tell a SPLIT from harmless drift, so it injects the content probe. Scoped
+    # to the derived key only (read-only, one bounded read per drifted gym).
+    plan = build_plan(
+        records,
+        canonical_owns_data=lambda k: key_owns_content(k, counter=data_counter),
+    )
     applied = []
     if apply:
         writer = writer or _default_writer
@@ -349,6 +413,12 @@ def print_plan(summary, printer=print):
             changed += 1
         printer(f"  {row['status']:9} {row['gym_id'][:16]:16} {str(row['current'])[:22]:22} "
                 f"{arrow:2} {str(row['canonical'])[:22]:22}  {row['name']}")
+        # A SPLIT row's second identity is the whole finding, and it is NOT the write target
+        # (idempotency keeps `canonical` on the current key), so name it explicitly.
+        if row.get("status") == "SPLIT":
+            printer(f"    ! SPLIT: a fresh derivation yields {row.get('derived')!r}, which OWNS "
+                    f"content. This gym has TWO live identities. Do NOT re-point blind — that "
+                    f"moves the pointer and strands the data. Reconcile the two calendars by hand.")
         if row.get("error"):
             printer(f"    ! {row['error']}")
     printer(f"  ({changed} would change, {len(plan) - changed} already canonical)")
