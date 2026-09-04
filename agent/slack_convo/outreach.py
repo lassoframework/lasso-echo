@@ -129,7 +129,12 @@ def eligible(ticket, who):
     # (a confirmed magic-link click, an authenticated portal session, etc.) by setting
     # `ticket["reporter_verified"] = True`. A ticket without that flag refuses here,
     # even if every other check above passed.
-    if not (ticket or {}).get("reporter_verified"):
+    # Closing-audit finding: this used to be a truthiness check (`if not ...get(...)`),
+    # which a future producer could defeat by accident -- setting reporter_verified to a
+    # token string, a timestamp, or any other truthy-but-not-boolean value would have
+    # silently passed. The whole point of D42's fail-closed design is that only the
+    # literal boolean True, set deliberately, ever opens this gate.
+    if (ticket or {}).get("reporter_verified") is not True:
         return False, "reporter_not_verified"
 
     return True, "eligible"
@@ -202,11 +207,15 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
         log(f"[outreach] refused ticket={(ticket or {}).get('id')} reason={reason}")
         return OutreachResult(opened=False, reason=reason)
 
-    # D41 (CRITICAL): escaped unconditionally here too, not only inside
-    # first_message_text() -- a caller-supplied `message_text` must get the same
-    # treatment as the default template, since either can carry untrusted content.
-    text = _slack_escape(message_text if message_text is not None
-                         else first_message_text(ticket, ident))
+    # D41 (CRITICAL): a caller-supplied `message_text` gets the SAME escaping treatment
+    # as the default template, since either can carry untrusted content. Escaped here,
+    # not inside first_message_text() twice -- that function already escapes its own
+    # `ask` substring internally, so re-escaping its finished output here would
+    # double-encode it (a closing-audit finding: the original version of this line
+    # unconditionally re-escaped the already-escaped default text, turning "&lt;" into
+    # "&amp;lt;" -- cosmetic, never a live-markup regression, but wrong).
+    text = (_slack_escape(message_text) if message_text is not None
+           else first_message_text(ticket, ident))
 
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):

@@ -645,5 +645,43 @@ All three D41 fixes plus the D42 gate landed in `agent/slack_convo/outreach.py`,
 new tests (escaping x2, idempotency x1, row-lifecycle x3, D42 x2) alongside the 24
 pre-existing outreach tests, all updated to assert `reporter_verified: True` in the base
 fixture so they keep testing what they said they test. `tests/test_slack_convo_outreach.py`:
-32/32 green. Full suite green (see commit for exact count). outreach.py remains
-unwired to any production caller -- D42's open ruling should be resolved before it is.
+32/32 green. Full suite green. outreach.py remains unwired to any production caller --
+D42's open ruling should be resolved before it is.
+
+## D43 (closing audit, narrow, fresh verifier of D41/D42). Two real fixes, D42's provenance
+## question confirmed genuinely still open
+A fresh agent (not the one that built D41/D42) verified the fix commit against the
+original 4 findings: all 4 CLOSED. It also broke two things on its own adversarial pass:
+- **MINOR**: `initiate()` was re-escaping `first_message_text()`'s already-escaped
+  default output, double-encoding it (`&lt;` -> `&amp;lt;`) whenever `message_text` was
+  not overridden. Never a live-markup regression (Slack renders it as ugly-but-inert
+  literal text, not live markup), but wrong. Fixed: escaping only applies to a
+  caller-supplied `message_text` now; the default path is already escaped once, inside
+  `first_message_text()`, and is not re-escaped.
+- **MAJOR (latent, unexploitable today, confirmed by execution)**: the `reporter_verified`
+  gate was a truthiness check (`if not ...get(...)`), not the `is True` check its own
+  comment and DECISIONS.md both claimed. `"True"` (the string), `"yes"`, `1`, and an
+  arbitrary truthy object all passed the gate when tested directly. Since no producer
+  sets this field today the fail-closed guarantee held in practice, but the FIRST
+  producer to set it to anything truthy-but-not-boolean (a token string, a timestamp --
+  an easy real mistake) would have silently defeated D42's entire point. Fixed:
+  `is not True`, exact boolean match, no other value opens the gate.
+
+Two residual, honestly-flagged (not fixed) design notes from this same pass, neither
+exploitable today because nothing wires either path live yet: `mark_message` is optional
+with a silent no-op default, so a future caller that forgets to pass it silently
+reintroduces D41's original repost bug with no warning; and `eligible()`'s
+already-outreached check and the eventual `stamp_ticket()` write are not atomic (no real
+`stamp_ticket` implementation exists anywhere in the repo yet, only test doubles), a
+narrow TOCTOU gap for whoever builds the real one.
+
+D42's provenance mechanism remains an explicitly open ruling for Blake -- confirmed
+genuinely open, not silently resolved, both by this verifier's own repo-wide grep
+(`reporter_verified` appears nowhere outside this file and its tests) and by
+DECISIONS.md's own text above naming the two unimplemented options.
+
+## Verification loop status (closing audit)
+34/34 outreach tests green (32 + 2 new: a parametrized reporter_verified truthiness
+test, a no-double-escape test). Full suite: 5123 passed, 11 skipped, 0 failed. Zero
+CRITICAL, zero MAJOR remaining on this module as of this commit -- per Blake's "fix,
+re-audit to zero," this closes the Frame 1/2 audit wave.

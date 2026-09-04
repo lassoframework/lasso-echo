@@ -379,3 +379,32 @@ def test_eligible_refuses_when_reporter_verified_key_is_entirely_absent():
     del ticket["reporter_verified"]
     ok, reason = outreach.eligible(ticket, _client())
     assert ok is False and reason == "reporter_not_verified"
+
+
+# ---- closing-audit fixes (fresh independent verifier of the D41/D42 fix commit) --------
+
+def test_eligible_refuses_any_truthy_but_not_literal_true_reporter_verified_value():
+    """A future producer setting reporter_verified to a token string, a timestamp, or
+    any other truthy-but-not-boolean value must NOT accidentally satisfy the gate --
+    the whole point of D42 is that only the literal boolean True, set deliberately,
+    opens it."""
+    for bad_value in ("True", "yes", 1, "pending-not-really", object(), "false"):
+        ticket = _ticket(reporter_verified=bad_value)
+        ok, reason = outreach.eligible(ticket, _client())
+        assert ok is False and reason == "reporter_not_verified", (
+            f"reporter_verified={bad_value!r} must not pass the gate")
+
+
+def test_initiate_does_not_double_escape_the_default_first_message_text():
+    """Closing-audit finding: initiate() used to re-escape first_message_text()'s
+    already-escaped output, turning '&lt;' into '&amp;lt;'. The default (message_text=
+    None) path must post text escaped exactly once."""
+    log, open_dm, post, record = _calls()
+    ident = ids.IDENTITIES["wrangler"]
+    ticket = _ticket(raw_text="<!channel> urgent")
+    outreach.initiate(ticket, _client(), ident, open_group_dm=open_dm,
+                      post_first_message=post, record_outbound=record)
+    posted_text = log["posted"][0][1]
+    assert "&lt;!channel&gt;" in posted_text
+    assert "&amp;lt;" not in posted_text
+    assert "&amp;amp;" not in posted_text
