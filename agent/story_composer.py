@@ -56,6 +56,32 @@ ROUTE_OPUS = "opus"
 HOOK_FRAME_MIN_SEC = 3.0
 ASK_FRAME_SEC = 3.0
 
+# ---- music bed mix (Blake 2026-09-04: "make sure the music is A+ on the reels") ----
+# The old burn was one flat `amix=inputs=2`, which is three separate faults: amix
+# divides EVERY input by the input count, so the gym's own audio and the bed both came
+# out ~6dB down and the whole reel played quiet; the bed sat at the same level as the
+# room for the entire run instead of sliding under it; and it started at full volume
+# and hard-cut at the end, mid-phrase. Measured against the live library on
+# 2026-09-04, the beds themselves also range -7.4 to -18.2 LUFS (an 11dB spread), so
+# one reel arrived deafening and the next inaudible.
+MUSIC_BED_LUFS = -20.0        # the bed, normalized BEFORE it is mixed under the room
+MUSIC_ONLY_LUFS = -15.0       # a silent source: the bed is the only audio, so carry it
+MUSIC_FADE_IN_SEC = 0.4
+MUSIC_FADE_OUT_SEC = 1.5      # never a hard cut on the closing ask frame
+# Ducking: the bed compresses when the room is loud (a coach talking, a class
+# cheering) and comes back up when it is quiet. attack fast enough not to clip a word,
+# release slow enough not to pump between syllables.
+MUSIC_DUCK_THRESHOLD = 0.05
+MUSIC_DUCK_RATIO = 8
+MUSIC_DUCK_ATTACK_MS = 5
+MUSIC_DUCK_RELEASE_MS = 400
+# Delivery level for the FINISHED mix. Instagram normalizes reel playback to roughly
+# -14 LUFS, so a reel handed over at -20 gets +6dB applied by the platform instead of
+# by us — which lifts the room noise with it. Delivering at the platform's own target
+# keeps that gain decision here, where the bed is still separable from the room.
+# TP=-1.5 dBTP is the limiter, so raising the mix cannot clip it.
+MIX_DELIVERY_LUFS = -14.0
+
 # The ONE video profile every segment is re-encoded to before the concat demuxer
 # joins them (see _default_normalize). Mixed frame rates / timebases across phone
 # clips silently truncate the concatenated VIDEO track, so both are pinned.
@@ -508,20 +534,102 @@ def _default_end_frame(path, out_dir, ask_text, *, ask_lines=None, identity_text
     return out
 
 
+def _has_audio_stream(path):
+    """True when this file carries at least one audio stream. A muted phone clip, a
+    screen recording or an export a coach stripped the audio from has none — and the
+    old burn's `[0:a]` filter reference made ffmpeg fail outright on those, which
+    surfaced to the coach as a 502 "render failed" rather than a reel. Probe failure
+    reads False (bed-only), which still produces a reel."""
+    import json as _json
+    import shutil as _shutil
+    import subprocess as _sp
+    ffprobe = _shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+    try:
+        r = _sp.run([ffprobe, "-v", "quiet", "-print_format", "json",
+                     "-select_streams", "a", "-show_streams", path],
+                    capture_output=True, text=True, timeout=30)
+        return bool((_json.loads(r.stdout or "{}") or {}).get("streams"))
+    except Exception as e:  # noqa: BLE001 - a probe failure is never a crash
+        print(f"[story-music] audio probe failed for {path}: {type(e).__name__}: {e}")
+        return False
+
+
+def _music_filter(video_dur, has_room_audio):
+    """The audio filter graph for the bed burn, and the label to map.
+
+    Two shapes, because a source with no audio of its own cannot be ducked against
+    anything:
+      * room audio present -> normalize the bed to MUSIC_BED_LUFS, fade it, DUCK it
+        under the room via sidechaincompress, then mix at unity (normalize=0, so
+        neither input is divided down the way plain amix does it).
+      * no room audio      -> the bed IS the reel's audio: normalize it louder
+        (MUSIC_ONLY_LUFS) and fade it, no duck, no mix.
+
+    duration=first pins the mix to the VIDEO, and the caller loops the bed, so a
+    library track shorter than the reel can no longer truncate it.
+    """
+    fade_out_at = max(0.0, float(video_dur) - MUSIC_FADE_OUT_SEC)
+    fades = (f"afade=t=in:st=0:d={MUSIC_FADE_IN_SEC},"
+             f"afade=t=out:st={fade_out_at:.2f}:d={MUSIC_FADE_OUT_SEC}")
+    fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    deliver = f"loudnorm=I={MIX_DELIVERY_LUFS}:TP=-1.5:LRA=11"
+    if not has_room_audio:
+        # Bed only: it is already normalized to the louder MUSIC_ONLY_LUFS, so the
+        # delivery pass just lands it on the platform target.
+        return (f"[1:a]{fmt},loudnorm=I={MUSIC_ONLY_LUFS}:TP=-1.5:LRA=11,"
+                f"atrim=0:{float(video_dur):.2f},{fades},{deliver}[a]"), "[a]"
+    return (
+        f"[0:a]{fmt},asplit=2[room][duckkey];"
+        f"[1:a]{fmt},loudnorm=I={MUSIC_BED_LUFS}:TP=-2:LRA=11,"
+        f"atrim=0:{float(video_dur):.2f},{fades}[bed];"
+        f"[bed][duckkey]sidechaincompress=threshold={MUSIC_DUCK_THRESHOLD}:"
+        f"ratio={MUSIC_DUCK_RATIO}:attack={MUSIC_DUCK_ATTACK_MS}:"
+        f"release={MUSIC_DUCK_RELEASE_MS}[ducked];"
+        f"[room][ducked]amix=inputs=2:duration=first:normalize=0[mixed];"
+        # The room/bed BALANCE is set above; this only lands the finished mix on the
+        # platform's playback target, lifting both together.
+        f"[mixed]{deliver}[a]"
+    ), "[a]"
+
+
 def _default_music_burn(path, music_path, out_dir):
-    """Burn the licensed music bed UNDER the video's own audio (real ffmpeg amix,
-    shortest duration). Only ever called with a non-empty music_path (a 'none'
-    selection skips the burn). Reuses clipper_render's ffmpeg guard."""
+    """Burn the licensed music bed under the video's own audio. Only ever called with
+    a non-empty music_path (a 'none' selection skips the burn). Reuses
+    clipper_render's ffmpeg guard.
+
+    Three live faults fixed here on 2026-09-04 (Blake: "make sure the music is A+"):
+
+    1. TRUNCATION. The old command paired `amix=duration=shortest` with `-shortest`,
+       so a bed SHORTER than the reel cut the VIDEO down to the bed's length. Two of
+       the nine tracks in the live library are under 60s (hype_06 at 56.4s, chill_03
+       at 51.2s), so a full-length reel lost its closing seconds — which is exactly
+       where the single validated ASK frame lives. The bed now loops
+       (-stream_loop -1) and the mix follows the video (duration=first).
+    2. A SILENT SOURCE KILLED THE RENDER. `[0:a]` on a file with no audio stream is
+       an ffmpeg error, not an empty stream, so a muted clip failed the whole render.
+       Probed now, with a bed-only graph for that case.
+    3. THE MIX. amix divided both inputs by 2 (quiet reel), the bed never ducked
+       under the room, and it hard-cut at the end. See the constants above.
+    """
     from . import clipper_render
     clipper_render._require_render()
     os.makedirs(out_dir, exist_ok=True)
     dst = os.path.join(out_dir, "story_music.mp4")
+    video_dur = clipper_render.probe_duration(path)
+    has_room = _has_audio_stream(path)
+    graph, out_label = _music_filter(video_dur, has_room)
     clipper_render._run([
-        clipper_render._ffmpeg(), "-y", "-i", path, "-i", music_path,
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=shortest[a]",
-        "-map", "0:v", "-map", "[a]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
+        clipper_render._ffmpeg(), "-y",
+        "-i", path,
+        # loop the bed so a track shorter than the reel repeats instead of ending it.
+        "-stream_loop", "-1", "-i", music_path,
+        "-filter_complex", graph,
+        "-map", "0:v", "-map", out_label,
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        # the VIDEO is the length of record; the looped bed is trimmed to it above.
+        "-t", f"{float(video_dur):.2f}",
         dst,
     ], "story_music_burn")
     return dst
