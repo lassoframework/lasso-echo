@@ -635,6 +635,20 @@ def _daily_scheduler(store):
                 _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
             except Exception as e:
                 print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
+            # D47: product='portal' tickets (the generic Website tab form's default,
+            # not Echo-specific) route to Scout per the identity map, never to
+            # Ranger's ad-engine-only fixer-lane.ts, which has no reason to see them.
+            # Same flag, same throttle -- this is one lane with two identity legs, not
+            # a second thing to arm.
+            try:
+                from . import echo_ticket_worker as _etw
+                from . import echo_ticket_wiring as _etw_live
+                scout_deps = _etw_live.live_deps(
+                    product="portal", source="website_tab", identity_name="scout")
+                _etw.intake_pass(scout_deps.bus, **scout_deps.intake_kwargs)
+                _etw.fixed_pass(scout_deps.bus, **scout_deps.fixed_kwargs)
+            except Exception as e:
+                print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
