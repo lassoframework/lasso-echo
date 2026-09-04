@@ -1516,16 +1516,32 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
      if(b.classList.contains("busy")) return;
      setErr(""); b.classList.add("busy");
      var ret = window.location.origin + window.location.pathname;
+     // POPUP LAW: claim the tab NOW, in the click itself, and steer it once the url
+     // arrives. Opening it later (inside the fetch .then) is a different task, so the
+     // browser blocks it silently and hands back null and the owner sees a dead button.
+     // Pass NO window features: the flags that suppress the opener also suppress the
+     // return value, and we need the handle. The opener is nulled by hand on the next
+     // line instead, which is the same protection.
+     // Full account, and the tests that pin it: test_connection_watch.py,
+     // test_connect_page_opens_oauth_in_new_tab_and_polls_on_focus.
+     var win = window.open("", "_blank");
+     if(win){ try { win.opener = null; } catch(e){} }
      fetch(base + "/social-connect?platform=" + encodeURIComponent(b.dataset.p)
            + "&redirect_url=" + encodeURIComponent(ret))
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
       .then(function(res){
         var url = res.j && res.j.oauth_url;
         if(res.ok && url){
-          // Open OAuth in a NEW tab so this page stays alive and can detect the return.
-          // Hill Country 2026-08-26: navigating the same tab away meant the status
-          // fetch never ran again, so badges were permanently stuck on "Not yet".
-          window.open(url, "_blank", "noopener");
+          // Send the tab we already hold to the OAuth url. This page stays alive and can
+          // detect the return. Hill Country 2026-08-26: navigating the same tab away
+          // meant the status fetch never ran again, so badges were permanently stuck on
+          // "Not yet" -- which is why the new tab is still the preferred path.
+          if(win && !win.closed){ win.location.replace(url); }
+          // Popup blocked at the gesture too (a hard blocker, or an embedded webview
+          // with no tabs at all). Never leave the owner on a dead button: go in THIS
+          // tab. The connect flow redirects back to this same page, which re-runs
+          // refreshStatus on load, so the badges still catch up.
+          else { window.location.href = url; return; }
           b.classList.remove("busy");
           // Start backup polling (4s, max 45 ticks = 3 min) to catch the return even
           // if focus event does not fire (e.g. mobile Safari, embedded webview).
@@ -1537,9 +1553,13 @@ CONNECT_PAGE = """<!doctype html><html><head><meta charset="utf-8">
             if(_pollCount >= 45){ clearInterval(_pollTimer); _pollTimer = null; }
           }, 4000);
         }
-        else { b.classList.remove("busy"); setErr((res.j && (res.j.detail||res.j.error)) || "Could not start the connection. Please try again."); }
+        // Never strand the blank tab we claimed on the click: an error must not leave
+        // the owner staring at an empty window wondering if it worked.
+        else { if(win && !win.closed) win.close();
+               b.classList.remove("busy"); setErr((res.j && (res.j.detail||res.j.error)) || "Could not start the connection. Please try again."); }
       })
-      .catch(function(){ b.classList.remove("busy"); setErr("Network error. Please try again."); });
+      .catch(function(){ if(win && !win.closed) win.close();
+                         b.classList.remove("busy"); setErr("Network error. Please try again."); });
    });
  });
 </script>
