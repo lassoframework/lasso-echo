@@ -745,3 +745,46 @@ both PRs as of this commit, confirmed by two independent fresh audits per findin
 outreach.py and the resolved-ticket-learning path into brain.py both remain unwired to
 any production caller -- D42's provenance ruling is still the one open item before
 either is wired live.
+
+---
+
+# D45 (Blake's ruling, 2026-09-04). D42's provenance question resolved: reuse the
+# existing #fixer hold-card + tap, don't invent authentication for producers that don't
+# exist yet
+
+Blake: "do whatever you recommend for D42." Building real authentication into three
+intake producers that do not exist yet (portal_form, engage_tenant_event, website_intake)
+is a speculative, much larger project than this feature warrants, and blocking outreach
+indefinitely on it wastes the work already done. This system already has a proven,
+audited pattern for exactly this shape of problem -- a human tap gates anything that
+cannot verify itself (D20's hold-card + Release button, already used for fixer_request
+and held replies). Reused here, not reinvented.
+
+`eligible(ticket, who)` (the split-out `_base_eligible()` plus the `reporter_verified is
+True` check) stays the FAST, autonomous path for a future strongly-authenticated
+producer that genuinely doesn't need a human in the loop -- unchanged, still fails closed
+for everyone today, exactly as D42 left it.
+
+New for every OTHER ticket (which today is every ticket, since nothing sets
+`reporter_verified`): `eligible_for_approval_request()` (the same base gates, minus
+provenance) plus `request_approval()`, which writes the proposed first message as a
+`held` row (`kind=KIND_OUTREACH_REQUEST` -- deliberately NOT postable by the normal
+outbox loop, which does not know how to `open_group_dm`) and a hold-notice card in
+#fixer via the existing `adapter.write_hold_notice`. `release_approved_outreach()` is the
+tap handler: validates the held row belongs to THIS ticket and THIS identity (same
+discipline as V-m10's cross-identity release check), re-runs the base gates at tap time
+(not just at request time -- the ticket could have changed in the window between the
+card posting and the tap), then sends via the same `_send()` internals `initiate()`
+itself now calls (refactored out to avoid duplicating the escaping/row-lifecycle/claim
+logic between the two paths).
+
+One thing this build does NOT do: wire `RELEASE_ACTION_ID`'s Slack button dispatch to
+`release_approved_outreach()` in `listener_wiring.py`. That is a small, mechanical follow
+up consistent with everything else about `outreach.py` -- it still has zero production
+callers today, so this is prep work, not a live capability, exactly like the rest of
+this module has been from the start.
+
+## Verification loop status (D45)
+outreach.py: 46 tests green (37 existing + 9 new: hold-request success/refusal/escaping,
+release validation x2 (kind, ticket, identity), re-check-at-tap-time, backward-compat).
+Full suite: see commit.
