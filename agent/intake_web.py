@@ -73,17 +73,57 @@ def client_for_token(token):
     """The client key a token authenticates, or None. A SIGNED token verifies
     against the shared secret (no per-gym env var needed); a legacy per-client env
     value (AGENT_INTAKE_TOKEN_<KEY>) still matches so the cutover is zero-downtime.
-    The token value is never logged. Pure: no I/O beyond reading env. Revocation
-    is enforced separately (see is_revoked)."""
+    The token value is never logged. Revocation is enforced separately (see
+    is_revoked).
+
+    STALE FINGERPRINTS ARE RESOLVED HERE, once, for every route (2026-09-04). A signed
+    link self-decodes the account_key it was MINTED with, and re-canonicalizing a gym's
+    key deliberately never invalidates an already-issued link -- so a gym can hold a link
+    carrying a key that nothing else in the system reads any more. gym_media_routes
+    special-cased that for /media/* only, which left every other tokened surface blind:
+    Dean Holcomb's /calendar returned 0 drafts under his link's crossfitreverb6cdf33
+    while the same call under crossfitreverb30b5b2 returned 90, so his portal counted
+    "93 posts drafted" from the shared table and then rendered "Echo is creating your
+    first month" underneath it. Resolving at the ONE place a token becomes an identity
+    fixes calendar, report, library, media, events, studio and support together, instead
+    of one route at a time as each gym finds the next one.
+
+    REVOCATION IS UNAFFECTED: a revoked raw key is returned AS-IS so the caller's
+    is_revoked() check still refuses it. Resolution can only ever redirect a live token
+    onto the gym it already belonged to; it can never revive a killed link."""
     if not token:
         return None
+    raw = None
     signed = intake_tokens.verify(token)
     if signed is not None:
-        return signed
-    for name, value in os.environ.items():
-        if name.startswith(_TOKEN_ENV_PREFIX) and value and value == token:
-            return name[len(_TOKEN_ENV_PREFIX):].lower()
-    return None
+        raw = signed
+    else:
+        for name, value in os.environ.items():
+            if name.startswith(_TOKEN_ENV_PREFIX) and value and value == token:
+                raw = name[len(_TOKEN_ENV_PREFIX):].lower()
+                break
+    if raw is None:
+        return None
+    return _resolved_account_key(raw)
+
+
+def _resolved_account_key(raw):
+    """`raw` mapped onto the gym it actually belongs to, or `raw` unchanged.
+
+    Skips entirely (no I/O at all) for a key that is not <slug><6-hex> shaped -- a bare
+    legacy key like 'eng' or 'topfuel' can never be a stale fingerprint. A revoked key is
+    returned untouched so revocation still bites. Any failure returns `raw`: this must
+    never be able to turn a working token into a broken one."""
+    try:
+        from . import gym_media_routes as _gmr
+        if not _gmr._name_slug_of(raw):  # noqa: SLF001 - same package, one shared shape
+            return raw
+        if is_revoked(raw):
+            return raw
+        return _gmr._resolve_stale_fingerprint(raw)  # noqa: SLF001
+    except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
+        print(f"[intake-web] stale-key resolution skipped: {type(e).__name__}: {e}")
+        return raw
 
 
 # The token charset: b64url alphabet plus the '.' that separates a signed

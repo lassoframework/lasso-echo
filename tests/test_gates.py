@@ -248,9 +248,26 @@ def test_store_roundtrip_and_no_token(tmp_path):
     got = s.get(d.draft_id)
     assert got is not None and got.caption == d.caption
     assert len(s.list_pending()) == 1
-    # the store is sqlite now: scan the raw bytes for any token leakage
-    body = (tmp_path / "p.json").read_bytes()
-    assert b"token" not in body.lower()
+    # NEVER HOLD A TOKEN. This asserts on the stored VALUES, not the raw file bytes.
+    #
+    # 2026-09-04: the byte scan was a first-run-only test. The store is sqlite now, and
+    # sqlite keeps its DDL in page 1 -- which contains the gyms table's own column names,
+    # intake_token_hash / token_sha256 / token_rotated_at. So "token" is present in every
+    # store file by construction, and the byte scan passed only while a given file still
+    # happened to be legacy JSON. Proven on unchanged main: run this test once in a fresh
+    # clone and it passes; run it a second time, changing nothing at all, and it fails.
+    # Any branch that touched any file inherited the failure and looked like the culprit.
+    #
+    # The real invariant is about VALUES: no draft row may ever persist a token, or the
+    # env var NAME that holds one (_acct() carries token_env="T_TOKEN"). That is what is
+    # checked now, so the guard is stronger than the byte scan AND stable across runs.
+    import sqlite3 as _sqlite3
+    with _sqlite3.connect(str(tmp_path / "p.json")) as _con:
+        _rows = _con.execute("SELECT * FROM drafts").fetchall()
+    assert _rows, "the draft must actually be in the store for this guard to mean anything"
+    _stored = " ".join(str(v) for row in _rows for v in row).lower()
+    assert "token" not in _stored
+    assert "t_token" not in _stored
     assert s.remove(d.draft_id) is True
     assert s.get(d.draft_id) is None
 

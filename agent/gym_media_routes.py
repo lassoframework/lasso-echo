@@ -45,6 +45,39 @@ def _name_slug_of(key):
     return m.group(1) if m else ""
 
 
+_PLANE_BASES_TTL = 300  # seconds; this list changes at onboarding speed, not request speed
+_plane_bases_cache = {"at": 0.0, "bases": frozenset()}
+
+
+def _shared_plane_bases(now_fn=None, get=None):
+    """Every account key the PORTAL considers real, read from the shared plane
+    (echo_intake_tokens.echo_account_key) rather than from worker-local state.
+
+    Both the worker and echo-intake-web can read this; only the worker can read the
+    account registry file. Cached for _PLANE_BASES_TTL so a per-request resolution never
+    turns into a per-request round trip.
+
+    Fails to an EMPTY set, never raises: an unreadable plane must leave the caller in
+    exactly today's behaviour (return the key unchanged), never remap on a guess."""
+    import time
+    now = (now_fn or time.time)()
+    if now - _plane_bases_cache["at"] < _PLANE_BASES_TTL and _plane_bases_cache["bases"]:
+        return set(_plane_bases_cache["bases"])
+    try:
+        if get is None:
+            from .account_key_split_watch import _supabase_get as get  # noqa: PLC0415
+        rows = get("echo_intake_tokens", {"select": "echo_account_key"}) or []
+        bases = {str(r.get("echo_account_key") or "").strip() for r in rows}
+        bases = {b for b in bases if b}
+    except Exception as e:  # noqa: BLE001 - never let a plane read break a media request
+        print(f"[gym-media] shared-plane base read failed: {type(e).__name__}: {e}")
+        return set()
+    if bases:
+        _plane_bases_cache["at"] = now
+        _plane_bases_cache["bases"] = frozenset(bases)
+    return set(bases)
+
+
 def _resolve_stale_fingerprint(gym, *, bases_fn=None):
     """Resolve a STALE account-key fingerprint onto the currently-registered gym it
     belongs to, or return `gym` unchanged.
@@ -79,7 +112,28 @@ def _resolve_stale_fingerprint(gym, *, bases_fn=None):
     try:
         bases = set(bases_fn())
     except Exception:  # noqa: BLE001 - a registry read failure just skips the remap
-        return gym
+        bases = set()
+    # SHARED-PLANE FALLBACK (Dean Holcomb again, 2026-09-04). Everything above is
+    # correct and it still did not work for him, because client_gym_bases() reads
+    # accounts.all_accounts(), which reads the account registry FILE
+    # (config.gym_registry_path(), /data/gym_accounts.json). That file lives on the
+    # WORKER's Railway volume. echo-intake-web -- the service that actually serves
+    # /portal/<token>/media/* to the gym -- has no such file: os.path.exists() is
+    # False there, so client_gym_bases() returned 5 built-in bases with no client gym
+    # among them, no name-slug ever matched, and this resolver handed back the stale
+    # key unchanged on the ONE service where a gym's request actually lands.
+    #
+    # Live proof on 2026-09-04: GET /portal/<6cdf33 token>/media/sources returned
+    # {"sources": []} while the same call under crossfitreverb30b5b2 returned his
+    # "Reverb LASSO Content" folder. Dean saw "no connected folders", and re-connecting
+    # said "already connected" because the hijack rail (find_source_by_folder) looks the
+    # folder up GLOBALLY and does find it. Two contradictory answers, one cause.
+    #
+    # So the base list can never come from worker-local state alone. echo_intake_tokens
+    # is the portal's own key column and BOTH services can read it, so it is the source
+    # of truth for "which keys are real" -- the registry is now an optimisation, not the
+    # only answer.
+    bases |= _shared_plane_bases()
     if not bases or gym in bases:
         return gym
     slug = _name_slug_of(gym)
