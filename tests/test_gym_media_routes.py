@@ -243,10 +243,19 @@ def test_name_slug_of_rejects_bare_keys():
     assert gm._name_slug_of(None) == ""
 
 
+
+# Identity-based resolution (2026-09-04 audit): the resolver no longer matches by
+# name-slug over a "bases" list -- it maps a gym's COMPUTED Echo key onto that gym's live
+# portal key, anchored on gym_id. These tests inject that mapping directly, which is the
+# same behaviour they always asserted, minus the unsafe heuristic.
+def _resolve_map(mapping):
+    return lambda key: mapping.get(key, key)
+
+
 def test_resolve_stale_fingerprint_remaps_to_the_one_registered_match():
-    bases = ["crossfitreverb30b5b2", "piercefitness", "eng"]
     resolved = gm._resolve_stale_fingerprint(
-        "crossfitreverb6cdf33", bases_fn=lambda: bases)
+        "crossfitreverb6cdf33",
+        resolve=_resolve_map({"crossfitreverb6cdf33": "crossfitreverb30b5b2"}))
     assert resolved == "crossfitreverb30b5b2"
 
 
@@ -254,17 +263,17 @@ def test_resolve_stale_fingerprint_alerts_once(monkeypatch):
     fired = []
     monkeypatch.setattr("agent.gym_media_index.dedup_alert",
                         lambda k, m: fired.append((k, m)) or True)
-    bases = ["crossfitreverb30b5b2"]
-    gm._resolve_stale_fingerprint("crossfitreverb6cdf33", bases_fn=lambda: bases)
+    gm._resolve_stale_fingerprint(
+        "crossfitreverb6cdf33",
+        resolve=_resolve_map({"crossfitreverb6cdf33": "crossfitreverb30b5b2"}))
     assert fired
     assert "crossfitreverb6cdf33" in fired[0][1]
     assert "crossfitreverb30b5b2" in fired[0][1]
 
 
 def test_resolve_stale_fingerprint_already_registered_is_untouched():
-    bases = ["crossfitreverb30b5b2"]
     resolved = gm._resolve_stale_fingerprint(
-        "crossfitreverb30b5b2", bases_fn=lambda: bases)
+        "crossfitreverb30b5b2", resolve=_resolve_map({}))
     assert resolved == "crossfitreverb30b5b2"
 
 
@@ -288,14 +297,14 @@ def test_resolve_stale_fingerprint_bare_key_never_matched():
     # A key with no 6-hex tail is never treated as a stale fingerprint, even if some
     # registered base happens to share letters with it.
     bases = ["pierce2222bb"]
-    resolved = gm._resolve_stale_fingerprint("pierce", bases_fn=lambda: bases)
+    resolved = gm._resolve_stale_fingerprint("pierce", resolve=_resolve_map({}))
     assert resolved == "pierce"
 
 
 def test_resolve_stale_fingerprint_registry_failure_degrades_safely():
-    def _boom():
-        raise RuntimeError("registry unavailable")
-    resolved = gm._resolve_stale_fingerprint("crossfitreverb6cdf33", bases_fn=_boom)
+    def _boom(_key):
+        raise RuntimeError("plane unavailable")
+    resolved = gm._resolve_stale_fingerprint("crossfitreverb6cdf33", resolve=_boom)
     assert resolved == "crossfitreverb6cdf33"
 
 
@@ -303,8 +312,9 @@ def test_bind_remaps_stale_key_and_writes_under_the_live_gym(monkeypatch):
     """The exact CrossFit Reverb scenario: a bind request arrives on a stale
     fingerprint; the row is written under the CURRENT registered key instead."""
     monkeypatch.setattr(
-        "agent.calendar_autopublish.client_gym_bases",
-        lambda: ["crossfitreverb30b5b2"])
+        "agent.account_key_resolve.resolve",
+        lambda key, now_fn=None, get=None: (
+            "crossfitreverb30b5b2" if key == "crossfitreverb6cdf33" else key))
     store = FakeMediaStore()
     drive = FakeDrive(meta={"name": "Reverb LASSO Content",
                             "owner_email": "deanholcomb6@gmail.com",

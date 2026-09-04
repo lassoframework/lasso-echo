@@ -110,19 +110,21 @@ def client_for_token(token):
 def _resolved_account_key(raw):
     """`raw` mapped onto the gym it actually belongs to, or `raw` unchanged.
 
-    Skips entirely (no I/O at all) for a key that is not <slug><6-hex> shaped -- a bare
-    legacy key like 'eng' or 'topfuel' can never be a stale fingerprint. A revoked key is
-    returned untouched so revocation still bites. Any failure returns `raw`: this must
-    never be able to turn a working token into a broken one."""
+    Matching is by IDENTITY, not resemblance: account_key_resolve computes each gym's
+    Echo-derived key from its gym_id and maps that exact string onto that gym's live
+    portal key. A key that is already live, maps nowhere, or cannot be resolved with
+    certainty is returned untouched -- which is precisely the pre-fix behaviour.
+
+    A REVOKED key is returned before any resolution, so revocation still bites and a
+    killed link can never be revived. Any failure returns `raw`: this sits in the auth
+    path and must never turn a working token into a broken one."""
     try:
-        from . import gym_media_routes as _gmr
-        if not _gmr._name_slug_of(raw):  # noqa: SLF001 - same package, one shared shape
-            return raw
         if is_revoked(raw):
             return raw
-        return _gmr._resolve_stale_fingerprint(raw)  # noqa: SLF001
+        from . import account_key_resolve as _akr  # noqa: PLC0415
+        return _akr.resolve(raw)
     except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
-        print(f"[intake-web] stale-key resolution skipped: {type(e).__name__}: {e}")
+        print(f"[intake-web] key resolution skipped: {type(e).__name__}: {e}")
         return raw
 
 
