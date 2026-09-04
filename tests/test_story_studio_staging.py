@@ -442,3 +442,68 @@ def test_deny_also_denies_the_approval_row_it_created(monkeypatch, tmp_path):
     assert denied and denied[0][1] == row_id, "the approval row was left orphaned"
     assert denied[0][0] == "pierce"
     assert "not on brand" in denied[0][2]
+
+
+# ---- the identity anchor on a SERVER-BUILT request (2026-09-04) -------------
+# gym_event.story_studio_create_request builds a request with NO identity_tokens key --
+# it has no frontend to supply one -- so story_overlay refused it and the event story
+# offer HELD every single time. create_story now reads the anchor off the gym's own row
+# when the request omits it. The refusal rail is untouched: a gym with no name still
+# resolves to nothing and still HOLDS.
+def _run_story(monkeypatch, tmp_path, request):
+    """Drive create_story the way the other tests here do, with the render armed and
+    everything network-bound inert."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"ID3fake")
+    return ss.create_story(
+        request, candidates=_cands("pierce"), assets_by_id={},
+        analysis={"confidence": 0.9, "tags": ["workout"]},
+        store=_FakeStore(), music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+
+
+def _event_shaped_request():
+    """EXACTLY the shape gym_event.story_studio_create_request returns: note the
+    complete absence of an identity_tokens key."""
+    return {
+        "gym_id": "pierce", "account_key": "pierce_ig",
+        "asset_ids": ["a0", "a1", "a2"],
+        "brief": "Summer Shred kickoff saturday come train with us",
+        "template": None, "music_mood": None, "requested_by": "event:one-tap",
+    }
+
+
+def test_a_server_built_request_stages_using_the_gyms_own_name(monkeypatch, tmp_path):
+    monkeypatch.setattr("agent.gym_identity.tokens_for",
+                        lambda base, **k: ["Pierce Fitness", "Carmel"])
+    res = _run_story(monkeypatch, tmp_path, _event_shaped_request())
+    assert res["status"] == "staged", res.get("reason")
+    burned = (res.get("story_render") or {}).get("overlay_text_final") or ""
+    assert "SUMMER SHRED" in burned
+
+
+def test_a_gym_with_no_resolvable_name_still_HOLDS(monkeypatch, tmp_path):
+    """The rail is untouched. Echo never burns an unbranded Story just because the
+    lookup came back empty."""
+    monkeypatch.setattr("agent.gym_identity.tokens_for", lambda base, **k: [])
+    res = _run_story(monkeypatch, tmp_path, _event_shaped_request())
+    assert res["status"] == "held"
+    assert "identity" in (res.get("reason") or "").lower()
+
+
+def test_a_request_that_DOES_carry_tokens_is_not_overridden(monkeypatch, tmp_path):
+    """A coach tap supplies its own anchor (the portal resolves it). The fallback must
+    not second-guess a caller that already answered."""
+    called = {"n": 0}
+
+    def _never(base, **k):
+        called["n"] += 1
+        return ["WRONG"]
+
+    monkeypatch.setattr("agent.gym_identity.tokens_for", _never)
+    req = _event_shaped_request()
+    req["identity_tokens"] = ["Pierce Fitness"]
+    res = _run_story(monkeypatch, tmp_path, req)
+    assert res["status"] == "staged", res.get("reason")
+    assert called["n"] == 0, "the gym row was queried despite the request answering"

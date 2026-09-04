@@ -4162,3 +4162,32 @@ the words means rendering again from the same clips:
   the editor's counter reads it instead of a retyped 24, and hides when Echo sends none.
 
 Suite: 5270 passed, 1 deselected.
+
+## The event story offer HELD every time too, and now does not (Blake, 2026-09-04)
+Blake ruled: fix it, and "nothing should need me".
+
+The same identity-anchor bug that made the coach's Create-a-Story button useless also
+killed the EVENT story offer — the button Echo shows a gym to turn an event's recap
+photos into a story. `gym_event.story_studio_create_request` builds its request
+SERVER-side and has no identity_tokens key at all, so `story_overlay` refused it with
+"no identity_tokens (city/gym anchor) were provided for this render", every single time.
+
+`story_overlay` carries no default of its own by an earlier audit's ruling ("the frontend
+must supply it"). That is right for a coach tap — the portal now supplies it — and
+impossible for a request Echo builds itself. So `agent/gym_identity.py` (new) reads the
+anchor off the gym's OWN row and `create_story` falls back to it when the request omits
+one:
+  * NOT a default in the sense the audit ruled against: it invents nothing. The tokens
+    are `gyms.name` plus the city half of `gyms.market`, mirroring the portal's
+    `identityTokensFrom` so both lanes anchor a gym identically.
+  * The rail is UNTOUCHED. A gym with no resolvable name still yields nothing and the
+    render still HOLDS — it just stops firing on gyms that do have a name. Tested both
+    ways, plus that a request which DOES carry tokens is never second-guessed.
+  * Two hops, because Story Studio works in base keys ('pierce') while `gyms` is keyed
+    by uuid and the base key is NOT gyms.slug (topfuel -> top-fuel). `echo_intake_tokens`
+    is the authoritative roster the portal mints, so it is the join.
+  * Cached per process (misses too), so a render never pays the round trip twice and a
+    nameless gym is not hammered.
+
+Verified against the exact event-shaped request: status `staged`, overlay burned as
+"SUMMER SHRED KICKOFF / SATURDAY COME TRAIN WITH / US". Suite: 5297 passed, 1 deselected.
