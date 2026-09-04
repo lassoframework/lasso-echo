@@ -134,3 +134,52 @@ def test_an_empty_plane_is_not_cached():
 
     assert gmr._shared_plane_bases(now_fn=lambda: 1000.0, get=flaky) == set()
     assert gmr._shared_plane_bases(now_fn=lambda: 1000.5, get=flaky) == {REVERB_REAL}
+
+
+# ---- resolution at the TOKEN boundary, so every route gets it -------------------------
+#
+# Dean's second symptom came through /calendar, not /media. gym_media_routes had
+# special-cased the resolution for its own handlers, which left calendar, report, library,
+# events, studio and support blind to exactly the same stale key. Proven live on
+# echo-intake-web before this fix:
+#   handle_portal_calendar("crossfitreverb6cdf33", "2026-09") -> 0 drafts
+#   handle_portal_calendar("crossfitreverb30b5b2", "2026-09") -> 90 drafts
+# which is why his portal counted "93 posts drafted" from the shared table and then
+# rendered "Echo is creating your first month" directly underneath it.
+
+def test_token_boundary_resolves_a_stale_key(monkeypatch):
+    from agent import intake_web as iw
+    monkeypatch.setattr(iw, "is_revoked", lambda k: False)
+    monkeypatch.setattr(gmr, "_shared_plane_bases", lambda: {REVERB_REAL})
+    monkeypatch.setattr(gmr._idx, "dedup_alert", lambda *a, **k: None)
+    monkeypatch.setattr(gmr, "client_gym_bases", lambda: [], raising=False)
+    assert iw._resolved_account_key(REVERB_STALE) == REVERB_REAL
+
+
+def test_a_revoked_token_is_never_revived(monkeypatch):
+    """Resolution is a repair, not a bypass: a killed link stays killed."""
+    from agent import intake_web as iw
+    monkeypatch.setattr(iw, "is_revoked", lambda k: k == REVERB_STALE)
+    monkeypatch.setattr(gmr, "_shared_plane_bases", lambda: {REVERB_REAL})
+    assert iw._resolved_account_key(REVERB_STALE) == REVERB_STALE
+
+
+def test_a_bare_legacy_key_does_no_io_at_all(monkeypatch):
+    """'eng' / 'topfuel' can never be a stale fingerprint, so the resolver must not even
+    look -- this path runs on every single tokened request."""
+    from agent import intake_web as iw
+    called = []
+    monkeypatch.setattr(gmr, "_shared_plane_bases",
+                        lambda: called.append(1) or {REVERB_REAL})
+    monkeypatch.setattr(iw, "is_revoked", lambda k: called.append("revoked") or False)
+    assert iw._resolved_account_key("eng") == "eng"
+    assert called == [], "a non-fingerprinted key must short-circuit before any lookup"
+
+
+def test_resolution_failure_returns_the_raw_key(monkeypatch):
+    """This sits in the auth path; it must never turn a working token into a broken one."""
+    from agent import intake_web as iw
+    monkeypatch.setattr(iw, "is_revoked", lambda k: False)
+    monkeypatch.setattr(gmr, "_resolve_stale_fingerprint",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane down")))
+    assert iw._resolved_account_key(REVERB_STALE) == REVERB_STALE
