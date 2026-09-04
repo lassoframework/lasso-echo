@@ -107,8 +107,21 @@ def _verified_ticket_dict(ticket):
 
 
 def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print):
+    """LIVE BUG FIX (2026-09-04, found running the real Echo regression test): the
+    support_tickets.status CHECK constraint has never allowed the literal value
+    'escalated' -- the rest of this codebase's own convention (tests/test_slack_convo.py)
+    has always been status='hold' + the separate escalated=True boolean. This function
+    used the wrong string since D46 shipped, so EVERY unresolved-identity or
+    unclassifiable ticket through this bridge raised a BusError on the very first
+    bus.set_ticket call, before record_outbound ever ran -- caught (after the Frame 1
+    MINOR fix) by intake_pass's per-ticket try/except, which stopped it from starving
+    other tickets, but meant the escalation notice was NEVER written and the ticket's
+    status stayed 'new', so it silently retried and failed identically every poll,
+    forever, with no card ever reaching #fixer. Found live: a real client's ticket
+    ("Can we add our group sessions schedule to the website?") was stuck in exactly
+    this loop from the moment AGENT_PORTAL_ECHO_TICKETS_ENABLED first armed."""
     tid = ticket.get("id")
-    bus.set_ticket(tid, status="escalated", escalated=True)
+    bus.set_ticket(tid, status="hold", escalated=True)
     bus.record_outbound(
         ticket_id=tid, author_type="system",
         body=f"Portal ticket {tid} ({identity_name}) could not be routed "
@@ -160,11 +173,16 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
     tid = ticket["id"]
     # Row-first: the client's original words are recorded as an inbound message
     # before anything else touches this ticket -- the portal insert only wrote the
-    # TICKET, not a support_messages row, unlike a Slack-sourced ticket.
-    bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
-                       author_type="client", author_id=ticket.get("reporter") or "",
-                       body=ticket.get("raw_text") or "",
-                       meta={"surface": "portal_ticket_bridge"})
+    # TICKET, not a support_messages row, unlike a Slack-sourced ticket. Guarded by
+    # inbound_count so a ticket that fails a LATER step (and so stays 'new' for the
+    # next poll to pick up again) does not duplicate this row every retry -- found
+    # live: the same real client message was recorded 5 times over 5 failed polls
+    # before the _escalate_unresolved status bug (fixed alongside this) was found.
+    if bus.inbound_count(tid) < 1:
+        bus.record_inbound(ticket_id=tid, slack_event_id=None, slack_ts=None,
+                           author_type="client", author_id=ticket.get("reporter") or "",
+                           body=ticket.get("raw_text") or "",
+                           meta={"surface": "portal_ticket_bridge"})
 
     # D46/D47 audit fix (Frame 1, CRITICAL): outbox.py's dispatch gate refuses to post
     # ANY row whose parent ticket's bot_identity does not match the identity currently
