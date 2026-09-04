@@ -13,10 +13,22 @@ empty key and saw a gym with nothing. Every lane that starts from the CONTENT ke
 month nobody could see. Neither side errored. Neither side alerted. The gyms would simply
 have never posted, and the first signal would have been the owner asking why.
 
+WHAT THIS WATCH STILL CANNOT SEE (2026-09-04). It keys off CONTENT, so it only fires once
+rows exist under the rival key: it found 3 split gyms while a column-vs-token comparison
+found 7. A row is ALREADY broken the moment `echo_intake_tokens.echo_account_key` disagrees
+with the key Echo SIGNED INTO that same row's token — the gym's link authenticates as one
+identity while every portal read uses the other — and that is true before any content is
+built. Only the PORTAL can run that check (it holds the Fernet key for the blob), so it
+lives there as `scripts/echo-account-key-audit.mjs`. Run BOTH: this one catches drift that
+grew content, that one catches the row being wrong at birth. The root generator itself is
+fixed (the portal now stores the key Echo reports), so this pair is regression cover.
+
 WHY THE EXISTING DETECTORS ALL MISS IT:
   * account_key_reconcile compares the token key to canonical_account_key, but its
-    idempotency rule treats ANY non-collided current key as "issued" and returns it
-    verbatim — so it grades a split gym OK. It is also CLI-only and never scheduled.
+    idempotency rule treated ANY non-collided current key as "issued" and returned it
+    verbatim — so it graded a split gym OK. FIXED 2026-09-04: it now computes a fresh
+    derivation alongside the issued key and reports SPLIT / MISMATCH, never OK, when the
+    two differ. It is still CLI-only and never scheduled.
   * account_key_doctor asks "does this base resolve to exactly one gyms row" — both keys
     resolve fine, to the SAME gym. That is precisely the split, and it reads as healthy.
   * onboarding_watch compares the portal token key to the INTAKE submission key. When both

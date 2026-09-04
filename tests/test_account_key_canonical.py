@@ -644,9 +644,96 @@ def test_a_collided_gym_with_data_is_blocked_not_repointed():
 
 def test_a_non_collided_live_gym_is_never_repointed_at_all():
     """Pierce's real shape: a unique current key is treated as ISSUED, so there is no
-    change to make and the guard never even has to fire."""
+    change to make and the guard never even has to fire.
+
+    The STATUS is now MISMATCH rather than OK, and that change is the point. Pierce's key
+    genuinely does NOT equal a fresh canonical derivation, and grading that "OK" is what
+    let three live split gyms pass this sweep clean on 2026-09-04. MISMATCH is the honest
+    reading: the key has drifted, and (because nothing else owns content under the derived
+    key) that drift is harmless and the key rightly stays put. What must NOT change is the
+    WRITE behaviour, which this still pins: change False, so --apply never touches it."""
     plan = akr.build_plan([_rec("g-pierce", "Pierce Fitness", "piercefitness")])
-    assert plan[0]["status"] == "OK" and plan[0]["change"] is False
+    assert plan[0]["change"] is False, "a live gym must still never be re-pointed"
+    assert plan[0]["status"] == "MISMATCH"
+    assert plan[0]["status"] != "OK", "a drifted key is never graded OK again"
+
+
+# ---------------------------------------------------------------------------
+# SPLIT detection: one gym_id owning TWO keys (the mirror of a collision).
+# ---------------------------------------------------------------------------
+
+def _split_rec():
+    """CrossFit Sunnyside's real prod shape, 2026-09-04: the portal token row points at
+    crossfitsunnysidef574c0 (28 calendar rows) while canonical_account_key derives
+    crossfitsunnyside2616ac, which owns 42. ONE gym, TWO live identities."""
+    return [_rec("f574c06c-498a-45f8-a599-b2a8863fadfb", "CrossFit Sunnyside",
+                 "crossfitsunnysidef574c0")]
+
+
+def test_a_split_gym_is_never_graded_ok():
+    """THE REGRESSION THIS SWEEP SHIPPED WITH. The idempotency rule treats any
+    non-collided current key as ISSUED, canonical_account_key returns an issued key
+    verbatim, so canonical == current and the row scored OK — for a gym whose second key
+    held every one of its calendar rows. Collision detection cannot see it either: a split
+    is one gym_id owning two keys, the mirror image of two gym_ids sharing one key."""
+    derived = ak.canonical_account_key("f574c06c-498a-45f8-a599-b2a8863fadfb",
+                                       "CrossFit Sunnyside")
+    assert derived == "crossfitsunnyside2616ac", "fixture must match the live canonical key"
+
+    plan = akr.build_plan(_split_rec(), canonical_owns_data=lambda k: k == derived)
+    row = plan[0]
+    assert row["status"] == "SPLIT", "the other key OWNS content: two live identities"
+    assert row["derived"] == derived, "the second identity must be named in the plan"
+    assert row["current"] == "crossfitsunnysidef574c0"
+
+
+def test_a_split_row_still_refuses_to_repoint_itself():
+    """A SPLIT is a finding, not an instruction. `canonical` keeps honoring issued_key, so
+    change stays False and --apply cannot move a pointer that would strand the data. On
+    Sunnyside BOTH keys own rows, so merging the calendars would double-post the month;
+    that is a human decision."""
+    plan = akr.build_plan(_split_rec(), canonical_owns_data=lambda _k: True)
+    assert plan[0]["status"] == "SPLIT"
+    assert plan[0]["change"] is False, "a split must never auto-repoint"
+
+
+def test_drift_with_an_empty_other_key_is_mismatch_not_split():
+    """Honest gradation: drift where the derived key owns NOTHING is not two live
+    identities. Reporting it as SPLIT would cry wolf over every legacy short-key gym."""
+    plan = akr.build_plan(_split_rec(), canonical_owns_data=lambda _k: False)
+    assert plan[0]["status"] == "MISMATCH"
+
+
+def test_unknowable_ownership_is_mismatch_never_ok():
+    """With no probe injected the planner cannot tell live from empty. It must still
+    refuse to say OK — the weaker MISMATCH is the honest answer."""
+    plan = akr.build_plan(_split_rec())
+    assert plan[0]["status"] == "MISMATCH"
+
+
+def test_a_probe_that_raises_does_not_manufacture_a_split():
+    """A reader fault must not invent a finding. (Note the deliberate asymmetry with
+    key_owns_content, where an UNREADABLE key reports data-present so a WRITE is blocked:
+    blocking a write is safe, announcing a split that may not exist is not.)"""
+    def boom(_k):
+        raise RuntimeError("supabase down")
+    plan = akr.build_plan(_split_rec(), canonical_owns_data=boom)
+    assert plan[0]["status"] == "MISMATCH"
+
+
+def test_key_owns_content_reads_only_shared_plane_signals():
+    """Split detection asks which IDENTITY owns the gym's content, so only the shared-plane
+    signals count. The voice doc and media library existing_data_for also reports are LOCAL
+    to whichever Echo host runs the probe and say nothing about identity ownership."""
+    assert akr.key_owns_content("k", counter=_counter(
+        k={"sources": 0, "calendar": 5, "voice": False, "library": False})) is True
+    assert akr.key_owns_content("k", counter=_counter(
+        k={"sources": 2, "calendar": 0, "voice": False, "library": False})) is True
+    assert akr.key_owns_content("k", counter=_counter(
+        k={"sources": 0, "calendar": 0, "voice": True, "library": True})) is False
+    # Standing module rule: an unreadable probe (-1) reports data PRESENT.
+    assert akr.key_owns_content("k", counter=_counter(
+        k={"sources": -1, "calendar": 0, "voice": False, "library": False})) is True
 
 
 def test_an_unused_key_is_still_reconciled():
