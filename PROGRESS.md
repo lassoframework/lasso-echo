@@ -4118,3 +4118,47 @@ docstring now says what is actually mounted. A real production-music subscriptio
 the single biggest remaining lever on how the reels SOUND, and it is a purchasing
 decision. Everything above makes the mix professional; it cannot make a freesound loop
 into a chart-style track.
+
+## The overlay editor, and the anchor bug it uncovered (Blake, 2026-09-04)
+Blake lifted the 2026-09-01 "backlog, it is a convenience" ruling on the inline overlay
+editor. Building it turned up something worse first.
+
+**Create-a-Story had NEVER produced a reel from the portal.** Reproduced against the
+exact body the portal was sending: `status: held`, "overlay rejected: no identity_tokens
+(city/gym anchor) were provided for this render". `story_overlay.py:289` records an audit
+ruling that there is no server-side default and "the frontend must supply it" — and the
+frontend never did. `buildCreateStoryBody` emitted only {asset_ids, brief, music_mood,
+actor_id}, with a test asserting those were the ONLY keys, so the omission looked
+deliberate and stayed. Echo behaved exactly as designed; every coach tap got "Echo could
+not finish this story" and no video. Fixed portal-side (lasso-ops-portal#581): the anchor
+is resolved SERVER-side from the gym's own row (name + the city half of `market`) so a
+coach cannot send another gym's brand token, and the builder now refuses an empty anchor
+rather than sending one Echo will reject.
+STILL BROKEN: the EVENT one-tap lane (`gym_event.story_studio_create_request`) omits
+identity_tokens too and holds identically. It has no frontend to supply it, so the fix is
+a server-side default inside Echo — precisely what the story_overlay audit ruled against.
+That needs Blake's ruling, not an override.
+
+**Why there is no "inline text editor", and what shipped instead.** The 2026-09-01 note
+asked for one. It cannot exist: the copy is BURNED INTO PIXELS at render time, and
+nothing persists a pre-burn artifact for a Story Studio reel
+(`story_reburn.stamp_source_media` is only ever called from the daily-story lane, and
+renders land in a temp dir that is cleaned up). There is no image to patch. So changing
+the words means rendering again from the same clips:
+`POST /portal/<token>/studio/story/<id>/rebuild {overlay_text, identity_tokens}`.
+- The coach's text is NOT trusted verbatim onto the frame. It enters as the `brief`, so
+  it flows through story_grounding (source=brief, kept as written) and then
+  story_overlay's copy_gate scrub, the ALL-CAPS layout, the identity anchor and the
+  per-gym avatar rail — the same gauntlet an original render passes. A breach HOLDS.
+- ORDER MATTERS and is tested: the new story is staged FIRST and the old card is denied
+  only once the new one exists. Denying first would mean a held rebuild (a copy_gate
+  breach in the coach's own wording, say) destroyed the story they already had. A held
+  rebuild answers `original_kept: true`.
+- If the new story stages but the deny fails, the response carries a `warning` naming it
+  rather than claiming the old card is gone. Two cards is confusing; a lie is worse.
+- `_staged_payload` is now ONE builder for create and rebuild, so the two can never
+  drift into different response shapes.
+- `overlay_char_budget` (measured from the real drawtext font) finally has a consumer:
+  the editor's counter reads it instead of a retyped 24, and hides when Echo sends none.
+
+Suite: 5270 passed, 1 deselected.

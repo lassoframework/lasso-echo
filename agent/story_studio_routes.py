@@ -95,6 +95,30 @@ def handle_create_story(account_key, body, actor_id="", *, candidates=None,
         # breach): nothing staged, an honest reason the coach can act on.
         return 200, {"ok": True, "status": "held", "request_id": res.get("request_id"),
                      "hold_reason": res.get("reason")}
+    return 200, _staged_payload(res)
+
+
+def _asset_ids_of(row):
+    """The asset_ids a persisted story_request recorded. PostgREST may hand a jsonb
+    column back as a real list OR as a JSON string depending on the client, so both are
+    accepted; anything else reads as no clips (the caller refuses the rebuild rather
+    than re-rendering from a guess)."""
+    raw = (row or {}).get("asset_ids")
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            raw = _json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(a) for a in raw if str(a or "").strip()]
+
+
+def _staged_payload(res):
+    """The staged-story response body. ONE builder for create and rebuild: a coach who
+    edits their copy must get back exactly the shape they got the first time, or the
+    portal has to special-case which call it made."""
     draft = res.get("draft")
     sr = res.get("story_render") or {}
     from . import story_layout as _sl
@@ -102,7 +126,7 @@ def handle_create_story(account_key, body, actor_id="", *, candidates=None,
     used = res.get("used_clips") or []
     requested = res.get("requested_clips") or []
     skipped = res.get("skipped_clips") or []
-    return 200, {
+    return {
         "ok": True, "status": "staged", "request_id": res.get("request_id"),
         "draft_id": getattr(draft, "draft_id", None),
         "overlay": sr.get("overlay_text_final"),
@@ -127,6 +151,127 @@ def handle_create_story(account_key, body, actor_id="", *, candidates=None,
         "music": {"shelf": sr.get("music_shelf"), "track_id": sr.get("track_id"),
                   "license_ref": sr.get("license_ref")},
     }
+
+
+# ---- POST /studio/story/<request_id>/rebuild ---------------------------------
+# Blake, 2026-09-04, lifting the 2026-09-01 "backlog, it is a convenience" ruling on the
+# inline overlay editor. Worth stating what is and is not possible here, because the
+# backlog note asked for an "inline TEXT EDITOR" and that cannot exist: the overlay is
+# BURNED INTO PIXELS at render time, and nothing persists a pre-burn artifact for a
+# Story Studio reel (story_reburn.stamp_source_media is only ever called from the daily
+# story lane, and renders land in a temp dir). So there is no image to patch. Changing
+# the words means rendering again from the same clips, which is what this does.
+#
+# The coach's text is NOT trusted verbatim onto the frame: it enters as the `brief`, so
+# it flows through story_grounding (source=brief, text kept as written) and then
+# story_overlay's copy_gate scrub, the ALL-CAPS layout, the identity anchor and the
+# per-gym avatar rail -- the same gauntlet an original render passes. Their words are
+# used, subject to the gates, and a breach HOLDS instead of shipping.
+def handle_rebuild_story(account_key, request_id, body, actor_id="", *, store=None,
+                         candidates=None, assets_by_id=None, analysis=None,
+                         music_library=None, render_fn=None, cal_store=None):
+    """POST /studio/story/<id>/rebuild — a coach edited the burned copy.
+
+    body: {overlay_text: str, identity_tokens?: [...]}
+
+    Re-renders the SAME clips with the new copy and stages a fresh PENDING draft, then
+    denies the old one. Response mirrors create: {ok, status, request_id, overlay, ...}
+    plus replaced_request_id.
+
+    ORDER MATTERS: the new story is built FIRST and the old one is denied only once the
+    new one is genuinely staged. Denying first would mean a HELD rebuild (a copy_gate
+    breach in the coach's own wording, say) left them with no story at all -- their
+    original destroyed by an edit that never landed."""
+    if not _render_armed(account_key):
+        return 403, {"ok": False, "error": "Story Studio is not enabled for this gym"}
+
+    body = body or {}
+    text = str(body.get("overlay_text") or "").strip()
+    if not text:
+        return 400, {"ok": False, "error": "the new text is empty"}
+    if len(text) > 300:
+        return 400, {"ok": False, "error": "that text is too long for a story overlay"}
+    tokens = body.get("identity_tokens") or []
+    if not tokens:
+        # Same rail as create: Echo will not burn a Story with no identity anchor, and
+        # holding for it AFTER re-rendering would waste the work and confuse the coach.
+        return 400, {"ok": False,
+                     "error": "no identity anchor was sent for this gym; a rebuild "
+                              "cannot be branded without one"}
+
+    gym = _base(account_key)
+    st = store
+    if st is None:
+        from . import story_studio_store as _sss
+        st = _sss.default_store()
+    if not getattr(st, "available", lambda: False)():
+        return 503, {"ok": False,
+                     "error": "story history is not available in this environment"}
+
+    try:
+        original = st.get_request(request_id, gym_id=gym)
+    except Exception as e:  # noqa: BLE001
+        return 502, {"ok": False, "error": f"story read failed ({type(e).__name__})"}
+    if not original:
+        # gym-scoped read: another gym's request id is absent, never content.
+        return 404, {"ok": False, "error": "no such story for this gym"}
+    if str(original.get("status") or "").lower() == "denied":
+        return 409, {"ok": False,
+                     "error": "that story was already denied; create a new one instead"}
+
+    asset_ids = _asset_ids_of(original)
+    if not asset_ids:
+        return 409, {"ok": False,
+                     "error": "the original story did not record which clips it used, "
+                              "so it cannot be rebuilt; create a new one instead"}
+
+    from . import story_studio
+    request = {
+        "gym_id": gym,
+        "account_key": account_key,
+        "asset_ids": asset_ids,
+        # the edited copy drives the overlay, through every gate (see the note above).
+        "brief": text,
+        "template": original.get("template"),
+        "music_mood": original.get("music_mood"),
+        "identity_tokens": list(tokens),
+        "requested_by": actor_id or "",
+    }
+    try:
+        res = story_studio.create_story(
+            request, candidates=candidates, assets_by_id=assets_by_id,
+            analysis=analysis, store=st, music_library=music_library,
+            render_fn=render_fn, cal_store=cal_store)
+    except Exception as e:  # noqa: BLE001
+        return 502, {"ok": False, "error": f"rebuild failed ({type(e).__name__})"}
+
+    status = res.get("status")
+    if status == "off":
+        return 403, {"ok": False, "error": "Story Studio is not enabled for this gym"}
+    if status == "held":
+        # The ORIGINAL is untouched and still in the approval queue -- say so, or a coach
+        # is left guessing whether they still have a story.
+        return 200, {"ok": True, "status": "held", "request_id": res.get("request_id"),
+                     "hold_reason": res.get("reason"),
+                     "original_kept": True,
+                     "replaced_request_id": None}
+
+    # Only now is it safe to retire the old one.
+    replaced, deny_error = True, ""
+    try:
+        story_studio.deny(request_id, gym, reason=f"rebuilt with edited copy by {actor_id or 'a coach'}",
+                          store=st, cal_store=cal_store)
+    except Exception as e:  # noqa: BLE001 - the NEW story is already staged; never claim
+        # the old card is gone when it may not be. Two cards is confusing; a lie is worse.
+        replaced, deny_error = False, f"{type(e).__name__}"
+
+    out = _staged_payload(res)
+    out["replaced_request_id"] = request_id if replaced else None
+    if not replaced:
+        out["warning"] = ("the new story is staged, but the old card could not be "
+                          f"denied ({deny_error}); deny it by hand so it is not "
+                          "approved twice")
+    return 200, out
 
 
 # ---- GET /studio/story (list) ------------------------------------------------
