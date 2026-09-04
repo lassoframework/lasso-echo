@@ -254,3 +254,67 @@ def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
     W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert bus.tickets["t-1"]["status"] == "escalated"
     assert log["opened"] == []
+
+
+# ---- D47: generalized to a second (product, identity) pair -- portal -> Scout ---------
+# fixer-lane.ts (the portal's ranger-only cron) never had a reason to see a non-ranger
+# ticket; a product='portal' ticket needs its own real consumer, routed to Scout per
+# the identity map, not bolted onto ranger's ad-engine-specific worker.
+
+def test_intake_pass_routes_product_portal_to_scout_identity():
+    bus = FakeBus([_ticket(product="portal", raw_text="how do I add my group class schedule?")])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+
+    def fetch_state(ticket, who):
+        return {"portal_status": "ok"}
+
+    def llm(system, user):
+        return "You can add it from the Website tab, under Content."
+
+    result = W.intake_pass(bus, slack_lookup_email=lambda e: "U_CLIENT",
+                           account_key_for_gym=lambda g: "crossfitlocal",
+                           open_group_dm=open_dm, post_first_message=post,
+                           write_hold_notice=notice, product="portal",
+                           identity_name="scout", fetch_state=fetch_state, llm=llm)
+    assert result == {"processed": 1}
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    assert len(log["opened"]) == 1
+    assert "Website tab" in log["posted"][0][1]
+
+
+def test_intake_pass_does_not_touch_product_echo_when_scoped_to_portal():
+    """The two pipelines are independent -- scoping a pass to product='portal' must
+    never also pick up an unrelated product='echo' ticket sitting in the same table."""
+    bus = FakeBus([_ticket(product="echo")])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    result = W.intake_pass(bus, slack_lookup_email=lambda e: "U_CLIENT",
+                           account_key_for_gym=lambda g: "x", open_group_dm=open_dm,
+                           post_first_message=post, write_hold_notice=notice,
+                           product="portal", identity_name="scout")
+    assert result == {"processed": 0}
+    assert bus.tickets["t-1"]["status"] == "new"  # untouched
+
+
+def test_intake_pass_still_defaults_to_echo_when_called_with_no_product_override():
+    """Backward compatibility: every existing Echo call site (and every test above
+    this one in the file) must keep working unchanged after generalization."""
+    bus = FakeBus([_ticket(product="echo", raw_text="is it broken?")])
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    result = W.intake_pass(bus, slack_lookup_email=lambda e: "U_CLIENT",
+                           account_key_for_gym=lambda g: "x", open_group_dm=open_dm,
+                           post_first_message=post, write_hold_notice=notice)
+    assert result == {"processed": 1}
+
+
+def test_fixed_pass_routes_product_portal_to_scout_identity():
+    bus = FakeBus([_ticket(product="portal", status="fixing", slack_user_id="U_CLIENT",
+                          verification_after={"fix_pr_url": "https://github.com/x/y/pull/2"})])
+    log, open_dm, post = _calls()
+    result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                         product="portal", identity_name="scout")
+    assert result == {"notified": 1}
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    assert "Fixed it" in log["posted"][0][1]

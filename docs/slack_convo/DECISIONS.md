@@ -873,3 +873,43 @@ Portal side (lasso-ops-portal, separate repo): `/api/gyms/[gymId]/support` exten
 (product allowlist + authenticated reporter), `EchoSupportLinks.tsx` rewritten (inline
 form, no external token dependency), `OrganicSocialFlow.tsx`'s `SupportButton` pointed
 at the real banner instead of the dead mailto pattern. `npx tsc --noEmit` clean.
+
+## D47: `product='portal'` tickets are invisible to `fixer-lane.ts` -- routed to Scout instead
+
+Ground truth check (Blake, 2026-09-04): `src/lib/server/ranger/fixer-lane.ts` in
+lasso-ops-portal is Ranger's ad-engine cron (`processRangerTickets()`, Pipeboard writes,
+`firstBrokenLeg`/`FunnelLegs` policy) -- deeply ranger-specific, never scoped to any
+other product, and not the right place to bolt on portal-ticket handling. Blake's own
+ruling: "Portal tickets route to Scout per the identity map." The fix is on the
+lasso-echo-work side, generalizing D46's bridge rather than touching fixer-lane.ts:
+
+- `echo_ticket_worker.py`'s `intake_pass()`/`fixed_pass()` now take `product`, `source`,
+  `identity_name` as parameters (still defaulting to Echo's original
+  `PRODUCT="echo"`/`SOURCE="website_tab"`/`identity_name="echo"`, so every existing call
+  site and test is byte-for-byte unchanged). `classify()`'s `identity_product` argument
+  now reads `ident.product` off the resolved identity object, not the raw
+  `identity_name` string -- these can differ (an identity's registry name is not
+  guaranteed to equal its product tag).
+- `echo_ticket_wiring.py`'s `live_deps()` takes the same `product`/`source`/
+  `identity_name` and resolves that identity's OWN bot token via
+  `ident.env(ident.bot_token_env)` (the same lookup `listener_wiring.py` already uses),
+  never a hardcoded Echo token constant -- Scout's messages must send as Scout.
+- `listener.py`'s scheduler runs a second poll pass alongside the existing Echo one,
+  same flag (`AGENT_PORTAL_ECHO_TICKETS_ENABLED`) and same throttle
+  (`portal_echo_tickets_poll_minutes()`) -- one lane, two identity legs, not a second
+  thing to arm: `live_deps(product="portal", source="website_tab",
+  identity_name="scout")`, then `intake_pass`/`fixed_pass` on those deps.
+- 4 new tests added to `tests/test_echo_ticket_worker.py` proving: a `product='portal'`
+  ticket routes to the Scout identity; the portal pass never touches `product='echo'`
+  tickets; Echo's own call site still defaults correctly with no `product` override;
+  `fixed_pass` routes portal tickets to Scout too. All 17 tests in that file pass.
+  Caught one test bug along the way: `fetch_state` returning `{}` made
+  `answer_lane._all_unavailable()` treat the ticket as ungroundable before any LLM call
+  (empty dict, not missing keys) -- fixed the test to return `{"portal_status": "ok"}`.
+
+Known limitation, unchanged from D46: a code_fix ticket routed through a non-Echo
+identity (Scout included) queues a HELD `fixer_request` correctly but the desktop
+`ops-fix-triage.js` worker still only trusts Echo's `bot_id` (D10) -- this is the same
+documented gap every other non-Echo code_fix path in this system already carries, not
+new. `AGENT_PORTAL_ECHO_TICKETS_ENABLED` stays unarmed; this is a routing fix, not an
+arming decision.
