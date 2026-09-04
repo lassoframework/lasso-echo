@@ -788,3 +788,88 @@ this module has been from the start.
 outreach.py: 46 tests green (37 existing + 9 new: hold-request success/refusal/escaping,
 release validation x2 (kind, ticket, identity), re-check-at-tap-time, backward-compat).
 Full suite: see commit.
+
+---
+
+# D46 (Blake, 2026-09-04). The real incident: three dark paths, one built bridge
+
+Blake reported submitting an Echo support ticket through the portal and getting nothing
+back. Traced live (a fresh agent, evidence-backed, no code touched during the trace):
+THREE completely separate mechanisms exist for "Echo support," and all three were dark.
+
+1. `/api/gyms/[gymId]/support` (portal) writes a real `support_tickets` row
+   (`product='portal', source='website_tab'`) -- but the only worker anywhere that reads
+   `support_tickets` and posts to Slack (`fixer-lane.ts`, a 5-minute cron) hard-filters
+   every query to `product='ranger'`. A `product='portal'` row is invisible to it and
+   sits forever. NOT fixed by this build (out of today's scope -- Ranger's cron is a
+   separate product line Blake did not ask about); flagged here so it is not forgotten.
+2. The Echo tab's "Contact support" button was a plain link to a token-signed URL on the
+   separate Echo Railway service; any resolution failure (missing token row, missing
+   config) silently fell back to a `mailto:` link -- a click that transmits nothing until
+   a human notices a blank compose window. A second, near-identical copy existed in
+   `OrganicSocialFlow.tsx`'s header `SupportButton`. **Fixed**: both now point at the
+   already-working, already-durable `/api/gyms/[gymId]/support` endpoint instead of an
+   external, token-dependent one -- the header button scrolls to the real form, the
+   bottom banner IS the real form (an inline textarea + POST, `product: "echo"`).
+3. Even a correctly-resolved token URL hits Echo's own `/portal/<token>/support`, which
+   is feature-flagged `AGENT_SUPPORT_INBOX=false` by default and 403s before rendering.
+   Superseded for the Echo tab by fix #2 above (no longer used for that path); Blake
+   asked to arm this flag anyway for its own, older support surface -- done separately,
+   see the arming note in the session record, not this file.
+
+## The built bridge: `agent/echo_ticket_worker.py` + `echo_ticket_wiring.py`
+
+Ground truth (Blake's own words): "with echo if someone submits a support echo should
+receive that then echo should fix it verify the fix and then send slack message with
+them and me in the message." Two poll passes, wired into the existing scheduler loop in
+`listener.py`, both no-ops unless `AGENT_PORTAL_ECHO_TICKETS_ENABLED=true`:
+
+- **intake_pass()**: picks up NEW, unclassified `product='echo', source='website_tab'`
+  tickets. Resolves the client's Slack identity from the ticket's `reporter` (a real,
+  server-authenticated email -- see provenance note below) via `users.lookupByEmail`.
+  Classifies via the SAME `classifier.classify()` every Slack-sourced ticket uses. A
+  QUESTION gets answered from live state (`answer_lane.answer()`) and, if grounded, sent
+  immediately via `outreach.initiate()` with the VERIFIED ANSWER as the first message --
+  never a generic "I'm on it" placeholder, per Blake's own ordering (answer/fix, verify,
+  THEN send). A CODE_FIX is written as a HELD `fixer_request` card, identical to any
+  other code_fix in this system -- **D14's hold gate is completely untouched**: a
+  client's code_fix is always held behind Blake's #fixer tap, no exception for this
+  source. This build only automates the notify-once-verified step, never the fix step.
+- **fixed_pass()**: polls `status='fixing'` tickets for a `verification_after` the
+  existing ops-fix-triage.js worker writes back once it has verified a real fix (D3's
+  same, unchanged desktop-dependent executor). Once present, sends the client (and
+  Blake, always in the DM by outreach.py's own design) the verified result. A ticket not
+  yet verified is left exactly as-is for the next poll.
+
+## Provenance (D42's escape hatch, actually used)
+
+`/api/gyms/[gymId]/support` now stamps `reporter` from the AUTHENTICATED Clerk session
+server-side (a fresh `app_users` lookup by `clerk_user_id`, never the request body) --
+the client cannot spoof it. This is exactly D42's "a confirmed... authenticated portal
+session" option, so `echo_ticket_worker.py` builds an in-memory `reporter_verified=True`
+ticket dict when calling `outreach.initiate()` (D45's `eligible()` fast path), rather
+than the human-tap `request_approval()` path -- Blake asked for a fully automatic
+pipeline for this specific, trusted source. Any OTHER non-Slack source added later
+without an equivalent authenticated-session guarantee should use the tap path instead.
+
+## D46 also: `website_tab` added to `NON_SLACK_SOURCES`
+
+The real portal source value is `website_tab`, not `website_intake` (D34's spec
+paraphrase). Added deliberately per D34's own explicit-allowlist discipline; kept
+`website_intake` too rather than rename it.
+
+## Verification loop status (D46)
+13 new tests (`tests/test_echo_ticket_worker.py`): config-off no-ops (both passes),
+identity resolution (success + 3 failure modes), unresolved-identity escalation,
+grounded-question answer + outreach (and the never-a-placeholder assertion), an
+ungroundable question escalates, a code_fix is held behind the SAME tap gate (explicit
+assertion `delivery_status == "held"`), fixed_pass notifies/leaves-alone/escalates
+correctly. Also fixed one pre-existing regression this build surfaced:
+`test_status_completeness.py` requires every `_enabled()` config flag to appear in
+`agent/__main__.py`'s `_status()` output -- added the missing line for
+`portal_echo_tickets_enabled`. Full suite: 5238 passed, 11 skipped, 0 failed.
+
+Portal side (lasso-ops-portal, separate repo): `/api/gyms/[gymId]/support` extended
+(product allowlist + authenticated reporter), `EchoSupportLinks.tsx` rewritten (inline
+form, no external token dependency), `OrganicSocialFlow.tsx`'s `SupportButton` pointed
+at the real banner instead of the dead mailto pattern. `npx tsc --noEmit` clean.

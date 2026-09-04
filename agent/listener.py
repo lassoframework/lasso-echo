@@ -427,6 +427,8 @@ def _print_scheduled_lanes():
         ("nightly brain", config.brain_proposals_enabled(),
          "AGENT_BRAIN_PROPOSALS_ENABLED"),
         ("nightly backup", config.backup_enabled(), "AGENT_BACKUP_ENABLED"),
+        ("portal echo ticket bridge", config.portal_echo_tickets_enabled(),
+         "AGENT_PORTAL_ECHO_TICKETS_ENABLED"),
     ]
     for name, armed, env in lanes:
         state = "ARMED" if armed else f"dormant ({env} off)"
@@ -449,6 +451,7 @@ def _daily_scheduler(store):
     podcast_every = max(1, int(os.environ.get("AGENT_PODCAST_POLL_MINUTES", "60"))) * 60
     inbox_every = config.episode_inbox_poll_minutes() * 60
     cms_every = config.client_media_sync_minutes() * 60
+    portal_echo_every = config.portal_echo_tickets_poll_minutes() * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
@@ -457,6 +460,7 @@ def _daily_scheduler(store):
     last_podcast = 0.0
     last_inbox = 0.0
     last_cms = 0.0
+    last_portal_echo = 0.0
     while True:
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
@@ -613,6 +617,24 @@ def _daily_scheduler(store):
                 intake_ingest.process_all()
             except Exception as e:
                 print(f"[intake] ingest pass failed: {type(e).__name__}: {e}")
+        # Portal Echo ticket bridge (D46): dormant unless
+        # AGENT_PORTAL_ECHO_TICKETS_ENABLED. Picks up a portal-submitted Echo support
+        # ticket, classifies it, dispatches it (grounded answer + outreach, or a HELD
+        # fixer_request behind Blake's tap same as any other code_fix), then a second
+        # pass notifies once a dispatched fix is verified. An error never kills the
+        # loop; a wired-real Slack client/bus is built lazily inside so an unarmed
+        # deploy never even imports the Slack SDK for this lane.
+        if (config.portal_echo_tickets_enabled()
+                and time.monotonic() - last_portal_echo >= portal_echo_every):
+            last_portal_echo = time.monotonic()
+            try:
+                from . import echo_ticket_worker as _etw
+                from . import echo_ticket_wiring as _etw_live
+                deps = _etw_live.live_deps()
+                _etw.intake_pass(deps.bus, **deps.intake_kwargs)
+                _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
+            except Exception as e:
+                print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT

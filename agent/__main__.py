@@ -97,6 +97,8 @@ def _status():
     print(f"  doc_intake     : {config.doc_intake_enabled()}  (env AGENT_DOC_INTAKE_ENABLED)")
     print(f"  social_proof   : {config.social_proof_enabled()}  (env AGENT_SOCIAL_PROOF_ENABLED)")
     print(f"  intake         : {config.intake_enabled()}  (env AGENT_INTAKE_ENABLED)")
+    print(f"  portal_echo_tk : {config.portal_echo_tickets_enabled()}  "
+          f"(env AGENT_PORTAL_ECHO_TICKETS_ENABLED)")
     print(f"  connect        : {config.connect_enabled()}  (env AGENT_CONNECT_ENABLED)")
     print(f"  connect_tokens : {config.connect_tokens_enabled()}  (env AGENT_CONNECT_TOKENS_ENABLED)")
     print(f"  connect_grade  : {config.connect_grade_enabled()}  (env AGENT_CONNECT_GRADE_ENABLED)")

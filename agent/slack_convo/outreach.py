@@ -49,7 +49,14 @@ BLAKE_SLACK_USER_ID = "U06EPUUCL13"
 # nobody has reasoned about yet), this is an explicit allowlist. A new non-Slack source
 # must be added here deliberately -- fail closed on an unrecognised source, never open a
 # DM speculatively.
-NON_SLACK_SOURCES = frozenset({"portal_form", "engage_tenant_event", "website_intake"})
+#
+# D46: "website_tab" added deliberately -- this is the REAL `source` value the portal's
+# /api/gyms/[gymId]/support route actually stamps (support/route.ts), not the "website
+# intake" name D34's spec paraphrase used. Kept "website_intake" too rather than rename
+# it, in case anything already relies on that name; a real producer stamps one or the
+# other, never both.
+NON_SLACK_SOURCES = frozenset({"portal_form", "engage_tenant_event", "website_intake",
+                              "website_tab"})
 
 
 class OutreachRefused(Exception):
