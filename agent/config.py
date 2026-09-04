@@ -3557,3 +3557,20 @@ def avatar_athlete_rail_enabled() -> bool:
     gen-pop-only wording. Blake has been told the org settings need editing so the two
     agree; until he does, this flag is the authoritative record of his ruling."""
     return _truthy(os.environ.get("AGENT_AVATAR_ATHLETE_RAIL", "false"))
+
+
+def portal_echo_tickets_enabled() -> bool:
+    """D46 (Blake, 2026-09-04): the bridge from a portal-submitted Echo support ticket
+    (support_tickets, product='echo', source='website_tab') to the real pipeline --
+    classify, dispatch to the ops-fix worker or the grounded answer lane, and once
+    verified, open the client+Blake group DM via outreach.py with the VERIFIED result
+    as the first message (never a placeholder). OFF by default; the poll loop
+    (agent/echo_ticket_worker.py) does nothing at all while this is off."""
+    return _truthy(os.environ.get("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "false"))
+
+
+def portal_echo_tickets_poll_minutes() -> int:
+    try:
+        return max(1, int(os.environ.get("AGENT_PORTAL_ECHO_TICKETS_POLL_MINUTES", "3")))
+    except ValueError:
+        return 3
