@@ -540,6 +540,35 @@ gate, and the agent replies in the same thread only after verification." Broken 
   action per his ruling ("by my hand"). Not executed by this build. See the arming-state
   report handed to Blake alongside this doc for what was (read-only) checked.
 
+## D39. Correction to D36: "shapes classification and reply style only" always meant a
+## structural boundary, not zero import
+D36's original enforcement for the brain (item 2/6 of Blake's ruling) was "answer_lane.py
+does not import brain.py at all", proven by a source-grep test. Blake's follow-up ruling
+explicitly asked to "wire the per-agent brain into classifier and answer-lane... shapes
+classification and reply style only, never facts" -- style wiring into answer_lane.py is
+not optional, so a blanket no-import rule cannot be the real enforcement; it was a
+stand-in for it while the wiring didn't exist yet. Corrected: `answer_lane.py` now
+imports `brain.py` for exactly one purpose, `BrainHint.tone_notes`, appended to the
+`{voice}` section of the system prompt alongside (never replacing) the reply-voice doc.
+The actual enforcement is now structural and tested behaviorally, not by grepping for an
+import: a poisoned `tone_notes` entry is proven (by a real `answer()` call with a fake
+brain file) to reach the SYSTEM prompt's voice section and NOT the `facts` dict, not
+`grounding['facts']`, and not the FACTS block of the user prompt -- the only three paths
+a fact can reach a client's reply.
+
+## D40. Brain wiring, both sides, done
+`classifier.py.classify()` takes an optional `brain_hint` (a `BrainHint`) and consults
+`classification_hint_for(text)` in the same deterministic slot as the rule-based checks --
+before the optional LLM step, since a phrase match is exact-string matching, not a guess.
+It is filtered through the identical `_VALID`/no-`FOLLOW_UP` rule the LLM verdict already
+uses, so a hint can never mint a label outside the fixed set, never force a re-trigger,
+and (proven by test) never overrides a verdict the deterministic rules already reached
+(an open ticket's `follow_up`, breakage+domain's `code_fix`, etc.). `adapter.py` loads
+the calling identity's hint via `brain.load_hint(ident.name)` right before the classify
+call, swallowing any read failure to `None` (a brain is an optimization, never a
+dependency the ticket pipeline can be blocked by, matching `brain.py`'s own
+`append_resolution` philosophy). `answer_lane.py`'s wiring is described in D39 above.
+
 ## Verification loop status (this ruling)
 `python3 -m pytest` in lasso-echo-work: 5056 passed / 11 skipped before this build began
 this session; 5106 passed / 11 skipped after (50 new tests: routing 13, brain 10,

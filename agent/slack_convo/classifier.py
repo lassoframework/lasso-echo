@@ -90,11 +90,19 @@ def request_type_for(text):
     return "other"
 
 
-def classify(text, *, has_open_ticket, identity_product, llm=None):
+def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None):
     """One label from the fixed set, or None (escalate). Never raises.
 
     llm(text) -> one of the labels, or anything else (ignored). Only consulted when the
-    rules do not decide; a wrong label from it cannot widen the set."""
+    rules do not decide; a wrong label from it cannot widen the set.
+
+    brain_hint (D40, wiring D34-D38's brain.py in): an optional BrainHint whose
+    classification_hints are phrase->label pairs LEARNED from this identity's own resolved
+    tickets (brain.py docstring: "shapes classification and reply style only, never
+    facts"). Consulted in the SAME deterministic slot as the rule-based checks above --
+    before the LLM step, since a phrase match is exact-string matching, not a guess -- and
+    filtered through the identical _VALID/no-FOLLOW_UP rule the llm verdict already uses,
+    so a brain hint can never mint a label outside the fixed set or force a re-trigger."""
     t = (text or "").strip()
     if not t:
         return ESCALATE
@@ -107,6 +115,10 @@ def classify(text, *, has_open_ticket, identity_product, llm=None):
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
+    if brain_hint is not None:
+        hinted = brain_hint.classification_hint_for(t)
+        if hinted in _VALID and hinted != FOLLOW_UP:
+            return hinted
     if llm is not None:
         try:
             verdict = llm(t)
