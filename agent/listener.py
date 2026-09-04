@@ -103,6 +103,41 @@ def _mark_draw_finished(day):
     _write_state(d)
 
 
+def _accounts_starved_on(day):
+    """Static accounts (client zero: lasso_ig, lasso_fb) that recorded NO heartbeat for
+    `day`. Returns None when the heartbeat store cannot be read, so the caller says
+    "unknown" rather than implying "fine" -- same contract as _gyms_short_on.
+
+    WHY THIS EXISTS (2026-09-04): the interrupted-draw alert reported "1 gym(s) have NO
+    rows for 2026-09-04" and stopped there, because _gyms_short_on reads CLIENT gym
+    calendars and nothing else. It was blind to the accounts that starve FIRST. run_daily
+    walks roughly thirty fleet-wide, network-bound maintenance sweeps before it ever
+    reaches the static account loop, so a deploy or restart mid-draw cuts LASSO off before
+    it cuts any client gym off. On the morning this was found, lasso_ig had gone eight
+    days without publishing and three days without so much as a heartbeat, while the alert
+    that fired about the very same interrupted draw named one client gym and never
+    mentioned LASSO at all.
+
+    The alert's job is to say what was actually lost. Understating that is worse than
+    silence, because a human reads "1 gym short" and reasonably decides it can wait."""
+    try:
+        from .accounts import active_accounts
+        from .heartbeat import heartbeat_at
+        starved, checked = [], 0
+        for account in active_accounts():
+            checked += 1
+            if not heartbeat_at(account.key, str(day)[:10]):
+                starved.append(account.key)
+        if not checked:
+            # Same reasoning as _gyms_short_on: checking zero accounts makes "nothing is
+            # starved" vacuously true, which is the worst direction for this to fail.
+            return None
+        return starved
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler] account-heartbeat read failed: {type(e).__name__}: {e}")
+        return None
+
+
 def _gyms_short_on(day):
     """Registry gyms with ZERO calendar rows dated `day`. Returns None when coverage
     cannot be read, so the caller can say "unknown" rather than imply "fine".
@@ -163,10 +198,24 @@ def alert_interrupted_draw():
             return False
         db.kv_set(key, "1")
         short = _gyms_short_on(started)
+        starved = _accounts_starved_on(started)
         head = (f"the daily draw for {started} was INTERRUPTED mid-run (deploy or "
                 "restart). It is NOT auto-refired (fail closed: a blind refire is "
                 "what triple-published LASSO IG on 2026-08-27; per-draft claims + "
                 "the 24h meta dedup also guard it).")
+        # The static accounts are drafted LAST in run_daily, after every fleet sweep, so
+        # they are what an interrupted draw loses FIRST. Naming them is not a detail: an
+        # alert that reports only client gyms let LASSO go quiet for three days under an
+        # alert that fired about the very draw that starved it.
+        if starved is None:
+            acct_tail = (" Could not read the account heartbeats, so whether client zero "
+                         "drafted today is unknown.")
+        elif starved:
+            acct_tail = (f" {len(starved)} account(s) never drafted at all for {started}: "
+                         f"{', '.join(sorted(starved))} -- these are drafted last, so an "
+                         "interrupted draw loses them first.")
+        else:
+            acct_tail = ""
         if short is None:
             tail = (" Could not read today's coverage, so this needs a human look: "
                     "check #echoclaude for missing cards, and run `python -m agent "
@@ -176,11 +225,17 @@ def alert_interrupted_draw():
                     f"{', '.join(sorted(short))}. Run `python -m agent run-daily "
                     "--force` (plain run-daily no-ops because last_run_date is already "
                     "stamped).")
+        elif starved:
+            # Every client gym is covered but client zero is not: still real work, and
+            # the old code called this exact state "No action needed".
+            tail = (" Every registry gym still has rows for that day. Run `python -m "
+                    "agent run-daily --force` to recover the account(s) above (plain "
+                    "run-daily no-ops because last_run_date is already stamped).")
         else:
             tail = (" Every registry gym still has rows for that day, so the draw had "
                     "already placed the day's content before it was cut off. No action "
                     "needed.")
-        ops_alerts.alert(head + tail)
+        ops_alerts.alert(head + tail + acct_tail)
         return True
     except Exception as e:
         print(f"[scheduler] interrupted-draw check failed: {type(e).__name__}: {e}")
