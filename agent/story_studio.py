@@ -119,9 +119,14 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
                      tmpl_name, "")
 
     # 4. music (hype default, never chill-default; track_id + license_ref stored).
+    #    min_sec is this template's longest possible reel, so selection prefers a bed
+    #    that covers the whole thing (2026-09-04). A bed shorter than the reel used to
+    #    truncate the VIDEO to the bed's length, taking the closing ask frame with it;
+    #    the burn loops as a safety net, but a loop restart mid-reel is audible.
     music_sel = story_music.select(
         request.get("music_mood") if request.get("music_mood") else template.music_mood,
-        library=music_library, seed=request_id)
+        library=music_library, seed=request_id,
+        min_sec=template.segment_plan.total_max_sec)
     if music_sel.held:
         return _held(request_id, gym_id, music_sel.hold_reason, store, request,
                      tmpl_name, music_sel.shelf)

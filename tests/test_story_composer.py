@@ -277,3 +277,122 @@ def test_a_short_pool_still_holds_with_an_honest_count():
     plan = comp.plan_compose(_cands("pierce", 2, seg=4.0), "pierce", t)
     assert plan.held is True
     assert "2 usable segment(s) totaling 8s" in plan.hold_reason
+
+
+# ---- the music bed mix (Blake 2026-09-04: "make sure the music is A+") ------
+# Measured against real ffmpeg before these were written: the OLD burn turned a 12s
+# reel into a 4s file when the bed was 4s (amix duration=shortest + -shortest cut the
+# VIDEO to the bed), hard-FAILED on a source with no audio stream ("Stream specifier
+# ':a' matches no streams"), and came out 3.2dB QUIETER than the source audio alone
+# because amix divides every input by the input count.
+def test_music_filter_pins_the_mix_to_the_video_not_the_bed():
+    graph, label = comp._music_filter(60.0, True)
+    assert "duration=first" in graph, "the VIDEO is the length of record, not the bed"
+    assert "duration=shortest" not in graph
+    assert label == "[a]"
+
+
+def test_music_filter_mixes_at_unity_so_the_reel_is_not_quieter():
+    graph, _ = comp._music_filter(60.0, True)
+    assert "normalize=0" in graph, \
+        "plain amix divides each input by the input count: the room drops ~6dB"
+
+
+def test_music_filter_ducks_the_bed_under_the_room():
+    graph, _ = comp._music_filter(60.0, True)
+    assert "sidechaincompress" in graph
+    assert "asplit=2[room][duckkey]" in graph, \
+        "the room feeds both the mix and the duck key"
+    assert f"ratio={comp.MUSIC_DUCK_RATIO}" in graph
+
+
+def test_music_filter_fades_in_and_out_instead_of_hard_cutting():
+    graph, _ = comp._music_filter(60.0, True)
+    assert "afade=t=in:st=0" in graph
+    # the fade-out has to LAND before the end, on the closing ask frame.
+    assert f"afade=t=out:st={60.0 - comp.MUSIC_FADE_OUT_SEC:.2f}" in graph
+
+
+def test_music_filter_never_schedules_a_fade_out_before_zero():
+    """A reel shorter than the fade itself must not produce a negative start time
+    (ffmpeg accepts it silently and the fade never fires)."""
+    graph, _ = comp._music_filter(0.5, True)
+    assert "afade=t=out:st=0.00" in graph
+
+
+def test_music_filter_falls_back_to_bed_only_on_a_silent_source():
+    """A muted phone clip has NO audio stream; referencing [0:a] is an ffmpeg error,
+    not an empty stream, so the old graph failed the whole render."""
+    graph, label = comp._music_filter(60.0, False)
+    assert "[0:a]" not in graph, "a silent source has no [0:a] to reference"
+    assert "sidechaincompress" not in graph, "nothing to duck against"
+    assert "amix" not in graph, "the bed IS the audio; there is no second input"
+    # and it is carried louder, since it is the only thing the viewer hears.
+    assert f"I={comp.MUSIC_ONLY_LUFS}" in graph
+    assert label == "[a]"
+
+
+def test_music_filter_normalizes_the_bed_against_the_library_spread():
+    """The live library measured -7.4 to -18.2 LUFS on 2026-09-04 (an 11dB spread), so
+    an un-normalized bed made one reel deafening and the next inaudible."""
+    graph, _ = comp._music_filter(60.0, True)
+    assert f"loudnorm=I={comp.MUSIC_BED_LUFS}" in graph
+
+
+def test_music_burn_loops_the_bed_and_never_shortens_the_video(monkeypatch, tmp_path):
+    """The command itself: the bed loops (a short track repeats instead of ending the
+    reel), the output is pinned to the probed VIDEO duration, and -shortest is gone."""
+    from agent import clipper_render
+    captured = {}
+    monkeypatch.setattr(clipper_render, "_require_render", lambda: None)
+    monkeypatch.setattr(clipper_render, "_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(clipper_render, "probe_duration", lambda p: 47.5)
+    monkeypatch.setattr(comp, "_has_audio_stream", lambda p: True)
+    monkeypatch.setattr(clipper_render, "_run",
+                        lambda cmd, label="": captured.setdefault("cmd", list(cmd)))
+    comp._default_music_burn(str(tmp_path / "v.mp4"), str(tmp_path / "b.mp3"),
+                             str(tmp_path / "out"))
+    cmd = captured["cmd"]
+    assert "-stream_loop" in cmd and cmd[cmd.index("-stream_loop") + 1] == "-1"
+    assert "-shortest" not in cmd, "-shortest let a short bed truncate the reel"
+    assert "-t" in cmd and cmd[cmd.index("-t") + 1] == "47.50"
+    assert cmd[cmd.index("-map") + 1] == "0:v", "the video track is copied through"
+
+
+def test_music_burn_probes_for_room_audio_and_switches_graph(monkeypatch, tmp_path):
+    from agent import clipper_render
+    seen = {}
+    monkeypatch.setattr(clipper_render, "_require_render", lambda: None)
+    monkeypatch.setattr(clipper_render, "_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(clipper_render, "probe_duration", lambda p: 30.0)
+    monkeypatch.setattr(comp, "_has_audio_stream", lambda p: False)
+    monkeypatch.setattr(clipper_render, "_run",
+                        lambda cmd, label="": seen.setdefault("cmd", list(cmd)))
+    comp._default_music_burn(str(tmp_path / "v.mp4"), str(tmp_path / "b.mp3"),
+                             str(tmp_path / "out"))
+    graph = seen["cmd"][seen["cmd"].index("-filter_complex") + 1]
+    assert "[0:a]" not in graph, "a silent source must never reach the ducking graph"
+
+
+def test_has_audio_stream_reads_false_when_ffprobe_is_absent(monkeypatch):
+    """No probe = bed-only, which still produces a reel. Failing the other way would
+    build the ducking graph and hard-fail on a silent source."""
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert comp._has_audio_stream("/nope.mp4") is False
+
+
+def test_the_finished_mix_is_delivered_at_the_platform_target():
+    """Instagram normalizes reel playback to roughly -14 LUFS. Handing over a reel at
+    -20 lets the PLATFORM apply that +6dB, which lifts room noise with it; landing it
+    ourselves keeps the gain decision where the bed is still separable from the room."""
+    graph, _ = comp._music_filter(60.0, True)
+    assert f"loudnorm=I={comp.MIX_DELIVERY_LUFS}" in graph
+    # ...and it is the LAST stage, after the balance is set, so it lifts both together.
+    assert graph.rstrip().endswith(
+        f"[mixed]loudnorm=I={comp.MIX_DELIVERY_LUFS}:TP=-1.5:LRA=11[a]")
+
+
+def test_the_bed_only_mix_is_delivered_at_the_platform_target_too():
+    graph, _ = comp._music_filter(60.0, False)
+    assert f"loudnorm=I={comp.MIX_DELIVERY_LUFS}" in graph

@@ -4062,3 +4062,59 @@ portal typecheck + lint clean, story-studio-panel 38 checks.
 STILL OPEN from that backlog item: the approval-card inline overlay TEXT EDITOR (a portal
 convenience, backlogged 2026-09-01 and not part of this) and the `was_edited` coach-facing
 "what Echo is learning from your edits" view.
+
+## The music bed on reels: two live bugs and a quiet mix (Blake, 2026-09-04)
+Blake: "i want to make sure the music is A+ on the reels."
+
+Measured, not reasoned about. The whole burn was one line —
+`amix=inputs=2:duration=shortest` with `-shortest` — and it carried three faults,
+two of them reel-breaking. All three reproduced against real ffmpeg first, then fixed,
+then re-verified.
+
+**1. A short bed TRUNCATED THE REEL.** `amix duration=shortest` mixed only to the
+shorter input and `-shortest` then cut the OUTPUT to it, so a bed shorter than the
+montage cut the VIDEO down to the bed's length. Reproduced: a 12s reel with a 4s bed
+produced a **4s file**. This was live — two of the nine tracks in /data/story-music
+are under 60s (hype_06 56.4s, chill_03 51.2s), so a full-length reel lost its closing
+seconds, which is exactly where the single validated ASK frame lives. The reel dropped
+its call to action and nothing reported it. Fixed: the bed loops (`-stream_loop -1`),
+the mix follows the video (`duration=first`), output is pinned to the probed video
+duration, `-shortest` is gone. Selection also now prefers a track that COVERS the reel
+(story_music.pick(min_sec=...), fed the template's total_max_sec) so looping is the
+safety net rather than the plan — and DirMusicLibrary measures each file with ffprobe
+at load, because the live manifest declares no durations at all.
+
+**2. A SILENT SOURCE KILLED THE RENDER.** `[0:a]` on a file with no audio stream is an
+ffmpeg *error*, not an empty stream: `Stream specifier ':a' ... matches no streams`.
+So a muted phone clip, a screen recording, or an export a coach stripped audio from
+failed the whole render — surfacing to the coach as a 502 "render failed", not a reel.
+Fixed: probe for an audio stream and use a bed-only graph when there is none (carried
+louder, MUSIC_ONLY_LUFS, since it is then the only audio the viewer hears). A probe
+failure reads as bed-only, which still produces a reel.
+
+**3. THE MIX WAS NOT A+.** `amix` divides every input by the input count, so the gym's
+own audio came out ~6 dB down and adding music made the reel QUIETER: measured -21.9
+LUFS for the source audio alone vs **-25.1 LUFS** for the old burn. The bed also sat at
+room level for the whole run and hard-cut at the end, mid-phrase. Fixed: mix at unity
+(`normalize=0`), duck the bed under the room (`sidechaincompress`, 5ms attack /
+400ms release so it dips for a talking coach without pumping between syllables), fade
+in 0.4s and out 1.5s, and loudness-normalize every bed to -20 LUFS before mixing —
+because the library itself measures -7.4 to -18.2 LUFS, an 11 dB spread that made one
+reel deafening and the next inaudible. New burn measures -20.0 LUFS.
+
+**4. IT WAS NOT DELIVERED AT PLATFORM LEVEL.** Instagram normalizes reel playback to
+roughly -14 LUFS, so a reel handed over quieter gets that gain applied by the PLATFORM,
+which lifts the room noise along with the music. The finished mix now lands on -14 LUFS
+itself (MIX_DELIVERY_LUFS, after the room/bed balance is set, so both lift together;
+TP=-1.5 dBTP limits, so raising it cannot clip). Verified end to end against real
+ffmpeg: all three cases (room + short bed, room + long bed, silent source) come out
+12.0s from a 12s reel at -14.0/-14.1 LUFS.
+
+**The honest ceiling, which is NOT a code problem.** /data/story-music holds nine CC0
+clips from freesound.org ("High speed jr..m4a", "Venom Clip", "city-loop"), with a BPM
+on one of nine. story_music.py's docstring claimed an "Artlist / Soundstripe-class
+library of chart-STYLE tracks" — the code was fine, the claim was aspirational, and the
+docstring now says what is actually mounted. A real production-music subscription is
+the single biggest remaining lever on how the reels SOUND, and it is a purchasing
+decision. Everything above makes the mix professional; it cannot make a freesound loop
+into a chart-style track.

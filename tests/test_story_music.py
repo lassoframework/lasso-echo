@@ -189,3 +189,88 @@ def test_dir_library_pick_deterministic_by_seed(tmp_path, monkeypatch):
     a = sm.select(sm.SHELF_HYPE, library=lib, seed="req-7")
     b = sm.select(sm.SHELF_HYPE, library=lib, seed="req-7")
     assert a.track_id == b.track_id
+
+
+# ---- duration-aware selection (Blake 2026-09-04) ----------------------------
+# Two of the nine tracks in the live library are shorter than a 60s reel, and a bed
+# shorter than the reel used to truncate the VIDEO to the bed's length -- taking the
+# closing ask frame with it. The burn loops a short bed now, but a loop restart
+# mid-reel is audible, so selection prefers a track that covers the whole reel.
+def _lib(*specs):
+    """specs: (track_id, shelf, duration_sec)"""
+    return sm.StubMusicLibrary(tracks=[
+        sm.Track(track_id=t, license_ref=f"lic:{t}", shelf=sh, title=t,
+                 duration_sec=d, path=f"/tmp/{t}.mp3")
+        for t, sh, d in specs])
+
+
+def test_pick_prefers_a_track_that_covers_the_reel():
+    lib = _lib(("short", sm.SHELF_HYPE, 30.0), ("covers", sm.SHELF_HYPE, 95.0))
+    assert lib.pick(sm.SHELF_HYPE, min_sec=60).track_id == "covers"
+
+
+def test_pick_falls_back_to_a_short_track_when_nothing_covers_the_reel():
+    """Never return None for length alone: the burn loops a short bed, so a short
+    track is a worse bed, not an unusable one."""
+    lib = _lib(("short", sm.SHELF_HYPE, 30.0))
+    assert lib.pick(sm.SHELF_HYPE, min_sec=60).track_id == "short"
+
+
+def test_pick_keeps_unmeasured_tracks_eligible():
+    """duration_sec 0 means never probed (no ffprobe in that env), not zero-length.
+    Excluding those would empty the library and HOLD every render."""
+    lib = _lib(("unknown", sm.SHELF_HYPE, 0.0))
+    assert lib.pick(sm.SHELF_HYPE, min_sec=60).track_id == "unknown"
+
+
+def test_pick_prefers_a_measured_cover_over_an_unmeasured_track():
+    lib = _lib(("unknown", sm.SHELF_HYPE, 0.0), ("covers", sm.SHELF_HYPE, 95.0))
+    assert lib.pick(sm.SHELF_HYPE, min_sec=60).track_id == "covers"
+
+
+def test_pick_without_min_sec_is_unchanged():
+    lib = _lib(("a", sm.SHELF_HYPE, 10.0), ("b", sm.SHELF_HYPE, 900.0))
+    assert lib.pick(sm.SHELF_HYPE) is not None       # deterministic first-of-pool
+    assert lib.pick(sm.SHELF_HYPE, seed="x") is not None
+
+
+def test_select_forwards_min_sec_to_the_library():
+    lib = _lib(("short", sm.SHELF_HYPE, 20.0), ("covers", sm.SHELF_HYPE, 90.0))
+    assert sm.select(sm.SHELF_HYPE, library=lib, min_sec=60).track_id == "covers"
+
+
+def test_select_still_works_with_a_library_predating_min_sec():
+    """An injected library whose pick() has no min_sec keyword must keep working --
+    length preference improves selection, it is not a required interface change."""
+
+    class OldLibrary:
+        def pick(self, shelf, *, seed=None):
+            return sm.Track(track_id="old", license_ref="lic:old", shelf=shelf)
+
+        def resolve_path(self, track):
+            return "/tmp/old.mp3"
+
+    sel = sm.select(sm.SHELF_HYPE, library=OldLibrary(), min_sec=60)
+    assert sel.track_id == "old"
+    assert sel.held is False
+
+
+def test_dir_library_measures_track_length(tmp_path, monkeypatch):
+    """DirMusicLibrary measures the file rather than trusting a manifest field: the
+    live manifest carries no duration at all, and a wrong one would put a short bed
+    on a long reel."""
+    import json
+    audio = tmp_path / "hype_01.mp3"
+    audio.write_bytes(b"x")
+    (tmp_path / "manifest.json").write_text(json.dumps({"tracks": [
+        {"track_id": "hype_01", "shelf": "hype", "title": "T",
+         "file": "hype_01.mp3", "license_ref": "lic:1"}]}))
+    monkeypatch.setattr(sm, "_probe_seconds", lambda p: 88.0)
+    lib = sm.DirMusicLibrary(str(tmp_path))
+    assert lib._tracks[0].duration_sec == 88.0
+
+
+def test_probe_seconds_returns_zero_rather_than_raising(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert sm._probe_seconds("/nope.mp3") == 0.0

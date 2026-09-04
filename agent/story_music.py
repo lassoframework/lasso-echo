@@ -4,11 +4,25 @@ story_music.py — the LICENSED music bed engine for Story Studio (spec §3).
 HONESTY (read this before assuming this attaches trending IG audio):
   The Instagram Graph API CANNOT attach native / trending IG audio to a published
   reel or story. Trending audio is a MANUAL in-app step only. So this engine does
-  NOT attach trending audio. It selects a LICENSED music track (an Artlist /
-  Soundstripe-class library covered by one LASSO license) and BURNS it into the
-  rendered video as an audio bed. Licensed libraries sell chart-STYLE tracks (big
-  drums / drops / hooks, 120+ BPM) — never the actual chart record (never the real
-  Drake song). Curation of the library is a standing monthly ops job.
+  NOT attach trending audio. It selects a licensed track from whatever library is
+  mounted at AGENT_STORY_MUSIC_DIR and BURNS it into the rendered video as an audio
+  bed — never the actual chart record (never the real Drake song).
+
+  WHAT IS ACTUALLY MOUNTED (measured 2026-09-04, /data/story-music on the live echo
+  service): NINE CC0 clips pulled from freesound.org — 6 hype, 3 chill — with titles
+  like "High speed jr..m4a", "Venom Clip" and "city-loop", and a BPM declared on
+  exactly one of the nine. That is NOT the "Artlist / Soundstripe-class library of
+  chart-STYLE tracks" this docstring used to claim it was; the code was fine and the
+  claim was aspirational. Two consequences a future session should not have to
+  rediscover:
+    * measured loudness ranges -7.4 to -18.2 LUFS across the nine (an 11 dB spread),
+      which is why the burn normalizes every bed before mixing (story_composer
+      MUSIC_BED_LUFS) instead of trusting the file;
+    * two of the nine are SHORTER than a 60s reel (hype_06 56.4s, chill_03 51.2s),
+      which is why selection prefers a track that covers the reel and the burn loops.
+  Buying a real production-music subscription is the single biggest lever on how the
+  reels SOUND, and it is a purchasing decision, not a code change. Curation of the
+  library remains a standing ops job.
 
 Shelves (spec §3):
   * hype  — the DEFAULT for every template. High energy, chart-STYLE. Blake's rule.
@@ -52,6 +66,10 @@ class Track:
     title: str = ""
     bpm: int = 0
     path: str = ""              # local/bucket path, filled by the library at resolve time
+    # Measured length in seconds (0 = unknown / not probed). Load-bearing since
+    # 2026-09-04: a bed SHORTER than the reel used to truncate the video, cutting off
+    # the closing ask frame, so selection now prefers a track that covers the reel.
+    duration_sec: float = 0.0
 
 
 @dataclass
@@ -103,12 +121,24 @@ class StubMusicLibrary:
                   shelf=SHELF_CHILL, title="Chill Opt-Out 01", bpm=92),
         ]
 
-    def pick(self, shelf, *, seed=None):
+    def pick(self, shelf, *, seed=None, min_sec=0):
         """The next track for a shelf, or None when the shelf is empty. Deterministic
-        by `seed` (e.g. the request id) so a re-render picks the same bed."""
+        by `seed` (e.g. the request id) so a re-render picks the same bed.
+
+        min_sec (2026-09-04): prefer a track at least this long, so a reel is not
+        handed a bed shorter than itself. Two of the nine tracks in the live library
+        are under 60s, and a short bed used to truncate the VIDEO down to its own
+        length. The burn loops the bed as a safety net, but a loop restart mid-reel is
+        audible, so the right answer is to pick a track that covers the reel when one
+        exists. Tracks of UNKNOWN length (duration_sec 0, never probed) stay eligible
+        as a fallback rather than being excluded on missing metadata."""
         pool = [t for t in self._tracks if t.shelf == shelf]
         if not pool:
             return None
+        if min_sec:
+            covers = [t for t in pool if t.duration_sec and t.duration_sec >= min_sec]
+            unknown = [t for t in pool if not t.duration_sec]
+            pool = covers or unknown or pool
         if seed is None:
             return pool[0]
         return pool[hash(str(seed)) % len(pool)]
@@ -117,6 +147,24 @@ class StubMusicLibrary:
         """The local/bucket path of the track's audio file, or '' when the ops asset
         is not present (the stub has none)."""
         return track.path or ""
+
+
+def _probe_seconds(path):
+    """The measured length of an audio file, or 0.0 when it cannot be probed. Best
+    effort by design: an unprobed track is still usable (pick() treats unknown length
+    as a fallback), so a missing ffprobe degrades selection quality, never the lane."""
+    import shutil
+    import subprocess
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not path:
+        return 0.0
+    try:
+        r = subprocess.run([ffprobe, "-v", "quiet", "-show_entries",
+                            "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=30)
+        return round(float((r.stdout or "0").strip() or 0), 2)
+    except Exception:  # noqa: BLE001 - unknown length is a valid state, not an error
+        return 0.0
 
 
 class DirMusicLibrary(StubMusicLibrary):
@@ -173,7 +221,11 @@ class DirMusicLibrary(StubMusicLibrary):
                 bpm = 0
             tracks.append(Track(
                 track_id=track_id, license_ref=license_ref, shelf=shelf,
-                title=str(row.get("title") or ""), bpm=bpm, path=path))
+                title=str(row.get("title") or ""), bpm=bpm, path=path,
+                # Measure the file rather than trust a manifest field: the live
+                # manifest has no duration at all, and a wrong one would put a short
+                # bed on a long reel, which is what truncated reels in the first place.
+                duration_sec=_probe_seconds(path)))
         return tracks
 
     def resolve_path(self, track):
@@ -222,7 +274,7 @@ def default_library():
 
 
 # ---- the engine -------------------------------------------------------------
-def select(shelf=None, *, library=None, seed=None):
+def select(shelf=None, *, library=None, seed=None, min_sec=0):
     """Pick a bed for ONE render and return a MusicSelection with the honesty fields.
 
     shelf: the requested shelf. None -> default_shelf() (hype or none, NEVER chill).
@@ -232,6 +284,9 @@ def select(shelf=None, *, library=None, seed=None):
     A shelf that wants a bed (hype/chill) but whose library is empty returns a HELD
     selection (held=True, hold_reason set) — the caller HOLDS the render with an
     honest reason rather than shipping a silent bed-less post or fabricating a track.
+
+    min_sec: the reel length the bed has to cover. Prefers a track at least that long
+    (see pick); it never HOLDS for length alone, because the burn loops a short bed.
     """
     lib = library or default_library()
     requested = default_shelf() if shelf is None else normalize_shelf(shelf)
@@ -239,7 +294,12 @@ def select(shelf=None, *, library=None, seed=None):
     if requested == SHELF_NONE:
         return MusicSelection(shelf=SHELF_NONE)  # no track_id, no license_ref, no note
 
-    track = lib.pick(requested, seed=seed)
+    try:
+        track = lib.pick(requested, seed=seed, min_sec=min_sec)
+    except TypeError:
+        # An injected library predating min_sec still works: length preference is an
+        # improvement on selection, never a requirement of the interface.
+        track = lib.pick(requested, seed=seed)
     if track is None:
         return MusicSelection(
             shelf=requested, held=True,
