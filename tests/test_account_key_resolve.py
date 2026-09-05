@@ -450,3 +450,58 @@ def test_the_media_resolver_defaults_to_the_real_resolver(monkeypatch):
                         lambda key, **kw: called.append(key) or key)
     gmr._resolve_stale_fingerprint("crossfitreverb6cdf33")
     assert called == ["crossfitreverb6cdf33"], "the default path is not wired"
+
+
+def test_a_target_held_by_two_gyms_is_never_a_remap_destination():
+    """MAJOR from the wave-5 audit. The collision guard refused a duplicate SOURCE but
+    never checked the TARGET. Two gyms genuinely sharing one current key -- the Bird Dog /
+    Bolton collision this repo's reconciler exists for -- yields {dA: K, dB: K}: two
+    distinct derived sources pointing at one shared key. The moment either gym is re-keyed,
+    its OWN new live key is briefly absent from this cached view and the old mapping
+    rewrites it onto the OTHER tenant. That is the exact failure this module's header uses
+    to disqualify the name-slug design, coming back through the target side."""
+    SHARED = "crossfitanywhere"
+    A_ID = "9d9b8a00-0000-4000-8000-00000000000a"
+    B_ID = "924e8900-0000-4000-8000-00000000000b"
+    get = _plane([{"gym_id": A_ID, "echo_account_key": SHARED},
+                  {"gym_id": B_ID, "echo_account_key": SHARED}],
+                 [{"id": A_ID, "name": "CrossFit Anywhere"},
+                  {"id": B_ID, "name": "CrossFit Anywhere"}])
+    _live, mapping, _by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    assert mapping == {}, f"a shared key must never be a remap target: {mapping}"
+    b_derived = _derived(B_ID, "CrossFit Anywhere")
+    assert akr.resolve(b_derived, now_fn=lambda: 1.0, get=get) == b_derived
+    assert akr.resolve(b_derived + "_ig", now_fn=lambda: 1.0, get=get) == b_derived + "_ig"
+
+
+def test_a_rebuild_that_raises_still_backs_off():
+    """MAJOR from the wave-5 audit. Only the `ok=False` return path stamped last_fail, so
+    any EXCEPTION inside _build (a null row in the JSON, a non-str gym name) left no stamp
+    and no cache write, and every subsequent auth-path request rebuilt. Measured at 100
+    requests -> 200 plane reads: the wave-4 blocker reopened through the raise branch."""
+    reads = {"n": 0}
+
+    def poison(path, params):
+        reads["n"] += 1
+        return ([None] if path == "echo_intake_tokens" else []), True  # null row -> raises
+
+    for i in range(20):
+        assert akr.resolve(REVERB_STALE, now_fn=lambda i=i: float(i), get=poison) \
+            == REVERB_STALE
+    assert reads["n"] <= 6, (
+        f"{reads['n']} plane reads for 20 requests -- a raising rebuild is not backing off")
+
+
+def test_the_raw_gym_id_is_hashed_not_a_lowercased_copy():
+    """The portal and the mint path hash the id EXACTLY as stored. Lowercasing it first
+    inside the resolver would derive a different key for any mixed-case id, silently
+    reintroducing a divergence."""
+    MIXED_ID = "AABBCCDD-0000-4000-8000-00000000000E"
+    LIVE = "mixedcasegym01"
+    get = _plane([{"gym_id": MIXED_ID, "echo_account_key": LIVE}],
+                 [{"id": MIXED_ID, "name": "Mixed Case Gym"}])
+    from agent.account_key import _base_key
+    assert akr.resolve(_base_key(MIXED_ID, "Mixed Case Gym"),
+                       now_fn=lambda: 1.0, get=get) == LIVE, \
+        "the resolver must hash the id exactly as the mint path does"

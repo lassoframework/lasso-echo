@@ -181,6 +181,22 @@ def _build(get=None, now_fn=None):
         mapping[derived] = live_key
     for key in collided:
         mapping.pop(key, None)
+    # A TARGET held by MORE THAN ONE GYM is unsafe, even though its SOURCE is unique.
+    # Two gyms genuinely sharing one current key is a real production state (the Bird Dog /
+    # Bolton collision this repo's reconciler exists for). That yields {dA: K, dB: K}: two
+    # distinct derived sources pointing at one shared key. The moment either gym is re-keyed
+    # -- a portal re-onboard, a reconciler run -- its OWN new live key is briefly absent
+    # from this cached view, and the old mapping would rewrite it onto the OTHER tenant's
+    # key. That is verbatim the failure this module's header uses to disqualify the
+    # rejected name-slug design, reintroduced through the target side, and the brownout
+    # backoff makes the window unbounded rather than one cache TTL.
+    #
+    # There is no safe remap onto a key whose owner is ambiguous, so drop those entries.
+    holders = {}
+    for gid, live_key in by_gym.items():
+        holders[live_key] = holders.get(live_key, 0) + 1
+    for src in [k for k, target in mapping.items() if holders.get(target, 0) > 1]:
+        mapping.pop(src, None)
     resolvable = {gid: k for gid, k in by_gym.items() if gid not in dupes}
     return live, mapping, resolvable, True
 
@@ -219,7 +235,22 @@ def _state(now_fn=None, get=None, fresh=False):
     with _lock:
         if not fresh and (_within_ttl() or (_backing_off() and _cache["at"] is not None)):
             return _cached()
-        live, mapping, by_gym, ok = _build(get=get, now_fn=now_fn)
+        try:
+            live, mapping, by_gym, ok = _build(get=get, now_fn=now_fn)
+        except Exception as e:  # noqa: BLE001
+            # A RAISE must back off exactly like a returned failure. Only the `ok=False`
+            # path stamped last_fail, so any exception inside _build (a null row in the
+            # JSON, a non-str gym name reaching _slugify_name) left no stamp and no cache
+            # write -- and every subsequent auth-path request rebuilt again. Measured at
+            # 100 requests -> 200 plane reads. That is the wave-4 blocker, reopened
+            # through the exception branch.
+            print(f"[key-resolve] rebuild raised: {type(e).__name__}: {e}")
+            _cache["last_fail"] = now
+            if _cache["ok"]:
+                return (_cache["live"], _cache["map"], _cache["by_gym"],
+                        False if fresh else True)
+            _cache.update({"at": now, "ok": False})
+            return _cache["live"], _cache["map"], _cache["by_gym"], False
         if not ok:
             _cache["last_fail"] = now
             if _cache["ok"]:

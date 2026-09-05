@@ -156,20 +156,42 @@ def test_a_gym_that_already_owns_data_is_still_never_repointed(monkeypatch):
     assert ok is False and "BLOCKED" in detail, detail
 
 
+PORTAL_TS = "/Users/blakeruff/lasso-ops-portal/src/lib/echo/social-onboard.ts"
+
+
 def test_the_portal_now_derives_the_same_key_echo_does():
     """2026-09-04, portal PR #578 landed the other half of the cure: social-onboard.ts
     deriveAccountKey switched from `slug + rawUUID[:6]` to `slug + sha256(gym_id)[:6]`,
     which is exactly account_key._base_key. Both ends now agree, so no NEW gym can split.
 
-    This pins the convergence: if either side drifts again, this fails and the whole
-    stale-key resolver stops being a bridge and becomes permanent infrastructure again."""
-    import hashlib
+    This reads the PORTAL'S OWN SOURCE rather than re-implementing its formula in Python.
+    The earlier version asserted a locally-rebuilt sha256 against Echo's, which could only
+    ever catch ECHO-side drift -- while the whole point of this pin is to catch the PORTAL
+    drifting away again, which is what caused the split in the first place."""
+    import re
+    if not os.path.exists(PORTAL_TS):
+        import pytest
+        pytest.skip("portal checkout not present on this machine")
+    src = open(PORTAL_TS, encoding="utf-8").read()
+    fn = src[src.index("export function deriveAccountKey"):]
+    fn = fn[: fn.index("\n}")]
+
+    assert 'createHash("sha256")' in fn, (
+        "the portal is no longer hashing the gym id with sha256 -- if it went back to a raw "
+        "uuid prefix, every newly onboarded gym splits again")
+    assert "rawUUID" not in fn and ".slice(0, 6)" not in fn.replace(
+        "ID_FINGERPRINT_LEN", ""), fn
+
+    from agent.account_key import _ID_FINGERPRINT_LEN, _NAME_SLUG_MAXLEN
+    ts_fp = int(re.search(r"ID_FINGERPRINT_LEN\s*=\s*(\d+)", src).group(1))
+    ts_slug = int(re.search(r"NAME_SLUG_MAXLEN\s*=\s*(\d+)", src).group(1))
+    assert ts_fp == _ID_FINGERPRINT_LEN, (ts_fp, _ID_FINGERPRINT_LEN)
+    assert ts_slug == _NAME_SLUG_MAXLEN, (ts_slug, _NAME_SLUG_MAXLEN)
+
+
+def test_reverbs_live_key_predates_the_convergence():
+    """Legacy rows still need the resolver, which is why portal_key_for_gym reads the
+    STORED key rather than re-deriving it."""
     from agent.account_key import _base_key
-    slug = "crossfitreverb"
-    portal_now = slug + hashlib.sha256(REVERB_ID.encode("utf-8")).hexdigest()[:6]
-    assert _base_key(REVERB_ID, REVERB_NAME) == portal_now
-    assert portal_now == REVERB_ECHO_WOULD_DERIVE
-    assert portal_now != REVERB_PORTAL, (
-        "Reverb's LIVE key predates the convergence -- legacy rows still need the "
-        "resolver, which is why portal_key_for_gym reads the stored key rather than "
-        "re-deriving it")
+    assert _base_key(REVERB_ID, REVERB_NAME) == REVERB_ECHO_WOULD_DERIVE
+    assert REVERB_ECHO_WOULD_DERIVE != REVERB_PORTAL
