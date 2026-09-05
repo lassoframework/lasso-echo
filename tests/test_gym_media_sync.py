@@ -156,9 +156,13 @@ def test_run_remaps_stale_fingerprint_source(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)
     monkeypatch.setattr("agent.config.gym_drive_connect_active_for", lambda g: True)
+    # Identity resolution (2026-09-04 audit): the resolver maps a gym's COMPUTED Echo key
+    # onto that gym's live portal key by gym_id, so the sync is pinned by stubbing that
+    # mapping rather than a name-slug "bases" list.
     monkeypatch.setattr(
-        "agent.calendar_autopublish.client_gym_bases",
-        lambda: ["crossfitreverb30b5b2"])
+        "agent.account_key_resolve.resolve",
+        lambda key, now_fn=None, get=None: (
+            "crossfitreverb30b5b2" if key == "crossfitreverb6cdf33" else key))
     drive = FakeDrive(files=[photo("p1")])
     store = FakeMediaStore(sources=[
         make_source("srev", gym_id="crossfitreverb6cdf33", folder_id="frev")])

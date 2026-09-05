@@ -510,10 +510,23 @@ def _looks_like_uuid(value):
 
 def _canonical_base(gym_id, answers):
     """The canonical account base for a gym that has NO portal token row yet, or "" when
-    one cannot honestly be derived (no gym name). Same derivation as portal onboarding
-    (account_key.canonical_account_key), so a gym arriving through the intake door and one
-    arriving through the portal door land on the SAME key instead of two divergent tenants.
+    one cannot honestly be derived (no gym name). Prefers the key the PORTAL has already
+    issued for this gym (account_key_resolve.portal_key_for_gym) so a gym arriving through
+    the intake door and one arriving through the portal door land on the SAME key; only
+    when the portal has issued nothing does it fall back to Echo's own derivation.
     Pure apart from reading `answers`; never raises out."""
+    # THE PORTAL'S KEY WINS (2026-09-04). The docstring above used to claim this was the
+    # "same derivation as portal onboarding". It was not, and that belief is what let one
+    # gym end up with two live keys: the portal mints slug + rawUUID[:6], this derived
+    # slug + sha256(gym_id)[:6]. Ask the portal first; only derive when it has issued
+    # nothing for this gym.
+    try:
+        from . import account_key_resolve as _akr
+        portal_key = _akr.portal_key_for_gym(gym_id, fresh=True)
+        if portal_key:
+            return _clean(portal_key)
+    except Exception:  # noqa: BLE001 - an unreadable plane falls through to derivation
+        pass
     name = _clean(((answers or {}).get("gym") or {}).get("name"))
     if not name:
         return ""
