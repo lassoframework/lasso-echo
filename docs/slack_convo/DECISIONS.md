@@ -913,3 +913,56 @@ identity (Scout included) queues a HELD `fixer_request` correctly but the deskto
 documented gap every other non-Echo code_fix path in this system already carries, not
 new. `AGENT_PORTAL_ECHO_TICKETS_ENABLED` stays unarmed; this is a routing fix, not an
 arming decision.
+
+## D48: an escalated portal ticket must never be silence for the person who wrote in
+
+Found live 2026-09-05. Three real portal tickets (`cb7b385a` / `063bc73d` / `af01f3ea`,
+ZZ Test Gym) each escalated correctly into #fixer, and each left its submitter with
+nothing at all. Blake's words: "i got both of these in fixer channel but nothing got
+sent to the person [who] submitted with the fix or letting me know it was resolved."
+
+Two separate holes, both closed here.
+
+**Hole 1: the bridge escalated and returned.** `_escalate_unresolved()` wrote the
+internal `escalation` row and stopped. The Slack-initiated path has always sent the
+person an acknowledgement inline (`adapter.py`, `TEMPLATE_ESCALATED`); the portal bridge
+never did. New `acknowledge_submitter()` in `echo_ticket_worker.py` sends it on the best
+channel available: a Slack group DM (Blake + client + bot) through the same
+`outreach.initiate()` the answered path uses when the person resolved to a real client,
+the portal support thread otherwise. Written exactly once per ticket, and fails CLOSED on
+a bus read fault (a lookup failure never licenses a second send, the same convention
+`adapter._outbound_kind_ever` holds).
+
+**Hole 2: a portal ticket had no delivery surface at all.** `outbox.py` gate 7 marked
+every conversational row with no `slack_channel_id` `failed`, silently. A portal ticket
+has no Slack channel until a group DM is opened, which for an unresolved identity never
+happens, so even a written acknowledgement would have died there. Gate 7 now recognises
+a second real surface: the `/my/support/[ticketId]` thread the person submitted from.
+Migration 0310 already decides what a client may read there (outbound + `posted` + not an
+internal kind), so delivery means marking the row posted with
+`delivered_via='portal_thread'`. Restricted to `portal_form` / `website_tab` (the two
+sources a client submits through the portal UI) AND to tickets carrying a `client_id`,
+without which 0310's predicate can never match the reader to the row. A ticket with
+neither surface still fails, as before.
+
+**Closing the loop.** An escalation card in #fixer now renders a "Resolved, tell them"
+button (`slack_convo_resolve`, operator-gated in `listener_wiring.py` exactly like the
+release tap), routed to `outbox.resolve_and_notify()`: it writes the person a `status`
+row and closes the ticket. The notice goes out through every gate this module already
+enforces, so it lands in the group DM when one was opened and the portal thread
+otherwise. Idempotent (a second press writes nothing), refuses another bot's ticket, and
+refuses when there is nowhere to deliver -- and the button is not rendered in that last
+case, since a tap that could only no-op is worse than no tap.
+
+**How the whole path reads now.** Client submits in the portal -> ticket + inbound row ->
+identity -> classify. A grounded question is answered and the ticket resolves. A code fix
+is held for Blake's tap, worked by `ops-fix-triage.js`, and `fixed_pass()` notifies the
+client once the fix is VERIFIED. Anything else escalates: the person gets "this needs a
+person, the team will follow up" immediately, Blake gets the card, and his tap on that
+card is what tells them it is done.
+
+Not changed, deliberately: `question_not_groundable` on "is my instagram connected?" was
+CORRECT for ZZ Test Gym. That gym has no `echo_intake_tokens` row, so no `account_key`,
+so `answer_lane` had zero facts and refused to guess. A gym with a real Echo account
+grounds that question from `handle_social_status`. The bug was the silence, not the
+refusal.
