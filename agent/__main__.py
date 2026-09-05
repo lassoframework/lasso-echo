@@ -208,6 +208,10 @@ def _status():
     print(f"  alert_noise_flt: {config.ops_alerts_noise_filter_enabled()}  "
           f"(env AGENT_OPS_ALERTS_NOISE_FILTER; an alert ops_triage calls NOISE is not "
           f"posted to Slack, still audited)")
+    print(f"  slot_dedupe    : {config.slot_dedupe_enabled()}  "
+          f"(env AGENT_SLOT_DEDUPE, DEFAULT ON; a calendar slot is (account, post_date, "
+          f"time_slot, format) and a slot already taken -- in the same batch or already "
+          f"live in the DB -- is never staged twice. Set false as an escape hatch)")
     print(f"  alert_repeat   : {config.alert_repeat_gate_enabled()}  "
           f"(env AGENT_ALERT_REPEAT_GATE, window {config.alert_repeat_window_hours()}h via "
           f"AGENT_ALERT_REPEAT_WINDOW_HOURS; an unchanged NEEDS_TRIAGE alert already told "

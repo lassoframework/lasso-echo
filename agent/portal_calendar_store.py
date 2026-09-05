@@ -1359,6 +1359,29 @@ class SupabaseCalendarStore:
         # wired into exactly TWO of them. This door is the one every staging lane walks
         # through, so the rule lives here too. See _media_stage_belt.
         payload = _media_stage_belt(self, account_key, payload)
+        # SLOT IDEMPOTENCY BELT (AUD-001, 2026-09-05; default ON because it PREVENTS
+        # damage, same posture as the plan-horizon belt. AGENT_SLOT_DEDUPE=false is the
+        # escape hatch).
+        #
+        # The docstring above says "apply is delete-then-insert, so a plain insert is
+        # correct and idempotent". Production disagreed: on 2026-09-05 the fleet carried
+        # 155 genuine duplicate slots across 14 gyms, and the forward book was still
+        # growing hour over hour. Two distinct causes, both closed here because this is
+        # the single door every staging lane walks through:
+        #
+        #   1. 94 of them were written TWICE IN THE SAME SECOND by one run, so the batch
+        #      itself already held the row twice before the POST. No caller-side fix
+        #      catches every lane; a batch that contains one slot twice is never correct.
+        #   2. 61 spanned different runs. delete_month deliberately PRESERVES human-owned
+        #      rows (an approved row is a client decision), so a re-plan legitimately
+        #      skips deleting that slot and then inserts a fresh row on top of it.
+        #
+        # The slot key is (account, post_date, time_slot, format), NOT (account,
+        # post_date). That distinction is the whole point: a gym posting 2x a day plus a
+        # story has three legitimate rows on one date. Keying on the date alone called
+        # 441 rows duplicates when only 155 were, and superseding on it would have
+        # destroyed live client content.
+        payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return []
         all_keys = set()
@@ -1605,6 +1628,86 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+def _dedupe_slot_key(row):
+    """The natural identity of a calendar slot, or None when it cannot be identified.
+
+    Date alone is NOT a slot: a gym running 2x a day plus a story owns three rows on one
+    date, each a different time_slot/format. And a row missing time_slot or format has no
+    identifiable slot at all, so it returns None and is never deduped -- guessing that two
+    such rows are "the same slot" would collapse genuinely different posts. Every duplicate
+    measured in production on 2026-09-05 carried both fields, so this costs nothing real."""
+    account = str(row.get("account") or "").strip().lower()
+    date = str(row.get("post_date") or "")[:10]
+    slot = str(row.get("time_slot") or "").strip().lower()
+    fmt = str(row.get("format") or "").strip().lower()
+    if not (account and date and slot and fmt):
+        return None
+    return (account, date, slot, fmt)
+
+
+def _dedupe_slots(store, account_key, payload, *, existing=None):
+    """Drop rows whose slot is already taken, in the batch or already live in the DB.
+
+    Two passes, because production showed two distinct duplicate sources (see the caller):
+    an in-batch pass that keeps the FIRST row for a slot, then a live pass that drops any
+    slot this gym already holds in a live status. Never deletes anything and never
+    rewrites a row: a duplicate is simply not inserted.
+
+    Fails OPEN on an unreadable live read (returns the in-batch-deduped payload). A
+    staging lane must not stop because a dedupe lookup failed; the worst case is the
+    behaviour that shipped before this belt existed."""
+    if not payload or not config.slot_dedupe_enabled():
+        return payload
+    seen, deduped, in_batch = set(), [], 0
+    for row in payload:
+        k = _dedupe_slot_key(row)
+        if k is None:          # unidentifiable slot: never guess, always stage
+            deduped.append(row)
+            continue
+        if k in seen:
+            in_batch += 1
+            continue
+        seen.add(k)
+        deduped.append(row)
+    dropped_live = 0
+    if existing is None:
+        existing = _live_slots_for(store, account_key, {k[1] for k in seen})
+    if existing:
+        kept = []
+        for row in deduped:
+            k = _dedupe_slot_key(row)
+            if k is not None and k in existing:
+                dropped_live += 1
+                continue
+            kept.append(row)
+        deduped = kept
+    if in_batch or dropped_live:
+        print(f"[slot-dedupe] {account_key}: dropped {in_batch} in-batch duplicate(s) "
+              f"and {dropped_live} slot(s) already live; staged {len(deduped)}")
+    return deduped
+
+
+def _live_slots_for(store, account_key, dates):
+    """Slot keys this gym already holds in a LIVE status on those dates, or None when the
+    read fails. 'deleted', 'denied' and 'killed' rows free their slot by design."""
+    if not dates:
+        return set()
+    try:
+        rows = store.rows_in_range(account_key, min(dates), max(dates))
+    except Exception as e:  # noqa: BLE001 - never block staging on a lookup
+        print(f"[slot-dedupe] live slot read failed for {account_key}: "
+              f"{type(e).__name__}: {e}")
+        return None
+    live = {"draft", "pending", "approved", "publishing", "published"}
+    out = set()
+    for r in (rows or []):
+        if str(r.get("status") or "").strip().lower() in live:
+            k = _dedupe_slot_key(r)
+            if k is not None:
+                out.add(k)
+    return out
+
 
 def _stage_belts(account_key, payload):
     """Apply the stage-time empty-caption + verbatim-dedup belts to an
