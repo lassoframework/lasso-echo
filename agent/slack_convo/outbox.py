@@ -107,6 +107,32 @@ def _channel_for(kind, identity):
     return identity.fixer_channel() or config.fixer_channel_id()
 
 
+def _person_for_card(bus, ticket, identity):
+    """m2: a post-time hold card names the person and gym in words, like a draft-time one.
+
+    The outbox has no identity_gate result to hand (it runs long after resolution), so this
+    reconstructs the same line from the ticket row itself -- reporter, gym, identity kind --
+    rather than falling back to a bare Slack id, which is exactly the unreadable card D53
+    was written to get rid of."""
+    t = ticket or {}
+    uid = str(t.get("slack_user_id") or "") or "?"
+    kind = str(t.get("identity_kind") or "unknown")
+    email = str(t.get("reporter") or "").strip()
+    gym = str(t.get("client_id") or "").strip()
+    label = ""
+    try:
+        if gym:
+            rows = bus._get("gyms", {"id": f"eq.{gym}", "select": "name", "limit": "1"})
+            label = str((rows or [{}])[0].get("name") or "").strip()
+    except Exception:  # noqa: BLE001 - a name lookup never blocks a card
+        label = ""
+    bits = [f"{kind} {_a._slack_escape(uid)}"]
+    if email:
+        bits.append(_a._slack_escape(email))
+    bits.append(f"gym {_a._slack_escape(label or gym or 'not resolved')}")
+    return ", ".join(bits)
+
+
 def _recipient_armed(identity, recipient_kind):
     if recipient_kind in ("staff", "coach"):
         return config.slack_convo_staff_reply_armed(identity.name)
@@ -359,6 +385,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
                 recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
                 account_key=None, kind=kind, body=row.get("body") or "",
                 held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
                 why="hard line (billing, hours or schedule, injury or liability): this never "
                     "auto answers, whatever the flags say")
             return
@@ -371,6 +398,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
                 recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
                 account_key=None, kind=kind, body=row.get("body") or "",
                 held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
                 why=f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER is off: a grounded "
                     "answer needs your tap")
             return
@@ -404,21 +432,46 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             return
         bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
         summary["posted"] += 1
-        _receipt(bus, ticket, row, identity, kind, att, where="the portal support thread",
-                 summary=summary)
         _resolve_on_answer(bus, ticket, kind, summary)
+        # m4: no Slack call happens on this branch -- "posted" here means migration 0310 now
+        # lets the client read it in the thread they wrote from. The receipt says exactly
+        # that rather than claiming a message was pushed to them.
+        _receipt(bus, ticket, row, identity, kind, att,
+                 where="released into the portal support thread they wrote from",
+                 summary=summary)
         return
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
-    _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
     _resolve_on_answer(bus, ticket, kind, summary)
+    _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
 
 
 # Kinds worth a receipt in #fixer. An `ack` ("checking that for you now") is noise; what
 # Blake asked to see is anything SUBSTANTIVE that reached the client without him: the answer
 # itself, the honest no-draft template, and the resolution notice that closes a ticket.
 RECEIPT_KINDS = frozenset({_a.KIND_ANSWER, _a.KIND_TEMPLATE, _a.KIND_STATUS})
+
+
+def write_receipt(bus, ticket, *, identity, body, kind, where, auto, extra=None):
+    """The shared receipt writer, so every path that tells a client something -- this
+    module's outbox AND the portal bridge's direct-outreach path (M1) -- produces the same
+    card. Written only AFTER a delivery actually succeeded."""
+    from datetime import datetime as _dt, timezone as _tz
+    sent_at = _dt.now(_tz.utc).isoformat()
+    how = "SENT AUTOMATICALLY (no tap)" if auto else "sent"
+    meta = {"identity": getattr(identity, "name", ""), "receipt": True,
+            "receipt_kind": kind, "auto_answer": bool(auto), "sent_at": sent_at}
+    if extra:
+        meta.update(extra)
+    return bus.record_outbound(
+        ticket_id=ticket["id"], author_type="system",
+        body=(f"RECEIPT: the client was told this, {how}.\n"
+              f"BOT: {getattr(identity, 'name', '?')}   TICKET: {ticket['id']}   "
+              f"KIND: {kind}\nWHERE: {where}   WHEN: {sent_at}\n"
+              f"STATUS NOW: {(bus.ticket(ticket['id']) or ticket).get('status') or '?'}\n\n"
+              f"{body or ''}"),
+        delivery_status="ready", kind=_a.KIND_ESCALATION, meta=meta)
 
 
 def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
@@ -435,6 +488,14 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
         return  # staff can see their own thread; a receipt would just be an echo
     try:
         sent_at = datetime.now(timezone.utc).isoformat()
+        # m4: re-read the ticket so STATUS NOW is the status now, not the one captured
+        # before _resolve_on_answer ran a line earlier.
+        fresh = None
+        try:
+            fresh = bus.ticket(ticket["id"])
+        except Exception:  # noqa: BLE001
+            fresh = None
+        status_now = (fresh or ticket).get("status") or "?"
         auto = bool(kind == _a.KIND_ANSWER and not (att or {}).get("released_by"))
         how = ("SENT AUTOMATICALLY (no tap)" if auto else
                ("sent after your tap" if (att or {}).get("released_by") else "sent"))
@@ -443,9 +504,11 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
             body=(f"RECEIPT: the client was told this, {how}.\n"
                   f"BOT: {identity.name}   TICKET: {ticket['id']}   KIND: {kind}\n"
                   f"WHERE: {where}   WHEN: {sent_at}\n"
-                  f"STATUS NOW: {ticket.get('status') or '?'}\n\n{row.get('body') or ''}"),
-            delivery_status="ready", kind=_a.KIND_RECEIPT,
-            meta={"identity": identity.name, "receipt_for": row["id"],
+                  f"STATUS NOW: {status_now}\n\n{row.get('body') or ''}"),
+            # C3: an ESCALATION row, because that is a kind the portal already hides from
+            # clients. attachments.receipt marks it as a receipt for everything on this side.
+            delivery_status="ready", kind=_a.KIND_ESCALATION,
+            meta={"identity": identity.name, "receipt_for": row["id"], "receipt": True,
                   "receipt_kind": kind, "auto_answer": auto, "sent_at": sent_at})
     except Exception:  # noqa: BLE001 - never undo a successful post over a receipt
         pass

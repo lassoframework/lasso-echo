@@ -24,6 +24,16 @@ from agent.slack_convo import identity_gate as IG
 @pytest.fixture(autouse=True)
 def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
+    # C2 (2026-09-05 audit): the bridge's QUESTION branch now obeys the same D54 gates as
+    # every other client-facing path -- a grounded answer sends unattended ONLY with that
+    # identity's AUTO_ANSWER armed on top of CLIENT_REPLY. These tests are about the intake
+    # behaviour, not the permission, so they arm it explicitly; the tests that are about the
+    # permission live in tests/test_portal_escalation_loop.py and turn it off deliberately.
+    for ident in ("ECHO", "SCOUT"):
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_ENABLED", "true")
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_CLIENT_REPLY", "true")
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     yield
 
 
@@ -449,7 +459,10 @@ def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
 # the identity map, not bolted onto ranger's ad-engine-specific worker.
 
 def test_intake_pass_routes_product_portal_to_scout_identity():
-    bus = FakeBus([_ticket(product="portal", raw_text="how do I add my group class schedule?")])
+    # The question text is deliberately NOT a gym-schedule one: "group class schedule" is on
+    # the D54 hard-line list (a real-world commitment about a client's classes), so it would
+    # hold for a tap and this test is about ROUTING, not about the permission.
+    bus = FakeBus([_ticket(product="portal", raw_text="where do I add a new coach?")])
     log, open_dm, post = _calls()
     _, notice = _notices()
 

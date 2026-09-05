@@ -82,11 +82,30 @@ KIND_ESCALATION = "escalation"   # to the fixer channel: a human must look
 KIND_FIXER_REQUEST = "fixer_request"  # to the ops-fix channel: a code fix for the worker
 KIND_HOLD_NOTICE = "hold_notice"      # to the fixer channel: a row awaits a tap
 KIND_OUTREACH_REQUEST = "outreach_request"  # a proposed client DM awaiting a tap (D45)
-KIND_RECEIPT = "receipt"         # to the fixer channel: what the client was actually told
+# C3 (2026-09-05 audit, CRITICAL): a receipt is an INTERNAL card, and internal cards must be
+# invisible to the client. But client visibility is decided in the OTHER repo by a DENYLIST
+# of kinds -- lasso-ops-portal's client-visible.ts and migration 0310 both list
+# ('escalation','fixer_request','hold_notice') and hide those, showing everything else. A NEW
+# internal kind is therefore visible to the client by default, in a repo this one cannot see.
+# The first draft of receipts invented kind='receipt' and leaked the fixer channel id, the
+# ops status, and "SENT AUTOMATICALLY (no tap)" into the client's own portal thread.
+#
+# Until that denylist is an allowlist (portal-side change, Blake's deploy), a receipt is
+# written as an ESCALATION -- a kind BOTH repos already agree is internal -- and carries
+# attachments.receipt=True so #fixer, reports and tests can still tell the two apart. The
+# CLIENT_INVISIBLE_KINDS constant below is this repo's copy of that cross-repo contract, and
+# a test asserts every internal kind is in it, so the next new internal kind cannot repeat
+# this by accident.
+RECEIPT_META = "receipt"         # attachments.receipt=True on an escalation row
+
+# The kinds the PORTAL is known to hide from clients (lasso-ops-portal:
+# src/lib/support/client-visible.ts and supabase/migrations/0310_*.sql). Mirrored here on
+# purpose: this repo decides what is internal, that repo decides what is readable, and the
+# two must not drift. tests/test_slack_convo_autonomy.py asserts INTERNAL_KINDS is a subset.
+CLIENT_INVISIBLE_KINDS = frozenset({"escalation", "fixer_request", "hold_notice"})
 
 # Delivered to the fixer / ops-fix channel, never into the person's thread.
-INTERNAL_KINDS = frozenset({KIND_ESCALATION, KIND_FIXER_REQUEST, KIND_HOLD_NOTICE,
-                            KIND_RECEIPT})
+INTERNAL_KINDS = frozenset({KIND_ESCALATION, KIND_FIXER_REQUEST, KIND_HOLD_NOTICE})
 CONVERSATIONAL_KINDS = frozenset({KIND_ACK, KIND_ANSWER, KIND_TEMPLATE, KIND_STATUS})
 ALL_KINDS = INTERNAL_KINDS | CONVERSATIONAL_KINDS
 
@@ -129,9 +148,15 @@ TEMPLATE_QUEUED = (
 # we did not answer it ourselves, and we are not claiming anything about what happens next.
 # The escalation card is what actually reaches a human, and outbox.resolve_and_notify is
 # what tells the person it is handled -- a real event, not a promise made in advance.
+# m3 (audit): the first replacement still said "I have passed it to the LASSO team to look
+# at", which is one link short of true -- the escalation row is written first (row-first
+# holds), but if that identity's fixer channel is unset the row is marked failed and never
+# reaches a person, while this text posts anyway. What IS true at the moment this is written,
+# on every path, is that the message is recorded and no answer was given. It claims that and
+# nothing more.
 TEMPLATE_NO_ANSWER_YET = (
     "Got it, I have your message. I could not answer this one myself, so I have not got an "
-    "answer for you yet and I have passed it to the LASSO team to look at.")
+    "answer for you yet. It is recorded for the LASSO team.")
 
 # Cards in #fixer that carry no draft at all are labelled as such rather than as a reply
 # awaiting a tap, so Blake never has to open one to find out it is a placeholder.
@@ -200,13 +225,26 @@ import re as _re
 # checked at DRAFT time here and again at POST time in outbox._dispatch_one. Billing/price is
 # already refused before any model call by answer_lane.is_billing (a stricter, earlier gate);
 # it is repeated here so this list reads as the whole rule rather than half of it.
+# m1 (audit): the first draft banned bare "hours", "open", "close" and "schedule", which
+# swallowed ordinary Echo questions ("is the october schedule loaded?", "did the calendar
+# open ok?") and made the new capability near-inert for the most common question shape there
+# is. The GYM's hours and the GYM's class schedule are the hard line -- telling a member the
+# wrong opening time or moving a class is a real-world commitment we cannot make for a
+# client. A content calendar is not that. So those two topics are qualified; billing,
+# injuries and liability stay deliberately broad, because a false hold there costs nothing.
 AUTO_ANSWER_FORBIDDEN = _re.compile(
     r"\b(price|prices|pricing|cost|costs|charge|charged|bill|billing|billed|invoice|refund|"
     r"refunds|subscription|payment|stripe|credit card|"
-    r"hours|open|opening|close|closing|closed|schedule|reschedule|timetable|class time|"
-    r"class times|holiday|"
     r"injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
-    r"liability|waiver|insurance|lawsuit|legal)\b", _re.IGNORECASE)
+    r"liability|waiver|insurance|lawsuit|legal)\b|"
+    r"\b(?:gym|class|classes|session|sessions|group sessions|studio|business|holiday|"
+    r"opening|door|front desk|member)\s+(?:hours|schedule|schedules|times|time)\b|"
+    r"\b(?:hours|schedule)\s+(?:change|changes|for the gym|on (?:monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|the holiday|labor day|christmas|thanksgiving))\b|"
+    r"\b(?:change|move|update|adjust)\s+(?:our|the|my)\s+(?:hours|schedule|class)\b|"
+    r"\breschedule\b|\btimetable\b|\bwhat time do (?:you|we) (?:open|close)\b|"
+    r"\bare (?:you|we) open\b|\bwhen do (?:you|we) (?:open|close)\b|"
+    r"\bwhat are (?:your|our) hours\b|\bholiday hours\b", _re.IGNORECASE)
 
 
 def auto_answer_forbidden(text):

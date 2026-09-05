@@ -1432,3 +1432,44 @@ by a tap, or resolved by a human -- a RECEIPT card is written to #fixer AFTER th
 succeeds, quoting the exact text that went out, where, when, and whether it sent with no tap.
 A receipt is never written for a delivery that did not happen, which is the whole point of
 writing it after rather than before.
+
+---
+
+## D59 (2026-09-05) -- what the first independent audit found, and why it mattered
+
+The wave above shipped green: 5415 tests passing, CI green, every new behaviour covered. A
+fresh auditor with no shared context found **three CRITICALs in it**, all of which the suite
+was green through. Recorded here because each one is a distinct lesson, not a typo.
+
+**C1 -- the boot assertion could not fire.** `default_classify_llm()` built and returned its
+closure unconditionally; the `ANTHROPIC_API_KEY` check lived inside `answer_lane.default_llm`
+at CALL time. So `build_classify_llm`'s `NotWiredError` branches were unreachable for the only
+factory production uses, and a keyless deployment booted, logged *"classifier LLM wired"*, and
+escalated every message -- **the D51 flood wearing the badge of the fix for it**. The tests
+passed because both "refuses to boot" tests injected `factory=lambda: None`: they proved the
+seam and never the rule. The key is now checked at BUILD time, and the test that would have
+caught this (flag on, key unset, production factory) exists. *A test that injects its own
+failure proves the handler, not the requirement.*
+
+**C2 -- a second door to the client with none of the gates.** The portal bridge's QUESTION
+branch sends through `outreach.initiate`, not `outbox._dispatch_one`, so D54's trust ladder,
+AUTO_ANSWER flag and hard lines never applied to it. The auditor reproduced a model-written
+answer posting to a client's group DM with CLIENT_REPLY off, AUTO_ANSWER off, on a hard-line
+topic -- using this system's own real ticket text. Every D54 test ran through
+`adapter.handle_event`, which is exactly why a green suite could not see it. The gates now sit
+in front of the send on that path too. *"Checked at draft time and post time" has to mean
+every path that can reach a client, not every path that happens to use one module.*
+
+**C3 -- a new internal kind is client-VISIBLE by default, in another repo.** Client visibility
+is decided in lasso-ops-portal by a DENYLIST (`client-visible.ts` and migration 0310, both
+listing exactly `escalation / fixer_request / hold_notice`). The new `kind='receipt'` was in
+neither, so the receipt -- the fixer channel id, the ops status, and the words *"SENT
+AUTOMATICALLY (no tap)"* -- was readable by the client in their own portal thread. Receipts
+now ride on an `escalation` row with `attachments.receipt`, and `INTERNAL_KINDS <=
+CLIENT_INVISIBLE_KINDS` is asserted by a test that fails the moment someone adds a kind. *A
+denylist in another repo means every new internal kind ships visible until someone remembers
+it; the contract needs a test on THIS side, because this side is where kinds are invented.*
+
+The through-line with D56: all three are the same family. A capability that looks armed and
+is not; a gate that exists on one path and not its twin; a safety list that defaults to
+"allowed". **Green tests plus a careful build is not evidence. An independent read is.**

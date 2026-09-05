@@ -33,9 +33,16 @@ Blake actually asked for: "excluded from any future report/metric and never resu
 """
 import re
 
-# Any bracketed probe tag our own harnesses stamp at the front of a synthetic message.
-PROBE_TAG_RE = re.compile(r"\[(?:phase\d+-audit|arming-probe|smoke-test)[^\]]*\]",
-                          re.IGNORECASE)
+# Any bracketed probe tag our own harnesses stamp at the FRONT of a synthetic message.
+#
+# m5 (audit): this used to match anywhere in the text, and bus.find_new_tickets drops what it
+# matches -- so a client who pasted a log line containing "[smoke-test ...]" would have had
+# their ticket silently dropped from the only intake poll the portal bridge has. Hiding a
+# real client's ticket is the one direction that must never happen, so the tag is anchored to
+# the start (after an optional leading @mention, which is how the Wrangler probes arrived).
+PROBE_TAG_RE = re.compile(
+    r"^\s*(?:<@[A-Z0-9]+>\s*)*\[(?:phase\d+-audit|arming-probe|smoke-test)[^\]]*\]",
+    re.IGNORECASE)
 
 # The literal placeholder id the escalation-path probe sends as; never a real Slack user.
 SYNTHETIC_SLACK_IDS = frozenset({"U0000000000"})

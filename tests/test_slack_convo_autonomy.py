@@ -171,6 +171,30 @@ def test_build_classify_llm_refuses_to_boot_when_claimed_but_absent(monkeypatch)
                               factory=lambda: (_ for _ in ()).throw(RuntimeError("no key")))
 
 
+def test_no_api_key_with_the_flag_on_refuses_to_boot(monkeypatch):
+    """THE REQUIREMENT, not the seam. The first version of this suite only ever proved the
+    assertion by injecting a factory that returned None -- while the REAL factory could
+    neither return None nor raise, so a keyless production deployment booted, logged
+    "classifier LLM wired", and escalated every message. This is the test that would have
+    caught that, and it uses the production factory."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert C.default_classify_llm() is None, "the production factory must fail at BUILD time"
+    with pytest.raises(LW.NotWiredError):
+        LW.build_classify_llm(IDS.get("echo"), log=lambda *a: None)
+
+
+def test_with_a_key_the_production_factory_builds_a_real_callable(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    llm = LW.build_classify_llm(IDS.get("echo"), log=lambda *a: None)
+    assert callable(llm)
+
+
 def test_build_classify_llm_wires_a_real_callable_when_the_flag_is_on(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
@@ -184,6 +208,7 @@ def test_default_classify_llm_never_returns_a_label_outside_the_set(monkeypatch)
     """The model's raw output is filtered, so a chatty or hallucinated response escalates
     rather than mislabelling. No network: default_llm is patched."""
     from agent.slack_convo import answer_lane as AL
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
     monkeypatch.setattr(AL, "default_llm", lambda s, u, model=None: "I think it is a question")
     assert C.default_classify_llm()("anything") is None
     monkeypatch.setattr(AL, "default_llm", lambda s, u, model=None: "code_fix\n")
@@ -547,8 +572,12 @@ def test_a_released_answer_still_posts_after_a_human_tap(monkeypatch):
 # =========================================================================================
 
 def _receipts(bus, tid):
+    """C3: a receipt is an ESCALATION row carrying attachments.receipt -- a kind the portal
+    already hides from clients. Anything that reads receipts must key on the marker, never
+    on a kind of its own."""
     return [m for m in bus.messages_for(tid)
-            if m["attachments"].get("kind") == A.KIND_RECEIPT]
+            if m["attachments"].get("kind") == A.KIND_ESCALATION
+            and m["attachments"].get("receipt")]
 
 
 def test_an_auto_answer_posts_a_receipt_naming_what_was_sent(monkeypatch):
@@ -569,6 +598,7 @@ def test_an_auto_answer_posts_a_receipt_naming_what_was_sent(monkeypatch):
     assert "SENT AUTOMATICALLY (no tap)" in body
     assert "Yes, instagram is connected." in body, "the receipt quotes the real sent text"
     assert rec[0]["attachments"]["auto_answer"] is True
+    assert rec[0]["attachments"]["kind"] in A.CLIENT_INVISIBLE_KINDS
     assert rec[0]["attachments"]["sent_at"]
     # and it is an internal kind: it goes to the fixer channel, never the client's thread
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -592,6 +622,35 @@ def test_a_receipt_is_never_written_before_the_post_succeeds(monkeypatch):
 
     OB.run_once(bus, failing_post, identity=IDS.get("echo"), log=lambda *a: None)
     assert _receipts(bus, d.ticket_id) == [], "no receipt for a delivery that did not happen"
+
+
+def test_no_internal_kind_is_readable_by_a_client():
+    """C3, as a cross-repo contract test.
+
+    Client visibility is decided in lasso-ops-portal (src/lib/support/client-visible.ts and
+    migration 0310) by a DENYLIST of three kinds. Any internal kind this repo invents that is
+    not in that list is visible to the client by default, in a repo this one cannot import.
+    That is how kind='receipt' leaked the fixer channel id and "SENT AUTOMATICALLY (no tap)"
+    into a client's portal thread. If you add an internal kind and this test fails, the
+    portal's list must change FIRST, in its own PR, before the kind ships here."""
+    assert A.INTERNAL_KINDS <= A.CLIENT_INVISIBLE_KINDS, (
+        f"internal kinds the portal would show a client: "
+        f"{sorted(A.INTERNAL_KINDS - A.CLIENT_INVISIBLE_KINDS)}")
+
+
+def test_a_receipt_never_uses_a_kind_the_portal_would_show(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    d = A.handle_event(_ev("is my instagram connected?"), "k",
+                       _answering_deps(bus, client_armed=True, auto_answer=True))
+    post, _calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    for r in _receipts(bus, d.ticket_id):
+        assert r["attachments"]["kind"] in A.CLIENT_INVISIBLE_KINDS
 
 
 def test_acks_get_no_receipt(monkeypatch):

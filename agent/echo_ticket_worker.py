@@ -40,6 +40,7 @@ from .slack_convo import adapter as _a
 from .slack_convo import classifier as _cls
 from .slack_convo import identities as _ids
 from .slack_convo import identity_gate as _ig
+from .slack_convo import outbox as _ob
 from .slack_convo import outreach as _out
 
 _EPOCH_ISO = "1970-01-01T00:00:00+00:00"
@@ -310,6 +311,39 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
                            verification_before=answer["grounding"],
                            verification_after=answer["grounding"])
+            # C2 (2026-09-05 audit, CRITICAL): this branch posts a model-written answer
+            # straight to the client through outreach.initiate, bypassing outbox._dispatch_one
+            # and therefore EVERY gate D54 added -- the trust ladder, the AUTO_ANSWER flag and
+            # the hard lines. Reproduced by the auditor on this system's own real ticket text
+            # ("Can we add our group sessions schedule to the website?" -- 'schedule' is a hard
+            # line): with CLIENT_REPLY and AUTO_ANSWER both OFF it posted to the client's group
+            # DM and resolved the ticket. The gates now live in front of the send, not only in
+            # the outbox, because "checked at draft time AND at post time" has to mean every
+            # path that can reach a client, not every path that happens to use one module.
+            forbidden = (_a.auto_answer_forbidden(ticket.get("raw_text") or "")
+                         or _a.auto_answer_forbidden(answer["body"]))
+            armed = (config.slack_convo_auto_answer_armed(identity_name)
+                     and config.slack_convo_client_reply_armed(identity_name))
+            if forbidden or not armed:
+                why = ("hard line (billing, hours or schedule, injury or liability): this "
+                       "never auto answers, whatever the flags say" if forbidden else
+                       f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER is off: a grounded "
+                       f"answer needs your tap")
+                row = bus.record_outbound(
+                    ticket_id=tid, author_type=identity_name, body=answer["body"],
+                    delivery_status="held", kind=_a.KIND_ANSWER,
+                    meta={"identity": identity_name, "recipient_kind": who.kind,
+                          "surface": "portal_ticket_bridge",
+                          "auto_answer_forbidden": bool(forbidden)})
+                bus.set_ticket(tid, status="hold", escalated=True)
+                if write_hold_notice:
+                    write_hold_notice(tid=tid, recipient_kind=who.kind,
+                                      user=who.slack_user_id or "", account_key=who.account_key,
+                                      kind=_a.KIND_ANSWER, body=answer["body"],
+                                      held_message_id=(row or {}).get("id"),
+                                      surface="portal_ticket_bridge", why=why)
+                log(f"[echo-ticket-worker] answer HELD ticket={tid} why={why}")
+                return
             result = _out.initiate(
                 _verified_ticket_dict(ticket), who, ident,
                 open_group_dm=open_group_dm, post_first_message=post_first_message,
@@ -318,6 +352,16 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 claim_message=claim_message, log=log)
             if result.opened:
                 bus.set_ticket(tid, status="resolved")
+                # M1: the one path that sends a model answer with NO tap at all produced no
+                # receipt, so the very thing Blake asked to see was the one thing invisible.
+                try:
+                    _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
+                                      body=answer["body"], kind=_a.KIND_ANSWER,
+                                      where="a group DM opened for this ticket", auto=True,
+                                      extra={"surface": "portal_ticket_bridge"})
+                except Exception as e:  # noqa: BLE001 - never undo a delivery over a receipt
+                    log(f"[echo-ticket-worker] receipt failed ticket={tid}: "
+                        f"{type(e).__name__}")
             else:
                 log(f"[echo-ticket-worker] outreach refused ticket={tid} "
                     f"reason={result.reason}")

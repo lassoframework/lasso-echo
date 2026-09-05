@@ -186,9 +186,23 @@ def default_classify_llm(model=None):
     the regexes did not recognise fell to ESCALATE by construction, which is exactly the
     "the classifier did not decide" flood in #fixer.
 
-    Returns a callable (text) -> label | None. It NEVER raises out to the caller: classify()
-    already treats an exception as ESCALATE, and this returns None on anything unexpected, so
-    the deterministic behaviour is the floor and the model can only ever fill the middle."""
+    Returns a callable (text) -> label | None, or None when there is no key to call with.
+
+    C1 (2026-09-05 audit, CRITICAL): this used to build and return the closure
+    unconditionally, because the ANTHROPIC_API_KEY check lived inside answer_lane.default_llm
+    at CALL time. So build_classify_llm could never see a failure, its NotWiredError branches
+    were unreachable, and a keyless deployment booted while LOGGING "classifier LLM wired" --
+    then escalated every message, because each call raised and classify() turned that into
+    ESCALATE. That is the D51 flood wearing the badge of the fix for it. The key is now
+    checked HERE, at build time, which is the only place a boot assertion can see it.
+
+    The returned callable NEVER raises out to the caller: classify() already treats an
+    exception as ESCALATE, and this returns None on anything unexpected, so the deterministic
+    behaviour is the floor and the model can only ever fill the middle."""
+    import os
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+
     def _llm(text):
         from . import answer_lane as _al
         raw = _al.default_llm(_LLM_SYSTEM, str(text or "")[:4000], model=model)

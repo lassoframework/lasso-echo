@@ -53,6 +53,77 @@ def _live_deps_source():
     return inspect.getsource(LW.live_deps)
 
 
+def _both_live_deps():
+    """BOTH wiring paths. The first version of this guard inspected only
+    listener_wiring.live_deps -- and RTF-2, the bug that actually reached a real client, was
+    in the OTHER one (echo_ticket_wiring). A guard that covers one of two doors is not a
+    guard."""
+    from agent import echo_ticket_wiring as ETW
+    return {"listener_wiring.live_deps": inspect.getsource(LW.live_deps),
+            "echo_ticket_wiring.live_deps": inspect.getsource(ETW.live_deps)}
+
+
+@pytest.mark.parametrize("where", ["listener_wiring.live_deps", "echo_ticket_wiring.live_deps"])
+def test_neither_wiring_path_hardcodes_a_none_capability(where):
+    src = _both_live_deps()[where]
+    tree = ast.parse(src.strip())
+    banned = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg and (
+                node.arg.endswith("_llm") or node.arg in ("answer", "resolve_identity")):
+            if isinstance(node.value, ast.Constant) and node.value.value is None:
+                banned.append(node.arg)
+    assert not banned, (f"{where} hardcodes {banned} to None -- that is the classify_llm=None "
+                        f"bug returning.")
+
+
+def test_the_portal_bridge_actually_forwards_the_classifier_callable():
+    """RTF-2 as a WIRE test, not a substring test. The earlier version asserted a parameter
+    name and a source substring, and would still have passed if intake_pass accepted
+    classify_llm and dropped it on the floor. This one runs the code and watches the callable
+    arrive at classify()."""
+    from agent import echo_ticket_worker as ETW
+    from agent.slack_convo import classifier as CC
+    seen = {}
+
+    class _Bus:
+        def find_new_tickets(self, **kw):
+            return [{"id": "t-1", "product": "echo", "source": "website_tab",
+                     "client_id": "g-1", "reporter": "owner@gym.com",
+                     "raw_text": "something ambiguous entirely", "status": "new"}]
+
+        def inbound_count(self, tid):
+            return 1
+
+        def ticket(self, tid):
+            return {"id": tid, "status": "new"}
+
+        def set_ticket(self, tid, **f):
+            return {}
+
+        def record_outbound(self, **kw):
+            return {"id": "m-1"}
+
+    def probe(text):
+        seen["called_with"] = text
+        return CC.QUESTION
+
+    import os as _os
+    _os.environ["AGENT_PORTAL_ECHO_TICKETS_ENABLED"] = "true"
+    ETW.intake_pass(
+        _Bus(), slack_lookup_email=lambda e: "U1",
+        slack_user_info=lambda u: {"id": u, "is_bot": False, "email": "owner@gym.com"},
+        portal_lookup=lambda e: {"role": "client",
+                                 "gyms": [{"gym_id": "g-1", "relationship": "client_owner",
+                                           "account_key": "k"}]},
+        open_group_dm=lambda ids: {"ok": False}, post_first_message=lambda c, t: {"ok": False},
+        write_hold_notice=lambda **kw: None, classify_llm=probe,
+        fetch_state=lambda t, w: {}, llm=lambda *a, **k: "",
+        log=lambda *a, **k: None)
+    assert seen.get("called_with") == "something ambiguous entirely", \
+        "intake_pass accepted classify_llm but never handed it to classify()"
+
+
 def test_live_deps_never_hardcodes_a_none_capability():
     """The literal regression, asserted statically so no future edit can restore it.
 

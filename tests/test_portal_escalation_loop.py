@@ -340,3 +340,75 @@ def test_the_resolve_notice_reaches_the_portal_thread_end_to_end():
     summary = OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
     assert summary["posted"] == 1
     assert bus.of_kind(A.KIND_STATUS)[0]["delivery_status"] == "posted"
+
+
+# =========================================================================================
+# C2 (2026-09-05 audit, CRITICAL): the portal bridge bypassed EVERY D54 gate
+# =========================================================================================
+#
+# The bridge's QUESTION branch sends through outreach.initiate, not through
+# outbox._dispatch_one, so none of the trust ladder, the AUTO_ANSWER flag or the hard lines
+# applied to it. The auditor reproduced a model-written answer posting to a client's group
+# DM with CLIENT_REPLY off, AUTO_ANSWER off, on a hard-line topic ("Can we add our group
+# sessions schedule to the website?"). These tests are that reproduction, kept.
+
+def _answering_worker(bus, seen_deps, *, answer_body="Yes, both are connected."):
+    """Run intake_pass with an answer lane that always grounds, so the QUESTION branch is
+    the one under test rather than the escalation branch."""
+    import agent.echo_ticket_worker as WW
+    cards = []
+    WW.intake_pass(
+        bus, open_group_dm=seen_deps[1], post_first_message=seen_deps[2],
+        write_hold_notice=lambda **kw: cards.append(kw),
+        fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
+        llm=lambda system, user, model=None: answer_body,
+        classify_llm=None, mark_message=bus.mark_message, claim_message=bus.claim_message,
+        stamp_ticket=lambda *a, **k: None, log=lambda *a, **k: None,
+        **_client_deps())
+    return cards
+
+
+def test_portal_bridge_never_auto_answers_a_client_with_auto_answer_off(monkeypatch):
+    monkeypatch.delenv("SLACK_CONVO_ECHO_AUTO_ANSWER", raising=False)
+    bus = Bus([_ticket()])
+    seen, open_dm, post = _slack_calls()
+    cards = _answering_worker(bus, (seen, open_dm, post))
+    assert seen["posted"] == [], "no client-facing send without the narrower permission"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    held = [m for m in bus.of_kind(A.KIND_ANSWER) if m["delivery_status"] == "held"]
+    assert held, "the drafted answer is kept, held, for a tap"
+    assert cards, "a held answer always gets a card in #fixer"
+
+
+def test_portal_bridge_never_auto_answers_a_hard_line_even_when_armed(monkeypatch):
+    """The real a9efa713 text. 'group sessions schedule' is a gym schedule question."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket(raw_text="Can we add our group sessions schedule to the website?")])
+    seen, open_dm, post = _slack_calls()
+    cards = _answering_worker(bus, (seen, open_dm, post),
+                              answer_body="Yes, we can add your group sessions schedule.")
+    assert seen["posted"] == [], "a hard line never auto answers, whatever the flags say"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert any("hard line" in (c.get("why") or "") for c in cards)
+
+
+def test_portal_bridge_does_auto_answer_when_fully_armed_and_writes_a_receipt(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket()])
+    seen, open_dm, post = _slack_calls()
+    _answering_worker(bus, (seen, open_dm, post))
+    assert seen["posted"], "fully armed, the grounded answer does go out"
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    # M1: the one path that sends with no tap at all must be visible in #fixer
+    receipts = [m for m in bus.of_kind(A.KIND_ESCALATION)
+                if (m["attachments"] or {}).get("receipt")]
+    assert receipts, "an unattended send must leave a receipt"
+    assert "SENT AUTOMATICALLY (no tap)" in receipts[0]["body"]
+    assert "Yes, both are connected." in receipts[0]["body"]
+    assert receipts[0]["attachments"]["kind"] in A.CLIENT_INVISIBLE_KINDS
