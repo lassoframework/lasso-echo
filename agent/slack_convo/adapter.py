@@ -82,6 +82,27 @@ KIND_ESCALATION = "escalation"   # to the fixer channel: a human must look
 KIND_FIXER_REQUEST = "fixer_request"  # to the ops-fix channel: a code fix for the worker
 KIND_HOLD_NOTICE = "hold_notice"      # to the fixer channel: a row awaits a tap
 KIND_OUTREACH_REQUEST = "outreach_request"  # a proposed client DM awaiting a tap (D45)
+# C3 (2026-09-05 audit, CRITICAL): a receipt is an INTERNAL card, and internal cards must be
+# invisible to the client. But client visibility is decided in the OTHER repo by a DENYLIST
+# of kinds -- lasso-ops-portal's client-visible.ts and migration 0310 both list
+# ('escalation','fixer_request','hold_notice') and hide those, showing everything else. A NEW
+# internal kind is therefore visible to the client by default, in a repo this one cannot see.
+# The first draft of receipts invented kind='receipt' and leaked the fixer channel id, the
+# ops status, and "SENT AUTOMATICALLY (no tap)" into the client's own portal thread.
+#
+# Until that denylist is an allowlist (portal-side change, Blake's deploy), a receipt is
+# written as an ESCALATION -- a kind BOTH repos already agree is internal -- and carries
+# attachments.receipt=True so #fixer, reports and tests can still tell the two apart. The
+# CLIENT_INVISIBLE_KINDS constant below is this repo's copy of that cross-repo contract, and
+# a test asserts every internal kind is in it, so the next new internal kind cannot repeat
+# this by accident.
+RECEIPT_META = "receipt"         # attachments.receipt=True on an escalation row
+
+# The kinds the PORTAL is known to hide from clients (lasso-ops-portal:
+# src/lib/support/client-visible.ts and supabase/migrations/0310_*.sql). Mirrored here on
+# purpose: this repo decides what is internal, that repo decides what is readable, and the
+# two must not drift. tests/test_slack_convo_autonomy.py asserts INTERNAL_KINDS is a subset.
+CLIENT_INVISIBLE_KINDS = frozenset({"escalation", "fixer_request", "hold_notice"})
 
 # Delivered to the fixer / ops-fix channel, never into the person's thread.
 INTERNAL_KINDS = frozenset({KIND_ESCALATION, KIND_FIXER_REQUEST, KIND_HOLD_NOTICE})
@@ -103,19 +124,55 @@ MAX_UNKNOWN_ESCALATIONS_PER_TICKET_PER_DAY = 3
 MAX_FOLLOWUP_NOISE_PER_TICKET_PER_DAY = 5
 _EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 
+# D52, extended (2026-09-05 audit 2): the ban is on PROMISING FUTURE HUMAN ACTION as a fact,
+# not on one particular sentence. These two carried the same shape as the removed template
+# ("the team will pick it up there", "Someone will pick it up") and are reworded to say only
+# what is true when they are written: where the message went, and what to do next.
 TEMPLATE_UNKNOWN = (
     "Thanks for reaching out. I can only help from inside your LASSO portal, so this message "
-    "did not reach a person yet. Please use the Support page in your portal and the team "
-    "will pick it up there.")
+    "did not reach a person yet. Please use the Support page in your portal, which is the "
+    "route that gets it to the team.")
 TEMPLATE_QUEUED = (
     "Got it. You have sent a lot today, so I have queued this for the team rather than "
-    "acting on it right away. Someone will pick it up.")
-TEMPLATE_ESCALATED = (
-    "Got it. This one needs a person, so I have flagged it for the LASSO team and they "
-    "will follow up here.")
+    "acting on it right away. It is recorded with everything else you sent.")
+# D52 (2026-09-05). The old TEMPLATE_ESCALATED read:
+#
+#   "Got it. This one needs a person, so I have flagged it for the LASSO team and they
+#    will follow up here."
+#
+# Blake, looking at #fixer: "every held draft is the escalation placeholder, not a real
+# answer." Two separate lies were stacked in that one string. It was written as a REPLY row,
+# so the tap card said "HELD REPLY awaiting your tap" over text that is not a reply to
+# anything -- nothing had been drafted at all. And it stated a promise ("they will follow up
+# here") as already true at the moment it was written, before the escalation row had posted
+# anywhere, and on the one path (classifier did not decide) where nobody has yet decided
+# there is anything to follow up ON.
+#
+# What replaces it says only what is true at the moment it is written: we have the message,
+# we did not answer it ourselves, and we are not claiming anything about what happens next.
+# The escalation card is what actually reaches a human, and outbox.resolve_and_notify is
+# what tells the person it is handled -- a real event, not a promise made in advance.
+# m3 (audit): the first replacement still said "I have passed it to the LASSO team to look
+# at", which is one link short of true -- the escalation row is written first (row-first
+# holds), but if that identity's fixer channel is unset the row is marked failed and never
+# reaches a person, while this text posts anyway. What IS true at the moment this is written,
+# on every path, is that the message is recorded and no answer was given. It claims that and
+# nothing more.
+TEMPLATE_NO_ANSWER_YET = (
+    "Got it, I have your message. I could not answer this one myself, so I have not got an "
+    "answer for you yet. It is recorded for the LASSO team.")
+
+# Cards in #fixer that carry no draft at all are labelled as such rather than as a reply
+# awaiting a tap, so Blake never has to open one to find out it is a placeholder.
+NO_DRAFT_LABEL = "NO DRAFT"
+# Finding 5 (2026-09-05 audit 3): this said "You will hear back here from the team once it is
+# verified" -- the exact sentence V-M6 records as removed for having no mechanism, restored in
+# a different constant. There still is no mechanism on this path: the Slack adapter sets
+# status='triage' and fixed_pass (the thing that would send that follow-up) polls
+# status='fixing' only, so nothing was ever going to send it. Says what is true instead.
 ACK_CODE_FIX = (
-    "Got it. I read that as something not working on our side, so I have opened a fix "
-    "request for the team. You will hear back here from the team once it is verified.")
+    "Got it. I read that as something not working on our side, so I have written it up as a "
+    "fix request with your message attached.")
 ACK_FOLLOW_UP = "Got it, I have added that to the open request for the team."
 ACK_QUESTION = "Got it, checking that for you now."
 ACK_ACTION = ("Got it. I read that as a request to change something on your ads, so it is "
@@ -154,6 +211,215 @@ class Deps:
     answer: object = None                  # (ticket, identity, messages, question) -> dict|None
     classify_llm: object = None            # (text) -> label | None
     log: object = print
+    # D53 (2026-09-05, card readability). Best-effort human labels for the #fixer card:
+    # (gym_id) -> "Bird Dog CrossFit". None or a failure means the card falls back to the
+    # account key and then the raw id, and says so -- never a blank where a gym should be.
+    describe_gym: object = None
+    # D54 (Phase 4): () -> bool, may a GROUNDED answer to a client send with no human tap?
+    # Absent (None) means NO. Narrower than client_reply in every direction; see config.
+    auto_answer_armed: object = None
+    # D50: () -> bool, may a confident website question be drafted with the website
+    # identity's knowledge instead of this entry-point identity's? Absent means no.
+    cross_product_armed: object = None
+
+
+import re as _re
+
+# ---- D54: the hard lines on auto-answer -------------------------------------------------
+# Blake, 2026-09-05: "Code fixes, price questions, refunds, hours/schedule changes, anything
+# touching injuries/liability, and anything below the classifier's confidence bar must ALWAYS
+# still hold for Blake's tap regardless of this flag -- these are hard lines, not tunable."
+#
+# Structural, not advisory: no env var and no config function can widen this set, and it is
+# checked at DRAFT time here and again at POST time in outbox._dispatch_one. Billing/price is
+# already refused before any model call by answer_lane.is_billing (a stricter, earlier gate);
+# it is repeated here so this list reads as the whole rule rather than half of it.
+# m1 (audit): the first draft banned bare "hours", "open", "close" and "schedule", which
+# swallowed ordinary Echo questions ("is the october schedule loaded?", "did the calendar
+# open ok?") and made the new capability near-inert for the most common question shape there
+# is. The GYM's hours and the GYM's class schedule are the hard line -- telling a member the
+# wrong opening time or moving a class is a real-world commitment we cannot make for a
+# client. A content calendar is not that. So those two topics are qualified; billing,
+# injuries and liability stay deliberately broad, because a false hold there costs nothing.
+AUTO_ANSWER_FORBIDDEN = _re.compile(
+    r"\b(price|prices|pricing|cost|costs|charge|charged|bill|billing|billed|invoice|refund|"
+    r"refunds|subscription|payment|stripe|credit card|"
+    r"injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
+    r"liability|waiver|insurance|lawsuit|legal)\b|"
+    r"\b(?:gym|class|classes|session|sessions|group sessions|studio|business|holiday|"
+    r"opening|door|front desk|member)\s+(?:hours|schedule|schedules|times|time)\b|"
+    r"\b(?:hours|schedule)\s+(?:change|changes|for the gym|on (?:monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|the holiday|labor day|christmas|thanksgiving))\b|"
+    r"\b(?:change|move|update|adjust)\s+(?:our|the|my)\s+(?:hours|schedule|class)\b|"
+    r"\breschedule\b|\btimetable\b|\bwhat time do (?:you|we) (?:open|close)\b|"
+    r"\bare (?:you|we) open\b|\bwhen do (?:you|we) (?:open|close)\b|"
+    r"\bwhat are (?:your|our) hours\b|\bholiday hours\b", _re.IGNORECASE)
+
+
+# M3 (2026-09-05 audit 2): the denylist above was documented as "structural, not advisory",
+# and an auditor walked eleven ordinary sentences straight past it -- "what time does the gym
+# open on saturday", "our saturday classes are moving to 8am", "a member tweaked her back,
+# what do we tell her", "how much is this going to run us each month". A denylist of topics is
+# whack-a-mole by construction: it has to enumerate every phrasing of every dangerous subject,
+# and it is wrong the moment someone says it differently.
+#
+# So the hard rule is inverted for the one path that sends with NO human tap. An answer may
+# go out unattended only if the question is ABOUT something this system can actually observe
+# in live account state -- the connection status of an account, whether posts went out, what
+# is on the content calendar, an approval, an upload. That is the entire universe of things
+# answer_lane.default_fetch_state can even fetch. Anything else, however it is phrased, holds
+# for a person, and the denylist stays as a second layer on top for the subjects where a
+# wrong answer is most costly.
+#
+# Both are checked at draft time AND at post time, and neither has an env var.
+AUTO_ANSWER_ALLOWED = _re.compile(
+    r"\b(connect|connected|connection|connecting|disconnected|reconnect|linked|"
+    r"instagram|ig|facebook|fb|google|gbp|business profile|zernio|"
+    r"post|posts|posted|posting|publish|published|publishing|reel|reels|story|stories|"
+    r"caption|captions|calendar|scheduled|schedule|schedules|queue|queued|draft|drafts|"
+    r"approve|approved|approval|approvals|deny|denied|upload|uploads|uploaded|media|"
+    r"photo|photos|video|videos|account|accounts|dashboard|portal|login|log in)\b",
+    _re.IGNORECASE)
+
+
+def auto_answer_forbidden(text):
+    """True when this message may never be auto-answered, whatever the flags say."""
+    return bool(AUTO_ANSWER_FORBIDDEN.search(text or ""))
+
+
+# Finding 12 (audit 3): the allowlist leaks toward ACTION-shaped requests -- "can you post
+# that our saturday group is moving to 8am", "publish the announcement that we are raising
+# rates". Those satisfy the allowlist because they name posting, and they are not questions
+# about state at all: they ask us to PUBLISH a real-world claim on a client's behalf. Auto
+# answer is for reporting what is already true, never for agreeing to say something new.
+# Audit 5, finding 2 (CRITICAL): the audit-4 rewrite REPLACED the previous alternatives
+# instead of adding to them, and picked the wrong axis a second time. Measured on a realistic
+# corpus it held 37% of ordinary state questions ("were my posts scheduled?", "any update on
+# our posts?") while MISSING three imperative requests the version before it caught ("post the
+# flyer for the open house"). Both directions wrong at once.
+#
+# The axis that actually separates them is not vocabulary, it is SHAPE:
+#   * a REQUEST asks us to author or publish something -- an imperative ("post the flyer"), a
+#     polite request form ("can you publish ..."), or a content verb bound to a claim we would
+#     be asserting on the client's behalf ("post that we are moving to 8am");
+#   * a QUESTION asks what is already true ("were my posts scheduled?"), and the tense and
+#     interrogative shape are what make it one.
+# So the claim markers are only the ones that introduce AUTHORED CONTENT (that / saying /
+# announcing / telling), never ordinary words like "were" or "our" that any question contains.
+_CONTENT_VERB = (r"post|posts|publish|announce|share|schedule|draft|write|send out|put up|"
+                 r"throw up|put out|tell|let .{0,25}know")
+_AUTHORED_CLAIM = (r"that\b|saying\b|says\b|announcing\b|telling\b|to say\b|about how\b|"
+                   r"letting .{0,25}know")
+# (a) a polite request form wrapped around a content verb
+_REQ_POLITE = (rf"\b(?:can|could|would|will|please|pls|need|want|wanna|mind)\b"
+               rf"[^.?!]{{0,25}}?\b(?:{_CONTENT_VERB})\b")
+# (b) an imperative opening the message
+_REQ_IMPERATIVE = rf"^\s*(?:please\s+|pls\s+|hey\s+)?(?:{_CONTENT_VERB})\b"
+# (c) asking for a piece of content to exist
+_REQ_MAKE = (r"\b(?:make|need|want|create|write|draft|put together|get)\b[^.?!]{0,20}?"
+             r"\b(?:a |an |the )?(?:post|caption|story|reel|announcement|graphic|flyer)\b")
+# (d) a content verb bound to a claim we would be asserting for them
+_REQ_CLAIM = rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,40}}?\b(?:{_AUTHORED_CLAIM})"
+_ASK_TO_PUBLISH = _re.compile(
+    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM)), _re.IGNORECASE)
+
+
+def asks_us_to_publish(text):
+    """True when the message asks us to SAY something new, rather than report what is true."""
+    return bool(_ASK_TO_PUBLISH.search(text or ""))
+
+
+def auto_answer_allowed(text):
+    """True only when the question is about live account state this system can observe.
+
+    The allowlist is the primary gate for unattended sending; auto_answer_forbidden is the
+    second layer. A message must pass BOTH to send with no tap."""
+    t = text or ""
+    return (bool(AUTO_ANSWER_ALLOWED.search(t)) and not auto_answer_forbidden(t)
+            and not asks_us_to_publish(t))
+
+
+def may_auto_answer(question, body=""):
+    """THE decision for sending a drafted answer with no human tap. One function, called by
+    every path that can reach a client, so no path can enforce half the rule.
+
+    Finding 2 (2026-09-05 audit 3, CRITICAL): the Slack adapter checked the allowlist and the
+    portal bridge did not -- it called auto_answer_forbidden twice and auto_answer_allowed
+    never. Two paths, one rule, written out twice, drifted within a day of being written.
+    They share this now."""
+    return (auto_answer_allowed(question)
+            and not auto_answer_forbidden(body or "")
+            and not asks_us_to_publish(body or ""))
+
+
+# ---- D53: cards a human can actually read ----------------------------------------------
+
+def describe_person(deps, who, user, ticket=None):
+    """One plain-language line naming WHO wrote in, for a #fixer card a human reads.
+
+    RT-m3 (display names never appear in cards) is deliberately NOT relaxed for the
+    fixer_request card, which is relayed to a Bash-armed Claude Code worker that reads its
+    preamble as trusted operator context -- a user-editable display name there is an
+    injection surface, and fixer_request_text() below still carries ids only. This function
+    feeds the ESCALATION and HOLD cards, which only ever reach human eyes in #fixer, where
+    Blake's actual problem was the opposite one: a raw U0BV9D5A17W with no context tells him
+    nothing about who is waiting. The name is Slack-escaped like every other untrusted value
+    and labelled as self-reported, never presented as verified identity."""
+    uid = _slack_escape(str(user or (ticket or {}).get("slack_user_id") or "") or "?")
+    name = _slack_escape(str(getattr(who, "display", "") or "").strip())
+    email = _slack_escape(str(getattr(who, "email", "") or "").strip())
+    kind = str(getattr(who, "kind", "") or (ticket or {}).get("identity_kind") or "unknown")
+    gym = _describe_gym(deps, who, ticket)
+    who_part = f"{name} ({uid})" if name else uid
+    bits = [f"{kind} {who_part}"]
+    if email:
+        bits.append(email)
+    bits.append(f"gym {gym}")
+    return ", ".join(bits)
+
+
+def _describe_gym(deps, who, ticket=None):
+    gym_id = str(getattr(who, "gym_id", "") or (ticket or {}).get("client_id") or "").strip()
+    key = str(getattr(who, "account_key", "") or "").strip()
+    label = ""
+    if gym_id and getattr(deps, "describe_gym", None):
+        try:
+            label = str(deps.describe_gym(gym_id) or "").strip()
+        except Exception:  # noqa: BLE001 - a name lookup never blocks a card
+            label = ""
+    if label:
+        return _slack_escape(f"{label}" + (f" ({key})" if key else ""))
+    if key:
+        return _slack_escape(key)
+    if gym_id:
+        return _slack_escape(gym_id)
+    return "not resolved"
+
+
+def unresolved_identity_line(who):
+    """Plain words for a card when we could not tell who this is, plus what was tried.
+
+    identity_gate.resolve() and echo_ticket_worker.resolve_client_identity() both already
+    carry the specific diagnosis on Identity.reason ("no email on slack profile", "ticket
+    missing reporter or client_id", "ambiguous: 2 client_owner gyms"). Until now every card
+    threw that away and printed the coarse bucket, so a9efa713's card said only
+    'identity_unknown' -- true, useless, and indistinguishable from a Slack outage."""
+    reason = str(getattr(who, "reason", "") or "").strip() or "no reason recorded"
+    return f"unresolved identity: {_slack_escape(reason)}"
+
+
+def question_card(deps, ident, tid, who, user, text, *, proposal, status):
+    """The card body for a question that did not get answered automatically. Blake's four:
+    who (name + gym), what they actually asked, what we propose to do, where the ticket is."""
+    person = (describe_person(deps, who, user)
+              if getattr(who, "is_human_known", False) else
+              f"{describe_person(deps, who, user)} [{unresolved_identity_line(who)}]")
+    asked = _slack_escape(str(text or "").strip())[:1200]
+    return (f"{ident.name} ticket {tid}\n"
+            f"FROM: {person}\n"
+            f"ASKED: {asked}\n"
+            f"PROPOSED: {proposal}\n"
+            f"STATUS: {status}")
 
 
 def _ignore(reason, surface="", identity_kind=""):
@@ -201,7 +467,20 @@ def delivery_for(deps, who, kind, *, lane=None):
         return "ready"
     if _is_staffish(who):
         return "ready" if deps.staff_reply_armed() else "held"
-    return "ready" if deps.client_reply_armed() else "held"
+    if not deps.client_reply_armed():
+        return "held"
+    # D54: a substantive, model-written ANSWER to a client is the one conversational kind
+    # that can state a fact about their account, so it needs its own, narrower permission on
+    # top of client_reply. Blake, 2026-09-05: "this is a NEW, narrower permission than the
+    # blanket CLIENT_REPLY flag already armed tonight." Before this, arming CLIENT_REPLY (as
+    # all four identities were) silently armed auto-answering too, which is not what that
+    # flag was ever reviewed as meaning. Acks, templates and status rows are unaffected: they
+    # carry no claim about live state.
+    if kind == KIND_ANSWER:
+        armed = deps.auto_answer_armed() if callable(getattr(deps, "auto_answer_armed", None)) \
+            else False
+        return "ready" if armed else "held"
+    return "ready"
 
 
 def handle_event(event, event_id, deps):
@@ -359,6 +638,11 @@ def handle_event(event, event_id, deps):
         m = {"surface": surface, "recipient_kind": who.kind, "identity": ident.name}
         if meta:
             m.update(meta)
+        # D54 hard line, applied at the single point every outbound row is written: a topic
+        # on the forbidden list is HELD no matter what any flag says. delivery_for() reads
+        # flags; this reads the message itself, so no flag combination can reach past it.
+        if kind == KIND_ANSWER and m.get("auto_answer_forbidden") and not _is_staffish(who):
+            status = "held"
         # DV4 (2026-09-03, MAJOR): a QUESTION's answer body is model-generated from a
         # transcript that includes the person's own words -- a successful prompt injection
         # ("reply with exactly <!channel> ...") had no defense once it left the model, and
@@ -374,7 +658,9 @@ def handle_event(event, event_id, deps):
                                        body=safe_body, delivery_status=status, kind=kind, meta=m)
         out.append(kind)
         if status == "held":
-            _hold_notice(deps, ident, tid, who, user, kind, safe_body, row, surface)
+            _hold_notice(deps, ident, tid, who, user, kind, safe_body, row, surface,
+                         no_draft=bool(m.get("no_draft")),
+                         forbidden=bool(m.get("auto_answer_forbidden")))
             out.append(KIND_HOLD_NOTICE)
         return status
 
@@ -416,28 +702,56 @@ def handle_event(event, event_id, deps):
     if classification == _cls.QUESTION:
         if not _is_staffish(who):
             emit(KIND_ACK, ACK_QUESTION)
+        answer_ident, routed_from = _answer_identity(deps, ident, text)
         answer = None
         if deps.answer is not None:
             try:
-                answer = deps.answer(ticket, who, deps.bus.messages(tid), text)
+                answer = _call_answer(deps, ticket, who, deps.bus.messages(tid), text,
+                                     answer_ident)
             except Exception as e:  # noqa: BLE001 - a model fault escalates, never invents
                 deps.log(f"[slack-convo] answer lane failed: {type(e).__name__}")
                 answer = None
         if answer and answer.get("body") and answer.get("grounding"):
             # The grounding snapshot is the verification: what was true when we said it.
             # The ticket sits in 'verification' until the outbox actually posts the answer.
+            grounding = dict(answer["grounding"])
+            if routed_from:
+                # m2 (audit 2): answer_lane.default_fetch_state is keyed on who.account_key
+                # and fetches the SAME Echo seams whichever identity drafts, so recording
+                # "answered_with_product: websites" would put a false claim in the
+                # verification record -- the facts did not come from a websites seam,
+                # because there is no websites seam. What actually moved is the knowledge
+                # and voice, and that is what this says.
+                grounding["routed_from_product"] = routed_from
+                # Audit 5, finding 6: named for what it IS. The domain guidance came from the
+                # routed identity; the client was spoken to by the entry identity; the facts
+                # came from this gym's own account either way.
+                grounding["domain_guidance_from"] = answer_ident.name
+                grounding["spoken_by"] = ident.name
+                grounding["facts_source"] = "account state for this gym (unchanged by routing)"
             deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
-                                verification_before=answer["grounding"],
-                                verification_after=answer["grounding"])
-            emit(KIND_ANSWER, answer["body"])
+                                verification_before=grounding,
+                                verification_after=grounding)
+            # D54: the hard lines are checked HERE, at draft time, as well as at post time.
+            # A forbidden topic never reaches 'ready' whatever the flags say.
+            # BOTH layers, on the question AND on what we are about to say.
+            forbidden = not may_auto_answer(text, answer["body"])
+            emit(KIND_ANSWER, answer["body"],
+                 meta={"answered_with": answer_ident.name,
+                       "routed_from_product": routed_from or None,
+                       "auto_answer_forbidden": bool(forbidden)})
         else:
             deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="hold",
                                 escalated=True)
-            emit(KIND_ESCALATION, f"Question from {who.kind} {user} on {ident.name} could "
-                                  f"not be answered from live state. Ticket {tid}.",
+            emit(KIND_ESCALATION,
+                 question_card(deps, ident, tid, who, user, text,
+                               proposal=("no answer drafted: the answer lane had no grounded "
+                                         "facts for this question, so nothing was written "
+                                         "for the client to read"),
+                               status="hold, escalated, waiting on a person"),
                  author_type="system")
             if not _is_staffish(who):
-                emit(KIND_TEMPLATE, TEMPLATE_ESCALATED)
+                emit(KIND_TEMPLATE, TEMPLATE_NO_ANSWER_YET, meta={"no_draft": True})
         return Decision("ticketed", "question", surface, who.kind, tid, created,
                         _cls.QUESTION, out)
 
@@ -462,11 +776,64 @@ def handle_event(event, event_id, deps):
 
     # ESCALATE: nothing decided -> a human looks. No worker, no answer.
     deps.bus.set_ticket(tid, status="hold", escalated=True)
-    emit(KIND_ESCALATION, f"{who.kind} {user} wrote to {ident.name} and the classifier did "
-                          f"not decide. Ticket {tid}.", author_type="system")
+    emit(KIND_ESCALATION,
+         question_card(deps, ident, tid, who, user, text,
+                       proposal=(f"{NO_DRAFT_LABEL}: the classifier did not decide what this "
+                                 f"is, so no answer, no fix request and no ad action was "
+                                 f"started. Nothing has been drafted for the client"),
+                       status="hold, escalated, waiting on a person"),
+         author_type="system")
     if not _is_staffish(who):
-        emit(KIND_TEMPLATE, TEMPLATE_ESCALATED)
+        emit(KIND_TEMPLATE, TEMPLATE_NO_ANSWER_YET, meta={"no_draft": True})
     return Decision("ticketed", "escalated", surface, who.kind, tid, created, "", out)
+
+
+def _call_answer(deps, ticket, who, messages, text, answer_ident):
+    """Call the injected answer lane, passing the answering identity when it accepts one.
+
+    The signature check is done once, by inspection, rather than by catching TypeError: a
+    TypeError raised INSIDE the answer lane would be indistinguishable from one raised by the
+    call itself, and swallowing that would turn a real fault into a silent 'no answer'."""
+    fn = deps.answer
+    try:
+        import inspect
+        takes = "answer_identity" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # a builtin or C callable: assume the old shape
+        takes = False
+    if takes:
+        return fn(ticket, who, messages, text, answer_identity=answer_ident)
+    return fn(ticket, who, messages, text)
+
+
+def _answer_identity(deps, ident, text):
+    """(identity_whose_knowledge_answers, routed_from_product_or_'').
+
+    D50 cross-product routing. Returns the ENTRY identity unchanged unless all three hold:
+    the flag is armed for this identity, classifier.product_hint is CONFIDENT, and the hinted
+    product is not the one we are already on. The ticket, its channel, its client_id/gym, its
+    bot_identity and every delivery decision are untouched by this -- only which identity's
+    product knowledge and reply voice drafts the answer. A website question asked by Gym A is
+    still a Gym A ticket answered in Gym A's own conversation; there is no code path here
+    that can move a question, or its answer, into another gym's context."""
+    armed = deps.cross_product_armed() \
+        if callable(getattr(deps, "cross_product_armed", None)) else False
+    if not armed:
+        return ident, ""
+    product, confidence = _cls.product_hint(text)
+    if confidence != _cls.CONFIDENT or not product or product == ident.product:
+        return ident, ""
+    from . import identities as _ids
+    target = None
+    for cand in _ids.IDENTITIES.values():
+        # Lainey is never a routing target: it has no Slack surface and stays off (repo rule).
+        if cand.product == product and cand.name != "lainey":
+            target = cand
+            break
+    if target is None:
+        return ident, ""
+    deps.log(f"[slack-convo/{ident.name}] cross-product: answering with {target.name} "
+             f"knowledge (product {product}), ticket stays on {ident.name}")
+    return target, ident.product
 
 
 def _follow_up(deps, ident, ticket, who, user, text, surface, emit, out, created):
@@ -556,11 +923,20 @@ def _outbound_kind_ever(deps, tid, kind):
         return True
 
 
-def _hold_notice(deps, ident, tid, who, user, kind, body, row, surface):
+def _hold_notice(deps, ident, tid, who, user, kind, body, row, surface, *, no_draft=False,
+                 forbidden=False):
     """ONE tap notice per held row, to the fixer channel. The outbox renders the button."""
+    why = ""
+    if no_draft:
+        why = ("nothing was drafted; this is the honest placeholder, not an answer")
+    elif forbidden:
+        why = ("held by a hard line (billing, hours or schedule, injury or liability); this "
+               "one can never auto answer whatever the flags say")
     write_hold_notice(deps.bus, ident_name=ident.name, tid=tid, recipient_kind=who.kind,
                       user=user, account_key=who.account_key, kind=kind, body=body,
-                      held_message_id=(row or {}).get("id"), surface=surface)
+                      held_message_id=(row or {}).get("id"), surface=surface, why=why,
+                      no_draft=no_draft,
+                      person=describe_person(deps, who, user))
 
 
 # RA-M1: the fence markers are literal '<' / '>' runs. Slack-escaping the untrusted text
@@ -576,7 +952,7 @@ def _slack_escape(text):
 
 
 def write_hold_notice(bus, *, ident_name, tid, recipient_kind, user, account_key, kind, body,
-                      held_message_id, surface, why=""):
+                      held_message_id, surface, why="", no_draft=False, person=""):
     """The tap card as a row. Shared with the outbox (V-M8: a row the outbox moves to held at
     post time, because a flag flipped between write and post, gets a notice too; nothing
     ever sits in 'held' with no card in the fixer channel).
@@ -596,18 +972,29 @@ def write_hold_notice(bus, *, ident_name, tid, recipient_kind, user, account_key
         label = "FIXER REQUEST"
     elif kind == KIND_OUTREACH_REQUEST:
         label = "OUTREACH REQUEST"
+    elif no_draft:
+        # D52: the card Blake taps must not call a placeholder a reply. This is the label
+        # that was lying in every screenshot he sent: "HELD REPLY awaiting your tap" over
+        # text that answers nothing.
+        label = NO_DRAFT_LABEL
     else:
         label = "REPLY"
     safe_user = _slack_escape(user)
     safe_key = _slack_escape(account_key) if account_key else ""
+    # D53: a human reads this card. Lead with who it is about in words, not a raw Slack id.
+    who_line = person or (f"{recipient_kind} {safe_user}"
+                          + (f", account {safe_key}" if safe_key else ""))
     return bus.record_outbound(
         ticket_id=tid, author_type="system",
-        body=(f"HELD {label} awaiting your tap ({recipient_kind} {safe_user}"
-              f"{', account ' + safe_key if safe_key else ''}, {ident_name}, "
-              f"ticket {tid}{', ' + why if why else ''}):\n\n{body}"),
+        body=(f"HELD {label} awaiting your tap\n"
+              f"FROM: {who_line}\n"
+              f"BOT: {ident_name}   TICKET: {tid}\n"
+              f"{'WHY: ' + why + chr(10) if why else ''}"
+              f"{'TEXT THAT WILL POST ON RELEASE' if not no_draft else 'PLACEHOLDER TEXT (not an answer)'}:\n\n{body}"),
         delivery_status="ready", kind=KIND_HOLD_NOTICE,
         meta={"surface": surface, "held_message_id": held_message_id,
-              "held_kind": kind, "recipient_kind": recipient_kind, "identity": ident_name})
+              "held_kind": kind, "recipient_kind": recipient_kind, "identity": ident_name,
+              "no_draft": bool(no_draft)})
 
 
 def fixer_request_text(ident, tid, text, who, user, follow_up=False):

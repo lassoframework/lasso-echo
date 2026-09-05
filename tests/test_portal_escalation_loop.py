@@ -28,7 +28,13 @@ ECHO = IDS.IDENTITIES["echo"]
 def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
-    # armed live on the Railway echo service since 2026-09-03 ([[slack-convo-adapter-armed]])
+    # armed live on the Railway echo service since 2026-09-03 ([[slack-convo-adapter-armed]]).
+    # The master and identity switches are set too: M1 (2026-09-05 audit 2) made the portal
+    # bridge's client-facing DMs obey them, so a fixture that armed only CLIENT_REPLY was
+    # describing a state that cannot exist -- client_reply is meaningless with the identity
+    # off, and config.slack_convo_client_reply_armed's own callers now check both.
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     yield
 
@@ -194,7 +200,7 @@ def test_unresolved_identity_still_gets_an_acknowledgement():
     assert A.KIND_ESCALATION in kinds, "the #fixer card must still be written"
     acks = bus.of_kind(A.KIND_ACK)
     assert len(acks) == 1
-    assert acks[0]["body"] == A.TEMPLATE_ESCALATED
+    assert acks[0]["body"] == A.TEMPLATE_NO_ANSWER_YET
     assert acks[0]["delivery_status"] == "ready"
     assert seen["opened"] == [], "no Slack DM is possible for an unresolved identity"
 
@@ -203,7 +209,7 @@ def test_a_known_client_gets_the_acknowledgement_as_a_group_dm():
     bus = Bus([_ticket()])
     seen, _ = _run_intake(bus, _client_deps())
     assert seen["opened"] == [[W._out.BLAKE_SLACK_USER_ID, "U_CLIENT"]]
-    assert seen["posted"] and A.TEMPLATE_ESCALATED in seen["posted"][0][1]
+    assert seen["posted"] and A.TEMPLATE_NO_ANSWER_YET in seen["posted"][0][1]
     assert len(bus.of_kind(A.KIND_ACK)) == 1
 
 
@@ -244,7 +250,7 @@ def test_a_conversational_row_on_a_portal_ticket_is_delivered_to_the_portal_thre
     bus = Bus([_ticket(status="hold")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="hi", meta={})
-    bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.TEMPLATE_ESCALATED,
+    bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.TEMPLATE_NO_ANSWER_YET,
                         delivery_status="ready", kind=A.KIND_ACK,
                         meta={"identity": "echo", "recipient_kind": "client"})
     sent, post = _posts()
@@ -340,3 +346,75 @@ def test_the_resolve_notice_reaches_the_portal_thread_end_to_end():
     summary = OB.run_once(bus, post, identity=ECHO, log=lambda *a: None)
     assert summary["posted"] == 1
     assert bus.of_kind(A.KIND_STATUS)[0]["delivery_status"] == "posted"
+
+
+# =========================================================================================
+# C2 (2026-09-05 audit, CRITICAL): the portal bridge bypassed EVERY D54 gate
+# =========================================================================================
+#
+# The bridge's QUESTION branch sends through outreach.initiate, not through
+# outbox._dispatch_one, so none of the trust ladder, the AUTO_ANSWER flag or the hard lines
+# applied to it. The auditor reproduced a model-written answer posting to a client's group
+# DM with CLIENT_REPLY off, AUTO_ANSWER off, on a hard-line topic ("Can we add our group
+# sessions schedule to the website?"). These tests are that reproduction, kept.
+
+def _answering_worker(bus, seen_deps, *, answer_body="Yes, both are connected."):
+    """Run intake_pass with an answer lane that always grounds, so the QUESTION branch is
+    the one under test rather than the escalation branch."""
+    import agent.echo_ticket_worker as WW
+    cards = []
+    WW.intake_pass(
+        bus, open_group_dm=seen_deps[1], post_first_message=seen_deps[2],
+        write_hold_notice=lambda **kw: cards.append(kw),
+        fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
+        llm=lambda system, user, model=None: answer_body,
+        classify_llm=None, mark_message=bus.mark_message, claim_message=bus.claim_message,
+        stamp_ticket=lambda *a, **k: None, log=lambda *a, **k: None,
+        **_client_deps())
+    return cards
+
+
+def test_portal_bridge_never_auto_answers_a_client_with_auto_answer_off(monkeypatch):
+    monkeypatch.delenv("SLACK_CONVO_ECHO_AUTO_ANSWER", raising=False)
+    bus = Bus([_ticket()])
+    seen, open_dm, post = _slack_calls()
+    cards = _answering_worker(bus, (seen, open_dm, post))
+    assert seen["posted"] == [], "no client-facing send without the narrower permission"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    held = [m for m in bus.of_kind(A.KIND_ANSWER) if m["delivery_status"] == "held"]
+    assert held, "the drafted answer is kept, held, for a tap"
+    assert cards, "a held answer always gets a card in #fixer"
+
+
+def test_portal_bridge_never_auto_answers_a_hard_line_even_when_armed(monkeypatch):
+    """The real a9efa713 text. 'group sessions schedule' is a gym schedule question."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket(raw_text="Can we add our group sessions schedule to the website?")])
+    seen, open_dm, post = _slack_calls()
+    cards = _answering_worker(bus, (seen, open_dm, post),
+                              answer_body="Yes, we can add your group sessions schedule.")
+    assert seen["posted"] == [], "a hard line never auto answers, whatever the flags say"
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert any("hard line" in (c.get("why") or "") for c in cards)
+
+
+def test_portal_bridge_does_auto_answer_when_fully_armed_and_writes_a_receipt(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    bus = Bus([_ticket()])
+    seen, open_dm, post = _slack_calls()
+    _answering_worker(bus, (seen, open_dm, post))
+    assert seen["posted"], "fully armed, the grounded answer does go out"
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    # M1: the one path that sends with no tap at all must be visible in #fixer
+    receipts = [m for m in bus.of_kind(A.KIND_ESCALATION)
+                if (m["attachments"] or {}).get("receipt")]
+    assert receipts, "an unattended send must leave a receipt"
+    assert "SENT AUTOMATICALLY (no tap)" in receipts[0]["body"]
+    assert "Yes, both are connected." in receipts[0]["body"]
+    assert receipts[0]["attachments"]["kind"] in A.CLIENT_INVISIBLE_KINDS

@@ -129,6 +129,10 @@ def live_deps(*, product=None, source=None, identity_name="echo", bus=None, log=
         write_hold_notice=_write_hold_notice_factory(bus),
         fetch_state=_al.default_fetch_state,
         llm=_al.default_llm,
+        # RTF-2: the classifier gets its OWN, correctly shaped callable, built through the
+        # same flag-gated, boot-asserted factory the Slack path uses. `llm` above stays the
+        # answer lane's; the two contracts are different and must never be crossed again.
+        classify_llm=_lw.build_classify_llm(_ids.IDENTITIES[identity_name], log=log),
     )
     fixed_kwargs = dict(shared)
     fixed_kwargs.update({k: v for k, v in routing_kwargs.items() if k != "source"})

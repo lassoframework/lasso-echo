@@ -33,6 +33,7 @@ Everything is injected (fetch_state, llm) so this is offline-testable with no mo
 """
 import json
 import re
+import re as _re
 
 NO_ANSWER = "NO_ANSWER"
 
@@ -175,9 +176,18 @@ def conversation_for_model(messages):
     return out
 
 
-def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None):
-    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises."""
+def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None,
+           speaks_as=None):
+    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises.
+
+    `speaks_as` (finding 13, 2026-09-05 audit 3): under D50 cross-product routing the
+    KNOWLEDGE and voice doc come from one identity while the message is posted by another --
+    so the system prompt used to say "You are Wrangler" on a reply going out of Scout's bot,
+    in Scout's DM. The client would see one bot introduce itself as another. The name in the
+    prompt is now the bot that will actually speak; everything else about the routing is
+    unchanged."""
     convo = conversation_for_model(messages)
+    speaker = speaks_as or identity.name
     q = (question or "").strip()
     if not q:
         inbound = [m for m in convo if m.get("direction") == "inbound"]
@@ -190,10 +200,32 @@ def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, 
         facts = {"unavailable": type(e).__name__}
     if _all_unavailable(facts):
         return None   # V-M4: a snapshot of failures is not grounding
+    # Audit 5, finding 6: `bot` used to record the identity whose knowledge drafted the
+    # answer, while the client was spoken to by a different one -- a false entry in the
+    # record this system treats as evidence. It records both, named for what they are.
     grounding = {"question": q[:500], "facts": facts, "thread_len": len(convo),
-                 "bot": identity.name}
-    system = _SYSTEM.format(bot=identity.name.capitalize(), who=who.kind,
-                            voice=_voice_rules(identity))
+                 "bot": speaker, "domain_guidance_from": identity.name}
+    # Audit 4, finding 5: swapping one token of the system prompt was not enough -- the
+    # appended VOICE DOC is the longer and far more specific identity instruction, and under
+    # cross-product routing it still named the other bot throughout ("Wrangler is the LASSO
+    # team member who builds and maintains gym websites", five times over). The voice a
+    # client hears must belong to the bot that is actually speaking, so the voice doc comes
+    # from the SPEAKER; what routing moves is the subject matter, stated explicitly.
+    voice = _voice_rules(identity)
+    if speaks_as and speaks_as != identity.name:
+        # Audit 5, finding 6: the audit-4 fix swapped the whole voice doc to the SPEAKER's,
+        # which removed the only thing D50 routing actually moves -- the routed product's
+        # domain guidance -- leaving a capability that did nothing. The doc that matters is
+        # the routed one; what must not survive is the other bot's NAME, because the client
+        # is talking to exactly one bot. So the routed guidance is kept and every mention of
+        # the routed bot's name is rewritten to the speaker's, which is precisely the
+        # substitution a human would make reading it aloud.
+        voice = _re.sub(rf"\b{_re.escape(identity.name)}\b", speaker.capitalize(), voice,
+                        flags=_re.IGNORECASE)
+        voice += (f"\n\nThis question is about the client's {identity.product}. Answer it "
+                  f"from the FACTS block, in your own voice as {speaker.capitalize()}, and "
+                  f"never introduce yourself as any other name.")
+    system = _SYSTEM.format(bot=speaker.capitalize(), who=who.kind, voice=voice)
     user = ("FACTS:\n" + json.dumps(facts, default=str, indent=1)[:6000] +
             "\n\nCONVERSATION SO FAR (most recent last):\n" +
             "\n".join(f"- {m.get('author_type')}: {str(m.get('body') or '')[:300]}"

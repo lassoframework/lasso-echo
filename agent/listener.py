@@ -634,7 +634,19 @@ def _daily_scheduler(store):
                 _etw.intake_pass(deps.bus, **deps.intake_kwargs)
                 _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
             except Exception as e:
-                print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
+                # M4, corrected by finding 8 (audit 3): raising HERE was worse than the bug
+                # it fixed. This runs inside _daily_scheduler's `while True`, on a daemon
+                # thread, so a raise killed the ENTIRE daily scheduler -- catchup report,
+                # welcome digest, intake ingest, media sync, social sync -- silently, with
+                # the process still reporting healthy. "Refuse to start" belongs at boot,
+                # where it crashes the deploy visibly; here the same misconfiguration is
+                # made LOUD on every cycle instead, and the other jobs keep running.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker] CRITICAL not wired, portal tickets are NOT "
+                          f"being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
             # D47: product='portal' tickets (the generic Website tab form's default,
             # not Echo-specific) route to Scout per the identity map, never to
             # Ranger's ad-engine-only fixer-lane.ts, which has no reason to see them.
@@ -648,7 +660,14 @@ def _daily_scheduler(store):
                 _etw.intake_pass(scout_deps.bus, **scout_deps.intake_kwargs)
                 _etw.fixed_pass(scout_deps.bus, **scout_deps.fixed_kwargs)
             except Exception as e:
-                print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
+                # Finding 8 (audit 3): the two legs must behave identically -- this one
+                # swallowed NotWiredError with a plain print while the Echo leg above raised.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker/scout] CRITICAL not wired, portal tickets "
+                          f"are NOT being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
@@ -976,6 +995,17 @@ def run_listener():
         _convo.attach(app, "echo")
         _convo.start_additional_identities()
     except Exception as _ce:  # noqa: BLE001 - the adapter must never take the listener down
+        # M4 (2026-09-05 audit 2): a NotWiredError caught HERE was the worst possible outcome
+        # of the "refuse to boot" assertion -- attach() and start_additional_identities()
+        # would both be skipped, all four bot identities would go silently dark, and the
+        # listener would report healthy. That is the exact "ships inert" pattern the
+        # assertion exists to kill, one level up. A misconfiguration this specific is a
+        # deployment fault and must be LOUD: it re-raises, the process fails to start, and
+        # Railway shows a crashed deploy instead of a quiet lobotomy.
+        from .slack_convo.listener_wiring import NotWiredError as _NotWired
+        if isinstance(_ce, _NotWired):
+            print(f"[slack-convo] REFUSING TO START: {_ce}")
+            raise
         print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
