@@ -69,6 +69,18 @@ def _rate_per_minute():
     return int(os.environ.get("AGENT_INTAKE_RATE_PER_MINUTE", "10"))
 
 
+# The per-post actions Echo routes at /portal/<token>/posts/<id>/<action>.
+#
+# THIS IS A CROSS REPO CONTRACT (P-11). The portal relays to exactly
+#   `${base}/portal/${token}/posts/${postId}/${action}`
+# in src/lib/echo/portal-content.ts (postPostAction), so an action the portal can
+# offer must exist HERE first. "swap-media" is the free photo swap (B6): the portal
+# could not build "use a different photo" as its own button because Echo had only
+# approve / edit / deny / kill, which left deny as the single lever and made a photo
+# change cost one of the gym's 15 monthly recreates.
+PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media")
+
+
 def client_for_token(token):
     """The client key a token authenticates, or None. A SIGNED token verifies
     against the shared secret (no per-gym env var needed); a legacy per-client env
@@ -2010,11 +2022,14 @@ def build_server(port=None):
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
-            /portal/<token>/posts/<id>/{approve|edit|deny|kill}, else (None,None,None).
-            Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s."""
+            /portal/<token>/posts/<id>/{approve|edit|deny|kill|swap-media}, else
+            (None,None,None).
+            Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s.
+            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE, which is
+            default OFF: the route exists but the handler 403s until it is armed."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
-                r"(approve|edit|deny|kill)$",
+                r"(" + "|".join(PORTAL_POST_ACTIONS) + r")$",
                 self.path.split("?")[0],
             )
             if m:
@@ -2852,8 +2867,18 @@ def build_server(port=None):
                     status, resp = _ps.handle_edit(account_key, ps_post_id, actor_id,
                                                    note=note, store=store, reason=reason)
                 elif ps_action == "deny":
+                    # B6: intent="media" routes the "Use a different photo" chip to the
+                    # FREE swap instead of charging one of the 15 recreates. Ignored
+                    # while ECHO_MEDIA_SWAP_FREE is off, so today's behavior is unchanged.
+                    _intent = str(body.get("intent", "") or "").strip()
+                    # Only PASS the kwarg when the client actually sent one, so the
+                    # default call shape stays byte for byte what it has always been.
+                    _extra = {"intent": _intent} if _intent else {}
                     status, resp = _ps.handle_deny(account_key, ps_post_id, actor_id,
-                                                   note=note, store=store)
+                                                   note=note, store=store, **_extra)
+                elif ps_action == "swap-media":
+                    status, resp = _ps.handle_swap_media(account_key, ps_post_id,
+                                                         actor_id)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)

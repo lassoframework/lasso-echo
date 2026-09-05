@@ -192,3 +192,77 @@ def test_sub_a_plus_caption_skips_slot_not_ships():
     assert out["standard"] == 0
     # photo drops still land (no caption gate)
     assert out["photo"] == 4
+
+
+# ---- B9: an empty GBP month must name what is MISSING -----------------------
+# ENG, 2026-09: the month sweep failed for four gyms with the single line
+# "nothing planned (no A+ captions or media)" -- true, and useless. It names two
+# possible causes and tells the gym which one applies for neither. The A+ gate is
+# NOT relaxed by any of this and nothing is fabricated to fill a slot; only the
+# sentence the gym reads changes.
+
+def test_empty_month_reason_names_missing_media_not_a_blanket_line():
+    msg = gp.empty_month_reason({"no_media": 6})
+    assert "no A+ captions or media" not in msg          # the useless line is gone
+    assert "6" in msg and "photo" in msg.lower()
+    assert "Drive" in msg or "upload" in msg             # tells them where to act
+
+
+def test_empty_month_reason_ranks_the_biggest_gap_first_and_lists_the_rest():
+    msg = gp.empty_month_reason({"no_media": 6, "no_fact": 2, "caption_rejected": 1})
+    assert msg.index("photo") < msg.index("sources")     # biggest cause leads
+    assert "9" in msg                                    # the honest total
+    assert "quality gate" in msg                         # the small causes survive
+
+
+def test_empty_month_reason_falls_back_when_nothing_was_even_attempted():
+    # No slot was tried at all -> the historical wording, so no caller loses a reason.
+    assert gp.empty_month_reason({}) == "nothing planned (no A+ captions or media)"
+    assert gp.empty_month_reason(None) == "nothing planned (no A+ captions or media)"
+
+
+def test_no_media_month_tells_the_gym_it_is_photos_and_never_fabricates_a_row():
+    _seed()
+    store = _Store()
+    out = gp.plan_gbp_month("lasso", "lasso_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            offer=None, events=[], caption_fn=_cap,
+                            image_fn=lambda day_key, used: None)   # library is empty
+    assert out["ok"] is False and out["planned"] == 0
+    assert store.rows == []                          # nothing invented to fill a slot
+    assert out["skips"]["no_media"] > 0
+    assert "photo" in out["reason"].lower()
+    assert "no A+ captions or media" not in out["reason"]
+
+
+def test_caption_gate_rejection_is_reported_as_a_caption_problem_not_a_photo_one():
+    _seed()
+    store = _Store()
+    out = gp.plan_gbp_month("lasso", "lasso_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            offer=None, events=[], caption_fn=lambda fact: None,
+                            image_fn=_img)           # media is fine, captions are not
+    # Photo drops carry no caption, so they still land; every CAPTIONED slot is lost.
+    assert out["standard"] == 0 and out["offer"] == 0 and out["event"] == 0
+    assert out["skips"]["caption_rejected"] > 0 and out["skips"]["no_media"] == 0
+    assert gp.empty_month_reason(out["skips"])
+    assert "quality gate" in gp.empty_month_reason(out["skips"])
+
+
+def test_a_month_that_planned_rows_still_reports_what_it_lost():
+    # A PARTIAL month is the common case: the ledger must ride along on success too,
+    # so a gym that got 4 posts instead of 13 can still be told why.
+    _seed()
+    store = _Store()
+    calls = {"n": 0}
+
+    def _some_media(day_key, used):
+        calls["n"] += 1
+        return f"https://r2/gbp/{day_key}.jpg" if calls["n"] <= 3 else None
+
+    out = gp.plan_gbp_month("lasso", "lasso_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            offer=None, events=[], caption_fn=_cap,
+                            image_fn=_some_media)
+    assert out["ok"] is True and out["planned"] > 0
+    assert out["skips"]["no_media"] > 0
