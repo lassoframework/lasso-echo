@@ -1110,6 +1110,23 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def portal_show_rejected() -> bool:
+    """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
+
+    Default OFF means the guard is ARMED: a post the gym owner already denied or
+    killed, and a row that was deleted, no longer comes back to them as a card on
+    their own calendar (agent/portal_social._client_visible). Measured on production
+    2026-09-05, that was 45% of LASSO's September rows, 40% of ENG's, 34% of pierce's
+    and 33% of zanshin's -- one card in three was content the client had rejected.
+
+    Set ECHO_PORTAL_SHOW_REJECTED=true to restore the historical payload byte for
+    byte (only 'coach_review' hidden). Nothing is deleted or re-statused either way:
+    the rows stay in content_calendar for audit and the publisher's own exclusions
+    (portal_calendar_store.due_rows) are untouched.
+    """
+    return _truthy(os.environ.get("ECHO_PORTAL_SHOW_REJECTED", "false"))
+
+
 def social_billing_delegated() -> bool:
     """The LASSO portal now owns the $99.99/mo social subscription and enforces
     entitlement (isSocialEntitled) BEFORE it ever calls Echo. When this flag is ON,

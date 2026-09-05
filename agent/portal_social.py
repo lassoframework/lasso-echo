@@ -406,6 +406,40 @@ def _base_of_account(account_key):
     return key
 
 
+# ---- B12: a post the client already rejected must leave their calendar ----------
+# THE DEFECT: a client denies a post, Echo issues a replacement (deny backfill,
+# client_month_run.backfill_denied_slots), and the ORIGINAL row stays on the calendar
+# forever. backfill_denied_slots is INSERT ONLY and nothing anywhere transitions a
+# denied row out of 'denied' -- portal_calendar_store._WIPEABLE_STATUSES deliberately
+# treats it as human owned so a rebuild cannot destroy it. Meanwhile the client render
+# carried exactly ONE status filter, `!= "coach_review"`, so denied / killed / deleted
+# rows were mapped into cards and shipped to the owner beside their replacements.
+#
+# MEASURED ON PRODUCTION 2026-09-05, September book: LASSO 45% of rows, ENG 40%,
+# pierce 34%, zanshin 33% were denied or deleted. One in three cards on a client's
+# calendar was content they had already rejected or that had been removed.
+#
+# THIS IS A GUARD, SO IT DEFAULTS ON, with a named escape hatch
+# (ECHO_PORTAL_SHOW_REJECTED=true restores the old payload byte for byte). Rows are
+# never deleted or re-statused by this -- they stay in content_calendar for audit, the
+# publisher still excludes them (portal_calendar_store.due_rows), and every derived
+# signal (low_creative, days_remaining, awaiting_media, recreate_budget) is computed
+# from the SAME row set as before so no banner changes behavior.
+_CLIENT_HIDDEN_STATUSES = ("coach_review", "denied", "killed", "deleted")
+
+
+def _client_visible(rows):
+    """The rows a gym owner should see on their own calendar. Hides content they have
+    already rejected (denied / killed), content that was removed (deleted), and content
+    a coach has not released yet (coach_review, the pre-existing rule)."""
+    from . import config as _cfg
+    hidden = _CLIENT_HIDDEN_STATUSES
+    if getattr(_cfg, "portal_show_rejected", None) and _cfg.portal_show_rejected():
+        hidden = ("coach_review",)          # escape hatch: the historical behavior
+    return [r for r in (rows or [])
+            if str((r or {}).get("status") or "").strip().lower() not in hidden]
+
+
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
@@ -425,7 +459,12 @@ def _handle_social_supabase(account_key, month, now=None):
             str((r or {}).get("status") or "").lower() == "coach_review" for r in rows)
         rows = [r for r in rows
                 if str((r or {}).get("status") or "").lower() != "coach_review"]
-        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        # B12: the CARDS drop rejected/removed content; `rows` (and therefore
+        # low_creative) stays exactly what it was, so no banner flips behind this.
+        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(rows)]
+        signal_posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in rows]
     except Exception as exc:
         return 500, {"error": f"store error: {type(exc).__name__}"}
 
@@ -435,7 +474,9 @@ def _handle_social_supabase(account_key, month, now=None):
     low_creative = not any((r.get("image_url") or "").strip() for r in rows)
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    # Signal on the UNFILTERED set: a month that is entirely denied is still a BUILT
+    # month, and must not raise the red "Echo is waiting on your uploads" banner.
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     if has_withheld_calendar:
         awaiting_media = False        # built + coach-screened is NOT "waiting on uploads"
     return 200, {
@@ -488,13 +529,17 @@ def handle_social(account_key, month, reader=None, now=None):
                 "SELECT * FROM gym_calendar_queue WHERE account_key=? AND day_key LIKE ? "
                 "ORDER BY day_key",
                 (account_key, prefix + "%")).fetchall()
-        posts = [_calendar_post(dict(r), is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        all_rows = [dict(r) for r in rows]
+        posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(all_rows)]
+        signal_posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in all_rows]
     except Exception as exc:
         return 500, {"error": f"db error: {type(exc).__name__}"}
 
     low_creative, days_remaining = _low_creative_and_days(account_key, month,
                                                           today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     return 200, {
         "account_key": account_key,
         "month": month,
