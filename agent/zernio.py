@@ -687,6 +687,40 @@ class ZernioClient:
 
     # ---- inbox + demographics reads (Wave 8; READ ONLY — nothing in this
     # section ever replies, hides, deletes, likes, or writes anything) --------
+    def accounts_health(self):
+        """GET /v1/accounts/health -> {summary:{...}, accounts:[{accountId, platform,
+        username, profileId, status, canPost, canFetchAnalytics, analyticsSupported,
+        tokenValid, needsReconnect, issues, messagingRestriction, tokenExpiresAt}]}.
+
+        ONE call covers the whole org, so a fleet health read costs a single request.
+        Verified live 2026-09-05: 46 accounts, keys exactly as listed above.
+
+        NOTE ON tokenExpiresAt (C15): for googlebusiness this is the GOOGLE ACCESS token
+        expiry, a rolling one hour clock, and it is routinely ALREADY IN THE PAST while
+        the same row reports tokenValid true and needsReconnect false. It is NOT a
+        reconnect deadline and must never be alerted on. `needsReconnect` and `tokenValid`
+        are the reconnect signals. See token_health_read().
+        """
+        return self._get("/v1/accounts/health")
+
+    def follower_stats(self):
+        """GET /v1/accounts/follower-stats -> {accounts:[...], stats:{accountId:[{date,
+        followers}]}, dateRange, granularity}.
+
+        `stats` is the DAILY follower series per account, which is exactly the granularity
+        gym_social_metrics_daily needs. ONE call returns every account in the org.
+
+        Verified live 2026-09-05: startDate/endDate/from/to/start/end/days and granularity
+        are ALL IGNORED by the API. It returns the full history it holds (ENG instagram:
+        27 days from 2026-08-10) regardless of what is asked. So this method sends NO date
+        params: sending them would imply a window the response does not honour, and a
+        caller that trusted the window would mislabel the data. Window the result locally.
+
+        `accounts[].accountStats` is NOT the series. It is profile metadata (mediaCount,
+        accountType, followsCount, instagramScopedId). Do not confuse the two.
+        """
+        return self._get("/v1/accounts/follower-stats")
+
     def list_inbox_comments(self, profile_id, limit=50, platform=None):
         """GET /v1/inbox/comments?profileId=... -> {data:[{id, accountId,
         accountUsername, platform, content(post caption), createdTime,
@@ -1005,3 +1039,142 @@ def post_id_of(post_json):
             if pid:
                 return str(pid)
     return ""
+
+
+# ---- fleet health + follower series (pure mappers) ---------------------------
+
+#: Platforms Zernio reports no follower count for. A 0 from these is ABSENCE, not a
+#: measurement, and follower_series() drops it rather than writing a fabricated zero.
+NO_FOLLOWER_PLATFORMS = ("googlebusiness", "openaiads")
+
+
+def map_account_ids(accounts_json):
+    """{platform: account_id} for the CONNECTED account on each STATUS_PLATFORMS lane.
+
+    A separate mapper rather than a new key on map_status(): map_status's per-platform dict
+    is the portal status contract and is asserted by exact equality in several tests, so it
+    stays byte-identical. Same precedence as map_status (a connected account wins), so the
+    id returned here always belongs to the account map_status called connected.
+    """
+    out = {}
+    for acct in (accounts_json or {}).get("accounts") or []:
+        if not isinstance(acct, dict):
+            continue
+        plat = acct.get("platform")
+        if plat not in STATUS_PLATFORMS or plat in out:
+            continue
+        if account_state(acct) == "connected" and acct.get("_id"):
+            out[plat] = str(acct["_id"])
+    return out
+
+
+def token_health_read(health_json):
+    """Fold /v1/accounts/health into {account_id: {...}} carrying ONLY the fields that
+    genuinely indicate a broken connection.
+
+    THE C15 RULE, and the reason this mapper exists: tokenExpiresAt is NOT a reconnect
+    signal. Google access tokens live about an hour and Zernio refreshes them behind the
+    call, so on any given read a third of the googlebusiness rows carry an expiry already
+    in the past while reporting tokenValid true, needsReconnect false, status healthy and
+    an empty issues list. Verified live 2026-09-05 at 13:44 UTC: Top Fuel CrossFit's
+    tokenExpiresAt was 13:07:55Z, 37 minutes gone, and the account was healthy and
+    postable. Alerting on tokenExpiresAt would have opened 13 client tickets for a system
+    that was working correctly.
+
+    `needs_reconnect` is therefore derived from needsReconnect / tokenValid / status ONLY.
+    tokenExpiresAt is carried through for display and never used in the decision.
+    """
+    out = {}
+    for a in (health_json or {}).get("accounts") or []:
+        if not isinstance(a, dict):
+            continue
+        aid = a.get("accountId") or a.get("_id")
+        if not aid:
+            continue
+        status = str(a.get("status") or "").strip().lower()
+        token_valid = a.get("tokenValid")
+        needs = bool(a.get("needsReconnect") is True
+                     or token_valid is False
+                     or status in ("error", "needs_reconnect", "needsreconnect", "expired"))
+        out[str(aid)] = {
+            "account_id": str(aid),
+            "platform": a.get("platform"),
+            "username": a.get("username"),
+            "profile_id": a.get("profileId"),
+            "status": a.get("status"),
+            "needs_reconnect": needs,
+            "can_post": a.get("canPost"),
+            "token_valid": token_valid,
+            # display only, NEVER a decision input - see the docstring
+            "token_expires_at": a.get("tokenExpiresAt"),
+            "issues": list(a.get("issues") or []),
+        }
+    return out
+
+
+def follower_series(stats_json, account_id):
+    """[(date_str, followers_int)] for one account, from the follower-stats `stats` map.
+
+    NULL MEANS NULL, enforced here rather than described in a comment: a point whose
+    `followers` is missing or non-numeric is DROPPED, never emitted as 0. A caller cannot
+    accidentally write a fabricated zero because this function never produces one.
+
+    Points are deduped on date (last wins) and returned in ascending date order.
+    """
+    raw = ((stats_json or {}).get("stats") or {}).get(str(account_id)) or []
+    by_date = {}
+    for pt in raw:
+        if not isinstance(pt, dict):
+            continue
+        d = str(pt.get("date") or "")[:10]
+        if len(d) != 10:
+            continue
+        f = pt.get("followers")
+        if isinstance(f, bool) or not isinstance(f, (int, float)):
+            continue
+        by_date[d] = int(f)
+    return sorted(by_date.items())
+
+
+def health_read(points, window_days=28, min_points=2, min_span_days=14, threshold=0.01):
+    """('growing' | 'flat' | 'declining' | None, basis) per METRICS_DATA_CONTRACT.md s6.
+
+    `points` is [(date_str, followers)] as returned by follower_series.
+
+    None is NOT 'flat'. Insufficient data is not a finding: fewer than `min_points`
+    measured points, a span under `min_span_days`, or a first value of 0 all return None,
+    and the basis still explains why so a surface can say so out loud.
+    """
+    from datetime import date as _date
+
+    def _d(s):
+        return _date(int(s[0:4]), int(s[5:7]), int(s[8:10]))
+
+    pts = sorted((p for p in (points or []) if p and p[0]), key=lambda p: p[0])
+    basis = {"points": 0, "window_start": None, "window_end": None,
+             "first": None, "last": None, "pct": None}
+    if not pts:
+        return None, basis
+    end = _d(pts[-1][0])
+    cutoff = end.toordinal() - int(window_days) + 1
+    pts = [p for p in pts if _d(p[0]).toordinal() >= cutoff]
+    basis["points"] = len(pts)
+    if not pts:
+        return None, basis
+    basis["window_start"], basis["window_end"] = pts[0][0], pts[-1][0]
+    if len(pts) < int(min_points):
+        return None, basis
+    span = _d(pts[-1][0]).toordinal() - _d(pts[0][0]).toordinal()
+    if span < int(min_span_days):
+        return None, basis
+    first, last = pts[0][1], pts[-1][1]
+    basis["first"], basis["last"] = first, last
+    if not first:  # 0 or None -> a percentage is undefined, and 0 is not a baseline
+        return None, basis
+    pct = (last - first) / float(first)
+    basis["pct"] = round(pct, 4)
+    if pct >= threshold:
+        return "growing", basis
+    if pct <= -threshold:
+        return "declining", basis
+    return "flat", basis
