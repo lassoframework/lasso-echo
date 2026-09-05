@@ -125,7 +125,7 @@ def derive_mint_key(account_key, display_name, *, resolve_uuid=None, gym_exists=
     # portal and crossfitreverb6cdf33 in Echo, and Dean got "93 posts drafted" over an empty
     # approve list. Deriving here at all is only correct when the portal has issued nothing.
     from . import account_key_resolve as _akr
-    portal_key = _akr.portal_key_for_gym(str(gym_uuid))
+    portal_key = _akr.portal_key_for_gym(str(gym_uuid), fresh=True)
     if portal_key:
         canonical = portal_key
         info["source"] = "portal"

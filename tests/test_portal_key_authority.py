@@ -119,3 +119,34 @@ def test_intake_door_falls_back_to_derivation_when_portal_is_silent(monkeypatch)
                         lambda gid, **kw: "")
     got = sir._canonical_base(REVERB_ID, {"gym": {"name": REVERB_NAME}})
     assert got == REVERB_ECHO_WOULD_DERIVE
+
+
+def test_the_reconciler_never_overwrites_a_portal_minted_key(monkeypatch):
+    """Audit #12 was only half fixed. account_key_reconcile PATCHes
+    echo_intake_tokens.echo_account_key -- the portal's own column -- with ECHO's
+    derivation. blocking_data does not stop it, because a BRAND NEW gym owns no data yet,
+    which is precisely the case that splits (Chateau: created 19:28, split the same day)."""
+    from agent import account_key_reconcile as akrec
+    # Arm the writer's own flag so the PORTAL guard is what refuses, not the flag gate.
+    monkeypatch.setattr(akrec.config, "account_key_reconcile_enabled", lambda: True)
+    monkeypatch.setattr(akrec, "blocking_data", lambda key: "")
+    portal_key = akrec._portal_derivation(REVERB_ID, REVERB_NAME)
+    assert portal_key == REVERB_PORTAL, "the port of deriveAccountKey must match the portal"
+    ok, detail = akrec._default_writer({"gym_id": REVERB_ID, "name": REVERB_NAME,
+                                  "current": REVERB_PORTAL,
+                                  "canonical": REVERB_ECHO_WOULD_DERIVE})
+    assert ok is False
+    assert "portal" in detail.lower(), detail
+
+
+def test_the_reconciler_still_repairs_a_genuinely_ad_hoc_key(monkeypatch):
+    """The guard must not make the reconciler useless: a key the portal never minted is
+    still repairable."""
+    from agent import account_key_reconcile as akrec
+    monkeypatch.setattr(akrec.config, "account_key_reconcile_enabled", lambda: True)
+    monkeypatch.setattr(akrec, "blocking_data", lambda key: "")
+    monkeypatch.setattr(akrec.config, "supabase_url", lambda: "")
+    ok, detail = akrec._default_writer({"gym_id": REVERB_ID, "name": REVERB_NAME,
+                                  "current": "some_hand_typed_key",
+                                  "canonical": REVERB_ECHO_WOULD_DERIVE})
+    assert "portal" not in detail.lower(), detail

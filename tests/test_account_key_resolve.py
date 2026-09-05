@@ -34,14 +34,25 @@ LOCAL_A_ID = "1a2b3c4d-0000-4000-8000-000000000001"
 LOCAL_B_ID = "9f8e7d6c-0000-4000-8000-000000000002"
 
 
-def _plane(tokens, gyms, fail=False, truncate=False):
-    """A fake reader with _get's contract: (path, params) -> (rows, ok)."""
+# SCHEMA-FAITHFUL by default. The tables really do key differently -- echo_intake_tokens
+# on gym_id, gyms on id -- and PostgREST answers an unknown order column with 400/42703,
+# which _get turns into ok=False. A fake that ignores `params` cannot see that, and that
+# blind spot shipped a resolver that was a permanent no-op in production while thirty
+# tests passed green. So this fake validates the order column the way the database does.
+_REAL_COLUMNS = {"echo_intake_tokens": {"gym_id", "echo_account_key"},
+                 "gyms": {"id", "name", "slug"}}
+
+
+def _plane(tokens, gyms, fail=False):
+    """A fake reader with _get's contract: (path, params) -> (rows, ok), which REJECTS a
+    request the real database would reject."""
     def get(path, params):
         if fail:
             return [], False
+        order_col = str(params.get("order", "")).split(".")[0]
+        if order_col and order_col not in _REAL_COLUMNS.get(path, set()):
+            return [], False   # PostgREST 400: column <path>.<order_col> does not exist
         rows = tokens if path == "echo_intake_tokens" else gyms
-        if truncate:
-            return rows, True if False else (rows, False)[1] and ([], False)
         off = int(params.get("offset", 0))
         lim = int(params.get("limit", 1000))
         return rows[off:off + lim], True
@@ -143,18 +154,23 @@ def test_two_gyms_deriving_the_same_key_refuses_both():
                   {"gym_id": LOCAL_B_ID, "echo_account_key": "twinbbb222"}],
                  [{"id": LOCAL_A_ID, "name": same_name},
                   {"id": LOCAL_B_ID, "name": same_name}])
-    # Force the collision by giving both gyms the same derived key via a stubbed derivation.
-    import agent.account_key_resolve as m
-    real = m._build
-
-    def collide(get=None):
-        live = frozenset({"twinaaa111", "twinbbb222"})
-        return live, {}, True
-    m._build = collide
+    # Drive the REAL _build so the collision branch is actually exercised. Both gyms are
+    # named "Twin", so both derive <slug><hash-of-their-own-id> -- distinct. To force one
+    # derived string to belong to two gyms we stub _base_key, which is what the collision
+    # branch defends against.
+    import agent.account_key as ak
+    real_base = ak._base_key
+    ak._base_key = lambda gid, name: "twincollision"
     try:
-        assert akr.resolve(d_a, now_fn=lambda: 1000.0, get=get) == d_a
+        akr.reset_cache()
+        live, mapping, by_gym, ok = akr._build(get=get, now_fn=lambda: 1000.0)
+        assert ok is True
+        assert "twincollision" not in mapping, \
+            "two gyms deriving one key must map NEITHER -- never pick one"
+        assert akr.resolve("twincollision", now_fn=lambda: 1000.0, get=get) == "twincollision"
     finally:
-        m._build = real
+        ak._base_key = real_base
+        akr.reset_cache()
 
 
 def test_a_gym_with_no_name_is_never_derived_for():
@@ -229,3 +245,80 @@ def test_the_reader_asks_for_bounded_ordered_pages():
     assert seen, "it must actually read"
     for params in seen:
         assert "limit" in params and "offset" in params and "order" in params, params
+
+
+# ---- the wave-2 audit's own findings, each with a guard ---------------------------------
+
+def test_every_table_is_ordered_by_a_column_it_actually_has():
+    """NEW-1, the bug that made the whole resolver a production no-op: the reader ordered
+    BOTH tables by gym_id, but `gyms` keys on `id`. PostgREST answers an unknown order
+    column with 400/42703 -> ok=False -> every key returned unchanged, forever, while the
+    suite passed green. This asserts the declared order column against each table's real
+    columns rather than merely asserting that SOME order was requested."""
+    for table, column in akr._ORDER_COLUMN.items():
+        assert column in _REAL_COLUMNS[table], \
+            f"{table} ordered by {column!r}, which that table does not have"
+
+
+def test_a_mint_path_forces_a_fresh_read_past_a_warm_cache():
+    """NEW-2: minting is a one-shot, permanent decision, and it shares the 300s cache with
+    the read path. A cache warmed seconds BEFORE a gym was created answers "" for it, the
+    caller falls back to deriving, and the split is recreated -- the Chateau case exactly."""
+    NEW_ID = "cccccccc-0000-4000-8000-00000000000c"
+    NEW_KEY = "crossfitchateauaaaabb"
+    world = {"tokens": [], "gyms": []}
+
+    def get(path, params):
+        rows = world["tokens"] if path == "echo_intake_tokens" else world["gyms"]
+        off = int(params.get("offset", 0)); lim = int(params.get("limit", 1000))
+        return rows[off:off + lim], True
+
+    # t+0: warm the cache while the gym does not exist yet.
+    assert akr.portal_key_for_gym(NEW_ID, now_fn=lambda: 0.0, get=get) == ""
+    # t+10: the portal creates it.
+    world["tokens"] = [{"gym_id": NEW_ID, "echo_account_key": NEW_KEY}]
+    world["gyms"] = [{"id": NEW_ID, "name": "CrossFit Chateau"}]
+    # t+30, still inside the 300s success cache: a cached miss would recreate the split.
+    assert akr.portal_key_for_gym(NEW_ID, now_fn=lambda: 30.0, get=get) == "", \
+        "the plain read is cache-served, which is exactly why a mint must not use it"
+    assert akr.portal_key_for_gym(NEW_ID, now_fn=lambda: 30.0, get=get, fresh=True) == NEW_KEY
+
+
+def test_a_suffixed_stale_key_resolves_and_keeps_its_suffix():
+    """NEW-6: account_key_mint deliberately preserves _ig/_fb, so suffixed stale keys
+    exist. They were previously left unresolved."""
+    get = _plane([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}],
+                 [{"id": REVERB_ID, "name": REVERB_NAME}])
+    assert akr.resolve(REVERB_STALE + "_ig", now_fn=lambda: 1.0, get=get) \
+        == REVERB_LIVE + "_ig"
+    assert akr.resolve(REVERB_STALE + "_fb", now_fn=lambda: 1.0, get=get) \
+        == REVERB_LIVE + "_fb"
+    assert akr.resolve(REVERB_LIVE + "_ig", now_fn=lambda: 1.0, get=get) \
+        == REVERB_LIVE + "_ig", "a live suffixed key is untouched"
+
+
+def test_every_key_a_gym_holds_counts_as_live_not_just_the_last_row():
+    """Audit #6: by_gym[gid] was overwritten unconditionally, so a gym with two token rows
+    kept only ONE of its keys in `live` -- while the comment claimed both were kept. A key
+    a gym genuinely holds must never be eligible as a remap target."""
+    get = _plane([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE},
+                  {"gym_id": REVERB_ID, "echo_account_key": "crossfitreverbold99"}],
+                 [{"id": REVERB_ID, "name": REVERB_NAME}])
+    live, mapping, by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    assert REVERB_LIVE in live and "crossfitreverbold99" in live, \
+        "both of the gym's real keys must be live"
+    assert REVERB_ID not in by_gym, "a gym with disagreeing rows must not be resolvable"
+
+
+def test_a_rebuild_that_runs_out_of_time_reports_incomplete():
+    """Audit #4: two paged reads on the auth path need a total budget, not just a per-read
+    timeout."""
+    clock = {"t": 0.0}
+
+    def slow(path, params):
+        clock["t"] += akr._BUILD_BUDGET  # one page burns the whole budget
+        return [{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}] * akr._PAGE, True
+
+    live, mapping, by_gym, ok = akr._build(get=slow, now_fn=lambda: clock["t"])
+    assert ok is False, "an over-budget rebuild must read as unknown, never as complete"

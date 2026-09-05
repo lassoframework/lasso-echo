@@ -35,6 +35,7 @@ truncated page, a gym whose rows disagree, a key that maps nowhere -- returns th
 UNCHANGED, which is exactly the pre-fix behaviour. Remapping is only ever done on an exact
 match against a complete, unambiguous reading.
 """
+import threading
 import time
 
 from . import config
@@ -47,9 +48,11 @@ _TTL_FAIL = 20.0
 _PAGE = 1000          # PostgREST caps responses; page explicitly so truncation is visible
 _MAX_PAGES = 20       # 20k gyms is far beyond the fleet; hitting it means "unknown"
 _READ_TIMEOUT = 8     # bounded: this runs before a request is served
+_BUILD_BUDGET = 25.0  # total seconds a whole rebuild may spend, all pages of both tables
 
 # state: {"at": float, "ok": bool, "live": frozenset, "map": dict}
-_cache = {"at": 0.0, "ok": False, "live": frozenset(), "map": {}, "by_gym": {}}
+_lock = threading.Lock()
+_cache = {"at": None, "ok": False, "live": frozenset(), "map": {}, "by_gym": {}}
 
 
 def _norm(value):
@@ -77,16 +80,33 @@ def _get(path, params):
         return [], False
 
 
-def _read_all(path, select, get=None):
+# The column each table is ordered by. THIS IS NOT COSMETIC (audit, 2026-09-04): the first
+# version hardcoded "gym_id.asc" for BOTH reads, but `gyms` keys on `id`, not `gym_id`.
+# PostgREST answers an unknown order column with 400 / 42703, _get maps any >=400 to
+# ok=False, and the whole resolver therefore returned every key unchanged FOREVER in
+# production while thirty tests passed green -- because every one of them injected a fake
+# reader that ignored `params`. A paging read must order by a column the table actually
+# has, and a test must drive the real parameter construction.
+_ORDER_COLUMN = {"echo_intake_tokens": "gym_id", "gyms": "id"}
+
+
+def _read_all(path, select, get=None, now_fn=None):
     """Every row of `path`, paged explicitly. Returns (rows, complete).
 
-    complete=False when a page fails OR the page budget is exhausted -- a silently
-    truncated read is what made the old ambiguity guard unsound, so truncation is surfaced
-    rather than mistaken for "that is all of them"."""
+    complete=False when a page fails, the page budget is exhausted, or the time budget is
+    spent -- a silently truncated read is what made the old ambiguity guard unsound, so
+    truncation is surfaced rather than mistaken for "that is all of them"."""
+    order = _ORDER_COLUMN.get(path)
+    if not order:
+        raise KeyError(f"no order column declared for table {path!r}")
     getter = get or _get
+    clock = now_fn or time.time
+    deadline = clock() + _BUILD_BUDGET
     rows, offset = [], 0
     for _ in range(_MAX_PAGES):
-        page, ok = getter(path, {"select": select, "order": "gym_id.asc",
+        if clock() > deadline:
+            return rows, False  # auth path: never spend an unbounded amount of time here
+        page, ok = getter(path, {"select": select, "order": f"{order}.asc",
                                  "limit": str(_PAGE), "offset": str(offset)})
         if not ok:
             return rows, False
@@ -97,31 +117,37 @@ def _read_all(path, select, get=None):
     return rows, False
 
 
-def _build(get=None):
+def _build(get=None, now_fn=None):
     """(live_keys, stale->live map, complete). Pure apart from the injected reader.
 
     live_keys: every account key the portal considers current, normalised.
     map:       Echo's DERIVED key for a gym -> that gym's live portal key. Computed from
                gym_id, so one entry can only ever belong to one gym.
     """
-    tokens, t_ok = _read_all("echo_intake_tokens", "gym_id,echo_account_key", get=get)
-    gyms, g_ok = _read_all("gyms", "id,name", get=get)
+    tokens, t_ok = _read_all("echo_intake_tokens", "gym_id,echo_account_key",
+                             get=get, now_fn=now_fn)
+    gyms, g_ok = _read_all("gyms", "id,name", get=get, now_fn=now_fn)
     if not (t_ok and g_ok):
         return frozenset(), {}, {}, False
 
     # A gym_id with more than one token row cannot be resolved: we cannot tell which key is
     # current, and picking wrong sends a write to the wrong place. Drop it from the map (its
     # keys still count as LIVE, so they are returned unchanged).
-    by_gym, dupes = {}, set()
+    # EVERY key any token row carries is LIVE, not just the last one seen. The previous
+    # version overwrote by_gym[gid] unconditionally, so a gym with two rows kept only one
+    # of its keys in `live` -- the comment claimed both were kept, and that was false. A
+    # key that a gym genuinely holds must never be eligible as a remap target.
+    by_gym, dupes, all_keys = {}, set(), set()
     for row in tokens:
         gid, key = _norm(row.get("gym_id")), _norm(row.get("echo_account_key"))
         if not gid or not key:
             continue
+        all_keys.add(key)
         if gid in by_gym and by_gym[gid] != key:
             dupes.add(gid)
         by_gym[gid] = key
 
-    live = frozenset(by_gym.values())
+    live = frozenset(all_keys)
     names = {_norm(g.get("id")): g.get("name") for g in gyms}
 
     from .account_key import _base_key  # noqa: PLC0415 - same package
@@ -147,24 +173,49 @@ def _build(get=None):
     return live, mapping, resolvable, True
 
 
-def _state(now_fn=None, get=None):
+def _state(now_fn=None, get=None, fresh=False):
+    """The cached view of the plane, rebuilding when stale (or when `fresh`).
+
+    Serialised: N concurrent cold requests used to each run a full rebuild. The lock is
+    held across the rebuild and re-checks the cache on entry, so the losers of the race
+    take the winner's result instead of issuing their own reads."""
     now = (now_fn or time.time)()
-    ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
-    if _cache["at"] and now - _cache["at"] < ttl:
-        return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
-    live, mapping, by_gym, ok = _build(get=get)
-    _cache.update({"at": now, "ok": ok, "live": live, "map": mapping, "by_gym": by_gym})
-    return live, mapping, by_gym, ok
+    if not fresh:
+        ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
+        if _cache["at"] is not None and now - _cache["at"] < ttl:
+            return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+    with _lock:
+        if not fresh:
+            ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
+            if _cache["at"] is not None and now - _cache["at"] < ttl:
+                return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+        live, mapping, by_gym, ok = _build(get=get, now_fn=now_fn)
+        _cache.update({"at": now, "ok": ok, "live": live, "map": mapping,
+                       "by_gym": by_gym})
+        return live, mapping, by_gym, ok
+
+
+_SUFFIXES = ("_ig", "_fb")
 
 
 def resolve(account_key, now_fn=None, get=None):
     """`account_key` mapped onto the key its gym's data lives under, or unchanged.
 
     Unchanged is returned whenever anything is uncertain: an unreadable or truncated plane,
-    a key that is already live, a key that maps nowhere, or a derived key two gyms share."""
+    a key that is already live, a key that maps nowhere, or a derived key two gyms share.
+
+    A platform-suffixed key resolves through its BASE and keeps its suffix
+    (crossfitreverb6cdf33_ig -> crossfitreverb30b5b2_ig). account_key_mint deliberately
+    preserves those suffixes, so suffixed stale keys genuinely exist and were previously
+    left unresolved."""
     key = _norm(account_key)
     if not key:
         return account_key
+    suffix = ""
+    for suf in _SUFFIXES:
+        if key.endswith(suf):
+            key, suffix = key[: -len(suf)], suf
+            break
     try:
         live, mapping, _by_gym, ok = _state(now_fn=now_fn, get=get)
     except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
@@ -172,10 +223,11 @@ def resolve(account_key, now_fn=None, get=None):
         return account_key
     if not ok or key in live:
         return account_key
-    return mapping.get(key, account_key)
+    remapped = mapping.get(key)
+    return f"{remapped}{suffix}" if remapped else account_key
 
 
-def portal_key_for_gym(gym_id, now_fn=None, get=None):
+def portal_key_for_gym(gym_id, now_fn=None, get=None, fresh=False):
     """The account key the PORTAL has already issued to this gym, or "".
 
     This is the anti-divergence primitive. The portal is where a gym is created and where
@@ -186,12 +238,18 @@ def portal_key_for_gym(gym_id, now_fn=None, get=None):
 
     "" on any uncertainty (unreadable or truncated plane, unknown gym, a gym whose token
     rows disagree), so a caller falls back to its existing behaviour rather than acting on
-    a half-read."""
+    a half-read.
+
+    PASS fresh=True FROM A MINT PATH. Minting is a one-shot, permanent decision, and the
+    300s success cache is shared with the read path: a cache warmed seconds BEFORE a brand
+    new gym was created answers "" for it, the caller falls back to deriving, and the split
+    this function exists to prevent is recreated -- exactly the Chateau case. A cache miss
+    on a write decision must be re-read, not believed."""
     gid = _norm(gym_id)
     if not gid:
         return ""
     try:
-        _live, _map, by_gym, ok = _state(now_fn=now_fn, get=get)
+        _live, _map, by_gym, ok = _state(now_fn=now_fn, get=get, fresh=fresh)
     except Exception as e:  # noqa: BLE001
         print(f"[key-resolve] portal key lookup unavailable: {type(e).__name__}: {e}")
         return ""
@@ -200,5 +258,5 @@ def portal_key_for_gym(gym_id, now_fn=None, get=None):
 
 def reset_cache():
     """Tests only."""
-    _cache.update({"at": 0.0, "ok": False, "live": frozenset(), "map": {},
+    _cache.update({"at": None, "ok": False, "live": frozenset(), "map": {},
                    "by_gym": {}})

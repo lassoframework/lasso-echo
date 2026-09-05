@@ -522,7 +522,7 @@ def _canonical_base(gym_id, answers):
     # nothing for this gym.
     try:
         from . import account_key_resolve as _akr
-        portal_key = _akr.portal_key_for_gym(gym_id)
+        portal_key = _akr.portal_key_for_gym(gym_id, fresh=True)
         if portal_key:
             return _clean(portal_key)
     except Exception:  # noqa: BLE001 - an unreadable plane falls through to derivation

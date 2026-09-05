@@ -323,6 +323,16 @@ def _default_writer(plan_row):
     blocked = blocking_data((str(plan_row.get("current") or "")).strip())
     if blocked:
         return False, f"BLOCKED: {blocked}"
+    # THE PORTAL OWNS THIS COLUMN (2026-09-04). echo_intake_tokens.echo_account_key is the
+    # key the PORTAL minted and the key Echo now treats as authoritative
+    # (account_key_resolve.portal_key_for_gym). Overwriting it with Echo's OWN derivation
+    # is the divergence that gave one gym two live keys in the first place -- and
+    # blocking_data above does not stop it, because a BRAND NEW gym owns no data yet, which
+    # is exactly the case that splits. So: never rewrite a key the portal itself minted.
+    current = (str(plan_row.get("current") or "")).strip().lower()
+    if current and current == _portal_derivation(gid, str(plan_row.get("name") or "")):
+        return False, ("BLOCKED: the portal minted this key and owns the column; Echo does "
+                       "not re-derive it (see account_key_resolve.portal_key_for_gym)")
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
@@ -339,6 +349,22 @@ def _default_writer(plan_row):
     except Exception as exc:  # noqa: BLE001
         return False, f"write failed: {type(exc).__name__}"
     return True, "updated"
+
+
+def _portal_derivation(gym_id, gym_name):
+    """The key the PORTAL would mint for this gym, as a 1:1 port of social-onboard.ts
+    deriveAccountKey:
+
+        idFrag = gymId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 6)
+        slug   = (gymName ?? "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40)
+        return slug ? slug + idFrag : "gym" + gymId.replace(/[^a-z0-9]/g, "").slice(0, 12)
+
+    Used ONLY to recognise a portal-minted key so Echo does not overwrite one. Never used
+    to mint: Echo does not mint portal keys, it defers to them."""
+    import re as _re
+    gid = _re.sub(r"[^a-z0-9]", "", (gym_id or "").lower())
+    slug = _re.sub(r"[^a-z0-9]", "", (gym_name or "").lower())[:40]
+    return (slug + gid[:6]) if slug else ("gym" + gid[:12])
 
 
 # ---- sweep ------------------------------------------------------------------------
