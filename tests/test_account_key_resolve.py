@@ -253,11 +253,24 @@ def test_every_table_is_ordered_by_a_column_it_actually_has():
     """NEW-1, the bug that made the whole resolver a production no-op: the reader ordered
     BOTH tables by gym_id, but `gyms` keys on `id`. PostgREST answers an unknown order
     column with 400/42703 -> ok=False -> every key returned unchanged, forever, while the
-    suite passed green. This asserts the declared order column against each table's real
-    columns rather than merely asserting that SOME order was requested."""
-    for table, column in akr._ORDER_COLUMN.items():
-        assert column in _REAL_COLUMNS[table], \
-            f"{table} ordered by {column!r}, which that table does not have"
+    suite passed green. This asserts every column of the declared order spec against each
+    table's real columns rather than merely asserting that SOME order was requested."""
+    for table, spec in akr._ORDER_COLUMN.items():
+        for term in spec.split(","):
+            column = term.split(".")[0].strip()
+            assert column in _REAL_COLUMNS[table], \
+                f"{table} ordered by {column!r}, which that table does not have"
+
+
+def test_a_duplicable_table_is_paged_by_a_unique_order():
+    """Offset paging over a non-unique column has non-deterministic tie order, so past one
+    page a row can be skipped -- silently dropping a live key out of `live` and making it
+    remappable. echo_intake_tokens can hold two rows per gym_id (that IS the split state
+    this module exists for), so gym_id alone is not a safe page order."""
+    spec = akr._ORDER_COLUMN["echo_intake_tokens"]
+    assert "echo_account_key" in spec, (
+        f"echo_intake_tokens paged by {spec!r}: gym_id is duplicable, so the order must be "
+        f"made unique by a second column")
 
 
 def test_a_mint_path_forces_a_fresh_read_past_a_warm_cache():
@@ -505,3 +518,76 @@ def test_the_raw_gym_id_is_hashed_not_a_lowercased_copy():
     assert akr.resolve(_base_key(MIXED_ID, "Mixed Case Gym"),
                        now_fn=lambda: 1.0, get=get) == LIVE, \
         "the resolver must hash the id exactly as the mint path does"
+
+
+def test_a_split_gym_holding_the_shared_key_still_blocks_the_remap():
+    """The wave-6 blocker. `holders` was counted over by_gym, which keeps only each gym's
+    LAST token row -- so a SPLIT gym holding the shared key as a non-final row was
+    invisible to the count and the shared key survived as a remap target.
+
+    Executed as: tenant X holds {sharedkey, other}; tenant Y holds {sharedkey}. by_gym sees
+    sharedkey once. After Y is re-keyed, Y's old link resolved onto a key now held by X
+    alone -- a cross-tenant misroute, on a path that governs writes. Split gyms are real:
+    Sunnyside, Nine 7 and Chateau were all split on prod on 2026-09-04."""
+    SHARED = "sharedkey0001"
+    X_ID = "aaaa0000-0000-4000-8000-00000000000x".replace("x", "1")
+    Y_ID = "bbbb0000-0000-4000-8000-00000000000y".replace("y", "2")
+    get = _plane([{"gym_id": X_ID, "echo_account_key": SHARED},
+                  {"gym_id": X_ID, "echo_account_key": "boltonclub9999"},
+                  {"gym_id": Y_ID, "echo_account_key": SHARED}],
+                 [{"id": X_ID, "name": "Bolton Club"},
+                  {"id": Y_ID, "name": "Bird Dog CrossFit"}])
+    _live, mapping, _by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    for src, target in mapping.items():
+        assert target != SHARED, (
+            f"{src!r} still maps onto a key two tenants hold: {mapping}")
+
+
+def test_a_mapping_target_is_always_held_by_exactly_one_gym():
+    """The invariant behind the guard, stated directly so a future refactor cannot satisfy
+    the specific repro above while breaking the general rule."""
+    A = "aaaa1111-0000-4000-8000-000000000001"
+    B = "bbbb2222-0000-4000-8000-000000000002"
+    C = "cccc3333-0000-4000-8000-000000000003"
+    get = _plane([{"gym_id": A, "echo_account_key": "sharedone"},
+                  {"gym_id": A, "echo_account_key": "aonly111111"},
+                  {"gym_id": B, "echo_account_key": "sharedone"},
+                  {"gym_id": C, "echo_account_key": "conly222222"}],
+                 [{"id": A, "name": "Gym A"}, {"id": B, "name": "Gym B"},
+                  {"id": C, "name": "Gym C"}])
+    _live, mapping, _by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    holders = {}
+    for row in [{"gym_id": A, "echo_account_key": "sharedone"},
+                {"gym_id": A, "echo_account_key": "aonly111111"},
+                {"gym_id": B, "echo_account_key": "sharedone"},
+                {"gym_id": C, "echo_account_key": "conly222222"}]:
+        holders.setdefault(row["echo_account_key"], set()).add(row["gym_id"])
+    for target in mapping.values():
+        assert len(holders.get(target, ())) == 1, (target, mapping)
+
+
+def test_a_warm_cache_raise_still_backs_off():
+    """The raise-path stamp only matters on a WARM cache: from cold, the `at`/`ok` write
+    supplies the backoff on its own, so the cold test passed even with the stamp deleted
+    while the warm brownout storm returned (200 plane reads / 100 requests)."""
+    world = {"poison": False, "reads": 0}
+
+    def flaky(path, params):
+        world["reads"] += 1
+        if world["poison"]:
+            return ([None] if path == "echo_intake_tokens" else []), True  # -> raises
+        rows = ([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}]
+                if path == "echo_intake_tokens" else [{"id": REVERB_ID, "name": REVERB_NAME}])
+        return rows, True
+
+    assert akr.resolve(REVERB_STALE, now_fn=lambda: 0.0, get=flaky) == REVERB_LIVE
+    world["poison"] = True
+    world["reads"] = 0
+    for i in range(100):
+        t = akr._TTL_OK + 1 + i * 0.01
+        akr.resolve(REVERB_STALE, now_fn=lambda t=t: t, get=flaky)
+    assert world["reads"] <= 6, (
+        f"{world['reads']} plane reads for 100 warm requests -- the raise path is not "
+        f"recording a backoff stamp")

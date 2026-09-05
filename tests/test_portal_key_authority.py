@@ -195,3 +195,91 @@ def test_reverbs_live_key_predates_the_convergence():
     from agent.account_key import _base_key
     assert _base_key(REVERB_ID, REVERB_NAME) == REVERB_ECHO_WOULD_DERIVE
     assert REVERB_ECHO_WOULD_DERIVE != REVERB_PORTAL
+
+
+def _node_bin():
+    for cand in ("/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node"):
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def test_the_portal_and_echo_derive_identical_keys_by_EXECUTION():
+    """The convergence pin, executed rather than grepped.
+
+    The text-matching version passed on two real drifts I care about: changing the portal's
+    slug regex to /[^a-z0-9_]+/g, and hashing id.toLowerCase() instead of id. Either one
+    splits keys again while every assertion about "sha256 appears in the file" stays green.
+    So this EXTRACTS the portal's own deriveAccountKey, runs it under node, and compares it
+    to account_key._base_key over a fixture set.
+
+    KNOWN LIMIT, flagged deliberately: lasso-echo's CI checks out one repo, so this skips
+    there and only fires on a machine that has the portal checkout. Cross-repo drift wants
+    a matching check in the PORTAL's own CI -- that is where a portal change is gated."""
+    import json
+    import re
+    import subprocess
+    import tempfile
+
+    node = _node_bin()
+    if not node or not os.path.exists(PORTAL_TS):
+        import pytest
+        pytest.skip("needs node and the portal checkout (see the docstring: CI has neither)")
+
+    src = open(PORTAL_TS, encoding="utf-8").read()
+    fn = src[src.index("export function deriveAccountKey"):]
+    fn = fn[: fn.index("\n}") + 2].replace("export function", "function")
+    fn = re.sub(r"\)\s*:\s*string\s*\{", ") {", fn)        # drop the RETURN annotation
+    fn = re.sub(r"(\w+)\s*:\s*string", r"\1", fn)          # drop the param annotations
+    fp = re.search(r"ID_FINGERPRINT_LEN\s*=\s*(\d+)", src).group(1)
+    slug_max = re.search(r"NAME_SLUG_MAXLEN\s*=\s*(\d+)", src).group(1)
+
+    cases = [
+        ("30b5b234-0dac-4048-87d8-5330e6fbfa9d", "CrossFit Reverb"),
+        ("f574c06c-498a-45f8-a599-b2a8863fadfb", "CrossFit Sunnyside"),
+        ("82f21b3c-4111-47f7-a7c3-ba82eb6a2b7c", "CrossFit Nine 7"),
+        ("5276b90e-d280-4c46-80b8-84d3c3dc54dd", "CrossFit Chateau"),
+        ("aaaabbbb-cccc-4ddd-8eee-ffff00001111", "Zanshin Fitness 630"),
+        ("11112222-3333-4444-8555-666677778888", "O'Malley's Gym & Co."),
+        ("99998888-7777-4666-8555-444433332222", "Ünïcode Gym İstanbul"),
+        ("12345678-90ab-4cde-8f01-234567890abc",
+         "A Very Long Gym Name That Exceeds The Slug Cap By Quite A Lot Indeed"),
+        # DISCRIMINATING FIXTURES. Without these the suite passes on real drifts:
+        #  * an UNDERSCORE separates /[^a-z0-9]+/ from /[^a-z0-9_]+/
+        #  * a MIXED-CASE id separates hashing `id` from hashing `id.toLowerCase()`
+        #  * leading/trailing space separates trim() from no-trim
+        ("abcd1234-0000-4000-8000-000000000001", "Iron_Works Gym"),
+        ("ABCD1234-0000-4000-8000-00000000000F", "Mixed Case Id Gym"),
+        ("  eeee1234-0000-4000-8000-000000000002  ", "  Padded Name Gym  "),
+        ("ffff1234-0000-4000-8000-000000000003", "Dots.And-Dashes_Gym"),
+    ]
+    harness = (
+        'const { createHash } = require("crypto");\n'
+        f"const ID_FINGERPRINT_LEN = {fp};\n"
+        f"const NAME_SLUG_MAXLEN = {slug_max};\n"
+        f"{fn}\n"
+        "const out = JSON.parse(process.argv[2]).map(([id, name]) => "
+        "deriveAccountKey(name, id));\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+        fh.write(harness)
+        path = fh.name
+    try:
+        proc = subprocess.run([node, path, json.dumps(cases)],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr[:400]
+        portal_keys = json.loads(proc.stdout)
+    finally:
+        os.unlink(path)
+
+    # Compare against canonical_account_key, the function the portal's deriveAccountKey
+    # actually mirrors (its own comments say so). _base_key is the inner half and does NOT
+    # strip the id, which is a real difference on a padded value -- account_key_resolve
+    # calls _base_key directly and therefore strips the id itself before doing so.
+    from agent.account_key import canonical_account_key
+    echo_keys = [canonical_account_key(gid, name) for gid, name in cases]
+    mismatches = [(c, p, e) for c, p, e in zip(cases, portal_keys, echo_keys) if p != e]
+    assert not mismatches, (
+        "the portal and Echo no longer derive the same key -- every newly onboarded gym "
+        f"will split again: {mismatches}")

@@ -88,7 +88,13 @@ def _get(path, params):
 # production while thirty tests passed green -- because every one of them injected a fake
 # reader that ignored `params`. A paging read must order by a column the table actually
 # has, and a test must drive the real parameter construction.
-_ORDER_COLUMN = {"echo_intake_tokens": "gym_id", "gyms": "id"}
+# The order each table is paged by. It must be UNIQUE per row: offset paging over a
+# non-unique column has non-deterministic tie order, so past one page a row can be skipped
+# entirely -- which would silently drop a live key out of `live` and make it remappable.
+# echo_intake_tokens can hold two rows per gym_id (that is the split state this module
+# exists for), so it is ordered by the composite.
+_ORDER_COLUMN = {"echo_intake_tokens": "gym_id.asc,echo_account_key.asc",
+                 "gyms": "id.asc"}
 
 
 def _read_all(path, select, get=None, now_fn=None, deadline=None):
@@ -111,7 +117,7 @@ def _read_all(path, select, get=None, now_fn=None, deadline=None):
     for _ in range(_MAX_PAGES):
         if clock() > deadline:
             return rows, False  # auth path: never spend an unbounded amount of time here
-        page, ok = getter(path, {"select": select, "order": f"{order}.asc",
+        page, ok = getter(path, {"select": select, "order": order,
                                  "limit": str(_PAGE), "offset": str(offset)})
         if not ok:
             return rows, False
@@ -156,7 +162,13 @@ def _build(get=None, now_fn=None):
 
     live = frozenset(all_keys)
     names = {_norm(g.get("id")): g.get("name") for g in gyms}
-    raw_ids = {_norm(g.get("id")): str(g.get("id") or "") for g in gyms}
+    # STRIPPED, NOT LOWERCASED. The portal trims the id before hashing
+    # (social-onboard.ts: `const id = (gymId ?? "").trim()`), and so does
+    # canonical_account_key -- but _base_key, which this module calls DIRECTLY, does not.
+    # A padded id in the column would therefore hash differently here than at either mint
+    # site: found by the execution pin's padded-id fixture, not by reading. Case is
+    # preserved, because both mint sites hash the id's real case.
+    raw_ids = {_norm(g.get("id")): str(g.get("id") or "").strip() for g in gyms}
 
     from .account_key import _base_key, _slugify_name  # noqa: PLC0415 - same package
     mapping, collided = {}, set()
@@ -192,10 +204,20 @@ def _build(get=None, now_fn=None):
     # backoff makes the window unbounded rather than one cache TTL.
     #
     # There is no safe remap onto a key whose owner is ambiguous, so drop those entries.
+    # COUNT HOLDERS FROM THE TOKEN ROWS, NOT FROM by_gym. by_gym keeps ONE key per gym
+    # (last row wins), so a SPLIT gym that holds the shared key as a non-final row is
+    # invisible to the count and its target survives the drop. Executed repro: tenant X
+    # holds {sharedkey, boltonclub} and tenant Y holds {sharedkey}; by_gym sees each key
+    # once, the mapping keeps -> sharedkey, and after Y is re-keyed, Y's old link resolves
+    # onto a key now held by X ALONE. Split gyms are not hypothetical -- Sunnyside, Nine 7
+    # and Chateau were all split on prod on 2026-09-04, and this governs writes.
     holders = {}
-    for gid, live_key in by_gym.items():
-        holders[live_key] = holders.get(live_key, 0) + 1
-    for src in [k for k, target in mapping.items() if holders.get(target, 0) > 1]:
+    for row in tokens:
+        gid, key = _norm(row.get("gym_id")), _norm(row.get("echo_account_key"))
+        if gid and key:
+            holders.setdefault(key, set()).add(gid)
+    for src in [k for k, target in mapping.items()
+                if len(holders.get(target, ())) > 1]:
         mapping.pop(src, None)
     resolvable = {gid: k for gid, k in by_gym.items() if gid not in dupes}
     return live, mapping, resolvable, True
