@@ -1110,6 +1110,24 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def media_swap_free_enabled() -> bool:
+    """ECHO_MEDIA_SWAP_FREE, default OFF. The client-initiated FREE photo swap (B6).
+
+    A gym gets 15 recreates a month. The portal's only levers are approve / edit /
+    deny / kill, so "use a different photo" and "the caption needs work" are both a
+    deny and both burn one of the 15. Pete (zanshin) ran out of recreates swapping
+    PHOTOS. The counter was never wrong; the two actions were never separated.
+
+    ON: a media swap is FREE and unlimited (the caption Echo wrote is kept, only the
+    pixels change, so nothing is regenerated and nothing is spent). A caption
+    recreate still costs one of 15. OFF (default): byte-for-byte today's behavior --
+    the swap endpoint 403s and every deny charges the budget.
+
+    NEW client capability, so it ships dark. Arm by hand: ECHO_MEDIA_SWAP_FREE=true.
+    """
+    return _truthy(os.environ.get("ECHO_MEDIA_SWAP_FREE", "false"))
+
+
 def portal_show_rejected() -> bool:
     """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
 
