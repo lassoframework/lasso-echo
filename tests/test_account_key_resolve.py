@@ -591,3 +591,23 @@ def test_a_warm_cache_raise_still_backs_off():
     assert world["reads"] <= 6, (
         f"{world['reads']} plane reads for 100 warm requests -- the raise path is not "
         f"recording a backoff stamp")
+
+
+def test_a_padded_gym_id_derives_the_same_key_as_the_mint_sites():
+    """NEW-1. The id strip was asserted only in a comment: reverting it passed all 5339
+    tests. The portal trims the id before hashing (social-onboard.ts) and
+    canonical_account_key strips at account_key.py:95 -- but _base_key, which this module
+    calls DIRECTLY, does not. Unreachable through a `uuid` column today, which is exactly
+    why it needs a test rather than a comment."""
+    from agent.account_key import canonical_account_key
+    PADDED = "  eeee1234-0000-4000-8000-000000000002  "
+    NAME, LIVE = "Padded Name Gym", "paddednamegymlive1"
+    get = _plane([{"gym_id": PADDED, "echo_account_key": LIVE}],
+                 [{"id": PADDED, "name": NAME}])
+    _live, mapping, _by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    expected = canonical_account_key(PADDED, NAME)
+    assert expected in mapping, (
+        f"the resolver derived {list(mapping)} but the mint sites derive {expected!r} -- "
+        f"a padded id must hash identically in both places")
+    assert mapping[expected] == LIVE

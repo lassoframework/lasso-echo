@@ -145,7 +145,9 @@ def _build(get=None, now_fn=None):
 
     # A gym_id with more than one token row cannot be resolved: we cannot tell which key is
     # current, and picking wrong sends a write to the wrong place. Drop it from the map (its
-    # keys still count as LIVE, so they are returned unchanged).
+    # keys still count as LIVE, so they are returned unchanged). Also defensive -- the
+    # portal declares unique(gym_id) on this table -- for the same reason as the target
+    # guard below.
     # EVERY key any token row carries is LIVE, not just the last one seen. The previous
     # version overwrote by_gym[gid] unconditionally, so a gym with two rows kept only one
     # of its keys in `live` -- the comment claimed both were kept, and that was false. A
@@ -194,8 +196,12 @@ def _build(get=None, now_fn=None):
     for key in collided:
         mapping.pop(key, None)
     # A TARGET held by MORE THAN ONE GYM is unsafe, even though its SOURCE is unique.
-    # Two gyms genuinely sharing one current key is a real production state (the Bird Dog /
-    # Bolton collision this repo's reconciler exists for). That yields {dA: K, dB: K}: two
+    # DEFENSIVE, NOT OBSERVED: echo_intake_tokens declares unique(gym_id) AND
+    # unique(echo_account_key) (portal migrations 0254 and 0292), so under the schema two
+    # gyms cannot share a key and one gym cannot hold two rows. This guard exists because
+    # the module must fail closed on a shape it is handed, not on a shape it assumes -- the
+    # constraint could be dropped, a read could be served from a replica mid-migration, or
+    # a future table could relax it. The shape it defends against yields {dA: K, dB: K}: two
     # distinct derived sources pointing at one shared key. The moment either gym is re-keyed
     # -- a portal re-onboard, a reconciler run -- its OWN new live key is briefly absent
     # from this cached view, and the old mapping would rewrite it onto the OTHER tenant's
