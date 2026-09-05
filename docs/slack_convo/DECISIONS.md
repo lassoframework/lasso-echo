@@ -1190,3 +1190,66 @@ CORRECT for ZZ Test Gym. That gym has no `echo_intake_tokens` row, so no `accoun
 so `answer_lane` had zero facts and refused to guess. A gym with a real Echo account
 grounds that question from `handle_social_status`. The bug was the silence, not the
 refusal.
+
+## D55. Postmortem: zero messages ever posted, and why every prior "green" was wrong (2026-09-05)
+
+Blake asked for a plain account of three things: what actually happened, why earlier
+reports of this system working were wrong, and what check would have caught it sooner.
+
+**What actually happened.** Every outbound row in `support_messages` -- every escalation,
+every fixer_request card, every hold notice, every conversational reply, across every
+identity, since this table existed -- was stuck. `outbox.py`'s dispatch is a
+compare-and-swap: claim a row by PATCHing `delivery_status` from `ready` to `posting` in
+one round trip (so two concurrent consumers, a redeploy overlap or a second Wrangler on
+the same rows, can never double-post one row), THEN post to Slack, THEN mark it `posted`.
+Migration 0309 defined the `delivery_status` CHECK constraint the day this table was
+built, and it listed only the STEADY states its own comment described --
+`drafted/held/ready/posted/suppressed/failed` -- never `posting`, the TRANSIENT state the
+code has always needed mid-claim. Every single claim attempt raised a Postgres 400 and
+was logged as `[slack-convo/outbox] claim failed for row ...: BusError`. Nothing ever
+reached `posted`. A separate bug in `echo_ticket_worker.py` compounded this for the
+portal-ticket bridge specifically: its escalation path wrote `support_tickets.status=
+'escalated'`, a value the `status` CHECK constraint has never allowed either, so even the
+ATTEMPT to write an escalation row failed before the (already-broken) claim step was ever
+reached -- a ticket in this state retried identically, forever, with a duplicate inbound
+row recorded on every retry, and no card ever reaching a human. A real client's ticket
+sat in exactly this loop from the moment the portal bridge was first armed until this was
+found, hours later, running a live regression test.
+
+**Why the earlier reports were wrong.** Every existing test in this system -- for both
+constraints, across dozens of tests written over multiple sessions -- ran against a
+`FakeBus` or an in-memory dict that accepted any string as a valid `status` or
+`delivery_status`. None of them touched a real Postgres CHECK constraint, so none of them
+could ever fail this way. A build that reports "5,000+ tests passing" is a true statement
+about the CODE'S OWN LOGIC and a false signal about whether that code can actually write
+to the real table it targets -- the tests and the schema had quietly drifted apart, and
+nothing in the test suite's own shape could reveal that, no matter how many times it was
+run. D33's earlier audit found and fixed a related but different bug (a row stranded by a
+wrong `bot_identity`, not an illegal literal) using the same kind of FakeBus, and correctly
+closed clean -- because that bug WAS reachable through a FakeBus. This class of bug is
+categorically invisible to that testing strategy, not a gap in how carefully any single
+audit was run.
+
+**What check would have caught it sooner.** A static test with no live database
+connection at all: read every Postgres CHECK constraint's actual allowed values (via
+`pg_get_constraintdef`, not a migration file's comment describing intent) into an
+explicit allow-list constant, then statically scan every place in the codebase that
+writes to that column for string literals, and assert every one is a member of that
+constant. This is now `tests/test_db_constraint_contract.py` -- it parses the known
+writer files with Python's own `ast` module (no test double, no live DB) and would have
+failed on day one of either bug: `'escalated'` is not in `support_tickets.status`'s
+allow-list, and `'posting'` was not in `support_messages.delivery_status`'s allow-list
+until this postmortem's own fix. The two-way guard matters as much as the check itself:
+the test also asserts the allow-list constants themselves still contain `posting` and
+`hold`+`escalated=True` (not the string `'escalated'`) -- so a future edit that quietly
+narrows the allow-list back to the broken state fails immediately, not months later on a
+real client's ticket.
+
+The generalizable lesson, not specific to this table: a FakeBus (or any test double) is
+only as good as the constraints it happens to enforce. When the real backing store has
+constraints the double does not model -- a CHECK constraint, a foreign key, a uniqueness
+rule -- passing tests prove the code's logic is internally consistent, not that it can
+actually talk to production. A schema-contract test, run statically against the actual
+DDL rather than a description of it, is the check that closes that specific gap, and is
+worth having for any column with a narrow, hand-maintained CHECK constraint that
+application code writes literals into.

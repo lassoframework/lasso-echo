@@ -5,19 +5,23 @@ Blake (spec item 7): "bot identity is config. product, worker, allowed lanes, re
 doc, and per-identity flags live in one config per bot. Adding Ranger or Lainey is a config
 entry, not code. Echo ships first. Others ship with their config present and flags OFF."
 
-Every identity below is fully described, but only Echo has live Slack tokens in this
-service's environment today. The listener starts one Bolt App per identity whose tokens are
-present; an identity with no tokens is simply not started (and says so once at boot). So
-arming Ranger, Scout, Wrangler or Lainey here is: set their two token env vars, flip their
+Every identity below is fully described. The listener starts one Bolt App per identity
+whose tokens are present; an identity with no tokens is simply not started (and says so
+once at boot). So arming an identity here is: set its two token env vars, flip its
 per-identity flag. No code change.
 
-Ground truth about the other four (2026-09-03 recon), so nobody is surprised at arming:
-  - Wrangler and Scout are REAL separate Slack apps today, each with its own listener
-    process on Blake's Mac (~/wrangler-listener, ~/scout-listener). Consolidating them
-    into this Railway process is a decision for Blake, not something this file assumes.
-  - Ranger has no Slack bot identity of its own today; it is the ad-engine feature plus
-    the fixer-lane cron in the portal. Its row here is ready for when it gets one.
-  - Lainey (lasso-engage) is an SMS/voice persona with no Slack surface today.
+Ground truth (2026-09-05, Phase 4 arming): Echo, Scout, Ranger, and Wrangler all now have
+live tokens in this Railway service's environment and run as separate Bolt Apps in the
+SAME process (agent/slack_convo/listener_wiring.py's start_additional_identities()), each
+with its own bot token, channel wiring, and SLACK_CONVO_<IDENTITY>_* flags -- all four
+are armed (ENABLED + STAFF_REPLY + CLIENT_REPLY). Only Lainey (lasso-engage, an SMS/voice
+persona) remains unarmed and has no Slack surface today; its row here is ready for when
+it gets one. Wrangler's bot token is missing the channels:write/groups:write/mpim:write/
+im:write scopes, so it cannot proactively open a new DM (conversations.open) -- it can
+still reply in any channel it can join or any DM/MPIM a human already opened, which is
+every path this system's own client-reply flow actually uses today; add those scopes to
+its Slack app only if outreach.py's ticket-initiated group-DM path is ever wired to
+Wrangler.
 
 Token env NAMES live here; values are set by hand in the service environment and are
 never read into any object, never logged.
