@@ -48,7 +48,7 @@ _TTL_FAIL = 20.0
 _PAGE = 1000          # PostgREST caps responses; page explicitly so truncation is visible
 _MAX_PAGES = 20       # 20k gyms is far beyond the fleet; hitting it means "unknown"
 _READ_TIMEOUT = 8     # bounded: this runs before a request is served
-_BUILD_BUDGET = 25.0  # total seconds a whole rebuild may spend, all pages of both tables
+_BUILD_BUDGET = 25.0  # total seconds ONE rebuild may spend across ALL pages of BOTH tables
 
 # state: {"at": float, "ok": bool, "live": frozenset, "map": dict}
 _lock = threading.Lock()
@@ -90,7 +90,7 @@ def _get(path, params):
 _ORDER_COLUMN = {"echo_intake_tokens": "gym_id", "gyms": "id"}
 
 
-def _read_all(path, select, get=None, now_fn=None):
+def _read_all(path, select, get=None, now_fn=None, deadline=None):
     """Every row of `path`, paged explicitly. Returns (rows, complete).
 
     complete=False when a page fails, the page budget is exhausted, or the time budget is
@@ -101,7 +101,11 @@ def _read_all(path, select, get=None, now_fn=None):
         raise KeyError(f"no order column declared for table {path!r}")
     getter = get or _get
     clock = now_fn or time.time
-    deadline = clock() + _BUILD_BUDGET
+    # The budget is the WHOLE rebuild's, shared across both tables. Computing it per table
+    # doubled it silently -- the previous version could spend 2 x _BUILD_BUDGET while
+    # holding the rebuild lock, stalling every concurrent tokened request behind it.
+    if deadline is None:
+        deadline = clock() + _BUILD_BUDGET
     rows, offset = [], 0
     for _ in range(_MAX_PAGES):
         if clock() > deadline:
@@ -124,9 +128,11 @@ def _build(get=None, now_fn=None):
     map:       Echo's DERIVED key for a gym -> that gym's live portal key. Computed from
                gym_id, so one entry can only ever belong to one gym.
     """
+    clock = now_fn or time.time
+    deadline = clock() + _BUILD_BUDGET
     tokens, t_ok = _read_all("echo_intake_tokens", "gym_id,echo_account_key",
-                             get=get, now_fn=now_fn)
-    gyms, g_ok = _read_all("gyms", "id,name", get=get, now_fn=now_fn)
+                             get=get, now_fn=now_fn, deadline=deadline)
+    gyms, g_ok = _read_all("gyms", "id,name", get=get, now_fn=now_fn, deadline=deadline)
     if not (t_ok and g_ok):
         return frozenset(), {}, {}, False
 
@@ -190,6 +196,14 @@ def _state(now_fn=None, get=None, fresh=False):
             if _cache["at"] is not None and now - _cache["at"] < ttl:
                 return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
         live, mapping, by_gym, ok = _build(get=get, now_fn=now_fn)
+        if not ok and _cache["ok"]:
+            # A FAILED read never demotes a HEALTHY cache. A mint path forces fresh=True,
+            # and one such read during a brownout used to overwrite a good answer with an
+            # unusable one -- the read path would then return every key unchanged for the
+            # next _TTL_FAIL seconds even though the plane had already recovered. The
+            # caller still gets the honest "not ok" for ITS decision; what is retained is
+            # only what everyone else was already being served.
+            return _cache["live"], _cache["map"], _cache["by_gym"], False
         _cache.update({"at": now, "ok": ok, "live": live, "map": mapping,
                        "by_gym": by_gym})
         return live, mapping, by_gym, ok
@@ -208,20 +222,31 @@ def resolve(account_key, now_fn=None, get=None):
     (crossfitreverb6cdf33_ig -> crossfitreverb30b5b2_ig). account_key_mint deliberately
     preserves those suffixes, so suffixed stale keys genuinely exist and were previously
     left unresolved."""
-    key = _norm(account_key)
-    if not key:
+    whole = _norm(account_key)
+    if not whole:
         return account_key
-    suffix = ""
-    for suf in _SUFFIXES:
-        if key.endswith(suf):
-            key, suffix = key[: -len(suf)], suf
-            break
     try:
         live, mapping, _by_gym, ok = _state(now_fn=now_fn, get=get)
     except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
         print(f"[key-resolve] unavailable: {type(e).__name__}: {e}")
         return account_key
-    if not ok or key in live:
+    if not ok:
+        return account_key
+    # THE WHOLE KEY IS CHECKED AGAINST live FIRST, BEFORE ANY SUFFIX IS STRIPPED. The
+    # suffix feature originally stripped first, which meant a live key STORED WITH a
+    # suffix was never protected by "a live key is never rewritten" -- resolve() would
+    # strip '_ig', resolve the base, and hand back either a doubled suffix or, in the
+    # adversarial case, another tenant's key. account_key_mint re-applies _ig/_fb to the
+    # portal key and the portal stores exactly what Echo reports, so such rows are a real
+    # write path, not a hypothetical.
+    if whole in live:
+        return account_key
+    key, suffix = whole, ""
+    for suf in _SUFFIXES:
+        if key.endswith(suf):
+            key, suffix = key[: -len(suf)], suf
+            break
+    if key in live:
         return account_key
     remapped = mapping.get(key)
     return f"{remapped}{suffix}" if remapped else account_key

@@ -322,3 +322,67 @@ def test_a_rebuild_that_runs_out_of_time_reports_incomplete():
 
     live, mapping, by_gym, ok = akr._build(get=slow, now_fn=lambda: clock["t"])
     assert ok is False, "an over-budget rebuild must read as unknown, never as complete"
+
+
+# ---- wave-3 audit findings -------------------------------------------------------------
+
+def test_a_live_key_stored_with_a_suffix_is_never_rewritten():
+    """NEW-A, MAJOR. The suffix feature stripped _ig/_fb BEFORE the live check, so a live
+    key stored WITH a suffix lost the protection the whole design rests on. Adversarially:
+    if gym A's live key is gym B's derived key + '_ig', A's own key was rewritten to B."""
+    a_live = "attackerlive_ig"
+    get = _plane([{"gym_id": LOCAL_A_ID, "echo_account_key": a_live},
+                  {"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}],
+                 [{"id": LOCAL_A_ID, "name": "Attacker"},
+                  {"id": REVERB_ID, "name": REVERB_NAME}])
+    assert akr.resolve(a_live, now_fn=lambda: 1.0, get=get) == a_live, \
+        "a live key is a live key, suffix or not"
+    # and the doubled-suffix garbage it used to produce is gone
+    assert not akr.resolve(a_live, now_fn=lambda: 1.0, get=get).endswith("_ig_ig")
+
+
+def test_the_build_budget_is_total_across_both_tables():
+    """NEW-C: the deadline was computed per table, so a rebuild could spend 2x the budget
+    while holding the rebuild lock."""
+    clock = {"t": 0.0}
+
+    def slow(path, params):
+        clock["t"] += akr._BUILD_BUDGET * 0.6  # each page burns 60% of the whole budget
+        return [{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}] * akr._PAGE, True
+
+    start = clock["t"]
+    _live, _map, _by_gym, ok = akr._build(get=slow, now_fn=lambda: clock["t"])
+    assert ok is False
+    assert clock["t"] - start <= akr._BUILD_BUDGET * 2, \
+        "one rebuild must not be able to spend a per-table budget twice"
+
+
+def test_a_failed_fresh_read_does_not_clobber_a_healthy_cache():
+    """NEW-D: a mint path forces fresh=True. One such read during a brownout used to
+    overwrite a good cache, so the READ path then returned every key unchanged for the
+    next _TTL_FAIL seconds even though the plane had already recovered."""
+    world = {"fail": False}
+
+    def flaky(path, params):
+        if world["fail"]:
+            return [], False
+        rows = ([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}]
+                if path == "echo_intake_tokens" else [{"id": REVERB_ID, "name": REVERB_NAME}])
+        return rows, True
+
+    assert akr.resolve(REVERB_STALE, now_fn=lambda: 1.0, get=flaky) == REVERB_LIVE
+    world["fail"] = True
+    assert akr.portal_key_for_gym(REVERB_ID, now_fn=lambda: 2.0, get=flaky, fresh=True) == "", \
+        "the mint path still gets an honest 'unknown' for its own decision"
+    world["fail"] = False
+    assert akr.resolve(REVERB_STALE, now_fn=lambda: 3.0, get=flaky) == REVERB_LIVE, \
+        "everyone else keeps being served the healthy answer"
+
+
+def test_an_undeclared_table_raises_rather_than_guessing_an_order_column():
+    """_ORDER_COLUMN is the single place a table's ordering is declared. A new table with
+    no entry must fail loudly here, not silently order by something that does not exist --
+    which is exactly how the production no-op shipped."""
+    import pytest
+    with pytest.raises(KeyError):
+        akr._read_all("some_new_table", "id", get=lambda p, q: ([], True))
