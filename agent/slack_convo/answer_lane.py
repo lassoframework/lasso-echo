@@ -118,6 +118,34 @@ def default_llm(system, user, *, model=None):
     return "".join(parts).strip()
 
 
+def _speaker_identity(speaker, fallback):
+    from . import identities as _ids
+    try:
+        return _ids.get(speaker)
+    except KeyError:
+        return fallback
+
+
+_IDENTITY_SENTENCE = _re.compile(r"[^.\n]*\b{}\b[^.\n]*[.\n]?", _re.IGNORECASE)
+
+
+def _domain_guidance_only(doc, routed_name):
+    """The routed voice doc minus every line that names the routed bot.
+
+    A voice doc mixes two things: who the bot IS ("Wrangler is the LASSO team member who
+    builds and maintains gym websites") and how to talk about its SUBJECT. Only the second
+    travels when another bot answers -- the first is a claim about identity that would be
+    false in the speaker's mouth however it is phrased, and rewriting the name only makes it
+    a more convincing falsehood (audit 6, finding 5)."""
+    kept = []
+    for line in (doc or "").splitlines():
+        if _re.search(rf"\b{_re.escape(routed_name)}\b", line, _re.IGNORECASE):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    return text[:2000]
+
+
 def _voice_rules(identity):
     try:
         import os
@@ -213,18 +241,25 @@ def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, 
     # from the SPEAKER; what routing moves is the subject matter, stated explicitly.
     voice = _voice_rules(identity)
     if speaks_as and speaks_as != identity.name:
-        # Audit 5, finding 6: the audit-4 fix swapped the whole voice doc to the SPEAKER's,
-        # which removed the only thing D50 routing actually moves -- the routed product's
-        # domain guidance -- leaving a capability that did nothing. The doc that matters is
-        # the routed one; what must not survive is the other bot's NAME, because the client
-        # is talking to exactly one bot. So the routed guidance is kept and every mention of
-        # the routed bot's name is rewritten to the speaker's, which is precisely the
-        # substitution a human would make reading it aloud.
-        voice = _re.sub(rf"\b{_re.escape(identity.name)}\b", speaker.capitalize(), voice,
-                        flags=_re.IGNORECASE)
+        # Audit 6, findings 5 and 6: rewriting the routed bot's NAME to the speaker's turned
+        # its self-description into a FALSE ROLE CLAIM in a client-facing prompt ("Scout is
+        # the LASSO team member who builds and maintains gym websites"), and the substitution
+        # was a case-insensitive \bname\b over the whole doc -- "echo" is both an identity
+        # and an ordinary English word, so the same code would silently corrupt text the day
+        # routing ever targets Echo.
+        #
+        # No substitution. The SPEAKER's own voice doc is the voice (one bot, one identity),
+        # and from the routed doc we take only the lines that do not talk about who that bot
+        # IS -- which is exactly the domain guidance routing exists to move, with none of the
+        # identity statements that made it a lie.
+        own = _voice_rules(_speaker_identity(speaker, identity))
+        routed_guidance = _domain_guidance_only(voice, identity.name)
+        voice = own
+        if routed_guidance:
+            voice += (f"\n\nGuidance for questions about a client's {identity.product} "
+                      f"(this is one):\n{routed_guidance}")
         voice += (f"\n\nThis question is about the client's {identity.product}. Answer it "
-                  f"from the FACTS block, in your own voice as {speaker.capitalize()}, and "
-                  f"never introduce yourself as any other name.")
+                  f"from the FACTS block, in your own voice as {speaker.capitalize()}.")
     system = _SYSTEM.format(bot=speaker.capitalize(), who=who.kind, voice=voice)
     user = ("FACTS:\n" + json.dumps(facts, default=str, indent=1)[:6000] +
             "\n\nCONVERSATION SO FAR (most recent last):\n" +

@@ -141,10 +141,21 @@ def test_live_deps_never_hardcodes_a_none_capability():
                         f"whose OFF state is honest about what is not running.")
 
 
-def test_the_boot_assertion_is_actually_called_from_the_wiring_path():
-    """An assertion nobody calls is the very bug it exists to catch."""
-    assert "build_classify_llm(" in _live_deps_source()
-    assert "assert_classifier_shape(" in inspect.getsource(LW.build_classify_llm)
+def test_the_boot_assertion_is_actually_called_from_the_wiring_path(monkeypatch):
+    """An assertion nobody calls is the very bug it exists to catch.
+
+    Audit 6, weakness 5: this was two `in inspect.getsource(...)` substring checks -- the
+    anti-pattern this very file names at the top -- and would have passed if live_deps called
+    build_classify_llm and discarded the result. It RUNS live_deps now, with the flag on and
+    nothing behind it, and requires the refusal to propagate."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLASSIFIER_LLM", "true")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("AGENT_SLACK_BOT_TOKEN", "xoxb-not-real")
+    from tests.test_slack_convo import FakeBus
+    with pytest.raises(LW.NotWiredError):
+        LW.live_deps(IDS.get("echo"), bus=FakeBus(), log=lambda *a: None)
 
 
 def test_a_capability_flagged_on_with_nothing_behind_it_refuses_to_boot(monkeypatch):

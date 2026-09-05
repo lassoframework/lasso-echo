@@ -32,6 +32,11 @@ _MESSAGES = "support_messages"
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
 
 
+def _a_kind_escalation():
+    from .adapter import KIND_ESCALATION
+    return KIND_ESCALATION
+
+
 class BusError(RuntimeError):
     def __init__(self, status, detail=""):
         self.status = status
@@ -290,6 +295,22 @@ class Bus:
             "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
             "attachments->>kind": f"eq.{kind}", "created_at": f"gte.{since_iso}",
             "select": "id"})
+        return len(rows)
+
+    def count_escalation_cards_since(self, ticket_id, since_iso):
+        """Escalation rows on a ticket since a timestamp, EXCLUDING receipts.
+
+        Receipts ride on kind='escalation' (the portal's client-visibility denylist has no
+        'receipt' entry, so a new kind would be readable by the client). They are marked with
+        attachments.receipt, and every bound that means "have we already told a human about
+        this" must exclude them -- otherwise one receipt suppresses a real card for the rest
+        of the day (audit 6, finding 3). Filtered server-side, so it cannot undercount the
+        way a client-side scan of the oldest 200 rows did."""
+        rows = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "attachments->>kind": f"eq.{_a_kind_escalation()}",
+            "attachments->>receipt": "is.null",
+            "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
 
     def outbox(self, status="ready", limit=50, identity=None):

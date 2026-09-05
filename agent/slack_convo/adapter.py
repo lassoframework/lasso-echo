@@ -347,9 +347,15 @@ def may_auto_answer(question, body=""):
     portal bridge did not -- it called auto_answer_forbidden twice and auto_answer_allowed
     never. Two paths, one rule, written out twice, drifted within a day of being written.
     They share this now."""
+    # Audit 6, finding 1: asks_us_to_publish was applied to the model-written ANSWER too,
+    # and an answer legitimately says things like "your post about the new class went out
+    # tuesday" -- which is a content verb next to a claim marker, so 4 of 10 realistic
+    # answers were held. A REQUEST to publish can only ever appear in what the PERSON wrote;
+    # our own reply cannot ask us to do anything. So the publish guard reads the question
+    # only. The topic denylist still reads both, because a hard-line SUBJECT can surface in
+    # an answer that a benign question invited.
     return (auto_answer_allowed(question)
-            and not auto_answer_forbidden(body or "")
-            and not asks_us_to_publish(body or ""))
+            and not auto_answer_forbidden(body or ""))
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------

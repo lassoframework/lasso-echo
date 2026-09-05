@@ -104,7 +104,14 @@ def is_test_ticket_strict(ticket):
 
 
 def exclude_test(tickets):
-    """The list, minus our own probes. The one call every report and metric should use."""
+    """The list, minus our own probes. The call a report or metric should use.
+
+    Audit 6, finding 9: this had NO call site while its docstring called itself "the one call
+    every report and metric should use" -- an unwired promise, which is D56's own pattern. It
+    is kept (a report is the obvious next consumer, and `is_test_ticket` alone is the wrong
+    shape for a list) but it is now described honestly: nothing in agent/ calls it TODAY.
+    bus.find_new_tickets and bus.count_tickets_for_user_today use exclude_test_strict, which
+    is the correct, narrower predicate for dropping work rather than hiding a count."""
     return [t for t in (tickets or []) if not is_test_ticket(t)]
 
 

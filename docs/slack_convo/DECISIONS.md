@@ -1753,3 +1753,70 @@ fix waves are now the primary source of new defects**, which is the strongest po
 for the two-consecutive-clean-audits gate and against ever treating a single clean pass, or a
 green suite, as done. Every round has also gotten narrower -- round 1 found "the classifier
 never ran at all"; round 5 found a regex 37% too broad and a shell `|| true` two repos over.
+
+---
+
+## D64 (2026-09-05) -- the sixth audit: zero CRITICAL, and the two MAJORs worth reading
+
+First round with **no CRITICAL findings**. Two MAJORs, and both are more interesting than the
+bugs they describe.
+
+**Finding 1 -- I applied the publish guard to our own answer.** `may_auto_answer` ran
+`asks_us_to_publish` against the model-written BODY as well as the question. An answer
+legitimately says *"your post about the new class went out tuesday"* -- a content verb next to
+a claim marker -- so on an independent corpus **4 of 10 realistic answers were held**, and
+3 of 6 legitimate grounded answers never reached `ready` end to end. D63's own record claimed
+"0 false positives, 0 false negatives", measured on a corpus I wrote myself, with the default
+EMPTY body -- so the test never exercised half the predicate it was proving. A request to
+publish can only ever appear in what the PERSON wrote; our own reply cannot ask us to do
+anything. The publish guard reads the question only now; the topic denylist still reads both,
+because a hard-line subject can surface in an answer a benign question invited.
+
+**Finding 2 -- D63's own explanation of the inert path was wrong, one step short again.** D63
+said the verified-fix notification was blocked only by the absence of a verdict field. Reading
+`~/scout-listener` one step further: the ops-fix worker polls `status='new'` and mints a
+**brand new `support_tickets` row** (`src/index.js:334` -> `intake.fromOpsFix` ->
+`store.insertNew`); the verification lands on THAT row. The ticket `fixed_pass` watches keeps
+`verification_after` NULL forever. **Wiring a verdict field would not have fixed it.** That is
+the third consecutive round where a claim about another repo was one read short of the truth.
+
+The response is deliberately not a workaround: inventing our own verdict is precisely the
+guessing D62 and D63 exist to condemn. Instead the inertness is made VISIBLE -- a ticket
+sitting in `fixing` past 24h with no verification gets one honest card per day naming the exact
+cause and saying a person must close it. **A capability that cannot work should say so on a
+schedule, not wait silently to be discovered by an audit.** Wiring the worker to write back to
+the originating ticket is a cross-repo change and stays Blake's call.
+
+Also closed: the escalation-card bound had been reimplemented as a client-side scan of
+`bus.messages(tid, limit=200)` -- ordered `created_at.asc`, i.e. the OLDEST 200 rows, so on a
+long ticket today's card is outside the window and the daily bound silently vanishes. That is
+verbatim the bug `count_outbound_kind_since`'s docstring exists to prevent, reintroduced by
+hand to filter receipts out; it is a server-side filtered count now (finding 3). A failed
+outreach Release tap wrote a log line and nothing a human sees (finding 4). The routed voice
+doc's name substitution turned another bot's self-description into a FALSE ROLE CLAIM in a
+client-facing prompt ("Scout is the LASSO team member who builds and maintains gym websites"),
+and `\bname\b` case-insensitive over a whole doc would silently corrupt text the day routing
+ever targets Echo, whose name is an ordinary English word -- no substitution now; the speaker's
+own doc is the voice, and only the routed doc's non-identity lines travel (findings 5, 6).
+`classifier_health` could not tell "flag off" from "flagged on and dead" (finding 8).
+`exclude_test` called itself "the one call every report should use" and had no call site
+(finding 9) -- D56's pattern again, now described honestly instead of promising.
+
+Six of the auditor's six named test weaknesses are fixed, including the two that mattered: the
+corpus now attaches realistic answer bodies (which is where finding 1 lived), and the
+boot-assertion guard RUNS `live_deps` instead of grepping its source.
+
+### Six rounds
+
+| Round | CRITICAL | MAJOR | Introduced by the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | **0** | 2 | 1 |
+
+The severity curve finally broke. Round 1 was "the classifier never ran in production at all";
+round 6 is a regex applied to one argument too many and a docstring one repo-read short. But
+the gate is two CONSECUTIVE clean rounds, and round 6 was not clean, so nothing arms yet.

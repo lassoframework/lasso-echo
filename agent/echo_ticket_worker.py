@@ -553,6 +553,50 @@ def _fix_summary_text(verification):
     return "Fixed it and confirmed the change is live before sending this."
 
 
+STUCK_FIXING_HOURS = 24
+
+
+def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
+    """One honest card per stuck ticket per day. Never claims anything to the client."""
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    for ticket in tickets or []:
+        if ticket.get("verification_after"):
+            continue
+        started = _parse_iso(ticket.get("created_at"))
+        if started is None or (now - started).total_seconds() < STUCK_FIXING_HOURS * 3600:
+            continue
+        tid = ticket["id"]
+        if _outbound_escalations_today(bus, tid) >= 1:
+            continue
+        try:
+            bus.record_outbound(
+                ticket_id=tid, author_type="system",
+                body=(f"Ticket {tid} ({identity_name}) has been in 'fixing' for over "
+                      f"{STUCK_FIXING_HOURS}h with no verification written to it, so nothing "
+                      f"has been said to the client and nothing will be. Known cause: the "
+                      f"ops-fix worker mints its own source='ops_fix' ticket and writes the "
+                      f"verification there, not onto this row, so this pass can never see "
+                      f"it. This needs a person: either close it by hand after checking the "
+                      f"fix, or wire the worker to write verification_after back to the "
+                      f"originating ticket."),
+                delivery_status="ready", kind=_a.KIND_ESCALATION,
+                meta={"identity": identity_name, "surface": "portal_ticket_bridge",
+                      "stuck_in_fixing": True})
+        except Exception as e:  # noqa: BLE001 - a report failure never breaks the pass
+            log(f"[ticket-worker/{identity_name}] stuck-report failed ticket={tid}: "
+                f"{type(e).__name__}")
+
+
+def _parse_iso(value):
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        d = _dt.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=_tz.utc)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _outbound_escalations_today(bus, tid):
     """Escalation cards written today on this ticket, NOT counting receipts.
 
@@ -562,19 +606,27 @@ def _outbound_escalations_today(bus, tid):
     ever told. The rows are distinguishable by attachments.receipt; this counts what a human
     would actually call an escalation."""
     from datetime import datetime as _dt, timezone as _tz
-    start = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()[:10]
+    start = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    # Audit 6, finding 3: the first version of this scanned bus.messages(tid, limit=200),
+    # which is ordered created_at.asc -- the OLDEST 200 rows. On a long ticket today's
+    # escalation is outside that window, the count returns 0, and the one-card-per-day bound
+    # silently disappears. That is verbatim the bug count_outbound_kind_since exists to
+    # prevent, reintroduced by hand to filter out receipts. Filtered server-side now.
     try:
-        rows = bus.messages(tid, limit=200)
+        return bus.count_escalation_cards_since(tid, start)
+    except AttributeError:
+        pass
     except Exception:  # noqa: BLE001 - fail closed: assume we already said it
         return 10 ** 9
-    n = 0
-    for m in rows or []:
-        att = m.get("attachments") or {}
-        if (m.get("direction") == "outbound" and att.get("kind") == _a.KIND_ESCALATION
-                and not att.get("receipt")
-                and str(m.get("created_at") or "").startswith(start)):
-            n += 1
-    return n
+    try:
+        rows = bus.messages(tid, limit=200)
+    except Exception:  # noqa: BLE001
+        return 10 ** 9
+    return sum(1 for m in rows or []
+               if m.get("direction") == "outbound"
+               and (m.get("attachments") or {}).get("kind") == _a.KIND_ESCALATION
+               and not (m.get("attachments") or {}).get("receipt")
+               and str(m.get("created_at") or "") >= start)
 
 
 def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
@@ -595,6 +647,21 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
     ident = _ids.IDENTITIES[identity_name]
     tickets = bus.find_fixing_tickets(product=product)
     notified = 0
+    # AUDIT 6, FINDING 2 -- THE THING THIS PASS CANNOT DO, SAID OUT LOUD.
+    #
+    # This pass polls status='fixing' and waits for verification_after to appear on the
+    # ticket. Reading ~/scout-listener one step further than D63 did: the ops-fix worker
+    # polls status='new' and, via runTriage -> opsFixIntake.fromOpsFix -> store.insertNew,
+    # mints a BRAND NEW support_tickets row (src/index.js:334, src/fixer/intake.js:100). Its
+    # verification lands on THAT row. The ticket this pass is watching keeps
+    # verification_after NULL forever, so the loop below short-circuits on every cycle and no
+    # client is ever told their fix was verified.
+    #
+    # That is a cross-repo wiring gap, not something to invent a workaround for here (writing
+    # our own verdict would be exactly the guessing D62 and D63 were written about). What
+    # this code CAN do is refuse to be silently inert -- D56's whole lesson -- so a ticket
+    # that has waited too long says so, once per ticket per day, in plain words.
+    _report_stuck_fixing(bus, tickets, identity_name=identity_name, log=log)
     for ticket in tickets:
         tid = ticket["id"]
         verification = ticket.get("verification_after")

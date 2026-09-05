@@ -652,6 +652,33 @@ def test_no_internal_kind_is_readable_by_a_client():
         f"{sorted(A.INTERNAL_KINDS - A.CLIENT_INVISIBLE_KINDS)}")
 
 
+def test_a_receipt_does_not_suppress_a_real_escalation_card():
+    """Audit 6, finding 3 / weakness 4: receipts ride on kind='escalation', so a bound that
+    counts that kind lets ONE receipt silence a real card for the rest of the day. Nothing
+    tested the discrimination the fix turns on."""
+    from agent import echo_ticket_worker as ETW
+
+    class _Bus:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def count_escalation_cards_since(self, tid, since):
+            return sum(1 for r in self.rows
+                       if (r.get("attachments") or {}).get("kind") == A.KIND_ESCALATION
+                       and not (r.get("attachments") or {}).get("receipt"))
+
+        def messages(self, tid, limit=200):
+            return self.rows
+
+    receipt_only = [{"direction": "outbound", "created_at": "2999-01-01",
+                     "attachments": {"kind": A.KIND_ESCALATION, "receipt": True}}]
+    assert ETW._outbound_escalations_today(_Bus(receipt_only), "t-1") == 0, \
+        "a receipt is not an escalation card and must not suppress one"
+    real = receipt_only + [{"direction": "outbound", "created_at": "2999-01-01",
+                            "attachments": {"kind": A.KIND_ESCALATION}}]
+    assert ETW._outbound_escalations_today(_Bus(real), "t-1") == 1
+
+
 def test_a_receipt_never_uses_a_kind_the_portal_would_show(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
@@ -1002,10 +1029,13 @@ def test_the_portal_bridge_enforces_the_allowlist_not_just_the_denylist(text, mo
         fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
         llm=lambda system, user, model=None: "Here is an answer about that.",
         classify_llm=None, log=lambda *a, **k: None)
-    # The honest acknowledgement IS allowed to reach them (it claims nothing); the
-    # model-written ANSWER is what must never send unattended.
+    # Audit 6, weakness 6: "the answer is not in posted" is weaker than this test's name.
+    # Exactly one thing may reach the client here -- the honest acknowledgement, which claims
+    # nothing -- and nothing else, ever.
     assert not any("Here is an answer about that." in p for p in posted), \
         f"{text!r} reached a client with a model-written answer and no tap"
+    assert all("could not answer this one myself" in p for p in posted), \
+        f"only the honest acknowledgement may reach the client, got: {posted!r}"
     assert bus.status == "hold"
 
 
@@ -1347,8 +1377,13 @@ def test_a_routed_answer_never_carries_the_other_bots_voice_doc():
               fetch_state=lambda t, w: {"site": "live"}, llm=llm)
     system = seen["system"]
     assert system.startswith("You are Scout")
-    assert "Wrangler" not in system, \
-        "the speaking bot must never be handed another bot's voice doc"
+    # Audit 6, weakness 2: asserting only the opening line passed identically with the whole
+    # name-handling removed. These are the actual guarantees: the other bot is never named,
+    # and no sentence claims the speaker IS the other bot's role.
+    assert "wrangler" not in system.lower(), \
+        "the speaking bot must never be handed another bot's name"
+    assert "Scout is the LASSO team member who builds" not in system, \
+        "a rewritten self-description is a false role claim, not a fix"
     assert "websites" in system, "the SUBJECT still moves, which is the point of routing"
 
 
@@ -1445,6 +1480,28 @@ PUBLISH_REQUESTS = [
     "please announce we are closed monday",
     "tell everyone the 6am is cancelled",
 ]
+
+
+# Audit 6, weakness 1: the corpus below called may_auto_answer with the DEFAULT EMPTY BODY,
+# while production always passes a model-written answer -- which is exactly where the false
+# positives lived (an answer legitimately says "your post about the new class went out
+# tuesday", a content verb next to a claim marker). Every question is now measured with a
+# realistic answer body attached.
+REALISTIC_ANSWERS = [
+    "Yes, your instagram is connected right now.",
+    "Your post about the new class went out tuesday morning.",
+    "There are four posts on the calendar for october and two are waiting on your approval.",
+    "Nothing published yesterday. The two drafts are still waiting on approval.",
+    "Your facebook page disconnected on the 3rd, so the reel scheduled for friday did not go.",
+    "The october schedule is loaded with twelve posts, and the first goes out monday.",
+]
+
+
+@pytest.mark.parametrize("body", REALISTIC_ANSWERS)
+@pytest.mark.parametrize("text", STATE_QUESTIONS[:6])
+def test_a_real_answer_body_never_holds_a_legitimate_question(text, body):
+    assert A.may_auto_answer(text, body), \
+        f"legitimate answer held: question={text!r} body={body!r}"
 
 
 @pytest.mark.parametrize("text", STATE_QUESTIONS)

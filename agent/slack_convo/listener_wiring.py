@@ -443,8 +443,29 @@ class ConvoWiring:
         # NOTHING was counted release:ok and logged nothing at all.
         delivered = bool(getattr(result, "delivered", False))
         if not delivered:
-            self.log(f"[slack-convo/{self.identity.name}] outreach release did not deliver "
-                     f"row={message_id} reason={result.reason}")
+            # Audit 6, finding 4: this wrote a Railway log line and nothing else -- no row,
+            # no card -- so Blake tapped Release and got silence, the same dead-button class
+            # resolve_and_notify was fixed for one file over. The refusal is a card now.
+            why = (f"Outreach Release tap did NOT deliver (row {message_id}, ticket "
+                   f"{(ticket or {}).get('id') or '?'}, {self.identity.name}): "
+                   f"{result.reason}. Nothing was sent to the client. "
+                   + {"open_failed": "The DM could not be opened; the row is still held, so "
+                                     "tapping again is the right retry.",
+                      "post_failed": "Slack refused the message; the row is marked failed and "
+                                     "will not retry on its own.",
+                      "claim_failed": "Another consumer already owns this row; do not retap, "
+                                      "or the client gets it twice.",
+                      "lost_claim": "Another consumer already owns this row; do not retap, "
+                                    "or the client gets it twice."}.get(result.reason,
+                                                                        "See the logs."))
+            self.log(f"[slack-convo/{self.identity.name}] {why}")
+            try:
+                self.deps.bus.record_outbound(
+                    ticket_id=(ticket or {}).get("id"), author_type="system", body=why,
+                    delivery_status="ready", kind=_adapter.KIND_ESCALATION,
+                    meta={"identity": self.identity.name, "outreach_release_refused": True})
+            except Exception:  # noqa: BLE001 - the refusal already stands
+                pass
         return delivered
 
     # -- loops --
@@ -481,9 +502,15 @@ class ConvoWiring:
         the comment claimed the count was surfaced on the health line. Nothing read it -- a
         dead-key counter nobody reads is D56's own pattern inside the fix for it. Read here,
         and rendered by health_line below."""
-        state = getattr(getattr(self.deps, "classify_llm", None), "failure_state", None)
+        llm = getattr(self.deps, "classify_llm", None)
+        if llm is None:
+            # Audit 6, finding 8: returning {} made "the flag is off" and "the flag is on and
+            # the model is dead" identical on the health line -- the one distinction this
+            # line exists to make.
+            return {"classifier_llm": "off (deterministic rules only)"}
+        state = getattr(llm, "failure_state", None)
         if not isinstance(state, dict):
-            return {}
+            return {"classifier_llm": "on"}
         n = state.get("consecutive_failures") or 0
         return {"classifier_llm_consecutive_failures": n,
                 "classifier_llm": "DEAD" if n >= 3 else ("degraded" if n else "ok")}
