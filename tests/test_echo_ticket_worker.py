@@ -185,7 +185,7 @@ def test_intake_pass_is_a_full_noop_when_the_flag_is_off(monkeypatch):
 
 def test_fixed_pass_is_a_full_noop_when_the_flag_is_off(monkeypatch):
     _off(monkeypatch)
-    bus = FakeBus([_ticket(status="fixing", verification_after={"fix_pr_url": "x"})])
+    bus = FakeBus([_ticket(status="fixing", verification_after={"verified": True, "fix_pr_url": "x"})])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert result == {"notified": 0}
@@ -424,7 +424,7 @@ def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
 
 def test_fixed_pass_notifies_once_verification_after_is_present():
     bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
-                          verification_after={"fix_pr_url": "https://github.com/x/y/pull/1"})])
+                          verification_after={"verified": True, "fix_pr_url": "https://github.com/x/y/pull/1"})])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert result == {"notified": 1}
@@ -445,7 +445,7 @@ def test_fixed_pass_leaves_an_unverified_ticket_alone():
 
 def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
     bus = FakeBus([_ticket(status="fixing",
-                          verification_after={"fix_pr_url": "x"})])
+                          verification_after={"verified": True, "fix_pr_url": "x"})])
     log, open_dm, post = _calls()
     W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert bus.tickets["t-1"]["status"] == "hold"
@@ -462,7 +462,7 @@ def test_intake_pass_routes_product_portal_to_scout_identity():
     # The question text is deliberately NOT a gym-schedule one: "group class schedule" is on
     # the D54 hard-line list (a real-world commitment about a client's classes), so it would
     # hold for a tap and this test is about ROUTING, not about the permission.
-    bus = FakeBus([_ticket(product="portal", raw_text="where do I add a new coach?")])
+    bus = FakeBus([_ticket(product="portal", raw_text="is my instagram connected?")])
     log, open_dm, post = _calls()
     _, notice = _notices()
 
@@ -508,7 +508,7 @@ def test_intake_pass_still_defaults_to_echo_when_called_with_no_product_override
 
 def test_fixed_pass_routes_product_portal_to_scout_identity():
     bus = FakeBus([_ticket(product="portal", status="fixing", slack_user_id="U_CLIENT",
-                          verification_after={"fix_pr_url": "https://github.com/x/y/pull/2"})])
+                          verification_after={"verified": True, "fix_pr_url": "https://github.com/x/y/pull/2"})])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post,
                          product="portal", identity_name="scout")

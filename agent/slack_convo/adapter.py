@@ -165,9 +165,14 @@ TEMPLATE_NO_ANSWER_YET = (
 # Cards in #fixer that carry no draft at all are labelled as such rather than as a reply
 # awaiting a tap, so Blake never has to open one to find out it is a placeholder.
 NO_DRAFT_LABEL = "NO DRAFT"
+# Finding 5 (2026-09-05 audit 3): this said "You will hear back here from the team once it is
+# verified" -- the exact sentence V-M6 records as removed for having no mechanism, restored in
+# a different constant. There still is no mechanism on this path: the Slack adapter sets
+# status='triage' and fixed_pass (the thing that would send that follow-up) polls
+# status='fixing' only, so nothing was ever going to send it. Says what is true instead.
 ACK_CODE_FIX = (
     "Got it. I read that as something not working on our side, so I have opened a fix "
-    "request for the team. You will hear back here from the team once it is verified.")
+    "request for the team and put it in front of them with your message attached.")
 ACK_FOLLOW_UP = "Got it, I have added that to the open request for the team."
 ACK_QUESTION = "Got it, checking that for you now."
 ACK_ACTION = ("Got it. I read that as a request to change something on your ads, so it is "
@@ -282,13 +287,43 @@ def auto_answer_forbidden(text):
     return bool(AUTO_ANSWER_FORBIDDEN.search(text or ""))
 
 
+# Finding 12 (audit 3): the allowlist leaks toward ACTION-shaped requests -- "can you post
+# that our saturday group is moving to 8am", "publish the announcement that we are raising
+# rates". Those satisfy the allowlist because they name posting, and they are not questions
+# about state at all: they ask us to PUBLISH a real-world claim on a client's behalf. Auto
+# answer is for reporting what is already true, never for agreeing to say something new.
+_ASK_TO_PUBLISH = _re.compile(
+    r"\b(?:can|could|would|will|please|pls)\s+(?:you|we|u)?\s*"
+    r"(?:go ahead and\s+)?(?:post|publish|announce|share|put up|send out|tell|let .{0,20}know)"
+    r"\b|^\s*(?:post|publish|announce|share|put up|send out|tell) \b", _re.IGNORECASE)
+
+
+def asks_us_to_publish(text):
+    """True when the message asks us to SAY something new, rather than report what is true."""
+    return bool(_ASK_TO_PUBLISH.search(text or ""))
+
+
 def auto_answer_allowed(text):
     """True only when the question is about live account state this system can observe.
 
     The allowlist is the primary gate for unattended sending; auto_answer_forbidden is the
     second layer. A message must pass BOTH to send with no tap."""
     t = text or ""
-    return bool(AUTO_ANSWER_ALLOWED.search(t)) and not auto_answer_forbidden(t)
+    return (bool(AUTO_ANSWER_ALLOWED.search(t)) and not auto_answer_forbidden(t)
+            and not asks_us_to_publish(t))
+
+
+def may_auto_answer(question, body=""):
+    """THE decision for sending a drafted answer with no human tap. One function, called by
+    every path that can reach a client, so no path can enforce half the rule.
+
+    Finding 2 (2026-09-05 audit 3, CRITICAL): the Slack adapter checked the allowlist and the
+    portal bridge did not -- it called auto_answer_forbidden twice and auto_answer_allowed
+    never. Two paths, one rule, written out twice, drifted within a day of being written.
+    They share this now."""
+    return (auto_answer_allowed(question)
+            and not auto_answer_forbidden(body or "")
+            and not asks_us_to_publish(body or ""))
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------
@@ -670,8 +705,7 @@ def handle_event(event, event_id, deps):
             # D54: the hard lines are checked HERE, at draft time, as well as at post time.
             # A forbidden topic never reaches 'ready' whatever the flags say.
             # BOTH layers, on the question AND on what we are about to say.
-            forbidden = (auto_answer_forbidden(text) or auto_answer_forbidden(answer["body"])
-                         or not auto_answer_allowed(text))
+            forbidden = not may_auto_answer(text, answer["body"])
             emit(KIND_ANSWER, answer["body"],
                  meta={"answered_with": answer_ident.name,
                        "routed_from_product": routed_from or None,

@@ -470,11 +470,25 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
     # closes. Best-effort, same as every other mark_message call in this module: the
     # real DM is already sent, a bookkeeping-close failure here must never look like the
     # send itself failed.
-    if result.opened and mark_message is not None:
+    # Finding 3 (2026-09-05 audit 3): this read `opened`, which is True even when the post
+    # FAILED -- so a held outreach row was marked 'posted' with nothing sent. In the portal
+    # that row's kind (outreach_request) is not on migration 0310's hidden list, so a client
+    # could read a "message" they were never sent. `delivered` is the only correct predicate
+    # for "the client has this".
+    if getattr(result, "delivered", False) and mark_message is not None:
         try:
             mark_message(message_id, "posted")
         except Exception as e:  # noqa: BLE001 - the send already succeeded
             log(f"[outreach] held row {message_id} close-out failed (send itself "
                 f"succeeded): {type(e).__name__}")
+    elif not getattr(result, "delivered", False) and mark_message is not None:
+        # Nothing reached the client. The row must not read as delivered, and the failure
+        # must be visible rather than counted as a successful tap.
+        try:
+            mark_message(message_id, "failed",
+                         meta_update={"outreach_reason": result.reason})
+        except Exception as e:  # noqa: BLE001
+            log(f"[outreach] held row {message_id} failure mark failed: {type(e).__name__}")
+        log(f"[outreach] release did NOT deliver row={message_id} reason={result.reason}")
 
     return result

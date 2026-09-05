@@ -209,11 +209,34 @@ def default_classify_llm(model=None):
     except Exception:  # noqa: BLE001
         return None
 
+    # Finding 4 (2026-09-05 audit 3): a PRESENT BUT INVALID key (revoked, typo'd, wrong
+    # project) builds fine and cannot be detected without a network call, so the boot
+    # assertion can never catch it. What it can do is refuse to be SILENT: classify() catches
+    # every exception and returns ESCALATE with no log, which is byte-for-byte
+    # indistinguishable from a healthy classifier that had nothing to say -- the D51 flood
+    # again. So the closure logs each failure loudly and counts consecutive ones, and the
+    # count is surfaced on the wiring health line. A dead key now looks like a dead key.
+    state = {"consecutive_failures": 0}
+
     def _llm(text):
         from . import answer_lane as _al
-        raw = _al.default_llm(_LLM_SYSTEM, str(text or "")[:4000], model=model)
+        try:
+            raw = _al.default_llm(_LLM_SYSTEM, str(text or "")[:4000], model=model)
+        except Exception as e:  # noqa: BLE001 - re-raised after being made visible
+            state["consecutive_failures"] += 1
+            n = state["consecutive_failures"]
+            level = "CRITICAL" if n >= 3 else "WARNING"
+            print(f"[slack-convo/classifier] {level} model call failed "
+                  f"({type(e).__name__}: {str(e)[:200]}); this is the "
+                  f"{n}{'st' if n == 1 else 'nd' if n == 2 else 'rd' if n == 3 else 'th'} "
+                  f"consecutive failure. Every message is escalating to a person while this "
+                  f"lasts. Check ANTHROPIC_API_KEY on this service.")
+            raise
+        state["consecutive_failures"] = 0
         verdict = (raw or "").strip().splitlines()[0].strip() if raw else ""
         return verdict if verdict in _VALID else None
+
+    _llm.failure_state = state
     return _llm
 
 

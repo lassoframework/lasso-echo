@@ -1552,3 +1552,52 @@ handler, a substring assertion that survives a dropped value, a marker check tha
 boolean. **When a test and its subject were written by the same author in the same hour, the
 test tends to encode what the code does, not what the rule is.** That is what an independent
 read buys, and it is why the loop is two consecutive clean audits by fresh eyes, never one.
+
+---
+
+## D61 (2026-09-05) -- the third audit: half-fixes are their own failure mode
+
+Third fresh auditor, third pair of CRITICALs, and both of them were **halves of the fixes the
+second audit asked for**. That is the entry.
+
+**Finding 1 (CRITICAL) -- M5's fix moved the lie one layer in.** `verification_succeeded` was
+written as a denylist of five false strings, so `{"verified": "not verified"}`,
+`{"verified": "pending"}`, `{"passed": "0 of 3"}`, `{"ok": "timeout"}`, `{"success":
+"partial"}` and a bare PR link **all** read as success, and the client was told *"Fixed it and
+confirmed the change is live."* This is the identical whack-a-mole shape M3 had just declared
+unacceptable for auto-answer, reused one file away for the sentence that most directly lies to
+a paying client -- written in the same hour as the ruling against it. The column is produced by
+`ops-fix-triage.js`, in another repo, so its vocabulary is not ours to guess: an **allowlist of
+affirmative verdicts** now, and anything unrecognised makes no claim at all.
+
+**Finding 2 (CRITICAL) -- the allowlist existed on one of the two paths.** M3 introduced
+`AUTO_ANSWER_ALLOWED` as *the primary gate* for unattended sending, and the portal bridge --
+the exact path the previous audit's C2 was filed against -- called `auto_answer_forbidden`
+twice and `auto_answer_allowed` never. *"a member tweaked her back, what do we tell her?"*
+posted to a client's group DM, no tap, ticket resolved. The tests could not see it because they
+asserted the **predicate** (`auto_answer_allowed(text)`) rather than the **call site**, so they
+would have passed with the allowlist deleted from every caller -- which was very nearly the
+state of the code. There is now ONE function, `adapter.may_auto_answer`, called by both paths,
+and the tests drive the call sites.
+
+Also closed: `release_approved_outreach` still read `opened` instead of `delivered` (a failed
+tap marked the row `posted`, and `outreach_request` is not on the portal's hidden list, so a
+client could read a message never sent); a present-but-INVALID API key builds fine and cannot
+be caught at boot, so the classifier now LOGS every model failure loudly and escalates its own
+log level after three consecutive ones -- the requirement is not "detect a bad key", it is
+"never be silent about one"; `ACK_CODE_FIX` had restored V-M6's removed promise in a different
+constant, and the promise test now scans EVERY client-facing constant by reflection rather than
+three by name; `exclude_test` was inert in the daily cap (`select: "id"` meant the predicate saw
+no columns); M4's `raise` in the scheduler lane would have killed the entire daily scheduler
+thread, so "refuse to start" stays at boot and the same misconfiguration is merely loud per
+cycle; and a routed answer introduced itself as *"You are Wrangler"* out of Scout's bot.
+
+### The pattern this audit adds
+
+D59 and D60 said green tests are not evidence. D61 says something narrower and more
+uncomfortable: **a fix written in response to an audit is the least-reviewed code in the
+repo.** It arrives with urgency, it is written by whoever just had the bug explained to them,
+and it lands after the audit that would have caught it. Three of the seven findings here were
+introduced by the previous round's fixes; two of those were CRITICAL. The loop is two
+CONSECUTIVE clean audits for exactly this reason -- one clean pass after a fix wave proves
+nothing about the fix wave itself.

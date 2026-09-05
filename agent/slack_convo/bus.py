@@ -179,12 +179,24 @@ class Bus:
     def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                    microsecond=0).isoformat()
+        # Finding 7 (2026-09-05 audit 3): this selected "id" only, so every row handed to
+        # the filter was {"id": ...} and the filter could never match anything -- inert in
+        # production, the exact pattern D56 names, inside the fix for a different one. The
+        # columns the predicate reads are selected now, and it uses the STRICT predicate: a
+        # daily cap is a safety limit, and loosening it on a tag a client could type would
+        # hand anyone an unbounded cap.
         params = {"slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
-                  "select": "id"}
+                  "select": "id,raw_text,reporter,slack_user_id,is_test"}
         if bot_identity:
             params["bot_identity"] = f"eq.{bot_identity}"
-        rows = self._get(_TICKETS, params)
-        return len(_td.exclude_test(rows))
+        try:
+            rows = self._get(_TICKETS, params)
+        except BusError:
+            # is_test may not exist yet on an older database; fall back to the columns that
+            # always have, rather than failing the cap read open.
+            params["select"] = "id,raw_text,reporter,slack_user_id"
+            rows = self._get(_TICKETS, params)
+        return len(_td.exclude_test_strict(rows))
 
     def find_recent_ticket_for_user_today(self, slack_user_id, bot_identity=None):
         """RB2/D25 (2026-09-03, MAJOR): the most recent ticket this user opened today, in ANY

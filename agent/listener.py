@@ -634,13 +634,19 @@ def _daily_scheduler(store):
                 _etw.intake_pass(deps.bus, **deps.intake_kwargs)
                 _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
             except Exception as e:
-                # M4: same rule on the portal lane. A flag on with nothing behind it would
-                # otherwise stop every portal-ticket pass, quietly, every cycle, forever.
+                # M4, corrected by finding 8 (audit 3): raising HERE was worse than the bug
+                # it fixed. This runs inside _daily_scheduler's `while True`, on a daemon
+                # thread, so a raise killed the ENTIRE daily scheduler -- catchup report,
+                # welcome digest, intake ingest, media sync, social sync -- silently, with
+                # the process still reporting healthy. "Refuse to start" belongs at boot,
+                # where it crashes the deploy visibly; here the same misconfiguration is
+                # made LOUD on every cycle instead, and the other jobs keep running.
                 from .slack_convo.listener_wiring import NotWiredError as _NotWired
                 if isinstance(e, _NotWired):
-                    print(f"[echo-ticket-worker] REFUSING TO RUN: {e}")
-                    raise
-                print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
+                    print(f"[echo-ticket-worker] CRITICAL not wired, portal tickets are NOT "
+                          f"being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
             # D47: product='portal' tickets (the generic Website tab form's default,
             # not Echo-specific) route to Scout per the identity map, never to
             # Ranger's ad-engine-only fixer-lane.ts, which has no reason to see them.
@@ -654,7 +660,14 @@ def _daily_scheduler(store):
                 _etw.intake_pass(scout_deps.bus, **scout_deps.intake_kwargs)
                 _etw.fixed_pass(scout_deps.bus, **scout_deps.fixed_kwargs)
             except Exception as e:
-                print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
+                # Finding 8 (audit 3): the two legs must behave identically -- this one
+                # swallowed NotWiredError with a plain print while the Echo leg above raised.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker/scout] CRITICAL not wired, portal tickets "
+                          f"are NOT being processed this cycle: {e}")
+                else:
+                    print(f"[echo-ticket-worker/scout] pass failed: {type(e).__name__}: {e}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT

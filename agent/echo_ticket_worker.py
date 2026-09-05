@@ -330,8 +330,13 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             # DM and resolved the ticket. The gates now live in front of the send, not only in
             # the outbox, because "checked at draft time AND at post time" has to mean every
             # path that can reach a client, not every path that happens to use one module.
-            forbidden = (_a.auto_answer_forbidden(ticket.get("raw_text") or "")
-                         or _a.auto_answer_forbidden(answer["body"]))
+            # Finding 2 (audit 3, CRITICAL): this used to call auto_answer_forbidden twice
+            # and auto_answer_allowed NEVER -- so the allowlist, documented as THE primary
+            # gate for unattended sending, was absent from the one path C2 was filed against.
+            # "a member tweaked her back, what do we tell her?" posted to a client's group DM
+            # with no tap. Both paths now call the SAME shared decision so they cannot drift
+            # apart again.
+            forbidden = not _a.may_auto_answer(ticket.get("raw_text") or "", answer["body"])
             armed = (config.slack_convo_auto_answer_armed(identity_name)
                      and config.slack_convo_client_reply_armed(identity_name))
             if forbidden or not armed:
@@ -398,6 +403,11 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         # execute -- the same documented limitation every other non-Echo code_fix
         # path in this system already carries.
         bus.set_ticket(tid, classification=_cls.CODE_FIX, status="fixing")
+        # Finding 10 (audit 3): D48's rule is that an escalation is never silence, and this
+        # is the branch the client waits on longest. The Slack path has always acked a
+        # code_fix inline; this one returned without writing the client anything at all.
+        acknowledge_submitter(bus, ticket, who=who, identity_name=identity_name,
+                              outreach=outreach, log=log)
         text = _a.fixer_request_text(ident, tid, ticket.get("raw_text") or "", who,
                                     who.slack_user_id)
         row = bus.record_outbound(ticket_id=tid, author_type="system", body=text,
@@ -424,26 +434,44 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
 # do the verifying; the external fixer worker writes that column. So the rule is: say it only
 # when the snapshot says it, and when the snapshot says anything else (or nothing legible),
 # make no claim at all and put it in front of a person.
-_VERIFIED_TRUE_KEYS = ("verified", "ok", "success", "passed")
-_VERIFIED_FALSE_VALUES = (False, "false", "failed", "no", "error")
+_VERDICT_KEYS = ("verified", "ok", "success", "passed", "status", "result")
+# An ALLOWLIST of affirmative verdicts, not a denylist of negative ones (2026-09-05 audit 3,
+# CRITICAL). The first version asked "is this verdict one of five known false values?", so
+# "not verified", "pending", "unverified", "could not verify", "0 of 3", "timeout" and
+# "partial" all read as SUCCESS and the client was told "Fixed it and confirmed the change is
+# live". That is the identical whack-a-mole shape M3 rejected for auto-answer, reused one
+# file away for the single sentence that most directly lies to a client.
+#
+# This column is written by ops-fix-triage.js, a process in another repo. We do not get to
+# assume its vocabulary. So: an explicit true value, or an explicit affirmative word, or we
+# make no claim -- and a bare PR link is NOT a verification, because a PR can be open,
+# closed, reverted or unmerged.
+_AFFIRMATIVE = frozenset({"true", "yes", "y", "verified", "passed", "pass", "success",
+                          "successful", "ok", "okay", "fixed", "confirmed", "done",
+                          "complete", "completed", "green"})
 
 
 def verification_succeeded(verification):
-    """True only when the snapshot affirmatively says the fix was verified."""
+    """True ONLY when the snapshot affirmatively says the fix was verified.
+
+    Anything unrecognised -- an unknown string, a dict, a number, a missing verdict -- is
+    NOT a success. The cost of a false negative is a person looking at a ticket that was
+    already fixed. The cost of a false positive is telling a paying client their problem is
+    solved when it is not."""
     if not isinstance(verification, dict) or not verification:
         return False
-    for key in _VERIFIED_TRUE_KEYS:
-        if key in verification:
-            val = verification[key]
-            if isinstance(val, str):
-                return val.strip().lower() not in _VERIFIED_FALSE_VALUES
-            return bool(val)
-    status = str(verification.get("status") or verification.get("result") or "").lower()
-    if status:
-        return status in ("verified", "passed", "success", "ok", "fixed")
-    # No verdict field at all: a snapshot with a PR url and nothing contradicting it is the
-    # shape the existing fixer worker writes, so that stays a success; anything else is not.
-    return bool(verification.get("fix_pr_url") or verification.get("pr_url"))
+    for key in _VERDICT_KEYS:
+        if key not in verification:
+            continue
+        val = verification[key]
+        if val is True:
+            return True
+        if isinstance(val, str) and val.strip().lower() in _AFFIRMATIVE:
+            return True
+        # A verdict field is present and is not an affirmative we recognise: that is a
+        # verdict we must not interpret, so it is never a success.
+        return False
+    return False
 
 
 def _fix_summary_text(verification):

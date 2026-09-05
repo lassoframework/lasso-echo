@@ -175,8 +175,16 @@ def conversation_for_model(messages):
     return out
 
 
-def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None):
-    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises."""
+def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None,
+           speaks_as=None):
+    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises.
+
+    `speaks_as` (finding 13, 2026-09-05 audit 3): under D50 cross-product routing the
+    KNOWLEDGE and voice doc come from one identity while the message is posted by another --
+    so the system prompt used to say "You are Wrangler" on a reply going out of Scout's bot,
+    in Scout's DM. The client would see one bot introduce itself as another. The name in the
+    prompt is now the bot that will actually speak; everything else about the routing is
+    unchanged."""
     convo = conversation_for_model(messages)
     q = (question or "").strip()
     if not q:
@@ -192,7 +200,7 @@ def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, 
         return None   # V-M4: a snapshot of failures is not grounding
     grounding = {"question": q[:500], "facts": facts, "thread_len": len(convo),
                  "bot": identity.name}
-    system = _SYSTEM.format(bot=identity.name.capitalize(), who=who.kind,
+    system = _SYSTEM.format(bot=(speaks_as or identity.name).capitalize(), who=who.kind,
                             voice=_voice_rules(identity))
     user = ("FACTS:\n" + json.dumps(facts, default=str, indent=1)[:6000] +
             "\n\nCONVERSATION SO FAR (most recent last):\n" +

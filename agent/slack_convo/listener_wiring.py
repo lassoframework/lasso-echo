@@ -155,7 +155,8 @@ def live_deps(identity, *, bus=None, log=print):
         # off who.account_key. There is no argument here through which another gym's data
         # could enter.
         return _answer.answer(ticket, who, messages, question,
-                              identity=answer_identity or identity)
+                              identity=answer_identity or identity,
+                              speaks_as=identity.name)
 
     return _adapter.Deps(
         bus=bus, identity=identity, resolve_identity=resolve,
@@ -438,10 +439,13 @@ class ConvoWiring:
             post_first_message=post_first_message, record_outbound=bus.record_outbound,
             stamp_ticket=_stamp_ticket_factory(bus), mark_message=bus.mark_message,
             claim_message=getattr(bus, "claim_message", None), log=self.log)
-        if not result.opened:
-            self.log(f"[slack-convo/{self.identity.name}] outreach release refused "
+        # Finding 3 (audit 3): `opened` is True on post_failed, so a tap that delivered
+        # NOTHING was counted release:ok and logged nothing at all.
+        delivered = bool(getattr(result, "delivered", False))
+        if not delivered:
+            self.log(f"[slack-convo/{self.identity.name}] outreach release did not deliver "
                      f"row={message_id} reason={result.reason}")
-        return result.opened
+        return delivered
 
     # -- loops --
     def start_loops(self):
