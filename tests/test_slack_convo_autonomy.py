@@ -247,6 +247,15 @@ def test_the_false_promise_template_is_gone_and_cannot_come_back():
         for line in path.read_text(encoding="utf-8").splitlines():
             if banned in line and not line.strip().startswith("#"):
                 pytest.fail(f"{path.name}: the false-promise template is back: {line}")
+    # audit 2: a grep for one sentence would pass on any reworded equivalent lie, so the
+    # REQUIREMENT is asserted too -- no client-facing constant on an undecided path may
+    # promise future human action, in whatever words.
+    promises = ("follow up", "get back to you", "will be in touch", "someone will",
+                "we will reach out", "will look into", "will fix")
+    for name in ("TEMPLATE_NO_ANSWER_YET", "TEMPLATE_UNKNOWN", "TEMPLATE_QUEUED"):
+        body = getattr(A, name).lower()
+        for promise in promises:
+            assert promise not in body, f"{name} promises future action: {promise!r}"
 
 
 def test_undecided_message_gets_an_honest_template_and_a_no_draft_card():
@@ -390,7 +399,11 @@ def test_confident_website_question_is_answered_with_wrangler_knowledge():
     assert t["product"] == "scout"
     assert t["slack_channel_id"] == "G0MPIM"
     assert t["verification_after"]["routed_from_product"] == "scout"
-    assert t["verification_after"]["answered_with_product"] == "websites"
+    # m2 (audit 2): the record says the KNOWLEDGE moved, not that the facts came from a
+    # websites seam -- there is no websites seam, and claiming one would be a false entry in
+    # the verification record this system treats as evidence.
+    assert t["verification_after"]["knowledge_and_voice_of"] == "wrangler"
+    assert "unchanged by routing" in t["verification_after"]["facts_source"]
 
 
 def test_cross_product_routing_does_not_fire_when_the_flag_is_off():
@@ -712,14 +725,58 @@ def test_a_mis_shaped_classifier_callable_refuses_to_boot():
     LW.assert_classifier_shape(lambda text: C.QUESTION, IDS.get("echo"))  # the right shape
 
 
-def test_portal_bridge_classifies_with_the_classifier_callable_not_the_answer_lane():
-    """The regression, at the call site: _intake_one must hand classify() the callable that
-    takes one argument, and must keep handing the answer lane its own."""
-    import inspect
+def test_the_answer_lane_llm_is_never_the_one_handed_to_classify():
+    """RTF-2 as behaviour, not as a source substring (audit 2: the old version of this test
+    asserted a literal line of code, so it passed on a dropped value and failed on a
+    reformat). Two DIFFERENT callables go in; the test asserts each is called with the
+    signature it actually has, which is the thing that was wrong."""
     from agent import echo_ticket_worker as ETW
-    src = inspect.getsource(ETW._intake_one)
-    assert "identity_product=ident.product, llm=classify_llm)" in src
-    assert "classify_llm" in inspect.signature(ETW.intake_pass).parameters
+    seen = {"classify": [], "answer": []}
+
+    class _Bus:
+        def find_new_tickets(self, **kw):
+            return [{"id": "t-1", "product": "echo", "source": "website_tab",
+                     "client_id": "g-1", "reporter": "owner@gym.com",
+                     "raw_text": "wholly ambiguous sentence", "status": "new"}]
+
+        def inbound_count(self, tid):
+            return 1
+
+        def ticket(self, tid):
+            return {"id": tid, "status": "new"}
+
+        def set_ticket(self, tid, **f):
+            return {}
+
+        def record_outbound(self, **kw):
+            return {"id": "m-1"}
+
+        def count_outbound_kind_since(self, *a, **k):
+            return 0
+
+        def messages(self, tid, limit=200):
+            return []
+
+    def classify_llm(text):                       # one positional arg
+        seen["classify"].append(text)
+        return None
+
+    def answer_llm(system, user, model=None):     # three, the answer lane's shape
+        seen["answer"].append(system)
+        return "NO_ANSWER"
+
+    os.environ["AGENT_PORTAL_ECHO_TICKETS_ENABLED"] = "true"
+    ETW.intake_pass(
+        _Bus(), slack_lookup_email=lambda e: "U1",
+        slack_user_info=lambda u: {"id": u, "is_bot": False, "email": "owner@gym.com"},
+        portal_lookup=lambda e: {"role": "client",
+                                 "gyms": [{"gym_id": "g-1", "relationship": "client_owner",
+                                           "account_key": "k"}]},
+        open_group_dm=lambda ids: {"ok": False}, post_first_message=lambda c, t: {"ok": False},
+        write_hold_notice=lambda **kw: None, classify_llm=classify_llm,
+        fetch_state=lambda t, w: {}, llm=answer_llm, log=lambda *a, **k: None)
+    assert seen["classify"] == ["wholly ambiguous sentence"], \
+        "classify() must be handed the one-argument callable, and actually called with it"
 
 
 # =========================================================================================
@@ -771,3 +828,144 @@ def test_the_durable_column_is_honoured_when_it_exists():
 def test_exclude_test_filters_a_mixed_list():
     rows = [{"raw_text": "[phase4-audit x] probe"}, {"raw_text": REAL_DALE}]
     assert TD.exclude_test(rows) == [{"raw_text": REAL_DALE}]
+
+
+# =========================================================================================
+# AUDIT 2 (2026-09-05): the findings a green suite was blind to, each with the fake that
+# hid it replaced by one shaped like production.
+# =========================================================================================
+
+def _real_signature_hold_notice(bus):
+    """The production hold-notice callable, not a **kwargs sponge.
+
+    C1 of audit 2 was invisible because EVERY test passed `write_hold_notice=lambda **kw:
+    ...`, which accepts any signature -- including the one that raised TypeError in
+    production on every held portal answer. A fake that cannot fail the way production fails
+    is not a test double, it is a blindfold."""
+    from agent import echo_ticket_wiring as ETW
+    return ETW._write_hold_notice_factory(bus)
+
+
+def test_the_portal_hold_path_calls_write_hold_notice_with_a_valid_signature():
+    """C1 (audit 2): the held-answer branch omitted ident_name, so every held portal answer
+    raised TypeError inside the per-ticket except -- no card, no escalation, nothing to the
+    client, and the ticket left in a state find_new_tickets never returns again."""
+    import inspect
+    sig = inspect.signature(A.write_hold_notice)
+    required = [n for n, p in sig.parameters.items()
+                if p.default is inspect.Parameter.empty and n != "bus"]
+    from agent import echo_ticket_worker as ETW
+    src = inspect.getsource(ETW._intake_one)
+    call = src[src.index("write_hold_notice(ident_name="):]
+    for name in required:
+        assert f"{name}=" in call[:600], f"the hold branch omits {name!r}, which is required"
+
+
+def test_delivered_is_not_the_same_as_opened():
+    """C2 (audit 2): OutreachResult.opened is True when conversations.open succeeded, which
+    includes the case where the message post FAILED. Callers must read `delivered`."""
+    from agent.slack_convo import outreach as OU
+    posted_calls = []
+
+    def open_group_dm(ids):
+        return {"ok": True, "channel_id": "G_DM"}
+
+    def post_first_message(chan, text):
+        posted_calls.append(text)
+        return {"ok": False}          # slack refused
+
+    rows = []
+    res = OU.initiate(
+        {"id": "t-1", "source": "website_tab", "reporter": "owner@gym.com",
+         "slack_user_id": "U_C", "client_id": "g-1", "reporter_verified": True},
+        IG.Identity(IG.CLIENT, "U_C", email="owner@gym.com", account_key="k", gym_id="g-1",
+                    reason="t"),
+        IDS.get("echo"), open_group_dm=open_group_dm,
+        post_first_message=post_first_message,
+        record_outbound=lambda **kw: rows.append(kw) or {"id": "r1"},
+        stamp_ticket=lambda *a, **k: None, message_text="hello",
+        mark_message=lambda *a, **k: None, log=lambda *a, **k: None)
+    assert res.opened is True, "the DM channel really did open"
+    assert res.delivered is False, "but nothing reached the client"
+
+
+@pytest.mark.parametrize("text", [
+    "what time does the gym open on saturday",
+    "what time is the 6am class",
+    "our saturday classes are moving to 8am",
+    "we moved the 6am class to 5:30, can you update everything",
+    "tell members the 9am is cancelled tomorrow",
+    "a member tweaked her back, what do we tell her",
+    "someone got dizzy during a workout, are we covered",
+    "do we need them to sign anything before they train",
+    "how much is this going to run us each month",
+    "can we downgrade to the cheaper plan",
+    "we want to cancel and get our money back",
+])
+def test_ordinary_phrasing_cannot_walk_past_the_hard_lines(text):
+    """M3 (audit 2): eleven real sentences an auditor walked straight past a denylist of
+    topics. A denylist has to enumerate every phrasing of every dangerous subject and is
+    wrong the moment someone says it differently, so unattended sending is now gated by an
+    ALLOWLIST of what this system can actually observe, with the denylist as a second layer."""
+    assert not A.auto_answer_allowed(text)
+
+
+@pytest.mark.parametrize("text", [
+    "is my instagram connected?",
+    "did my posts go out this week?",
+    "what is on the calendar for october?",
+    "is the october schedule loaded?",
+    "why is my facebook account disconnected?",
+])
+def test_the_questions_auto_answer_exists_for_still_pass(text):
+    """The allowlist must not make the capability inert -- that is its own failure mode."""
+    assert A.auto_answer_allowed(text)
+
+
+def test_post_time_hard_line_re_reads_the_body_not_just_the_marker(monkeypatch):
+    """M2 (audit 2): gate 5a trusted the stored attachments marker alone, so a row written by
+    any writer that omits it posted a hard-line answer with no tap. The previous test for
+    this injected the marker and asserted the lookup -- it proved the boolean, not the rule,
+    which is exactly why M2 shipped underneath it."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    d = A.handle_event(_ev("is my instagram connected?"), "k",
+                       _answering_deps(bus, client_armed=True, auto_answer=True))
+    row = [m for m in bus.messages_for(d.ticket_id)
+           if m["attachments"].get("kind") == A.KIND_ANSWER][0]
+    for m in bus.msgs:                       # a row from a writer that knows nothing of D54
+        if m["id"] == row["id"]:
+            m["body"] = "Your gym hours are 5am to 8pm and the monthly charge is $149."
+            m["attachments"].pop("auto_answer_forbidden", None)
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert not any("monthly charge" in c["text"] for c in calls), \
+        "a hard line in the BODY must be caught at post time even with no marker"
+    assert bus.message(row["id"])["delivery_status"] == "held"
+
+
+def test_a_verification_that_did_not_succeed_is_never_announced_as_a_fix():
+    """M5 (audit 2): _fix_summary_text claimed "Fixed it and confirmed the change is live"
+    on the mere PRESENCE of verification_after, without reading it."""
+    from agent import echo_ticket_worker as ETW
+    assert ETW._fix_summary_text({"verified": False, "reason": "could not reproduce"}) is None
+    assert ETW._fix_summary_text({"status": "failed"}) is None
+    assert ETW._fix_summary_text({}) is None
+    assert ETW._fix_summary_text(None) is None
+    assert "Fixed it" in (ETW._fix_summary_text({"verified": True}) or "")
+    assert "Fixed it" in (ETW._fix_summary_text({"fix_pr_url": "https://x/1"}) or "")
+
+
+def test_a_client_cannot_hide_their_own_ticket_by_pasting_a_probe_tag():
+    """m5 (audit 2): the INTAKE drop needs a stronger predicate than the report exclusion --
+    find_new_tickets is the only intake poll there is, so a drop is permanent."""
+    from agent.slack_convo import testdata as TD2
+    client_row = {"raw_text": "[smoke-test 12] is what my log says, my posts are not going out",
+                  "reporter": "owner@realgym.com"}
+    assert TD2.is_test_ticket_strict(client_row) is False
+    probe = {"raw_text": "[phase4-audit 1] probe", "reporter": "blake+zztest@lassoframework.com"}
+    assert TD2.is_test_ticket_strict(probe) is True

@@ -376,7 +376,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # forbidden. Blake's release tap is still the way any of these actually go out.
     if kind == _a.KIND_ANSWER and recipient_kind not in ("staff", "coach") \
             and not att.get("released_by"):
-        if att.get("auto_answer_forbidden"):
+        # M2 (audit 2): this used to trust the stored marker alone, so a row written by any
+        # writer that omits it -- a pre-D54 process, a future one -- posted a hard-line
+        # answer to a client with no tap. The body is re-read here, which is what "checked
+        # again at post time" has to mean for a rule that is about content.
+        if att.get("auto_answer_forbidden") or _a.auto_answer_forbidden(row.get("body")):
             bus.mark_message(row["id"], "held",
                              meta_update={"held_why": "hard line: never auto answered"})
             summary["held"] += 1

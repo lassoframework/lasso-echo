@@ -166,7 +166,7 @@ class Bus:
         # looking exactly like unhandled client tickets; a re-run of this poll must not put
         # any of them back on a card. testdata.py is the single predicate for that, shared
         # with every report and metric so they can never disagree.
-        return _td.exclude_test(rows)
+        return _td.exclude_test_strict(rows)
 
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer

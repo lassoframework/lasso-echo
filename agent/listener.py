@@ -634,6 +634,12 @@ def _daily_scheduler(store):
                 _etw.intake_pass(deps.bus, **deps.intake_kwargs)
                 _etw.fixed_pass(deps.bus, **deps.fixed_kwargs)
             except Exception as e:
+                # M4: same rule on the portal lane. A flag on with nothing behind it would
+                # otherwise stop every portal-ticket pass, quietly, every cycle, forever.
+                from .slack_convo.listener_wiring import NotWiredError as _NotWired
+                if isinstance(e, _NotWired):
+                    print(f"[echo-ticket-worker] REFUSING TO RUN: {e}")
+                    raise
                 print(f"[echo-ticket-worker] pass failed: {type(e).__name__}: {e}")
             # D47: product='portal' tickets (the generic Website tab form's default,
             # not Echo-specific) route to Scout per the identity map, never to
@@ -976,6 +982,17 @@ def run_listener():
         _convo.attach(app, "echo")
         _convo.start_additional_identities()
     except Exception as _ce:  # noqa: BLE001 - the adapter must never take the listener down
+        # M4 (2026-09-05 audit 2): a NotWiredError caught HERE was the worst possible outcome
+        # of the "refuse to boot" assertion -- attach() and start_additional_identities()
+        # would both be skipped, all four bot identities would go silently dark, and the
+        # listener would report healthy. That is the exact "ships inert" pattern the
+        # assertion exists to kill, one level up. A misconfiguration this specific is a
+        # deployment fault and must be LOUD: it re-raises, the process fails to start, and
+        # Railway shows a crashed deploy instead of a quiet lobotomy.
+        from .slack_convo.listener_wiring import NotWiredError as _NotWired
+        if isinstance(_ce, _NotWired):
+            print(f"[slack-convo] REFUSING TO START: {_ce}")
+            raise
         print(f"[slack-convo] attach failed: {type(_ce).__name__}: {_ce}")
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:

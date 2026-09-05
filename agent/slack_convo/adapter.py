@@ -124,13 +124,17 @@ MAX_UNKNOWN_ESCALATIONS_PER_TICKET_PER_DAY = 3
 MAX_FOLLOWUP_NOISE_PER_TICKET_PER_DAY = 5
 _EPOCH_ISO = "1970-01-01T00:00:00+00:00"
 
+# D52, extended (2026-09-05 audit 2): the ban is on PROMISING FUTURE HUMAN ACTION as a fact,
+# not on one particular sentence. These two carried the same shape as the removed template
+# ("the team will pick it up there", "Someone will pick it up") and are reworded to say only
+# what is true when they are written: where the message went, and what to do next.
 TEMPLATE_UNKNOWN = (
     "Thanks for reaching out. I can only help from inside your LASSO portal, so this message "
-    "did not reach a person yet. Please use the Support page in your portal and the team "
-    "will pick it up there.")
+    "did not reach a person yet. Please use the Support page in your portal, which is the "
+    "route that gets it to the team.")
 TEMPLATE_QUEUED = (
     "Got it. You have sent a lot today, so I have queued this for the team rather than "
-    "acting on it right away. Someone will pick it up.")
+    "acting on it right away. It is recorded with everything else you sent.")
 # D52 (2026-09-05). The old TEMPLATE_ESCALATED read:
 #
 #   "Got it. This one needs a person, so I have flagged it for the LASSO team and they
@@ -247,9 +251,44 @@ AUTO_ANSWER_FORBIDDEN = _re.compile(
     r"\bwhat are (?:your|our) hours\b|\bholiday hours\b", _re.IGNORECASE)
 
 
+# M3 (2026-09-05 audit 2): the denylist above was documented as "structural, not advisory",
+# and an auditor walked eleven ordinary sentences straight past it -- "what time does the gym
+# open on saturday", "our saturday classes are moving to 8am", "a member tweaked her back,
+# what do we tell her", "how much is this going to run us each month". A denylist of topics is
+# whack-a-mole by construction: it has to enumerate every phrasing of every dangerous subject,
+# and it is wrong the moment someone says it differently.
+#
+# So the hard rule is inverted for the one path that sends with NO human tap. An answer may
+# go out unattended only if the question is ABOUT something this system can actually observe
+# in live account state -- the connection status of an account, whether posts went out, what
+# is on the content calendar, an approval, an upload. That is the entire universe of things
+# answer_lane.default_fetch_state can even fetch. Anything else, however it is phrased, holds
+# for a person, and the denylist stays as a second layer on top for the subjects where a
+# wrong answer is most costly.
+#
+# Both are checked at draft time AND at post time, and neither has an env var.
+AUTO_ANSWER_ALLOWED = _re.compile(
+    r"\b(connect|connected|connection|connecting|disconnected|reconnect|linked|"
+    r"instagram|ig|facebook|fb|google|gbp|business profile|zernio|"
+    r"post|posts|posted|posting|publish|published|publishing|reel|reels|story|stories|"
+    r"caption|captions|calendar|scheduled|schedule|schedules|queue|queued|draft|drafts|"
+    r"approve|approved|approval|approvals|deny|denied|upload|uploads|uploaded|media|"
+    r"photo|photos|video|videos|account|accounts|dashboard|portal|login|log in)\b",
+    _re.IGNORECASE)
+
+
 def auto_answer_forbidden(text):
     """True when this message may never be auto-answered, whatever the flags say."""
     return bool(AUTO_ANSWER_FORBIDDEN.search(text or ""))
+
+
+def auto_answer_allowed(text):
+    """True only when the question is about live account state this system can observe.
+
+    The allowlist is the primary gate for unattended sending; auto_answer_forbidden is the
+    second layer. A message must pass BOTH to send with no tap."""
+    t = text or ""
+    return bool(AUTO_ANSWER_ALLOWED.search(t)) and not auto_answer_forbidden(t)
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------
@@ -616,14 +655,23 @@ def handle_event(event, event_id, deps):
             # The ticket sits in 'verification' until the outbox actually posts the answer.
             grounding = dict(answer["grounding"])
             if routed_from:
+                # m2 (audit 2): answer_lane.default_fetch_state is keyed on who.account_key
+                # and fetches the SAME Echo seams whichever identity drafts, so recording
+                # "answered_with_product: websites" would put a false claim in the
+                # verification record -- the facts did not come from a websites seam,
+                # because there is no websites seam. What actually moved is the knowledge
+                # and voice, and that is what this says.
                 grounding["routed_from_product"] = routed_from
-                grounding["answered_with_product"] = answer_ident.product
+                grounding["knowledge_and_voice_of"] = answer_ident.name
+                grounding["facts_source"] = "account state for this gym (unchanged by routing)"
             deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
                                 verification_before=grounding,
                                 verification_after=grounding)
             # D54: the hard lines are checked HERE, at draft time, as well as at post time.
             # A forbidden topic never reaches 'ready' whatever the flags say.
-            forbidden = auto_answer_forbidden(text) or auto_answer_forbidden(answer["body"])
+            # BOTH layers, on the question AND on what we are about to say.
+            forbidden = (auto_answer_forbidden(text) or auto_answer_forbidden(answer["body"])
+                         or not auto_answer_allowed(text))
             emit(KIND_ANSWER, answer["body"],
                  meta={"answered_with": answer_ident.name,
                        "routed_from_product": routed_from or None,

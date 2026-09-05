@@ -200,7 +200,13 @@ def default_classify_llm(model=None):
     exception as ESCALATE, and this returns None on anything unexpected, so the deterministic
     behaviour is the floor and the model can only ever fill the middle."""
     import os
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return None
+    try:
+        import anthropic  # noqa: F401 - m1 (audit 2): a key with no client library is still
+        # "flagged on with nothing behind it". Imported HERE so the boot assertion sees it,
+        # not at first call where the failure is indistinguishable from "nothing to say".
+    except Exception:  # noqa: BLE001
         return None
 
     def _llm(text):

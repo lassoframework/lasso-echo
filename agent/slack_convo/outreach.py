@@ -71,6 +71,13 @@ class OutreachResult:
     opened: bool
     channel_id: str = ""
     reason: str = ""
+    # C2 (2026-09-05 audit 2, CRITICAL): `opened` means conversations.open succeeded --
+    # nothing more. It is True on claim_failed, lost_claim AND post_failed, and every caller
+    # was reading it as "the client was told". A failed chat.postMessage therefore resolved
+    # the ticket and wrote a receipt asserting "the client was told this, SENT AUTOMATICALLY
+    # (no tap)" over a row whose own delivery_status was 'failed'. `delivered` is the fact
+    # callers actually need, and it is True only after the post came back ok.
+    delivered: bool = False
 
 
 def _base_eligible(ticket, who):
@@ -319,7 +326,8 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             except Exception as e:  # noqa: BLE001 - the failure is already logged above
                 log(f"[outreach] mark_message(failed) itself failed row={row_id}: "
                     f"{type(e).__name__}")
-        return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed")
+        return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed",
+                              delivered=False)
 
     if mark_message is not None and row_id is not None:
         try:
@@ -347,7 +355,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             log(f"[outreach] stamp_ticket failed ticket={(ticket or {}).get('id')}: "
                 f"{type(e).__name__}")
 
-    return OutreachResult(opened=True, channel_id=channel_id, reason="ok")
+    return OutreachResult(opened=True, channel_id=channel_id, reason="ok", delivered=True)
 
 
 # ---- D45: the human-tap path (Blake's ruling, 2026-09-04, resolving D42) -----------------

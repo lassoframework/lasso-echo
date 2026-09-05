@@ -82,6 +82,32 @@ def is_test_ticket(ticket):
         return False
 
 
+def is_test_ticket_strict(ticket):
+    """The predicate for DROPPING a ticket from work, as opposed to hiding it from a count.
+
+    m5 (2026-09-05 audit 2): bus.find_new_tickets is the portal bridge's only intake poll, so
+    anything it drops is never worked, never escalated and never seen -- permanently. A tag
+    match alone is too weak a reason for that: a gym owner testing their own support form
+    could open their message with one. Dropping requires the durable column, OR a probe tag
+    AND a sender inside our own test namespace, which no client can satisfy. Reports and
+    metrics keep using the looser is_test_ticket -- hiding a row from a count is recoverable,
+    dropping it from the only queue there is is not."""
+    t = ticket or {}
+    try:
+        if bool(t.get("is_test")):
+            return True
+        return bool(is_test_text(t.get("raw_text"))
+                    and (is_test_reporter(t.get("reporter"))
+                         or str(t.get("slack_user_id") or "") in SYNTHETIC_SLACK_IDS))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def exclude_test(tickets):
     """The list, minus our own probes. The one call every report and metric should use."""
     return [t for t in (tickets or []) if not is_test_ticket(t)]
+
+
+def exclude_test_strict(tickets):
+    """The list, minus rows it is safe to never work at all. Used by the intake poll."""
+    return [t for t in (tickets or []) if not is_test_ticket_strict(t)]

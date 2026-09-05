@@ -1473,3 +1473,82 @@ it; the contract needs a test on THIS side, because this side is where kinds are
 The through-line with D56: all three are the same family. A capability that looks armed and
 is not; a gate that exists on one path and not its twin; a safety list that defaults to
 "allowed". **Green tests plus a careful build is not evidence. An independent read is.**
+
+---
+
+## D60 (2026-09-05) -- the second audit, and the fake that hid a CRITICAL
+
+The D59 fixes shipped green (5425 tests). A second fresh auditor found **two more CRITICALs**,
+one of them introduced BY the D59 fix, plus five MAJORs. The pattern in every one is worth
+more than the individual bugs.
+
+**C1 -- the fix for C2 threw on every invocation.** The new held-answer branch called
+`write_hold_notice(tid=..., ...)` without `ident_name`, which the production callable
+(`adapter.write_hold_notice`) requires. Every held portal answer raised `TypeError` inside
+`intake_pass`'s per-ticket `except`: no hold card, no escalation row, nothing to the client --
+and the ticket was already out of `status='new'`, so the intake poll never returned it again.
+**Permanently silent in both directions**, on the exact path built to stop silence.
+
+It was invisible because every test in three files passed `write_hold_notice=lambda **kw:
+...`. A `**kwargs` sponge accepts any signature, including the broken one. *A fake that cannot
+fail the way production fails is not a test double, it is a blindfold.* The regression test now
+builds the REAL factory (`echo_ticket_wiring._write_hold_notice_factory`) and checks the call
+site against the real signature.
+
+**C2 -- `opened` is not `delivered`.** `OutreachResult.opened` means `conversations.open`
+succeeded; it is `True` on `claim_failed`, `lost_claim` AND `post_failed`. Three callers read
+it as "the client was told". So a failed `chat.postMessage` resolved the ticket AND wrote the
+new receipt asserting *"the client was told this, SENT AUTOMATICALLY (no tap)"* over a row
+whose own `delivery_status` was `failed`. The receipt -- the very thing added so Blake would
+never have to wonder whether a ticket landed -- could state a delivery that did not happen.
+`delivered` is now a separate field, true only after the post returns ok, and the three
+callers read it instead.
+
+**M1 -- the flags stopped at one branch.** D59 gated the QUESTION branch; its two siblings
+(`acknowledge_submitter`, `fixed_pass`) DM clients through the same `outreach.initiate` and
+checked no slack_convo flag at all, not even the identity master switch. "Flags off equals
+today" was simply untrue for the portal bridge. *Gating the path the audit found is not the
+same as gating the paths that share its door.*
+
+**M2 -- "re-checked at post time" was re-reading a boolean.** Gate 5a trusted the stored
+`attachments.auto_answer_forbidden`, so a row from any writer that omits it posted a hard-line
+answer unattended. The body is re-evaluated now. The old test injected the marker and asserted
+the lookup: it proved the boolean, not the rule, which is precisely how M2 shipped underneath a
+test named for it.
+
+**M3 -- a denylist of topics is whack-a-mole, and the auditor won.** Eleven ordinary sentences
+walked past `AUTO_ANSWER_FORBIDDEN`: *"what time does the gym open on saturday"*, *"our
+saturday classes are moving to 8am"*, *"a member tweaked her back, what do we tell her"*, *"how
+much is this going to run us each month"*. So the rule is **inverted** for unattended sending:
+`AUTO_ANSWER_ALLOWED` is an allowlist of what this system can actually observe in live account
+state (connection status, posts, calendar, approvals, uploads) -- the entire universe
+`answer_lane.default_fetch_state` can even fetch -- and a message must pass BOTH it and the
+denylist. Anything phrased any other way holds for a person. *When a safety rule must
+enumerate every dangerous phrasing, enumerate the safe ones instead.*
+
+**M4 -- "refuses to boot" was caught by a catch-all one level up.** `NotWiredError` raised
+inside `listener.py`'s `try` around `attach()` meant `attach` and `start_additional_identities`
+were both skipped: **all four identities silently dark while the listener reported healthy** --
+a worse instance of the exact pattern D56 named. It re-raises now, on both lanes, so a
+misconfigured deployment crashes visibly instead of lobotomising itself.
+
+**M5 -- a fix claim nobody verified.** `_fix_summary_text` said *"Fixed it and confirmed the
+change is live"* whenever `verification_after` was merely non-empty; it never looked inside. A
+snapshot saying `{"verified": false, "reason": "could not reproduce"}` would have been
+announced to the client as a confirmed fix. It reads the verdict now, and makes no claim at all
+when the snapshot does not affirmatively say the fix was verified.
+
+Also from this audit: `TEMPLATE_UNKNOWN` and `TEMPLATE_QUEUED` carried the same promise-shape
+D52 removed ("the team will pick it up there", "Someone will pick it up") and are reworded --
+**the ban is on promising future human action as a fact, not on one particular sentence**, and
+the test asserts the requirement now rather than grepping for the old string.
+
+### The lesson that outranks all seven
+
+Two independent audits, five CRITICALs between them, and the full suite was green through every
+single one. Each bug lived exactly where the tests were shaped like the build instead of like
+the requirement: a fake that accepts any signature, an injected failure that proves the
+handler, a substring assertion that survives a dropped value, a marker check that proves the
+boolean. **When a test and its subject were written by the same author in the same hour, the
+test tends to encode what the code does, not what the rule is.** That is what an independent
+read buys, and it is why the loop is two consecutive clean audits by fresh eyes, never one.

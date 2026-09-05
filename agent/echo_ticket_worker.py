@@ -161,7 +161,14 @@ def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outrea
     tid = ticket.get("id")
     if _has_outbound_kind(bus, tid, _a.KIND_ACK, log=log):
         return True
-    if outreach and who is not None and who.kind == _ig.CLIENT and who.slack_user_id:
+    # M1 (audit 2): a group DM to a client is a client-facing send and obeys the same flags
+    # as every other one. With them off this falls through to the portal-thread row below,
+    # which the outbox gates in the usual way -- the client is still acknowledged, through a
+    # surface that respects the trust ladder.
+    dm_allowed = (config.slack_convo_identity_enabled(identity_name)
+                  and config.slack_convo_client_reply_armed(identity_name))
+    if (dm_allowed and outreach and who is not None and who.kind == _ig.CLIENT
+            and who.slack_user_id):
         result = _out.initiate(
             _verified_ticket_dict(ticket), who, outreach["ident"],
             open_group_dm=outreach["open_group_dm"],
@@ -169,9 +176,12 @@ def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outrea
             record_outbound=bus.record_outbound, stamp_ticket=outreach.get("stamp_ticket"),
             message_text=_a.TEMPLATE_NO_ANSWER_YET, mark_message=outreach.get("mark_message"),
             claim_message=outreach.get("claim_message"), log=log)
-        if result.opened:
+        if getattr(result, "delivered", False):
             return True
-        log(f"[ticket-worker/{identity_name}] escalation ack: group DM refused "
+        # C2 (audit 2): this used to return True on `opened`, which is True even when the
+        # post FAILED -- so the client got nothing AND the portal-thread fallback below was
+        # skipped, on the one path whose entire job is making sure they hear something.
+        log(f"[ticket-worker/{identity_name}] escalation ack not delivered "
             f"ticket={tid} reason={result.reason}; falling back to the portal thread")
     bus.record_outbound(
         ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_NO_ANSWER_YET,
@@ -337,7 +347,8 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                           "auto_answer_forbidden": bool(forbidden)})
                 bus.set_ticket(tid, status="hold", escalated=True)
                 if write_hold_notice:
-                    write_hold_notice(tid=tid, recipient_kind=who.kind,
+                    write_hold_notice(ident_name=identity_name, tid=tid,
+                                      recipient_kind=who.kind,
                                       user=who.slack_user_id or "", account_key=who.account_key,
                                       kind=_a.KIND_ANSWER, body=answer["body"],
                                       held_message_id=(row or {}).get("id"),
@@ -350,7 +361,7 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
                 message_text=answer["body"], mark_message=mark_message,
                 claim_message=claim_message, log=log)
-            if result.opened:
+            if getattr(result, "delivered", False):
                 bus.set_ticket(tid, status="resolved")
                 # M1: the one path that sends a model answer with NO tap at all produced no
                 # receipt, so the very thing Blake asked to see was the one thing invisible.
@@ -363,8 +374,14 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                     log(f"[echo-ticket-worker] receipt failed ticket={tid}: "
                         f"{type(e).__name__}")
             else:
-                log(f"[echo-ticket-worker] outreach refused ticket={tid} "
+                # C2: `opened` is not delivery. A post_failed / claim_failed / lost_claim
+                # result leaves the client with NOTHING, so the ticket must not resolve and
+                # no receipt may claim it was told. It escalates to a person instead.
+                log(f"[echo-ticket-worker] outreach did not deliver ticket={tid} "
                     f"reason={result.reason}")
+                _escalate_unresolved(bus, ticket, reason=f"answer_undelivered_{result.reason}",
+                                     identity_name=identity_name, log=log, who=who,
+                                     outreach=None)
         else:
             _escalate_unresolved(bus, ticket, reason="question_not_groundable",
                                 identity_name=identity_name, log=log, who=who,
@@ -400,8 +417,40 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                         who=who, outreach=outreach)
 
 
+# M5 (2026-09-05 audit 2): what counts as a verification that actually SUCCEEDED. The old
+# code claimed "Fixed it and confirmed the change is live" whenever verification_after was
+# merely non-empty -- it never looked inside. A snapshot saying {"verified": false, "reason":
+# "could not reproduce"} was announced to the client as a confirmed fix. This module does not
+# do the verifying; the external fixer worker writes that column. So the rule is: say it only
+# when the snapshot says it, and when the snapshot says anything else (or nothing legible),
+# make no claim at all and put it in front of a person.
+_VERIFIED_TRUE_KEYS = ("verified", "ok", "success", "passed")
+_VERIFIED_FALSE_VALUES = (False, "false", "failed", "no", "error")
+
+
+def verification_succeeded(verification):
+    """True only when the snapshot affirmatively says the fix was verified."""
+    if not isinstance(verification, dict) or not verification:
+        return False
+    for key in _VERIFIED_TRUE_KEYS:
+        if key in verification:
+            val = verification[key]
+            if isinstance(val, str):
+                return val.strip().lower() not in _VERIFIED_FALSE_VALUES
+            return bool(val)
+    status = str(verification.get("status") or verification.get("result") or "").lower()
+    if status:
+        return status in ("verified", "passed", "success", "ok", "fixed")
+    # No verdict field at all: a snapshot with a PR url and nothing contradicting it is the
+    # shape the existing fixer worker writes, so that stays a success; anything else is not.
+    return bool(verification.get("fix_pr_url") or verification.get("pr_url"))
+
+
 def _fix_summary_text(verification):
-    """Plain language, no dashes (same voice rule outreach.py's templates follow)."""
+    """Plain language, no dashes (same voice rule outreach.py's templates follow), or None
+    when the verification does not actually say the fix was verified."""
+    if not verification_succeeded(verification):
+        return None
     pr = ""
     if isinstance(verification, dict):
         pr = str(verification.get("fix_pr_url") or verification.get("pr_url") or "")
@@ -415,8 +464,15 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
               stamp_ticket=None, log=print):
     """Second pass: code_fix tickets already dispatched, whose verification has landed.
     A ticket the fixer worker has not finished yet is left exactly as-is -- polled
-    again next cycle. Never runs if the config flag is off."""
+    again next cycle. Never runs if the config flag is off.
+
+    M1 (2026-09-05 audit 2): this path DMs a client and checked no slack_convo flag at all --
+    not client_reply, not even the identity's master switch. "Flags off equals today" was
+    simply not true for the portal bridge. It is now."""
     if not config.portal_echo_tickets_enabled():
+        return {"notified": 0}
+    if not (config.slack_convo_identity_enabled(identity_name)
+            and config.slack_convo_client_reply_armed(identity_name)):
         return {"notified": 0}
     ident = _ids.IDENTITIES[identity_name]
     tickets = bus.find_fixing_tickets(product=product)
@@ -434,16 +490,34 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
             _escalate_unresolved(bus, ticket, reason="fixed_but_no_slack_user_id",
                                 identity_name=identity_name, log=log, who=who)
             continue
+        summary = _fix_summary_text(verification)
+        if summary is None:
+            # M5 (audit 2): the old text asserted "Fixed it and confirmed the change is live"
+            # on the mere PRESENCE of verification_after, without ever reading whether the
+            # verification succeeded. A failed or inconclusive verification would have been
+            # announced to the client as a confirmed fix. No claim is made now; a person is.
+            _escalate_unresolved(bus, ticket, reason="verification_not_a_success",
+                                identity_name=identity_name, log=log, who=who)
+            continue
         result = _out.initiate(
             _verified_ticket_dict(ticket), who, ident,
             open_group_dm=open_group_dm, post_first_message=post_first_message,
             record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
-            message_text=_fix_summary_text(verification), mark_message=mark_message,
+            message_text=summary, mark_message=mark_message,
             claim_message=claim_message, log=log)
-        if result.opened:
+        if getattr(result, "delivered", False):
             bus.set_ticket(tid, status="resolved")
             notified += 1
+            try:
+                _ob.write_receipt(bus, bus.ticket(tid) or {"id": tid}, identity=ident,
+                                  body=summary, kind=_a.KIND_STATUS,
+                                  where="a group DM opened for this ticket", auto=True,
+                                  extra={"surface": "portal_ticket_bridge"})
+            except Exception as e:  # noqa: BLE001
+                log(f"[ticket-worker/{identity_name}] receipt failed ticket={tid}: "
+                    f"{type(e).__name__}")
         else:
-            log(f"[ticket-worker/{identity_name}] fixed-pass outreach refused "
+            # C2: `opened` is not delivery; a failed post must not resolve the ticket.
+            log(f"[ticket-worker/{identity_name}] fixed-pass not delivered "
                 f"ticket={tid} reason={result.reason}")
     return {"notified": notified}

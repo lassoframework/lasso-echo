@@ -28,7 +28,13 @@ ECHO = IDS.IDENTITIES["echo"]
 def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
-    # armed live on the Railway echo service since 2026-09-03 ([[slack-convo-adapter-armed]])
+    # armed live on the Railway echo service since 2026-09-03 ([[slack-convo-adapter-armed]]).
+    # The master and identity switches are set too: M1 (2026-09-05 audit 2) made the portal
+    # bridge's client-facing DMs obey them, so a fixture that armed only CLIENT_REPLY was
+    # describing a state that cannot exist -- client_reply is meaningless with the identity
+    # off, and config.slack_convo_client_reply_armed's own callers now check both.
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     yield
 
