@@ -185,6 +185,134 @@ def cross_day_repeats(rows, lib):
     return out
 
 
+# ---------------------------------------------------------------------------
+# B5 — the repeats the sweep is RIGHT to refuse, and WRONG to swallow
+#
+# Measured live on 2026-09-05 with the guard armed and this sweep running nightly:
+#   zanshin  5 photo repeats, dates_fixed 0, approved_left 5, small library
+#            -41.jpg sits on 09-03 (LIVE), 09-08 (approved) and 09-09 (approved):
+#            the SAME photo three times inside seven days
+#   lasso   28 photo repeats, dates_fixed 0, small library
+#
+# The stage-time guard works (zero repeats among rows created after it deployed).
+# What is left is the rows it cannot see, and this sweep is correctly forbidden
+# from fixing them: an APPROVED row's media is never swapped, because the gym
+# approved that exact card, and a small library is never given fabricated media.
+# Both refusals are right. Recording them as an integer on a stdout table is not:
+# approved_left has been counted since the job was written and has never reached a
+# person, so Pete's photos have repeated for weeks with the machine "working".
+#
+# This says it out loud, once, with the dates. It changes NO write behavior: the
+# approved rows and the small library are still left exactly alone.
+#
+# Flag: config.media_repeat_report_enabled() (AGENT_MEDIA_REPEAT_REPORT, default
+# OFF -- a new alert is a new capability).
+_NEAR_DAYS = 7          # B5's own bar: never the same photo twice inside 7 days
+
+
+def unfixable_report(result, *, near_days=_NEAR_DAYS):
+    """One client-readable sentence per gym whose repeats this sweep left in place,
+    or "" when there is nothing to say. PURE: no I/O, no kv, no alerting.
+
+    Repeats inside `near_days` are called out separately because they are the ones a
+    follower actually notices -- the same photo twice in a week reads as a bot."""
+    detail = [d for d in (result or {}).get("detail") or []
+              if "APPROVED duplicate" in d or "LIVE row also carries it" in d
+              or "no unused photo left" in d]
+    if not detail:
+        return ""
+    gym = (result or {}).get("gym", "")
+    approved = int((result or {}).get("approved_left") or 0)
+    small = bool((result or {}).get("small_library"))
+    photos = int((result or {}).get("photos_repeated") or 0)
+
+    # Group the left-behind dates per photo so "twice inside a week" is provable.
+    by_photo = {}
+    for line in detail:
+        head = line.split(":", 1)[0].strip()
+        parts = head.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        key, pd = parts[0], parts[1]
+        if len(pd) == 10 and pd[4] == "-":
+            by_photo.setdefault(key, set()).add(pd)
+    near = []
+    for key, dates in by_photo.items():
+        ds = sorted(dates)
+        best = None
+        for i in range(1, len(ds)):
+            try:
+                gap = (date.fromisoformat(ds[i]) - date.fromisoformat(ds[i - 1])).days
+            except ValueError:
+                continue
+            # The CLOSEST pair is the one a follower actually sees, so report that
+            # one rather than whichever happened to come first in date order.
+            if gap <= near_days and (best is None or gap < best[0]):
+                best = (gap, ds[i - 1], ds[i])
+        if best is not None:
+            near.append(f"{key} on {best[1]} and {best[2]} ({best[0]} days apart)")
+
+    lines = [f"{gym}: {photos} photo(s) repeat across different days of the book and "
+             f"this sweep left them in place ON PURPOSE."]
+    if approved:
+        lines.append(f"{approved} of them sit on APPROVED posts. Echo will not change "
+                     "a card the gym already approved, so a person has to decide: "
+                     "re-approve a swap, or leave the repeat.")
+    if small:
+        lines.append("This gym has fewer usable photos than it has posting days, so "
+                     "there is nothing fresh to swap in. Add photos (connect the "
+                     "gym's Drive folder or upload in the portal).")
+    if near:
+        lines.append(f"Inside {near_days} days (the ones a follower notices): "
+                     + "; ".join(sorted(near)[:4]) + ".")
+    lines.append("Nothing was published, nothing was fabricated and no approval was "
+                 "changed.")
+    return " ".join(lines)
+
+
+def report_unfixable(result, *, today_iso="", alert_fn=None, db=None,
+                     near_days=_NEAR_DAYS):
+    """Raise `unfixable_report` once per gym per month, and AGAIN whenever the count
+    gets worse. Durable-or-silent (the repo's alert-dedup convention: a process with
+    an ephemeral kv would re-alert every night, so it stays quiet instead). Returns
+    the text it alerted, else "". Never raises: reporting may not break a sweep."""
+    if not config.media_repeat_report_enabled():
+        return ""
+    text = unfixable_report(result, near_days=near_days)
+    if not text:
+        return ""
+    gym = (result or {}).get("gym", "")
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        if hasattr(_db, "kv_is_durable") and not _db.kv_is_durable():
+            return ""
+        key = f"media_repeat_left_{gym}_{str(today_iso or '')[:7]}"
+        seen = _db.kv_get(key, "") or ""
+        now_n = int((result or {}).get("photos_repeated") or 0)
+        if seen:
+            try:
+                if now_n <= int(seen):
+                    return ""            # same or better: already said this month
+            except (TypeError, ValueError):
+                return ""
+        _db.kv_set(key, str(now_n))
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        (alert_fn or _alert)(text)
+    except Exception:  # noqa: BLE001
+        return ""
+    return text
+
+
+def _alert(text):
+    from agent import ops_alerts
+    ops_alerts.alert(text)
+
+
 def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     today = today or date.today()
     win = config.media_repeat_window_days()
@@ -317,8 +445,18 @@ def run(gyms, *, apply=False, horizon=62):
         from agent.calendar_autopublish import client_gym_bases
         gyms = client_gym_bases() + ["lasso"]
     results = []
+    today_iso = date.today().isoformat()
     for base in gyms:
-        results.append(sweep_gym(base, store, apply=apply, horizon=horizon))
+        r = sweep_gym(base, store, apply=apply, horizon=horizon)
+        # B5: say out loud what this sweep deliberately did NOT fix. Flag-gated
+        # (AGENT_MEDIA_REPEAT_REPORT, default OFF) and kv-deduped per gym per month.
+        # Only in APPLY mode: a dry run must stay a dry run, including its alerts.
+        if apply:
+            try:
+                report_unfixable(r, today_iso=today_iso)
+            except Exception as exc:  # noqa: BLE001 - reporting never breaks a sweep
+                _log(f"{base}: unfixable report failed ({type(exc).__name__})")
+        results.append(r)
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"\n=== media_repeat_sweep [{mode}] ===")
     print(f"{'gym':<14}{'photos':>7}{'dates_fixed':>12}{'rows':>6}"

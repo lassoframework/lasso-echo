@@ -1110,6 +1110,29 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def media_repeat_report_enabled() -> bool:
+    """AGENT_MEDIA_REPEAT_REPORT, default OFF. Say out loud what the nightly
+    cross-day photo sweep deliberately did NOT fix (B5).
+
+    Measured live 2026-09-05 with the guard armed and the sweep running nightly:
+    zanshin had 5 photo repeats, dates_fixed 0, approved_left 5, small library --
+    one photo on 09-03 (live), 09-08 (approved) and 09-09 (approved), the same
+    picture three times inside seven days. LASSO had 28 repeats, dates_fixed 0.
+
+    The sweep is RIGHT to refuse both cases: it never swaps an APPROVED row's media
+    (the gym approved that exact card) and never fabricates media for a small
+    library. Recording those refusals as an integer on a stdout table is the defect
+    -- approved_left has been counted since the job was written and has never
+    reached a person, so the photos repeated for weeks while the machine reported
+    itself working.
+
+    ON: one kv-deduped sentence per gym per month (and again when it gets worse)
+    naming the photo, the dates, and which repeats fall inside 7 days. It changes
+    NO write behavior. OFF (default): byte for byte today, no extra kv read.
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_REPORT", "false"))
+
+
 def grade_stuck_escalation_enabled() -> bool:
     """ECHO_GRADE_STUCK_ESCALATION, default OFF. The named-human escalation for a
     calendar book that the remediation loop cannot fix (C7).
