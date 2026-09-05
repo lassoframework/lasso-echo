@@ -23,6 +23,7 @@ matching" at runtime. Catching the violation is the reliable form.
 import json
 from datetime import datetime, timedelta, timezone
 
+from . import testdata as _td
 from .. import config
 
 _TICKETS = "support_tickets"
@@ -157,10 +158,15 @@ class Bus:
         picked up by anything" means for this bus; a ticket already routed to a
         classification (question/code_fix/action_request) or otherwise past 'new' is
         never re-fetched here, so a slow worker restart can never double-process one."""
-        return self._get(_TICKETS, {
+        rows = self._get(_TICKETS, {
             "product": f"eq.{product}", "source": f"eq.{source}", "status": "eq.new",
             "classification": "is.null", "select": "*",
             "order": "created_at.asc", "limit": str(int(limit))})
+        # 2026-09-05: our own arming probes are never work. Eight of them sat in #fixer
+        # looking exactly like unhandled client tickets; a re-run of this poll must not put
+        # any of them back on a card. testdata.py is the single predicate for that, shared
+        # with every report and metric so they can never disagree.
+        return _td.exclude_test(rows)
 
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer
@@ -178,7 +184,7 @@ class Bus:
         if bot_identity:
             params["bot_identity"] = f"eq.{bot_identity}"
         rows = self._get(_TICKETS, params)
-        return len(rows)
+        return len(_td.exclude_test(rows))
 
     def find_recent_ticket_for_user_today(self, slack_user_id, bot_identity=None):
         """RB2/D25 (2026-09-03, MAJOR): the most recent ticket this user opened today, in ANY

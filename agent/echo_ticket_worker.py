@@ -145,7 +145,7 @@ def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outrea
     Found live on three real portal tickets: each one reached #fixer correctly and each one
     left its submitter with nothing at all -- no "we got it", and no word when it was dealt
     with. The Slack-initiated path has always sent this acknowledgement (adapter.py emits
-    ACK/TEMPLATE_ESCALATED inline); the portal bridge never did, because it escalates and
+    ACK/TEMPLATE_NO_ANSWER_YET inline); the portal bridge never did, because it escalates and
     returns before any client-facing row is written.
 
     Best channel available, in order:
@@ -166,14 +166,14 @@ def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outrea
             open_group_dm=outreach["open_group_dm"],
             post_first_message=outreach["post_first_message"],
             record_outbound=bus.record_outbound, stamp_ticket=outreach.get("stamp_ticket"),
-            message_text=_a.TEMPLATE_ESCALATED, mark_message=outreach.get("mark_message"),
+            message_text=_a.TEMPLATE_NO_ANSWER_YET, mark_message=outreach.get("mark_message"),
             claim_message=outreach.get("claim_message"), log=log)
         if result.opened:
             return True
         log(f"[ticket-worker/{identity_name}] escalation ack: group DM refused "
             f"ticket={tid} reason={result.reason}; falling back to the portal thread")
     bus.record_outbound(
-        ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_ESCALATED,
+        ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_NO_ANSWER_YET,
         delivery_status="ready", kind=_a.KIND_ACK,
         meta={"identity": identity_name, "surface": "portal_ticket_bridge",
               "recipient_kind": "client"})
@@ -202,7 +202,8 @@ def _has_outbound_kind(bus, tid, kind, *, log=print):
 def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
                identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
-               mark_message=None, claim_message=None, stamp_ticket=None, log=print):
+               classify_llm=None, mark_message=None, claim_message=None, stamp_ticket=None,
+               log=print):
     """First pass: NEW, unclassified tickets for (product, source), dispatched under
     identity_name. Never runs if the config flag is off. Defaults preserve the
     original Echo-only behavior; D47 generalized this for a second (product,
@@ -224,6 +225,7 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
                         post_first_message=post_first_message,
                         write_hold_notice=write_hold_notice, ident=ident,
                         identity_name=identity_name, fetch_state=fetch_state, llm=llm,
+                        classify_llm=classify_llm,
                         mark_message=mark_message, claim_message=claim_message,
                         stamp_ticket=stamp_ticket, log=log)
             processed += 1
@@ -235,7 +237,8 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
 
 def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
                 operator_ids, open_group_dm, post_first_message, write_hold_notice,
-                ident, identity_name, fetch_state, llm, mark_message, claim_message,
+                ident, identity_name, fetch_state, llm, classify_llm, mark_message,
+                claim_message,
                 stamp_ticket, log):
     tid = ticket["id"]
     # Row-first: the client's original words are recorded as an inbound message
@@ -281,8 +284,18 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
     # reconstruct who to notify without re-resolving.
     bus.set_ticket(tid, slack_user_id=who.slack_user_id)
 
+    # RTF-2 (2026-09-05, found live): this used to pass `llm` -- the ANSWER LANE's model
+    # callable, whose signature is (system, user, model=None) -- as the CLASSIFIER's llm,
+    # whose contract is (text) -> label. Calling it with one argument raised TypeError on
+    # every single message, classify() caught it (a model fault escalates, by design) and
+    # returned ESCALATE. So the portal bridge's LLM fallback never once ran: every message
+    # the deterministic rules did not recognise silently escalated, which is precisely what
+    # happened to the one real client ticket of 2026-09-05 (35e066d0, the "nothing was
+    # recreated" report). Same bug class as classify_llm=None in listener_wiring, one layer
+    # subtler: here something WAS passed, it was just the wrong shape, and the fail-closed
+    # path made it look identical to "the classifier had nothing to say".
     classification = _cls.classify(ticket.get("raw_text") or "", has_open_ticket=False,
-                                   identity_product=ident.product, llm=llm)
+                                   identity_product=ident.product, llm=classify_llm)
 
     if classification == _cls.QUESTION:
         answer = None

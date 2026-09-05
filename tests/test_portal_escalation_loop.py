@@ -194,7 +194,7 @@ def test_unresolved_identity_still_gets_an_acknowledgement():
     assert A.KIND_ESCALATION in kinds, "the #fixer card must still be written"
     acks = bus.of_kind(A.KIND_ACK)
     assert len(acks) == 1
-    assert acks[0]["body"] == A.TEMPLATE_ESCALATED
+    assert acks[0]["body"] == A.TEMPLATE_NO_ANSWER_YET
     assert acks[0]["delivery_status"] == "ready"
     assert seen["opened"] == [], "no Slack DM is possible for an unresolved identity"
 
@@ -203,7 +203,7 @@ def test_a_known_client_gets_the_acknowledgement_as_a_group_dm():
     bus = Bus([_ticket()])
     seen, _ = _run_intake(bus, _client_deps())
     assert seen["opened"] == [[W._out.BLAKE_SLACK_USER_ID, "U_CLIENT"]]
-    assert seen["posted"] and A.TEMPLATE_ESCALATED in seen["posted"][0][1]
+    assert seen["posted"] and A.TEMPLATE_NO_ANSWER_YET in seen["posted"][0][1]
     assert len(bus.of_kind(A.KIND_ACK)) == 1
 
 
@@ -244,7 +244,7 @@ def test_a_conversational_row_on_a_portal_ticket_is_delivered_to_the_portal_thre
     bus = Bus([_ticket(status="hold")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
                        author_type="client", author_id="owner@gym.com", body="hi", meta={})
-    bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.TEMPLATE_ESCALATED,
+    bus.record_outbound(ticket_id="t-1", author_type="echo", body=A.TEMPLATE_NO_ANSWER_YET,
                         delivery_status="ready", kind=A.KIND_ACK,
                         meta={"identity": "echo", "recipient_kind": "client"})
     sent, post = _posts()

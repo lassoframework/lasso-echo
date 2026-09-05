@@ -184,7 +184,8 @@ def _who(kind, uid="U_CLIENT", account_key="crossfitlocal", gym_id="g-1"):
 
 
 def _deps(bus, *, who=IG.CLIENT, identity="echo", enabled=True, client_armed=False,
-          staff_armed=True, cap=10, answer=None):
+          staff_armed=True, cap=10, answer=None, auto_answer=False, cross_product=False,
+          describe_gym=None, classify_llm=None):
     ident = IDS.get(identity)
     return A.Deps(bus=bus, identity=ident,
                   resolve_identity=lambda uid: _who(who, uid),
@@ -192,7 +193,10 @@ def _deps(bus, *, who=IG.CLIENT, identity="echo", enabled=True, client_armed=Fal
                   client_reply_armed=lambda: client_armed,
                   staff_reply_armed=lambda: staff_armed,
                   daily_cap=lambda: cap, open_window_days=lambda: 7,
-                  answer=answer, classify_llm=None, log=lambda *a, **k: None)
+                  answer=answer, classify_llm=classify_llm, log=lambda *a, **k: None,
+                  describe_gym=describe_gym,
+                  auto_answer_armed=lambda: auto_answer,
+                  cross_product_armed=lambda: cross_product)
 
 
 def _ev(text, *, channel="G0MPIM", ts="1.001", channel_type="mpim", user="U_CLIENT",
@@ -547,11 +551,15 @@ def test_question_answer_sets_verification_and_writes_answer():
 
 
 def test_ticket_resolves_only_when_the_answer_posts(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "Yes, both connected.", "grounding": {"ig": "connected"}}
-    d = A.handle_event(_ev("are my accounts connected?"), "k", _deps(bus, answer=ans, client_armed=True))
+    d = A.handle_event(_ev("are my accounts connected?"), "k",
+                       _deps(bus, answer=ans, client_armed=True, auto_answer=True))
     assert bus.ticket(d.ticket_id)["status"] == "verification"
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -726,10 +734,14 @@ def _rows(bus, tid, kind):
 
 
 def test_reply_never_posts_without_verification_after(monkeypatch):
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "answer", "grounding": {"x": 1}}
-    d = A.handle_event(_ev("are my accounts connected?"), "k", _deps(bus, answer=ans, client_armed=True))
+    d = A.handle_event(_ev("are my accounts connected?"), "k",
+                       _deps(bus, answer=ans, client_armed=True, auto_answer=True))
     bus.set_ticket(d.ticket_id, verification_after=None)   # someone cleared it
     post, calls = _posted()
     s = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)

@@ -33,6 +33,7 @@ from .. import config
 from . import adapter as _adapter
 from . import answer_lane as _answer
 from . import bus as _bus
+from . import classifier as _cls
 from . import identity_gate as _ig
 from . import identities as _ids
 from . import outbox as _outbox
@@ -146,8 +147,15 @@ def live_deps(identity, *, bus=None, log=print):
         return _ig.resolve(uid, slack_user_info=info, portal_lookup=lookup,
                            operator_ids=operators)
 
-    def answer(ticket, who, messages, question=None):
-        return _answer.answer(ticket, who, messages, question, identity=identity)
+    def answer(ticket, who, messages, question=None, answer_identity=None):
+        # D50: `answer_identity` is which product's knowledge and reply voice drafts this
+        # answer. It defaults to the identity that owns the ticket and can only ever be a
+        # DIFFERENT BOT'S KNOWLEDGE, never a different gym: `ticket` and `who` are passed
+        # straight through untouched, and answer_lane's own fetch_state keys every live fact
+        # off who.account_key. There is no argument here through which another gym's data
+        # could enter.
+        return _answer.answer(ticket, who, messages, question,
+                              identity=answer_identity or identity)
 
     return _adapter.Deps(
         bus=bus, identity=identity, resolve_identity=resolve,
@@ -156,7 +164,104 @@ def live_deps(identity, *, bus=None, log=print):
         staff_reply_armed=lambda: config.slack_convo_staff_reply_armed(identity.name),
         daily_cap=config.slack_convo_daily_ticket_cap,
         open_window_days=config.slack_convo_open_window_days,
-        answer=answer, classify_llm=None, log=log)
+        answer=answer, classify_llm=build_classify_llm(identity, log=log),
+        describe_gym=_describe_gym_factory(bus),
+        auto_answer_armed=lambda: config.slack_convo_auto_answer_armed(identity.name),
+        cross_product_armed=lambda: config.slack_convo_cross_product_routing_enabled(
+            identity.name),
+        log=log)
+
+
+class NotWiredError(RuntimeError):
+    """A capability is configured ON but nothing is actually behind it. Raised at boot."""
+
+
+def build_classify_llm(identity, *, log=print, factory=None):
+    """The production classifier LLM for one identity, or None when the flag is off.
+
+    THE FIX, and the assertion that keeps it fixed (2026-09-05):
+
+    This function replaces the literal `classify_llm=None` that sat in live_deps() above.
+    While it was there, classifier.classify() could never reach its LLM branch in production,
+    so every message the regexes did not recognise fell to ESCALATE by construction -- the
+    "the classifier did not decide" flood in #fixer. The capability was written, tested,
+    documented in config.slack_convo_model()'s own docstring, and wired to nothing.
+
+    That is the THIRD instance of one pattern in this system (see DECISIONS.md D56):
+    delivery_status='posting' (a state the code wrote and the DB constraint rejected),
+    listener_watch (a loop that shipped and was never started), and this. The shape is always
+    the same: the capability exists, a flag says it is on, and nothing between the flag and
+    the work is actually connected -- and it looks EXACTLY like working software from the
+    outside, because the fallback path is a legitimate one.
+
+    So this refuses to boot rather than degrade: if the flag says the model classifier is on
+    and we cannot build one, that is a broken deployment, not a quieter mode. The `factory`
+    seam exists so a test can assert both branches with no key and no network."""
+    if not config.slack_convo_classifier_llm_enabled(identity.name):
+        if config.slack_convo_identity_enabled(identity.name):
+            log(f"[slack-convo/{identity.name}] classifier LLM is OFF "
+                f"(SLACK_CONVO_{identity.name.upper()}_CLASSIFIER_LLM): classification is "
+                f"deterministic rules only, and anything they do not recognise will escalate "
+                f"to a person rather than be answered")
+        return None
+    try:
+        llm = (factory or _cls.default_classify_llm)()
+    except Exception as e:  # noqa: BLE001 - surfaced as NotWiredError below, never swallowed
+        raise NotWiredError(
+            f"SLACK_CONVO_{identity.name.upper()}_CLASSIFIER_LLM is on but no classifier LLM "
+            f"could be built ({type(e).__name__}). Set ANTHROPIC_API_KEY or turn the flag "
+            f"off; refusing to run with the flag on and nothing behind it.") from e
+    if llm is None:
+        raise NotWiredError(
+            f"SLACK_CONVO_{identity.name.upper()}_CLASSIFIER_LLM is on but the classifier LLM "
+            f"is None. Refusing to boot: with the flag on and nothing behind it, every "
+            f"message the deterministic rules miss silently escalates and #fixer fills with "
+            f"'the classifier did not decide'.")
+    assert_classifier_shape(llm, identity)
+    log(f"[slack-convo/{identity.name}] classifier LLM wired "
+        f"(model {config.slack_convo_model()})")
+    return llm
+
+
+def assert_classifier_shape(llm, identity):
+    """The classifier's llm contract is (text) -> label. Anything else refuses to boot.
+
+    RTF-2 (2026-09-05): echo_ticket_wiring passed answer_lane.default_llm -- signature
+    (system, user, model=None) -- as the CLASSIFIER's llm. Every call raised TypeError,
+    classify() caught it exactly as designed (a model fault escalates rather than
+    dispatches), and the result was indistinguishable from "the classifier had nothing to
+    say". A mis-shaped callable is the same failure as no callable at all, only harder to
+    see, so it is checked in the same place and just as loudly."""
+    try:
+        import inspect
+        sig = inspect.signature(llm)
+    except (TypeError, ValueError):
+        return  # a builtin/C callable: nothing to check, and never what we build here
+    required = [p for p in sig.parameters.values()
+                if p.default is inspect.Parameter.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    if len(required) != 1:
+        raise NotWiredError(
+            f"[{identity.name}] the classifier LLM has the wrong shape: it needs exactly one "
+            f"required argument (text), but takes {len(required)} ({list(sig.parameters)}). "
+            f"This is how the answer lane's (system, user) callable got wired into the "
+            f"classifier and silently escalated every message; refusing to boot.")
+
+
+def _describe_gym_factory(bus):
+    """(gym_id) -> a human gym name for a #fixer card, or '' (never raises, never blocks)."""
+    def _describe(gym_id):
+        gid = str(gym_id or "").strip()
+        if not gid:
+            return ""
+        try:
+            rows = bus._get("gyms", {"id": f"eq.{gid}", "select": "name,slug", "limit": "1"})
+        except Exception:  # noqa: BLE001
+            return ""
+        if not rows:
+            return ""
+        return str(rows[0].get("name") or rows[0].get("slug") or "").strip()
+    return _describe
 
 
 def dedupe_key(event):

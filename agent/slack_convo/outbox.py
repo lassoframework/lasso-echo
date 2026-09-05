@@ -344,6 +344,36 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # 5. trust ladder, re-checked at post time; held rows always get a card (V-M8). A row
     # Blake has explicitly released is the one exception: his tap already IS the approval.
     recipient_kind = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
+    # 5a. D54 hard lines, re-checked at POST time (a flag can flip, and a row can be written
+    # by an older process). A substantive ANSWER to a client posts on its own ONLY with that
+    # identity's AUTO_ANSWER flag armed, and NEVER when the draft-time check marked it
+    # forbidden. Blake's release tap is still the way any of these actually go out.
+    if kind == _a.KIND_ANSWER and recipient_kind not in ("staff", "coach") \
+            and not att.get("released_by"):
+        if att.get("auto_answer_forbidden"):
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "hard line: never auto answered"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                why="hard line (billing, hours or schedule, injury or liability): this never "
+                    "auto answers, whatever the flags say")
+            return
+        if not config.slack_convo_auto_answer_armed(identity.name):
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "auto answer not armed"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                why=f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER is off: a grounded "
+                    "answer needs your tap")
+            return
     if not att.get("released_by") and not _recipient_armed(identity, recipient_kind):
         bus.mark_message(row["id"], "held", meta_update={"held_why": "flag off at post time"})
         summary["held"] += 1
@@ -374,12 +404,51 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             return
         bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
         summary["posted"] += 1
+        _receipt(bus, ticket, row, identity, kind, att, where="the portal support thread",
+                 summary=summary)
         _resolve_on_answer(bus, ticket, kind, summary)
         return
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
+    _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
     _resolve_on_answer(bus, ticket, kind, summary)
+
+
+# Kinds worth a receipt in #fixer. An `ack` ("checking that for you now") is noise; what
+# Blake asked to see is anything SUBSTANTIVE that reached the client without him: the answer
+# itself, the honest no-draft template, and the resolution notice that closes a ticket.
+RECEIPT_KINDS = frozenset({_a.KIND_ANSWER, _a.KIND_TEMPLATE, _a.KIND_STATUS})
+
+
+def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
+    """D55: a receipt of what the client was ACTUALLY told, posted to #fixer.
+
+    Blake, 2026-09-05: "so Blake never has to wonder whether a ticket actually landed with
+    the client". This is written only AFTER the row is marked posted, and it quotes the real
+    body that went out with the real timestamp, so it can never claim a delivery that did not
+    happen. It is an internal kind: it goes to the fixer channel and never into the person's
+    thread. A failure here never fails the post that already succeeded."""
+    if kind not in RECEIPT_KINDS:
+        return
+    if (att or {}).get("recipient_kind") in ("staff", "coach"):
+        return  # staff can see their own thread; a receipt would just be an echo
+    try:
+        sent_at = datetime.now(timezone.utc).isoformat()
+        auto = bool(kind == _a.KIND_ANSWER and not (att or {}).get("released_by"))
+        how = ("SENT AUTOMATICALLY (no tap)" if auto else
+               ("sent after your tap" if (att or {}).get("released_by") else "sent"))
+        bus.record_outbound(
+            ticket_id=ticket["id"], author_type="system",
+            body=(f"RECEIPT: the client was told this, {how}.\n"
+                  f"BOT: {identity.name}   TICKET: {ticket['id']}   KIND: {kind}\n"
+                  f"WHERE: {where}   WHEN: {sent_at}\n"
+                  f"STATUS NOW: {ticket.get('status') or '?'}\n\n{row.get('body') or ''}"),
+            delivery_status="ready", kind=_a.KIND_RECEIPT,
+            meta={"identity": identity.name, "receipt_for": row["id"],
+                  "receipt_kind": kind, "auto_answer": auto, "sent_at": sent_at})
+    except Exception:  # noqa: BLE001 - never undo a successful post over a receipt
+        pass
 
 
 def _resolve_on_answer(bus, ticket, kind, summary):

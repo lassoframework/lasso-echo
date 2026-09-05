@@ -37,7 +37,30 @@ _BREAKAGE_RE = re.compile(
     r"wont|can't|cant|cannot|error|errors|erroring|failed|failing|fails|crash|crashed|"
     r"stuck|still (?:not|broken|failing|down)|bug|glitch|won't load|not loading|"
     r"didn't (?:post|publish|go out|send)|didnt (?:post|publish|go out|send)|"
-    r"never (?:posted|published|went out)|404|500)\b", re.IGNORECASE)
+    r"never (?:posted|published|went out)|404|500|"
+    # RTF-1 (2026-09-05): the live gap. Every phrasing below was a real client sentence
+    # shape that the list above missed, so it fell past CODE_FIX to ESCALATE with "the
+    # classifier did not decide". Present-progressive negation ("are not going out") and
+    # the "stopped / no longer / wrong" family were simply absent. Widening is safe here
+    # because CODE_FIX still requires a _DOMAIN_RE noun in the same message (RT-M2): a bare
+    # "I am not going to make it" has no Echo-domain noun and still escalates.
+    r"(?:are|is|isn't|isnt|aren't|arent|has|hasn't|hasnt|have|haven't|havent|was|were|"
+    r"still)?\s*not (?:going out|posting|publishing|showing|showing up|appearing|"
+    r"updating|syncing|loading|connecting|sending|working)|"
+    r"stopped (?:working|posting|publishing|showing|syncing|updating|going out|sending)|"
+    r"no longer (?:working|posts|posting|publishing|showing|syncing|updating)|"
+    r"(?:showing|shows|showing up with|displaying|displays) the wrong|"
+    r"(?:wrong|incorrect|out of date|outdated) (?:hours|address|phone|number|info|"
+    r"information|schedule|times|link|price)|"
+    r"nothing (?:posted|published|went out|happened|shows|showed up)|"
+    r"(?:still|yet) nothing|"
+    r"keeps? (?:failing|erroring|crashing|logging me out)|"
+    r"(?:has|have|had)(?:n't|nt)? (?:posted|published|gone out|updated|synced|recreated|"
+    r"regenerated|shown up|come through)|"
+    r"nothing (?:was |has been |ever |got )?(?:recreated|regenerated|generated|created|"
+    r"posted|published|sent|updated|synced)|"
+    r"won't (?:post|publish|go out|send|load|connect|update)|"
+    r"wont (?:post|publish|go out|send|load|connect|update))", re.IGNORECASE)
 
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
@@ -66,7 +89,15 @@ _DOMAIN_RE = re.compile(
     r"caption|captions|calendar|schedule|scheduled|instagram|ig|facebook|fb|page|google|"
     r"gbp|business profile|connect|connection|connected|connecting|link|upload|uploads|"
     r"photo|photos|video|videos|media|approve|approval|approvals|portal|login|log in|"
-    r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder)\b", re.IGNORECASE)
+    r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder|"
+    # RTF-1: the website product's nouns, which were missing entirely -- every
+    # Wrangler-shaped breakage report ("the website is showing the wrong hours") failed
+    # RT-M2's domain check and escalated. Bare "site" is deliberately NOT here: the existing
+    # RT-M2 guard case "the site crashed my brain lol" is exactly the figurative use that
+    # word invites, and every real report of ours says website / homepage / page, or names
+    # the thing that is wrong (hours, address, form).
+    r"website|websites|web site|homepage|home page|landing page|web page|webpage|"
+    r"url|domain|form|forms|booking|book now|hours|address)\b", re.IGNORECASE)
 
 # V-m4: greetings, thanks, acknowledgements. Never a ticket, never a page.
 _CHATTER_RE = re.compile(
@@ -88,6 +119,82 @@ def request_type_for(text):
         if rx.search(t):
             return label
     return "other"
+
+
+# ---- cross-product routing (D50, 2026-09-05) -------------------------------------------
+# Blake: "a website question should reach the identity that can actually answer it,
+# regardless of entry point, WHEN the classifier is confident about the content; low
+# confidence stays with the entry-point agent."
+#
+# This decides WHICH BOT'S KNOWLEDGE AND VOICE drafts the answer. It never changes the
+# ticket's channel, its client_id/gym, its bot_identity, or who the reply is delivered to --
+# see adapter._answer_product / outbox delivery, which are untouched by this. A website
+# question about Gym A is still answered in Gym A's own conversation by Gym A's own ticket;
+# only the product knowledge used to draft it moves. That containment is the whole Frame 2
+# safety argument, and tests assert it directly.
+_WEBSITE_RE = re.compile(
+    r"\b(website|web site|websites|homepage|home page|landing page|web page|webpage|"
+    r"our site|my site|the site|your site|site's|sites)\b", re.IGNORECASE)
+# Terms that mean the message is really about the OTHER products. Any of these present and
+# the website signal is no longer unambiguous, so confidence drops and routing does not fire.
+_NOT_WEBSITE_RE = re.compile(
+    r"\b(instagram|ig|facebook|fb|reel|reels|story|stories|caption|captions|post|posts|"
+    r"posting|publish|published|calendar|ad|ads|adset|ad set|campaign|budget|spend|"
+    r"targeting|audience|cpl|lead|leads)\b", re.IGNORECASE)
+
+CONFIDENT = "confident"
+UNSURE = "unsure"
+
+
+def product_hint(text):
+    """(product, confidence) for cross-product routing, or (None, UNSURE).
+
+    Deterministic and deliberately narrow: an unmistakable website noun with no competing
+    product noun in the same message is CONFIDENT; anything else is UNSURE, which the
+    adapter treats as "stay with the entry-point identity", the unchanged behaviour."""
+    t = (text or "").strip()
+    if not t:
+        return None, UNSURE
+    if _WEBSITE_RE.search(t) and not _NOT_WEBSITE_RE.search(t):
+        return "websites", CONFIDENT
+    return None, UNSURE
+
+
+# ---- the LLM fallback, wired for real (D51, 2026-09-05) ---------------------------------
+
+_LLM_SYSTEM = """You label one inbound support message for a LASSO support bot. Reply with
+EXACTLY ONE of these tokens and nothing else:
+
+answerable_question  - the person is asking something that could be answered from their own
+                       account state (is X connected, what is scheduled, what happened to Y).
+code_fix             - the person is reporting that something we run is broken or not doing
+                       what it should.
+action_request       - the person is asking us to CHANGE something on their ads.
+UNSURE               - anything else, or you are not confident. Choose this freely; a wrong
+                       label sends a client a wrong answer, UNSURE only asks a human to look.
+
+Never explain. Never output any other text."""
+
+
+def default_classify_llm(model=None):
+    """A real LLM classifier for the ambiguous middle, or None when no key is configured.
+
+    THE BUG THIS CLOSES (found live 2026-09-05): listener_wiring.live_deps() hardcoded
+    `classify_llm=None`, so in production classify() could only ever reach the deterministic
+    rules -- config.slack_convo_model()'s own docstring has promised "the LLM fallback of the
+    classifier" since the day it was written, and nothing was ever wired to it. Every message
+    the regexes did not recognise fell to ESCALATE by construction, which is exactly the
+    "the classifier did not decide" flood in #fixer.
+
+    Returns a callable (text) -> label | None. It NEVER raises out to the caller: classify()
+    already treats an exception as ESCALATE, and this returns None on anything unexpected, so
+    the deterministic behaviour is the floor and the model can only ever fill the middle."""
+    def _llm(text):
+        from . import answer_lane as _al
+        raw = _al.default_llm(_LLM_SYSTEM, str(text or "")[:4000], model=model)
+        verdict = (raw or "").strip().splitlines()[0].strip() if raw else ""
+        return verdict if verdict in _VALID else None
+    return _llm
 
 
 def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None):

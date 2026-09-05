@@ -1253,3 +1253,182 @@ actually talk to production. A schema-contract test, run statically against the 
 DDL rather than a description of it, is the check that closes that specific gap, and is
 worth having for any column with a narrow, hand-maintained CHECK constraint that
 application code writes literals into.
+
+---
+
+## D56 (2026-09-05) -- "built but not wired": naming the pattern after its third instance
+
+Blake, looking at #fixer with all four identities armed: *"#fixer is not autonomous. Every
+ticket says 'the classifier did not decide' and every held draft is the escalation
+placeholder, not a real answer."*
+
+The direct cause was one line, present since this package's first commit (`a5a008a`,
+2026-09-03) and never anything else:
+
+```python
+# agent/slack_convo/listener_wiring.py, live_deps()
+answer=answer, classify_llm=None, log=log)
+```
+
+`classifier.classify()` consults its injected model ONLY after every deterministic rule
+declines. With `classify_llm=None` hardcoded in the one function that builds production
+dependencies, that branch was unreachable in production for the entire life of the system.
+Every message the regexes did not recognise fell to `ESCALATE` -- not by failure, BY
+CONSTRUCTION. `config.slack_convo_model()`'s own docstring had promised "the LLM fallback of
+the classifier" the whole time; the env var could be set on the service forever and change
+nothing.
+
+Its twin, found the same day in the portal bridge (`RTF-2`): `echo_ticket_wiring.py` passed
+`answer_lane.default_llm` -- signature `(system, user, model=None)` -- as the CLASSIFIER's
+`llm`, whose contract is `(text) -> label`. Every call raised `TypeError`; `classify()`
+caught it and escalated, exactly as designed for a model fault; and the outcome was
+indistinguishable from "the classifier had nothing to say". **A wrong-shaped wire is the
+same bug as a missing one, only harder to see.** This is the path the one real client ticket
+of 2026-09-05 (`35e066d0`, the "nothing was recreated" report) actually travelled.
+
+### The pattern, now three deep in one system
+
+| # | Instance | What existed | What was connected | How it looked from outside |
+|---|----------|--------------|--------------------|----------------------------|
+| 1 | `delivery_status='posting'` | the outbox CAS, always | the CHECK constraint never allowed the state | every claim 400'd; NOTHING had ever posted |
+| 2 | `listener_watch` | the watchdog loop, in the repo | nothing started it | a safety net that shipped inert |
+| 3 | `classify_llm=None` | the LLM classifier, tested | `None`, hardcoded in `live_deps()` | "the classifier did not decide", forever |
+| 3b | `llm=` in the portal bridge | a callable WAS passed | the wrong callable's shape | identical to instance 3, one layer subtler |
+
+The shape is always the same, and it is why none of these were caught by tests: **the
+capability exists, config says it is on, and the fallback path is a legitimate one.**
+Escalating to a human when the classifier is unsure is CORRECT behaviour. Failing closed on
+a model exception is CORRECT behaviour. That is exactly what makes this class invisible --
+the broken state is byte-for-byte identical to a healthy system that simply had nothing to
+say. "All tests green" said nothing about it, because every test injected its own working
+fake into the seam that production left empty.
+
+### The check that catches the whole class
+
+`tests/test_not_wired_guard.py`, a sibling of `tests/test_db_constraint_contract.py` and
+written in the same spirit -- static, no network, no test double:
+
+1. **No hardcoded `None` capability in `live_deps()`.** The function is parsed with `ast`;
+   any `*_llm=None` / `answer=None` written as a constant fails the test by name.
+2. **The boot assertion is actually called.** `build_classify_llm()` refuses to boot
+   (`NotWiredError`) when a flag says a capability is on and nothing can be built behind it,
+   and `assert_classifier_shape()` refuses a callable whose signature is not `(text)`. The
+   test asserts both are reachable from the real wiring path -- *an assertion nobody calls is
+   itself an instance of the bug it exists to catch.*
+3. **OFF must be loud.** A deployment running deterministic-only classification says so at
+   boot. Silence is what let this live for two days; the OFF state is allowed, being unable
+   to tell OFF from BROKEN is not.
+4. **Every flag has a config reader**, so an env var set on the service cannot be inert.
+
+### The generalizable rule
+
+Pair the D55 lesson with this one and they cover both halves of the same failure:
+
+> **D55:** a test double is only as good as the constraints it models; check the code against
+> the real schema, statically.
+> **D56:** a capability is only as real as its wiring; check that the flag, the seam, and the
+> implementation are connected, statically -- and make the disconnected state fail loudly at
+> boot rather than degrade into a legitimate-looking fallback.
+
+Whenever a new capability ships behind a flag (the standing repo rule, and the right rule),
+the flag's ON state must be unable to boot into a no-op. That is the whole fix.
+
+### Live impact, checked against the bus rather than assumed
+
+Queried directly (`support_tickets`, project `ooqcvmcjspeltuuhcvlh`, 2026-09-03 onward,
+excluding `[phase4-audit]` probes and the `U0000000000` synthetic sender):
+
+* **`source='slack_conversation'`: zero real client tickets, ever.** The Slack path where
+  `classify_llm=None` lived carried no genuine client traffic in the whole window. Nobody was
+  told anything wrong, and no client saw the placeholder. That is a good outcome and it is
+  worth stating plainly rather than softening: the bug was real, its blast radius was not.
+* **`source='website_tab'`: exactly one real client ticket affected** -- `35e066d0`
+  (dale@brokerdale.realestate, 2026-09-05 01:02 UTC), a legitimate breakage report that
+  escalated with `classification=null` where a working classifier would have opened a fix
+  request. It travelled the RTF-2 wrong-shape path, not the `None` one.
+* `a9efa713` (2026-09-04, "Can we add our group sessions schedule to the website?") never
+  reached the classifier at all: it failed identity resolution first (`reporter` NULL, a row
+  created ~18 hours before the portal began stamping `reporter` at all). Structurally
+  unroutable, not a classifier failure. See D57.
+
+---
+
+## D57 (2026-09-05) -- a9efa713, and what "identity_unknown" was hiding
+
+Ticket `a9efa713-c9f0-4688-9580-5a93dfa4b4f2`, portal Website tab, 2026-09-04 02:22 UTC:
+*"Can we add our group sessions schedule to the website?"* It reached #fixer as
+`Portal ticket a9efa713... (scout) could not be routed automatically: identity_unknown` and
+stopped there. Two separate failures, traced independently.
+
+**(a) Identity: structurally unfixable for this ticket, and not a bug today.**
+`echo_ticket_worker.resolve_client_identity()` returns UNKNOWN before any lookup when the
+row has no `reporter`:
+
+```python
+email = (ticket.get("reporter") or "").strip()
+claimed_gym_id = ticket.get("client_id") or ""
+if not email or not claimed_gym_id:
+    return _ig.Identity(_ig.UNKNOWN, "", reason="ticket missing reporter or client_id")
+```
+
+This row's `reporter` is NULL and always was: the portal only began stamping `reporter`
+in `db126a60` (2026-09-04 16:45), roughly 18 hours AFTER this ticket was inserted. There is
+no email anywhere on the row to recover, so no code change can route it. A human attributing
+it to its gym (`client_id b536c122-49b6-4b98-9021-b0713750bf82`) is the only path. Of the
+five `website_tab` tickets in the table, this pre-fix row is the only one with a NULL
+reporter; all four created after the fix carry one.
+
+What WAS a bug is what the card said. `_escalate_unresolved` threw away the specific
+`Identity.reason` and printed the coarse bucket, so "identity_unknown" was true, useless, and
+indistinguishable from a Slack outage. Cards now carry the reason verbatim ("no reporter
+email on this ticket"), plus the person and gym in words -- D53.
+
+**Not closed, and reported rather than silently patched:** the current portal route can STILL
+produce `reporter: NULL`. It initialises `reporter = null` and never rejects the insert if it
+stays null, so three live paths still reach it: `clerkConfigured()` false (which ALSO skips
+the `canReadGym` check), `auth()` returning no `userId`, and the `app_users` lookup missing or
+erroring (the query's `error` is discarded, so a Supabase fault is indistinguishable from "no
+row"). Narrowed, not closed. Fixing it means changing portal auth behaviour, which is Blake's
+call, not this session's.
+
+**(b) Routing: a website question had no path to the website bot.** `product='portal'` routes
+to Scout, hardcoded as a literal pair in `listener.py`'s scheduler; Wrangler's
+`product="websites"` is a label nothing polls for, and no producer ever writes it. So this
+question could not reach the identity that knows about websites even by hand.
+
+**D50, the fix, and the shape chosen deliberately:** cross-product routing changes WHICH
+BOT'S KNOWLEDGE drafts the answer, and nothing else. When `classifier.product_hint()` is
+CONFIDENT (an unmistakable website noun with no competing product noun) and the flag
+`SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT` is armed, the answer lane is called with the website
+identity's knowledge and voice. The ticket's `bot_identity`, `product`, channel, thread,
+`client_id` and every delivery decision are untouched, and `who` (the asking person, their
+account key, their gym) is passed through unchanged, so every live fact is still keyed off
+the asking gym's own account. A website question from Gym A is still a Gym A ticket answered
+in Gym A's own conversation. Low confidence stays with the entry-point identity, unchanged.
+Lainey can never be a routing target. The Frame 2 containment argument is asserted directly
+in `tests/test_slack_convo_autonomy.py`, not just described here.
+
+---
+
+## D58 (2026-09-05) -- auto-answer is a narrower permission than CLIENT_REPLY, with hard lines
+
+Arming `SLACK_CONVO_<IDENTITY>_CLIENT_REPLY` was reviewed as "the bot may reply to a client".
+It silently also meant "the bot may send a model-written statement about that client's live
+account, unattended" -- because a `kind=answer` row went `ready` on exactly the same flag as
+an acknowledgement. Those are not the same permission and should never have shared a flag.
+
+`SLACK_CONVO_<IDENTITY>_AUTO_ANSWER` now gates the grounded-answer path alone. It requires
+the identity to be enabled AND client-reply armed (it can never be the flag that lets a bot
+speak to a client at all), and acks, templates and status rows are unaffected by it.
+
+**Hard lines, not tunable, checked at draft time AND at post time:** billing and price,
+refunds, hours and schedule changes, injuries, liability. `adapter.AUTO_ANSWER_FORBIDDEN` is
+a module constant with no env var behind it; a matching message is held for a tap no matter
+what any flag says. Code fixes, action requests and anything the classifier was unsure about
+were already held and stay held.
+
+**D55 (receipts):** whenever a client is actually told something -- auto-answered, released
+by a tap, or resolved by a human -- a RECEIPT card is written to #fixer AFTER the post
+succeeds, quoting the exact text that went out, where, when, and whether it sent with no tap.
+A receipt is never written for a delivery that did not happen, which is the whole point of
+writing it after rather than before.
