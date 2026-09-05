@@ -1630,26 +1630,40 @@ class SupabaseCalendarStore:
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
 
 def _dedupe_slot_key(row):
-    """The natural identity of a calendar slot, or None when it cannot be identified.
+    """The identity of a calendar row for duplicate purposes, or None when it cannot be
+    established. A row is a duplicate ONLY of a row in the same slot carrying the same
+    content.
 
-    Date alone is NOT a slot: a gym running 2x a day plus a story owns three rows on one
-    date, each a different time_slot/format. And a row missing time_slot or format has no
-    identifiable slot at all, so it returns None and is never deduped -- guessing that two
-    such rows are "the same slot" would collapse genuinely different posts. Every duplicate
-    measured in production on 2026-09-05 carried both fields, so this costs nothing real."""
+    THIS KEY WAS WRONG TWICE AND BOTH MISTAKES DESTROYED CLIENT CONTENT (2026-09-05).
+
+    First it was (gym, account, post_date), which treats a gym posting 2x a day plus a
+    story as duplication. That would have removed roughly 286 legitimate rows.
+
+    Then it was (account, post_date, time_slot, format), which STILL cannot represent two
+    posts inside one time_slot. ENG runs posts_per_day=2 and both posts can land in the
+    same time_slot bucket, separated only by slot_index. A dedupe on that key deleted 140
+    rows across five gyms, and when the survivors were compared against the deletions,
+    ZERO were actually duplicates: 131 differed by image, 123 by caption, 75 by slot_index.
+    All 140 were restored.
+
+    So the identity now carries slot_index AND the content itself. Two rows are the same
+    row only if they occupy the same slot and say the same thing with the same picture.
+    Anything else is a distinct post that a gym owner is entitled to see. slot_index is
+    null on most rows, and a null slot_index is a real value here (the single post of the
+    day) rather than a missing one, so it participates in the key instead of voiding it."""
     account = str(row.get("account") or "").strip().lower()
     date = str(row.get("post_date") or "")[:10]
     slot = str(row.get("time_slot") or "").strip().lower()
     fmt = str(row.get("format") or "").strip().lower()
     if not (account and date and slot and fmt):
         # RULING (AUD-104): a row missing time_slot or format has no identifiable slot, so
-        # it is never deduped. That UNDER-blocks -- 46 forward rows carry a null time_slot
-        # -- and under-blocking is the correct direction for a filter that can only drop
-        # content. slot_index is not a usable fallback: it is null on 1090 of 1169 forward
-        # rows. The fix for those rows is to populate time_slot at plan time, not to guess
-        # here.
+        # it is never deduped. That under-blocks, and under-blocking is the only safe
+        # direction for a filter that can drop a client's content.
         return None
-    return (account, date, slot, fmt)
+    idx = row.get("slot_index")
+    caption = " ".join(str(row.get("caption") or "").split()).lower()
+    image = str(row.get("image_url") or "").strip()
+    return (account, date, slot, fmt, idx, caption, image)
 
 
 def _dedupe_slots(store, account_key, payload, *, existing=None):

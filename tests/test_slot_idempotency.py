@@ -47,10 +47,15 @@ def _armed(monkeypatch, on=True):
 # ---- cause 1: the same run staged the slot twice ---------------------------------------
 
 def test_an_in_batch_duplicate_is_dropped(monkeypatch):
+    """CORRECTED 2026-09-05: this test used to stage two rows with DIFFERENT captions and
+    assert one was dropped. That was asserting the defect. Two rows that say different
+    things are two posts, and the version of the belt that believed otherwise deleted 140
+    real rows. A duplicate is same slot AND same content."""
     _armed(monkeypatch)
-    batch = [_row(caption="first"), _row(caption="second")]
+    batch = [_row(caption="identical words", image_url="same.jpg"),
+             _row(caption="identical words", image_url="same.jpg")]
     out = pcs._dedupe_slots(_Store(), "eng", batch)
-    assert len(out) == 1 and out[0]["caption"] == "first", "the FIRST row for a slot wins"
+    assert len(out) == 1, "the FIRST row for an identical slot+content pair wins"
 
 
 def test_the_zanshin_shape_from_production(monkeypatch):
@@ -91,9 +96,12 @@ def test_a_slot_already_live_is_not_staged_again(monkeypatch):
     """delete_month preserves an APPROVED row because it is a client decision. A re-plan
     then landed a second row on that same slot. 61 of the fleet's duplicates were this."""
     _armed(monkeypatch)
-    live = [_row(status="approved", caption="the client already approved this")]
-    out = pcs._dedupe_slots(_Store(live), "zanshinfitness630e22", [_row(caption="new")])
-    assert out == [], "a slot the gym already holds live must not be filled twice"
+    live = [_row(status="approved", caption="the client already approved this",
+                 image_url="approved.jpg")]
+    out = pcs._dedupe_slots(_Store(live), "zanshinfitness630e22",
+                            [_row(caption="the client already approved this",
+                                  image_url="approved.jpg")])
+    assert out == [], "re-staging the SAME post onto a live slot must not duplicate it"
 
 
 def test_a_denied_or_deleted_row_frees_its_slot(monkeypatch):
@@ -196,3 +204,59 @@ def test_the_live_set_matches_the_readers_own_allowlist():
     assert listed == reader, (
         f"belt live set {sorted(listed)} does not match what rows_in_range returns "
         f"{sorted(reader)} -- a mismatch silently under- or over-blocks")
+
+
+# ---- the key was wrong twice, and both mistakes deleted real posts ----------------------
+
+def test_two_posts_in_one_time_slot_are_not_duplicates(monkeypatch):
+    """THE regression test for the 140-row deletion. ENG runs posts_per_day=2 and both
+    posts can land in the SAME time_slot, separated only by slot_index. The previous key
+    could not represent that, so it deleted the second post of the day for five gyms."""
+    _armed(monkeypatch)
+    batch = [_row(slot_index=0, caption="first post of the day", image_url="a.jpg"),
+             _row(slot_index=1, caption="second post of the day", image_url="b.jpg")]
+    out = pcs._dedupe_slots(_Store(), "eng", batch)
+    assert len(out) == 2, "ENG's second post of the day is not a duplicate of the first"
+
+
+def test_a_different_image_is_never_a_duplicate(monkeypatch):
+    """131 of the 140 wrongly-deleted rows differed from their survivor by image alone."""
+    _armed(monkeypatch)
+    batch = [_row(caption="same words", image_url="Grace-and-4.jpg"),
+             _row(caption="same words", image_url="26.2-7624.jpg")]
+    assert len(pcs._dedupe_slots(_Store(), "eng", batch)) == 2
+
+
+def test_a_different_caption_is_never_a_duplicate(monkeypatch):
+    """123 of the 140 differed by caption."""
+    _armed(monkeypatch)
+    batch = [_row(caption="You walk out with a plan.", image_url="x.jpg"),
+             _row(caption="Bring a friend this week.", image_url="x.jpg")]
+    assert len(pcs._dedupe_slots(_Store(), "eng", batch)) == 2
+
+
+def test_a_genuinely_identical_row_is_still_dropped(monkeypatch):
+    """The belt must still do its job: same slot, same words, same picture is one post."""
+    _armed(monkeypatch)
+    batch = [_row(slot_index=0, caption="identical", image_url="same.jpg"),
+             _row(slot_index=0, caption="identical", image_url="same.jpg")]
+    assert len(pcs._dedupe_slots(_Store(), "eng", batch)) == 1
+
+
+def test_whitespace_only_caption_differences_still_count_as_identical(monkeypatch):
+    _armed(monkeypatch)
+    batch = [_row(caption="one   two", image_url="s.jpg"),
+             _row(caption="one two", image_url="s.jpg")]
+    assert len(pcs._dedupe_slots(_Store(), "eng", batch)) == 1
+
+
+def test_the_live_pass_also_compares_content(monkeypatch):
+    """A live row only blocks a new row that says the same thing with the same picture."""
+    _armed(monkeypatch)
+    live = [_row(status="approved", caption="already live", image_url="live.jpg")]
+    same = pcs._dedupe_slots(_Store(live), "eng",
+                             [_row(caption="already live", image_url="live.jpg")])
+    assert same == [], "an identical row must not be staged on top of a live one"
+    other = pcs._dedupe_slots(_Store(live), "eng",
+                              [_row(caption="different post", image_url="other.jpg")])
+    assert len(other) == 1, "a genuinely different post must still stage"
