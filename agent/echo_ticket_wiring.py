@@ -8,6 +8,7 @@ and the live bus, mirroring agent/slack_convo/listener_wiring.py's own split bet
 module scope by anything that runs with the config flag off.
 """
 import json
+import urllib.parse as _up
 from dataclasses import dataclass
 
 from . import config
@@ -20,9 +21,20 @@ from .slack_surface import SlackPoster
 
 
 def _slack_lookup_email_factory(poster):
+    """LIVE BUG FIX (2026-09-04, found running the real Echo regression test): raw
+    string concatenation left '+' un-percent-encoded in the query string, and Slack's
+    API (like most application/x-www-form-urlencoded parsers) decodes an unencoded '+'
+    as a literal SPACE, not the character itself. Any email containing '+' -- Gmail's
+    own "+alias" convention among real clients, not just the test account that
+    surfaced this -- silently failed this lookup, which resolve_client_identity then
+    reported as "no Slack account for this authenticated email" (identity_unknown):
+    a genuine client with a real Slack account got escalated instead of answered.
+    agent/connect_link_notify.py's own _slack_lookup_email already had the correct
+    pattern (urllib.parse.urlencode); this one just didn't match it."""
     def lookup(email):
         resp = poster._send(
-            "https://slack.com/api/users.lookupByEmail?email=" + email, {})
+            "https://slack.com/api/users.lookupByEmail?" +
+            _up.urlencode({"email": email}), {})
         return (resp or {}).get("user", {}).get("id") if (resp or {}).get("ok") else None
     return lookup
 
