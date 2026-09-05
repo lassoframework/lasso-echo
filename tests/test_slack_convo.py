@@ -1022,6 +1022,80 @@ def test_release_actually_delivers_the_reply_the_flag_off_held_it_for(monkeypatc
     assert holds_after == holds_before, "no second card was written for the row that just delivered"
 
 
+def test_release_button_on_an_outreach_request_actually_sends_not_a_silent_noop():
+    """Frame 1 audit MAJOR (closing here): a tap on a KIND_OUTREACH_REQUEST hold card used
+    to route to OB.release_held, which refuses that kind outright (not a conversational
+    reply or fixer_request) and no-ops SILENTLY -- Blake would believe he approved an
+    outreach that never actually sent, with no error surfaced anywhere. This drives the
+    tap through ConvoWiring's REAL registered action handler (not a direct call to
+    outreach.release_approved_outreach, which was already unit-tested and already
+    correct in isolation -- the bug was entirely in the dispatch wiring that never
+    reached it) and asserts the message is actually posted."""
+    from agent.slack_convo import listener_wiring as W
+    from agent.slack_convo import outreach as O
+
+    bus = FakeBus()
+    tid = "t-outreach-1"
+    bus.tickets[tid] = {
+        "id": tid, "source": "portal_form", "reporter": "owner@gym.com",
+        "slack_user_id": "U_CLIENT", "raw_text": "my page shows the wrong hours",
+        "status": "new", "bot_identity": "echo", "slack_channel_id": None,
+        "identity_kind": None, "verification_before": None, "verification_after": None,
+    }
+    who = IG.Identity(IG.CLIENT, "U_CLIENT", email="owner@gym.com", display="Owner",
+                      account_key="crossfitlocal", gym_id="g-1", reason="test")
+    req = O.request_approval(
+        bus.tickets[tid], who, IDS.get("echo"), record_outbound=bus.record_outbound,
+        write_hold_notice=lambda **kw: A.write_hold_notice(bus, **kw), log=lambda *a: None)
+    assert req.requested is True
+    held_id = req.held_message_id
+    assert bus.message(held_id)["attachments"]["kind"] == O.KIND_OUTREACH_REQUEST
+    assert bus.message(held_id)["delivery_status"] == "held"
+
+    class _App:
+        def __init__(self):
+            self._actions = {}
+
+        def event(self, *a, **k):
+            return lambda f: f
+
+        def action(self, action_id):
+            def deco(f):
+                self._actions[action_id] = f
+                return f
+            return deco
+
+    open_calls, post_calls = [], []
+
+    def fake_open(user_ids):
+        open_calls.append(list(user_ids))
+        return {"ok": True, "channel_id": "G_NEW_DM"}
+
+    def fake_post(channel_id, text):
+        post_calls.append((channel_id, text))
+        return {"ok": True, "ts": "9.001"}
+
+    app = _App()
+    deps = _deps(bus, who=IG.CLIENT)
+    w = W.ConvoWiring(app, IDS.get("echo"), deps, post=lambda *a, **k: "1",
+                      open_group_dm=fake_open, post_first_message=fake_post,
+                      log=lambda *a: None).register()
+
+    handler = app._actions[OB.RELEASE_ACTION_ID]
+    handler(ack=lambda: None, body={"user": {"id": "U06EPUUCL13"}},
+           action={"value": held_id})
+
+    assert len(post_calls) == 1, "the release must actually send the outreach message"
+    assert post_calls[0][0] == "G_NEW_DM"
+    assert open_calls == [["U06EPUUCL13", "U_CLIENT"]]
+    assert bus.message(held_id)["delivery_status"] == "posted", \
+        "the held row must close out, not sit held forever after a successful send"
+    assert bus.tickets[tid]["slack_channel_id"] == "G_NEW_DM", \
+        "the group DM thread must become the ticket thread"
+    assert w.counts["release:ok"] == 1
+    assert w.counts.get("release:noop", 0) == 0
+
+
 def test_unknown_user_noise_is_bounded_across_many_messages(monkeypatch):
     """N3/RA-M3a: an unresolved identity's hold ticket used to re-escalate AND re-template on
     every single message with no bound. The template goes out once ever; escalations cap."""
