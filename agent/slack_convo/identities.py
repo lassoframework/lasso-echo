@@ -16,12 +16,13 @@ SAME process (agent/slack_convo/listener_wiring.py's start_additional_identities
 with its own bot token, channel wiring, and SLACK_CONVO_<IDENTITY>_* flags -- all four
 are armed (ENABLED + STAFF_REPLY + CLIENT_REPLY). Only Lainey (lasso-engage, an SMS/voice
 persona) remains unarmed and has no Slack surface today; its row here is ready for when
-it gets one. Wrangler's bot token is missing the channels:write/groups:write/mpim:write/
-im:write scopes, so it cannot proactively open a new DM (conversations.open) -- it can
-still reply in any channel it can join or any DM/MPIM a human already opened, which is
-every path this system's own client-reply flow actually uses today; add those scopes to
-its Slack app only if outreach.py's ticket-initiated group-DM path is ever wired to
-Wrangler.
+it gets one. Wrangler's manifest gained im:write and mpim:write on 2026-09-05 (so it CAN proactively
+open a DM/MPIM once outreach.py's ticket-initiated group-DM path is ever wired to it --
+that path is not wired today, so this is unused capacity, not live behavior) -- a
+reinstall is required before the live bot token actually carries the new scopes; until
+then it still only replies in a channel it can join or a DM/MPIM a human already opened,
+which is every path this system's own client-reply flow actually uses today.
+channels:write/groups:write were not requested and remain absent.
 
 Token env NAMES live here; values are set by hand in the service environment and are
 never read into any object, never logged.
