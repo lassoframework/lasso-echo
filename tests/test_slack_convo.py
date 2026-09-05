@@ -1096,6 +1096,61 @@ def test_release_button_on_an_outreach_request_actually_sends_not_a_silent_noop(
     assert w.counts.get("release:noop", 0) == 0
 
 
+def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dead_button():
+    """Frame 1 audit MAJOR (closing here): escalation_blocks() (outbox.py, D48/#41) has
+    rendered a "Resolved, tell them" button on every escalation card since that commit,
+    and its own docstring promises "listener_wiring routes it (operator-gated) to
+    resolve_and_notify" -- but no @app.action(OB.RESOLVE_ACTION_ID) handler was ever
+    registered anywhere. Every tap silently failed at the Slack layer (ack() never ran,
+    resolve_and_notify() never called): Blake taps the button, Slack shows a failed
+    action, and the client is never told anything. This drives the tap through
+    ConvoWiring's REAL registered action handler (not a direct call to
+    OB.resolve_and_notify, which was already unit-tested and already correct in
+    isolation -- the bug was entirely in the missing registration) and asserts the
+    ticket actually closes and the person actually gets a notice."""
+    from agent.slack_convo import listener_wiring as W
+
+    bus = FakeBus()
+    d = A.handle_event(_ev("posts broken"), "k", _deps(bus, client_armed=False))
+    tid = d.ticket_id
+    esc = bus.record_outbound(ticket_id=tid, author_type="system", body="x is broken",
+                              delivery_status="ready", kind=A.KIND_ESCALATION,
+                              meta={"identity": "echo"})
+    assert bus.tickets[tid]["status"] != "resolved"
+
+    class _App:
+        def __init__(self):
+            self._actions = {}
+
+        def event(self, *a, **k):
+            return lambda f: f
+
+        def action(self, action_id):
+            def deco(f):
+                self._actions[action_id] = f
+                return f
+            return deco
+
+    app = _App()
+    deps = _deps(bus, who=IG.CLIENT)
+    w = W.ConvoWiring(app, IDS.get("echo"), deps, post=lambda *a, **k: "1",
+                      log=lambda *a: None).register()
+
+    assert OB.RESOLVE_ACTION_ID in app._actions, \
+        "a handler must actually be registered for the resolve button's action id"
+    handler = app._actions[OB.RESOLVE_ACTION_ID]
+    handler(ack=lambda: None, body={"user": {"id": "U06EPUUCL13"}}, action={"value": tid})
+
+    assert bus.tickets[tid]["status"] == "resolved", \
+        "the ticket must actually close, not sit open after a tap that appears to work"
+    notices = [m for m in bus.messages_for(tid)
+              if m["direction"] == "outbound" and m["attachments"]["kind"] == A.KIND_STATUS]
+    assert len(notices) == 1, "the person must actually be told, once"
+    assert notices[0]["body"] == OB.RESOLVED_NOTICE
+    assert w.counts["resolve:ok"] == 1
+    assert w.counts.get("resolve:noop", 0) == 0
+
+
 def test_unknown_user_noise_is_bounded_across_many_messages(monkeypatch):
     """N3/RA-M3a: an unresolved identity's hold ticket used to re-escalate AND re-template on
     every single message with no bound. The template goes out once ever; escalations cap."""

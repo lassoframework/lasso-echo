@@ -285,6 +285,28 @@ class ConvoWiring:
                                       identity=identity, log=self.log)
             self.counts[f"release:{'ok' if ok else 'noop'}"] += 1
 
+        @app.action(_outbox.RESOLVE_ACTION_ID)
+        def _on_resolve(ack, body, action):
+            ack()
+            actor = (body.get("user") or {}).get("id", "")
+            if not config.APPROVER_SLACK_ID or actor != config.APPROVER_SLACK_ID:
+                self.counts["resolve:refused_non_operator"] += 1
+                return
+            if not self.deps.identity_enabled():
+                self.counts["resolve:refused_flag_off"] += 1
+                return
+            tid = (action or {}).get("value") or ""
+            # Frame 1 audit MAJOR (closing here): escalation_blocks() (outbox.py) has
+            # rendered a "Resolved, tell them" button on every escalation card since D48
+            # (#41), and its own docstring already promised this is "operator-gated like
+            # the release tap" -- but nothing ever registered an @app.action handler for
+            # RESOLVE_ACTION_ID, so every tap silently failed at the Slack layer (no ack()
+            # ever ran) with resolve_and_notify() never invoked: Blake would tap the
+            # button, see it error out, and the client would never be told anything.
+            ok = _outbox.resolve_and_notify(self.deps.bus, tid, approved_by=actor,
+                                            identity=identity, log=self.log)
+            self.counts[f"resolve:{'ok' if ok else 'noop'}"] += 1
+
         self.log(f"[slack-convo/{identity.name}] registered (enabled="
                  f"{self.deps.identity_enabled()})")
         return self
