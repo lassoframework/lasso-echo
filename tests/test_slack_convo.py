@@ -229,6 +229,7 @@ def test_flags_off_touches_nothing():
 
 def test_attach_registers_nothing_when_master_off(monkeypatch):
     from agent.slack_convo import listener_wiring as W
+
     monkeypatch.delenv("SLACK_CONVO_ENABLED", raising=False)
 
     class _App:
@@ -1108,7 +1109,8 @@ def test_release_button_on_an_outreach_request_actually_sends_not_a_silent_noop(
     assert w.counts.get("release:noop", 0) == 0
 
 
-def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dead_button():
+def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dead_button(
+        monkeypatch):
     """Frame 1 audit MAJOR (closing here): escalation_blocks() (outbox.py, D48/#41) has
     rendered a "Resolved, tell them" button on every escalation card since that commit,
     and its own docstring promises "listener_wiring routes it (operator-gated) to
@@ -1121,6 +1123,14 @@ def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dea
     isolation -- the bug was entirely in the missing registration) and asserts the
     ticket actually closes and the person actually gets a notice."""
     from agent.slack_convo import listener_wiring as W
+
+    # Audit 4, finding 9: resolve_and_notify now REFUSES when the client notice would be
+    # held by the trust ladder -- claiming a resolution the client will never hear about is
+    # the same lie in a different place. This test is about the button being wired, so it
+    # arms the flag that makes delivery possible.
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
 
     bus = FakeBus()
     d = A.handle_event(_ev("posts broken"), "k", _deps(bus, client_armed=False))

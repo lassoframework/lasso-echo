@@ -481,14 +481,21 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
         except Exception as e:  # noqa: BLE001 - the send already succeeded
             log(f"[outreach] held row {message_id} close-out failed (send itself "
                 f"succeeded): {type(e).__name__}")
-    elif not getattr(result, "delivered", False) and mark_message is not None:
-        # Nothing reached the client. The row must not read as delivered, and the failure
-        # must be visible rather than counted as a successful tap.
-        try:
-            mark_message(message_id, "failed",
-                         meta_update={"outreach_reason": result.reason})
-        except Exception as e:  # noqa: BLE001
-            log(f"[outreach] held row {message_id} failure mark failed: {type(e).__name__}")
-        log(f"[outreach] release did NOT deliver row={message_id} reason={result.reason}")
+    elif not getattr(result, "delivered", False):
+        # Nothing reached the client, so the row must never read as delivered -- but WHICH
+        # non-delivery matters (audit 4, finding 6). Only a definitive send failure burns the
+        # row; a transient one (the DM would not open, another consumer held the claim) LEAVES
+        # IT HELD so Blake's Release card still works on the next tap. Burning it on a
+        # transient fault re-created the exact silent no-op card that listener_wiring's own
+        # dispatch fix exists to prevent.
+        if result.reason == "post_failed" and mark_message is not None:
+            try:
+                mark_message(message_id, "failed",
+                             meta_update={"outreach_reason": result.reason})
+            except Exception as e:  # noqa: BLE001
+                log(f"[outreach] held row {message_id} failure mark failed: "
+                    f"{type(e).__name__}")
+        log(f"[outreach] release did NOT deliver row={message_id} reason={result.reason} "
+            f"(row left {'failed' if result.reason == 'post_failed' else 'held for a retap'})")
 
     return result

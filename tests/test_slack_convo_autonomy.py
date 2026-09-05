@@ -1180,3 +1180,180 @@ def test_the_cross_product_answer_introduces_the_bot_that_is_actually_speaking()
               identity=IDS.get("wrangler"), speaks_as="scout",
               fetch_state=lambda t, w: {"site": "live"}, llm=llm)
     assert seen["system"].startswith("You are Scout"), seen["system"][:40]
+
+
+# =========================================================================================
+# AUDIT 4 (2026-09-05): the fixes for audit 3, audited
+# =========================================================================================
+
+REAL_VERIFY_SNAPSHOTS = [
+    # THE ACTUAL SHAPE, read from ~/scout-listener src/index.js runVerify (audit 4 went and
+    # looked; audit 3's fix had guessed a vocabulary of verdict words that this producer
+    # never writes, which made fixed_pass permanently inert).
+    ({"phase": "after", "exit_code": 0, "tail": "5455 passed", "at": "2026-09-05T00:00:00Z"},
+     True),
+    ({"phase": "after", "exit_code": 1, "tail": "1 failed", "at": "2026-09-05T00:00:00Z"},
+     False),
+    ({"phase": "before", "exit_code": 2, "tail": "collection error", "at": "x"}, False),
+    # audit 3's cases must stay closed
+    ({"verified": "not verified"}, False), ({"verified": "pending"}, False),
+    ({"passed": "0 of 3"}, False), ({"ok": "timeout"}, False),
+    ({"success": "partial"}, False), ({"fix_pr_url": "https://x/1"}, False),
+    # audit 4 finding 10: first-present-key-wins let a contradiction through
+    ({"status": "completed", "result": "failed"}, False),
+    ({"verified": True}, True), ({"status": "passed"}, True),
+]
+
+
+@pytest.mark.parametrize("snapshot,expected", REAL_VERIFY_SNAPSHOTS)
+def test_verification_verdict_matches_the_real_producer(snapshot, expected):
+    from agent import echo_ticket_worker as ETW
+    assert ETW.verification_succeeded(snapshot) is expected, snapshot
+
+
+def test_an_unreadable_verification_leaves_the_ticket_in_the_poll():
+    """Audit 4 finding 1's second half: an unreadable snapshot used to be escalated as
+    'verification_not_a_success' AND flipped to status='hold', which removes the ticket from
+    find_fixing_tickets forever -- so a fix that later verified could never notify anyone."""
+    from agent import echo_ticket_worker as ETW
+    assert ETW.verification_is_unreadable({"weird": "shape"}) is True
+    assert ETW.verification_is_unreadable({"exit_code": 1}) is False
+    assert ETW.verification_is_unreadable({"verified": False}) is False
+
+
+@pytest.mark.parametrize("text", [
+    "make a post that says we are moving to 8am",
+    "put a post up saying we are closed for the holiday",
+    "could you throw up a post saying we changed our hours",
+    "schedule a post telling everyone we are closed friday",
+    "draft a post saying our rates go up in january",
+    "let everyone know on instagram that we are closed",
+    "we need a post announcing our new saturday time",
+    "our saturday classes are moving to 8am, can you update the post",
+])
+def test_asking_us_to_author_a_statement_never_auto_answers(text):
+    """Audit 4 finding 3: eight ordinary phrasings walked past the publish guard. Enumerating
+    polite request forms was the wrong axis -- what they share is a content verb plus a claim
+    marker, i.e. asking us to AUTHOR a statement rather than report what is true."""
+    assert not A.may_auto_answer(text)
+
+
+@pytest.mark.parametrize("text", [
+    "is my instagram connected?",
+    "did my posts go out this week?",
+    "what is on the calendar for october?",
+    "is the october schedule loaded?",
+    "did anything publish yesterday?",
+])
+def test_the_publish_guard_did_not_make_the_capability_inert(text):
+    assert A.may_auto_answer(text)
+
+
+def test_the_post_time_gate_runs_the_whole_rule_not_half(monkeypatch):
+    """Audit 4 finding 4: the post-time gate re-read only the DENYLIST, so the claim that
+    both layers are checked at draft AND post time was false, and a row from a writer that
+    predates the marker could post something may_auto_answer rejects."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    d = A.handle_event(_ev("is my instagram connected?"), "k",
+                       _answering_deps(bus, client_armed=True, auto_answer=True))
+    # rewrite the ticket's question to one the whole rule rejects, and strip the marker, as a
+    # process that predates D54 would have left it
+    bus.tickets[d.ticket_id]["raw_text"] = "can you post that we are moving to 8am?"
+    row = [m for m in bus.messages_for(d.ticket_id)
+           if m["attachments"].get("kind") == A.KIND_ANSWER][0]
+    for m in bus.msgs:
+        if m["id"] == row["id"]:
+            m["attachments"].pop("auto_answer_forbidden", None)
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert not any("connected" in c["text"] and c["channel"] == "G0MPIM" for c in calls)
+
+
+def test_a_routed_answer_never_carries_the_other_bots_voice_doc():
+    """Audit 4 finding 5: swapping one token of the system prompt left the appended VOICE
+    DOC -- the longer, far more specific identity instruction -- naming the other bot five
+    times, including "Wrangler is the LASSO team member who...". The voice a client hears
+    must belong to the bot that is actually speaking."""
+    from agent.slack_convo import answer_lane as AL
+    seen = {}
+
+    def llm(system, user):
+        seen["system"] = system
+        return "Yes, we can add that."
+
+    AL.answer({"id": "t-1", "raw_text": "q"},
+              IG.Identity(IG.CLIENT, "U", account_key="k", gym_id="g", reason="t"),
+              [], "can we add our hours to the website?",
+              identity=IDS.get("wrangler"), speaks_as="scout",
+              fetch_state=lambda t, w: {"site": "live"}, llm=llm)
+    system = seen["system"]
+    assert system.startswith("You are Scout")
+    assert "Wrangler" not in system, \
+        "the speaking bot must never be handed another bot's voice doc"
+    assert "websites" in system, "the SUBJECT still moves, which is the point of routing"
+
+
+def test_a_transient_release_failure_leaves_the_row_retappable():
+    """Audit 4 finding 6: marking the held row failed on ANY non-delivery burned Blake's
+    Release card on a transient fault, re-creating the silent no-op tap."""
+    from agent.slack_convo import outreach as OU
+    marks = []
+    held = {"id": "r1", "ticket_id": "t-1", "delivery_status": "held", "body": "hello",
+            "attachments": {"kind": A.KIND_OUTREACH_REQUEST, "identity": "echo"}}
+    res = OU.release_approved_outreach(
+        "r1",
+        {"id": "t-1", "source": "website_tab", "reporter": "o@g.com", "slack_user_id": "U_C",
+         "client_id": "g-1", "reporter_verified": True},
+        IG.Identity(IG.CLIENT, "U_C", email="o@g.com", account_key="k", gym_id="g-1",
+                    reason="t"),
+        IDS.get("echo"), get_held_message=lambda mid: held,
+        open_group_dm=lambda ids: {"ok": False},          # transient Slack fault
+        post_first_message=lambda c, t: {"ok": True, "ts": "1"},
+        record_outbound=lambda **kw: {"id": "r2"}, stamp_ticket=lambda *a, **k: None,
+        mark_message=lambda mid, status, **kw: marks.append((mid, status)),
+        log=lambda *a, **k: None)
+    assert res.delivered is False
+    assert marks == [], "a transient fault must leave the row held so a retap still works"
+
+
+def test_the_dead_key_counter_is_actually_read_somewhere(monkeypatch):
+    """Audit 4 finding 7: the counter was assigned and read nowhere -- D56's own pattern
+    inside the fix for it."""
+    from agent.slack_convo import listener_wiring as LW2
+
+    class _App:
+        def event(self, *a, **k):
+            return lambda f: f
+
+        def action(self, *a, **k):
+            return lambda f: f
+
+    llm = lambda text: None                                            # noqa: E731
+    llm.failure_state = {"consecutive_failures": 4}
+    bus = FakeBus()
+    deps = _deps(bus, classify_llm=llm)
+    w = LW2.ConvoWiring(_App(), IDS.get("echo"), deps, post=lambda *a, **k: "1",
+                        log=lambda *a, **k: None)
+    assert w.classifier_health()["classifier_llm"] == "DEAD"
+    assert "classifier_llm" in w.health_line()
+
+
+def test_resolve_refuses_when_the_client_notice_would_be_held(monkeypatch):
+    """Audit 4 finding 9: the tap marked the ticket resolved and reported ok even when the
+    trust ladder would hold the notice -- Blake taps "Resolved, tell them", the ticket says
+    resolved, and the client is never told."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
+    bus = FakeBus()
+    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    bus.tickets[d.ticket_id]["slack_channel_id"] = "G0MPIM"
+    assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
+                                 identity=IDS.get("echo"), log=lambda *a: None) is False
+    assert bus.tickets[d.ticket_id]["status"] != "resolved"

@@ -449,29 +449,71 @@ _VERDICT_KEYS = ("verified", "ok", "success", "passed", "status", "result")
 _AFFIRMATIVE = frozenset({"true", "yes", "y", "verified", "passed", "pass", "success",
                           "successful", "ok", "okay", "fixed", "confirmed", "done",
                           "complete", "completed", "green"})
+_NEGATIVE_HINT = ("not ", "un", "fail", "error", "pending", "partial", "timeout", "could not",
+                  "cannot", "skip", "0 of", "no ")
 
 
 def verification_succeeded(verification):
     """True ONLY when the snapshot affirmatively says the fix was verified.
 
-    Anything unrecognised -- an unknown string, a dict, a number, a missing verdict -- is
-    NOT a success. The cost of a false negative is a person looking at a ticket that was
-    already fixed. The cost of a false positive is telling a paying client their problem is
-    solved when it is not."""
+    THE PRODUCER IS IN ANOTHER REPO, AND THIS WAS WRITTEN WITHOUT READING IT (2026-09-05
+    audit 3 wrote an allowlist of affirmative words; audit 4 went and looked). The real
+    writer is ~/scout-listener src/index.js's runVerify, which resolves:
+
+        {phase, exit_code, tail, at}
+
+    -- a pytest exit code, no verdict word anywhere. So the allowlist matched NOTHING the
+    producer actually writes, and fixed_pass could never fire for any real ticket while
+    writing a #fixer card asserting the verification was not a success over one that PASSED.
+    A guess about another process's vocabulary is not a contract; the shape below is read
+    from that code.
+
+    Recognised, in order:
+      * exit_code: 0 is a pass, anything else is not. This is the real producer's shape.
+      * an explicit True, or an affirmative word we recognise.
+      * ALL present verdict keys must agree (audit 4, finding 10): first-present-key-wins let
+        {"status": "completed", "result": "failed"} read as a success.
+    Anything else is not a success, and an unrecognised snapshot is reported as exactly that
+    rather than as a failure -- see fixed_pass, which no longer flips such a ticket out of
+    the poll it needs to stay in."""
     if not isinstance(verification, dict) or not verification:
         return False
-    for key in _VERDICT_KEYS:
-        if key not in verification:
-            continue
-        val = verification[key]
-        if val is True:
-            return True
-        if isinstance(val, str) and val.strip().lower() in _AFFIRMATIVE:
-            return True
-        # A verdict field is present and is not an affirmative we recognise: that is a
-        # verdict we must not interpret, so it is never a success.
+    if "exit_code" in verification:
+        try:
+            if int(verification["exit_code"]) != 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        # a zero exit code is the producer's pass signal; a contradicting verdict still wins
+        verdicts = [verification[k] for k in _VERDICT_KEYS if k in verification]
+        return all(_is_affirmative(v) for v in verdicts) if verdicts else True
+    verdicts = [verification[k] for k in _VERDICT_KEYS if k in verification]
+    if not verdicts:
         return False
+    return all(_is_affirmative(v) for v in verdicts)
+
+
+def _is_affirmative(val):
+    if val is True:
+        return True
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if any(h in v for h in _NEGATIVE_HINT):
+            return False
+        return v in _AFFIRMATIVE
     return False
+
+
+def verification_is_unreadable(verification):
+    """True when we cannot tell what this snapshot means, as opposed to it saying failure.
+
+    The difference matters: an unreadable snapshot must leave the ticket exactly where it is,
+    still polled, and must not tell a human the verification failed."""
+    if not isinstance(verification, dict) or not verification:
+        return True
+    if "exit_code" in verification:
+        return False
+    return not [k for k in _VERDICT_KEYS if k in verification]
 
 
 def _fix_summary_text(verification):
@@ -485,6 +527,15 @@ def _fix_summary_text(verification):
     if pr:
         return f"Fixed it. {pr} I confirmed the change is live before sending this."
     return "Fixed it and confirmed the change is live before sending this."
+
+
+def _outbound_escalations_today(bus, tid):
+    from datetime import datetime as _dt, timezone as _tz
+    start = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        return bus.count_outbound_kind_since(tid, _a.KIND_ESCALATION, start)
+    except Exception:  # noqa: BLE001 - fail closed: assume we already said it
+        return 10 ** 9
 
 
 def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
@@ -519,6 +570,24 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
                                 identity_name=identity_name, log=log, who=who)
             continue
         summary = _fix_summary_text(verification)
+        if summary is None and verification_is_unreadable(verification):
+            # Audit 4, finding 1: an unreadable snapshot used to be escalated as
+            # "verification_not_a_success" AND flipped to status='hold', which removes the
+            # ticket from find_fixing_tickets forever -- so a fix that later verified could
+            # never notify anyone. Left in 'fixing' (still polled), reported honestly, and
+            # bounded to one card per ticket per day so it cannot flood.
+            if _outbound_escalations_today(bus, tid) < 1:
+                bus.record_outbound(
+                    ticket_id=tid, author_type="system",
+                    body=(f"Ticket {tid} ({identity_name}) has a verification snapshot this "
+                          f"worker cannot read, so nothing was claimed to the client and the "
+                          f"ticket is LEFT IN 'fixing' and still polled. Snapshot keys: "
+                          f"{sorted(verification.keys()) if isinstance(verification, dict) else type(verification).__name__}. "
+                          f"Expected either exit_code (the ops-fix worker's shape) or a "
+                          f"verdict field."),
+                    delivery_status="ready", kind=_a.KIND_ESCALATION,
+                    meta={"identity": identity_name, "surface": "portal_ticket_bridge"})
+            continue
         if summary is None:
             # M5 (audit 2): the old text asserted "Fixed it and confirmed the change is live"
             # on the mere PRESENCE of verification_after, without ever reading whether the

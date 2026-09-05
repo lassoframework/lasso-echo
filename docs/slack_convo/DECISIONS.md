@@ -1601,3 +1601,84 @@ and it lands after the audit that would have caught it. Three of the seven findi
 introduced by the previous round's fixes; two of those were CRITICAL. The loop is two
 CONSECUTIVE clean audits for exactly this reason -- one clean pass after a fix wave proves
 nothing about the fix wave itself.
+
+---
+
+## D62 (2026-09-05) -- the fourth audit: I guessed another repo's contract instead of reading it
+
+**Finding 1 (CRITICAL) -- D61's own fix made `fixed_pass` permanently inert.** The audit-3 fix
+replaced a denylist of false verdict strings with an allowlist of affirmative ones. Both were
+guesses. The auditor did the thing neither previous round did: **went and read the producer.**
+`~/scout-listener` `src/index.js`'s `runVerify` resolves
+
+```js
+{ phase, exit_code, tail, at }
+```
+
+-- a pytest exit code and no verdict word anywhere. So the allowlist matched **nothing the real
+writer emits**: every verification snapshot fell through to "not a success", `fixed_pass` could
+never notify a client for any real ticket, and it wrote a #fixer card asserting the
+verification had failed over one that **passed**. Worse, that path flipped the ticket
+`fixing` -> `hold`, which removes it from `find_fixing_tickets` forever, so a fix that verified
+later could never be reported at all.
+
+`verification_succeeded` now reads `exit_code` first, because that is what the producer
+actually writes; keeps the affirmative-word path for other writers; requires ALL present
+verdict keys to agree (finding 10: `{"status":"completed","result":"failed"}` read as
+success); and distinguishes *unreadable* from *failed* -- an unreadable snapshot leaves the
+ticket in `fixing`, still polled, and says exactly that in one bounded card instead of
+announcing a failure that was never reported.
+
+**The lesson, and it is the sharpest one in this whole run:** two consecutive rounds wrote a
+rule about another process's data by reasoning about what such a process *probably* writes.
+Both were wrong, in opposite directions, and the second one was wrong in a way that silently
+disabled a capability rather than loudly breaking it. **A contract with another repo is read,
+never inferred** -- and this one was two directories away the entire time. The same failure
+also means the deeper gap stands and is REPORTED rather than papered over: the ops-fix worker
+writes a *new* `source='ops_fix'` ticket (`src/index.js:334`, `intake.fromOpsFix`) rather than
+writing `verification_after` back onto the portal-bridge ticket, so nothing populates that
+column for these tickets today. `fixed_pass` is correct now and still has no producer. That is
+Blake's call to wire, not this session's to invent.
+
+**Finding 2 (MAJOR)** -- `ACK_CODE_FIX`, reworded in the previous wave to fix exactly this
+class, told the client the request had been *"put in front of them"* while the card that does
+that was marked `failed`. Reworded again to claim only that it was written up, and an internal
+card that fails to post now logs CRITICAL rather than dying as a quiet `failed` row.
+
+**Finding 3 (MAJOR)** -- the publish guard, added the previous wave, leaked eight ordinary
+phrasings ("make a post that says we are moving to 8am", "let everyone know on instagram that
+we are closed"). Enumerating polite request forms was the wrong axis; it matches a CONTENT VERB
+plus a CLAIM MARKER now, in either order.
+
+**Finding 4 (MAJOR)** -- `may_auto_answer` was created so "no path can enforce half the rule",
+and the post-time gate then enforced half the rule: denylist only, never the allowlist. It runs
+the whole decision now, using the ticket's own `raw_text` as the question.
+
+**Finding 5 (MAJOR)** -- the cross-product voice fix swapped one token of the system prompt
+while the appended VOICE DOC still named the other bot five times over. The voice doc now comes
+from the bot that is actually speaking, and the routed subject is named by PRODUCT, so nothing
+in the prompt gives the client a second bot's name at all.
+
+Also: a transient release failure no longer burns Blake's Release card (finding 6); the
+dead-key counter is read and rendered on the health line instead of being written to nobody
+(finding 7 -- D56's pattern inside the fix for it, again); `is_test` got the migration file it
+never had (finding 8); and `resolve_and_notify` refuses rather than marking a ticket resolved
+when the trust ladder would hold the client's notice (finding 9).
+
+### Four audits, nine CRITICALs, and what actually generalises
+
+| Round | CRITICALs | How many were introduced by the previous round's fixes |
+|-------|-----------|--------------------------------------------------------|
+| 1 | 3 | -- |
+| 2 | 2 | 1 |
+| 3 | 2 | 2 |
+| 4 | 1 | 1 |
+
+The suite was green for every single one. Three rules earned the hard way:
+
+1. **A contract with another system is read, not inferred.** (D62)
+2. **A fix written in response to an audit is the least-reviewed code in the repo.** (D61)
+3. **A test written by the author of the code, in the same hour, encodes what the code does
+   rather than what the rule is** -- so it asserts predicates instead of call sites, injects
+   its own failures, greps source text, and accepts `**kwargs` where production requires a
+   signature. (D59, D60)

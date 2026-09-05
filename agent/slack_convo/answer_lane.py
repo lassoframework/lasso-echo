@@ -200,8 +200,28 @@ def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, 
         return None   # V-M4: a snapshot of failures is not grounding
     grounding = {"question": q[:500], "facts": facts, "thread_len": len(convo),
                  "bot": identity.name}
-    system = _SYSTEM.format(bot=(speaks_as or identity.name).capitalize(), who=who.kind,
-                            voice=_voice_rules(identity))
+    # Audit 4, finding 5: swapping one token of the system prompt was not enough -- the
+    # appended VOICE DOC is the longer and far more specific identity instruction, and under
+    # cross-product routing it still named the other bot throughout ("Wrangler is the LASSO
+    # team member who builds and maintains gym websites", five times over). The voice a
+    # client hears must belong to the bot that is actually speaking, so the voice doc comes
+    # from the SPEAKER; what routing moves is the subject matter, stated explicitly.
+    speaker = speaks_as or identity.name
+    voice_identity = identity
+    subject_note = ""
+    if speaks_as and speaks_as != identity.name:
+        from . import identities as _ids
+        try:
+            voice_identity = _ids.get(speaks_as)
+        except KeyError:
+            voice_identity = identity
+        # Named by PRODUCT, never by the other bot: the client is talking to one bot, and
+        # nothing in the prompt should give it a second name to mention.
+        subject_note = (f"\n\nThis question is about the client's {identity.product}. "
+                        f"Answer it from the FACTS block in your own voice as "
+                        f"{speaker.capitalize()}.")
+    system = _SYSTEM.format(bot=speaker.capitalize(), who=who.kind,
+                            voice=_voice_rules(voice_identity) + subject_note)
     user = ("FACTS:\n" + json.dumps(facts, default=str, indent=1)[:6000] +
             "\n\nCONVERSATION SO FAR (most recent last):\n" +
             "\n".join(f"- {m.get('author_type')}: {str(m.get('body') or '')[:300]}"

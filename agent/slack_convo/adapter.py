@@ -171,8 +171,8 @@ NO_DRAFT_LABEL = "NO DRAFT"
 # status='triage' and fixed_pass (the thing that would send that follow-up) polls
 # status='fixing' only, so nothing was ever going to send it. Says what is true instead.
 ACK_CODE_FIX = (
-    "Got it. I read that as something not working on our side, so I have opened a fix "
-    "request for the team and put it in front of them with your message attached.")
+    "Got it. I read that as something not working on our side, so I have written it up as a "
+    "fix request with your message attached.")
 ACK_FOLLOW_UP = "Got it, I have added that to the open request for the team."
 ACK_QUESTION = "Got it, checking that for you now."
 ACK_ACTION = ("Got it. I read that as a request to change something on your ads, so it is "
@@ -292,10 +292,25 @@ def auto_answer_forbidden(text):
 # rates". Those satisfy the allowlist because they name posting, and they are not questions
 # about state at all: they ask us to PUBLISH a real-world claim on a client's behalf. Auto
 # answer is for reporting what is already true, never for agreeing to say something new.
+# Audit 4, finding 3: eight ordinary phrasings walked past the first version -- "make a post
+# that says we are moving to 8am", "put a post up saying we are closed", "throw up a post
+# saying we changed our hours", "schedule a post telling everyone", "draft a post saying our
+# rates go up", "let everyone know on instagram", "we need a post announcing", "can you update
+# the post". Enumerating polite request forms was the wrong axis. What every one of them has
+# in common is a CONTENT VERB plus a CLAIM MARKER: they ask us to author a statement. That
+# pair is what this matches now, in either order, with no dependence on how politely it is
+# asked.
+_CONTENT_VERB = (r"post|posts|posting|publish|publishing|announce|announcing|announcement|"
+                 r"share|sharing|draft|drafting|write|writing|schedule|scheduling|"
+                 r"put up|putting up|throw up|send out|sending out|update|updating|tell|"
+                 r"telling|let .{0,25}know|caption|story|reel")
+_CLAIM_MARKER = (r"that|saying|says|announcing|telling|about|to say|letting .{0,25}know|"
+                 r"we are|we're|were|our |new |change|changed|changing|moving|moved|"
+                 r"cancel|cancelled|canceled|closed|closing|rates|prices|hours")
 _ASK_TO_PUBLISH = _re.compile(
-    r"\b(?:can|could|would|will|please|pls)\s+(?:you|we|u)?\s*"
-    r"(?:go ahead and\s+)?(?:post|publish|announce|share|put up|send out|tell|let .{0,20}know)"
-    r"\b|^\s*(?:post|publish|announce|share|put up|send out|tell) \b", _re.IGNORECASE)
+    rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,60}}?\b(?:{_CLAIM_MARKER})\b|"
+    rf"\b(?:{_CLAIM_MARKER})\b[^.?!]{{0,40}}?\b(?:{_CONTENT_VERB})\b",
+    _re.IGNORECASE)
 
 
 def asks_us_to_publish(text):

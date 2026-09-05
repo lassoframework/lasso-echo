@@ -476,6 +476,18 @@ class ConvoWiring:
                 break
             self.log(self.health_line())
 
+    def classifier_health(self):
+        """Audit 4, finding 7: default_classify_llm counts consecutive model failures, and
+        the comment claimed the count was surfaced on the health line. Nothing read it -- a
+        dead-key counter nobody reads is D56's own pattern inside the fix for it. Read here,
+        and rendered by health_line below."""
+        state = getattr(getattr(self.deps, "classify_llm", None), "failure_state", None)
+        if not isinstance(state, dict):
+            return {}
+        n = state.get("consecutive_failures") or 0
+        return {"classifier_llm_consecutive_failures": n,
+                "classifier_llm": "DEAD" if n >= 3 else ("degraded" if n else "ok")}
+
     def health_line(self):
         seen = {k.split(":", 1)[1]: v for k, v in self.counts.items() if k.startswith("event:")}
         # the zeros are the point: a subscription that is not enabled shows here as absent
@@ -483,6 +495,7 @@ class ConvoWiring:
                      "app_mention:-"):
             seen.setdefault(want, 0)
         other = {k: v for k, v in self.counts.items() if not k.startswith("event:")}
+        other.update(self.classifier_health())
         return (f"[slack-convo/{self.identity.name}] health enabled="
                 f"{self.deps.identity_enabled()} events={dict(sorted(seen.items()))} "
                 f"other={dict(sorted(other.items()))}")

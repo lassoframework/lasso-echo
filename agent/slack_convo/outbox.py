@@ -340,7 +340,16 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None
-        ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
+        try:
+            ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
+        except Exception as e:  # noqa: BLE001
+            # Audit 4, finding 2: a hold card or escalation that fails to post is the case
+            # where a human never learns anything -- while the client may already have been
+            # acknowledged. It must be LOUD; silence here is the whole failure mode.
+            log(f"[slack-convo/outbox] CRITICAL internal {kind} FAILED to reach "
+                f"{channel} for ticket {ticket['id']}: {type(e).__name__}: {e}. "
+                f"Nobody has been told about this ticket.")
+            raise
         bus.mark_message(row["id"], "posted", slack_ts=ts)
         summary["posted"] += 1
         return
@@ -380,7 +389,13 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
         # writer that omits it -- a pre-D54 process, a future one -- posted a hard-line
         # answer to a client with no tap. The body is re-read here, which is what "checked
         # again at post time" has to mean for a rule that is about content.
-        if att.get("auto_answer_forbidden") or _a.auto_answer_forbidden(row.get("body")):
+        # Audit 4, finding 4: this re-read only the DENYLIST against the body, so the claim
+        # "both are checked at draft time AND at post time" was false and the whole point of
+        # the single may_auto_answer decision (that no path enforces half the rule) did not
+        # hold for the post-time path. The ticket carries the question -- raw_text -- so the
+        # identical decision can be, and now is, made here too.
+        if (att.get("auto_answer_forbidden")
+                or not _a.may_auto_answer(ticket.get("raw_text") or "", row.get("body"))):
             bus.mark_message(row["id"], "held",
                              meta_update={"held_why": "hard line: never auto answered"})
             summary["held"] += 1
@@ -579,6 +594,15 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if not portal_deliverable(ticket) and not ticket.get("slack_channel_id"):
         log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} has no delivery "
             "surface (no portal thread, no group DM)")
+        return False
+    # Audit 4, finding 9: this marked the ticket resolved and returned True even when the
+    # notice would be HELD by the trust ladder -- Blake taps "Resolved, tell them", the tap
+    # reports ok, the ticket reads resolved, and the client is never told. If we cannot
+    # deliver the notice, we do not claim the resolution.
+    if not _recipient_armed(identity, ticket.get("identity_kind") or "client"):
+        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} would hold the "
+            f"client notice (SLACK_CONVO_{getattr(identity, 'name', '?').upper()}_"
+            f"CLIENT_REPLY is off), so the ticket is NOT marked resolved")
         return False
     bus.record_outbound(
         ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
