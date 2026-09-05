@@ -343,6 +343,104 @@ def openings_collide(caption, avoid_openings, prefix=_OPENING_COLLIDE_WORDS):
     return False
 
 
+# ---- opening FORMULA (the repetition openings_collide cannot see) ------------------
+#
+# Tough Temple, measured on production 2026-09-05: fifteen consecutive captions, every
+# single one opening on the second person pronoun.
+#
+#   "You walk in and see the space where your excuses end..."
+#   "You show up consistent. You do the work..."
+#   "You showed up even though the treadmill felt..."
+#   "You've been meaning to get stronger..."
+#   "You're holding the rings, and your shoulders are screaming..."
+#
+# openings_collide() compares the first FOUR words, and most of those diverge at word
+# two: measured against every earlier caption in the run it fires on 2 of the 15. The
+# de-dup let 13 through while the client denied 13 rows across five straight days
+# (2026-09-09 to 2026-09-13, both accounts), every reject_reason NULL. The repetition
+# a reader actually sees is not the shared WORDS, it is the shared FRAME: same pronoun,
+# same tense, same cold declarative open, every day.
+#
+# opening_formula() names that frame so it can be capped. It is deliberately COARSE:
+# second person openings are good direct response copy and must not be banned, only
+# rationed, so the cap is on how many may run CONSECUTIVELY, never on how many exist.
+_FORMULA_SECOND_PERSON = frozenset((
+    "you", "youre", "youve", "youll", "youd", "your", "yours", "yourself",
+))
+_FORMULA_FIRST_PERSON = frozenset((
+    "we", "were", "weve", "well", "wed", "our", "ours", "us", "im", "ive", "i",
+))
+_FORMULA_DEICTIC = frozenset((
+    "this", "that", "these", "those", "there", "here", "it", "its",
+))
+
+
+def opening_formula(caption):
+    """The coarse OPENING FRAME of a caption: the shape a reader recognizes before
+    they read the words. Returns one of:
+
+        'question'       the first real line asks something
+        'number'         it opens on a figure ("3 things", "90 days")
+        'second_person'  "You ...", "You're ...", "Your ..."
+        'first_person'   "We ...", "Our ...", "I ..."
+        'deictic'        "This ...", "That ...", "Here ..."
+        '<token>'        anything else, keyed on its own leading word, so genuinely
+                         different openers never collide with each other
+
+    Returns "" for an empty caption. Pure."""
+    toks = _opening_tokens(caption)
+    if not toks:
+        return ""
+    # A question HOOK is the frame even when the line carries on after it, so the
+    # test is on the first SENTENCE of the first real line, not the whole line.
+    for line in (caption or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        end = min((p for p in (line.find(c) for c in ".?!") if p >= 0),
+                  default=-1)
+        if end >= 0 and line[end] == "?":
+            return "question"
+        break
+    head = toks[0]
+    if head.isdigit():
+        return "number"
+    if head in _FORMULA_SECOND_PERSON:
+        return "second_person"
+    if head in _FORMULA_FIRST_PERSON:
+        return "first_person"
+    if head in _FORMULA_DEICTIC:
+        return "deictic"
+    return head
+
+
+# How many posts in a row may share one opening formula before the next one must
+# vary. Three is deliberate: a run of three second person opens reads as a voice, a
+# run of fifteen reads as a template, and Tough Temple denied twelve of the fifteen.
+FORMULA_MAX_RUN = 3
+
+
+def formula_run_exceeded(caption, recent_formulas, max_run=FORMULA_MAX_RUN):
+    """True when `caption` would extend an unbroken run of `max_run` posts that
+    already share its opening formula.
+
+    `recent_formulas` is the build's accepted formulas oldest to newest. A caption
+    with no readable opening never blocks. max_run <= 0 disables the check.
+
+    This is the check openings_collide cannot make: it fires on the fifteenth "You ..."
+    in a row even though no two of them share four leading words."""
+    if not max_run or max_run <= 0:
+        return False
+    formula = opening_formula(caption)
+    if not formula:
+        return False
+    recent = [f for f in (recent_formulas or ()) if f]
+    if len(recent) < max_run:
+        return False
+    tail = recent[-max_run:]
+    return all(f == formula for f in tail)
+
+
 def _output_claims_cleared(body, voice, client_note):
     """True when every figure in `body` appears verbatim in an approved input (the
     client note or the voice doc). No approved figure -> clean. This blocks an LLM

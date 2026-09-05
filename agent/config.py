@@ -3451,6 +3451,103 @@ def cadence_2x_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_CADENCE_2X_ENABLED", "false"))
 
 
+def day_shape_assert_enabled() -> bool:
+    """
+    The DAY SHAPE guard (ECHO_DAY_SHAPE_ASSERT, default ON).
+
+    At plan time, before a single row reaches content_calendar, two rows on the
+    same (gym_id, account, post_date, format) must differ in BOTH caption and
+    image_url. A violation FAILS the plan pass and the build writes nothing.
+
+    This is the assertion that was missing on 2026-08-30, when a piercefitness
+    build wrote slot_index 0 and slot_index 1 of 2026-09-27 with one identical
+    caption, and on 2026-09-04, when Tough Temple published six times in forty
+    seconds off a plan exactly like it.
+
+    Armed by DEFAULT because it only ever PREVENTS a write that would repeat a
+    paying client's post on their own account. It can never cause a publish, and
+    it can never publish something new. Escape hatch, restoring the old silent
+    behavior exactly: ECHO_DAY_SHAPE_ASSERT=false.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ASSERT", "true"))
+
+
+def day_shape_roles_enabled() -> bool:
+    """
+    The DAY SHAPE producer (ECHO_DAY_SHAPE_ROLES, default OFF).
+
+    The content half of the two post day (agent/day_shape.py): slot 0 in the
+    morning carries PROOF (story led, a real member moment, a soft ask) and slot
+    1 in the evening carries the INVITATION (offer led, a named next step, a hard
+    ask), drawing from different pillar pools and different SB7 entry angles.
+
+    Without this, the day shape guard keeps a 2x gym SAFE but leaves it thin: the
+    second slot is a fallback concept and a repeat is dropped rather than
+    replaced, so the gym reliably receives one post a day on a two post cadence
+    (Dale's B8). With it, the second slot is asked for a genuinely different post.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_DAY_SHAPE_ROLES=true.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ROLES", "false"))
+
+
+def opening_formula_cap_enabled() -> bool:
+    """
+    The OPENING FORMULA cap (ECHO_OPENING_FORMULA_CAP, default OFF).
+
+    drafter.openings_collide compares the first four words of two captions, so it
+    cannot see a gym whose every caption opens on the same FRAME with different
+    words. Measured on production 2026-09-05, Tough Temple had fifteen consecutive
+    captions all opening on the second person pronoun ("You walk in ...", "You
+    showed up ...", "You've been ...", "You're holding ..."). Not one pair collided.
+    The client denied 13 rows across five straight days (2026-09-09 to
+    2026-09-13, both accounts), every reject_reason NULL.
+
+    Armed, a build refuses to accept a caption that would extend an unbroken run of
+    opening_formula_max_run() posts sharing one opening formula, and walks the
+    neighbouring days for a genuinely different frame. It NEVER drops a day for this:
+    if no alternative varies the frame, the best available post is still placed, so
+    the cap can only improve variety and can never thin a calendar.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_OPENING_FORMULA_CAP=true.
+    """
+    return _truthy(os.environ.get("ECHO_OPENING_FORMULA_CAP", "false"))
+
+
+def opening_formula_max_run() -> int:
+    """
+    How many consecutive posts may share one opening formula before the next must
+    vary (ECHO_OPENING_FORMULA_MAX_RUN, default 3). A run of three second person
+    opens reads as a voice; a run of fifteen reads as a template. 0 or less
+    disables the run check even when the cap flag is armed.
+    """
+    raw = os.environ.get("ECHO_OPENING_FORMULA_MAX_RUN", "")
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 3
+
+
+def gym_ask_coverage_enabled() -> bool:
+    """
+    Ask coverage on a CLIENT GYM month (ECHO_GYM_ASK_COVERAGE, default OFF).
+
+    agent/ask_coverage.py has enforced one clear ask per reel and a month wide
+    coverage floor since 2026-08-28, but its only call site guards on the B2B
+    profile, so it has never once run on a gym. Measured on production
+    2026-09-05 with the real grader: Tough Temple scores path_to_join 0 out of
+    10 with 'no ask in caption' on every eligible post, and it is not alone
+    (crossfitnine7f7dadc is also 0).
+
+    Armed, a gym month runs the same lane using the gym's OWN approved CTA from
+    its voice doc. A gym whose voice doc carries no CTA that reads as exactly one
+    ask family is SKIPPED rather than given an invented ask.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_GYM_ASK_COVERAGE=true.
+    """
+    return _truthy(os.environ.get("ECHO_GYM_ASK_COVERAGE", "false"))
+
+
 def cadence_slot_times() -> tuple:
     """
     The two wall-clock publish slots for a 2x day: (slot 1, slot 2), default

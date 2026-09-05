@@ -48,7 +48,7 @@ path is offline-testable.
 import os
 import re
 
-from . import client_content, config
+from . import client_content, config, day_shape
 from . import real_calendar_mirror as _mirror
 
 # Media extensions that count as a client having uploaded usable creative.
@@ -230,7 +230,8 @@ def _has_real_creative(draft):
 
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
-                         angle="", avoid_angles=(), avoid_captions=()):
+                         angle="", avoid_angles=(), avoid_captions=(),
+                         recent_formulas=()):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -264,13 +265,34 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     day (the first slot's caption on a 2x day). A draft whose caption matches one is
     treated like a banned draft — the neighbour-day walk finds a DIFFERENT approved
     source — so the two slots of one day are never the same concept. HARD check
-    (a dup is rejected), unlike the STYLE-only opening guidance. Empty => unchanged."""
+    (a dup is rejected), unlike the STYLE-only opening guidance. Empty => unchanged.
+
+    recent_formulas (ECHO_OPENING_FORMULA_CAP, Tough Temple 2026-09-05): the opening
+    FORMULAS of this build's recently accepted posts, oldest to newest. A draft that
+    would extend an unbroken run of config.opening_formula_max_run() posts sharing one
+    frame ("You walk in ...", "You showed up ...", "You've been ..." fifteen days
+    running) is passed over and the neighbour-day walk looks for a different frame.
+    PREFERENCE, not a block: if the walk finds nothing that varies the frame, the best
+    otherwise-acceptable draft is still returned, so this can never thin a calendar.
+    Flag OFF or empty => unchanged."""
     from . import post_quality
 
     def _norm_caption(text):
         return " ".join((text or "").split()).strip().lower()
 
     _avoid = {_norm_caption(c) for c in (avoid_captions or ()) if (c or "").strip()}
+    _formula_cap = bool(recent_formulas) and config.opening_formula_cap_enabled()
+    _formula_max = config.opening_formula_max_run() if _formula_cap else 0
+    # The best draft that cleared every HARD gate but repeats the opening frame. It is
+    # returned only if nothing better turns up, so the formula cap never drops a day.
+    _formula_fallback = [None]
+
+    def _formula_repeats(d):
+        if not _formula_cap:
+            return False
+        from .drafter import formula_run_exceeded
+        return formula_run_exceeded(getattr(d, "caption", "") or "",
+                                    recent_formulas, _formula_max)
 
     def _accept(d):
         if d is None:
@@ -283,8 +305,19 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         # deterministic baseline mode (source + CTA), where only the banned-word bar
         # applies, so a thin source is not dropped and the baseline stays usable.
         if config.sb7_enabled():
-            return post_quality.is_a_plus(d, banned_words)
-        return not _has_banned_word(d.caption, banned_words)
+            hard_ok = post_quality.is_a_plus(d, banned_words)
+        else:
+            hard_ok = not _has_banned_word(d.caption, banned_words)
+        if not hard_ok:
+            return False
+        # Every HARD gate is cleared. The opening formula cap is a PREFERENCE, not a
+        # gate: remember this draft and keep looking for one that varies the frame.
+        # If nothing does, this one is placed anyway (a day is never dropped for it).
+        if _formula_repeats(d):
+            if _formula_fallback[0] is None:
+                _formula_fallback[0] = d
+            return False
+        return True
 
     # Primary attempt on the real day. NO template_fn: the day uses the gym's real photo.
     draft = client_content.build_client_draft(account, day_key, voice, library_path,
@@ -319,7 +352,41 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
             alt.day_key = day_key
             alt.scheduled_for = draft.scheduled_for
             return alt, None
+    # Nothing in the walk varied the opening frame. The formula cap NEVER drops a day:
+    # place the best draft that cleared every hard gate and say the frame repeated.
+    if _formula_fallback[0] is not None:
+        keep = _formula_fallback[0]
+        keep.day_key = day_key
+        keep.scheduled_for = draft.scheduled_for
+        log(f"{day_key}: no approved source varied the opening frame; keeping the "
+            "best post and letting the run stand (never a dropped day)")
+        return keep, None
     return None, f"not A+: {'; '.join(first_issues)}"
+
+
+def _approved_gym_ask(voice):
+    """The gym's OWN approved CTA to use as the ask-coverage default, or "" when it
+    has none usable.
+
+    Only a CTA the gym already approved in its voice doc is eligible, and only one
+    that reads as EXACTLY ONE ask family (publish_guard.ask_families) so the lane
+    cannot emit a multi-ask caption that publish_guard would then refuse. A CTA
+    carrying a dash is passed over, per the copy rules. No approved CTA qualifies
+    -> "" and the caller skips the lane: a gym never gets an invented ask."""
+    try:
+        from .publish_guard import ask_families
+    except Exception:  # noqa: BLE001
+        return ""
+    for cta in (getattr(voice, "ctas", None) or ()):
+        text = str(cta or "").strip()
+        if not text or "-" in text or "–" in text or "—" in text:
+            continue
+        try:
+            if len(ask_families(text)) == 1:
+                return text
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
 
 
 def _record_feed_served(account, feed, day_key):
@@ -710,9 +777,14 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # feed caption and feed the recent window into the NEXT day's generation so several
     # days in a row do not lead with the same hook. STYLE-only, bounded, never a block;
     # with SB7 off (deterministic baseline) the generator ignores it, so nothing changes.
-    from .drafter import opening_signature, angle_for_index
+    from .drafter import opening_signature, angle_for_index, opening_formula
     recent_openings = []            # accepted opening signatures, oldest..newest
     _OPENING_WINDOW = 6             # how many recent openings each new day must avoid
+    # OPENING FORMULA CAP (ECHO_OPENING_FORMULA_CAP, Tough Temple): the coarse opening
+    # FRAME of each accepted post, oldest..newest. openings_collide compares four words
+    # and so never fired on fifteen straight "You ..." captions; this sees the frame.
+    recent_formulas = []
+    _FORMULA_WINDOW = 8             # enough history to measure any sane run cap
     # ANGLE ROTATION (Bryan/Pierce, 2026-08, AGENT_CAPTION_ANGLE_ROTATION): when armed,
     # each accepted feed also gets a DISTINCT SB7 problem/entry angle round-robin (varied by
     # a build-local index that only advances on ACCEPTED days, so the spread is dense) plus
@@ -720,6 +792,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # opening-avoid window to ~12 so consecutive days diverge harder. STYLE-only, never a
     # fact, never a block. Flag OFF => no angle guidance and the window stays 6 (unchanged).
     _angle_rotation = config.caption_angle_rotation_enabled()
+    # DAY SHAPE ROLES: resolved ONCE per build (see the slot loop below).
+    _day_shape_roles = config.day_shape_roles_enabled()
     _ANGLE_WINDOW = 3               # how many recent angles each new day must avoid
     _WIDE_OPENING_WINDOW = 12       # widened opening-avoid window when angle rotation is on
     recent_angles = []              # accepted angles, oldest..newest
@@ -756,12 +830,27 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 opening_window = _WIDE_OPENING_WINDOW
             else:
                 day_angle, day_avoid_angles, opening_window = "", (), _OPENING_WINDOW
+            # DAY SHAPE ROLES (ECHO_DAY_SHAPE_ROLES, default OFF). On a 2x day the two
+            # slots have two different JOBS, not one job at two times: slot 0 in the
+            # morning is PROOF (a real member moment, a soft ask) and slot 1 in the
+            # evening is the INVITATION (the named next step, a hard ask). Each role
+            # leads from its OWN pool of SB7 entry angles, so the second slot is asked
+            # for a genuinely different post instead of leaning on the repeat guard to
+            # drop a near copy. Without this the guard keeps a 2x gym safe but thin: it
+            # reliably receives ONE post a day on a two post cadence (Dale's B8).
+            # Flag OFF, or a 1x gym, leaves the angle choice above byte for byte.
+            if _day_shape_roles and slots_per_day == 2:
+                day_angle = day_shape.angle_for_slot(slot_i, rotation=angle_idx)
+                day_avoid_angles = tuple(day_shape.angles_for_role(
+                    day_shape.role_for_slot(1 - slot_i)))
+                opening_window = _WIDE_OPENING_WINDOW
             feed, feed_drop = _clean_draft_for_day(
                 account, day_key, voice, library_path, banned_words, log,
                 exclude_keys=used_keys,
                 avoid_openings=recent_openings[-opening_window:],
                 angle=day_angle, avoid_angles=day_avoid_angles,
-                avoid_captions=tuple(day_captions))
+                avoid_captions=tuple(day_captions),
+                recent_formulas=tuple(recent_formulas[-_FORMULA_WINDOW:]))
             if feed is None:
                 if feed_drop:
                     skipped_banned += 1
@@ -825,6 +914,11 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             sig = opening_signature(getattr(feed, "caption", "") or "")
             if sig:
                 recent_openings.append(sig)
+            # Record this accepted feed's opening FRAME so the run cap can see a
+            # fifteen day streak of one formula that no four word compare would catch.
+            frame = opening_formula(getattr(feed, "caption", "") or "")
+            if frame:
+                recent_formulas.append(frame)
             # Record this accepted feed's angle + advance the round-robin so the NEXT
             # accepted slot gets a DISTINCT angle (angle rotation ON only).
             if _angle_rotation:
@@ -868,6 +962,34 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                     "Drive pool (PENDING, gap-fill)")
         except Exception as e:  # noqa: BLE001 - the lane never sinks the month
             log(f"{base_key}: gym-drive lane skipped ({type(e).__name__}: {e})")
+
+    # GYM ASK COVERAGE (ECHO_GYM_ASK_COVERAGE, default OFF). ask_coverage has run on
+    # the LASSO B2B month since 2026-08-28, but its ONLY call site guards on the B2B
+    # profile (real_month_planner.apply_month_plan), so no client gym has ever had a
+    # single ask enforced. Measured on production 2026-09-05 with the real grader:
+    # Tough Temple path_to_join 0/10, 'no ask in caption' on every eligible post, and
+    # crossfitnine7f7dadc also 0/10. That is half of Blake's D grade, and it is a
+    # wiring gap, not a copy problem.
+    #
+    # The gym's OWN approved CTA is used, never LASSO's "Book a call today." and never
+    # an invented one: if the voice doc carries no CTA that reads as exactly one ask
+    # family, the lane is SKIPPED and the month is unchanged.
+    if config.gym_ask_coverage_enabled():
+        _gym_ask = _approved_gym_ask(voice)
+        if _gym_ask:
+            try:
+                from . import ask_coverage as _ask
+                _summary = _ask.enforce_drafts(drafts, default_ask=_gym_ask)
+                log(f"{base_key}: ask coverage now "
+                    f"{_summary['coverage']:.0%} of feeds "
+                    f"({_summary['floor_added']} raised to the floor, "
+                    f"{_summary['reels_fixed']} reel(s) given exactly one ask)")
+            except Exception as e:  # noqa: BLE001 - never sinks the month
+                log(f"{base_key}: ask coverage lane skipped "
+                    f"({type(e).__name__}: {e})")
+        else:
+            log(f"{base_key}: ask coverage lane skipped, the voice doc carries no "
+                "approved CTA that reads as a single ask (never an invented one)")
 
     rows = _to_rows(base_key, drafts)
     # GATE 2 (coach-screens-first-month, Blake 2026-08-17): a CLIENT gym's FIRST month on
@@ -1274,6 +1396,37 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 "(no delete — never wipe to empty)")
             return {"ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
                     "months": months, "noop_empty": True}
+        # DAY SHAPE ASSERTION (ECHO_DAY_SHAPE_ASSERT, default ON). Run HERE, on the
+        # exact rows about to be inserted (after preserve_and_prune has dropped the
+        # human owned slots, so a day a coach already owns can never trip it), and
+        # BEFORE the first delete. Two rows on one (gym_id, account, post_date,
+        # format) must differ in BOTH caption and image_url.
+        #
+        # This is the check that was missing on 2026-08-30, when this lane wrote
+        # slot_index 0 and slot_index 1 of piercefitness 2026-09-27 carrying one
+        # identical caption, and that is the plan shape which published Tough Temple
+        # six times in forty seconds. A violation FAILS the pass: nothing is deleted,
+        # nothing is inserted, the existing calendar is left intact, and the broken
+        # days are named. A client seeing the same post twice on their own account is
+        # worse than a build that stops and asks for a human.
+        try:
+            day_shape.assert_day_distinct(
+                clean_rows, enabled=config.day_shape_assert_enabled())
+        except day_shape.DayShapeViolation as exc:
+            for v in exc.violations:
+                log(f"DAY SHAPE FAIL: {v.message()}")
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"{base_key}: month build STOPPED and wrote nothing. "
+                    f"{len(exc.violations)} day(s) would have put the same post "
+                    f"twice on one account. First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: same post twice in one day",
+                    "day_shape_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
         # NEVER SHRINK (TopFuel 2026-08-25): a grow-to-cap rebuild must only GROW, never
         # replace a good calendar with a SMALLER one. The grow-guard can re-trigger a build
         # for a gym that is already built out (build_target counts photo clusters, some of

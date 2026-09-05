@@ -1274,6 +1274,31 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         rows, _locked = preserve_and_prune(sb_store, account_key, months, rows)
+        # DAY SHAPE ASSERTION (ECHO_DAY_SHAPE_ASSERT, default ON). On the exact rows
+        # about to be inserted, after the human owned slots are pruned and BEFORE the
+        # first delete: two rows on one (gym_id, account, post_date, format) must
+        # differ in BOTH caption and image_url. Measured on production 2026-09-05,
+        # this lane's own output has lasso 2026-09-16 carrying two facebook feed rows
+        # with one identical platform caption. A violation FAILS the pass and nothing
+        # is deleted or written: the same post twice on one account is the defect that
+        # published Tough Temple six times in forty seconds.
+        from . import day_shape as _day_shape
+        try:
+            _day_shape.assert_day_distinct(
+                rows, enabled=config.day_shape_assert_enabled())
+        except _day_shape.DayShapeViolation as exc:
+            try:
+                from agent import ops_alerts as _oa
+                _oa.alert(f"{account_key}: month plan STOPPED and wrote nothing. "
+                          f"{len(exc.violations)} day(s) would have put the same "
+                          f"post twice on one account. "
+                          f"First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "day shape: same post twice in one day",
+                    "day_shape_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "deleted": 0}
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:
