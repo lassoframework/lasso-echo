@@ -74,8 +74,31 @@ from .. import config
 
 STALE_AFTER_SECONDS = 6 * 3600
 RELEASE_ACTION_ID = "slack_convo_release"
+RESOLVE_ACTION_ID = "slack_convo_resolve"
 _REENTRY_PREFIX = "OPS-FIX REQUEST"
 _BLOCK_TEXT_CHARS = 2900
+
+# D48 (Blake, 2026-09-05): a ticket the person submitted IN THE PORTAL has a second, real
+# delivery surface that is not Slack -- the /my/support/[ticketId] thread they submitted it
+# from. Migration 0310 already decides what a client may read there: an outbound row that is
+# delivery_status='posted' and not an internal kind. So for these tickets "post" means
+# "release the row into the thread they are already looking at", and gate 7 below marks it
+# posted instead of failing it for having no Slack channel. Restricted to the two sources a
+# client actually submits through the portal UI (a website_intake / engage_tenant_event
+# ticket has no portal reader), and to tickets carrying a client_id, without which 0310's
+# own predicate can never match the reader to the row.
+PORTAL_THREAD_SOURCES = frozenset({"portal_form", "website_tab"})
+
+RESOLVED_NOTICE = (
+    "Update from the LASSO team: this one is handled. If that is not what you needed, "
+    "reply here and we will pick it back up.")
+
+
+def portal_deliverable(ticket):
+    """True when the portal support thread is a real delivery surface for this ticket."""
+    t = ticket or {}
+    return (str(t.get("source") or "") in PORTAL_THREAD_SOURCES
+            and bool(str(t.get("client_id") or "").strip()))
 
 
 def _channel_for(kind, identity):
@@ -122,6 +145,30 @@ def hold_notice_blocks(row):
         blocks.append({"type": "actions", "elements": [{
             "type": "button", "action_id": RELEASE_ACTION_ID, "value": str(mid),
             "text": {"type": "plain_text", "text": "Release"}, "style": "primary"}]})
+    return blocks
+
+
+def escalation_blocks(row, ticket):
+    """Block Kit for an escalation card: the full text, plus ONE button that closes the loop
+    back to the person who wrote in (D48).
+
+    An escalation used to be the end of the line for the submitter. The card reached #fixer,
+    Blake dealt with it, and nothing ever went back -- no acknowledgement, no "this is
+    handled". The button is the missing half: listener_wiring routes it (operator-gated) to
+    resolve_and_notify below, which writes the person a status row and closes the ticket.
+
+    Rendered only when there IS somewhere to send that notice (a portal thread or an already
+    opened group DM) and the ticket is not already closed; a button that could only no-op is
+    worse than no button."""
+    body = row.get("body") or ""
+    tid = str((ticket or {}).get("id") or "")
+    chunks = [body[i:i + _BLOCK_TEXT_CHARS] for i in range(0, len(body), _BLOCK_TEXT_CHARS)] or [""]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c}} for c in chunks]
+    reachable = portal_deliverable(ticket) or bool((ticket or {}).get("slack_channel_id"))
+    if tid and reachable and (ticket or {}).get("status") != "resolved":
+        blocks.append({"type": "actions", "elements": [{
+            "type": "button", "action_id": RESOLVE_ACTION_ID, "value": tid,
+            "text": {"type": "plain_text", "text": "Resolved, tell them"}}]})
     return blocks
 
 
@@ -261,7 +308,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
         if not _claim(bus, row, log):
             summary["skipped"] += 1
             return
-        blocks = hold_notice_blocks(row) if kind == _a.KIND_HOLD_NOTICE else None
+        if kind == _a.KIND_HOLD_NOTICE:
+            blocks = hold_notice_blocks(row)
+        elif kind == _a.KIND_ESCALATION:
+            blocks = escalation_blocks(row, ticket)
+        else:
+            blocks = None
         ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
         bus.mark_message(row["id"], "posted", slack_ts=ts)
         summary["posted"] += 1
@@ -310,14 +362,29 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     surface = att.get("surface") or ""
     thread_ts = None if surface in (_a.SURFACE_IM, _a.SURFACE_MPIM) else ticket.get("slack_thread_ts")
     if not channel:
-        bus.mark_message(row["id"], "failed")
-        summary["failed"] += 1
+        # D48: no Slack thread is not automatically a dead end. A portal-submitted ticket
+        # is delivered to the thread the person wrote it in; only a ticket with neither
+        # surface fails. Before this, EVERY conversational row on a portal ticket that had
+        # not been group-DMed died here -- marked failed, silently, with the person who
+        # submitted the form never told anything at all (found live 2026-09-05 on three
+        # escalated portal tickets).
+        if not portal_deliverable(ticket):
+            bus.mark_message(row["id"], "failed")
+            summary["failed"] += 1
+            return
+        bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
+        summary["posted"] += 1
+        _resolve_on_answer(bus, ticket, kind, summary)
         return
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
+    _resolve_on_answer(bus, ticket, kind, summary)
+
+
+def _resolve_on_answer(bus, ticket, kind, summary):
+    """V-M4: the ticket closes when the person HAS the answer, not when we drafted it."""
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
-        # V-M4: the ticket closes when the person HAS the answer, not when we drafted it.
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
 
@@ -348,4 +415,41 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
                        approved_at=datetime.now(timezone.utc).isoformat())
     except Exception as e:  # noqa: BLE001 - the release itself already happened
         log(f"[slack-convo/outbox] approval stamp failed: {type(e).__name__}")
+    return True
+
+
+def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
+    """A human tap on an escalation card: tell the person it is handled, and close the
+    ticket (D48).
+
+    The notice is written as a normal conversational row, so it goes out through every gate
+    this module already enforces (first contact, trust ladder, freshness, claim) and lands
+    wherever that ticket's person actually is: the group DM if one was opened, the portal
+    support thread otherwise. Nothing is posted from here directly.
+
+    Refuses, returning False, when: the ticket is gone, it belongs to another bot (the same
+    cross-identity rule release_held holds), it is already resolved (the tap is idempotent --
+    a second press must not write a second notice), or there is nowhere to deliver."""
+    ticket = bus.ticket(ticket_id)
+    if not ticket:
+        log(f"[slack-convo/outbox] resolve refused: no ticket {ticket_id}")
+        return False
+    if identity is not None and (ticket.get("bot_identity") or "") != identity.name:
+        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} belongs to "
+            f"{ticket.get('bot_identity') or '?'} not {identity.name}")
+        return False
+    if ticket.get("status") == "resolved":
+        return False
+    if not portal_deliverable(ticket) and not ticket.get("slack_channel_id"):
+        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} has no delivery "
+            "surface (no portal thread, no group DM)")
+        return False
+    bus.record_outbound(
+        ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
+        body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
+        meta={"identity": getattr(identity, "name", ""), "recipient_kind": "client",
+              "surface": (ticket.get("source") or ""), "resolved_by": approved_by})
+    bus.set_ticket(ticket_id, status="resolved", approved_by=approved_by,
+                   approved_via="slack_button",
+                   approved_at=datetime.now(timezone.utc).isoformat())
     return True

@@ -219,6 +219,23 @@ class ConvoWiring:
                                       identity=identity, log=self.log)
             self.counts[f"release:{'ok' if ok else 'noop'}"] += 1
 
+        @app.action(_outbox.RESOLVE_ACTION_ID)
+        def _on_resolve(ack, body, action):
+            """D48: Blake's tap on an escalation card. Same operator gate and same flag gate
+            as a release -- this writes a message a client will read."""
+            ack()
+            actor = (body.get("user") or {}).get("id", "")
+            if not config.APPROVER_SLACK_ID or actor != config.APPROVER_SLACK_ID:
+                self.counts["resolve:refused_non_operator"] += 1
+                return
+            if not self.deps.identity_enabled():
+                self.counts["resolve:refused_flag_off"] += 1
+                return
+            tid = (action or {}).get("value") or ""
+            ok = _outbox.resolve_and_notify(self.deps.bus, tid, approved_by=actor,
+                                            identity=identity, log=self.log)
+            self.counts[f"resolve:{'ok' if ok else 'noop'}"] += 1
+
         self.log(f"[slack-convo/{identity.name}] registered (enabled="
                  f"{self.deps.identity_enabled()})")
         return self
