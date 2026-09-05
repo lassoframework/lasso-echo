@@ -1336,19 +1336,29 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                           library_path=None, store, banned_words=(), logger=None):
-    """Give each DENIED feed day a FRESH replacement (a NEW caption on a REUSED photo) for
-    a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op and
-    the denied slot would otherwise stay empty forever (the portal's "recreating" state
+    """Give each DENIED feed POST a FRESH 1:1 replacement (a NEW caption on a REUSED photo)
+    for a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op
+    and the denied slot would otherwise stay empty forever (the portal's "recreating" state
     never resolving; Dale / ENG, 2026-08-19).
 
-    A denied FEED day is replaced ONLY when it has no active (pending/approved/published)
-    feed on that date yet, so this is IDEMPOTENT: once a pending replacement lands the next
-    pass skips it. The replacement REUSES a photo (allow_reuse — the gym has no fresh
-    creative left) but NEVER the denied post's own photo and NEVER a photo consumed by an
-    approved/published row. Every replacement clears the same A+ / banned-word / fabrication
-    gates as a normal build and is written PENDING (owner-visible, awaits approval).
-    INSERT-only: the existing calendar is never deleted. Behind AGENT_DENY_BACKFILL (OFF by
-    default) — flag off -> returns ok:False and touches nothing.
+    ALWAYS 1:1 (Blake, 2026-09-05): every denied row gets its own replacement, regardless
+    of whether its day already has OTHER active content. This used to skip a denied row
+    whenever its day had any active (pending/approved/published) feed at all — correct
+    when that active feed WAS the row's own prior replacement, but wrong whenever a day
+    legitimately carries more than one independently-scheduled post: found live when a
+    real client (Dale/ENG) denied one of two same-day Instagram posts and the OTHER,
+    unrelated published post on that day silently blocked his denied one from ever being
+    replaced, for weeks. Idempotency is therefore now keyed to the denied ROW's own id (a
+    kv marker, denybf_done_<row id>), not to day coverage — a row already replaced is never
+    retried, but an unrelated active post on the same day no longer blocks a different
+    denied post's own replacement.
+
+    The replacement REUSES a photo (allow_reuse — the gym has no fresh creative left) but
+    NEVER the denied post's own photo and NEVER a photo consumed by an approved/published
+    row. Every replacement clears the same A+ / banned-word / fabrication gates as a normal
+    build and is written PENDING (owner-visible, awaits approval). INSERT-only: the
+    existing calendar is never deleted. Behind AGENT_DENY_BACKFILL (OFF by default) — flag
+    off -> returns ok:False and touches nothing.
 
     Returns {ok, backfilled, days_needing, skipped[, rows]}."""
     log = logger or (lambda m: print(f"[deny-backfill] {m}"))
@@ -1378,8 +1388,8 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     months = sorted({(start + timedelta(days=i)).isoformat()[:7]
                      for i in range(max(1, days))})
 
-    denied_photo_by_day = {}    # date -> the denied feed's own image basename (never re-served)
-    active_feed_days = set()    # dates already covered by a non-denied/killed feed
+    denied_rows = []            # [{"day", "photo", "row_id"}] -- every denied row, each
+                                 # replaced 1:1 regardless of other same-day active content.
     live_photo_keys = set()     # photos on approved/published/publishing rows (never reused)
     for month in months:
         try:
@@ -1403,15 +1413,20 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                 continue
             fmt = str(row.get("format") or "").lower()
             acct = str(row.get("account") or "").lower()
-            if fmt == "feed" and acct in ("instagram", "ig", ""):
-                if status == "denied":
-                    denied_photo_by_day.setdefault(
-                        pd, _url_basename(row.get("image_url") or ""))
-                elif status not in ("killed", "deleted"):
-                    active_feed_days.add(pd)
+            if fmt == "feed" and acct in ("instagram", "ig", "") and status == "denied":
+                denied_rows.append({"day": pd,
+                                    "photo": _url_basename(row.get("image_url") or ""),
+                                    "row_id": row.get("id")})
 
-    # A denied day still needs a replacement only if nothing active already covers it.
-    todo = sorted(d for d in denied_photo_by_day if d not in active_feed_days)
+    # Per-ROW idempotency: a denied row already replaced (kv-marked after a successful
+    # insert below) is never retried, no matter what else is or isn't active on its day.
+    from . import db as _db
+    todo = []
+    for d in sorted(denied_rows, key=lambda r: (r["day"], str(r.get("row_id") or ""))):
+        rid = d.get("row_id")
+        if rid and _db.kv_get(f"denybf_done_{rid}"):
+            continue
+        todo.append(d)
     if not todo:
         return {"ok": True, "backfilled": 0, "days_needing": 0, "skipped": 0}
 
@@ -1431,11 +1446,13 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             log(f"{base_key}: cross-day media guard read skipped ({type(exc).__name__})")
     drafts = []
     skipped = 0
-    for day_key in todo:
+    done_row_ids = []
+    for denied in todo:
+        day_key = denied["day"]
         # Exclude the denied post's OWN photo (never hand the same one back) + every photo
         # already live on the page. Everything else may be REUSED.
         exclude = set(live_photo_keys)
-        own = denied_photo_by_day.get(day_key)
+        own = denied.get("photo")
         if own:
             exclude.add(own)
         blocked = (media_guard.blocked_keys(guard_state, day_key)
@@ -1473,6 +1490,8 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             or os.path.basename(getattr(feed, "creative_path", "") or ""), day_key)
         drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
                                               day_key=day_key))
+        if denied.get("row_id"):
+            done_row_ids.append(denied["row_id"])
 
     if not drafts:
         return {"ok": True, "backfilled": 0, "days_needing": len(todo),
@@ -1503,6 +1522,14 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
         log(f"{base_key}: backfill insert failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"insert failed: {type(exc).__name__}",
                 "backfilled": 0, "days_needing": len(todo), "skipped": skipped}
+    # Stamp per-row idempotency ONLY after the insert genuinely succeeded -- a failed
+    # insert must leave every denied row eligible for retry next pass, not silently
+    # marked done with no actual replacement ever written.
+    for rid in done_row_ids:
+        try:
+            _db.kv_set(f"denybf_done_{rid}", "1")
+        except Exception:  # noqa: BLE001 - a marker failure never blocks the backfill itself
+            pass
     days_done = len({r.get("post_date") for r in clean_rows
                      if r.get("format") == "feed"})
     log(f"{base_key}: backfilled {days_done} denied slot(s) with a fresh caption on a "

@@ -593,23 +593,56 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
     assert ig_feed[0]["caption"].strip()
 
 
-def test_deny_backfill_idempotent_when_active_feed_covers_the_day(monkeypatch, tmp_path):
+def test_deny_backfill_idempotent_on_the_same_denied_row(monkeypatch, tmp_path):
+    """ALWAYS 1:1 (Blake, 2026-09-05): idempotency is now per DENIED ROW (a kv marker
+    keyed by that row's own id), not per day -- a day already having some OTHER active
+    feed no longer implies THIS row was already replaced. Simulate "already replaced"
+    directly: pre-set the kv marker for this row's id, exactly as a prior successful
+    pass would have left it."""
     monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
     _stock_clean("gritx_ig")
-    # The denied day ALREADY has a fresh pending feed (a prior backfill landed): skip it.
-    seeded = {("gritx", "2026-08"): [
-        _denied_feed_row("2026-08-19"),
-        {"gym_id": "gritx", "account": "instagram", "format": "feed",
-         "post_date": "2026-08-19", "status": "pending", "caption": "fresh replacement",
-         "image_url": "https://gritx.media/photo_01.jpg"},
-    ]}
-    store = _FakeStoreLM(seeded)
+    from agent import db as _db
+    row = _denied_feed_row("2026-08-19")
+    row["id"] = "denied-row-1"
+    _db.kv_set("denybf_done_denied-row-1", "1")
+    store = _FakeStoreLM({("gritx", "2026-08"): [row]})
     out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
                                     voice=_voice(), library_path=_lib(tmp_path),
                                     store=store, banned_words=())
     assert out["ok"] is True
-    assert out["backfilled"] == 0, "a covered denied day must not be backfilled again"
+    assert out["backfilled"] == 0, "a row already marked done must not be replaced again"
     assert store.inserted == []
+
+
+def test_deny_backfill_replaces_a_denied_row_even_when_another_post_covers_its_day(
+        monkeypatch, tmp_path):
+    """The exact live bug (Dale/ENG, 2026-09-05): two independently-scheduled Instagram
+    posts on the SAME day, one published, one denied. The published post must NEVER
+    block the denied one from getting its own 1:1 replacement -- the old "day already
+    covered" check silently did exactly that, for weeks, on a real client's account."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    seeded = {("gritx", "2026-08"): [
+        _denied_feed_row("2026-08-19"),
+        {"gym_id": "gritx", "account": "instagram", "format": "feed",
+         "post_date": "2026-08-19", "status": "published",
+         "image_url": "https://gritx.media/photo_01.jpg"},
+    ]}
+    store = _FakeStoreLM(seeded)
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib,
+                                    store=store, banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, (
+        "the denied post must get its own replacement even though the day "
+        "already has a DIFFERENT, unrelated published post")
+    ig_feed = [r for r in store.inserted
+              if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert ig_feed[0]["post_date"] == "2026-08-19"
+    # Never re-placed the day's OTHER, already-live photo.
+    assert "photo_01" not in ig_feed[0]["image_url"]
 
 
 def test_deny_backfill_never_reuses_a_live_photo(monkeypatch, tmp_path):
