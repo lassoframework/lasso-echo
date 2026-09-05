@@ -1110,6 +1110,31 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def reply_engine_watch_enabled() -> bool:
+    """AGENT_REPLY_ENGINE_WATCH, default OFF. The watchdog over the comment reply
+    engine (AUD-008 / AUD-105).
+
+    Verified live 2026-09-05: echo_reply_accounts holds 6 rows covering eng and
+    topfuel ONLY, echo_reply_settings holds 2, and echo_reply_queue holds 10 rows
+    that were ALL created 2026-08-31T14:27:20 (five days of zero ingest), while
+    gym_social_accounts holds 42 accounts and 26 instagram/facebook accounts across
+    13 gyms have no mapping at all. The portal's reply webhook answers HTTP 200
+    with ignored='account not mapped to a gym' (or 'gym disabled'), and a 200 is
+    an error to nobody, so those gyms drop every comment in silence.
+
+    Nothing noticed because the REPLY NEEDED cards come from inbox_alerts.py, which
+    reads the Zernio inbox directly; no code in this package has ever read
+    echo_reply_queue. Two systems that disagree, and the one that can actually reply
+    is the empty one.
+
+    ON: a daily READ ONLY comparison of the four tables, kv-deduped, that names the
+    unmapped gyms and a stalled ingest. It NEVER writes a mapping or enables a gym:
+    mapping a gym arms replying on that client's behalf, which is a person's call.
+    OFF (default): a no-op that reads nothing.
+    """
+    return _truthy(os.environ.get("AGENT_REPLY_ENGINE_WATCH", "false"))
+
+
 def media_repeat_report_enabled() -> bool:
     """AGENT_MEDIA_REPEAT_REPORT, default OFF. Say out loud what the nightly
     cross-day photo sweep deliberately did NOT fix (B5).
