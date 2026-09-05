@@ -1642,6 +1642,12 @@ def _dedupe_slot_key(row):
     slot = str(row.get("time_slot") or "").strip().lower()
     fmt = str(row.get("format") or "").strip().lower()
     if not (account and date and slot and fmt):
+        # RULING (AUD-104): a row missing time_slot or format has no identifiable slot, so
+        # it is never deduped. That UNDER-blocks -- 46 forward rows carry a null time_slot
+        # -- and under-blocking is the correct direction for a filter that can only drop
+        # content. slot_index is not a usable fallback: it is null on 1090 of 1169 forward
+        # rows. The fix for those rows is to populate time_slot at plan time, not to guess
+        # here.
         return None
     return (account, date, slot, fmt)
 
@@ -1661,6 +1667,21 @@ def _dedupe_slots(store, account_key, payload, *, existing=None):
         return payload
     seen, deduped, in_batch = set(), [], 0
     for row in payload:
+        if row.get("event_id"):
+            # DATED EVENT ROWS ARE NEVER DROPPED (AUD-102). plan_horizon exempts event_id
+            # for the same reason: an event arc is a deliberate, dated override of the
+            # evergreen plan, so "keep the first row for this slot" is exactly backwards
+            # for it. This is not hypothetical -- the first version of this belt discarded
+            # The Bolton Club's "Bring A Friend Week is on / Day is here / Last day" rows
+            # in favour of the generic rows that happened to be created a day earlier.
+            #
+            # Exempting them can leave a transient duplicate on a slot that already holds
+            # a generic row. That is the correct trade: a stray extra row is recoverable,
+            # a silently missing event post is not, and resolving generic-versus-event on
+            # one slot belongs to the event lane, not to a staging filter that is only
+            # allowed to drop rows and never to delete them.
+            deduped.append(row)
+            continue
         k = _dedupe_slot_key(row)
         if k is None:          # unidentifiable slot: never guess, always stage
             deduped.append(row)
@@ -1676,6 +1697,9 @@ def _dedupe_slots(store, account_key, payload, *, existing=None):
     if existing:
         kept = []
         for row in deduped:
+            if row.get("event_id"):
+                kept.append(row)      # AUD-102: never blocked by an existing generic row
+                continue
             k = _dedupe_slot_key(row)
             if k is not None and k in existing:
                 dropped_live += 1
@@ -1699,7 +1723,12 @@ def _live_slots_for(store, account_key, dates):
         print(f"[slot-dedupe] live slot read failed for {account_key}: "
               f"{type(e).__name__}: {e}")
         return None
-    live = {"draft", "pending", "approved", "publishing", "published"}
+    # EXACTLY the statuses rows_in_range can return (its own positive allowlist at the
+    # top of this file). "draft" was dead code here -- that reader never returns it -- and
+    # "coach_review" WAS being returned while missing from this set, so a coach-review slot
+    # read as free and a re-plan stacked on top of it. 105 forward draft rows and every
+    # coach_review row were invisible to this pass.
+    live = {"pending", "approved", "publishing", "published", "coach_review"}
     out = set()
     for r in (rows or []):
         if str(r.get("status") or "").strip().lower() in live:

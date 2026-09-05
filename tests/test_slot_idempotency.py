@@ -135,3 +135,64 @@ def test_the_belt_defaults_ON(monkeypatch):
     assert config.slot_dedupe_enabled() is True
     monkeypatch.setenv("AGENT_SLOT_DEDUPE", "false")
     assert config.slot_dedupe_enabled() is False
+
+
+# ---- AUD-102: a dated event row is never a duplicate ------------------------------------
+
+def test_a_dated_event_row_is_never_dropped_in_batch(monkeypatch):
+    """The auditor's CRITICAL, with a production precedent. The first version of this belt
+    kept the earliest row per slot, which discarded The Bolton Club's "Bring A Friend Week
+    is on / Day is here / Last day" rows in favour of generic rows created a day earlier.
+    An event arc is a deliberate dated override, so first-wins is exactly backwards."""
+    _armed(monkeypatch)
+    batch = [_row(caption="generic evergreen"),
+             _row(caption="Day is here for Bring A Friend Week.",
+                  event_id="evt_bring-a-friend-week_32b838bfad")]
+    out = pcs._dedupe_slots(_Store(), "theboltonclub", batch)
+    assert len(out) == 2, "the dated event row must survive alongside the generic one"
+    assert any(r.get("event_id") for r in out)
+
+
+def test_a_dated_event_row_is_never_blocked_by_a_live_slot(monkeypatch):
+    """Exempting it can leave a transient duplicate. That is the correct trade: a stray
+    extra row is recoverable, a silently missing event post is not."""
+    _armed(monkeypatch)
+    live = [_row(status="approved", caption="generic already live")]
+    out = pcs._dedupe_slots(_Store(live), "theboltonclub",
+                            [_row(event_id="evt_bring-a-friend-week_32b838bfad")])
+    assert len(out) == 1, "an event arc must stage even onto an occupied slot"
+
+
+def test_two_rows_of_the_same_event_are_both_kept(monkeypatch):
+    """A multi-day arc legitimately writes several dated rows; none of them is a duplicate
+    of another just because they share a slot shape."""
+    _armed(monkeypatch)
+    batch = [_row(date="2026-09-09", event_id="evt_x"),
+             _row(date="2026-09-11", event_id="evt_x"),
+             _row(date="2026-09-12", event_id="evt_x")]
+    assert len(pcs._dedupe_slots(_Store(), "theboltonclub", batch)) == 3
+
+
+# ---- AUD-103: the live set must match what the reader can actually return ---------------
+
+def test_a_coach_review_slot_is_treated_as_taken(monkeypatch):
+    """rows_in_range returns coach_review, but it was missing from the live set, so a
+    coach-review slot read as FREE and a re-plan stacked a second row on top of it."""
+    _armed(monkeypatch)
+    live = [_row(status="coach_review")]
+    assert pcs._dedupe_slots(_Store(live), "eng", [_row()]) == []
+
+
+def test_the_live_set_matches_the_readers_own_allowlist():
+    """Dead entries in this set are silent under-blocking. 'draft' was listed here while
+    rows_in_range can never return it; 'coach_review' was returned and not listed."""
+    import inspect
+    src = inspect.getsource(pcs.SupabaseCalendarStore.rows_in_range)
+    allow = src.split("status\": \"in.(")[1].split(")")[0]
+    reader = {s.strip() for s in allow.split(",") if s.strip()}
+    belt = inspect.getsource(pcs._live_slots_for)
+    listed = {s.strip().strip('"') for s in
+              belt.split("live = {")[1].split("}")[0].split(",") if s.strip()}
+    assert listed == reader, (
+        f"belt live set {sorted(listed)} does not match what rows_in_range returns "
+        f"{sorted(reader)} -- a mismatch silently under- or over-blocks")
