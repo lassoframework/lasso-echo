@@ -637,12 +637,23 @@ def test_sweep_alerts_once_past_threshold_and_never_reverts():
     assert out == ["s1"] and len(alerts) == 1
     assert "stuck in 'publishing'" in alerts[0]
     assert "NOT auto-reverted" in alerts[0]                      # human decision only
-    assert kv["stuck_publishing_s1"] == "alerted"
-    # second pass: no re-alert
+    # AUD-202, corrected 2026-09-05. This used to assert kv == "alerted", the magic word
+    # that was never cleared -- so it was pinning the bug in place. Production proved the
+    # cost: row d4574f62 sat in 'publishing' for eight days carrying that exact marker,
+    # alerted once and muted forever. The marker is a TIMESTAMP now, and the intent the
+    # test was really protecting (do not re-alert on every sweep) is asserted directly.
+    assert kv["stuck_publishing_s1"].startswith("alerted:")
+    # second pass an hour later: still quiet, the re-alert interval has not elapsed
     out2 = cap.sweep_stuck_publishing(store=store, kv=kv,
                                       now="2026-08-13T11:00:00-04:00",
                                       alert=alerts.append)
     assert out2 == [] and len(alerts) == 1
+    # a day later, still stuck: it speaks again rather than staying silent forever
+    out3 = cap.sweep_stuck_publishing(store=store, kv=kv,
+                                      now="2026-08-14T11:00:00-04:00",
+                                      alert=alerts.append)
+    assert out3 == ["s1"] and len(alerts) == 2
+    assert "STILL stuck" in alerts[1]
 
 
 def test_sweep_under_threshold_stays_quiet():

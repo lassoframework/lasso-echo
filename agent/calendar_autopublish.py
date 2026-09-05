@@ -1205,8 +1205,24 @@ def client_gym_bases():
 # would double-publish). It only ALERTS a human, once per row: first sighting
 # records the time in kv; a row still stuck past the threshold alerts and is
 # marked so it never re-alerts.
+#
+# THAT LAST SENTENCE WAS THE BUG (AUD-106, 2026-09-05). "Marked so it never re-alerts"
+# and "cleared on recovery" are different promises, and only the first was implemented.
+# The marker was written as the literal string "alerted" and cleared NOWHERE, so a row
+# that stays stuck is muted permanently after one alert. Caught red-handed: the LASSO
+# Instagram row d4574f62 carried stuck_publishing_d4574f62... = 'alerted' in production
+# while STILL sitting in status 'publishing' with published_at NULL, post_date 2026-08-28
+# -- eight days stranded, one alert, then silence. That is the same shape as the four
+# safety nets that already shipped inert.
+#
+# Two changes: the marker now records WHEN the alert fired (a timestamp, never a magic
+# word, so the value is comparable with the first-sighting stamp written above it), and a
+# row still stuck after STALE_PUBLISHING_REALERT_SECONDS alerts again with its age. A row
+# that leaves 'publishing' stops appearing in publishing_rows(), so its key simply goes
+# unread; nothing has to clear it for the alert to be correct on the next genuine stall.
 
 STALE_PUBLISHING_SECONDS = 2 * 3600   # 2h: far beyond the seconds-wide claim window
+STALE_PUBLISHING_REALERT_SECONDS = 24 * 3600   # re-alert daily while it is still stuck
 
 
 def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
@@ -1238,8 +1254,44 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
             seen = kv.get(key, "")
         except Exception:
             seen = ""
-        if seen == "alerted":
-            continue                              # already alerted, human owns it
+        if seen.startswith("alerted"):
+            # ALREADY ALERTED, BUT NOT FOREVER. Re-alert on a daily cadence while the row
+            # is still stuck, so a stall that nobody actioned resurfaces instead of going
+            # silent. Legacy value: a bare "alerted" with no timestamp (what the old code
+            # wrote) is treated as "alerted just now" and re-alerts one interval later,
+            # rather than being trusted forever or re-alerting instantly on every sweep.
+            stamp = seen.partition(":")[2]
+            try:
+                last = datetime.fromisoformat(stamp) if stamp else now_dt
+            except ValueError:
+                last = now_dt
+            # A stamp written by an older build (or by a test) can be naive while
+            # _local_now is aware; subtracting the two raises TypeError, which the caller
+            # would swallow and the row would go silent again -- the exact failure this
+            # fix exists to remove.
+            if (last.tzinfo is None) != (now_dt.tzinfo is None):
+                last = last.replace(tzinfo=now_dt.tzinfo) if last.tzinfo is None \
+                    else last.astimezone(None).replace(tzinfo=None)
+            if not stamp:
+                try:
+                    kv.set(key, f"alerted:{now_dt.isoformat()}")
+                except Exception:
+                    pass
+                continue
+            if (now_dt - last).total_seconds() < STALE_PUBLISHING_REALERT_SECONDS:
+                continue
+            alert(f"calendar row {rid} (gym {row.get('gym_id')}, {row.get('account')}, "
+                  f"{row.get('post_date')}) is STILL stuck in 'publishing'. It was first "
+                  f"alerted on {stamp[:19]} and nothing has changed since. This row "
+                  "cannot publish and cannot be seen by the client. Check the account's "
+                  "feed: if the post is live, mark the row published by hand; if not, "
+                  "flip it back to approved.")
+            try:
+                kv.set(key, f"alerted:{now_dt.isoformat()}")
+            except Exception:
+                pass
+            alerted.append(rid)
+            continue
         if not seen:
             try:
                 kv.set(key, now_dt.isoformat())   # first sighting: start the clock
@@ -1259,7 +1311,7 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
               "could double-post). Check the account's feed: if the post is live, "
               "mark the row published by hand; if not, flip it back to approved.")
         try:
-            kv.set(key, "alerted")
+            kv.set(key, f"alerted:{now_dt.isoformat()}")
         except Exception:
             pass
         alerted.append(rid)
