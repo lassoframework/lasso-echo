@@ -1682,3 +1682,74 @@ The suite was green for every single one. Three rules earned the hard way:
    rather than what the rule is** -- so it asserts predicates instead of call sites, injects
    its own failures, greps source text, and accepts `**kwargs` where production requires a
    signature. (D59, D60)
+
+---
+
+## D63 (2026-09-05) -- the fifth audit: reading one line further
+
+**Finding 1 (CRITICAL) -- D62 read the producer's SHAPE and stopped one line short of its
+SEMANTICS.** D62's whole lesson was "a contract with another system is read, not inferred",
+and the fix it produced read `~/scout-listener`'s `runVerify` output shape -- `{phase,
+exit_code, tail, at}` -- and treated `exit_code == 0` as a pass. The command that produces it
+is:
+
+```bash
+python3 -m pytest -q 2>&1 | tail -5 || true; echo "__EXIT__:$?"
+```
+
+`|| true`, and `$?` is `tail`'s status rather than pytest's. **`exit_code` is always 0**, for a
+passing suite and a failing one alike. So `verification_succeeded` became a constant `True` for
+the only producer there is, and *"Fixed it and confirmed the change is live before sending
+this"* would have gone to a paying client over a failing test suite. The inert bug D62 fixed
+was replaced by a lying one.
+
+The resolution is to stop trying to extract a verdict that is not there. **A field
+structurally incapable of expressing failure is not a verdict**, so that snapshot is
+UNREADABLE: no claim, ticket stays in `fixing` and still polled, one honest card to a human.
+Parsing the `tail` text was considered and rejected -- it is the same guess wearing a different
+hat. Announcing a verified fix requires an explicit verdict field, and until the ops-fix worker
+writes one this path stays quiet. **That wiring is a cross-repo change and Blake's call**; it
+is listed in the open items rather than invented here.
+
+**Finding 2 (CRITICAL) -- the publish guard was rewritten on the wrong axis, twice.** D62's
+rewrite REPLACED the previous alternatives rather than adding to them, and measured against a
+realistic corpus it held **37% of ordinary state questions** ("were my posts scheduled?", "any
+update on our posts?") while MISSING three publish requests the version before it caught ("post
+the flyer for the open house"). Leakier and blunter simultaneously, and the test that was meant
+to prove otherwise used five hand-picked strings.
+
+The axis is not vocabulary, it is SHAPE: a request asks us to author something (imperative, or
+a polite request form, or a content verb bound to a claim we would assert on the client's
+behalf); a question asks what is already true. Claim markers are now only the ones that
+introduce authored content ("that", "saying", "announcing", "telling") -- never ordinary words
+like "were" or "our" that any question contains. Measured on a 20-question / 14-request corpus
+that is now IN the test file: 0 false positives, 0 false negatives, both asserted per string.
+
+Also closed: `resolve_and_notify` gated on the ticket's `identity_kind` while writing
+`recipient_kind: "client"`, so a staff ticket passed the gate and held the row (finding 3); a
+refused resolve tap did nothing visible at all, which is the dead button that path exists to
+fix, and now writes the reason back to the channel it was tapped in (finding 4); leaving a
+released row `held` on `claim_failed`/`lost_claim` let a retap send the client a SECOND DM,
+because `_send` had already written a row another consumer owns -- three reasons now map to
+three distinct states (finding 5); the voice-doc swap had removed the routed identity's doc,
+which was the only thing D50 routing actually moves, so the routed guidance is kept with the
+other bot's NAME rewritten to the speaker's, and the grounding record names both roles
+honestly instead of claiming the wrong one (finding 6); and receipts ride on `kind=escalation`,
+so counting escalations let one receipt permanently suppress the unreadable-snapshot card
+(finding 7).
+
+### Five audits: what the numbers say
+
+| Round | CRITICAL | MAJOR | Introduced by the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+
+The suite was green for all eleven CRITICALs. The trend that matters is the last column: **the
+fix waves are now the primary source of new defects**, which is the strongest possible argument
+for the two-consecutive-clean-audits gate and against ever treating a single clean pass, or a
+green suite, as done. Every round has also gotten narrower -- round 1 found "the classifier
+never ran at all"; round 5 found a regex 37% too broad and a shell `|| true` two repos over.

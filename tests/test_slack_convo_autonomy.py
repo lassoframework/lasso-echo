@@ -402,7 +402,8 @@ def test_confident_website_question_is_answered_with_wrangler_knowledge():
     # m2 (audit 2): the record says the KNOWLEDGE moved, not that the facts came from a
     # websites seam -- there is no websites seam, and claiming one would be a false entry in
     # the verification record this system treats as evidence.
-    assert t["verification_after"]["knowledge_and_voice_of"] == "wrangler"
+    assert t["verification_after"]["domain_guidance_from"] == "wrangler"
+    assert t["verification_after"]["spoken_by"] == "scout"
     assert "unchanged by routing" in t["verification_after"]["facts_source"]
 
 
@@ -1001,7 +1002,10 @@ def test_the_portal_bridge_enforces_the_allowlist_not_just_the_denylist(text, mo
         fetch_state=lambda t, w: {"social_status": {"instagram": "connected"}},
         llm=lambda system, user, model=None: "Here is an answer about that.",
         classify_llm=None, log=lambda *a, **k: None)
-    assert posted == [], f"{text!r} reached a client with no tap"
+    # The honest acknowledgement IS allowed to reach them (it claims nothing); the
+    # model-written ANSWER is what must never send unattended.
+    assert not any("Here is an answer about that." in p for p in posted), \
+        f"{text!r} reached a client with a model-written answer and no tap"
     assert bus.status == "hold"
 
 
@@ -1187,11 +1191,17 @@ def test_the_cross_product_answer_introduces_the_bot_that_is_actually_speaking()
 # =========================================================================================
 
 REAL_VERIFY_SNAPSHOTS = [
-    # THE ACTUAL SHAPE, read from ~/scout-listener src/index.js runVerify (audit 4 went and
-    # looked; audit 3's fix had guessed a vocabulary of verdict words that this producer
-    # never writes, which made fixed_pass permanently inert).
+    # THE ACTUAL SHAPE AND ITS ACTUAL SEMANTICS. ~/scout-listener src/index.js runVerify runs
+    #     bash -lc 'python3 -m pytest -q 2>&1 | tail -5 || true; echo "__EXIT__:$?"'
+    # so exit_code is ALWAYS 0 -- `|| true`, and $? is tail's status, not pytest's. Audit 4
+    # read the shape and treated 0 as a pass, which made verification_succeeded a constant
+    # True for the only producer there is: "Fixed it and confirmed the change is live" over a
+    # FAILING suite. A field that cannot express failure is not a verdict, so this snapshot is
+    # UNREADABLE, and unreadable never announces anything to a client.
     ({"phase": "after", "exit_code": 0, "tail": "5455 passed", "at": "2026-09-05T00:00:00Z"},
-     True),
+     False),
+    ({"phase": "after", "exit_code": 0, "tail": "1 failed, 12 passed", "at": "x"}, False),
+    # a non-zero exit code is still a definite failure if anything ever writes one
     ({"phase": "after", "exit_code": 1, "tail": "1 failed", "at": "2026-09-05T00:00:00Z"},
      False),
     ({"phase": "before", "exit_code": 2, "tail": "collection error", "at": "x"}, False),
@@ -1211,14 +1221,57 @@ def test_verification_verdict_matches_the_real_producer(snapshot, expected):
     assert ETW.verification_succeeded(snapshot) is expected, snapshot
 
 
-def test_an_unreadable_verification_leaves_the_ticket_in_the_poll():
-    """Audit 4 finding 1's second half: an unreadable snapshot used to be escalated as
-    'verification_not_a_success' AND flipped to status='hold', which removes the ticket from
-    find_fixing_tickets forever -- so a fix that later verified could never notify anyone."""
+def test_an_unreadable_verification_leaves_the_ticket_in_the_poll(monkeypatch):
+    """Audit 4 finding 1's second half, re-tested through fixed_pass itself (audit 5: the
+    first version asserted only the predicate's return values, so it would have passed
+    unchanged if fixed_pass still flipped the ticket to 'hold' -- the exact thing its name
+    promises)."""
     from agent import echo_ticket_worker as ETW
     assert ETW.verification_is_unreadable({"weird": "shape"}) is True
     assert ETW.verification_is_unreadable({"exit_code": 1}) is False
     assert ETW.verification_is_unreadable({"verified": False}) is False
+    # and the real producer's snapshot, which cannot express failure
+    assert ETW.verification_is_unreadable(
+        {"phase": "after", "exit_code": 0, "tail": "ok", "at": "x"}) is True
+
+    monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
+    for v in ("SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED",
+              "SLACK_CONVO_ECHO_CLIENT_REPLY"):
+        monkeypatch.setenv(v, "true")
+    posted = []
+    state = {"status": "fixing"}
+    rows = []
+
+    class _Bus:
+        def find_fixing_tickets(self, **kw):
+            return [{"id": "t-1", "product": "echo", "status": state["status"],
+                     "slack_user_id": "U_C", "reporter": "o@g.com", "client_id": "g-1",
+                     "verification_after": {"phase": "after", "exit_code": 0,
+                                            "tail": "ok", "at": "x"}}]
+
+        def ticket(self, tid):
+            return {"id": tid, "status": state["status"]}
+
+        def set_ticket(self, tid, **f):
+            state.update(f)
+            return {}
+
+        def record_outbound(self, **kw):
+            rows.append(kw)
+            return {"id": f"m-{len(rows)}"}
+
+        def messages(self, tid, limit=200):
+            return []
+
+    ETW.fixed_pass(_Bus(), open_group_dm=lambda ids: posted.append(ids) or {"ok": True,
+                                                                            "channel_id": "G"},
+                   post_first_message=lambda c, t: posted.append(t) or {"ok": True, "ts": "1"},
+                   log=lambda *a, **k: None)
+    assert posted == [], "nothing may be claimed to a client from an unreadable verification"
+    assert state["status"] == "fixing", \
+        "the ticket must stay in the poll it needs to stay in, not be flipped out of it"
+    assert any(r.get("kind") == A.KIND_ESCALATION for r in rows), \
+        "and a human must be told once, honestly, what could not be read"
 
 
 @pytest.mark.parametrize("text", [
@@ -1357,3 +1410,137 @@ def test_resolve_refuses_when_the_client_notice_would_be_held(monkeypatch):
     assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
                                  identity=IDS.get("echo"), log=lambda *a: None) is False
     assert bus.tickets[d.ticket_id]["status"] != "resolved"
+
+
+# =========================================================================================
+# AUDIT 5 (2026-09-05): measured corpora, not hand-picked strings
+# =========================================================================================
+
+STATE_QUESTIONS = [
+    "is my instagram connected?", "did my posts go out this week?",
+    "what is on the calendar for october?", "is the october schedule loaded?",
+    "why is my facebook account disconnected?", "were my posts scheduled?",
+    "any update on our posts?", "did the post about our new class go out?",
+    "what is our posting schedule right now?", "are my accounts still connected",
+    "did anything publish yesterday?", "has the calendar been approved?",
+    "how many posts are queued?", "is the reel from tuesday published?",
+    "did you get the photos i uploaded?", "is my google business profile connected",
+    "what happened to the story i approved", "are there drafts waiting on me",
+    "did the caption change get saved", "when was the last post published",
+]
+
+PUBLISH_REQUESTS = [
+    "make a post that says we are moving to 8am",
+    "put a post up saying we are closed for the holiday",
+    "could you throw up a post saying we changed our hours",
+    "schedule a post telling everyone we are closed friday",
+    "draft a post saying our rates go up in january",
+    "let everyone know on instagram that we are closed",
+    "we need a post announcing our new saturday time",
+    "our saturday classes are moving to 8am, can you update the post",
+    "can you post the flyer for the open house?",
+    "post the flyer for the open house",
+    "can you publish the announcement",
+    "can you post that our saturday group is moving to 8am?",
+    "please announce we are closed monday",
+    "tell everyone the 6am is cancelled",
+]
+
+
+@pytest.mark.parametrize("text", STATE_QUESTIONS)
+def test_ordinary_state_questions_are_not_held_by_the_publish_guard(text):
+    """Audit 5 finding 2: the audit-4 guard held 37% of a realistic corpus of ordinary
+    questions while MISSING three publish requests the version before it caught. Both
+    directions wrong at once, and the test that was supposed to prove otherwise used five
+    hand-picked strings. Whole corpora now, asserted both ways."""
+    assert A.may_auto_answer(text), f"ordinary state question wrongly held: {text!r}"
+
+
+@pytest.mark.parametrize("text", PUBLISH_REQUESTS)
+def test_publish_requests_are_never_auto_answered(text):
+    assert not A.may_auto_answer(text), f"publish request wrongly auto answered: {text!r}"
+
+
+def test_a_staff_resolve_tap_does_not_lie_either(monkeypatch):
+    """Audit 5 finding 3: the refusal gated on the ticket's identity_kind while the row it
+    wrote hardcoded recipient_kind='client'. A STAFF ticket with STAFF_REPLY on and
+    CLIENT_REPLY off passed the gate and then held the row -- the same lie, one branch over."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_STAFF_REPLY", "true")
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus = FakeBus()
+    # V-M1: staff in a group DM with no open ticket is two humans talking; a 1:1 DM is where
+    # a staff message opens a ticket.
+    d = A.handle_event(_ev("my posts are not going out", channel="D_STAFF",
+                           channel_type="im", user="U_STAFF"), "k",
+                       _deps(bus, who=IG.STAFF))
+    bus.tickets[d.ticket_id]["slack_channel_id"] = "D_STAFF"
+    bus.tickets[d.ticket_id]["identity_kind"] = IG.STAFF
+    assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
+                                 identity=IDS.get("echo"), log=lambda *a: None) is True
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert any(OB.RESOLVED_NOTICE[:30] in c["text"] for c in calls), \
+        "a staff ticket resolved under STAFF_REPLY must actually deliver the notice"
+
+
+def test_a_refused_resolve_tap_is_visible_to_the_person_who_tapped_it(monkeypatch):
+    """Audit 5 finding 4: refusing silently is the dead button this path exists to fix."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
+    bus = FakeBus()
+    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    bus.tickets[d.ticket_id]["slack_channel_id"] = "G0MPIM"
+    assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
+                                 identity=IDS.get("echo"), log=lambda *a: None) is False
+    cards = [m for m in bus.messages_for(d.ticket_id)
+             if (m["attachments"] or {}).get("resolve_refused")]
+    assert cards, "the tap must say why it did nothing, in the channel it was tapped in"
+    assert "CLIENT_REPLY is off" in cards[0]["body"]
+
+
+@pytest.mark.parametrize("reason,expected_state", [
+    ("open_failed", "held"),          # nothing was written; a retap is the correct retry
+    ("post_failed", "failed"),        # definitive: attempted and refused
+    ("claim_failed", "suppressed"),   # another consumer owns the row; a retap would duplicate
+    ("lost_claim", "suppressed"),
+])
+def test_release_failure_states_cannot_produce_a_duplicate_dm(reason, expected_state):
+    """Audit 5 finding 5: "leave it held so a retap works" is right for open_failed and wrong
+    for the claim reasons -- on those, _send has ALREADY written a ready row another consumer
+    will post, so a retap sends the client the same DM twice."""
+    from agent.slack_convo import outreach as OU
+    marks = []
+    held = {"id": "r1", "ticket_id": "t-1", "delivery_status": "held", "body": "hello",
+            "attachments": {"kind": A.KIND_OUTREACH_REQUEST, "identity": "echo"}}
+    monkey = {"open_failed": (lambda ids: {"ok": False}, lambda c, t: {"ok": True, "ts": "1"}),
+              "post_failed": (lambda ids: {"ok": True, "channel_id": "G"},
+                              lambda c, t: {"ok": False})}
+    if reason in monkey:
+        open_dm, post_msg = monkey[reason]
+        claim = None
+    else:
+        open_dm = lambda ids: {"ok": True, "channel_id": "G"}          # noqa: E731
+        post_msg = lambda c, t: {"ok": True, "ts": "1"}                # noqa: E731
+        claim = (lambda rid: False) if reason == "lost_claim" else _raising_claim
+    res = OU.release_approved_outreach(
+        "r1",
+        {"id": "t-1", "source": "website_tab", "reporter": "o@g.com", "slack_user_id": "U_C",
+         "client_id": "g-1", "reporter_verified": True},
+        IG.Identity(IG.CLIENT, "U_C", email="o@g.com", account_key="k", gym_id="g-1",
+                    reason="t"),
+        IDS.get("echo"), get_held_message=lambda mid: held, open_group_dm=open_dm,
+        post_first_message=post_msg, record_outbound=lambda **kw: {"id": "r2"},
+        stamp_ticket=lambda *a, **k: None, claim_message=claim,
+        mark_message=lambda mid, status, **kw: marks.append((mid, status)),
+        log=lambda *a, **k: None)
+    assert res.delivered is False
+    got = marks[-1][1] if marks else "held"
+    assert got == expected_state, f"{reason} left the row {got}, expected {expected_state}"
+
+
+def _raising_claim(row_id):
+    raise RuntimeError("claim blew up")

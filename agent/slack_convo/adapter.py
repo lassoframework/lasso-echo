@@ -292,25 +292,36 @@ def auto_answer_forbidden(text):
 # rates". Those satisfy the allowlist because they name posting, and they are not questions
 # about state at all: they ask us to PUBLISH a real-world claim on a client's behalf. Auto
 # answer is for reporting what is already true, never for agreeing to say something new.
-# Audit 4, finding 3: eight ordinary phrasings walked past the first version -- "make a post
-# that says we are moving to 8am", "put a post up saying we are closed", "throw up a post
-# saying we changed our hours", "schedule a post telling everyone", "draft a post saying our
-# rates go up", "let everyone know on instagram", "we need a post announcing", "can you update
-# the post". Enumerating polite request forms was the wrong axis. What every one of them has
-# in common is a CONTENT VERB plus a CLAIM MARKER: they ask us to author a statement. That
-# pair is what this matches now, in either order, with no dependence on how politely it is
-# asked.
-_CONTENT_VERB = (r"post|posts|posting|publish|publishing|announce|announcing|announcement|"
-                 r"share|sharing|draft|drafting|write|writing|schedule|scheduling|"
-                 r"put up|putting up|throw up|send out|sending out|update|updating|tell|"
-                 r"telling|let .{0,25}know|caption|story|reel")
-_CLAIM_MARKER = (r"that|saying|says|announcing|telling|about|to say|letting .{0,25}know|"
-                 r"we are|we're|were|our |new |change|changed|changing|moving|moved|"
-                 r"cancel|cancelled|canceled|closed|closing|rates|prices|hours")
+# Audit 5, finding 2 (CRITICAL): the audit-4 rewrite REPLACED the previous alternatives
+# instead of adding to them, and picked the wrong axis a second time. Measured on a realistic
+# corpus it held 37% of ordinary state questions ("were my posts scheduled?", "any update on
+# our posts?") while MISSING three imperative requests the version before it caught ("post the
+# flyer for the open house"). Both directions wrong at once.
+#
+# The axis that actually separates them is not vocabulary, it is SHAPE:
+#   * a REQUEST asks us to author or publish something -- an imperative ("post the flyer"), a
+#     polite request form ("can you publish ..."), or a content verb bound to a claim we would
+#     be asserting on the client's behalf ("post that we are moving to 8am");
+#   * a QUESTION asks what is already true ("were my posts scheduled?"), and the tense and
+#     interrogative shape are what make it one.
+# So the claim markers are only the ones that introduce AUTHORED CONTENT (that / saying /
+# announcing / telling), never ordinary words like "were" or "our" that any question contains.
+_CONTENT_VERB = (r"post|posts|publish|announce|share|schedule|draft|write|send out|put up|"
+                 r"throw up|put out|tell|let .{0,25}know")
+_AUTHORED_CLAIM = (r"that\b|saying\b|says\b|announcing\b|telling\b|to say\b|about how\b|"
+                   r"letting .{0,25}know")
+# (a) a polite request form wrapped around a content verb
+_REQ_POLITE = (rf"\b(?:can|could|would|will|please|pls|need|want|wanna|mind)\b"
+               rf"[^.?!]{{0,25}}?\b(?:{_CONTENT_VERB})\b")
+# (b) an imperative opening the message
+_REQ_IMPERATIVE = rf"^\s*(?:please\s+|pls\s+|hey\s+)?(?:{_CONTENT_VERB})\b"
+# (c) asking for a piece of content to exist
+_REQ_MAKE = (r"\b(?:make|need|want|create|write|draft|put together|get)\b[^.?!]{0,20}?"
+             r"\b(?:a |an |the )?(?:post|caption|story|reel|announcement|graphic|flyer)\b")
+# (d) a content verb bound to a claim we would be asserting for them
+_REQ_CLAIM = rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,40}}?\b(?:{_AUTHORED_CLAIM})"
 _ASK_TO_PUBLISH = _re.compile(
-    rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,60}}?\b(?:{_CLAIM_MARKER})\b|"
-    rf"\b(?:{_CLAIM_MARKER})\b[^.?!]{{0,40}}?\b(?:{_CONTENT_VERB})\b",
-    _re.IGNORECASE)
+    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM)), _re.IGNORECASE)
 
 
 def asks_us_to_publish(text):
@@ -712,7 +723,11 @@ def handle_event(event, event_id, deps):
                 # because there is no websites seam. What actually moved is the knowledge
                 # and voice, and that is what this says.
                 grounding["routed_from_product"] = routed_from
-                grounding["knowledge_and_voice_of"] = answer_ident.name
+                # Audit 5, finding 6: named for what it IS. The domain guidance came from the
+                # routed identity; the client was spoken to by the entry identity; the facts
+                # came from this gym's own account either way.
+                grounding["domain_guidance_from"] = answer_ident.name
+                grounding["spoken_by"] = ident.name
                 grounding["facts_source"] = "account state for this gym (unchanged by routing)"
             deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="verification",
                                 verification_before=grounding,

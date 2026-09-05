@@ -468,8 +468,25 @@ def verification_succeeded(verification):
     A guess about another process's vocabulary is not a contract; the shape below is read
     from that code.
 
-    Recognised, in order:
-      * exit_code: 0 is a pass, anything else is not. This is the real producer's shape.
+    AND THEN AUDIT 5 READ THE SAME CODE ONE LINE FURTHER. That command is:
+
+        bash -lc 'python3 -m pytest -q 2>&1 | tail -5 || true; echo "__EXIT__:$?"'
+
+    `|| true` (and the fact that $? is the exit status of `tail`, not of pytest) means
+    `exit_code` is **always 0**, for a passing suite and a failing one alike. So reading it as
+    a verdict made verification_succeeded a constant True for the only producer there is --
+    and "Fixed it and confirmed the change is live" would have gone to a paying client over a
+    failing test suite. That is a worse failure than the inert one it replaced.
+
+    The honest conclusion, and the one this function now implements: **that snapshot carries
+    no verdict at all.** Not a pass, not a fail -- unreadable. We do not infer one from a
+    field that is structurally incapable of expressing failure, and we do not parse the
+    `tail` text either (that is the same guess wearing a different hat). A fix is announced
+    to a client only when the snapshot says so EXPLICITLY, and until the ops-fix worker
+    writes such a field, this path stays honest by staying quiet and telling a human why.
+    See D63; wiring that field is a cross-repo change and Blake's call.
+
+    Recognised:
       * an explicit True, or an affirmative word we recognise.
       * ALL present verdict keys must agree (audit 4, finding 10): first-present-key-wins let
         {"status": "completed", "result": "failed"} read as a success.
@@ -478,15 +495,14 @@ def verification_succeeded(verification):
     the poll it needs to stay in."""
     if not isinstance(verification, dict) or not verification:
         return False
+    # A non-zero exit code IS a definite failure (nothing else writes one, and if something
+    # ever does, it means what it says). A zero one means nothing, for the reason above.
     if "exit_code" in verification:
         try:
             if int(verification["exit_code"]) != 0:
                 return False
         except (TypeError, ValueError):
             return False
-        # a zero exit code is the producer's pass signal; a contradicting verdict still wins
-        verdicts = [verification[k] for k in _VERDICT_KEYS if k in verification]
-        return all(_is_affirmative(v) for v in verdicts) if verdicts else True
     verdicts = [verification[k] for k in _VERDICT_KEYS if k in verification]
     if not verdicts:
         return False
@@ -508,12 +524,20 @@ def verification_is_unreadable(verification):
     """True when we cannot tell what this snapshot means, as opposed to it saying failure.
 
     The difference matters: an unreadable snapshot must leave the ticket exactly where it is,
-    still polled, and must not tell a human the verification failed."""
+    still polled, and must not tell a human the verification failed.
+
+    The ops-fix worker's {phase, exit_code, tail, at} with exit_code 0 lands here, because
+    that zero cannot distinguish a pass from a failure (see verification_succeeded)."""
     if not isinstance(verification, dict) or not verification:
         return True
-    if "exit_code" in verification:
+    if [k for k in _VERDICT_KEYS if k in verification]:
         return False
-    return not [k for k in _VERDICT_KEYS if k in verification]
+    try:
+        if int(verification.get("exit_code", 0)) != 0:
+            return False        # a definite failure, not an unreadable snapshot
+    except (TypeError, ValueError):
+        return True
+    return True
 
 
 def _fix_summary_text(verification):
@@ -530,12 +554,27 @@ def _fix_summary_text(verification):
 
 
 def _outbound_escalations_today(bus, tid):
+    """Escalation cards written today on this ticket, NOT counting receipts.
+
+    Audit 5, finding 7: receipts ride on kind='escalation' (the C3 workaround for the
+    portal's denylist), so a plain count of that kind meant one receipt permanently
+    suppressed the unreadable-snapshot card and the ticket looped in 'fixing' with nobody
+    ever told. The rows are distinguishable by attachments.receipt; this counts what a human
+    would actually call an escalation."""
     from datetime import datetime as _dt, timezone as _tz
-    start = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    start = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()[:10]
     try:
-        return bus.count_outbound_kind_since(tid, _a.KIND_ESCALATION, start)
+        rows = bus.messages(tid, limit=200)
     except Exception:  # noqa: BLE001 - fail closed: assume we already said it
         return 10 ** 9
+    n = 0
+    for m in rows or []:
+        att = m.get("attachments") or {}
+        if (m.get("direction") == "outbound" and att.get("kind") == _a.KIND_ESCALATION
+                and not att.get("receipt")
+                and str(m.get("created_at") or "").startswith(start)):
+            n += 1
+    return n
 
 
 def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,

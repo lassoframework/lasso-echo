@@ -488,14 +488,24 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
         # IT HELD so Blake's Release card still works on the next tap. Burning it on a
         # transient fault re-created the exact silent no-op card that listener_wiring's own
         # dispatch fix exists to prevent.
-        if result.reason == "post_failed" and mark_message is not None:
+        # Audit 5, finding 5: "leave it held so a retap works" is right for open_failed and
+        # WRONG for claim_failed / lost_claim. On those two, _send has ALREADY written a
+        # 'ready' outbound row that another consumer owns and will post -- so a retap writes
+        # a second row and the client gets the same DM twice. Three outcomes, three states:
+        #   open_failed  -> held      (nothing was written; a retap is the correct retry)
+        #   post_failed  -> failed    (definitive: the send was attempted and refused)
+        #   claim_*      -> suppressed(another consumer has it; a retap must NOT duplicate)
+        state = {"post_failed": "failed",
+                 "claim_failed": "suppressed",
+                 "lost_claim": "suppressed"}.get(result.reason)
+        if state and mark_message is not None:
             try:
-                mark_message(message_id, "failed",
+                mark_message(message_id, state,
                              meta_update={"outreach_reason": result.reason})
             except Exception as e:  # noqa: BLE001
-                log(f"[outreach] held row {message_id} failure mark failed: "
+                log(f"[outreach] held row {message_id} state mark failed: "
                     f"{type(e).__name__}")
         log(f"[outreach] release did NOT deliver row={message_id} reason={result.reason} "
-            f"(row left {'failed' if result.reason == 'post_failed' else 'held for a retap'})")
+            f"(row left {state or 'held for a retap'})")
 
     return result

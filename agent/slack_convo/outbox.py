@@ -599,15 +599,34 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     # notice would be HELD by the trust ladder -- Blake taps "Resolved, tell them", the tap
     # reports ok, the ticket reads resolved, and the client is never told. If we cannot
     # deliver the notice, we do not claim the resolution.
-    if not _recipient_armed(identity, ticket.get("identity_kind") or "client"):
-        log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} would hold the "
-            f"client notice (SLACK_CONVO_{getattr(identity, 'name', '?').upper()}_"
-            f"CLIENT_REPLY is off), so the ticket is NOT marked resolved")
+    recipient_kind = ticket.get("identity_kind") or "client"
+    if not _recipient_armed(identity, recipient_kind):
+        # Audit 5, finding 4: refusing silently is its own version of the dead button this
+        # whole path exists to fix -- Blake taps "Resolved, tell them" and gets nothing at
+        # all. The refusal is written back to the fixer channel, naming the flag to flip.
+        flag = ("STAFF_REPLY" if recipient_kind in ("staff", "coach") else "CLIENT_REPLY")
+        why = (f"Resolve tap on ticket {ticket_id} did NOT go through: the notice to the "
+               f"{recipient_kind} would be held because SLACK_CONVO_"
+               f"{getattr(identity, 'name', '?').upper()}_{flag} is off, and marking a "
+               f"ticket resolved that the person was never told about is the lie this "
+               f"button exists to prevent. Arm that flag, or reply to them directly and "
+               f"close it by hand. The ticket is unchanged.")
+        log(f"[slack-convo/outbox] {why}")
+        try:
+            bus.record_outbound(
+                ticket_id=ticket_id, author_type="system", body=why,
+                delivery_status="ready", kind=_a.KIND_ESCALATION,
+                meta={"identity": getattr(identity, "name", ""), "resolve_refused": True})
+        except Exception:  # noqa: BLE001 - the refusal itself already stands
+            pass
         return False
     bus.record_outbound(
         ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
         body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
-        meta={"identity": getattr(identity, "name", ""), "recipient_kind": "client",
+        # Audit 5, finding 3: this hardcoded "client" while the gate above read the ticket's
+        # own identity_kind, so a staff ticket with STAFF_REPLY on and CLIENT_REPLY off
+        # passed the gate and then held the row -- the exact lie the gate was added to close.
+        meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
               "surface": (ticket.get("source") or ""), "resolved_by": approved_by})
     bus.set_ticket(ticket_id, status="resolved", approved_by=approved_by,
                    approved_via="slack_button",
