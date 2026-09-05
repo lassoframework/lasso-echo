@@ -31,8 +31,10 @@ from . import config, gym_media_index as _idx
 from . import gym_media_selector as _sel
 
 # <name-slug><6-hex-fingerprint> shape, matching account_key.py's canonical_account_key
-# output. Used only to detect a STALE fingerprint (see _resolve_stale_fingerprint) --
-# never to derive or mint a key.
+# output. NO LONGER USED FOR RESOLUTION (2026-09-04): matching a stale key by the slug in
+# front of that tail could rewrite a gym's own live key onto a different gym sharing the
+# slug, so account_key_resolve now maps by gym_id instead. Kept only as a shape helper for
+# callers that want to recognise the fingerprinted form; never to derive or mint a key.
 _FINGERPRINT_RE = re.compile(r"^([a-z0-9]+)([0-9a-f]{6})$")
 
 
@@ -45,112 +47,37 @@ def _name_slug_of(key):
     return m.group(1) if m else ""
 
 
-_PLANE_BASES_TTL = 300  # seconds; this list changes at onboarding speed, not request speed
-_plane_bases_cache = {"at": 0.0, "bases": frozenset()}
+def _resolve_stale_fingerprint(gym, *, bases_fn=None, resolve=None):
+    """Resolve a stale account key onto the gym it belongs to, or return `gym` unchanged.
 
+    The matching itself lives in account_key_resolve, which maps by IDENTITY (it computes
+    each gym's Echo-derived key from its gym_id and maps that exact string onto the gym's
+    live portal key) rather than by name-slug resemblance. See that module for why the
+    slug heuristic was removed: it could rewrite a gym's own LIVE key onto a DIFFERENT
+    gym that shared its name-slug whenever the first gym was momentarily missing from the
+    known-key set, and once this ran at the token boundary that governed writes.
 
-def _shared_plane_bases(now_fn=None, get=None):
-    """Every account key the PORTAL considers real, read from the shared plane
-    (echo_intake_tokens.echo_account_key) rather than from worker-local state.
-
-    Both the worker and echo-intake-web can read this; only the worker can read the
-    account registry file. Cached for _PLANE_BASES_TTL so a per-request resolution never
-    turns into a per-request round trip.
-
-    Fails to an EMPTY set, never raises: an unreadable plane must leave the caller in
-    exactly today's behaviour (return the key unchanged), never remap on a guess."""
-    import time
-    now = (now_fn or time.time)()
-    if now - _plane_bases_cache["at"] < _PLANE_BASES_TTL and _plane_bases_cache["bases"]:
-        return set(_plane_bases_cache["bases"])
+    `bases_fn` is accepted and ignored; it survives only so existing callers/tests keep
+    working. One throttled ops alert per stale key still fires, because a gym running on a
+    pre-re-key link is a real thing to fix at the source (re-issue its portal link), not
+    something to paper over forever."""
+    if resolve is None:
+        from . import account_key_resolve as _akr  # noqa: PLC0415
+        resolve = _akr.resolve
     try:
-        if get is None:
-            from .account_key_split_watch import _supabase_get as get  # noqa: PLC0415
-        rows = get("echo_intake_tokens", {"select": "echo_account_key"}) or []
-        bases = {str(r.get("echo_account_key") or "").strip() for r in rows}
-        bases = {b for b in bases if b}
-    except Exception as e:  # noqa: BLE001 - never let a plane read break a media request
-        print(f"[gym-media] shared-plane base read failed: {type(e).__name__}: {e}")
-        return set()
-    if bases:
-        _plane_bases_cache["at"] = now
-        _plane_bases_cache["bases"] = frozenset(bases)
-    return set(bases)
-
-
-def _resolve_stale_fingerprint(gym, *, bases_fn=None):
-    """Resolve a STALE account-key fingerprint onto the currently-registered gym it
-    belongs to, or return `gym` unchanged.
-
-    WHY (live 2026-08-31, CrossFit Reverb): a signed portal connect-link self-decodes
-    its OWN account_key from its HMAC payload -- by design, re-canonicalizing a gym's
-    key (account_key_mint.py) never invalidates an already-issued link, so the link
-    keeps validating under whatever key it was ORIGINALLY minted with ("WHY THIS
-    CANNOT BREAK EXISTING LINKS" in that module). Dean Holcomb used a connect link
-    still carrying 'crossfitreverb6cdf33' to bind his Google Drive folder 12 minutes
-    after a fresh mint moved Reverb onto 'crossfitreverb30b5b2'; Echo wrote his
-    media_source row (and 190 media_asset rows behind it) under the stale key, which
-    nothing else in the system reads (client_sources, the account registry, and the
-    Zernio profile all live under the new key) -- his photos were indexed and
-    invisible.
-
-    If `gym` is not itself a currently REGISTERED gym base, but its name-slug (the
-    part before the trailing 6-hex fingerprint) matches the name-slug of EXACTLY ONE
-    registered base, that registered base is returned instead. Zero or more-than-one
-    matches leave `gym` untouched -- never guess across an ambiguity: two different
-    gyms can legitimately share a name-slug (the fingerprint is what tells them
-    apart), and a brand-new gym that has not registered yet is legitimately absent,
-    not a stale fingerprint. A key with no 6-hex tail (a bare slug like 'pierce', or
-    an ad-hoc key with no fingerprint) never matches the shape and is always returned
-    unchanged. Never writes anything itself -- purely a read-time/write-time key
-    resolution, one throttled ops alert per stale key so the real fix (re-issue the
-    gym's portal link) does not go unnoticed."""
-    if bases_fn is None:
-        def bases_fn():
-            from .calendar_autopublish import client_gym_bases
-            return client_gym_bases()
-    try:
-        bases = set(bases_fn())
-    except Exception:  # noqa: BLE001 - a registry read failure just skips the remap
-        bases = set()
-    # SHARED-PLANE FALLBACK (Dean Holcomb again, 2026-09-04). Everything above is
-    # correct and it still did not work for him, because client_gym_bases() reads
-    # accounts.all_accounts(), which reads the account registry FILE
-    # (config.gym_registry_path(), /data/gym_accounts.json). That file lives on the
-    # WORKER's Railway volume. echo-intake-web -- the service that actually serves
-    # /portal/<token>/media/* to the gym -- has no such file: os.path.exists() is
-    # False there, so client_gym_bases() returned 5 built-in bases with no client gym
-    # among them, no name-slug ever matched, and this resolver handed back the stale
-    # key unchanged on the ONE service where a gym's request actually lands.
-    #
-    # Live proof on 2026-09-04: GET /portal/<6cdf33 token>/media/sources returned
-    # {"sources": []} while the same call under crossfitreverb30b5b2 returned his
-    # "Reverb LASSO Content" folder. Dean saw "no connected folders", and re-connecting
-    # said "already connected" because the hijack rail (find_source_by_folder) looks the
-    # folder up GLOBALLY and does find it. Two contradictory answers, one cause.
-    #
-    # So the base list can never come from worker-local state alone. echo_intake_tokens
-    # is the portal's own key column and BOTH services can read it, so it is the source
-    # of truth for "which keys are real" -- the registry is now an optimisation, not the
-    # only answer.
-    bases |= _shared_plane_bases()
-    if not bases or gym in bases:
+        remapped = resolve(gym)
+    except Exception as e:  # noqa: BLE001 - resolution is a repair, never a gate
+        print(f"[gym-media] key resolution skipped: {type(e).__name__}: {e}")
         return gym
-    slug = _name_slug_of(gym)
-    if not slug:
+    if not remapped or remapped == gym:
         return gym
-    matches = {b for b in bases if _name_slug_of(b) == slug}
-    if len(matches) != 1:
-        return gym
-    remapped = next(iter(matches))
     _idx.dedup_alert(
         f"stale_key_remap:{gym}",
         f"Connect Google Drive: a request carried account key {gym!r}, which is not "
-        f"a currently registered gym but looks like a STALE fingerprint of "
-        f"{remapped!r} (a portal link minted before a re-key). Resolved to "
-        f"{remapped!r} for this request so it is not silently invisible. Re-issue "
-        f"{gym!r}'s portal link so this stops being needed: python -m agent "
-        f"intake-link --account {remapped}")
+        f"a currently registered gym but resolves by gym_id to {remapped!r} (a portal "
+        f"link minted before a re-key). Resolved to {remapped!r} for this request so it "
+        f"is not silently invisible. Re-issue {gym!r}'s portal link so this stops being "
+        f"needed: python -m agent intake-link --account {remapped}")
     return remapped
 
 

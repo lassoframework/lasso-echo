@@ -323,6 +323,22 @@ def _default_writer(plan_row):
     blocked = blocking_data((str(plan_row.get("current") or "")).strip())
     if blocked:
         return False, f"BLOCKED: {blocked}"
+    # WHY WRITING THIS COLUMN IS SAFE AGAIN (2026-09-04). echo_intake_tokens.
+    # echo_account_key is the PORTAL's column, and for a while Echo writing its own
+    # derivation into it was a live divergence: the portal minted slug + rawUUID[:6]
+    # while Echo derived slug + sha256(gym_id)[:6], so a write here could hand one gym a
+    # second identity. Portal PR #578 closed that -- social-onboard.ts deriveAccountKey
+    # is now slug + sha256(gym_id)[:6], the same function as account_key._base_key -- so
+    # the canonical key this writer PATCHes is exactly the key the portal itself would
+    # mint. test_portal_key_authority.py::test_the_portal_now_derives_the_same_key_echo_does
+    # pins that equivalence, so drift on either side fails loudly rather than silently
+    # reopening the split.
+    #
+    # A blanket "never overwrite a non-empty key" guard was tried here and REVERTED: it
+    # destroyed the repair this module exists for. build_plan already treats a
+    # non-collided current key as ISSUED (change=False), so the only rows that reach this
+    # writer are COLLIDED (two gyms sharing one key -- a tenant-isolation hazard) or
+    # MISSING. Refusing those leaves the hazard in place and fixes nothing.
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
