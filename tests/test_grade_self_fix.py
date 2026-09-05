@@ -1195,3 +1195,139 @@ def test_repair_never_lowers_the_grade_across_repeated_passes(monkeypatch):
             booking_cta="Book your intro class this week.")
         totals.append(grade_month(rows, profile="GYM").total)
     assert all(b >= a for a, b in zip(totals, totals[1:])), totals
+
+
+# ---------------------------------------------------------------------------
+# C7 — a gym stuck below A must ASK A NAMED HUMAN, not wait forever
+#
+# The remediation loop is bounded (_MAX_FIX_PASSES = 3 here, 4 in the planner gate)
+# and its pass count lives only in memory for one sweep, so "stuck at B for four
+# nights" was not something the system could know. Worse, the held alert dedups on
+# (score, defect set), so a gym stuck in EXACTLY the same way goes SILENT after the
+# first night -- precisely when it needs a person. These tests pin the counter, the
+# escalation, the naming, and the recovery.
+# ---------------------------------------------------------------------------
+
+def _night(store, alerts, day, gyms=("gritx",)):
+    return grade_sweep.run(gyms=list(gyms), store=store, now=day,
+                           alert_fn=alerts.append)
+
+
+@pytest.fixture()
+def _stuck_on(monkeypatch, _self_fix_on):
+    monkeypatch.setenv("ECHO_GRADE_STUCK_ESCALATION", "true")
+    monkeypatch.setenv("ECHO_GRADE_STUCK_NIGHTS", "3")
+
+
+def test_flag_off_no_streak_is_kept_and_no_stuck_alert_ever_fires(_self_fix_on):
+    from agent import db as _db
+    store = _FakeStore(_forward_rows_with_dups())
+    for day in ("2026-08-29", "2026-08-30", "2026-08-31", "2026-09-01"):
+        alerts = []
+        out = _night(store, alerts, day)
+        assert not any(grade_sweep.STUCK_TAG in a for a in alerts)
+        assert "stuck_escalated" not in out
+    assert _db.kv_get("grade_stuck_streak_gritx", "") == ""
+
+
+def test_a_gym_stuck_for_three_nights_escalates_once_naming_a_human(_stuck_on):
+    store = _FakeStore(_forward_rows_with_dups())
+    seen = []
+    for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+        alerts = []
+        out = _night(store, alerts, day)
+        seen.append([a for a in alerts if grade_sweep.STUCK_TAG in a])
+    assert seen[0] == [] and seen[1] == [], "no escalation before the threshold"
+    assert len(seen[2]) == 1, "the third consecutive night escalates"
+    msg = seen[2][0]
+    assert msg.startswith(grade_sweep.STUCK_TAG), "the tag must lead so it is routable"
+    assert "gritx" in msg
+    assert "<@" in msg, "an escalation addressed to nobody is the defect"
+    assert "3 run(s) in a row" in msg
+    assert "Decide one:" in msg, "it must state the decision being asked for"
+    assert out["stuck_escalated"] == ["gritx"]
+
+
+def test_the_stuck_alert_survives_the_dedup_that_silences_the_held_alert(_stuck_on):
+    # The held alert dedups on (score, defect set). A gym that is stuck is stuck in
+    # exactly the SAME way every night, so that dedup is precisely what hides it.
+    store = _FakeStore(_forward_rows_with_dups())
+    for day in ("2026-08-29", "2026-08-30"):
+        _night(store, [], day)
+    alerts = []
+    _night(store, alerts, "2026-08-31")
+    held = [a for a in alerts if a.startswith("calendar grade: gritx")]
+    stuck = [a for a in alerts if grade_sweep.STUCK_TAG in a]
+    assert held == [], "the held alert is (correctly) still deduped"
+    assert len(stuck) == 1, "the escalation must NOT inherit that silence"
+
+
+def test_escalation_is_once_per_day_even_across_repeated_sweeps(_stuck_on):
+    store = _FakeStore(_forward_rows_with_dups())
+    for day in ("2026-08-29", "2026-08-30", "2026-08-31"):
+        _night(store, [], day)
+    alerts = []
+    for _ in range(3):                      # three sweeps on the SAME day
+        _night(store, alerts, "2026-08-31")
+    assert [a for a in alerts if grade_sweep.STUCK_TAG in a] == []
+
+
+def test_a_second_sweep_on_one_day_never_inflates_the_night_count(_stuck_on):
+    store = _FakeStore(_forward_rows_with_dups())
+    for _ in range(5):
+        _night(store, [], "2026-08-29")     # five sweeps, one calendar day
+    alerts = []
+    _night(store, alerts, "2026-08-30")
+    assert [a for a in alerts if grade_sweep.STUCK_TAG in a] == [], \
+        "five sweeps in one day is ONE night held, not five"
+
+
+def test_reaching_A_clears_the_streak_so_the_count_means_consecutive(
+        _stuck_on, monkeypatch):
+    store = _FakeStore(_forward_rows_with_dups())
+    for day in ("2026-08-29", "2026-08-30"):
+        _night(store, [], day)
+
+    # The book recovers to A on night 3.
+    counter = {"n": 100}
+
+    def fake_default_regen(gym_id, profile, log):
+        def _regen(row, attempt, ctx=""):
+            counter["n"] += 1
+            return _a_caption(counter["n"])
+        return _regen
+
+    monkeypatch.setattr(grade_fix, "_default_caption_regen", fake_default_regen)
+    _night(store, [], "2026-08-31")
+    monkeypatch.undo()
+
+    # Broken again -> the count restarts from one, so night 4 does NOT escalate.
+    store.rows = _forward_rows_with_dups()
+    alerts = []
+    _night(store, alerts, "2026-09-01")
+    assert [a for a in alerts if grade_sweep.STUCK_TAG in a] == []
+
+
+def test_the_threshold_is_configurable(_self_fix_on, monkeypatch):
+    monkeypatch.setenv("ECHO_GRADE_STUCK_ESCALATION", "true")
+    monkeypatch.setenv("ECHO_GRADE_STUCK_NIGHTS", "1")
+    store = _FakeStore(_forward_rows_with_dups())
+    alerts = []
+    _night(store, alerts, "2026-08-29")
+    assert len([a for a in alerts if grade_sweep.STUCK_TAG in a]) == 1
+
+
+def test_stuck_text_names_the_defect_that_will_not_move_and_the_flat_trajectory():
+    class _G:
+        total, letter = 88, "B"
+        defects = [("consistency", "2026-09-09", "gap of 7 days before 2026-09-09")]
+        exempt = {}
+
+    msg = grade_sweep._stuck_alert_text(
+        "gritx", _G(), {"passes": 3, "trajectory": [(88, 4), (88, 4), (88, 4)]},
+        {"nights": 4, "first_total": 88}, approver_id="U06EPUUCL13")
+    assert "88 -> 88 -> 88" in msg, "a flat trajectory is the evidence it is stuck"
+    assert "gap of 7 days before 2026-09-09" in msg
+    assert "<@U06EPUUCL13>" in msg
+    assert "3 pass(es)" in msg
+    assert "nothing was fabricated" in msg

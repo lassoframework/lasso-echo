@@ -1110,6 +1110,32 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def grade_stuck_escalation_enabled() -> bool:
+    """ECHO_GRADE_STUCK_ESCALATION, default OFF. The named-human escalation for a
+    calendar book that the remediation loop cannot fix (C7).
+
+    The loop is bounded (grade_sweep._MAX_FIX_PASSES = 3, the planner gate 4) and its
+    pass count lives only in memory for one sweep, so "stuck at B for four nights" is
+    not a thing the system can currently know. Worse, the held alert is deduped on
+    (score, defect set), so a gym stuck in EXACTLY the same way goes SILENT after the
+    first night -- precisely when it needs a person.
+
+    ON: consecutive held nights are counted in kv, and at grade_stuck_nights() the
+    sweep raises a GRADE-STUCK alert that names the approver and states the decision
+    being asked for. OFF (default): not one extra kv read, not one extra alert.
+    """
+    return _truthy(os.environ.get("ECHO_GRADE_STUCK_ESCALATION", "false"))
+
+
+def grade_stuck_nights() -> int:
+    """Consecutive nights a forward book may sit below A before C7 escalates to a
+    named human (ECHO_GRADE_STUCK_NIGHTS, default 3, floor 1)."""
+    try:
+        return max(1, int(os.environ.get("ECHO_GRADE_STUCK_NIGHTS", "3") or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
 def media_swap_free_enabled() -> bool:
     """ECHO_MEDIA_SWAP_FREE, default OFF. The client-initiated FREE photo swap (B6).
 
