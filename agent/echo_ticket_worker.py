@@ -42,6 +42,8 @@ from .slack_convo import identities as _ids
 from .slack_convo import identity_gate as _ig
 from .slack_convo import outreach as _out
 
+_EPOCH_ISO = "1970-01-01T00:00:00+00:00"
+
 # D47 (Blake, 2026-09-04): generalized from Echo-only to any (product, identity) pair
 # routed through the identity map -- portal tickets (product='portal', the generic
 # Website tab form's default) route to Scout, not Ranger's ad-engine-specific
@@ -106,7 +108,8 @@ def _verified_ticket_dict(ticket):
     return d
 
 
-def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print):
+def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print,
+                         who=None, outreach=None):
     """LIVE BUG FIX (2026-09-04, found running the real Echo regression test): the
     support_tickets.status CHECK constraint has never allowed the literal value
     'escalated' -- the rest of this codebase's own convention (tests/test_slack_convo.py)
@@ -129,7 +132,71 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
              f"{(ticket.get('raw_text') or '')[:300]}",
         delivery_status="ready", kind=_a.KIND_ESCALATION,
         meta={"identity": identity_name, "surface": "portal_ticket_bridge"})
+    acknowledge_submitter(bus, ticket, identity_name=identity_name, who=who,
+                          outreach=outreach, log=log)
     log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
+
+
+def acknowledge_submitter(bus, ticket, *, identity_name="echo", who=None, outreach=None,
+                          log=print):
+    """D48 (Blake, 2026-09-05): an escalation must never be silence for the person who
+    wrote in.
+
+    Found live on three real portal tickets: each one reached #fixer correctly and each one
+    left its submitter with nothing at all -- no "we got it", and no word when it was dealt
+    with. The Slack-initiated path has always sent this acknowledgement (adapter.py emits
+    ACK/TEMPLATE_ESCALATED inline); the portal bridge never did, because it escalates and
+    returns before any client-facing row is written.
+
+    Best channel available, in order:
+      1. a Slack group DM (Blake + the client + this bot) when we resolved the person to a
+         real client -- the same outreach.initiate the answered path uses, so the DM thread
+         becomes the ticket thread and everything after this lands there too;
+      2. the portal support thread they submitted from, which outbox.py now delivers to.
+
+    Written exactly once per ticket: an ack already on the row (including the one
+    outreach.initiate writes for itself) means this has been done. Returns True when an
+    acknowledgement exists after this call."""
+    tid = ticket.get("id")
+    if _has_outbound_kind(bus, tid, _a.KIND_ACK, log=log):
+        return True
+    if outreach and who is not None and who.kind == _ig.CLIENT and who.slack_user_id:
+        result = _out.initiate(
+            _verified_ticket_dict(ticket), who, outreach["ident"],
+            open_group_dm=outreach["open_group_dm"],
+            post_first_message=outreach["post_first_message"],
+            record_outbound=bus.record_outbound, stamp_ticket=outreach.get("stamp_ticket"),
+            message_text=_a.TEMPLATE_ESCALATED, mark_message=outreach.get("mark_message"),
+            claim_message=outreach.get("claim_message"), log=log)
+        if result.opened:
+            return True
+        log(f"[ticket-worker/{identity_name}] escalation ack: group DM refused "
+            f"ticket={tid} reason={result.reason}; falling back to the portal thread")
+    bus.record_outbound(
+        ticket_id=tid, author_type=identity_name, body=_a.TEMPLATE_ESCALATED,
+        delivery_status="ready", kind=_a.KIND_ACK,
+        meta={"identity": identity_name, "surface": "portal_ticket_bridge",
+              "recipient_kind": "client"})
+    return True
+
+
+def _has_outbound_kind(bus, tid, kind, *, log=print):
+    """Fails CLOSED (True, "already sent") on a bus fault -- the same convention
+    adapter._outbound_kind_ever uses: a read failure must never license a second send."""
+    try:
+        return bus.count_outbound_kind_since(tid, kind, _EPOCH_ISO) > 0
+    except AttributeError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
+        return True
+    try:
+        return any(m.get("direction") == "outbound"
+                   and (m.get("attachments") or {}).get("kind") == kind
+                   for m in bus.messages(tid, limit=200))
+    except Exception as e:  # noqa: BLE001
+        log(f"[ticket-worker] ack lookup failed ticket={tid}: {type(e).__name__}")
+        return True
 
 
 def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
@@ -196,13 +263,18 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
     # outbox.py entirely.
     bus.set_ticket(tid, bot_identity=identity_name)
 
+    outreach = {"ident": ident, "open_group_dm": open_group_dm,
+                "post_first_message": post_first_message, "stamp_ticket": stamp_ticket,
+                "mark_message": mark_message, "claim_message": claim_message}
+
     who = resolve_client_identity(ticket, slack_lookup_email=slack_lookup_email,
                                   slack_user_info=slack_user_info,
                                   portal_lookup=portal_lookup,
                                   operator_ids=operator_ids, log=log)
     if who.kind != _ig.CLIENT:
         _escalate_unresolved(bus, ticket, reason=f"identity_{who.kind}",
-                            identity_name=identity_name, log=log)
+                            identity_name=identity_name, log=log, who=who,
+                            outreach=outreach)
         return
 
     # Persisted so fixed_pass (a later poll, possibly after a redeploy) can
@@ -238,7 +310,8 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                     f"reason={result.reason}")
         else:
             _escalate_unresolved(bus, ticket, reason="question_not_groundable",
-                                identity_name=identity_name, log=log)
+                                identity_name=identity_name, log=log, who=who,
+                                outreach=outreach)
         return
 
     if classification == _cls.CODE_FIX:
@@ -266,7 +339,8 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
         return
 
     _escalate_unresolved(bus, ticket, identity_name=identity_name,
-                        reason=f"classification_{classification or 'none'}", log=log)
+                        reason=f"classification_{classification or 'none'}", log=log,
+                        who=who, outreach=outreach)
 
 
 def _fix_summary_text(verification):
@@ -301,7 +375,7 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
                            reason="portal ticket, previously resolved")
         if not who.slack_user_id:
             _escalate_unresolved(bus, ticket, reason="fixed_but_no_slack_user_id",
-                                identity_name=identity_name, log=log)
+                                identity_name=identity_name, log=log, who=who)
             continue
         result = _out.initiate(
             _verified_ticket_dict(ticket), who, ident,
