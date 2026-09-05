@@ -140,6 +140,37 @@ def _containment_match(target, slug_norm, slug_raw="", name_raw=""):
     return False
 
 
+#: The content_calendar `account` value for the Google Business lane.
+_GBP_ACCOUNT = "googlebusiness"
+
+
+def _column_missing(resp, column):
+    """True iff `resp` is PostgREST refusing a write because `column` does not exist.
+
+    Deliberately narrow: it must match the undefined-column error and NOTHING else, so a
+    permissions failure, a constraint violation or an outage is never silently downgraded
+    into "the column is missing" and retried into a quiet data loss. PostgREST surfaces
+    Postgres SQLSTATE 42703 with a message of the form:
+        column "late_account_id" of relation "echo_social_connections" does not exist
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    text = ""
+    if isinstance(body, dict):
+        text = " ".join(str(body.get(k) or "") for k in ("message", "code", "details", "hint"))
+    if not text:
+        try:
+            text = str(resp.text or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+    low = text.lower()
+    if "42703" in low:
+        return True
+    return f'"{column}"' in low and "does not exist" in low and "column" in low
+
+
 class PortalStoreError(Exception):
     """A Supabase call failed. Detail is scrubbed of any secret before raising."""
 
@@ -157,6 +188,11 @@ class SupabaseCalendarStore:
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+
+    #: Set once when a write proves echo_social_connections.late_account_id is not
+    #: deployed on this environment, so the sweep stops re-attempting it every gym.
+    #: Class level (not instance) because the store is constructed per call.
+    _late_account_id_column_absent = False
 
     def _client(self):
         if self._http is not None:
@@ -1070,7 +1106,7 @@ class SupabaseCalendarStore:
         return h or None
 
     def rewrite_social_connection(self, gym_slug, platform, state, handle=None,
-                                  mark_ever_connected=False):
+                                  mark_ever_connected=False, late_account_id=None):
         """RE-VERIFY SWEEP writer: set echo_social_connections.state (+ handle) for a
         gym's platform to the TRUE Zernio state, overwriting the poisoned not_connected
         the 6h cron wrote, and bump last_verified_at. When a platform is genuinely
@@ -1103,19 +1139,171 @@ class SupabaseCalendarStore:
         had_first = bool(crows and (crows[0] or {}).get("first_connected_at"))
         body = {"gym_id": gym_uuid, "platform": platform, "state": state,
                 "handle": handle, "last_verified_at": now_iso}
+        # AUD-005: stamp the Zernio account id on the SOURCE OF TRUTH row. This is the one
+        # thing the legacy gym_social_accounts table still carried that this table did not,
+        # and the only reason anything had to read two disagreeing pictures of the same
+        # fact. Omitted (not written as null) when we do not have one, so a transient read
+        # that could not resolve the id never erases a good one already stamped.
+        if late_account_id and not type(self)._late_account_id_column_absent:
+            body["late_account_id"] = str(late_account_id)
         # Stamp first_connected_at only for a genuinely-connected platform that has none yet;
         # never overwrite an existing original connect time (omitted -> merge-duplicates
         # leaves it untouched).
         if mark_ever_connected and not had_first:
             body["first_connected_at"] = now_iso
-        r = self._client().post(
-            self._rest("echo_social_connections"),
-            params={"on_conflict": "gym_id,platform"},
-            headers=self._headers({
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=representation",
-            }),
-            json=body,
+        def _write(payload):
+            return self._client().post(
+                self._rest("echo_social_connections"),
+                params={"on_conflict": "gym_id,platform"},
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                }),
+                json=payload,
+                timeout=30,
+            )
+
+        r = _write(body)
+        # DEGRADE, DO NOT BREAK, when late_account_id is not deployed yet. This writer runs
+        # on the 6h reverify sweep, which is the ONLY thing keeping the connection cache
+        # true. Migration social_metrics_daily_provenance_20260905 adds the column, but code
+        # and migrations do not land in the same instant, and this repo has been burned
+        # before by writing a column that did not exist (the ever_connected regression, and
+        # the echo_gym_settings.zernio_profile_id phantom). If the column is missing, the
+        # unstamped write still has to land: a stale connection cache is a client ticket per
+        # gym. Retried ONCE, without the new field, and remembered for this process so the
+        # fleet does not pay a doubled request per gym per sweep.
+        if (r.status_code >= 400 and "late_account_id" in body
+                and _column_missing(r, "late_account_id")):
+            type(self)._late_account_id_column_absent = True
+            body.pop("late_account_id", None)
+            r = _write(body)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
+
+    def social_connection_rows(self, state="connected"):
+        """READ-ONLY: every echo_social_connections row, optionally filtered to one state.
+
+        This is the AUD-005 source of truth for who is connected on what. Returns raw rows
+        [{gym_id, platform, state, handle, late_account_id, last_verified_at}]. Fleet-wide
+        (not gym-scoped) on purpose: the daily metrics pull is a fleet sweep, and paging it
+        per gym would turn one read into one per gym.
+
+        PAGED EXPLICITLY: PostgREST caps a response at 1000 rows and does so SILENTLY, so a
+        single unpaged read would quietly truncate the fleet the day it grew past the cap.
+        """
+        out = []
+        offset, page = 0, 1000
+        while True:
+            params = {"select": "gym_id,platform,state,handle,late_account_id,"
+                                "last_verified_at",
+                      "limit": str(page), "offset": str(offset),
+                      "order": "gym_id.asc"}
+            if state:
+                params["state"] = f"eq.{state}"
+            r = self._client().get(self._rest("echo_social_connections"), params=params,
+                                   headers=self._headers(), timeout=30)
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            rows = r.json() or []
+            out.extend(rows)
+            if len(rows) < page:
+                return out
+            offset += page
+
+    def upsert_social_metric_days(self, rows):
+        """Write daily metric rows into gym_social_metrics_daily. Returns the count written.
+
+        UPSERT on the LIVE unique constraint (late_account_id, metric_date), so a re-pull
+        of the same day UPDATES rather than appending a second point. Without that the
+        series silently doubles and every growth number computed off it is wrong.
+
+        That target is not a guess: it was probed against production on 2026-09-05.
+        (late_account_id, metric_date) resolved; (gym_id, late_account_id, metric_date)
+        came back 42P10 "there is no unique or exclusion constraint matching the ON
+        CONFLICT specification", which would have been a 400 on every write.
+
+        NULL MEANS NULL, enforced here and not merely documented: a metric key whose value
+        is None is REMOVED from the payload rather than sent. PostgREST merge-duplicates
+        would otherwise overwrite a real measurement with an explicit null on a later
+        partial pull, and no caller can turn a missing metric into a 0 through this method
+        because a 0 has to be an actual int to survive the filter below.
+        """
+        if not rows:
+            return 0
+        _METRICS = ("followers", "reach", "impressions", "engagement", "profile_views")
+        payload = []
+        for row in rows:
+            body = {k: row[k] for k in ("gym_id", "late_account_id", "metric_date",
+                                        "platform", "source", "raw", "pulled_at")
+                    if row.get(k) is not None}
+            for k in _METRICS:
+                v = row.get(k)
+                if v is None:
+                    continue  # not measured. NEVER written as 0.
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    continue
+                body[k] = int(v)
+            if body.get("gym_id") and body.get("metric_date"):
+                payload.append(body)
+        if not payload:
+            return 0
+        written = 0
+        for i in range(0, len(payload), 500):
+            chunk = payload[i:i + 500]
+            r = self._client().post(
+                self._rest("gym_social_metrics_daily"),
+                params={"on_conflict": "late_account_id,metric_date"},
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                }),
+                json=chunk, timeout=60,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            written += len(chunk)
+        return written
+
+    def failed_gbp_rows(self):
+        """READ-ONLY: every content_calendar row stuck in status='failed' on the
+        googlebusiness lane (AUD-003). Fleet wide; the retry sweep is a fleet sweep.
+
+        Selects only columns that exist. A select naming a column the table does not
+        have returns a 400, and the shared reader in this repo swallows a failure into
+        an empty list, so a typo here would read as "no failed rows" forever. That is
+        exactly how this defect stayed invisible.
+        """
+        params = {"status": "eq.failed", "account": f"eq.{_GBP_ACCOUNT}",
+                  "select": "id,gym_id,account,post_date,status,reject_reason,"
+                            "late_post_id,updated_at",
+                  "limit": "1000", "order": "post_date.asc"}
+        r = self._client().get(self._rest(_TABLE), params=params,
+                               headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
+    def requeue_failed_row(self, row_id):
+        """Move ONE failed googlebusiness row back to 'approved' so the ordinary
+        gbp_worker picks it up. Returns the updated row, or None if nothing matched.
+
+        THE GUARD IS IN THE FILTER, not in the caller. The PATCH matches on
+        status='failed' AND account='googlebusiness' AND late_post_id is null as well as
+        the id, so even a mistaken call cannot move a published row, a row on another
+        lane, or a row that already carries a post id. If the row changed underneath us
+        between the read and this write, the filter simply matches nothing and the
+        method reports that honestly instead of forcing the transition.
+        """
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "status": "eq.failed",
+                    "account": f"eq.{_GBP_ACCOUNT}", "late_post_id": "is.null"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "approved", "reject_reason": None},
             timeout=30,
         )
         if r.status_code >= 400:

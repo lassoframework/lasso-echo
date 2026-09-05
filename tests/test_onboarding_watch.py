@@ -83,7 +83,7 @@ def test_a_gym_missing_from_the_registry_is_caught():
     connection_watch iterates the registry, so this gym is invisible to it."""
     deps = _deps(roster=[("g1", "reverb")], intake={"g1": "reverb"}, bases=[],
                  sources={"reverb": ["a source"]}, profiles={"reverb": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"reverb": "1"})
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"reverb": "1"})
     seen = []
     out = ow.run(deps=deps, alert=seen.append, kv=_KV())
     assert out == {"reverb": [ow.REASON_NOT_REGISTERED]}
@@ -98,7 +98,7 @@ def test_a_key_mismatch_is_caught_while_it_is_still_stranding_the_answers():
     deps = _deps(roster=[("g1", "reverb30b5b2")], intake={"g1": "reverb6cdf33"},
                  bases=["reverb30b5b2"], sources={},
                  profiles={"reverb30b5b2": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"reverb30b5b2": "1"})
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"reverb30b5b2": "1"})
     out = ow.run(deps=deps, alert=lambda m: None, kv=_KV())
     assert out == {"reverb30b5b2": [ow.REASON_KEY_MISMATCH, ow.REASON_NO_SOURCES]}
 
@@ -112,7 +112,7 @@ def test_a_repaired_key_mismatch_is_silent():
     deps = _deps(roster=[("g1", "reverb30b5b2")], intake={"g1": "reverb6cdf33"},
                  bases=["reverb30b5b2"], sources={"reverb30b5b2": ["s"]},
                  profiles={"reverb30b5b2": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"reverb30b5b2": "1"})
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"reverb30b5b2": "1"})
     seen = []
     assert ow.run(deps=deps, alert=seen.append, kv=_KV()) == {}
     assert seen == []
@@ -190,7 +190,7 @@ def test_no_sources_still_wins_over_no_voice():
     alert, and no_voice is not piled on top as derived noise."""
     deps = _deps(roster=[("g1", "g")], intake={"g1": "g"}, bases=["g"],
                  sources={}, profiles={"g": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"g": "1"},
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"g": "1"},
                  voice={"g": False})
     seen = []
     out = ow.run(deps=deps, alert=seen.append, kv=_KV())
@@ -279,7 +279,7 @@ def test_the_live_voice_reader_uses_the_durable_path(monkeypatch, tmp_path):
 def test_one_alert_per_gym_per_issue_set_per_day():
     deps = _deps(roster=[("g1", "g")], intake={"g1": "g"}, bases=[],
                  sources={"g": ["s"]}, profiles={"g": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"g": "1"})
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"g": "1"})
     kv, seen = _KV(), []
     ow.run(deps=deps, alert=seen.append, kv=kv, today="2026-08-30")
     ow.run(deps=deps, alert=seen.append, kv=kv, today="2026-08-30")
@@ -333,7 +333,7 @@ def test_lasso_and_staff_accounts_are_never_flagged():
 def _unregistered(names=None):
     return _deps(roster=[("g1", "newbox")], intake={"g1": "newbox"}, bases=[],
                  sources={"newbox": ["s"]}, profiles={"newbox": "p1"},
-                 platforms={"p1": {"instagram"}}, pages={"newbox": "1"},
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"newbox": "1"},
                  names=({"g1": "New Box Fitness"} if names is None else names))
 
 
