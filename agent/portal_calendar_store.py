@@ -1359,6 +1359,29 @@ class SupabaseCalendarStore:
         # wired into exactly TWO of them. This door is the one every staging lane walks
         # through, so the rule lives here too. See _media_stage_belt.
         payload = _media_stage_belt(self, account_key, payload)
+        # SLOT IDEMPOTENCY BELT (AUD-001, 2026-09-05; default ON because it PREVENTS
+        # damage, same posture as the plan-horizon belt. AGENT_SLOT_DEDUPE=false is the
+        # escape hatch).
+        #
+        # The docstring above says "apply is delete-then-insert, so a plain insert is
+        # correct and idempotent". Production disagreed: on 2026-09-05 the fleet carried
+        # 155 genuine duplicate slots across 14 gyms, and the forward book was still
+        # growing hour over hour. Two distinct causes, both closed here because this is
+        # the single door every staging lane walks through:
+        #
+        #   1. 94 of them were written TWICE IN THE SAME SECOND by one run, so the batch
+        #      itself already held the row twice before the POST. No caller-side fix
+        #      catches every lane; a batch that contains one slot twice is never correct.
+        #   2. 61 spanned different runs. delete_month deliberately PRESERVES human-owned
+        #      rows (an approved row is a client decision), so a re-plan legitimately
+        #      skips deleting that slot and then inserts a fresh row on top of it.
+        #
+        # The slot key is (account, post_date, time_slot, format), NOT (account,
+        # post_date). That distinction is the whole point: a gym posting 2x a day plus a
+        # story has three legitimate rows on one date. Keying on the date alone called
+        # 441 rows duplicates when only 155 were, and superseding on it would have
+        # destroyed live client content.
+        payload = _dedupe_slots(self, account_key, payload)
         if not payload:
             return []
         all_keys = set()
@@ -1605,6 +1628,129 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
         return len([x for x in rows if str(x.get("gym_id")) == str(account_key)])
+
+def _dedupe_slot_key(row):
+    """The identity of a calendar row for duplicate purposes, or None when it cannot be
+    established. A row is a duplicate ONLY of a row in the same slot carrying the same
+    content.
+
+    THIS KEY WAS WRONG TWICE AND BOTH MISTAKES DESTROYED CLIENT CONTENT (2026-09-05).
+
+    First it was (gym, account, post_date), which treats a gym posting 2x a day plus a
+    story as duplication. That would have removed roughly 286 legitimate rows.
+
+    Then it was (account, post_date, time_slot, format), which STILL cannot represent two
+    posts inside one time_slot. ENG runs posts_per_day=2 and both posts can land in the
+    same time_slot bucket, separated only by slot_index. A dedupe on that key deleted 140
+    rows across five gyms, and when the survivors were compared against the deletions,
+    ZERO were actually duplicates: 131 differed by image, 123 by caption, 75 by slot_index.
+    All 140 were restored.
+
+    So the identity now carries slot_index AND the content itself. Two rows are the same
+    row only if they occupy the same slot and say the same thing with the same picture.
+    Anything else is a distinct post that a gym owner is entitled to see. slot_index is
+    null on most rows, and a null slot_index is a real value here (the single post of the
+    day) rather than a missing one, so it participates in the key instead of voiding it."""
+    account = str(row.get("account") or "").strip().lower()
+    date = str(row.get("post_date") or "")[:10]
+    slot = str(row.get("time_slot") or "").strip().lower()
+    fmt = str(row.get("format") or "").strip().lower()
+    if not (account and date and slot and fmt):
+        # RULING (AUD-104): a row missing time_slot or format has no identifiable slot, so
+        # it is never deduped. That under-blocks, and under-blocking is the only safe
+        # direction for a filter that can drop a client's content.
+        return None
+    idx = row.get("slot_index")
+    caption = " ".join(str(row.get("caption") or "").split()).lower()
+    image = str(row.get("image_url") or "").strip()
+    return (account, date, slot, fmt, idx, caption, image)
+
+
+def _dedupe_slots(store, account_key, payload, *, existing=None):
+    """Drop rows whose slot is already taken, in the batch or already live in the DB.
+
+    Two passes, because production showed two distinct duplicate sources (see the caller):
+    an in-batch pass that keeps the FIRST row for a slot, then a live pass that drops any
+    slot this gym already holds in a live status. Never deletes anything and never
+    rewrites a row: a duplicate is simply not inserted.
+
+    Fails OPEN on an unreadable live read (returns the in-batch-deduped payload). A
+    staging lane must not stop because a dedupe lookup failed; the worst case is the
+    behaviour that shipped before this belt existed."""
+    if not payload or not config.slot_dedupe_enabled():
+        return payload
+    seen, deduped, in_batch = set(), [], 0
+    for row in payload:
+        if row.get("event_id"):
+            # DATED EVENT ROWS ARE NEVER DROPPED (AUD-102). plan_horizon exempts event_id
+            # for the same reason: an event arc is a deliberate, dated override of the
+            # evergreen plan, so "keep the first row for this slot" is exactly backwards
+            # for it. This is not hypothetical -- the first version of this belt discarded
+            # The Bolton Club's "Bring A Friend Week is on / Day is here / Last day" rows
+            # in favour of the generic rows that happened to be created a day earlier.
+            #
+            # Exempting them can leave a transient duplicate on a slot that already holds
+            # a generic row. That is the correct trade: a stray extra row is recoverable,
+            # a silently missing event post is not, and resolving generic-versus-event on
+            # one slot belongs to the event lane, not to a staging filter that is only
+            # allowed to drop rows and never to delete them.
+            deduped.append(row)
+            continue
+        k = _dedupe_slot_key(row)
+        if k is None:          # unidentifiable slot: never guess, always stage
+            deduped.append(row)
+            continue
+        if k in seen:
+            in_batch += 1
+            continue
+        seen.add(k)
+        deduped.append(row)
+    dropped_live = 0
+    if existing is None:
+        existing = _live_slots_for(store, account_key, {k[1] for k in seen})
+    if existing:
+        kept = []
+        for row in deduped:
+            if row.get("event_id"):
+                kept.append(row)      # AUD-102: never blocked by an existing generic row
+                continue
+            k = _dedupe_slot_key(row)
+            if k is not None and k in existing:
+                dropped_live += 1
+                continue
+            kept.append(row)
+        deduped = kept
+    if in_batch or dropped_live:
+        print(f"[slot-dedupe] {account_key}: dropped {in_batch} in-batch duplicate(s) "
+              f"and {dropped_live} slot(s) already live; staged {len(deduped)}")
+    return deduped
+
+
+def _live_slots_for(store, account_key, dates):
+    """Slot keys this gym already holds in a LIVE status on those dates, or None when the
+    read fails. 'deleted', 'denied' and 'killed' rows free their slot by design."""
+    if not dates:
+        return set()
+    try:
+        rows = store.rows_in_range(account_key, min(dates), max(dates))
+    except Exception as e:  # noqa: BLE001 - never block staging on a lookup
+        print(f"[slot-dedupe] live slot read failed for {account_key}: "
+              f"{type(e).__name__}: {e}")
+        return None
+    # EXACTLY the statuses rows_in_range can return (its own positive allowlist at the
+    # top of this file). "draft" was dead code here -- that reader never returns it -- and
+    # "coach_review" WAS being returned while missing from this set, so a coach-review slot
+    # read as free and a re-plan stacked on top of it. 105 forward draft rows and every
+    # coach_review row were invisible to this pass.
+    live = {"pending", "approved", "publishing", "published", "coach_review"}
+    out = set()
+    for r in (rows or []):
+        if str(r.get("status") or "").strip().lower() in live:
+            k = _dedupe_slot_key(r)
+            if k is not None:
+                out.add(k)
+    return out
+
 
 def _stage_belts(account_key, payload):
     """Apply the stage-time empty-caption + verbatim-dedup belts to an
