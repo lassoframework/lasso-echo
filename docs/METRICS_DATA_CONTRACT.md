@@ -36,9 +36,14 @@ One row per gym per platform account per calendar day.
 | `platform` | text | NEW, no | `instagram` \| `facebook` \| `googlebusiness`. Denormalised from the account so a reader never has to join to know the lane. NULL only on rows written before the migration. |
 | `source` | text | NEW, no | `zernio` \| `apify`. Which lane produced this row. NULL only on rows written before the migration. |
 
-Uniqueness: one row per (`gym_id`, `late_account_id`, `metric_date`). A re-pull of the same
-day UPDATES that row; it never appends a second one. A reader may assume at most one row per
-that triple and does not need to de-duplicate.
+Uniqueness: the live unique constraint is (`late_account_id`, `metric_date`), probed
+against production on 2026-09-05. A re-pull of the same day UPDATES that row; it never
+appends a second one. A reader may assume at most one row per that pair and does not need
+to de-duplicate. `late_account_id` belongs to exactly one gym, so the pair already
+determines `gym_id`.
+
+Writers must use `on_conflict=late_account_id,metric_date`. Targeting
+(`gym_id`, `late_account_id`, `metric_date`) returns 42P10 and fails every write.
 
 ### 1.2 `post_metrics` — per post snapshots
 
@@ -234,3 +239,44 @@ can explain why.
 
 Strings built from this data carry no em dashes, no en dashes and no hyphens, and never use
 the word "vendor" or "vendors".
+
+---
+
+## 8. Social connection status (P-10)
+
+Echo's social-status payload, the one the portal status strip reads:
+
+```json
+{
+  "platforms": {
+    "instagram":      {"connected": true,  "handle": "eng", "expired": false,
+                       "expires_at": "2026-09-27T13:14:03.205000+00:00"},
+    "facebook":       {"connected": true,  "handle": "eng", "expired": false,
+                       "expires_at": "2026-09-27T23:08:06.327000+00:00"},
+    "googlebusiness": {"connected": true,  "handle": "Top Fuel CrossFit",
+                       "expired": false, "expires_at": null}
+  }
+}
+```
+
+`expires_at` is an ISO 8601 UTC string or `null`. The key is ALWAYS present on every
+platform, so a reader can read it unconditionally.
+
+`null` means WE DO NOT KNOW. It never means soon, and it is never 0. Render it as "not
+reported", never as a reassurance and never as a warning.
+
+**Google Business is always `null`, and that is deliberate.** Zernio reports
+`tokenExpiresAt` for every platform, but it does not mean the same thing on each:
+
+- instagram and facebook carry a real long lived grant. Live 2026-09-05: 2026-09-27,
+  about 60 days from the connect, matching `metadata.expires_in` of 5183999 seconds.
+  This is the value worth warning an owner about, and it is what the status strip should
+  count down.
+- googlebusiness carries the rolling GOOGLE ACCESS token, good for about an hour and
+  refreshed behind the call. Live 2026-09-05 at 13:44 UTC the 13 Google accounts carried
+  expiries from 13:07 to 14:36, a third of them already in the past, every one of them
+  healthy, valid and postable. Rendering that would show every Google connected gym
+  "expires within the hour", all day, every day.
+
+So the reconnect signal for Google Business is `expired`, never a countdown. That flag
+derives from `needsReconnect` / `tokenValid` / `status`, never from a timestamp.

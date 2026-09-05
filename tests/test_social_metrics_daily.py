@@ -120,7 +120,7 @@ def test_map_status_shape_is_unchanged_by_the_new_mapper():
         {"_id": "ig1", "platform": "instagram",
          "metadata": {"profileData": {"username": "eng"}}}]})
     assert out["platforms"]["instagram"] == {
-        "connected": True, "handle": "eng", "expired": False}
+        "connected": True, "handle": "eng", "expired": False, "expires_at": None}
 
 
 # ---- AUD-007 / D1: the series is built -------------------------------------
@@ -268,3 +268,137 @@ def test_health_for_a_gym_with_only_null_followers_is_none_not_flat():
     rows = [{"gym_id": GYM, "platform": "instagram",
              "metric_date": "2026-09-0%d" % i, "followers": None} for i in range(1, 6)]
     assert smd.health_for(rows) == {}
+
+
+# ---- the on_conflict target must match the LIVE constraint ------------------
+
+def test_the_upsert_targets_the_constraint_that_actually_exists():
+    """Probed live 2026-09-05: (late_account_id, metric_date) resolves, while
+    (gym_id, late_account_id, metric_date) returns 42P10 "there is no unique or exclusion
+    constraint matching the ON CONFLICT specification" and would 400 on EVERY write. A
+    draft of this pipeline targeted the second one. This test is the rail that keeps the
+    writer pointed at the constraint the database really has."""
+    import agent.portal_calendar_store as pcs
+
+    seen = {}
+
+    class _Http:
+        def post(self, url, params=None, headers=None, json=None, timeout=None):
+            seen["target"] = (params or {}).get("on_conflict")
+            seen["table"] = url.rstrip("/").split("/rest/v1/")[-1]
+
+            class _R:
+                status_code = 201
+                text = ""
+
+                @staticmethod
+                def json():
+                    return []
+            return _R()
+
+    store = pcs.SupabaseCalendarStore(url="https://x.supabase.co", service_key="k",
+                                      http=_Http())
+    store.upsert_social_metric_days(
+        [{"gym_id": GYM, "late_account_id": ENG_IG, "metric_date": "2026-09-05",
+          "followers": 996, "platform": "instagram", "source": "zernio"}])
+    assert seen["table"] == "gym_social_metrics_daily"
+    assert seen["target"] == "late_account_id,metric_date"
+
+
+def test_the_writer_drops_a_none_metric_instead_of_sending_a_zero():
+    """NULL MEANS NULL at the wire. merge-duplicates would otherwise overwrite a real
+    measurement with an explicit null on a later partial pull."""
+    import agent.portal_calendar_store as pcs
+
+    sent = {}
+
+    class _Http:
+        def post(self, url, params=None, headers=None, json=None, timeout=None):
+            sent["body"] = json
+
+            class _R:
+                status_code = 201
+                text = ""
+
+                @staticmethod
+                def json():
+                    return []
+            return _R()
+
+    store = pcs.SupabaseCalendarStore(url="https://x.supabase.co", service_key="k",
+                                      http=_Http())
+    store.upsert_social_metric_days(
+        [{"gym_id": GYM, "late_account_id": ENG_IG, "metric_date": "2026-09-05",
+          "followers": 996, "reach": None, "impressions": None, "engagement": 0}])
+    row = sent["body"][0]
+    assert row["followers"] == 996
+    assert "reach" not in row and "impressions" not in row   # absent, NOT 0
+    assert row["engagement"] == 0                            # a genuine 0 survives
+
+
+# ---- P-10: the token expiry the portal status strip needs -------------------
+
+# Real shape from api.zernio.com, 2026-09-05. IG/FB carry a genuine ~60 day grant
+# expiry; Google Business carries the rolling one hour access token.
+_IG_LIVE = {"_id": "ig1", "platform": "instagram", "isActive": True,
+            "tokenExpiresAt": "2026-09-27T13:14:03.205Z",
+            "metadata": {"connectedAt": "2026-07-29T13:14:04.205Z",
+                         "expires_in": 5183999,
+                         "profileData": {"username": "eng"}}}
+_GBP_LIVE = {"_id": "gbp1", "platform": "googlebusiness", "isActive": True,
+             "tokenExpiresAt": "2026-09-05T13:07:55.410Z",
+             "metadata": {"locationName": "Top Fuel CrossFit"}}
+
+
+def test_the_status_payload_now_carries_a_real_grant_expiry():
+    """P-10: the portal could not build 'expires in 3 days' because no expiry existed
+    anywhere in the chain. It does now, as a real timestamp."""
+    out = z.map_status({"accounts": [_IG_LIVE]})
+    assert out["platforms"]["instagram"]["expires_at"] == "2026-09-27T13:14:03.205000+00:00"
+
+
+def test_google_business_expiry_is_always_null_on_purpose():
+    """C15 as a product decision. Google's tokenExpiresAt is a rolling one hour access
+    token that Zernio refreshes behind the call. Live 2026-09-05 at 13:44 UTC a third of
+    the 13 Google accounts carried an expiry ALREADY IN THE PAST while healthy and
+    postable. Surfacing it would put 'expires within the hour' on every Google connected
+    gym's screen, all day, forever: the 13 ticket false alarm made permanent."""
+    out = z.map_status({"accounts": [_GBP_LIVE]})
+    assert out["platforms"]["googlebusiness"]["connected"] is True
+    assert out["platforms"]["googlebusiness"]["expires_at"] is None
+
+
+def test_an_unknown_expiry_is_null_never_a_guess_and_never_zero():
+    out = z.map_status({"accounts": [
+        {"_id": "ig1", "platform": "instagram",
+         "metadata": {"profileData": {"username": "eng"}}}]})
+    assert out["platforms"]["instagram"]["expires_at"] is None
+
+
+def test_a_missing_platform_reports_a_null_expiry_not_an_absent_key():
+    """The portal reads the key unconditionally; it must always be present."""
+    out = z.map_status({"accounts": []})
+    for plat in z.STATUS_PLATFORMS:
+        assert out["platforms"][plat]["expires_at"] is None
+
+
+def test_the_expiry_can_be_derived_from_connected_at_plus_expires_in():
+    acct = {"_id": "ig1", "platform": "instagram",
+            "metadata": {"connectedAt": "2026-07-29T13:14:04.205Z",
+                         "expires_in": 5183999,
+                         "profileData": {"username": "eng"}}}
+    assert z.expiry_of(acct) == "2026-09-27T13:14:03.205000+00:00"
+
+
+def test_expiry_of_is_defensive_on_garbage():
+    for bad in (None, {}, "x", 3, {"platform": "instagram", "tokenExpiresAt": "nonsense"},
+                {"platform": "instagram", "metadata": {"expires_in": True}}):
+        assert z.expiry_of(bad) is None
+
+
+def test_an_expired_account_still_reports_when_it_lapsed():
+    """An amber row is the one a gym owner most needs a date on."""
+    acct = dict(_IG_LIVE, isActive=False)
+    out = z.map_status({"accounts": [acct]})
+    assert out["platforms"]["instagram"]["expired"] is True
+    assert out["platforms"]["instagram"]["expires_at"] == "2026-09-27T13:14:03.205000+00:00"

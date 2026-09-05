@@ -931,14 +931,69 @@ def _handle_of(acct):
     return str(h) if h else None
 
 
+def expiry_of(acct):
+    """The account's GRANT expiry as an ISO 8601 UTC string, or None (P-10).
+
+    None means WE DO NOT KNOW. It never means "soon" and never means 0. The portal
+    renders a null as "not reported" rather than a false reassurance, so returning None
+    honestly is always better than returning a date we had to invent.
+
+    THE GOOGLE BUSINESS RULE, which is C15 turned into a product decision. Zernio reports
+    tokenExpiresAt for every platform, but it does not mean the same thing on each:
+
+      instagram / facebook  a real long lived grant. Live 2026-09-05: 2026-09-27, about
+                            60 days from the connect, matching metadata.expires_in of
+                            5183999 seconds. THIS is the value a gym owner needs days of
+                            warning about, and it is what P-10 asked for.
+
+      googlebusiness        the rolling GOOGLE ACCESS token, good for about an hour and
+                            refreshed behind the call. Live 2026-09-05 at 13:44 UTC, the
+                            13 Google accounts carried expiries from 13:07 to 14:36, a
+                            third of them ALREADY IN THE PAST, every one of them healthy,
+                            valid and postable. Surfacing that as an expiry would show
+                            every Google connected gym "expires in under an hour", all
+                            day, every day. That is the 13 ticket false alarm C15 was,
+                            rebuilt as a permanent fixture on the client's own screen.
+
+    So Google Business returns None: we genuinely do not know when its underlying grant
+    ends, and saying so is the honest answer.
+    """
+    if not isinstance(acct, dict):
+        return None
+    if str(acct.get("platform") or "").lower() == "googlebusiness":
+        return None
+    for key in ("tokenExpiresAt", "expires_at", "expiresAt"):
+        parsed = _parse_iso(acct.get(key))
+        if parsed is not None:
+            return parsed.astimezone(timezone.utc).isoformat()
+    md = acct.get("metadata") or {}
+    for key in ("tokenExpiresAt", "expires_at", "expiresAt"):
+        parsed = _parse_iso(md.get(key))
+        if parsed is not None:
+            return parsed.astimezone(timezone.utc).isoformat()
+    # Derived: connectedAt + expires_in, the same pair account_state already trusts.
+    exp = md.get("expires_in")
+    connected_at = _parse_iso(acct.get("connectedAt") or md.get("connectedAt"))
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool) and connected_at:
+        return (connected_at + timedelta(seconds=float(exp))).astimezone(
+            timezone.utc).isoformat()
+    return None
+
+
 def map_status(accounts_json, now=None):
     """
     Fold Zernio's flat `accounts[]` into the portal's per-platform shape:
-      {platforms: {instagram: {connected, handle, expired}, facebook: {...}, googlebusiness: {...}}}
+      {platforms: {instagram: {connected, handle, expired, expires_at}, facebook: {...},
+                   googlebusiness: {...}}}
+
+    `expires_at` (P-10) is an ISO 8601 UTC string or None, so the portal can warn a gym
+    owner days before a grant lapses instead of finding out when a post fails. It is
+    ALWAYS None for googlebusiness, on purpose: see expiry_of.
     Missing platform -> not connected, no handle (never fabricated). When more than one account of a
     platform exists, a connected one wins over an expired one.
     """
-    out = {p: {"connected": False, "handle": None, "expired": False} for p in STATUS_PLATFORMS}
+    out = {p: {"connected": False, "handle": None, "expired": False, "expires_at": None}
+           for p in STATUS_PLATFORMS}
     for acct in (accounts_json or {}).get("accounts") or []:
         if not isinstance(acct, dict):
             continue
@@ -951,9 +1006,11 @@ def map_status(accounts_json, now=None):
         if cur["connected"]:
             continue
         if state == "connected":
-            out[plat] = {"connected": True, "handle": _handle_of(acct), "expired": False}
+            out[plat] = {"connected": True, "handle": _handle_of(acct), "expired": False,
+                         "expires_at": expiry_of(acct)}
         elif state == "expired" and not cur["expired"]:
-            out[plat] = {"connected": False, "handle": _handle_of(acct), "expired": True}
+            out[plat] = {"connected": False, "handle": _handle_of(acct), "expired": True,
+                         "expires_at": expiry_of(acct)}
     return {"platforms": out}
 
 
@@ -1178,3 +1235,135 @@ def health_read(points, window_days=28, min_points=2, min_span_days=14, threshol
     if pct <= -threshold:
         return "declining", basis
     return "flat", basis
+
+
+# ---- C14: unwrap a failure into something a human can act on ----------------
+
+#: HTTP statuses worth trying again. 408/429 and 5xx are transient by definition.
+#: Everything else (400 bad payload, 401/403 dead grant, 404 wrong id, 422 rejected
+#: media) will fail identically forever, and retrying it just burns quota and buries
+#: the real reason under N identical alerts.
+_RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
+
+#: A connection problem the GYM must fix. No amount of retrying helps, and the right
+#: response is a reconnect link to the owner, not an ops ticket.
+_RECONNECT_STATUS = (401, 403)
+
+
+def describe_error(exc, *, endpoint=None, account_id=None):
+    """Unwrap an exception raised by a Zernio call into a structured, actionable dict.
+
+    THE DEFECT THIS CLOSES (C14): the GBP photo drop on crossfitnine7f7dadc recorded a
+    bare "ZernioError" as its whole reject_reason. That names the exception CLASS and
+    discards every fact that distinguishes a rejected image size from an unlinked
+    location from an expired grant, so the cause was unrecoverable after the fact and
+    nobody could tell whether trying again would ever help.
+
+    Returns {error, status, endpoint, account_id, retryable, needs_reconnect, detail}.
+    `detail` is SCRUBBED: a provider error can quote the credential it rejected, and
+    this string is written to a database row and sent to an alert channel.
+
+    Never raises: this runs inside an except block, and a failure to describe a failure
+    must not replace the original one.
+    """
+    try:
+        from .ops_alerts import scrub
+    except Exception:  # noqa: BLE001
+        def scrub(x):
+            return x
+
+    status = getattr(exc, "status", None)
+    if not isinstance(status, int):
+        status = None
+    raw_detail = getattr(exc, "detail", None)
+    if raw_detail in (None, ""):
+        raw_detail = str(exc)
+    try:
+        detail = scrub(f"{type(exc).__name__}: {raw_detail}")[:900]
+    except Exception:  # noqa: BLE001
+        detail = type(exc).__name__
+
+    if status is None:
+        # A transport failure (timeout, DNS, reset) never reached Zernio and is the
+        # most retryable thing there is. A programming error is not, but it also does
+        # not carry a status, so lean on the exception class rather than guessing.
+        name = type(exc).__name__.lower()
+        transport = any(w in name for w in
+                        ("timeout", "connection", "socket", "ssl", "chunked", "protocol"))
+        retryable, reconnect = transport, False
+    else:
+        retryable = status in _RETRYABLE_STATUS
+        reconnect = status in _RECONNECT_STATUS
+
+    return {
+        "error": type(exc).__name__,
+        "status": status,
+        "endpoint": endpoint,
+        "account_id": account_id,
+        "retryable": bool(retryable),
+        "needs_reconnect": bool(reconnect),
+        "detail": detail,
+    }
+
+
+def error_summary(desc):
+    """A one line, client-safe rendering of describe_error output for a reject_reason.
+
+    Copy rules: no em dashes, no en dashes, no hyphens, and never the word that means
+    an outside supplier. Reads e.g.
+        "zernio 422 on /v1/gmb-media (account 6a97...): image rejected [permanent]"
+    """
+    if not isinstance(desc, dict):
+        return ""
+    bits = ["zernio"]
+    if desc.get("status") is not None:
+        bits.append(str(desc["status"]))
+    if desc.get("endpoint"):
+        bits.append(f"on {desc['endpoint']}")
+    if desc.get("account_id"):
+        bits.append(f"(account {desc['account_id']})")
+    head = " ".join(bits)
+    if desc.get("needs_reconnect"):
+        tag = "[reconnect needed]"
+    elif desc.get("retryable"):
+        tag = "[retryable]"
+    else:
+        tag = "[permanent]"
+    return f"{head}: {desc.get('detail') or 'no detail'} {tag}"[:400]
+
+
+# ---- AUD-112: one spelling for the Google lane ------------------------------
+
+#: Every spelling of the Google Business platform seen across Echo, the portal and the
+#: two connection tables, folded to the ONE Zernio uses ('googlebusiness', one word,
+#: lowercase, verified live against api.zernio.com 2026-08-18).
+_PLATFORM_ALIASES = {
+    "google_business": "googlebusiness",
+    "google-business": "googlebusiness",
+    "googlebusiness": "googlebusiness",
+    "gbp": "googlebusiness",
+    "google_business_profile": "googlebusiness",
+}
+
+
+def normalize_platform(platform):
+    """Fold a platform string to Echo's canonical spelling. '' for a missing value.
+
+    WHY THIS EXISTS (AUD-112, measured live 2026-09-05). echo_social_connections spells
+    the Google lane 'googlebusiness'; gym_social_accounts spells it 'google_business'.
+    Joining the two on the raw string therefore drops EVERY Google Business connection
+    silently, and a silent drop reads exactly like a missing connection.
+
+    The size of that illusion, from a live query: the symmetric difference between the
+    two tables' connected rows is 30. After normalising the platform string it is 6. So
+    24 of the 30 rows that looked like a source of truth disagreement were one table
+    spelling a word with an underscore.
+
+    The remaining 6 are the real disagreement, and every one of them resolves the same
+    way: 4 are live connections gym_social_accounts is MISSING (CrossFit Chateau on all
+    three platforms, MFLH on facebook), and the other 2 are Demo Fitness rows that carry
+    LASSO's own account ids (see AUD-113), so they are duplicates rather than a second
+    real connection.
+    """
+    p = str(platform or "").strip().lower()
+    return _PLATFORM_ALIASES.get(p, p)

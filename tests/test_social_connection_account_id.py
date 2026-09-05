@@ -192,3 +192,35 @@ def test_reverify_stamps_nothing_for_a_platform_that_is_not_connected(monkeypatc
     by = {c["platform"]: c for c in store.calls}
     assert by["facebook"]["state"] == "not_connected"
     assert by["facebook"]["late_account_id"] is None
+
+
+# ---- AUD-112: the platform string split -------------------------------------
+
+from agent import zernio as _z   # noqa: E402
+
+
+def test_the_google_lane_folds_to_one_spelling():
+    for raw in ("google_business", "google-business", "googlebusiness", "GBP",
+                "Google_Business"):
+        assert _z.normalize_platform(raw) == "googlebusiness"
+
+
+def test_normalising_does_not_touch_the_other_lanes():
+    assert _z.normalize_platform("instagram") == "instagram"
+    assert _z.normalize_platform("facebook") == "facebook"
+    assert _z.normalize_platform("openaiads") == "openaiads"
+
+
+def test_a_missing_platform_normalises_to_empty_not_to_a_guess():
+    for raw in (None, "", "   "):
+        assert _z.normalize_platform(raw) == ""
+
+
+def test_the_string_split_is_what_made_the_two_tables_look_further_apart():
+    """The AUD-112 measurement, as a unit test over the live shape: joining on the raw
+    string drops every Google row; normalising first keeps them."""
+    esc = {("g1", "googlebusiness"), ("g1", "instagram")}
+    gsa = {("g1", "google_business"), ("g1", "instagram")}
+    assert len(esc ^ gsa) == 2                       # looks like a disagreement
+    norm = lambda s: {(g, _z.normalize_platform(p)) for g, p in s}   # noqa: E731
+    assert norm(esc) ^ norm(gsa) == set()            # and is not one

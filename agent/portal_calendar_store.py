@@ -140,6 +140,10 @@ def _containment_match(target, slug_norm, slug_raw="", name_raw=""):
     return False
 
 
+#: The content_calendar `account` value for the Google Business lane.
+_GBP_ACCOUNT = "googlebusiness"
+
+
 def _column_missing(resp, column):
     """True iff `resp` is PostgREST refusing a write because `column` does not exist.
 
@@ -1212,10 +1216,14 @@ class SupabaseCalendarStore:
     def upsert_social_metric_days(self, rows):
         """Write daily metric rows into gym_social_metrics_daily. Returns the count written.
 
-        UPSERT on the (gym_id, coalesce(late_account_id,''), metric_date) unique index from
-        migration social_metrics_daily_provenance_20260905, so a re-pull of the same day
-        UPDATES rather than appending a second point. Without that the series silently
-        doubles and every growth number computed off it is wrong.
+        UPSERT on the LIVE unique constraint (late_account_id, metric_date), so a re-pull
+        of the same day UPDATES rather than appending a second point. Without that the
+        series silently doubles and every growth number computed off it is wrong.
+
+        That target is not a guess: it was probed against production on 2026-09-05.
+        (late_account_id, metric_date) resolved; (gym_id, late_account_id, metric_date)
+        came back 42P10 "there is no unique or exclusion constraint matching the ON
+        CONFLICT specification", which would have been a 400 on every write.
 
         NULL MEANS NULL, enforced here and not merely documented: a metric key whose value
         is None is REMOVED from the payload rather than sent. PostgREST merge-duplicates
@@ -1247,7 +1255,7 @@ class SupabaseCalendarStore:
             chunk = payload[i:i + 500]
             r = self._client().post(
                 self._rest("gym_social_metrics_daily"),
-                params={"on_conflict": "gym_id,late_account_id,metric_date"},
+                params={"on_conflict": "late_account_id,metric_date"},
                 headers=self._headers({
                     "Content-Type": "application/json",
                     "Prefer": "resolution=merge-duplicates,return=minimal",
@@ -1258,6 +1266,50 @@ class SupabaseCalendarStore:
                 raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
             written += len(chunk)
         return written
+
+    def failed_gbp_rows(self):
+        """READ-ONLY: every content_calendar row stuck in status='failed' on the
+        googlebusiness lane (AUD-003). Fleet wide; the retry sweep is a fleet sweep.
+
+        Selects only columns that exist. A select naming a column the table does not
+        have returns a 400, and the shared reader in this repo swallows a failure into
+        an empty list, so a typo here would read as "no failed rows" forever. That is
+        exactly how this defect stayed invisible.
+        """
+        params = {"status": "eq.failed", "account": f"eq.{_GBP_ACCOUNT}",
+                  "select": "id,gym_id,account,post_date,status,reject_reason,"
+                            "late_post_id,updated_at",
+                  "limit": "1000", "order": "post_date.asc"}
+        r = self._client().get(self._rest(_TABLE), params=params,
+                               headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        return r.json() or []
+
+    def requeue_failed_row(self, row_id):
+        """Move ONE failed googlebusiness row back to 'approved' so the ordinary
+        gbp_worker picks it up. Returns the updated row, or None if nothing matched.
+
+        THE GUARD IS IN THE FILTER, not in the caller. The PATCH matches on
+        status='failed' AND account='googlebusiness' AND late_post_id is null as well as
+        the id, so even a mistaken call cannot move a published row, a row on another
+        lane, or a row that already carries a post id. If the row changed underneath us
+        between the read and this write, the filter simply matches nothing and the
+        method reports that honestly instead of forcing the transition.
+        """
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params={"id": f"eq.{row_id}", "status": "eq.failed",
+                    "account": f"eq.{_GBP_ACCOUNT}", "late_post_id": "is.null"},
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"status": "approved", "reject_reason": None},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        rows = r.json() or []
+        return rows[0] if rows else None
 
     def publishing_rows(self):
         """Every row currently stuck in status='publishing' with no published_at,
