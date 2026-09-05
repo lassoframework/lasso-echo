@@ -914,6 +914,230 @@ documented gap every other non-Echo code_fix path in this system already carries
 new. `AGENT_PORTAL_ECHO_TICKETS_ENABLED` stays unarmed; this is a routing fix, not an
 arming decision.
 
+## D49. Frame 1 audit MAJOR: outreach_request release button silently no-op'd (2026-09-05)
+
+Fresh independent audit (against merged main, pre-arming loop) found: the "Release" tap
+on a `KIND_OUTREACH_REQUEST` hold card (D45's safety net) routed to `outbox.release_held`,
+which refuses that kind outright (its own accepted-kinds check) and no-ops silently --
+Blake would believe he approved an outreach that never sent. Fixed in
+`lassoframework/lasso-echo#43` (merged `7fffde134f9f190d7f37a58af4171fe7004e6e84`):
+`listener_wiring.py`'s `_on_release` now dispatches on the held row's own
+`attachments.kind`, routing an outreach_request to `outreach.release_approved_outreach`
+instead. Currently dormant in production (nothing calls `request_approval()` yet), but a
+real, live gap in the dispatch wiring itself. New test drives the tap through
+`ConvoWiring`'s REAL registered action handler, not a direct call to the underlying
+function -- confirmed it fails with the fix reverted.
+
+## D50. Frame 1 audit MAJOR: the escalation card's Resolved button had no handler (2026-09-05)
+
+Same audit pass found a second, independent gap: `escalation_blocks()` (outbox.py, D48/#41)
+has rendered a "Resolved, tell them" button on every escalation card since #41 merged, and
+its own docstring already claimed the tap was "operator-gated like the release tap" -- but
+no `@app.action(OB.RESOLVE_ACTION_ID)` handler was EVER registered anywhere
+(`listener_wiring.py`, `echo_ticket_wiring.py`, `listener.py` all checked). Every tap
+silently failed at the Slack layer (no `ack()`, `resolve_and_notify()` never invoked): the
+ticket's submitter never heard anything, no matter how many times the button was tapped.
+Reachable today (escalation is an `INTERNAL_KINDS` row, always `ready`, live for any
+enabled identity -- Echo today). Fixed in `lassoframework/lasso-echo#44` (merged
+`da7de86395755321afa311a12425ba1a528f89a3`): registered
+`@app.action(_outbox.RESOLVE_ACTION_ID)` in `ConvoWiring.register()`, mirroring the release
+handler's operator-gate pattern exactly. New test again drives the tap through the REAL
+registered handler; confirmed it fails with the fix reverted.
+
+## Audit-loop closure (2026-09-05)
+
+Three independent fresh-agent audits run against this system before any Phase 4 arming,
+each with zero shared context with the others or with whoever built the code under review:
+
+1. Against `7fffde134f9f190d7f37a58af4171fe7004e6e84`: found D49 (MAJOR), zero CRITICAL.
+2. Against `da7de86395755321afa311a12425ba1a528f89a3` (after D49+D50 both merged): zero
+   CRITICAL/MAJOR. One MINOR (informational, matches D47's own already-documented ruling:
+   a portal-routed Scout ticket's rows would sit unread if `AGENT_PORTAL_ECHO_TICKETS_ENABLED`
+   were ever armed with no Scout outbox loop running in this service -- not reachable today,
+   flag defaults false, does not touch Echo's live path).
+3. A second independent pass against the SAME `da7de86...` SHA (nothing changed in
+   between): zero CRITICAL/MAJOR, re-confirmed both D49/D50 fixes correct by direct
+   re-trace (not by trusting the first pass's summary), re-confirmed the MINOR unreachable,
+   and separately flagged `agent/slack_convo/routing.py` as dead code (never imported by any
+   live call site) -- inert, not a live misroute risk.
+
+Two consecutive clean passes (zero CRITICAL/MAJOR) against the same final SHA
+`da7de86395755321afa311a12425ba1a528f89a3` closes the loop. Phase 4 arming begins against
+this exact commit.
+
+## D51. Phase 4 arming, identity 1/4: Echo (2026-09-05)
+
+Echo was already partially armed (`SLACK_CONVO_ECHO_ENABLED=true`,
+`SLACK_CONVO_ECHO_STAFF_REPLY=true`, `SLACK_CONVO_ECHO_CLIENT_REPLY=false`) on the
+Railway `echo` service, confirmed running `da7de86...` before any test ran
+(`railway status --json`, three active deployment instances all on that SHA).
+
+Both required legs run for REAL against the live Supabase bus and live Slack API via
+`railway ssh --service echo` (executing inside the actual deployed process, so the real
+`AGENT_SLACK_BOT_TOKEN` is used without ever being read into the orchestrating session),
+using `listener_wiring.live_deps("echo")` + `adapter.handle_event()` -- the exact
+production code path a real inbound Slack event drives. The "sender" of each event is a
+crafted payload, not a literal second human logged into Slack (no access to a second
+Slack session existed) -- named explicitly here per the run brief's own honesty
+requirement.
+
+- Test identity re-resolved FRESH via `users.lookupByEmail` with Echo's own bot token
+  (not a cached id): `blake+zztest@lassoframework.com` -> `U0BV9D5A17W` ("Lasso Test").
+  A real 1:1 IM channel was opened with Echo's bot token (`conversations.open`) ->
+  `D0BVBFTU9J8`.
+- **Happy-path leg**: a crafted `message` event from `U0BV9D5A17W` in that real IM channel
+  ("my facebook posts are not going out"). Result: ticket `299ed8fa-43d1-4336-926c-9005f80e739d`,
+  `identity_kind=client`, `client_id` correctly resolved to ZZ Test Gym
+  (`ca397eec-519a-4524-b666-d048199c76b2`), `bot_identity=echo`. The classifier did not
+  reach a QUESTION/CODE_FIX/ACTION_REQUEST decision (no LLM wired into this manual run,
+  matching `live_deps`'s own `classify_llm=None`) and correctly escalated rather than
+  guessing -- a legitimate "does not know, tells a human" outcome per the run brief's own
+  rule that a correctly-reasoned escalation counts as clean. `outbox.run_once` (real
+  `chat.postMessage` calls) posted the escalation + hold-notice card to #fixer (2 posted);
+  the client-facing `TEMPLATE_ESCALATED` row correctly stayed `held` -- CLIENT_REPLY was
+  still `false` at test time, and it was NOT sent, proving the trust ladder holds before
+  arming.
+- **Escalation-path leg**: a crafted event from a syntactically-valid but nonexistent
+  Slack user id (`U0000000000`) in a fresh synthetic channel. `identity_gate.resolve`'s
+  live `users.info` call genuinely failed (real Slack API 404), correctly resolving
+  UNKNOWN -- reason `unknown_identity`. Ticket `37143e16-eeca-404b-ba0c-4d6a3bd78ceb`
+  created; escalation + hold-notice posted to #fixer for real; the unknown-user template
+  correctly stayed `held`, never sent to the fake channel.
+- Verified directly against `support_messages` (both tickets): the inbound row's
+  `created_at` strictly precedes every outbound row's on both tickets (row-first held);
+  `attachments->>'identity'` is `echo` on every row, both tickets (no cross-agent
+  posting); no `KIND_ANSWER`/fix was ever claimed on either ticket, so no
+  verification_before/after gate applied -- nothing here fabricated a "verified" claim.
+  Both test tickets set `status='resolved'` afterward as cleanup.
+
+Clean on both legs -> armed `SLACK_CONVO_ECHO_CLIENT_REPLY=true` on the Railway `echo`
+service. Echo is now fully armed (ENABLED + STAFF_REPLY + CLIENT_REPLY, all true).
+Moving to Scout next.
+
+## D52. Phase 4 arming, identity 2/4: Scout (2026-09-05)
+
+Flipped `SLACK_CONVO_SCOUT_ENABLED=true` and `SLACK_CONVO_SCOUT_STAFF_REPLY=true` on the
+same Railway `echo` service (confirmed via `listener_wiring.start_additional_identities()`
+-- every identity's Bolt app runs inside this one process, not a separate service; Scout's
+real token env vars were already present in this service's env before this session). The
+env-var write triggered a Railway redeploy; confirmed post-redeploy via
+`railway ssh --service echo` reading the live process's own `os.environ` (not railway's
+config cache) and via `railway logs` showing `[slack-convo/scout] registered (enabled=True)`
++ `socket mode started` -- Scout's Bolt app is now a genuine live Socket Mode connection,
+not just a flag flip.
+
+Both legs run for real the same way as D51 (own worktree teardown notwithstanding),
+`live_deps("scout")` + `adapter.handle_event()`, real Slack API calls via Scout's own bot
+token, real Supabase writes:
+
+- Fresh `users.lookupByEmail` with SCOUT's own token: same address resolves to the same
+  `U0BV9D5A17W` (expected -- it is the same Slack workspace user; re-resolved per-identity
+  as instructed rather than reusing D51's cached id). Real IM channel opened with Scout's
+  token: `D0C0N7VE6SC`.
+- **Happy-path leg**: ticket `c68a3ac1-bd4e-4460-ab22-fb34725c9cb3`. Classifier again did
+  not reach a decision (no LLM in this manual run) and correctly escalated -- clean per the
+  same "does not know, tells a human" rule. Escalation + hold-notice posted to #fixer for
+  real; client template correctly held (CLIENT_REPLY still `false` at test time).
+- **Escalation-path leg**: nonexistent user id `U0000000000` in a fresh synthetic channel
+  -> genuinely failed `users.info` -> UNKNOWN -> ticket `209bdb07-927e-4189-bb75-e0bbd5ba3c69`,
+  escalation + hold-notice posted for real, template held.
+- Verified in `support_messages`: row-first holds on both tickets; `attachments->>'identity'`
+  is `scout` on every row, both tickets (zero cross-agent posting); no fix/answer claimed,
+  so no verification gate applies. Both test tickets set `status='resolved'` afterward.
+
+Clean on both legs -> armed `SLACK_CONVO_SCOUT_CLIENT_REPLY=true`. Scout fully armed.
+Moving to Ranger next.
+
+## D53. Phase 4 arming, identity 3/4: Ranger (2026-09-05)
+
+Ground-truth note: `identities.py`'s own module docstring says "Ranger has no Slack bot
+identity of its own today; it is the ad-engine feature plus the fixer-lane cron in the
+portal." That is stale against this Railway service's actual env -- `RANGER_SLACK_BOT_TOKEN`
+/ `RANGER_SLACK_APP_TOKEN` / `RANGER_SLACK_BOT_USER_ID` were already present before this
+session, and `SLACK_CONVO_RANGER_ENABLED` already existed as an explicit `false`. Flagging
+the stale docstring here rather than silently proceeding past it; the arming itself follows
+Blake's own explicit ordering (Echo, Scout, Ranger, Wrangler) from this run's brief. This is
+the Slack Conversational Adapter identity only -- entirely separate from Ranger's ad-engine
+autonomous execution rail, which this run never touches (per this run's own hard line: no
+safe-lane auto-merge changes for Ranger's ad-engine).
+
+Flipped `SLACK_CONVO_RANGER_ENABLED=true` + `SLACK_CONVO_RANGER_STAFF_REPLY=true` on the
+`echo` service; confirmed live via `railway logs` (`[slack-convo/ranger] registered` +
+`socket mode started`) and via `railway ssh` reading the running process's own env.
+
+- Fresh `users.lookupByEmail` with Ranger's own token -> `U0BV9D5A17W` (same workspace
+  user, re-resolved per-identity as instructed). Real IM channel opened with Ranger's
+  token: `D0BV5UJKFE2`.
+- **Happy-path leg**: ticket `ec3d1780-7e82-4ed5-a50b-5f360db3cfd5`. Same "classifier did
+  not decide, correctly escalated" outcome. Escalation + hold-notice posted to #fixer for
+  real; client template held (CLIENT_REPLY still `false` at test time).
+- **Escalation-path leg**: nonexistent user id, fresh synthetic channel -> UNKNOWN ->
+  ticket `8503b53a-912c-4dec-a1f1-cec400c6ca2a`, escalation + hold-notice posted for real,
+  template held.
+- Verified in `support_messages`: row-first holds on both tickets; `attachments->>'identity'`
+  is `ranger` on every row, both tickets (zero cross-agent posting); no fix/answer claimed.
+  Both test tickets set `status='resolved'` afterward.
+
+Clean on both legs -> armed `SLACK_CONVO_RANGER_CLIENT_REPLY=true`. Ranger fully armed.
+Moving to Wrangler next.
+
+## D54. Phase 4 arming, identity 4/4: Wrangler (2026-09-05)
+
+Flipped `SLACK_CONVO_WRANGLER_ENABLED=true` + `SLACK_CONVO_WRANGLER_STAFF_REPLY=true` on
+the `echo` service; confirmed live via `railway logs` (`[slack-convo/wrangler] registered`
++ `socket mode started`) and via `railway ssh` reading the running process's own env. At
+this point all four target identities (Echo, Scout, Ranger, Wrangler) have live Socket
+Mode connections in this one process; Lainey correctly still shows
+`tokens present but SLACK_CONVO_LAINEY_ENABLED is off; not started`.
+
+**New finding, not previously known**: Wrangler's bot token is missing OAuth scopes
+`channels:write` / `groups:write` / `mpim:write` / `im:write` -- `conversations.open`
+genuinely failed (`missing_scope`) when this run tried to open a fresh test DM the same
+way it did for Echo/Scout/Ranger. Provided scopes are `chat:write`, `channels:join`,
+`channels:history`/`read`, `groups:history`/`read`, `im:history`, `mpim:history`,
+`users:read`(`.email`), `app_mentions:read`. Practical effect: Wrangler's bot can post
+into any channel it can join (`channels:join` + `chat:write` covers the whole
+conversational-adapter reply path used here, and covers a REAL client-initiated DM too --
+Slack already owns that channel once the client opens it, no `conversations.open` call
+required on the bot's side) but can never itself PROACTIVELY open a new DM or group DM.
+The only place that matters in this codebase is `outreach.py`'s `open_group_dm` (D45's
+ticket-initiated outreach, gated separately by `AGENT_PORTAL_ECHO_TICKETS_ENABLED`,
+currently off and not called for Wrangler by any live wiring) -- so this does not block
+today's arming, but Wrangler cannot use that path until these scopes are added to its
+Slack app. Reported here rather than worked around silently.
+
+Both legs re-run using the **mention/channel-thread surface** instead of IM (the IM
+surface would have needed the missing `conversations.open` scope purely for this run's
+own test setup, not for anything CLIENT_REPLY actually gates -- see above):
+
+- Fresh `users.lookupByEmail` with Wrangler's own token -> `U0BV9D5A17W`. Real channel
+  used: Wrangler's own configured fixer channel (`WRANGLER_FIXER_CHANNEL_ID` = the shared
+  `#fixer`, `C0BUUL1G90E`) via a crafted `app_mention` event (needs no `conversations.open`
+  at all).
+- **Happy-path leg**: ticket `71c6c3e2-f409-4df6-8cd8-4c2ab71f8039`. Same "classifier did
+  not decide, correctly escalated" outcome; escalation + hold-notice posted to #fixer for
+  real; client template held (CLIENT_REPLY still `false` at test time).
+- **Escalation-path leg**: nonexistent user id mentioning the bot in a fresh synthetic
+  channel -> UNKNOWN -> ticket `eee5aa4c-8cbf-4d36-93f3-f8f19daa1b84`. Only an escalation
+  posted (no client template at all) -- this is RT-m6's documented behavior ("an unknown
+  user @mentioning the bot in a channel is escalated internally only"), correctly not a
+  gap.
+- Verified in `support_messages`: row-first holds on both tickets; `attachments->>'identity'`
+  is `wrangler` on every row, both tickets (zero cross-agent posting); no fix/answer
+  claimed. Both test tickets set `status='resolved'` afterward.
+
+Clean on both legs -> armed `SLACK_CONVO_WRANGLER_CLIENT_REPLY=true`. Wrangler fully
+armed.
+
+## Phase 4 arming complete (2026-09-05)
+
+All four target identities fully armed (`ENABLED` + `STAFF_REPLY` + `CLIENT_REPLY`, all
+`true`): Echo, Scout, Ranger, Wrangler. Lainey untouched, confirmed still off
+(`SLACK_CONVO_LAINEY_ENABLED` unset, no live socket, per Blake's explicit no-exceptions
+ruling). Every arm followed a clean staff/client two-leg test cycle against the live bus
+and live Slack API in THIS run, verified directly against `support_messages` rather than
+inferred from code alone.
+
 ## D48: an escalated portal ticket must never be silence for the person who wrote in
 
 Found live 2026-09-05. Three real portal tickets (`cb7b385a` / `063bc73d` / `af01f3ea`,
