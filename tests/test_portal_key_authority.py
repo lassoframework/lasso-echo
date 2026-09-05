@@ -121,50 +121,39 @@ def test_intake_door_falls_back_to_derivation_when_portal_is_silent(monkeypatch)
     assert got == REVERB_ECHO_WOULD_DERIVE
 
 
-def test_the_reconciler_never_overwrites_the_portals_column(monkeypatch):
-    """Audit #12 + NEW-B. account_key_reconcile PATCHes echo_intake_tokens.echo_account_key
-    -- the portal's own column -- with ECHO's derivation. blocking_data does not stop it,
-    because a BRAND NEW gym owns no data, which is precisely the case that splits.
+def test_the_reconciler_writes_only_the_key_the_portal_itself_would_mint(monkeypatch):
+    """Audit #12 / NEW-B, resolved by CONVERGENCE rather than by a guard.
 
-    The guard is identity-based on purpose. A first version recomputed the portal's old
-    formula from gyms.name and refused only on a match, which missed every RENAMED gym: on
-    real production rows it recognised 4 of 19 keys, and Zanshin's live
-    zanshinfitness630e22 (minted under an older name) would have been overwritten."""
+    account_key_reconcile PATCHes echo_intake_tokens.echo_account_key -- the portal's own
+    column. While the two sides derived differently that was a live divergence. Portal PR
+    #578 made deriveAccountKey slug + sha256(gym_id)[:6], the same function as
+    account_key._base_key, so the canonical key the writer PATCHes IS the portal's key.
+
+    A blanket "never overwrite a non-empty key" guard was tried and reverted: build_plan
+    already treats a non-collided key as ISSUED (change=False), so the only rows reaching
+    the writer are COLLIDED or MISSING -- and refusing those leaves the tenant-isolation
+    hazard (two gyms on one key) unrepaired, which is the opposite of the goal."""
+    from agent import account_key_reconcile as akrec
+    from agent.account_key import canonical_account_key
+    canonical = canonical_account_key(REVERB_ID, REVERB_NAME)
+    assert canonical == REVERB_ECHO_WOULD_DERIVE
+    # ... and that is exactly what the portal's own deriveAccountKey now produces.
+    import hashlib
+    portal_now = "crossfitreverb" + hashlib.sha256(REVERB_ID.encode("utf-8")).hexdigest()[:6]
+    assert canonical == portal_now, (
+        "the reconciler may only ever write a key the portal itself would mint")
+
+
+def test_a_gym_that_already_owns_data_is_still_never_repointed(monkeypatch):
+    """The guard that does matter is unchanged: moving the pointer without moving the data
+    strands every source, calendar row and media folder under the old key."""
     from agent import account_key_reconcile as akrec
     monkeypatch.setattr(akrec.config, "account_key_reconcile_enabled", lambda: True)
-    monkeypatch.setattr(akrec, "blocking_data", lambda key: "")
-    for current in (REVERB_PORTAL, "zanshinfitness630e22", "topfuel", "eng"):
-        ok, detail = akrec._default_writer(
-            {"gym_id": REVERB_ID, "name": REVERB_NAME, "current": current,
-             "canonical": REVERB_ECHO_WOULD_DERIVE})
-        assert ok is False, f"{current} was overwritten"
-        assert "portal" in detail.lower(), detail
-
-
-def test_a_renamed_gym_is_still_protected(monkeypatch):
-    """NEW-B's exact scenario: the gym's live key was minted under an OLD name, so no
-    derivation recomputed from today's name can recognise it."""
-    from agent import account_key_reconcile as akrec
-    monkeypatch.setattr(akrec.config, "account_key_reconcile_enabled", lambda: True)
-    monkeypatch.setattr(akrec, "blocking_data", lambda key: "")
+    monkeypatch.setattr(akrec, "blocking_data", lambda key, **kw: "17 sources, 155 rows")
     ok, detail = akrec._default_writer(
-        {"gym_id": REVERB_ID, "name": "Totally Different Name Now",
-         "current": "zanshinfitness630e22", "canonical": REVERB_ECHO_WOULD_DERIVE})
-    assert ok is False and "portal" in detail.lower(), detail
-
-
-def test_a_gym_with_no_key_at_all_is_still_repairable(monkeypatch):
-    """The guard must not make the reconciler useless: a gym the portal never keyed is
-    exactly what this sweep was built for."""
-    from agent import account_key_reconcile as akrec
-    monkeypatch.setattr(akrec.config, "account_key_reconcile_enabled", lambda: True)
-    monkeypatch.setattr(akrec, "blocking_data", lambda key: "")
-    monkeypatch.setattr(akrec.config, "supabase_url", lambda: "")
-    for blank in ("", "(none)"):
-        ok, detail = akrec._default_writer(
-            {"gym_id": REVERB_ID, "name": REVERB_NAME, "current": blank,
-             "canonical": REVERB_ECHO_WOULD_DERIVE})
-        assert "portal" not in detail.lower(), f"{blank!r} -> {detail}"
+        {"gym_id": REVERB_ID, "name": REVERB_NAME, "current": REVERB_PORTAL,
+         "canonical": REVERB_ECHO_WOULD_DERIVE})
+    assert ok is False and "BLOCKED" in detail, detail
 
 
 def test_the_portal_now_derives_the_same_key_echo_does():

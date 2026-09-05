@@ -327,18 +327,31 @@ def test_a_rebuild_that_runs_out_of_time_reports_incomplete():
 # ---- wave-3 audit findings -------------------------------------------------------------
 
 def test_a_live_key_stored_with_a_suffix_is_never_rewritten():
-    """NEW-A, MAJOR. The suffix feature stripped _ig/_fb BEFORE the live check, so a live
-    key stored WITH a suffix lost the protection the whole design rests on. Adversarially:
-    if gym A's live key is gym B's derived key + '_ig', A's own key was rewritten to B."""
-    a_live = "attackerlive_ig"
+    """NEW-A, MAJOR, with the ADVERSARIAL fixture actually built.
+
+    The first version of this test used a live key whose base was in neither `live` nor
+    `mapping`, so it passed for the wrong reason and still passed with the guard deleted.
+    This builds the real hazard: gym A's LIVE key is exactly gym B's DERIVED key + "_ig".
+    With the whole-key check removed, resolve() strips the suffix, finds B's derived key in
+    the mapping, and rewrites gym A's own live key onto gym B -- a cross-tenant write."""
+    b_derived = _derived(REVERB_ID, REVERB_NAME)          # crossfitreverb6cdf33
+    a_live = b_derived + "_ig"                            # gym A genuinely holds this
     get = _plane([{"gym_id": LOCAL_A_ID, "echo_account_key": a_live},
                   {"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}],
-                 [{"id": LOCAL_A_ID, "name": "Attacker"},
+                 [{"id": LOCAL_A_ID, "name": "Attacker Gym"},
                   {"id": REVERB_ID, "name": REVERB_NAME}])
-    assert akr.resolve(a_live, now_fn=lambda: 1.0, get=get) == a_live, \
-        "a live key is a live key, suffix or not"
-    # and the doubled-suffix garbage it used to produce is gone
-    assert not akr.resolve(a_live, now_fn=lambda: 1.0, get=get).endswith("_ig_ig")
+    assert akr.resolve(a_live, now_fn=lambda: 1.0, get=get) == a_live, (
+        "gym A's own live key was rewritten onto gym B -- the whole-key live check is gone")
+    # the unsuffixed stale key still resolves normally, so the guard is not over-broad
+    assert akr.resolve(b_derived, now_fn=lambda: 1.0, get=get) == REVERB_LIVE
+
+
+def test_a_suffixed_stale_key_that_is_not_live_still_resolves():
+    """The guard must not disable suffix resolution for keys nobody holds."""
+    get = _plane([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}],
+                 [{"id": REVERB_ID, "name": REVERB_NAME}])
+    assert akr.resolve(REVERB_STALE + "_ig", now_fn=lambda: 1.0, get=get) \
+        == REVERB_LIVE + "_ig"
 
 
 def test_the_build_budget_is_total_across_both_tables():
@@ -386,3 +399,54 @@ def test_an_undeclared_table_raises_rather_than_guessing_an_order_column():
     import pytest
     with pytest.raises(KeyError):
         akr._read_all("some_new_table", "id", get=lambda p, q: ([], True))
+
+
+def test_a_brownout_backs_off_instead_of_rebuilding_on_every_request():
+    """The wave-4 blocker. Retaining a healthy cache on a failed rebuild WITHOUT recording
+    a backoff stamp was worse than clobbering it: once the success TTL expired during a
+    Supabase brownout, every request re-entered the rebuild behind the global lock and
+    blocked on two timed-out reads, so requests queued for minutes."""
+    world = {"fail": False, "reads": 0}
+
+    def flaky(path, params):
+        world["reads"] += 1
+        if world["fail"]:
+            return [], False
+        rows = ([{"gym_id": REVERB_ID, "echo_account_key": REVERB_LIVE}]
+                if path == "echo_intake_tokens" else [{"id": REVERB_ID, "name": REVERB_NAME}])
+        return rows, True
+
+    assert akr.resolve(REVERB_STALE, now_fn=lambda: 0.0, get=flaky) == REVERB_LIVE
+    world["fail"] = True
+    world["reads"] = 0
+    # Well past the success TTL, ten requests during the brownout.
+    for i in range(10):
+        t = akr._TTL_OK + 1 + i * 0.1
+        assert akr.resolve(REVERB_STALE, now_fn=lambda t=t: t, get=flaky) == REVERB_LIVE, \
+            "the last known-good mapping should still be served"
+    assert world["reads"] <= 4, (
+        f"{world['reads']} plane reads for 10 requests -- the backoff stamp is missing "
+        f"and every request is rebuilding")
+
+
+def test_a_name_with_no_alphanumerics_never_becomes_a_remap_source():
+    """canonical_account_key REJECTS such a gym, so a key derived from one can never be a
+    real stale key. Deriving anyway invented a bare 6-hex remap source that nothing could
+    legitimately carry."""
+    PUNCT_ID = "67ef4400-0000-4000-8000-0000000000ff"
+    get = _plane([{"gym_id": PUNCT_ID, "echo_account_key": "punctgym99"}],
+                 [{"id": PUNCT_ID, "name": "!!!---***"}])
+    _live, mapping, _by_gym, ok = akr._build(get=get, now_fn=lambda: 1.0)
+    assert ok is True
+    assert all(len(k) > 6 for k in mapping), f"bare-hex remap source invented: {mapping}"
+
+
+def test_the_media_resolver_defaults_to_the_real_resolver(monkeypatch):
+    """Every other test injects `resolve=`; nothing asserted the production default is
+    wired to account_key_resolve.resolve at all."""
+    from agent import gym_media_routes as gmr
+    called = []
+    monkeypatch.setattr("agent.account_key_resolve.resolve",
+                        lambda key, **kw: called.append(key) or key)
+    gmr._resolve_stale_fingerprint("crossfitreverb6cdf33")
+    assert called == ["crossfitreverb6cdf33"], "the default path is not wired"

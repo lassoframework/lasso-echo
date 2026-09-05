@@ -31,8 +31,10 @@ from . import config, gym_media_index as _idx
 from . import gym_media_selector as _sel
 
 # <name-slug><6-hex-fingerprint> shape, matching account_key.py's canonical_account_key
-# output. Used only to detect a STALE fingerprint (see _resolve_stale_fingerprint) --
-# never to derive or mint a key.
+# output. NO LONGER USED FOR RESOLUTION (2026-09-04): matching a stale key by the slug in
+# front of that tail could rewrite a gym's own live key onto a different gym sharing the
+# slug, so account_key_resolve now maps by gym_id instead. Kept only as a shape helper for
+# callers that want to recognise the fingerprinted form; never to derive or mint a key.
 _FINGERPRINT_RE = re.compile(r"^([a-z0-9]+)([0-9a-f]{6})$")
 
 

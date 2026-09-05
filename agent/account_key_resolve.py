@@ -52,7 +52,8 @@ _BUILD_BUDGET = 25.0  # total seconds ONE rebuild may spend across ALL pages of 
 
 # state: {"at": float, "ok": bool, "live": frozenset, "map": dict}
 _lock = threading.Lock()
-_cache = {"at": None, "ok": False, "live": frozenset(), "map": {}, "by_gym": {}}
+_cache = {"at": None, "ok": False, "live": frozenset(), "map": {}, "by_gym": {},
+          "last_fail": None}
 
 
 def _norm(value):
@@ -155,17 +156,22 @@ def _build(get=None, now_fn=None):
 
     live = frozenset(all_keys)
     names = {_norm(g.get("id")): g.get("name") for g in gyms}
+    raw_ids = {_norm(g.get("id")): str(g.get("id") or "") for g in gyms}
 
-    from .account_key import _base_key  # noqa: PLC0415 - same package
+    from .account_key import _base_key, _slugify_name  # noqa: PLC0415 - same package
     mapping, collided = {}, set()
     for gid, live_key in by_gym.items():
         if gid in dupes:
             continue
         name = names.get(gid)
-        if not name:
-            continue  # never derive from an id alone; no name means no honest derivation
+        if not name or not _slugify_name(name):
+            # No usable name means no honest derivation. canonical_account_key REJECTS such
+            # a gym outright, so a key derived from one could never be a real stale key --
+            # deriving anyway invented a bare 6-hex remap source ("67ef44") that nothing
+            # could legitimately carry.
+            continue
         try:
-            derived = _norm(_base_key(gid, name))
+            derived = _norm(_base_key(raw_ids.get(gid, gid), name))
         except Exception:  # noqa: BLE001 - a underivable gym simply gets no entry
             continue
         if not derived or derived == live_key or derived in live:
@@ -184,26 +190,45 @@ def _state(now_fn=None, get=None, fresh=False):
 
     Serialised: N concurrent cold requests used to each run a full rebuild. The lock is
     held across the rebuild and re-checks the cache on entry, so the losers of the race
-    take the winner's result instead of issuing their own reads."""
+    take the winner's result instead of issuing their own reads.
+
+    A FAILED rebuild never demotes a healthy cache, AND it always records a backoff stamp.
+    Retaining the data without the stamp was worse than clobbering it: once the success TTL
+    expired during a brownout, every single request re-entered the rebuild behind the lock
+    and blocked on two timed-out reads, so requests queued for minutes. Serving the last
+    known-good mapping while backing off is better on both axes.
+
+    `fresh` (mint paths only) always attempts a rebuild and reports the REAL outcome, so a
+    one-shot permanent decision is never made from stale data."""
     now = (now_fn or time.time)()
-    if not fresh:
-        ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
-        if _cache["at"] is not None and now - _cache["at"] < ttl:
-            return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+
+    def _cached():
+        return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+
+    def _within_ttl():
+        if _cache["at"] is None:
+            return False
+        return now - _cache["at"] < (_TTL_OK if _cache["ok"] else _TTL_FAIL)
+
+    def _backing_off():
+        return (_cache["last_fail"] is not None
+                and now - _cache["last_fail"] < _TTL_FAIL)
+
+    if not fresh and (_within_ttl() or (_backing_off() and _cache["at"] is not None)):
+        return _cached()
     with _lock:
-        if not fresh:
-            ttl = _TTL_OK if _cache["ok"] else _TTL_FAIL
-            if _cache["at"] is not None and now - _cache["at"] < ttl:
-                return _cache["live"], _cache["map"], _cache["by_gym"], _cache["ok"]
+        if not fresh and (_within_ttl() or (_backing_off() and _cache["at"] is not None)):
+            return _cached()
         live, mapping, by_gym, ok = _build(get=get, now_fn=now_fn)
-        if not ok and _cache["ok"]:
-            # A FAILED read never demotes a HEALTHY cache. A mint path forces fresh=True,
-            # and one such read during a brownout used to overwrite a good answer with an
-            # unusable one -- the read path would then return every key unchanged for the
-            # next _TTL_FAIL seconds even though the plane had already recovered. The
-            # caller still gets the honest "not ok" for ITS decision; what is retained is
-            # only what everyone else was already being served.
-            return _cache["live"], _cache["map"], _cache["by_gym"], False
+        if not ok:
+            _cache["last_fail"] = now
+            if _cache["ok"]:
+                # Keep serving the last known-good view; the caller that asked for `fresh`
+                # still gets an honest False for its own decision.
+                return (_cache["live"], _cache["map"], _cache["by_gym"],
+                        False if fresh else True)
+        else:
+            _cache["last_fail"] = None
         _cache.update({"at": now, "ok": ok, "live": live, "map": mapping,
                        "by_gym": by_gym})
         return live, mapping, by_gym, ok
@@ -284,4 +309,4 @@ def portal_key_for_gym(gym_id, now_fn=None, get=None, fresh=False):
 def reset_cache():
     """Tests only."""
     _cache.update({"at": None, "ok": False, "live": frozenset(), "map": {},
-                   "by_gym": {}})
+                   "by_gym": {}, "last_fail": None})

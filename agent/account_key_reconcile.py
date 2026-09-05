@@ -323,26 +323,22 @@ def _default_writer(plan_row):
     blocked = blocking_data((str(plan_row.get("current") or "")).strip())
     if blocked:
         return False, f"BLOCKED: {blocked}"
-    # THE PORTAL OWNS THIS COLUMN (2026-09-04). echo_intake_tokens.echo_account_key is the
-    # portal's own column and the key Echo now treats as authoritative
-    # (account_key_resolve.portal_key_for_gym). Overwriting it with Echo's derivation is
-    # the divergence that gave one gym two live keys -- and blocking_data above does not
-    # stop it, because a BRAND NEW gym owns no data, which is exactly the case that splits.
+    # WHY WRITING THIS COLUMN IS SAFE AGAIN (2026-09-04). echo_intake_tokens.
+    # echo_account_key is the PORTAL's column, and for a while Echo writing its own
+    # derivation into it was a live divergence: the portal minted slug + rawUUID[:6]
+    # while Echo derived slug + sha256(gym_id)[:6], so a write here could hand one gym a
+    # second identity. Portal PR #578 closed that -- social-onboard.ts deriveAccountKey
+    # is now slug + sha256(gym_id)[:6], the same function as account_key._base_key -- so
+    # the canonical key this writer PATCHes is exactly the key the portal itself would
+    # mint. test_portal_key_authority.py::test_the_portal_now_derives_the_same_key_echo_does
+    # pins that equivalence, so drift on either side fails loudly rather than silently
+    # reopening the split.
     #
-    # The guard is deliberately IDENTITY-based, not derivation-based. A first version
-    # recomputed the portal's old formula from gyms.name and refused only when it matched;
-    # that missed every RENAMED gym, because the slug is recomputed from today's name.
-    # Against real production rows it recognised 4 of 19 keys -- Zanshin's live key
-    # zanshinfitness630e22 was minted under an older name and would have been overwritten.
-    # `current` is READ FROM echo_intake_tokens (see _default_reader), so a non-empty
-    # current value IS the portal's column by definition. No derivation needs to be
-    # guessed at, and no future rename can disarm it.
-    current = (str(plan_row.get("current") or "")).strip()
-    if current and current.lower() != "(none)":
-        return False, ("BLOCKED: echo_intake_tokens.echo_account_key is the portal's "
-                       "column and it already holds a key for this gym; Echo does not "
-                       "overwrite it (see account_key_resolve.portal_key_for_gym). A "
-                       "genuinely wrong portal key is repaired portal-side.")
+    # A blanket "never overwrite a non-empty key" guard was tried here and REVERTED: it
+    # destroyed the repair this module exists for. build_plan already treats a
+    # non-collided current key as ISSUED (change=False), so the only rows that reach this
+    # writer are COLLIDED (two gyms sharing one key -- a tenant-isolation hazard) or
+    # MISSING. Refusing those leaves the hazard in place and fixes nothing.
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
