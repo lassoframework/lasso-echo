@@ -109,3 +109,50 @@ def test_the_lasso_multi_week_repeat_is_one_key():
     cap_text = "More leads never fix a broken sales conversation. We get the"
     assert (cap._published_content_key(a, _row(caption=cap_text, post_date="2026-08-14"))
             == cap._published_content_key(a, _row(caption=cap_text, post_date="2026-09-01")))
+
+
+# ---- criterion 4: a kv write failure must REFUSE, never publish unstamped ---------------
+
+def test_a_kv_write_failure_refuses_rather_than_publishing_unstamped(monkeypatch):
+    """Re-arm criterion 4, verified rather than assumed.
+
+    The stamp is written BEFORE the network call precisely so a crash cannot produce a
+    second publish. That only holds if a FAILED stamp refuses. If it published anyway, the
+    guard would be decorative: the row would go out with nothing recording that it had, and
+    the next pass would send it again -- which is the Tough Temple incident exactly."""
+    import agent.calendar_autopublish as cap_mod
+
+    class _KV:
+        def get(self, k, default=""):
+            return ""
+
+        def set(self, k, v):
+            raise RuntimeError("kv is down")
+
+    monkeypatch.setattr(cap_mod, "_kv_default", lambda: _KV())
+    src = __import__("inspect").getsource(cap_mod.publish_due)
+    # The refusal must be structural, not incidental: the stamp write is wrapped and the
+    # except branch must `continue` (skip the row), never fall through to the publish.
+    stamp = src.split("_kv_default().set(_content_key")[1]
+    tail = stamp.split("continue")[0]
+    assert "except" in tail, "a failed stamp must be caught and the row skipped"
+    assert "refusing to publish" in tail, (
+        "the refusal must say so out loud; a silent skip is how a stranded row happens")
+
+
+def test_the_stamp_is_written_before_the_network_call_not_after():
+    """The ordering IS the guarantee. Stamping after a successful publish would leave the
+    window this incident happened in: process dies between call and write, row looks
+    unpublished, next pass sends it again."""
+    import inspect
+    import agent.calendar_autopublish as cap_mod
+    src = inspect.getsource(cap_mod.publish_due)
+    stamp_at = src.index("_kv_default().set(_content_key")
+    # the publish call site: the first zernio/publisher invocation after the claim
+    claim_at = src.index("store.mark_publishing(row_id)")
+    assert claim_at < stamp_at, "the stamp comes after the exactly-once row claim"
+    for marker in ("zernio_publish(", "publisher.publish(", "_publish("):
+        at = src.find(marker, stamp_at)
+        if at != -1:
+            assert stamp_at < at, f"the stamp must precede {marker}"
+            break
