@@ -36,6 +36,7 @@ from . import bus as _bus
 from . import identity_gate as _ig
 from . import identities as _ids
 from . import outbox as _outbox
+from . import outreach as _outreach
 
 HEALTH_EVERY_SECONDS = 15 * 60
 OUTBOX_EVERY_SECONDS = 5
@@ -95,6 +96,45 @@ def _portal_lookup_factory(bus):
     return _lookup
 
 
+# ---- outreach-release factories ---------------------------------------------------------
+# D48-follow-up (Frame 1 audit MAJOR, closing here): a tap on a KIND_OUTREACH_REQUEST hold
+# card used to route to outbox.release_held, which refuses that kind outright (outbox.py's
+# own accepted-kinds check) and no-ops SILENTLY -- Blake would believe he approved an
+# outreach that never actually sent. _on_release below now keys the dispatch on the held
+# row's own attachments.kind and, for an outreach request, calls
+# outreach.release_approved_outreach instead, matching what outreach.py's docstring already
+# promises happens. These two factories are copied verbatim from echo_ticket_wiring.py
+# rather than imported from it: echo_ticket_wiring.py itself imports THIS module (for
+# _slack_user_info_factory / _portal_lookup_factory), so importing it back here would be
+# circular. Keep both copies in sync if either Slack call shape ever changes.
+def _open_group_dm_factory(poster):
+    def open_group_dm(user_ids):
+        resp = poster._send("https://slack.com/api/conversations.open",
+                            {"users": ",".join(user_ids)})
+        if not (resp or {}).get("ok"):
+            return {"ok": False}
+        return {"ok": True, "channel_id": (resp.get("channel") or {}).get("id") or ""}
+    return open_group_dm
+
+
+def _post_first_message_factory(poster):
+    def post_first_message(channel_id, text):
+        res = poster._chat_post(text=text, blocks=None, channel=channel_id)
+        if not (res or {}).get("ok"):
+            return {"ok": False}
+        return {"ok": True, "ts": res.get("ts") or ""}
+    return post_first_message
+
+
+def _stamp_ticket_factory(bus):
+    def stamp_ticket(ticket_id, *, channel_id, thread_ts, slack_user_id, bot_identity,
+                     identity_kind):
+        return bus.set_ticket(ticket_id, slack_channel_id=channel_id,
+                              slack_thread_ts=thread_ts, slack_user_id=slack_user_id,
+                              bot_identity=bot_identity, identity_kind=identity_kind)
+    return stamp_ticket
+
+
 def live_deps(identity, *, bus=None, log=print):
     bus = bus or _bus.Bus()
     bot_token = identity.env(identity.bot_token_env)
@@ -126,7 +166,8 @@ def dedupe_key(event):
 # ---- registration ---------------------------------------------------------------------
 
 class ConvoWiring:
-    def __init__(self, app, identity, deps, *, post=None, log=print):
+    def __init__(self, app, identity, deps, *, post=None, open_group_dm=None,
+                 post_first_message=None, log=print):
         self.app = app
         self.identity = identity
         self.deps = deps
@@ -137,6 +178,12 @@ class ConvoWiring:
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EVENTS,
                                         thread_name_prefix=f"slack-convo-{identity.name}")
         self._post = post or self._default_post()
+        # Injectable, like `post` above, so a test can supply fakes without a real Slack
+        # client; built lazily off the identity's own bot token (never Blake's, never a
+        # different identity's) only if the outreach-release path is actually exercised.
+        self._open_group_dm = open_group_dm
+        self._post_first_message = post_first_message
+        self.__poster = None
         self._stop = threading.Event()
         self._boot_checks()
 
@@ -168,6 +215,13 @@ class ConvoWiring:
                 raise RuntimeError(f"slack post failed: {(res or {}).get('error')}")
             return res.get("ts")
         return post
+
+    def _poster(self):
+        if self.__poster is None:
+            from ..slack_surface import SlackPoster
+            token = self.identity.env(self.identity.bot_token_env)
+            self.__poster = SlackPoster(token=token)
+        return self.__poster
 
     # -- inbound --
     def _process(self, event, raw_event_id):
@@ -215,30 +269,52 @@ class ConvoWiring:
                 self.counts["release:refused_flag_off"] += 1
                 return
             mid = (action or {}).get("value") or ""
+            # Dispatch on the held row's OWN kind, not a single hardcoded handler: an
+            # outreach_request is a different animal (it needs open_group_dm, which
+            # outbox.release_held refuses to touch by design -- see outbox.py's own
+            # accepted-kinds check) and must route to outreach.release_approved_outreach
+            # instead, or the tap silently no-ops with nothing ever sent (the Frame 1
+            # audit MAJOR this closes).
+            row = self.deps.bus.message(mid)
+            kind = ((row or {}).get("attachments") or {}).get("kind") or ""
+            if kind == _adapter.KIND_OUTREACH_REQUEST:
+                ok = self._release_outreach(mid, row, actor)
+                self.counts[f"release:{'ok' if ok else 'noop'}"] += 1
+                return
             ok = _outbox.release_held(self.deps.bus, mid, approved_by=actor,
                                       identity=identity, log=self.log)
             self.counts[f"release:{'ok' if ok else 'noop'}"] += 1
 
-        @app.action(_outbox.RESOLVE_ACTION_ID)
-        def _on_resolve(ack, body, action):
-            """D48: Blake's tap on an escalation card. Same operator gate and same flag gate
-            as a release -- this writes a message a client will read."""
-            ack()
-            actor = (body.get("user") or {}).get("id", "")
-            if not config.APPROVER_SLACK_ID or actor != config.APPROVER_SLACK_ID:
-                self.counts["resolve:refused_non_operator"] += 1
-                return
-            if not self.deps.identity_enabled():
-                self.counts["resolve:refused_flag_off"] += 1
-                return
-            tid = (action or {}).get("value") or ""
-            ok = _outbox.resolve_and_notify(self.deps.bus, tid, approved_by=actor,
-                                            identity=identity, log=self.log)
-            self.counts[f"resolve:{'ok' if ok else 'noop'}"] += 1
-
         self.log(f"[slack-convo/{identity.name}] registered (enabled="
                  f"{self.deps.identity_enabled()})")
         return self
+
+    def _release_outreach(self, message_id, row, actor):
+        """Tap handler for a KIND_OUTREACH_REQUEST hold card. Reconstructs `ticket` and
+        `who` from the held row and its parent ticket, then calls
+        outreach.release_approved_outreach -- the function this whole path exists to
+        reach, keyed on attachments.held_kind as outreach.py's own docstring promises.
+        Refuses (never raises) for every validation failure; release_approved_outreach
+        itself re-checks identity/ticket ownership and every base eligibility gate at
+        tap time, so nothing here is a substitute for those checks."""
+        bus = self.deps.bus
+        att = (row or {}).get("attachments") or {}
+        ticket = bus.ticket((row or {}).get("ticket_id")) if row else None
+        uid = att.get("slack_user_id") or (ticket or {}).get("slack_user_id") or ""
+        who = self.deps.resolve_identity(uid) if uid else None
+        open_group_dm = self._open_group_dm or _open_group_dm_factory(self._poster())
+        post_first_message = (self._post_first_message
+                              or _post_first_message_factory(self._poster()))
+        result = _outreach.release_approved_outreach(
+            message_id, ticket, who, self.identity,
+            get_held_message=bus.message, open_group_dm=open_group_dm,
+            post_first_message=post_first_message, record_outbound=bus.record_outbound,
+            stamp_ticket=_stamp_ticket_factory(bus), mark_message=bus.mark_message,
+            claim_message=getattr(bus, "claim_message", None), log=self.log)
+        if not result.opened:
+            self.log(f"[slack-convo/{self.identity.name}] outreach release refused "
+                     f"row={message_id} reason={result.reason}")
+        return result.opened
 
     # -- loops --
     def start_loops(self):
