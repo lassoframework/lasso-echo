@@ -246,3 +246,29 @@ def test_client_messages_carry_no_dashes_and_never_say_vendor():
         msg = msw.client_message(reason)
         assert "—" not in msg and "–" not in msg and "-" not in msg
         assert "vendor" not in msg.lower()
+
+
+# ---- P-11: the exact contract the PORTAL relays against ---------------------
+# The portal builds
+#   `${base}/portal/${token}/posts/${postId}/${action}`
+# in src/lib/echo/portal-content.ts postPostAction, and its ACTIONS set is
+# {approve, edit, deny, kill, requeue}. "Photo swap is free" could not be built
+# there because Echo had no swap action to relay to. This pins the path shape so
+# the portal can add "swap-media" to that set and have it land.
+
+def test_the_portal_relay_path_for_swap_media_is_routable():
+    import re
+
+    from agent import intake_web
+
+    actions = set(intake_web.PORTAL_POST_ACTIONS)
+    # Everything the portal can already relay, plus the new one.
+    assert {"approve", "edit", "deny", "kill"} <= actions
+    assert "swap-media" in actions, \
+        "the portal relays /posts/<id>/swap-media; Echo must route it"
+
+    # And the path the portal actually builds must match the live route regex.
+    pattern = (r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
+               r"(" + "|".join(intake_web.PORTAL_POST_ACTIONS) + r")$")
+    m = re.match(pattern, "/portal/eyJhIjoiZW5nIn0.sig/posts/abc-123/swap-media")
+    assert m and m.group(3) == "swap-media"

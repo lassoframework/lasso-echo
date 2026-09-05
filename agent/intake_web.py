@@ -69,6 +69,18 @@ def _rate_per_minute():
     return int(os.environ.get("AGENT_INTAKE_RATE_PER_MINUTE", "10"))
 
 
+# The per-post actions Echo routes at /portal/<token>/posts/<id>/<action>.
+#
+# THIS IS A CROSS REPO CONTRACT (P-11). The portal relays to exactly
+#   `${base}/portal/${token}/posts/${postId}/${action}`
+# in src/lib/echo/portal-content.ts (postPostAction), so an action the portal can
+# offer must exist HERE first. "swap-media" is the free photo swap (B6): the portal
+# could not build "use a different photo" as its own button because Echo had only
+# approve / edit / deny / kill, which left deny as the single lever and made a photo
+# change cost one of the gym's 15 monthly recreates.
+PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media")
+
+
 def client_for_token(token):
     """The client key a token authenticates, or None. A SIGNED token verifies
     against the shared secret (no per-gym env var needed); a legacy per-client env
@@ -2017,7 +2029,7 @@ def build_server(port=None):
             default OFF: the route exists but the handler 403s until it is armed."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
-                r"(approve|edit|deny|kill|swap-media)$",
+                r"(" + "|".join(PORTAL_POST_ACTIONS) + r")$",
                 self.path.split("?")[0],
             )
             if m:
