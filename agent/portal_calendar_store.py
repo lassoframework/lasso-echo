@@ -149,6 +149,12 @@ class PortalStoreError(Exception):
         super().__init__(f"supabase {status}: {detail}")
 
 
+# The learning-lever columns patch_pending_plan is allowed to re-stamp when a
+# repair changes a caption. An explicit allowlist, so this lane can never be
+# used to write an arbitrary column.
+_LEVER_COLUMNS = ("hook_family", "ask_type", "caption_len_band")
+
+
 class SupabaseCalendarStore:
     """Thin PostgREST client over content_calendar. `http` is injectable for tests."""
 
@@ -1481,7 +1487,8 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None):
+    def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
+                           levers=None):
         """PATCH a WIPEABLE row's caption and/or pillar (the grade self-fix lane,
         AGENT_GRADE_SELF_FIX), filtered by id AND gym_id AND a server-side
         status IN (pending,draft,queued) guard, so a human-owned row (approved /
@@ -1490,12 +1497,29 @@ class SupabaseCalendarStore:
         that self-remediation only ever rewrites fresh machine drafts. Status
         stays 'pending' (the approval gate is untouched: the row remains in the
         owner's approval queue; nothing is auto-approved). Returns the updated
-        row dict, or None when zero rows matched."""
+        row dict, or None when zero rows matched.
+
+        LEVER RE-STAMP (Dean Holcomb / CrossFit Reverb, 2026-09-05). The learning
+        levers (hook_family, ask_type, caption_len_band) are stamped at STAGE time
+        against the SB7 body, which by design carries no CTA. This lane then
+        mutates the caption afterwards, and because only caption/pillar were ever
+        written, the levers stayed frozen at their pre-repair values. Measured on
+        Reverb's live book: ask_type='none' on 93 of 93 rows while 90 of them
+        ended in an ask, and caption_len_band='mid' on 100% of rows. Nothing could
+        correct it either, because jobs/backfill_levers only selects rows WHERE
+        hook_family IS NULL and these were already stamped. That is a lie the
+        learner reads: metrics_sync copies these columns onto post_metrics and
+        monthly_retro compares on them. A caller that changes the caption must
+        pass the re-stamped levers so the label keeps telling the truth.
+        """
         fields = {}
         if caption is not None:
             fields["caption"] = caption
         if pillar is not None:
             fields["pillar"] = pillar
+        for key, value in (levers or {}).items():
+            if key in _LEVER_COLUMNS and value is not None:
+                fields[key] = value
         if not fields:
             return None
         fields["status"] = "pending"
