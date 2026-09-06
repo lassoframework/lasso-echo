@@ -4191,3 +4191,64 @@ one:
 
 Verified against the exact event-shaped request: status `staged`, overlay burned as
 "SUMMER SHRED KICKOFF / SATURDAY COME TRAIN WITH / US". Suite: 5297 passed, 1 deselected.
+
+## The ask rate: 33%, and the half that actually reaches a live book (Blake, 2026-09-06)
+
+Blake: *"every post shold not have an ask make it 33% of post"*. Dean Holcomb's
+ticket 4941e162 is the reference case.
+
+- [~] `AGENT_CAPTION_ASK_RATE` (default 0.33). ONE number, read by BOTH the
+  repair (`grade_fix._ask_target_posts`) and the grader (`calendar_grade._path`),
+  so the target cannot drift from what is scored.
+- [~] The grader stops fighting the repair. `_path` scores the ask rule as a
+  BAND (at or above target costs nothing and names no defect; below it the
+  deduction scales with the SHORTFALL, so a book with no asks still loses the
+  full penalty). `_craft` drops `no_ask`, which was double counted on both legs.
+  Measured on Dean's real book, a book repaired exactly as intended scored
+  **71 (C) with 25 "no ask" defects** under the old rule and **89 (B) with 0**
+  under the band.
+- [~] `grade_fix._booking_deficit` counts POSTS, not rows, when armed. Reverb's
+  31 posts are 93 rows; a share over rows would have demanded 100%.
+- [~] `_fix_ask_excess`, the half that reaches an EXISTING book. `_fix_craft`
+  only ever rewrites a craft-FLAGGED day and a caption already ending in an ask
+  is not flagged, so on Dean's book **exactly 1 of 31 days was reachable**
+  (fleet-wide: 399 of 764 posts are unreachable that way). The trim pass only
+  DELETES a stapled, REPEATED closing ask, only above target, only on a wipeable
+  row, only when the remainder still clears the craft bar.
+
+  Measured on his ACTUAL live book with his ACTUAL (empty) CTA pool:
+  ask rate **96.8% -> 35.5%**, distinct closing lines **2 -> 22**, top closing
+  line share **96.8% -> 32.3%**, in-window collisions **321 -> 111**,
+  zero-width characters **30 -> 10**.
+- [~] Live regression fixed: `_patch_date_rows`' TypeError retry sat bare inside
+  its own handler, so a store raising on the retry aborted that gym's entire
+  grade-fix pass.
+- [x] `docs/ENV.md` gained the five flag rows the earlier PRs never added.
+
+### NOT armed, and why
+
+`AGENT_CTA_VARIETY`, `AGENT_CAPTION_FORM_PLAN`, `AGENT_CROSS_GYM_BRAIN` were
+armed on the Railway `echo` service on 2026-09-06 and **DISARMED the same day**
+pending an independent verification that graded the caption/brain build C+.
+`AGENT_GYM_DEEP_BRAIN` was never armed. All four are OFF right now.
+
+Open before arming:
+1. The CRITICAL in the deep-brain bible write path (scraped, uncited facts reach
+   `voice.raw` and then clear `drafter._output_claims_cleared` as if approved).
+2. Two cross-gym defects: an `insufficient_data` cell still writes its real
+   engagement value (re-identification risk on a small fleet), and there is no
+   per-gym minimum contribution per cell (99 posts from one gym treated as 99
+   independent draws).
+3. `migrations/cross_gym_brain_20260906.sql` is hand-applied (echo convention:
+   these are NOT recorded in `public.schema_migrations`, which holds only the
+   portal's `0xxx_` files). A follow-up adds a `top_posts` column and must be
+   applied before arming, or every weekly insert 400s.
+
+### The thing no code fixes
+
+5 of 18 live gyms have an EMPTY usable CTA pool after the shape gate: reverb,
+gritx, train7164ae502, crossfitnine7f7dadc, toughtemple52040e. 7 more have
+exactly one. Dean's voice-doc CTA section is an unfilled onboarding TODO, and
+his only candidate is the FAQ heading the shape gate correctly rejects. Trimming
+gets him to 35.5% without a pool, but **no ask-rate target can put a real CTA on
+a gym that has not approved one**. That is onboarding content, not code.

@@ -162,12 +162,13 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     if not config.grade_self_fix_enabled():
         return {"ok": False, "reason": "AGENT_GRADE_SELF_FIX off",
                 "captions_fixed": 0, "repillared": 0, "craft_fixed": 0,
-                "craft_attempted": 0, "booking_asks_added": 0,
+                "craft_attempted": 0, "booking_asks_added": 0, "ask_trimmed": 0,
                 "gap_fill": "none", "skipped": 0, "actions": []}
 
     actions = []
     result = {"ok": True, "captions_fixed": 0, "repillared": 0,
               "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
+              "ask_trimmed": 0,
               "audience_fixed": 0, "audience_attempted": 0, "scrubbed": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
@@ -216,6 +217,15 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
         actions.append(f"rewrote {craft_fixed} caption(s) that tripped craft flags (ask/hook/length)")
     if booking_added:
         actions.append(f"carried the gym's real booking CTA onto {booking_added} day(s)")
+
+    # ---- d2) ask EXCESS (the other half of the 33% target) -------------------
+    # _fix_craft can only ADD, and only to a craft-flagged day, so on a book
+    # already stapled to 96.8% asks it has nothing to grip. This removes the
+    # staple. Runs after the craft pass so it measures the book as repaired.
+    ask_trimmed = _fix_ask_excess(gym_id, rows, store, log)
+    result["ask_trimmed"] = ask_trimmed
+    if ask_trimmed:
+        actions.append(f"trimmed the stapled closing ask off {ask_trimmed} post(s)")
 
     # ---- e) off-avatar hooks (right_audience) -------------------------------
     aud_fixed, aud_attempted = _fix_audience(
@@ -497,12 +507,54 @@ def _clears_craft(caption, allow_no_ask=False) -> bool:
     return True
 
 
+def _ask_target_posts(n_posts: int) -> int:
+    """How many POSTS of an `n_posts` book should carry a booking ask.
+
+    `max(grader floor, share)` because the two constraints are both real and
+    the larger one wins:
+
+      * the grader's path_to_join GYM leg still wants `min(5, n)` posts carrying
+        a booking-SPECIFIC term, and
+      * Blake's ask-rate target (config.caption_ask_rate_target, 0.33) is the
+        share of the book that should close on an ask at all.
+
+    On a normal ~31 post month the share is the binding one (10 posts, 32.3%).
+    On a book shorter than ~15 posts the grader's floor of 5 binds instead and
+    the realised rate runs above the target; that is the grader's own hard
+    minimum, not a miscalculation, and lowering it is a separate decision.
+    """
+    if n_posts <= 0:
+        return 0
+    share = int(round(config.caption_ask_rate_target() * n_posts))
+    return min(n_posts, max(1, min(5, n_posts), share))
+
+
 def _booking_deficit(rows) -> int:
-    """How many more booking-term rows the path_to_join GYM leg wants
-    (>= min(5, n) rows carrying a booking-specific ask)."""
-    n = len(rows)
-    have = sum(1 for r in rows if _BOOKING_RE.search(r.get("caption") or ""))
-    return max(0, min(5, n) - have)
+    """How many more booking asks the book still wants.
+
+    FLAG OFF: rows, and a flat floor of `min(5, n)` -- byte for byte the
+    pre-2026-09-06 behavior.
+
+    AGENT_CTA_VARIETY ARMED: POSTS, and the target is `_ask_target_posts`.
+    Counting POSTS is what makes the rate mean anything: one calendar post
+    deliberately spans several rows (the IG feed, its Facebook mirror and the
+    paired story share one caption on one date), so Reverb's 31 posts are 93
+    rows. A share taken over ROWS would ask for 31 posts' worth of CTA on a
+    31 post book -- 100%, the exact defect this is meant to end -- because the
+    caller decrements this deficit once per POST repaired, not once per row.
+    """
+    if not config.cta_variety_enabled():
+        n = len(rows)
+        have = sum(1 for r in rows if _BOOKING_RE.search(r.get("caption") or ""))
+        return max(0, min(5, n) - have)
+
+    posts = {}
+    for r in rows or []:
+        key = (str(r.get("post_date") or "")[:10], caption_hash(r.get("caption") or ""))
+        posts.setdefault(key, r.get("caption") or "")
+    n = len(posts)
+    have = sum(1 for cap in posts.values() if _BOOKING_RE.search(cap or ""))
+    return max(0, _ask_target_posts(n) - have)
 
 
 def _booking_cta_pool(gym_id, log):
@@ -828,6 +880,108 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
 # e) off-avatar hooks (right_audience)
 # ---------------------------------------------------------------------------
 
+def _fix_ask_excess(gym_id, rows, store, log):
+    """Remove the STAPLED closing ask from a book that carries far too many.
+
+    WHY THIS EXISTS. `_fix_craft` sizes how many asks get ADDED, and that alone
+    cannot deliver a 33% book, because it only ever touches a craft-FLAGGED day
+    and a caption that already ends in an ask is not flagged. Measured on Dean
+    Holcomb's live book (crossfitreverb30b5b2) the morning after the CTA fix
+    shipped: 30 of 31 posts (96.8%) still closed on the same line, exactly 1 post
+    was craft-flagged, and the repair loop therefore had nothing to grip. His
+    ticket said the captions "all end with 'How do I get started with training at
+    CrossFit Reverb?' which doesn't make sense" and that was still true.
+
+    The fleet's own engagement data agrees, independently: the cross gym rollup
+    run on 2026-09-06 over 90 posts across 5 gyms found ONE result that survived
+    Benjamini Hochberg (q = 0.0296, Cohen's d = 0.49), and it was that feed posts
+    WITHOUT an ask outperform feed posts WITH one.
+
+    WHAT IT WILL AND WILL NOT DO. This pass only ever DELETES a line the machine
+    previously stapled on. It writes nothing, invents nothing, and rewrites no
+    body copy. Every one of these must hold before a single line is removed:
+
+      1. AGENT_CTA_VARIETY is armed (this whole rail is behind it).
+      2. The book is genuinely ABOVE its ask target. It stops the moment the
+         target is reached and can never take a book below it.
+      3. The row is wipeable -- a machine draft, never a human-owned day.
+      4. The line removed is the caption's LAST line and is ITSELF an ask. A
+         caption whose ask is woven into the body is left completely alone.
+      5. That closing is REPEATED elsewhere in the book. A bespoke closing that
+         appears once is the gym's own voice, not a staple, and is never touched.
+      6. What remains still clears the craft bar (length, hook, zero violations,
+         zero other soft flags). A trim that would leave a worse caption is
+         skipped, exactly like every other repair here.
+
+    Deterministic: the most-repeated closing is trimmed first, then by date, so
+    the same book trims identically and a diff stays reviewable.
+
+    Returns the number of POSTS trimmed.
+    """
+    if not config.cta_variety_enabled():
+        return 0
+
+    groups: dict = {}
+    for r in rows or []:
+        d = str(r.get("post_date") or "")[:10]
+        cap = r.get("caption") or ""
+        if not d or not str(cap).strip():
+            continue
+        groups.setdefault((d, caption_hash(cap)), []).append(r)
+    if not groups:
+        return 0
+
+    n = len(groups)
+    target = _ask_target_posts(n)
+    asking = [k for k, grp in groups.items()
+              if copy_gate.ASK_RE.search(grp[0].get("caption") or "")]
+    excess = len(asking) - target
+    if excess <= 0:
+        return 0
+
+    # How often each closing line appears across the book. A staple repeats; a
+    # gym's own bespoke sign-off does not.
+    closing_counts: dict = {}
+    for k, grp in groups.items():
+        sig = caption_variety.closing_signature(grp[0].get("caption") or "")
+        if sig:
+            closing_counts[sig] = closing_counts.get(sig, 0) + 1
+
+    def _rank(key):
+        grp = groups[key]
+        sig = caption_variety.closing_signature(grp[0].get("caption") or "")
+        return (-closing_counts.get(sig, 0), key[0])
+
+    trimmed = 0
+    for key in sorted(asking, key=_rank):
+        if trimmed >= excess:
+            break
+        grp = groups[key]
+        if any(not _is_wipeable(r) for r in grp):
+            continue                                # human-owned day: never touched
+        cap = grp[0].get("caption") or ""
+        lines = [ln for ln in cap.splitlines()]
+        idx = max((i for i, ln in enumerate(lines) if ln.strip()), default=-1)
+        if idx < 0:
+            continue
+        last = lines[idx]
+        if not copy_gate.ASK_RE.search(last):
+            continue                                # the ask is in the body: leave it
+        sig = caption_variety.closing_signature(cap)
+        if closing_counts.get(sig, 0) < 2:
+            continue                                # appears once: the gym's own voice
+        candidate = "\n".join(lines[:idx]).rstrip()
+        if not _clears_craft(candidate, allow_no_ask=True):
+            continue                                # trimming would leave it worse
+        if _patch_date_rows(gym_id, grp, store, candidate, None, log):
+            trimmed += 1
+            closing_counts[sig] = closing_counts.get(sig, 1) - 1
+    if trimmed:
+        log(f"{gym_id}: trimmed the stapled closing ask off {trimmed} post(s); "
+            f"book was {len(asking)}/{n} asking, target {target}")
+    return trimmed
+
+
 def _fix_audience(gym_id, rows, store, profile, caption_regen, avoid, log,
                   deadline=None):
     """Rewrite the caption of every fully wipeable day whose HOOK leaks the
@@ -926,8 +1080,22 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
         except TypeError:
             # A store predating the levers kwarg (older fakes, other callers).
             # The caption fix must never be lost over a metadata refresh.
-            updated = patcher(gym_id, r.get("id"),
-                              caption=new_cap, pillar=(new_cat or None))
+            #
+            # THE RETRY NEEDS ITS OWN GUARD (2026-09-06). This call used to sit
+            # bare inside the handler, so anything it raised escaped the loop
+            # ENTIRELY and aborted that gym's whole grade-fix pass. Before the
+            # levers change a single broad `except Exception` caught every store
+            # error and moved to the next row; splitting TypeError out quietly
+            # took that protection away from the retry path, which is the path
+            # most likely to fail (it exists precisely because the store is not
+            # the shape we expected). One row must never cost the other thirty.
+            try:
+                updated = patcher(gym_id, r.get("id"),
+                                  caption=new_cap, pillar=(new_cat or None))
+            except Exception as exc:  # noqa: BLE001
+                log(f"{gym_id} {r.get('post_date')}: caption patch retry failed: "
+                    f"{type(exc).__name__}")
+                continue
         except Exception as exc:  # noqa: BLE001
             log(f"{gym_id} {r.get('post_date')}: caption patch failed: "
                 f"{type(exc).__name__}")
