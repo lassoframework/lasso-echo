@@ -248,9 +248,16 @@ fleet after LASSO's clean 24 hours. Dean's message is Blake's to send, mine to d
    `pending`, nothing deleted, no caption touched. Dean's reply drafted and **posted to
    #echoclaude for Blake's review, NOT sent to Dean** — no mention of the key split or
    anything internal, no em/en dashes.
-4. **Day-shape alert**: on assertion failure alert #echoclaude the same hour naming gym,
-   date and which field collided; include that gym's remaining runway; **RE-FIRE daily while
-   blocked**; escalate to SOCIAL at 3 consecutive days as a content defect.
+4. **Day-shape alert — DONE.** The re-fire-daily half was already true by construction
+   (`day_shape.py`'s existing `ops_alerts.alert` fires every time a plan pass hits the
+   same violation, and a plan pass runs on a schedule). Added `agent/jobs/day_shape_block_alarm.py`
+   for the rest: the alert message now includes the gym's remaining runway (days of
+   already-good calendar left before it goes dark, computed from the existing calendar
+   since nothing is written on a block); a kv-backed consecutive-day counter per gym; and
+   ONE extra SOCIAL escalation the day a gym's blocked streak first reaches
+   `DAY_SHAPE_ESCALATE_DAYS` (default 3) — not every day after, since the existing alert
+   is already the re-fire. A clean day resets the streak and the escalation stamp, so a
+   later NEW streak reaching 3 escalates again. `AGENT_DAY_SHAPE_BLOCK_ALARM` default ON.
 5. **Fill-rate across EVERY `posts_per_day=2` gym — DONE, corrected against production;
    the old "ENG 24/24, Pierce 6/24, Chateau 6/16" figures were wrong, do not cite them.**
    The `posts_per_day=2` gyms, confirmed via `echo_gym_settings` joined to `gyms`: ENG,
