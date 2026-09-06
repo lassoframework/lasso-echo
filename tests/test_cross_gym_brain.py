@@ -281,7 +281,18 @@ def test_benjamini_hochberg_keeps_a_genuinely_strong_finding():
 
 
 def _cell(scores, gyms=("gyma", "gymb", "gymc")):
-    return {"scores": [float(s) for s in scores], "gyms": set(gyms)}
+    """A hand built lever cell, as lever_cells() would produce it.
+
+    `by_gym` (the per gym post counts the pseudoreplication guard reads) is
+    filled by dealing the scores round robin across `gyms`, so a hand built cell
+    is EVENLY spread and can never be refused for single gym dominance. Tests
+    that want to exercise the dominance rule build by_gym explicitly."""
+    scores = [float(s) for s in scores]
+    by_gym = {}
+    for i in range(len(scores)):
+        g = gyms[i % len(gyms)]
+        by_gym[g] = by_gym.get(g, 0) + 1
+    return {"scores": scores, "gyms": set(gyms), "by_gym": by_gym}
 
 
 # A modest, real separation: significant on its own (raw p well under 0.05) but
@@ -743,9 +754,708 @@ def test_prompt_lines_are_form_only(monkeypatch):
                       "effect_size": 0.9, "n": 24, "gyms": 3,
                       "q_value": 0.001}]})
     lines = guidance.prompt_lines("gyma", now=NOW, store=store)
-    assert lines == ["favor hook_family question on feed posts "
-                     "(fleet form signal, n=24 across 3 gyms)"]
+    # rendered from the module's OWN fixed phrase table, never from the stored
+    # value: the token "question" selects a phrase and is never itself printed
+    assert lines == ["open with one real question the reader is asking "
+                     "themselves (fleet form signal across 3 gyms, n=24)"]
+    assert "hook_family" not in lines[0]
 
 
 def test_prompt_lines_empty_when_dark():
     assert guidance.prompt_lines("gyma", now=NOW, store=_FakeStore()) == []
+
+
+# ===========================================================================
+# WEEKLY CADENCE (Blake, 2026-09-06: "i want echo to ... digest weekly")
+#
+# runner.run_daily still ticks nightly; it now calls run_weekly(), which fires
+# run() at most ONCE per ISO week. Every safety rail of the nightly version is
+# run()'s and is re-asserted end to end THROUGH run_weekly below, so the cadence
+# change cannot have quietly dropped one.
+# ===========================================================================
+
+class _Kv:
+    """A permissive in-memory kv. Deliberately stores whatever it is given and
+    refuses nothing, so a cadence test can only pass because run_weekly held the
+    line, never because the fake did (D68: a fake that enforces the same rule as
+    the code under test asserts the fake)."""
+
+    def __init__(self, initial=None):
+        self.data = dict(initial or {})
+        self.sets = []
+
+    def get(self, key):
+        return self.data.get(key, "")
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.sets.append((key, value))
+
+
+_WEEK_GYMS = ["gyma", "gymb"]
+
+
+def _week_rows():
+    """Two gyms, both hook values present in both, comfortably above the floor."""
+    rows = {}
+    for gym in ("gyma", "gymb"):
+        rows[gym] = (
+            [_metric_row(gym, i, score_likes=100, hook="question")
+             for i in range(8)]
+            + [_metric_row(gym, 100 + i, score_likes=10, hook="bold_claim")
+               for i in range(8)])
+    return rows
+
+
+def test_iso_week_key_is_pure_and_iso():
+    assert brain.iso_week_key(datetime(2026, 9, 6, tzinfo=timezone.utc)) == "2026-W36"
+    # 2026-09-07 is the Monday that starts W37
+    assert brain.iso_week_key(datetime(2026, 9, 7, tzinfo=timezone.utc)) == "2026-W37"
+    # zero padded, so string comparison of two keys in one year is chronological
+    assert brain.iso_week_key(datetime(2026, 1, 5, tzinfo=timezone.utc)) == "2026-W02"
+
+
+def test_run_weekly_flag_off_touches_nothing_at_all(monkeypatch):
+    """Flag OFF: no store read, no write, and the cadence marker is not even
+    consulted — a dormant lane must not poll a database."""
+    monkeypatch.delenv("AGENT_CROSS_GYM_BRAIN", raising=False)
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv()
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is False and out["ran"] is False
+    assert store.calls == [] and store.inserted == []
+    assert kv.sets == [] and kv.data == {}
+
+
+def test_run_weekly_fires_once_per_iso_week(monkeypatch):
+    """THE CADENCE RULING. The first nightly tick of an ISO week runs the job;
+    every later tick in the SAME week is a true no-op — no store constructed, no
+    fleet read, no second rollup row."""
+    _arm(monkeypatch)
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv()
+
+    first = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert first["ok"] is True and first["ran"] is True
+    assert first["week"] == "2026-W36"
+    assert len(store.inserted) == 1
+    calls_after_first = len(store.calls)
+
+    # the same night, and two more nights later, still inside 2026-W36
+    for later in (NOW, datetime(2026, 9, 6, 23, 0, tzinfo=timezone.utc)):
+        again = brain.run_weekly(gyms=_WEEK_GYMS, now=later, store=store,
+                                 kv_get=kv.get, kv_set=kv.set)
+        assert again["ran"] is False, "a second run inside one ISO week"
+        assert "already ran in ISO week 2026-W36" in again["reason"]
+    assert len(store.inserted) == 1, "only one rollup row per ISO week"
+    assert len(store.calls) == calls_after_first, "the store was read again"
+
+
+def test_run_weekly_fires_again_in_the_next_iso_week(monkeypatch):
+    """A new ISO week releases the gate. Keyed on the ISO WEEK, not on a fixed
+    weekday, so a missed nightly tick delays the digest but never skips a week."""
+    _arm(monkeypatch)
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv()
+    brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    # NOW is Sunday 2026-09-06 (W36); the Wednesday after is W37, and a Monday
+    # tick was missed entirely
+    nxt = brain.run_weekly(gyms=_WEEK_GYMS, now=datetime(2026, 9, 9, 2, 0, tzinfo=timezone.utc),
+                           store=store, kv_get=kv.get, kv_set=kv.set)
+    assert nxt["ran"] is True and nxt["week"] == "2026-W37"
+    assert len(store.inserted) == 2
+
+
+def test_a_failed_run_does_not_burn_the_week(monkeypatch):
+    """The marker is stamped only after run() reports ok. A write failure must
+    leave the week UNBURNED so the next nightly tick retries — otherwise one
+    transient 400 silently costs a whole week's digest."""
+    _arm(monkeypatch)
+
+    class _BadWrite(_FakeStore):
+        def insert_rollup(self, row):
+            self.calls.append(("insert_rollup", None))
+            raise RuntimeError("postgrest 400")
+
+    kv = _Kv()
+    bad = _BadWrite(rows_by_gym=_week_rows())
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=bad, kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is False and "rollup write failed" in out["reason"]
+    assert kv.sets == [], "a failed run must not stamp the cadence marker"
+
+    good = _FakeStore(rows_by_gym=_week_rows())
+    retry = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=good, kv_get=kv.get, kv_set=kv.set)
+    assert retry["ok"] is True and retry["ran"] is True
+    assert len(good.inserted) == 1
+
+
+def test_force_overrides_the_cadence_for_a_manual_run(monkeypatch):
+    """A human running the job by hand out of band is not blocked by the marker."""
+    _arm(monkeypatch)
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv({brain.WEEK_KV_KEY: "2026-W36"})
+    held = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert held["ran"] is False
+    forced = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, force=True,
+                              kv_get=kv.get, kv_set=kv.set)
+    assert forced["ran"] is True and len(store.inserted) == 1
+
+
+def test_an_unreadable_cadence_marker_holds_rather_than_runs(monkeypatch):
+    """Fail CLOSED: if the marker cannot be read we do not know whether this week
+    already ran, and running twice writes a duplicate rollup. Hold and say so."""
+    _arm(monkeypatch)
+
+    def _boom(_key):
+        raise RuntimeError("db locked")
+
+    store = _FakeStore(rows_by_gym=_week_rows())
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=_boom,
+                           kv_set=lambda k, v: None)
+    assert out["ok"] is False and out["ran"] is False
+    assert "cadence marker unreadable" in out["reason"]
+    assert store.calls == [] and store.inserted == []
+
+
+def test_runner_schedules_run_weekly_and_not_the_nightly_entry_point():
+    """WIRING ASSERTION (D68's "name the producer"): the nightly block in
+    run_daily must call run_weekly. Calling jobs.cross_gym_brain.run directly
+    would restore nightly behavior while every test here still passed, because
+    run() has no cadence gate of its own — exactly the inert/incorrect wiring
+    that looks identical to a healthy one from outside."""
+    import inspect
+
+    from agent import runner
+    src = inspect.getsource(runner.run_daily)
+    assert "run_weekly as _cross_gym_brain_weekly" in src
+    assert "_cross_gym_brain_weekly()" in src
+    assert "import run as _cross_gym_brain_run" not in src
+
+
+def test_listener_lists_the_weekly_lane_and_the_caption_lane():
+    import inspect
+
+    from agent import listener
+    src = inspect.getsource(listener._print_scheduled_lanes)
+    assert "cross gym brain (weekly)" in src
+    assert "AGENT_BRAIN_FEEDS_CAPTIONS" in src
+
+
+# ---------------------------------------------------------------------------
+# every safety guarantee of the nightly version, re-proven THROUGH run_weekly
+# ---------------------------------------------------------------------------
+
+def test_weekly_run_still_refuses_to_write_a_form_only_violation(monkeypatch):
+    """GUARANTEE 1 (form only whitelist + refuse to write), through the weekly
+    path. The store is PERMISSIVE — it accepts any row it is handed — so the only
+    thing that can stop the write is form_only_violations() in the code under
+    test."""
+    _arm(monkeypatch)
+    monkeypatch.setattr(brain, "top_posts_digest", lambda *a, **k: {
+        "n_top": 9, "n_rest": 81, "gyms_top": 3, "gyms_rest": 5,
+        "top_fraction": 0.1, "distinguishable": True, "verdict": "supported",
+        "note": brain.TOP_POSTS_NOTE,
+        "form": [{"lever": "hook_family",
+                  "value": "Down 42 lbs since January, ask Sarah how",
+                  "format_stratum": "*", "n": 9, "gyms": 3, "n_other": 20,
+                  "share_top": 1.0, "share_rest": 0.2, "effect_size": 1.6,
+                  "p_value": 0.0001, "q_value": 0.001, "verdict": "supported"}]})
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv()
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is False
+    assert "form only whitelist violation" in out["reason"]
+    assert store.inserted == [], "a violating artifact must never be written"
+    assert kv.sets == [], "a refused run must not burn the week either"
+
+
+def test_weekly_run_still_enforces_the_two_distinct_gym_floor(monkeypatch):
+    """GUARANTEE 2 (cross gym isolation). ONE gym, an enormous and perfectly
+    clean difference, n far above the sample floor: still zero guidance, because
+    a finding one gym alone could produce is that gym's content."""
+    _arm(monkeypatch)
+    rows = {"solo": ([_metric_row("solo", i, score_likes=900, hook="question")
+                      for i in range(40)]
+                     + [_metric_row("solo", 100 + i, score_likes=1,
+                                    hook="bold_claim") for i in range(40)])}
+    store = _FakeStore(rows_by_gym=rows)
+    kv = _Kv()
+    out = brain.run_weekly(gyms=["solo"], now=NOW, store=store,
+                           kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is True and out["ran"] is True
+    assert out["guidance"] == []
+    assert {f["verdict"] for f in out["findings"]} == {"insufficient_data"}
+    # and the same floor governs the best post digest
+    assert out["top_posts"]["gyms_top"] == 1
+    assert out["top_posts"]["verdict"] == "insufficient_data"
+    assert out["top_posts"]["distinguishable"] is False
+
+
+def test_weekly_run_artifact_carries_no_gym_id_anywhere(monkeypatch):
+    """GUARANTEE 3. No gym identifier reaches the stored row, in any section,
+    including the new best post digest."""
+    _arm(monkeypatch)
+    store = _FakeStore(rows_by_gym=_week_rows())
+    kv = _Kv()
+    brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    blob = json.dumps(store.inserted[0], default=str)
+    assert "gyma" not in blob and "gymb" not in blob
+    assert "gym_id" not in blob
+
+
+def test_weekly_run_still_drops_a_free_text_pillar(monkeypatch):
+    """GUARANTEE 4 (whitelist, not blacklist). Production content_calendar really
+    does carry caption fragments in `pillar`; such a row contributes its other
+    FORM and its pillar is DROPPED, never leaked into the artifact."""
+    _arm(monkeypatch)
+    rows = _week_rows()
+    for gym in rows:
+        for row in rows[gym]:
+            row["pillar"] = "We do the heavy lifting"
+    store = _FakeStore(rows_by_gym=rows)
+    kv = _Kv()
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is True
+    assert "heavy lifting" not in json.dumps(store.inserted[0], default=str)
+    assert not any(f["lever"] == "pillar" for f in out["findings"])
+
+
+# ===========================================================================
+# THE BEST POST DIGEST — "digest weekly the best post"
+# ===========================================================================
+
+def test_fisher_exact_matches_the_hand_computed_tea_tasting_table():
+    """The canonical 2x2: [[3,1],[1,3]] has two sided p = 0.4857142857...,
+    computable by hand from the hypergeometric margins. Exact, no table."""
+    p = brain.fisher_exact_two_sided(3, 1, 1, 3)
+    assert abs(p - 0.4857142857142857) < 1e-12
+    # perfect separation on the same margins is the extreme table
+    assert abs(brain.fisher_exact_two_sided(4, 0, 0, 4) - 0.02857142857142857) < 1e-12
+    # an empty margin is no evidence, never a manufactured significance
+    assert brain.fisher_exact_two_sided(0, 0, 5, 5) == 1.0
+
+
+def test_cohens_h_matches_a_hand_computed_case():
+    """h(1.0, 0.5) = 2*asin(1) - 2*asin(sqrt(0.5)) = pi - pi/2 = pi/2."""
+    import math
+    assert abs(brain.cohens_h(1.0, 0.5) - math.pi / 2) < 1e-12
+    assert brain.cohens_h(0.5, 0.5) == 0.0
+    assert brain.cohens_h(None, 0.5) is None
+    assert brain.cohens_h(1.5, 0.5) is None       # not a proportion
+
+
+def _posts(n, gym, score, **levers):
+    base = {"hook_family": "question", "caption_len_band": "mid",
+            "sentence_band": "three_to_five", "pillar": "service",
+            "ask_type": "booking_link", "ask_present": "yes",
+            "time_slot": "morning", "format": "feed",
+            "media_product_type": "feed", "has_member_face": "no"}
+    base.update(levers)
+    return [{"gym_id": gym, "score": float(score), "stratum": base["format"],
+             "levers": dict(base)} for _ in range(n)]
+
+
+def test_split_cuts_on_a_score_value_not_a_position():
+    """A tie straddling the cut must not make the split depend on input order:
+    everything tied with the last post IN is also in."""
+    posts = _posts(6, "a", 5.0) + _posts(6, "b", 5.0)
+    top, rest = brain.split_top_posts(posts, top_fraction=0.5, min_n=2)
+    # every score is identical, so the cut cannot separate anything and BOTH
+    # sides cannot clear the floor -> no split at all, honestly
+    assert (top, rest) == ([], [])
+    mixed = _posts(4, "a", 9.0) + _posts(8, "b", 1.0)
+    top, rest = brain.split_top_posts(mixed, top_fraction=0.25, min_n=3)
+    assert len(top) == 4 and len(rest) == 8
+    assert all(p["score"] == 9.0 for p in top)
+
+
+def test_split_refuses_when_either_side_is_below_the_floor():
+    """Four posts is not a trend. No split, and the caller reports
+    insufficient_data rather than describing noise."""
+    assert brain.split_top_posts(_posts(4, "a", 1.0), min_n=6) == ([], [])
+    # 10 posts: a top decile of 1 is below the floor, so the floor lifts it to 6
+    top, rest = brain.split_top_posts(
+        _posts(6, "a", 9.0) + _posts(6, "b", 1.0), top_fraction=0.1, min_n=6)
+    assert len(top) == 6 and len(rest) == 6
+
+
+def test_digest_says_not_distinguishable_at_todays_fleet_volume(monkeypatch):
+    """THE HEADLINE RULING FOR THE DIGEST. At the fleet's real volume the top
+    decile is single digits and nothing separates it from the rest. The artifact
+    must SAY the best posts are not distinguishable from noise, not crown one."""
+    _arm(monkeypatch)
+    # 90 posts across 5 gyms, scores jittered so no FORM token tracks the split
+    rows = {}
+    for g, gym in enumerate(("g1", "g2", "g3", "g4", "g5")):
+        rows[gym] = [
+            _metric_row(gym, i, score_likes=10 + ((i * 7 + g * 3) % 40),
+                        hook=("question" if (i + g) % 2 else "bold_claim"))
+            for i in range(18)]
+    store = _FakeStore(rows_by_gym=rows)
+    kv = _Kv()
+    out = brain.run_weekly(gyms=list(rows), now=NOW, store=store,
+                           kv_get=kv.get, kv_set=kv.set)
+    digest = out["top_posts"]
+    assert digest["distinguishable"] is False
+    assert digest["verdict"] in ("insufficient_data", "not_significant")
+    assert brain.guidance_from_top_posts(digest) == []
+    # the verdict is STORED, so a human reading the rollup sees the honest answer
+    assert store.inserted[0]["top_posts"]["distinguishable"] is False
+    assert store.inserted[0]["top_posts"]["note"] == brain.TOP_POSTS_NOTE
+
+
+def test_digest_refuses_a_top_decile_drawn_from_one_gym():
+    """CROSS GYM ISOLATION, applied to the best posts. One gym owning the whole
+    top decile is that gym's content, however clean the numbers look."""
+    posts = _posts(10, "solo", 9.0) + _posts(80, "other", 1.0)
+    digest = brain.top_posts_digest(posts)
+    assert digest["gyms_top"] == 1
+    assert digest["verdict"] == "insufficient_data"
+    assert digest["distinguishable"] is False
+    assert digest["form"] == []
+
+
+def test_a_token_carried_by_one_gyms_top_posts_alone_is_insufficient_data():
+    """The same rule one level down: the top decile spans two gyms, but the
+    over represented token inside it comes from only one of them."""
+    posts = (_posts(8, "a", 9.0, hook_family="story_open")
+             + _posts(8, "b", 9.0, hook_family="question")
+             + _posts(40, "a", 1.0, hook_family="question")
+             + _posts(40, "b", 1.0, hook_family="question"))
+    digest = brain.top_posts_digest(posts, min_gyms=2)
+    story = [i for i in digest["form"]
+             if i["lever"] == "hook_family" and i["value"] == "story_open"]
+    assert story and story[0]["gyms"] == 1
+    assert story[0]["verdict"] == "insufficient_data"
+    assert not any(g["value"] == "story_open"
+                   for g in brain.guidance_from_top_posts(digest))
+
+
+def test_a_real_cross_gym_top_post_signal_does_become_guidance():
+    """THE NOT-INERT TEST. The digest must be capable of producing guidance when
+    a signal genuinely is there across gyms, or the whole lane is a no-op that
+    looks healthy (D68's "built but not wired" shape). 20 story_open posts across
+    TWO gyms occupy the entire top decile of 100; that is a real, cross gym,
+    exactly-computable separation and it must clear the bar."""
+    posts = []
+    for j in range(20):
+        gym = "a" if j % 2 == 0 else "b"
+        posts += _posts(1, gym, 400.0 + j, hook_family="story_open")
+    for j in range(80):
+        gym = "a" if j % 2 == 0 else "b"
+        posts += _posts(1, gym, 1.0 + j * 0.1, hook_family="question")
+    digest = brain.top_posts_digest(posts)
+    assert digest["n_top"] == 10 and digest["gyms_top"] == 2
+    assert digest["distinguishable"] is True
+    assert digest["verdict"] == "supported"
+    items = brain.guidance_from_top_posts(digest)
+    assert items, "a real cross gym top post signal produced no guidance"
+    top = items[0]
+    assert top["lever"] == "hook_family" and top["value"] == "story_open"
+    assert top["direction"] == "favor"
+    assert top["source"] == brain.SOURCE_TOP_POSTS
+    assert top["gyms"] == 2 and top["n"] == 10
+    # and it is pure form: nothing in the item is outside the whitelist
+    assert brain.form_only_violations(top) == []
+
+
+def test_a_poisoned_best_post_entry_is_refused_not_sanitised(monkeypatch):
+    """BLAKE'S ABSOLUTE BOUNDARY. A top post's own caption text, offer, stat or
+    member story must NEVER propagate to another gym. If such a value somehow
+    reaches the artifact, the run REFUSES TO WRITE — it does not strip the string
+    and ship the rest, because a sanitiser that silently succeeds teaches nobody
+    that the boundary was crossed.
+
+    The store here is PERMISSIVE (it accepts any row), so only
+    form_only_violations() in the code under test can stop this."""
+    _arm(monkeypatch)
+    poisons = [
+        # a caption fragment used as a lever value
+        {"lever": "hook_family", "value": "Sarah lost 42 lbs in 12 weeks",
+         "format_stratum": "*", "n": 9, "gyms": 3, "verdict": "supported"},
+        # an offer smuggled in as a pillar token
+        {"lever": "pillar", "value": "$99 for 6 weeks unlimited",
+         "format_stratum": "*", "n": 9, "gyms": 3, "verdict": "supported"},
+        # a permalink, i.e. an identifiable post
+        {"lever": "format", "value": "reel", "format_stratum": "*",
+         "n": 9, "gyms": 3, "verdict": "supported",
+         "note": "https://www.instagram.com/p/ABC123/"},
+    ]
+    for poison in poisons:
+        digest = {"n_top": 9, "n_rest": 81, "gyms_top": 3, "gyms_rest": 5,
+                  "top_fraction": 0.1, "distinguishable": False,
+                  "verdict": "not_significant", "note": brain.TOP_POSTS_NOTE,
+                  "form": [poison]}
+        monkeypatch.setattr(brain, "top_posts_digest", lambda *a, **k: digest)
+        store = _FakeStore(rows_by_gym=_week_rows())
+        kv = _Kv()
+        out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+        assert out["ok"] is False, f"poison passed: {poison}"
+        assert "form only whitelist violation" in out["reason"]
+        assert store.inserted == [], f"poison was written: {poison}"
+        # refused, NOT sanitised: the run does not quietly write a cleaned row
+        assert out.get("violations")
+
+
+def test_a_real_top_post_caption_never_reaches_the_digest(monkeypatch):
+    """The natural path, not a monkeypatched one: real captions carrying a stat,
+    a price and a member name go in, and not one character of them comes out."""
+    _arm(monkeypatch)
+    rows, captions = {}, {}
+    poison = ("Sarah dropped 42 lbs and our $99 six week challenge starts "
+              "Monday. DM @gymfamous to claim.")
+    for gym in ("gyma", "gymb"):
+        rows[gym] = []
+        for i in range(18):
+            cal = f"cal-{gym}-{i}"
+            rows[gym].append(_metric_row(gym, i, score_likes=10 + i * 5,
+                                         calendar_id=cal))
+            # two length bands, so caption_len_band actually has something to
+            # compare and the derivation path is genuinely exercised
+            captions[cal] = poison if i % 2 else (poison + " " + "More. " * 90)
+    store = _FakeStore(rows_by_gym=rows, captions=captions)
+    kv = _Kv()
+    out = brain.run_weekly(gyms=_WEEK_GYMS, now=NOW, store=store, kv_get=kv.get, kv_set=kv.set)
+    assert out["ok"] is True
+    blob = json.dumps(store.inserted[0], default=str)
+    for leaked in ("Sarah", "42", "$99", "gymfamous", "challenge", "DM"):
+        assert leaked not in blob, f"{leaked!r} leaked into the rollup"
+    # the captions were still USED: their length and structure bands are there
+    levers = {f["lever"] for f in out["findings"]}
+    assert "caption_len_band" in levers or "sentence_band" in levers
+
+
+def test_digest_guidance_joins_the_lever_guidance_under_one_whitelist(monkeypatch):
+    """Both halves of the rollup's guidance are re-validated by the SAME
+    cross_gym_guidance._clean whitelist on the read, and are tagged with the
+    source they came from so a reader can tell the weaker claim apart."""
+    _arm(monkeypatch)
+    store = _FakeStore(rollup={
+        "run_at": "2026-09-06T02:00:00+00:00",
+        "guidance": [
+            {"lever": "hook_family", "value": "question", "format_stratum": "feed",
+             "direction": "favor", "effect_size": 0.9, "n": 24, "gyms": 3,
+             "q_value": 0.001, "source": brain.SOURCE_LEVERS},
+            {"lever": "caption_len_band", "value": "short",
+             "format_stratum": "*", "direction": "favor", "effect_size": 1.2,
+             "n": 10, "gyms": 2, "q_value": 0.004,
+             "source": brain.SOURCE_TOP_POSTS},
+            # and a poisoned item is DROPPED on the read, not rendered
+            {"lever": "hook_family", "value": "Sarah lost 42 lbs",
+             "format_stratum": "feed", "direction": "favor", "effect_size": 2.0,
+             "n": 9, "gyms": 3, "q_value": 0.001},
+        ]})
+    out = guidance.guidance_for("gyma", now=NOW, store=store)
+    assert len(out["guidance"]) == 2
+    assert {g["source"] for g in out["guidance"]} == {
+        brain.SOURCE_LEVERS, brain.SOURCE_TOP_POSTS}
+    lines = guidance.prompt_lines("gyma", now=NOW, store=store)
+    assert len(lines) == 2
+    assert not any("Sarah" in line or "42 lbs" in line for line in lines)
+
+
+# ===========================================================================
+# THE FOUR REVIEW DEFECTS (2026-09-06). Each of these failed before its fix.
+# ===========================================================================
+
+def test_an_untested_cell_publishes_no_engagement_measure():
+    """DEFECT 1: RE-IDENTIFICATION. Before this fix an insufficient_data finding
+    still stored mean_log_engagement for its cell. At n=1 / gyms=1 that is log1p
+    of ONE identifiable post from ONE identifiable gym, and an unusual lever token
+    narrows it to a specific gym on a ~19 gym fleet — so the artifact's "no
+    gym_id" guarantee leaked straight through the measurement.
+
+    A cell that did not qualify for a test publishes its COUNTS and its verdict,
+    and no measured value at all."""
+    posts = ([{"gym_id": "solo", "score": 9.0, "stratum": "feed",
+               "levers": {"pillar": "summit", "format": "feed"}}]
+             + [{"gym_id": "other", "score": 1.0 + i * 0.1, "stratum": "feed",
+                 "levers": {"pillar": "service", "format": "feed"}}
+                for i in range(20)])
+    findings = brain.evaluate(brain.lever_cells(posts))
+    lonely = [f for f in findings
+              if f["lever"] == "pillar" and f["value"] == "summit"]
+    assert lonely, "the single gym cell should still be reported"
+    f = lonely[0]
+    assert f["verdict"] == "insufficient_data"
+    assert f["n"] == 1 and f["gyms"] == 1        # the counts stay: they explain why
+    assert f["mean_log_engagement"] is None
+    assert f["mean_log_engagement_other"] is None
+    # and nothing anywhere in the run's findings measures an unqualified cell
+    for x in findings:
+        if x["verdict"] == "insufficient_data":
+            assert x["mean_log_engagement"] is None
+            assert x["mean_log_engagement_other"] is None
+            assert x["effect_size"] is None
+
+
+def test_ninety_nine_posts_from_one_gym_plus_one_is_not_a_fleet_finding():
+    """DEFECT 2: PSEUDOREPLICATION. ">= 2 distinct gyms" alone is satisfied by a
+    cell of 99 posts from one gym and 1 from another, and Welch's t then treats
+    99 correlated posts from a single voice as 99 independent draws — the fleet
+    would learn one gym's habits and hand them to everyone else.
+
+    Two structural rules close it: a gym must contribute MIN_GYM_CELL_N posts to
+    COUNT toward the floor, and no gym may exceed MAX_GYM_CELL_SHARE of a cell."""
+    hi = ([{"gym_id": "dom", "score": 9.0 + i * 0.01, "stratum": "feed",
+            "levers": {"hook_family": "question", "format": "feed"}}
+           for i in range(99)]
+          + [{"gym_id": "tok", "score": 9.5, "stratum": "feed",
+              "levers": {"hook_family": "question", "format": "feed"}}])
+    lo = ([{"gym_id": "dom", "score": 1.0 + i * 0.01, "stratum": "feed",
+            "levers": {"hook_family": "bold_claim", "format": "feed"}}
+           for i in range(30)]
+          + [{"gym_id": "tok", "score": 1.2 + i * 0.01, "stratum": "feed",
+              "levers": {"hook_family": "bold_claim", "format": "feed"}}
+             for i in range(30)])
+    findings = brain.evaluate(brain.lever_cells(hi + lo))
+    q = [f for f in findings
+         if f["lever"] == "hook_family" and f["value"] == "question"][0]
+    assert q["n"] == 100 and q["gyms"] == 2, "the raw counts do pass the old rule"
+    assert q["gyms_qualified"] == 1, "only one gym contributed >= 2 posts"
+    assert q["top_gym_share"] == pytest.approx(0.99, abs=1e-6)
+    assert q["verdict"] == "insufficient_data"
+    assert brain.guidance_from(findings) == []
+
+
+def test_the_dominance_cap_alone_refuses_a_lopsided_cell():
+    """The other half of defect 2: BOTH gyms clear the per gym floor, so the
+    distinct gym count and the qualified count both say 2 — and the cell is still
+    92% one gym, so it is still refused. Without the share cap this passes."""
+    hi = ([{"gym_id": "dom", "score": 9.0 + i * 0.01, "stratum": "feed",
+            "levers": {"hook_family": "question", "format": "feed"}}
+           for i in range(24)]
+          + [{"gym_id": "tok", "score": 9.4 + i * 0.01, "stratum": "feed",
+              "levers": {"hook_family": "question", "format": "feed"}}
+             for i in range(2)])
+    lo = ([{"gym_id": g, "score": 1.0 + i * 0.01, "stratum": "feed",
+            "levers": {"hook_family": "bold_claim", "format": "feed"}}
+           for g in ("dom", "tok") for i in range(15)])
+    findings = brain.evaluate(brain.lever_cells(hi + lo))
+    q = [f for f in findings
+         if f["lever"] == "hook_family" and f["value"] == "question"][0]
+    assert q["gyms_qualified"] == 2, "both gyms cleared the per gym floor"
+    assert q["top_gym_share"] > brain.MAX_GYM_CELL_SHARE
+    assert q["verdict"] == "insufficient_data"
+
+
+def test_an_evenly_spread_cell_still_passes_both_new_rules():
+    """The guard must not simply refuse everything: a genuinely even, genuinely
+    cross gym cell is untouched by either new rule."""
+    hi = [{"gym_id": g, "score": 9.0 + i * 0.01, "stratum": "feed",
+           "levers": {"hook_family": "question", "format": "feed"}}
+          for g in ("a", "b", "c") for i in range(6)]
+    lo = [{"gym_id": g, "score": 1.0 + i * 0.01, "stratum": "feed",
+           "levers": {"hook_family": "bold_claim", "format": "feed"}}
+          for g in ("a", "b", "c") for i in range(6)]
+    findings = brain.evaluate(brain.lever_cells(hi + lo))
+    q = [f for f in findings
+         if f["lever"] == "hook_family" and f["value"] == "question"][0]
+    assert q["gyms_qualified"] == 3
+    assert q["top_gym_share"] == pytest.approx(1 / 3, abs=1e-4)
+    assert q["verdict"] == "supported"
+    assert brain.guidance_from(findings)
+
+
+def test_qualified_gyms_and_top_gym_share_are_pure_and_fail_closed():
+    assert brain.qualified_gyms({"a": 5, "b": 1, "c": 2}, 2) == 2
+    assert brain.qualified_gyms({}, 2) == 0
+    assert brain.top_gym_share({"a": 9, "b": 1}) == pytest.approx(0.9)
+    assert brain.top_gym_share({}) == 1.0, "an empty cell must fail closed"
+    assert brain.top_gym_share(None) == 1.0
+
+
+def test_the_digest_applies_the_same_pseudoreplication_guard():
+    """Defect 2 in the best post digest: a token carried by the top decile is not
+    a fleet trait when one gym supplies almost all of it."""
+    posts = ([{"gym_id": "dom", "score": 90.0 + i, "stratum": "feed",
+               "levers": {"hook_family": "story_open", "format": "feed"}}
+              for i in range(9)]
+             + [{"gym_id": "tok", "score": 95.0, "stratum": "feed",
+                 "levers": {"hook_family": "story_open", "format": "feed"}}]
+             + [{"gym_id": g, "score": 1.0 + i * 0.1, "stratum": "feed",
+                 "levers": {"hook_family": "question", "format": "feed"}}
+                for g in ("dom", "tok") for i in range(45)])
+    digest = brain.top_posts_digest(posts)
+    story = [i for i in digest["form"]
+             if i["lever"] == "hook_family" and i["value"] == "story_open"]
+    assert story
+    assert story[0]["top_gym_share"] > brain.MAX_GYM_CELL_SHARE
+    assert story[0]["verdict"] == "insufficient_data"
+    assert story[0]["share_top"] is None, "no measured share for a refused cell"
+    assert digest["distinguishable"] is False
+    assert brain.guidance_from_top_posts(digest) == []
+
+
+def test_a_rollup_write_failure_alerts_a_human(monkeypatch):
+    """DEFECT 3: the ops_alerts.alert in run_daily's cross gym block was
+    UNREACHABLE — run() swallows its own write exception one frame earlier, so
+    the except never fired and a real 400 printed a benign "skipped" and alerted
+    nobody. It now returns failed=True and the runner has a branch for it.
+
+    This matters concretely: the table exists in production WITHOUT the
+    top_posts column, so arming before the migration is hand-applied produces
+    exactly this 400."""
+    _arm(monkeypatch)
+
+    class _BadWrite(_FakeStore):
+        def insert_rollup(self, row):
+            raise RuntimeError("postgrest 400: column top_posts does not exist")
+
+    out = brain.run(gyms=_WEEK_GYMS, now=NOW, store=_BadWrite(rows_by_gym=_week_rows()))
+    assert out["ok"] is False
+    assert out["failed"] is True, "a write failure must be distinguishable from OFF"
+    # ... and a merely DORMANT lane must NOT look like a failure
+    monkeypatch.delenv("AGENT_CROSS_GYM_BRAIN", raising=False)
+    dormant = brain.run(gyms=_WEEK_GYMS, now=NOW, store=_FakeStore())
+    assert dormant.get("failed") is not True
+
+
+def test_a_form_only_refusal_also_alerts(monkeypatch):
+    """A whitelist violation means something upstream is emitting non form
+    values. That must reach a human, not print as "skipped"."""
+    _arm(monkeypatch)
+    monkeypatch.setattr(brain, "top_posts_digest", lambda *a, **k: {
+        "n_top": 9, "form": [{"lever": "hook_family", "value": "a caption"}]})
+    out = brain.run(gyms=_WEEK_GYMS, now=NOW,
+                    store=_FakeStore(rows_by_gym=_week_rows()))
+    assert out["ok"] is False and out["failed"] is True
+
+
+def test_runner_has_a_reachable_alert_branch_for_a_reported_failure():
+    """WIRING (D68 "name the producer"): assert the runner actually BRANCHES on
+    failed and alerts there. Without this the fix is a flag nothing reads — the
+    built-but-not-wired shape, and invisible because the healthy path is
+    identical."""
+    import inspect
+
+    from agent import runner
+    src = inspect.getsource(runner.run_daily)
+    block = src.split("_cross_gym_brain_weekly()", 1)[1].split("GYM MEDIA")[0]
+    assert '_cgb.get("failed")' in block
+    assert block.index('_cgb.get("failed")') < block.index("except Exception")
+    alert_pos = block.index("ops_alerts.alert")
+    assert alert_pos < block.index("except Exception"), \
+        "the alert must be reachable WITHOUT an exception being raised"
+
+
+def test_a_failed_read_is_logged_distinguishably_from_an_empty_table(capsys):
+    """DEFECT 4: _get returned [] on any 4xx/5xx, so an armed brain whose
+    migration is missing read 400 forever and was byte-for-byte identical to a
+    dormant one. The status code is now logged (never the response body)."""
+
+    class _Resp:
+        status_code = 400
+
+        def json(self):
+            return []
+
+    class _Http:
+        def get(self, *a, **k):
+            return _Resp()
+
+    store = brain.SupabaseBrainStore(url="https://x.test", service_key="k",
+                                     http=_Http())
+    assert store.latest_rollup() is None          # still degrades to empty
+    out = capsys.readouterr().out
+    assert "cross_gym_brain" in out and "400" in out

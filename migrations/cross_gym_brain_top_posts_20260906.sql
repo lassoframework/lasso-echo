@@ -1,0 +1,38 @@
+-- Migration: cross_gym_brain_top_posts_20260906
+-- Adds the BEST POST DIGEST column to cross_gym_brain (see
+-- migrations/cross_gym_brain_20260906.sql for the table itself).
+--
+-- Blake, 2026-09-06: "i want echo to build a brain for all gyms it digest weekly
+-- the best post and then is able to digest all the post for the week see trends
+-- on what is working."
+--
+-- ARMING PREREQUISITE. cross_gym_brain already exists in production (the base
+-- migration was hand-applied on 2026-09-06). agent/jobs/cross_gym_brain.py now
+-- writes a `top_posts` key on every rollup insert, so THIS ALTER MUST BE APPLIED
+-- BEFORE AGENT_CROSS_GYM_BRAIN is armed. Without it every weekly insert returns
+-- 400 and the run reports {"ok": false, "reason": "rollup write failed: ..."} --
+-- loud, never silent, but no rollup is stored.
+--
+-- Echo's convention (unlike the portal's 0xxx_ files) is that migrations/*.sql
+-- here are hand-applied and are NOT recorded in public.schema_migrations.
+--
+-- WHAT LANDS IN THIS COLUMN. FORM statistics about the fleet's top decile of
+-- posts by engagement score, and nothing else. Counts, shares, whitelisted lever
+-- name and lever VALUE tokens, p/q values and Cohen's h. There is deliberately
+-- no key for caption text, a permalink, a post id or a gym id anywhere in
+-- cross_gym_brain.form_only_violations()'s allow-list, so such a value has
+-- nowhere legal to sit and the writer REFUSES to write an artifact carrying one.
+-- A top post's own offer, stat, member story or caption can never cross from the
+-- gym that published it to any other gym's prompt.
+--
+-- The honest expected value at today's fleet volume is
+--   {"n_top": 9, "n_rest": 81, "distinguishable": false,
+--    "verdict": "insufficient_data" | "not_significant", "form": [...]}
+-- i.e. the digest SAYS the best posts are not distinguishable from noise rather
+-- than crowning one. That is the correct output, not a failure.
+--
+-- Additive and idempotent: ADD COLUMN IF NOT EXISTS only. Existing rows keep the
+-- default, so a rollup written before this migration reads back as "no digest".
+
+ALTER TABLE cross_gym_brain
+    ADD COLUMN IF NOT EXISTS top_posts jsonb NOT NULL DEFAULT '{}'::jsonb;
