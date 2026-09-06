@@ -61,8 +61,21 @@ def hook_family(caption: str) -> str:
 
 _ASK_COMMENT_RE = re.compile(r"\bcomment [\"“']?\w+[\"”']?", re.I)
 _ASK_DM_RE = re.compile(r"\b(dm us|dm [\"“']?\w+[\"”']?|message us)\b", re.I)
+# THE ADJACENCY FALSE NEGATIVE, fixed here 2026-09-05. copy_gate.ASK_RE carried
+# exactly this bug and was fixed on 2026-08-31 ("The article and the noun are
+# almost never adjacent in real copy: 'Book a FREE NO SWEAT intro', 'Book your
+# FIRST class'... That single false negative was the dominant defect code across
+# the whole fleet"). The fix was never propagated to this classifier, so
+# ask_type() went on reading a real booking CTA as 'none'. Measured on CrossFit
+# Reverb's live book: ask_type='none' on 93 of 93 rows. Those labels are copied
+# onto post_metrics by metrics_sync and compared on by monthly_retro, so the
+# learner has been training on a column that says no post ever asks for anything.
+# Up to three modifier words between the article and the noun, same bound
+# copy_gate uses; more than that is a sentence, not an ask.
+_ASK_MODS = r"(?: [\w'-]+){0,3}"
 _ASK_BOOKING_RE = re.compile(
-    r"\b(book (a|your) (call|intro|class|spot)|schedule (a|your)|sign up|"
+    rf"\b(book (a|your){_ASK_MODS} (call|intro|class|spot|session|visit|tour)|"
+    r"schedule (a|your)|sign up|"
     r"get started|claim your|reserve your|try a (free )?class|"
     r"start (here|today|your))\b", re.I)
 _ASK_BIO_RE = re.compile(r"\blink in (our )?bio\b", re.I)
