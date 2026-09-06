@@ -937,3 +937,114 @@ def test_the_exemption_needs_the_flag(monkeypatch):
     grade = calendar_grade.grade_month(rows, profile="GYM")
     assert grade.scores["path_to_join"] == 0, grade.scores
     assert not any("no approved CTA" in k for k in grade.exempt), grade.exempt
+
+
+# ---------------------------------------------------------------------------
+# THE HONEST CEILING. Blake: "No fake/generic/repeated CTA just to hit a
+# target." A gym with ONE approved CTA cannot ask more than once per
+# anti-repetition window, so a third of its book is a target it can only reach
+# by repeating. Measured on the live fleet at window 10, only 2 of 18 gyms have
+# a ceiling at or above 33%; 11 sit below it and 5 have no usable CTA at all.
+# ---------------------------------------------------------------------------
+
+def test_the_ceiling_is_pool_size_once_per_window():
+    h = cv.honest_ask_ceiling
+    assert h(31, 0) == 0            # nothing approved: nothing honest to ask
+    # One CTA may reappear only once every window+1 posts, so 31 posts at
+    # window 10 gives ceil(31/11) = 3 slots. Measured, not reasoned: _fix_craft
+    # places exactly 3 (posts 1, 12, 23). An earlier ceil(n/window) said 4.
+    assert h(31, 1) == 3
+    assert h(31, 2) == 6
+    assert h(31, 4) == 12
+    assert h(48, 1) == 5
+    assert h(14, 2) == 4
+    assert h(10, 99) == 10          # never more asks than there are posts
+    assert h(0, 5) == 0
+
+
+def test_the_repair_target_is_capped_by_what_the_gym_can_supply(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    # 31 posts at 33% wants 10, but one CTA can only honestly cover 4.
+    assert grade_fix._ask_target_posts(31) == 10
+    assert grade_fix._ask_target_posts(31, pool_size=1) == 3
+    assert grade_fix._ask_target_posts(31, pool_size=4) == 10   # ceiling 12 > want
+    assert grade_fix._ask_target_posts(31, pool_size=0) == 0
+
+
+def test_a_thin_pool_gym_is_not_marked_down_for_the_unreachable_share(monkeypatch):
+    """11 of 18 live gyms are in this position. Without the cap they lose points
+    every night for a number no code can reach for them."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool",
+                        lambda g, log: ["Book your free No Sweat Intro"])
+    rows = _book(31)
+    # Give it the 3 asks its single CTA can honestly cover.
+    for r in rows[:3]:
+        r["caption"] = f"{r['caption']}\nBook your free No Sweat Intro"
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 10, grade.scores
+    assert any("capped by the gym's approved CTA pool" in k for k in grade.exempt), grade.exempt
+
+
+def test_a_thin_pool_gym_below_even_its_ceiling_is_still_marked_down(monkeypatch):
+    """The cap lowers the bar; it does not remove it."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool",
+                        lambda g, log: ["Book your free No Sweat Intro"])
+    rows = _book(31)                 # zero asks, ceiling is 4
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] < 10, grade.scores
+
+
+def test_a_rich_pool_gym_is_still_held_to_the_full_share(monkeypatch):
+    """The mutation guard: a gym whose pool CAN cover 33% gets no cap and no
+    exemption."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    assert not any("capped by" in k for k in grade.exempt), grade.exempt
+
+
+def test_the_booking_leg_is_capped_by_the_same_ceiling(monkeypatch):
+    """A gym whose pool can only honestly cover 2 asks cannot be asked for 5
+    booking-specific ones."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    cta = "Book your free No Sweat Intro"
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [cta])
+    rows = _book(14)                 # ceiling = 1 * ceil(14/10) = 2
+    for r in rows[:2]:
+        r["caption"] = f"{r['caption']}\n{cta}"
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    booking = [d for d in grade.defects if "booking-specific" in str(d[2])]
+    assert booking == [], booking
+
+
+def test_fix_craft_stops_at_the_ceiling_not_the_share(monkeypatch):
+    """A 31 post book at 33% wants 10 asks. A gym with ONE approved CTA can only
+    honestly cover 3, and asking for the other 7 means repeating a closing
+    inside the window -- the thing Blake ruled out.
+
+    HONEST NOTE, because mutation checking made it explicit: removing the
+    pool-size argument from _fix_craft's _booking_deficit call leaves this test
+    GREEN. The anti-repetition rail (pick_non_colliding + _recent_closings)
+    independently enforces the same bound inside the repair loop, so the cap
+    there is DEFENCE IN DEPTH and an honest deficit number, not the mechanism.
+
+    The ceiling is load-bearing in the GRADER, which has no such rail and would
+    otherwise mark 11 of 18 live gyms down every night for a share they cannot
+    reach; those mutations do go red. This test pins the OUTCOME either way, and
+    says which half is actually holding it.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool",
+                        lambda g, log: ["Book your free No Sweat Intro"])
+    rows = _book(31)
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None)
+    asking = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
+    assert asking == 3, asking
+    # And no two of them share a closing inside the window.
+    assert [c for c in cv.collisions(rows, window=10)
+            if c["kind"] == "closing"] == []
