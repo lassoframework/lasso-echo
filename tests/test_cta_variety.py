@@ -261,3 +261,140 @@ def test_empty_pool_never_produces_an_ask(monkeypatch):
     rows = _run(_book(6), monkeypatch, variety=True, pool=[])
     from agent.calendar_grade import _BOOKING_RE
     assert [r for r in rows if _BOOKING_RE.search(r["caption"])] == []
+
+
+# ---------------------------------------------------------------------------
+# 6. The learning levers must tell the truth after a repair
+# ---------------------------------------------------------------------------
+# Measured on Reverb's live book: ask_type='none' on 93 of 93 rows while 90 of
+# them ended in an ask, and caption_len_band='mid' on 100% of rows. The levers
+# are stamped at STAGE time against the SB7 body (which by design carries no
+# CTA); this lane then mutates the caption and only ever wrote caption/pillar.
+# jobs/backfill_levers could not correct it either: it selects rows WHERE
+# hook_family IS NULL, and these were already stamped. metrics_sync copies these
+# columns onto post_metrics and monthly_retro compares on them, so a stale lever
+# is a lie the cross-gym learner trains on.
+
+class _LeverStore(_FakeStore):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.levers_seen = []
+
+    def patch_pending_plan(self, gym_id, row_id, *, caption=None, pillar=None,
+                           levers=None):
+        self.levers_seen.append(levers)
+        out = super().patch_pending_plan(gym_id, row_id, caption=caption,
+                                         pillar=pillar)
+        if out is not None and levers:
+            for r in self.rows:
+                if r.get("id") == row_id:
+                    r.update(levers)
+        return out
+
+
+def test_repair_restamps_ask_type_to_the_truth(monkeypatch):
+    """The exact production lie: a caption that ends in an ask labelled
+    ask_type='none'."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(4)
+    for r in rows:
+        r["ask_type"] = "none"
+        r["caption_len_band"] = "mid"
+    grade_fix._fix_craft("reverb", rows, _LeverStore(rows), "GYM", None, set(),
+                         lambda m: None, booking_cta=None)
+    from agent.calendar_grade import _BOOKING_RE
+    for r in rows:
+        if _BOOKING_RE.search(r["caption"]):
+            assert r["ask_type"] != "none", r
+
+
+def test_restamped_levers_match_what_lever_stamp_says(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(3)
+    store = _LeverStore(rows)
+    grade_fix._fix_craft("reverb", rows, store, "GYM", None, set(),
+                         lambda m: None, booking_cta=None)
+    from agent import lever_stamp
+    for r in rows:
+        assert r["ask_type"] == lever_stamp.ask_type(r["caption"])
+        assert r["caption_len_band"] == lever_stamp.caption_len_band(r["caption"])
+        assert r["hook_family"] == lever_stamp.hook_family(r["caption"])
+
+
+def test_levers_are_not_restamped_when_the_flag_is_off(monkeypatch):
+    """OFF by default = zero behavior change, metadata included."""
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _book(3)
+    store = _LeverStore(rows)
+    grade_fix._fix_craft("reverb", rows, store, "GYM", None, set(),
+                         lambda m: None, booking_cta="Book your free intro")
+    assert all(l in (None, {}) for l in store.levers_seen), store.levers_seen
+
+
+def test_a_store_without_the_levers_kwarg_still_gets_its_caption_fixed(monkeypatch):
+    """A metadata refresh must never cost a caption fix. Older stores and fakes
+    take caption/pillar only."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(3)
+    before = [r["caption"] for r in rows]
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None, booking_cta=None)
+    assert [r["caption"] for r in rows] != before
+
+
+def test_patch_pending_plan_only_writes_allowlisted_lever_columns():
+    """The levers kwarg must not become a way to write an arbitrary column."""
+    from agent import portal_calendar_store as pcs
+    assert pcs._LEVER_COLUMNS == ("hook_family", "ask_type", "caption_len_band")
+
+    sent = {}
+
+    class _Http:
+        def patch(self, url, params=None, headers=None, json=None, timeout=None):
+            sent.update(json or {})
+
+            class _R:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return [{"gym_id": "reverb", "id": "row_1"}]
+            return _R()
+
+    store = pcs.SupabaseCalendarStore(url="https://x", service_key="k", http=_Http())
+    store.patch_pending_plan("reverb", "row_1", caption="c",
+                             levers={"ask_type": "booking_link",
+                                     "status": "approved",
+                                     "gym_id": "someone_else"})
+    assert sent["ask_type"] == "booking_link"
+    assert "gym_id" not in sent, "a non-lever column must never be written here"
+    assert sent["status"] == "pending", "the approval gate is never weakened"
+
+
+def test_lever_stamp_reads_a_real_booking_cta_as_an_ask():
+    """The SECOND, independent reason ask_type said 'none' on 93 of 93 Reverb
+    rows. copy_gate.ASK_RE was fixed for this exact adjacency false negative on
+    2026-08-31 ("Book a FREE NO SWEAT intro"); lever_stamp never got the fix, so
+    the classifier read every real booking CTA as no ask at all."""
+    from agent import lever_stamp
+    for cta in ("Book your free No Sweat Intro",
+                "Book a free no sweat intro",
+                "Book your first class",
+                "Book a free intro session"):
+        assert lever_stamp.ask_type(f"Body copy here.\n{cta}") == "booking_link", cta
+
+
+def test_lever_stamp_still_reports_none_when_there_is_no_ask():
+    from agent import lever_stamp
+    assert lever_stamp.ask_type("We had a great week at the gym.") == "none"
+
+
+def test_lever_stamp_does_not_swallow_a_whole_sentence_as_an_ask():
+    """Up to three modifier words, the same bound copy_gate uses. More than that
+    is a sentence, not an ask."""
+    from agent import lever_stamp
+    assert lever_stamp.ask_type(
+        "Book your very best most incredibly memorable first class") == "none"

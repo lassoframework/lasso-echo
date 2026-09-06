@@ -905,11 +905,27 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     patcher = getattr(store, "patch_pending_plan", None)
     if patcher is None:
         return False
+
+    # RE-STAMP THE LEARNING LEVERS against the caption we are actually writing.
+    # They were stamped at stage time against the pre-repair text and nothing
+    # ever corrected them: measured on Reverb's live book, ask_type='none' on
+    # 93 of 93 rows while 90 ended in an ask, and caption_len_band='mid' on
+    # 100%. metrics_sync copies these onto post_metrics and monthly_retro
+    # compares on them, so a stale lever is a lie the learner trains on.
+    levers = _restamp_levers(new_cap)
+
     patched_any = False
     for r in date_rows:
         if not _is_wipeable(r):
             continue                            # never touched, by policy
         try:
+            kwargs = {"caption": new_cap, "pillar": (new_cat or None)}
+            if levers:
+                kwargs["levers"] = levers
+            updated = patcher(gym_id, r.get("id"), **kwargs)
+        except TypeError:
+            # A store predating the levers kwarg (older fakes, other callers).
+            # The caption fix must never be lost over a metadata refresh.
             updated = patcher(gym_id, r.get("id"),
                               caption=new_cap, pillar=(new_cat or None))
         except Exception as exc:  # noqa: BLE001
@@ -920,8 +936,23 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             r["caption"] = new_cap
             if new_cat:
                 r["pillar"] = new_cat
+            r.update(levers)
             patched_any = True
     return patched_any
+
+
+def _restamp_levers(caption) -> dict:
+    """The learning levers this caption actually earns, or {} when the flag is
+    off. Classification only: it reads the caption and writes no copy."""
+    if not config.cta_variety_enabled():
+        return {}
+    try:
+        from agent import lever_stamp
+        return {"hook_family": lever_stamp.hook_family(caption),
+                "ask_type": lever_stamp.ask_type(caption),
+                "caption_len_band": lever_stamp.caption_len_band(caption)}
+    except Exception:  # noqa: BLE001 - a metadata refresh never blocks a fix
+        return {}
 
 
 # ---------------------------------------------------------------------------
