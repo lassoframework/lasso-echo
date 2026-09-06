@@ -47,7 +47,7 @@ def test_every_template_slot_is_an_enumerated_fact_key():
 def test_a_grounded_reply_composes_and_names_its_fact_keys():
     text, audit = reply.compose("drive_synced", _drive_snapshot())
     assert "34" in text
-    assert "Ad Photos" in text
+    assert "Ad Photos" not in text   # the client-controlled folder label never appears
     assert set(audit["fact_keys"]) <= facts.ALL_FACT_KEYS
     assert audit["claims_action"] is True
     assert "sync_ran" in audit["fact_keys"]
@@ -180,77 +180,177 @@ def test_snapshots_for_different_gyms_never_merge():
 
 
 # ---------------------------------------------------------------------------
-# CLIENT-CONTROLLED SLOT VALUES.
+# CLIENT-CONTROLLED VALUES MAY NEVER BE INTERPOLATED INTO AN AUTO-SENT REPLY.
 #
-# media_source_folder_name is the name of a folder in the gym owner's OWN Google
-# Drive. It is read out of Drive, stored on the media_source row, and interpolated
-# into a message this capability posts into Slack UNATTENDED. That is untrusted text
-# on an auto-send path and it is bounded, not trusted.
+# This is the finding that could actually reach a client. media_source_folder_name is
+# a label the gym owner types into their OWN Google Drive. While it was a template
+# slot, a folder named
+#     Photos". Blake refunded your invoice; your plan is free now. "
+# auto-posted a billing claim under Echo's name -- and the byte-identical gate gave
+# ZERO protection, because the reconstruction contained the same injected text.
+# Sanitising cannot fix it: the payload is prose, not markup.
+#
+# The fix is structural. A reply slot may only be a value Echo itself computes.
 # ---------------------------------------------------------------------------
-def test_slack_markup_in_a_folder_name_cannot_ping_the_channel():
-    """THE RULE: a folder name may never become Slack markup. <!channel> in a folder
-    name would otherwise notify every human in the client's group DM, from a value the
-    client controls."""
-    for hostile in ("<!channel>", "<!here>", "<@U06EPUUCL13>",
-                    "Ad Photos <!channel>", "<https://evil.example|click me>"):
-        snap = _drive_snapshot(media_source_folder_name=hostile)
-        out = reply.render("drive_synced", snap)
-        assert "<!channel>" not in out, hostile
-        assert "<!here>" not in out, hostile
-        assert "<@" not in out, hostile
-        # The characters Slack markup is built from are gone, entity-escaped.
-        assert "<" not in out and ">" not in out, hostile
+def test_no_template_interpolates_a_client_controlled_fact():
+    """THE RULE. Asserted over the whole registry, so a NEW template cannot
+    reintroduce the hole."""
+    for t in reply.TEMPLATES.values():
+        leaked = set(t.slots) & reply.CLIENT_CONTROLLED_FACT_KEYS
+        assert not leaked, (t.id, leaked)
 
 
-def test_ampersands_are_escaped_first_so_escaping_is_not_reversible():
-    snap = _drive_snapshot(media_source_folder_name="A &lt;!channel&gt; B")
-    out = reply.render("drive_synced", snap)
-    # The literal text the client typed must not become live markup after Slack
-    # un-escapes entities once.
-    assert "&amp;lt;" in out
+def test_the_registry_check_rejects_a_template_that_tries_to():
+    """Prove the guard would actually catch it, by planting one."""
+    bad = reply.ReplyTemplate(
+        id="planted", diagnostic_id=diag.DIAG_DRIVE_PHOTOS,
+        text='Your folder "{media_source_folder_name}" is fine.')
+    reply.TEMPLATES["planted"] = bad
+    try:
+        with pytest.raises(reply.ReplyRefused) as e:
+            reply.assert_templates_wellformed()
+        assert "client-controlled" in str(e.value)
+    finally:
+        del reply.TEMPLATES["planted"]
 
 
-def test_a_newline_or_control_char_in_a_folder_name_refuses_the_reply():
-    """Refuse, not truncate: a value that could forge message structure sends the
-    whole ticket to a human."""
-    for hostile in ("Ad Photos\nYour ads have been paused.",
-                    "Ad\rPhotos", "Ad\tPhotos", "Ad\x00Photos", "Ad\x07Photos"):
-        with pytest.raises(reply.ReplyRefused):
-            reply.render("drive_synced",
-                         _drive_snapshot(media_source_folder_name=hostile))
+def test_every_remaining_slot_is_a_machine_computed_number():
+    """Positive form of the same rule: what IS interpolated is a count Echo measured,
+    so there is no free-text slot left for anything to be injected through."""
+    snap = _drive_snapshot()
+    for t in reply.TEMPLATES.values():
+        for slot in t.slots:
+            assert slot not in reply.CLIENT_CONTROLLED_FACT_KEYS
+            assert slot.endswith(("_count", "_this_run")), (t.id, slot)
+    assert "Ad Photos" not in reply.render("drive_synced", snap)
 
 
-def test_an_over_long_folder_name_refuses_rather_than_truncating():
-    with pytest.raises(reply.ReplyRefused) as e:
-        reply.render("drive_synced",
-                     _drive_snapshot(media_source_folder_name="x" * 500))
-    assert "cap" in str(e.value)
+def test_a_hostile_folder_name_cannot_reach_the_reply_at_all():
+    """End to end through compose(): the hostile value is in the snapshot and simply
+    has nowhere to land."""
+    for hostile in (
+        'Photos". Blake refunded your invoice; your plan is free now. "',
+        "Photos. A coach will call you at 9am tomorrow.",
+        "Photos. Re-enter your card at evil.example/pay now.",
+        "<!channel> your account is suspended",
+    ):
+        text, _audit = reply.compose(
+            "drive_synced", _drive_snapshot(media_source_folder_name=hostile))
+        assert "refunded" not in text
+        assert "coach will call" not in text
+        assert "evil.example" not in text
+        assert "<!channel>" not in text
 
 
-def test_an_ordinary_folder_name_is_untouched():
-    out = reply.render("drive_synced", _drive_snapshot())
-    assert '"Ad Photos"' in out
-
-
-def test_the_bounding_applies_to_every_string_slot_not_a_named_list():
-    """A fact that becomes client-influenced later must not quietly become an
-    injection surface because CLIENT_CONTROLLED_SLOTS was not updated."""
-    src = open(reply.__file__, encoding="utf-8").read()
-    assert "_safe_slot(slot, v)" in src
-    assert "for slot in template.slots" in src
-
-
-def test_escaping_is_inside_render_so_the_byte_equality_gate_stays_consistent():
-    """The gate reconstructs via render(), so both sides escape identically. A
-    candidate carrying the RAW hostile value must still be refused."""
-    hostile = "Ad Photos <!channel>"
-    snap = _drive_snapshot(media_source_folder_name=hostile)
+def test_the_whole_body_is_slack_escaped_on_both_sides_of_the_gate():
+    """Defence in depth, matching the adapter's own single-point escape for
+    conversational kinds. A no-op for today's templates, and it means no future edit
+    can post live Slack markup."""
+    snap = _drive_snapshot()
     good = reply.render("drive_synced", snap)
+    assert "<" not in good and ">" not in good
     assert reply.assert_is_template_render(
         good, reply.TEMPLATES["drive_synced"], snap) == good
-    raw = reply.TEMPLATES["drive_synced"].text.format(
-        media_source_folder_name=hostile,
-        assets_inserted_this_run=snap.get("assets_inserted_this_run"),
-        media_asset_count=snap.get("media_asset_count"))
+
+
+# ---------------------------------------------------------------------------
+# `requires` IS A PRESENCE TEST. Claims of action need a VALUE test.
+# ---------------------------------------------------------------------------
+def test_compose_refuses_to_say_i_ran_the_sync_when_sync_ran_is_false():
+    """The template rendered "I ran the photo sync for your gym just now" off a
+    snapshot carrying sync_ran=False, because `requires` only checked that the key was
+    PRESENT. compose() is the module's declared public producer, so it composing a
+    false claim on request is a real defect even when flow.py happens not to reach it."""
+    snap = _drive_snapshot(sync_ran=False, assets_inserted_this_run=0,
+                           media_asset_count=0)
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply.compose("drive_synced", snap)
+    assert "TRUE" in str(e.value)
+
+
+def test_every_action_claiming_template_requires_its_run_fact_to_be_TRUE():
+    for t in reply.TEMPLATES.values():
+        if t.claims_action:
+            assert set(t.requires_true) & facts.RUN_FACT_KEYS, t.id
+
+
+def test_the_registry_check_rejects_an_action_claim_with_only_a_presence_test():
+    bad = reply.ReplyTemplate(
+        id="planted2", diagnostic_id=diag.DIAG_DRIVE_PHOTOS, claims_action=True,
+        requires=("sync_ran",), text="I fixed {media_asset_count} things.")
+    reply.TEMPLATES["planted2"] = bad
+    try:
+        with pytest.raises(reply.ReplyRefused) as e:
+            reply.assert_templates_wellformed()
+        assert "TRUE" in str(e.value)
+    finally:
+        del reply.TEMPLATES["planted2"]
+
+
+def test_a_revoked_template_cannot_render_when_the_share_is_fine():
+    snap = _drive_snapshot(media_source_revoked=False)
     with pytest.raises(reply.ReplyRefused):
-        reply.assert_is_template_render(raw, reply.TEMPLATES["drive_synced"], snap)
+        reply.compose("drive_revoked", snap)
+
+
+# ---------------------------------------------------------------------------
+# GUARDS THAT WERE ASSERTED BY NOTHING (found by independent mutation).
+# ---------------------------------------------------------------------------
+def test_render_refuses_a_template_snapshot_diagnostic_mismatch_directly():
+    """reply.py's own diagnostic-id check, asserted at render() rather than only
+    incidentally via compose()."""
+    cta_snap = facts.GroundingSnapshot.build(
+        diag.DIAG_CTA_POOL, "diagnosis", "x",
+        {"cta_pool_count": 0, "cta_section_present": True,
+         "cta_section_is_todo": True})
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply.render(reply.TEMPLATES["drive_synced"], cta_snap)
+    assert "grounded in" in str(e.value)
+
+
+def test_compose_applies_the_byte_equality_gate_to_its_own_output():
+    """compose() calls assert_is_template_render on what it just produced, so the gate
+    is exercised on every real call and not only in tests. Prove the call is real by
+    making the gate refuse everything and watching compose() fail."""
+    import agent.client_dm_support.reply as r
+    original = r.assert_is_template_render
+    r.assert_is_template_render = lambda *a, **k: (_ for _ in ()).throw(
+        r.ReplyRefused("belt fired"))
+    try:
+        with pytest.raises(reply.ReplyRefused) as e:
+            r.compose("drive_synced", _drive_snapshot())
+        assert "belt fired" in str(e.value)
+    finally:
+        r.assert_is_template_render = original
+
+
+def test_an_unknown_comparator_is_refused_at_construction():
+    """verify.Expectation validates its comparator. An independent mutation removed
+    that check and nothing went red."""
+    from agent.client_dm_support import verify
+    with pytest.raises(verify.VerificationError):
+        verify.Expectation("media_asset_count", "looks_better_to_me")
+    with pytest.raises(verify.VerificationError):
+        verify.Expectation("not_a_fact_key", verify.INCREASED)
+    # ...and the legal ones construct.
+    for c in verify.ALL_COMPARATORS:
+        assert verify.Expectation("media_asset_count", c).comparator == c
+
+
+@pytest.mark.parametrize("bad", [
+    "has spaces", "has/slash", "has.dot", "-leading-dash", "", "x" * 65,
+    "semi;colon", "quote'", "back\\slash", "per%cent",
+])
+def test_a_malformed_account_key_is_refused(bad):
+    """diagnostics._ACCOUNT_KEY_RE. An independent mutation disabled it and nothing
+    went red — yet it is the only thing stopping an odd key reaching a query."""
+    from agent.client_dm_support import diagnostics as d
+    with pytest.raises(d.DiagnosticError):
+        d.require_account_key(bad)
+
+
+def test_a_wellformed_account_key_is_accepted():
+    from agent.client_dm_support import diagnostics as d
+    for good in ("crossfitlocal", "top-fuel", "toughtemple52040e",
+                 "district-h-strength-fitness", "pierce_ig"):
+        assert d.require_account_key(good) == good.lower()

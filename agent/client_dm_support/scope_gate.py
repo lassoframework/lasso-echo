@@ -40,6 +40,7 @@ That is the whole point of D68: the question is not the thing to classify.
 """
 from __future__ import annotations
 
+import posixpath
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -181,6 +182,36 @@ def _deny(reason, trigger):
     return ScopeVerdict(allowed=False, reason=reason, trigger=trigger)
 
 
+class _PathRefused(Exception):
+    pass
+
+
+def _normalise_path(raw):
+    """A repo-relative, traversal-free, lowercase path -- or a refusal.
+
+    Refuses an absolute path, a path that escapes the repo root, and any path still
+    holding a '..' segment after normalisation. `posixpath.normpath` also collapses
+    './' and duplicate slashes, so the substring tests below run over one canonical
+    spelling instead of the many that name the same file.
+    """
+    p = str(raw or "").strip().replace("\\", "/")
+    if not p:
+        raise _PathRefused("a code fix named an empty path")
+    if p.startswith("/") or (len(p) > 1 and p[1] == ":"):
+        raise _PathRefused(
+            f"{raw!r} is an absolute path; a code fix may only name repo-relative "
+            f"files inside the allowed roots"
+        )
+    norm = posixpath.normpath(p).lower()
+    if norm == ".." or norm.startswith("../") or "/../" in norm:
+        raise _PathRefused(
+            f"{raw!r} escapes the repository root after normalisation ({norm!r})"
+        )
+    if norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
 def check(action: ProposedAction) -> ScopeVerdict:
     """allowed, or escalate — with the foundation trigger named.
 
@@ -194,8 +225,20 @@ def check(action: ProposedAction) -> ScopeVerdict:
 
     kind = str(action.kind or "").strip()
     tables = action.normalised_tables()
-    paths = tuple(str(p or "").strip().lower() for p in action.paths)
     sql_ops = tuple(str(o or "").strip().lower() for o in action.sql_ops)
+
+    # PATHS ARE NORMALISED BEFORE ANY CHECK, and a path that will not normalise is
+    # refused outright. Without this, `agent/jobs/../slack_convo/adapter.py` satisfied
+    # the allowed-roots prefix test and walked straight out of it -- reaching the
+    # #fixer gate, agent/config.py and anything else on the disk, because both the
+    # allowlist and the blocklist were plain substring tests over an unnormalised
+    # string. Traversal is not a fragment to add to a denylist (that would be an
+    # ENUMERATION OF AN OPEN SET); it is removed by normalising, and anything still
+    # containing '..' or anchored outside the repo is refused.
+    try:
+        paths = tuple(_normalise_path(p) for p in action.paths)
+    except _PathRefused as e:
+        return _deny(str(e), TRIGGER_UNKNOWN_SHAPE)
 
     # ---- BLOCKLIST -------------------------------------------------------
     # 1. Ad money. Unconditional, and checked before anything else so that no

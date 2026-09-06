@@ -7,29 +7,52 @@ and no live service." Five separate "built but not wired" bugs in this system we
 the same shape: the capability existed, config said it was on, and the inert state was
 byte-for-byte identical to a healthy one.
 
-So the two sinks below are real, and they are the defaults consumer.run_once() uses.
-There is no `None` default that a test double would quietly fill in.
+BOTH SINKS WERE THAT BUG FIRST TIME, and both are fixed here against the outbox's real
+contract rather than an assumed one:
 
-BOTH SINKS REUSE THE EXISTING RAILS. This capability invents no channel and no table:
+  * THE IDENTITY STAMP. outbox._dispatch_one suppresses any row whose
+    attachments carry no `identity` (agent/slack_convo/outbox.py:314,325-327 —
+    "row carries no identity stamp"). The first version of these sinks wrote
+    meta={lane, template_id, ...} with no identity, so every reply was silently
+    suppressed and nothing was ever posted. The identity now comes from the ticket's
+    own `bot_identity`, and a ticket without one is refused rather than written.
+  * THE ESCALATION'S DELIVERY STATUS. outbox.run_once reads only bus.outbox("ready")
+    (outbox.py:271). The first version wrote escalations as "held", so the SAFETY path
+    — the one that carries every refusal to a human — landed in the database and
+    surfaced to nobody. Escalations are now "ready", which is what
+    adapter.delivery_for returns for every INTERNAL kind (adapter.py:569-570) and what
+    every other escalation writer in the system uses. INTERNAL_KINDS go to the fixer
+    channel, never the client's thread, so "ready" here does not mean "post to the
+    client".
 
-  * the reply goes out as a support_messages row of kind STATUS in 'ready' state, and
-    the EXISTING outbox (the Wrangler outbound role) posts it into the same thread.
-    This module never calls chat.postMessage — the adapter's architectural rule
-    ("the adapter never posts; it writes the row, Wrangler posts") holds here too.
-  * the escalation goes out as a row of kind ESCALATION in 'held' state — the existing
-    #fixer hold-card mechanism, unchanged.
+THIS CAPABILITY INVENTS NO CHANNEL AND NO TABLE. It writes support_messages rows and
+the EXISTING outbox (the Wrangler outbound role) delivers them. This module never
+calls chat.postMessage: the adapter's architectural rule ("the adapter never posts; it
+writes the row, Wrangler posts") holds here too.
 
 WHY KIND_STATUS AND NOT KIND_ANSWER. KIND_ANSWER is the #fixer bus's own auto-answer
 lane, whose gate is locked by D67 and is explicitly Blake's separate decision. This
 capability must not ride it, re-enable it, or depend on `verification_after` semantics
 that belong to it. KIND_STATUS is plain-language status on the ticket, is not gated on
-`verification_after`, and is already a receipt kind — so the reply appears in the
-receipt trail like every other client-visible message. Nothing under agent/slack_convo/
-is modified by this file; it is called, not changed.
+`verification_after`, and is already a receipt kind.
+
+ONE THING TO KNOW WHEN ARMING. A reply row is written 'ready' directly, so it does not
+also consult the identity's SLACK_CONVO_<IDENTITY>_CLIENT_REPLY flag. That is
+deliberate — AGENT_CLIENT_DM_AUTOFIX is this lane's own authorization, and a lane that
+verified its fix should not be silently muted by a flag reviewed for a different
+capability — but it means arming this flag DOES put client-visible messages on the
+wire. It is stated here and in the flag's own docstring so nobody discovers it later.
+
+Nothing under agent/slack_convo/ is modified by this file; it is called, not changed.
 """
 from __future__ import annotations
 
 REPLY_META_LANE = "client_dm_autofix"
+
+
+class WiringError(RuntimeError):
+    """A row could not be written in a shape the existing outbox will actually
+    deliver. Raised rather than writing a row that would be silently suppressed."""
 
 
 def _kinds():
@@ -37,36 +60,60 @@ def _kinds():
     return _a.KIND_STATUS, _a.KIND_ESCALATION
 
 
+def _identity_of(ticket):
+    """The identity stamp the outbox requires, from the ticket's own bot_identity."""
+    ident = str((ticket or {}).get("bot_identity") or "").strip()
+    if not ident:
+        raise WiringError(
+            "ticket carries no bot_identity, so any row written for it would be "
+            "suppressed by the outbox as unattributed; refusing to write it"
+        )
+    return ident
+
+
+def _base_meta(ticket, surface="mpim", recipient_kind="client"):
+    return {
+        "identity": _identity_of(ticket),      # REQUIRED by outbox._dispatch_one
+        "surface": surface,
+        "recipient_kind": recipient_kind,
+        "lane": REPLY_META_LANE,
+    }
+
+
 def bus_reply_sink(bus):
-    """Return a callable(ticket_id, decision) that writes the grounded reply as a
-    'ready' row for the existing outbox to post into the client's own thread."""
+    """callable(ticket, decision) -> writes the grounded reply as a 'ready' row that
+    the existing outbox posts into the client's own thread."""
     kind_status, _ = _kinds()
 
-    def _post(ticket_id, decision):
+    def _post(ticket, decision):
+        meta = _base_meta(ticket)
+        meta.update({
+            "template_id": decision.template_id,
+            "fact_keys": list(decision.audit.get("fact_keys", [])),
+            "verification": decision.audit.get("verification", ""),
+        })
         return bus.record_outbound(
-            ticket_id=ticket_id,
-            author_type="bot",
+            ticket_id=ticket.get("id"),
+            author_type=meta["identity"],
             body=decision.reply_text,
             delivery_status="ready",
             kind=kind_status,
-            meta={
-                "lane": REPLY_META_LANE,
-                "template_id": decision.template_id,
-                "fact_keys": list(decision.audit.get("fact_keys", [])),
-                "verification": decision.audit.get("verification", ""),
-            },
+            meta=meta,
         )
 
     return _post
 
 
 def bus_escalation_sink(bus):
-    """Return a callable(ticket_id, decision) that writes a HELD escalation row — the
-    existing #fixer hold card — naming the foundation trigger, if any."""
+    """callable(ticket, decision) -> writes a 'ready' ESCALATION row. Internal kinds go
+    to the fixer channel, not the client's thread, so a human actually sees every
+    refusal this lane makes."""
     _, kind_escalation = _kinds()
 
-    def _hold(ticket_id, decision):
+    def _hold(ticket, decision):
         trigger = decision.foundation_trigger or "not_grounded"
+        meta = _base_meta(ticket, recipient_kind="staff")
+        meta["foundation_trigger"] = trigger
         body = (
             f"[{REPLY_META_LANE}] held for a human.\n"
             f"gym: {decision.gym_key or 'unresolved'}\n"
@@ -75,12 +122,12 @@ def bus_escalation_sink(bus):
             f"reason: {decision.reason}"
         )
         return bus.record_outbound(
-            ticket_id=ticket_id,
-            author_type="bot",
+            ticket_id=ticket.get("id"),
+            author_type=meta["identity"],
             body=body,
-            delivery_status="held",
+            delivery_status="ready",
             kind=kind_escalation,
-            meta={"lane": REPLY_META_LANE, "foundation_trigger": trigger},
+            meta=meta,
         )
 
     return _hold

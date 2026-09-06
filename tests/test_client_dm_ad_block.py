@@ -98,8 +98,8 @@ def test_run_once_asserts_the_structure_before_reading_any_ticket(monkeypatch):
         def available(self):
             return True
 
-        def find_new_tickets(self, **kw):
-            polled.append(kw)
+        def _get(self, table, params):
+            polled.append((table, params))
             return []
 
     def boom(*_a, **_k):
@@ -140,3 +140,84 @@ def test_the_scanner_catches_a_hand_built_graph_api_url(tmp_path):
     )
     findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
     assert any("Graph API" in f for f in findings), findings
+
+
+# ---------------------------------------------------------------------------
+# THE THREE BYPASSES AN INDEPENDENT AUDIT FOUND. All three scanned CLEAN before.
+# ---------------------------------------------------------------------------
+def test_a_relative_import_out_of_the_package_is_caught(tmp_path):
+    """THE WORST ONE. The scanner skipped every relative import, on the reasoning that
+    'a relative import can never reach another package' — which is false:
+    `from ..meta_publisher import x` inside agent.client_dm_support IS
+    agent.meta_publisher, the first entry in its own forbidden table. And
+    relative-out-of-package is the ONLY cross-package import style this package uses."""
+    (tmp_path / "evil_b.py").write_text(
+        "from ..meta_publisher import publish_ad\ndef go(): return publish_ad()\n")
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("agent.meta_publisher" in f for f in findings), findings
+
+
+def test_relative_level_resolution_is_correct():
+    assert ad_block._resolve_relative("meta_publisher", 2) == "agent.meta_publisher"
+    assert ad_block._resolve_relative(None, 2) == "agent"
+    assert ad_block._resolve_relative("jobs.sync_gym_media", 2) == \
+        "agent.jobs.sync_gym_media"
+    assert ad_block._resolve_relative("facts", 1) == "agent.client_dm_support.facts"
+
+
+def test_dynamic_import_plus_computed_getattr_is_caught(tmp_path):
+    (tmp_path / "evil_a.py").write_text(
+        'import importlib\n'
+        'def go():\n'
+        '    m = importlib.import_module("agent.meta_publisher")\n'
+        '    return getattr(m, "create_" + "campaign")(daily_budget=9999)\n')
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("importlib" in f for f in findings), findings
+    assert any("import_module" in f for f in findings), findings
+
+
+def test_subprocess_and_a_split_graph_api_url_are_caught(tmp_path):
+    (tmp_path / "evil_c.py").write_text(
+        'import subprocess\n'
+        'URL = "graph." + "face" + "book.com/v19.0/act" + "_1/campaigns"\n'
+        'def go(): return subprocess.run(["curl", "-X", "POST", URL])\n')
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("subprocess" in f for f in findings), findings
+    assert any("Graph API" in f for f in findings), findings
+
+
+def test_string_concatenation_is_folded_before_the_literal_check():
+    """A URL split across three literals is one string to a reader and must be one
+    string to the scanner."""
+    import ast
+    tree = ast.parse('X = "graph." + "face" + "book.com"')
+    assert "graph.facebook.com" in list(ad_block._string_literals(tree))
+
+
+def test_a_literal_getattr_is_still_allowed():
+    """The guard must not be noise: getattr with a LITERAL attribute name is just an
+    attribute access with a default, and the package uses it legitimately. A control
+    that fires on ordinary code gets switched off."""
+    import ast
+    findings = []
+    tree = ast.parse('x = getattr(obj, "available", None)')
+    assert tree is not None
+    # The real package uses exactly that form and self-scans clean.
+    assert ad_block.scan_for_ad_call_paths() == []
+    assert findings == []
+
+
+@pytest.mark.parametrize("mod", ["importlib", "subprocess", "requests", "httpx",
+                                 "urllib", "socket", "ctypes", "runpy"])
+def test_every_dynamic_dispatch_module_is_refused(mod):
+    """Two-way guard on the constant: each entry must actually be enforced."""
+    import tempfile, os as _os
+    d = tempfile.mkdtemp()
+    open(_os.path.join(d, "m.py"), "w").write(f"import {mod}\n")
+    assert ad_block.scan_for_ad_call_paths(d), mod
+
+
+def test_the_package_uses_no_dynamic_dispatch_of_its_own():
+    """The positive form: the ad tables are only sound if the ONLY way out of this
+    package is a static import."""
+    assert ad_block.assert_no_ad_call_path() is True

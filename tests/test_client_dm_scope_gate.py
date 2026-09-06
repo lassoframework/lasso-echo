@@ -340,3 +340,73 @@ def test_no_code_fix_root_reaches_a_blocked_path():
     for root in sg.ALLOWED_CODE_FIX_ROOTS:
         for frag in sg.BLOCKED_PATH_FRAGMENTS:
             assert frag not in root, (root, frag)
+
+
+# ---------------------------------------------------------------------------
+# THE BLOCKED-PATH LIST, MADE LOAD-BEARING.
+#
+# An independent mutation disabled the ENTIRE BLOCKED_PATH_FRAGMENTS loop and the
+# suite stayed green: every path the old tests used was also outside the allowed
+# roots, so the roots check caught it and the blocklist was asserted by nothing.
+# These paths sit INSIDE an allowed root, so only the blocklist can refuse them.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("path", [
+    "tests/fixtures/.env",
+    "tests/fixtures/secrets/key.json",
+    "tests/fixtures/credentials.json",
+    "tests/brand_voice/toughtemple52040e/lasso_voice.md",
+    "agent/client_dm_support/migrations/0311.sql",
+    "tests/.github/workflows/ci.yml",
+])
+def test_a_blocked_fragment_inside_an_allowed_root_still_escalates(path):
+    v = sg.check(sg.ProposedAction(
+        kind=sg.KIND_CODE_FIX, paths=(path,),
+        scope_column="gym_id", scope_values=("crossfitlocal",)))
+    assert v.escalate, path
+
+
+def test_every_blocked_fragment_is_refused_even_under_an_allowed_root():
+    """The two-way form: iterate the constant itself, so adding a fragment without
+    enforcing it, or dropping one, is caught."""
+    for frag in sg.BLOCKED_PATH_FRAGMENTS:
+        probe = f"tests/{frag.strip('/')}/x.py" if frag.endswith("/") \
+            else f"tests/{frag.lstrip('.')}x/{frag}"
+        v = sg.check(sg.ProposedAction(
+            kind=sg.KIND_CODE_FIX, paths=(probe,),
+            scope_column="gym_id", scope_values=("crossfitlocal",)))
+        assert v.escalate, (frag, probe)
+
+
+# ---------------------------------------------------------------------------
+# PATH TRAVERSAL. Every one of these was ALLOWED before normalisation.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("path,why", [
+    ("agent/jobs/../slack_convo/adapter.py", "the #fixer gate, explicitly out of scope"),
+    ("agent/jobs/../config.py", "the flag surface"),
+    ("agent/jobs/../meta_publisher.py", "outside the allowed roots"),
+    ("agent/jobs/../../../../etc/passwd", "outside the repo entirely"),
+    ("/Users/blakeruff/.ssh/tests/id_rsa", "absolute path containing '/tests/'"),
+    ("agent/media_../../config.py", "prefix trick"),
+    ("agent/jobs/./../../secrets.env", "dot segments"),
+])
+def test_path_traversal_cannot_walk_out_of_an_allowed_root(path, why):
+    v = sg.check(sg.ProposedAction(
+        kind=sg.KIND_CODE_FIX, paths=(path,),
+        scope_column="gym_id", scope_values=("crossfitlocal",)))
+    assert v.escalate, f"{path} ({why})"
+
+
+def test_an_absolute_path_is_refused_outright():
+    v = sg.check(sg.ProposedAction(
+        kind=sg.KIND_CODE_FIX, paths=("/etc/passwd",),
+        scope_column="gym_id", scope_values=("x",)))
+    assert v.escalate
+    assert "absolute" in v.reason
+
+
+def test_normalisation_does_not_break_ordinary_allowed_paths():
+    v = sg.check(sg.ProposedAction(
+        kind=sg.KIND_CODE_FIX,
+        paths=("./agent/jobs/sync_gym_media.py", "tests//test_gym_media_sync.py"),
+        scope_column="gym_id", scope_values=("crossfitlocal",)))
+    assert v.allowed, v.reason

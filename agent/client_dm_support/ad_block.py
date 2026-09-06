@@ -77,6 +77,32 @@ FORBIDDEN_AD_LITERAL_FRAGMENTS = (
 )
 
 
+# DYNAMIC DISPATCH IS FORBIDDEN IN THIS PACKAGE, full stop.
+#
+# The import and call tables above are only sound if the ONLY way out of this package
+# is a static import. `importlib.import_module("agent.meta_publisher")` followed by
+# `getattr(m, "create_campaign")()` defeats both tables, and `subprocess.run(["curl",
+# ...])` defeats them plus the URL literal check. Rather than adding those spellings to
+# a denylist -- an ENUMERATION OF AN OPEN SET, the exact failure D68 Part 1 is about --
+# the escape hatches themselves are removed. This package has no legitimate need for
+# any of them: it does no reflection, spawns no process, and makes no HTTP call of its
+# own (the media store and the bus own all I/O).
+FORBIDDEN_DYNAMIC_MODULES = frozenset({
+    "importlib", "subprocess", "runpy", "ctypes", "socket",
+    "requests", "httpx", "urllib", "urllib.request", "http.client",
+})
+
+# Names that can ONLY mean an escape hatch. Deliberately tight: `compile` is
+# re.compile, `run` is diagnostics.run, and flagging those would make the scanner
+# noise that gets switched off -- a control nobody trusts is not a control.
+# subprocess/importlib are already unreachable via the import table above, so what
+# remains here are the builtins and the os.* spellings that survive it.
+FORBIDDEN_DYNAMIC_CALLS = frozenset({
+    "import_module", "__import__", "eval", "exec",
+    "system", "popen", "Popen", "check_output", "check_call", "spawnv",
+})
+
+
 class AdCallPathError(AssertionError):
     """The package acquired a path to an ad write. This is never recoverable at
     runtime -- it means the structural guarantee is gone and the code must not run."""
@@ -98,18 +124,43 @@ def _source_files(pkg_dir=None):
     return out
 
 
-def _imported_names(tree):
+# This package's own dotted name. A relative import is resolved against it, because
+# `from ..meta_publisher import publish` inside agent.client_dm_support IS
+# agent.meta_publisher -- the first entry in FORBIDDEN_AD_IMPORT_PREFIXES. The first
+# version of this scanner skipped relative imports with the comment "a relative import
+# can never reach another package", which is simply false, and relative-out-of-package
+# is the ONLY cross-package import style this package uses.
+PACKAGE_DOTTED = "agent.client_dm_support"
+
+
+def _resolve_relative(module, level, package=PACKAGE_DOTTED):
+    """`from ..x import y` at level 2 inside agent.client_dm_support -> agent.x"""
+    parts = package.split(".")
+    if level > len(parts):
+        return module or ""
+    base = parts[: len(parts) - (level - 1)]
+    if module:
+        base = base + module.split(".")
+    return ".".join(base)
+
+
+def _imported_names(tree, package=PACKAGE_DOTTED):
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
                 yield a.name
         elif isinstance(node, ast.ImportFrom):
-            # `from . import x` has module None; a relative import can never reach
-            # another package, so only absolute ones are interesting here.
-            if node.level == 0 and node.module:
-                for a in node.names:
-                    yield f"{node.module}.{a.name}"
-                yield node.module
+            if node.level == 0:
+                if not node.module:
+                    continue
+                base = node.module
+            else:
+                base = _resolve_relative(node.module, node.level, package)
+            if not base:
+                continue
+            yield base
+            for a in node.names:
+                yield f"{base}.{a.name}"
 
 
 def _called_names(tree):
@@ -121,6 +172,35 @@ def _called_names(tree):
             yield f.attr
         elif isinstance(f, ast.Name):
             yield f.id
+
+
+def _fold(node):
+    """The string a literal expression evaluates to, following + concatenation and
+    adjacent-literal joining. `"graph." + "face" + "book.com"` is one string to a
+    reader and must be one string to the scanner too."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_fold(v) or "" for v in node.values)
+    if isinstance(node, ast.FormattedValue):
+        return ""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _string_literals(tree):
+    """Every string a reader would see, with concatenations folded first so that
+    splitting a URL across three literals does not hide it."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) or isinstance(node, ast.JoinedStr):
+            folded = _fold(node)
+            if folded:
+                yield folded
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
 
 
 def scan_for_ad_call_paths(pkg_dir=None):
@@ -148,21 +228,49 @@ def scan_for_ad_call_paths(pkg_dir=None):
                 if name == bad or name.startswith(bad + "."):
                     findings.append(f"{path}: imports forbidden ad module {name!r}")
 
+            for bad in FORBIDDEN_DYNAMIC_MODULES:
+                if name == bad or name.startswith(bad + "."):
+                    findings.append(
+                        f"{path}: imports {name!r}. Dynamic dispatch and self-driven "
+                        f"I/O are forbidden here -- they would make the ad import/call "
+                        f"tables unenforceable."
+                    )
+
         for name in _called_names(tree):
             if name in FORBIDDEN_AD_CALL_NAMES:
                 findings.append(f"{path}: calls forbidden ad-write function {name!r}")
+            if name in FORBIDDEN_DYNAMIC_CALLS and os.path.basename(path) != "ad_block.py":
+                findings.append(
+                    f"{path}: calls {name!r}, a dynamic-dispatch or subprocess escape "
+                    f"hatch; it could reach an ad write the static tables cannot see"
+                )
 
+        # getattr/setattr are fine with a LITERAL attribute name (that is just an
+        # attribute access with a default). A COMPUTED name is reflection, and
+        # `getattr(m, "create_" + "campaign")` is exactly the bypass the call table
+        # cannot see, so only that form is refused.
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                # Skip this module's own constant tables: they are the definition of
-                # what is forbidden, not a use of it.
-                if os.path.basename(path) == "ad_block.py":
-                    continue
-                low = node.value.lower()
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            fname = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+            if fname not in ("getattr", "setattr"):
+                continue
+            if len(node.args) < 2 or _fold(node.args[1]) is None:
+                findings.append(
+                    f"{path}: {fname}() with a computed attribute name is reflection "
+                    f"and could reach an ad write the static call table cannot see"
+                )
+
+        # Skip this module's own constant tables: they are the definition of what is
+        # forbidden, not a use of it.
+        if os.path.basename(path) != "ad_block.py":
+            for text in _string_literals(tree):
+                low = text.lower()
                 for frag in FORBIDDEN_AD_LITERAL_FRAGMENTS:
                     if frag in low:
                         findings.append(
-                            f"{path}: literal {node.value[:60]!r} looks like a "
+                            f"{path}: literal {text[:60]!r} looks like a "
                             f"hand-built Graph API ad URL"
                         )
     return findings

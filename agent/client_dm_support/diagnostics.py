@@ -126,14 +126,25 @@ def diagnose_drive_photos(gym_key, *, store, now=None, daily_hour_utc=None,
         from .. import config as _cfg
         lane_active_for = _cfg.gym_drive_connect_active_for
 
+    # SECOND, INDEPENDENT TENANT CHECK. The store is asked to filter by gym_id, and
+    # then every row it returns is re-checked here. The executor already did this; the
+    # DIAGNOSTIC did not, and the diagnostic is where every fact in a reply comes from
+    # -- so a broken server-side filter could put ANOTHER GYM'S folder state into a
+    # message auto-sent to this client (the drive_revoked path takes no executor, so
+    # the executor's guard never ran to catch it). Two independent controls must now
+    # both fail for one gym to see another's data.
     sources = [
         s for s in store.list_sources(gym_id=key, include_inactive=True)
         if str(s.get("kind") or "gym_drive") == "gym_drive"
+        and str(s.get("gym_id") or "") == key
     ]
     active = [s for s in sources if s.get("active")]
     chosen = (active or sources or [None])[0]
 
-    assets = store.list_assets(key) if sources else []
+    # ...and the same on the asset side, so a leaked list cannot inflate a count that
+    # a reply then states as this gym's.
+    assets = [a for a in (store.list_assets(key) if sources else [])
+              if str(a.get("gym_id") or "") == key]
 
     connected_at = _parse_ts(chosen.get("connected_at")) if chosen else None
     if connected_at is None:

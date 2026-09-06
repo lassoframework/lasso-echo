@@ -27,11 +27,18 @@ No LLM free text is auto-posted by this capability. There is no code path that
 composes a reply any other way: compose() takes a template id and a snapshot, and
 nothing else, and it is the only public producer.
 
-WHAT A TEMPLATE MAY SAY. Two rules, both asserted by tests:
-  * every {slot} must be a key in facts.ALL_FACT_KEYS
-  * a template may not claim an action was performed unless one of its required
-    facts is the run fact that PROVES it (verify.py supplies those). The
-    'fixed' templates below all require assets_inserted_this_run / sync_ran.
+WHAT A TEMPLATE MAY SAY. Three rules, all asserted by assert_templates_wellformed()
+and by tests:
+  * every {slot} must be a key in facts.ALL_FACT_KEYS;
+  * NO slot may be a CLIENT-CONTROLLED fact. The byte-identical gate is only as
+    strong as the values it interpolates: while the gym owner's own Drive folder
+    label was a slot, a folder named `Photos". Blake refunded your invoice. "`
+    auto-posted a billing claim, and the gate could not see it because the
+    reconstruction carried the same text. Every remaining slot is a number Echo
+    itself computed;
+  * a template that claims Echo performed an action must require a run fact to be
+    TRUE, not merely present -- `requires` is a presence test, and a snapshot
+    carrying sync_ran=False once rendered "I ran the photo sync just now".
 """
 from __future__ import annotations
 
@@ -49,17 +56,46 @@ class ReplyRefused(Exception):
     verified facts. The flow escalates instead of posting."""
 
 
+# ---------------------------------------------------------------------------
+# CLIENT-CONTROLLED FACT KEYS — NEVER INTERPOLATED INTO AN AUTO-SENT REPLY.
+#
+# This is the rule the first version of this file got wrong, and it is the one that
+# could actually reach a client. `media_source_folder_name` is a label the gym owner
+# types into their OWN Google Drive. It was a template slot, so a folder named
+#
+#     Photos". Blake refunded your invoice; your plan is free now. "
+#
+# rendered a billing claim into a message Echo auto-posts under its own name — and the
+# byte-identical grounding gate gave ZERO protection, because the reconstruction
+# contains the same injected text. Escaping does not fix it either: the injected text
+# is prose, not markup.
+#
+# The fix is structural rather than sanitising. A reply slot may only be a fact key
+# whose value Echo itself computes: counts, timestamps, booleans. A fact whose value
+# originates with the client may still be DIAGNOSED, recorded in the audit trail and
+# shown on the internal escalation card — it just cannot be a sentence Echo says
+# unattended. assert_templates_wellformed() enforces that, so a future template cannot
+# reintroduce the hole.
+CLIENT_CONTROLLED_FACT_KEYS = frozenset({
+    "media_source_folder_name",   # the gym owner's own Drive folder label
+})
+
+
 @dataclass(frozen=True)
 class ReplyTemplate:
     id: str
     diagnostic_id: str
     text: str
     # Facts that must be PRESENT in the snapshot for this template to be usable,
-    # beyond the ones it interpolates. Used to stop a "we fixed it" template from
-    # rendering off a snapshot that never measured whether anything was fixed.
+    # beyond the ones it interpolates.
     requires: tuple = ()
+    # Facts that must be present AND TRUE. `requires` is only a presence test, which
+    # is not enough for a template that claims Echo did something: a snapshot carrying
+    # sync_ran=False satisfied presence and rendered "I ran the photo sync just now".
+    requires_true: tuple = ()
     # True when the template asserts Echo performed an action. Such a template must
-    # require a run fact; assert_templates_wellformed() enforces it.
+    # require a run fact AND require it to be true; assert_templates_wellformed()
+    # enforces both.
     claims_action: bool = False
 
     @property
@@ -68,7 +104,8 @@ class ReplyTemplate:
 
     @property
     def fact_keys(self):
-        return tuple(sorted(set(self.slots) | set(self.requires)))
+        return tuple(sorted(set(self.slots) | set(self.requires)
+                            | set(self.requires_true)))
 
 
 # ---------------------------------------------------------------------------
@@ -89,12 +126,13 @@ DRIVE_SYNCED = _register(ReplyTemplate(
     id="drive_synced",
     diagnostic_id=_diag.DIAG_DRIVE_PHOTOS,
     claims_action=True,
-    requires=("sync_ran", "media_source_active"),
+    requires=("media_source_active",),
+    requires_true=("sync_ran", "media_source_active"),
     text=(
-        "Your Google Drive folder \"{media_source_folder_name}\" is connected and "
-        "active. I ran the photo sync for your gym just now and pulled in "
-        "{assets_inserted_this_run} file(s); your library now holds "
-        "{media_asset_count} photo(s) and video(s). New posts will draw from those."
+        "Your connected Google Drive folder is active. I ran the photo sync for your "
+        "gym just now and pulled in {assets_inserted_this_run} file(s); your library "
+        "now holds {media_asset_count} photo(s) and video(s). New posts will draw "
+        "from those."
     ),
 ))
 
@@ -110,11 +148,11 @@ DRIVE_REVOKED = _register(ReplyTemplate(
     id="drive_revoked",
     diagnostic_id=_diag.DIAG_DRIVE_PHOTOS,
     requires=("media_source_revoked",),
+    requires_true=("media_source_revoked",),
     text=(
-        "Your Google Drive folder \"{media_source_folder_name}\" is no longer shared "
-        "with us, so the photo sync cannot read it and your library holds "
-        "{media_asset_count} file(s). Re-sharing the folder in the portal will let it "
-        "resume."
+        "Your connected Google Drive folder is no longer shared with us, so the photo "
+        "sync cannot read it and your library holds {media_asset_count} file(s). "
+        "Re-sharing that folder in the portal will let it resume."
     ),
 ))
 
@@ -123,13 +161,14 @@ CTA_ASK = _register(ReplyTemplate(
     id="cta_ask",
     diagnostic_id=_diag.DIAG_CTA_POOL,
     requires=("cta_section_present", "cta_section_is_todo"),
+    requires_true=("cta_section_present", "cta_section_is_todo"),
     text=(
         "I checked your brand voice doc. The \"CTA rotation\" section is still the "
         "blank placeholder from onboarding, so your posts have "
         "{cta_pool_count} call(s) to action to draw from — that is why they are "
         "going out without one. I cannot write this one for you, because a CTA has "
-        "to be your real booking link, phone number or offer. Send me the ones you "
-        "want and I will load them in."
+        "to be your real booking link, phone number or offer. What would you like "
+        "your posts to ask people to do?"
     ),
 ))
 
@@ -137,11 +176,12 @@ CTA_MISSING_SECTION = _register(ReplyTemplate(
     id="cta_missing_section",
     diagnostic_id=_diag.DIAG_CTA_POOL,
     requires=("voice_doc_present", "cta_section_present"),
+    requires_true=("voice_doc_present",),
     text=(
         "I checked your brand voice doc. It has no \"CTA rotation\" section at all, "
-        "so your posts have {cta_pool_count} call(s) to action to draw from. Send me "
-        "the booking link, phone number or offer you want people to act on and I "
-        "will load them in."
+        "so your posts have {cta_pool_count} call(s) to action to draw from. What "
+        "booking link, phone number or offer would you like your posts to point "
+        "people to?"
     ),
 ))
 
@@ -166,10 +206,20 @@ def assert_templates_wellformed():
             problems.append(
                 f"template {t.id!r} names unknown diagnostic {t.diagnostic_id!r}"
             )
-        if t.claims_action and not (set(t.fact_keys) & _facts.RUN_FACT_KEYS):
+        hostile = set(t.slots) & CLIENT_CONTROLLED_FACT_KEYS
+        if hostile:
             problems.append(
-                f"template {t.id!r} claims Echo performed an action but requires no "
-                f"run fact to prove it; it could render off an unverified snapshot"
+                f"template {t.id!r} interpolates client-controlled fact(s) "
+                f"{sorted(hostile)} into a message Echo auto-posts. A client-supplied "
+                f"value can carry whole sentences, and the byte-identical gate cannot "
+                f"see them because the reconstruction contains the same text. A reply "
+                f"slot may only be a value Echo itself computes."
+            )
+        if t.claims_action and not (set(t.requires_true) & _facts.RUN_FACT_KEYS):
+            problems.append(
+                f"template {t.id!r} claims Echo performed an action but does not "
+                f"require a run fact to be TRUE; `requires` is only a presence test, "
+                f"so it could render 'I ran the sync' off sync_ran=False"
             )
     if problems:
         raise ReplyRefused("reply template registry is malformed: " + "; ".join(problems))
@@ -239,6 +289,15 @@ def render(template, snapshot):
             f"template {template.id!r} needs fact key(s) {missing} which the "
             f"grounding snapshot does not contain"
         )
+    # A VALUE check, not a presence check. sync_ran=False must never render
+    # "I ran the photo sync just now".
+    falsy = [k for k in template.requires_true if not snapshot.get(k)]
+    if falsy:
+        raise ReplyRefused(
+            f"template {template.id!r} requires fact(s) {falsy} to be TRUE, but the "
+            f"snapshot has them false/zero; refusing to state something that did not "
+            f"happen"
+        )
     values = {}
     for slot in template.slots:
         v = snapshot.get(slot)
@@ -246,7 +305,13 @@ def render(template, snapshot):
         # client-controlled: a fact that becomes client-influenced later must not
         # quietly become an injection surface because this list was not updated.
         values[slot] = _safe_slot(slot, v)
-    return template.text.format(**values)
+    body = template.text.format(**values)
+    # Whole-body Slack escape, the same single-point pass the adapter applies to every
+    # CONVERSATIONAL kind (its DV4 fix). A no-op for these templates -- their constants
+    # carry no & < >, and every remaining slot is a number or an ISO timestamp -- so it
+    # costs nothing and means no future edit can post live Slack markup. It happens
+    # INSIDE render(), so the reconstruction the gate compares against is escaped too.
+    return body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def assert_is_template_render(candidate, template, snapshot):

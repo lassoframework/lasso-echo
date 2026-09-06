@@ -138,11 +138,17 @@ def test_case1_end_to_end_runs_the_sync_verifies_it_and_replies_grounded():
     assert d.will_post
     assert d.template_id == "drive_synced"
     assert d.reply_text == (
-        'Your Google Drive folder "Ad Photos" is connected and active. I ran the '
-        'photo sync for your gym just now and pulled in 34 file(s); your library now '
-        'holds 34 photo(s) and video(s). New posts will draw from those.'
+        'Your connected Google Drive folder is active. I ran the photo sync for your '
+        'gym just now and pulled in 34 file(s); your library now holds 34 photo(s) '
+        'and video(s). New posts will draw from those.'
     )
     assert d.audit["facts"]["assets_inserted_this_run"] == 34
+    # THE FOLDER NAME IS NOT IN THE REPLY. It is a label the gym owner types into
+    # their own Drive, so it is client-controlled text; interpolating it let a folder
+    # called 'Photos". Blake refunded your invoice. "' auto-post a billing claim, and
+    # the byte-identical gate could not see it because the reconstruction carried the
+    # same text. Every remaining slot is a number Echo itself computed.
+    assert "Ad Photos" not in d.reply_text
     # Tenant isolation: every asset read named Chad's key and nobody else's.
     assert set(store.asset_reads) == {CHAD_KEY}
 
@@ -290,8 +296,11 @@ def test_case2_diagnoses_the_unfilled_todo_and_asks_instead_of_fabricating():
     assert "CTA rotation" in d.reply_text
     assert "blank placeholder from onboarding" in d.reply_text
     assert "0 call(s) to action" in d.reply_text
-    # ...asks for what only he can supply...
-    assert "Send me the ones you want" in d.reply_text
+    # ...asks for what only he can supply, WITHOUT promising future human action
+    # (the D52 rule: no client-facing constant may promise it)...
+    assert "What would you like your posts to ask people to do?" in d.reply_text
+    for promise in ("i will load", "we will add", "a coach will", "someone will"):
+        assert promise not in d.reply_text.lower(), promise
     # ...and never claims a CTA was added.
     low = d.reply_text.lower()
     for lie in ("i added", "i've added", "i wrote", "fixed", "all set", "sorted"):
@@ -503,15 +512,30 @@ def test_execute_re_checks_the_scope_gate_itself():
 # THE TRIGGER SURFACE + THE FLAG
 # ===========================================================================
 class FakeBus:
+    """Schema-faithful to what agent/slack_convo/ ACTUALLY writes.
+
+    The first version of this fake invented `surface` and `account_key` columns on the
+    ticket. support_tickets has neither: surface rides in the inbound MESSAGE's
+    attachments (adapter.py:729) and the gym is `client_id`, a PORTAL GYM UUID
+    (adapter.py:715). A fake that invents the missing columns is D68 verbatim --
+    "every test injects its own working fake into the exact seam production left
+    empty" -- so this one carries the real column set and nothing else.
+
+    `_get` also IGNORES the query params, deliberately (D68.3's poll-fake pattern), so
+    a poll predicate that lives only in the query string cannot pass vacuously.
+    """
+
     def __init__(self, tickets, messages):
         self.tickets = tickets
         self.msgs = messages
         self.out = []
+        self.queries = []
 
     def available(self):
         return True
 
-    def find_new_tickets(self, **kw):
+    def _get(self, table, params):
+        self.queries.append((table, dict(params)))
         return list(self.tickets)
 
     def recent_messages(self, ticket_id, limit=200):
@@ -522,12 +546,20 @@ class FakeBus:
         return {"id": len(self.out)}
 
 
-def _bus_for(text, surface="mpim"):
+def _bus_for(text, surface="mpim", author_type="client"):
     return FakeBus(
-        tickets=[{"id": "T1", "surface": surface, "account_key": CHAD_KEY}],
-        messages={"T1": [{"direction": "inbound", "author_type": "client",
-                          "body": text}]},
+        tickets=[{"id": "T1", "product": "echo", "source": "slack_conversation",
+                  "status": "new", "classification": "question",
+                  "bot_identity": "echo", "client_id": CHAD_UUID}],
+        messages={"T1": [{"direction": "inbound", "author_type": author_type,
+                          "body": text, "attachments": {"surface": surface}}]},
     )
+
+
+def _consumer_kw():
+    """The uuid -> account-key resolver, injected. In production this is
+    account_key_resolve.portal_key_for_gym, the repo's anti-divergence primitive."""
+    return {"portal_key_for_gym": lambda u: CHAD_KEY if u == CHAD_UUID else ""}
 
 
 def test_the_flag_is_off_by_default_and_off_is_loud():
@@ -537,7 +569,7 @@ def test_the_flag_is_off_by_default_and_off_is_loud():
     from agent import config
     os.environ.pop("AGENT_CLIENT_DM_AUTOFIX", None)
     assert config.client_dm_autofix_enabled() is False
-    out = consumer.run_once(bus=_bus_for("my posts have no photos"))
+    out = consumer.run_once(bus=_bus_for("my posts have no photos"), **_consumer_kw())
     assert out["ok"] is False
     assert out["reason"] == "AGENT_CLIENT_DM_AUTOFIX is off"
     assert out["replied"] == 0
@@ -547,10 +579,18 @@ def test_with_the_flag_on_a_case1_ticket_produces_one_ready_reply_row():
     store = FakeStore(sources=[CHAD_SOURCE], assets=[])
     bus = _bus_for("the posts waiting on me have no photos")
     out = consumer.run_once(bus=bus, flag_on=True,
-                            deps=drive_deps(store, make_sync(34, store)))
+                            deps=drive_deps(store, make_sync(34, store)),
+                            **_consumer_kw())
     assert out["ok"] and out["replied"] == 1 and out["escalated"] == 0
+    # The poll asked for the source the adapter ACTUALLY writes.
+    assert bus.queries[0][0] == "support_tickets"
+    assert bus.queries[0][1]["source"] == "eq.slack_conversation"
     row = bus.out[0]
     assert row["delivery_status"] == "ready"
+    # THE IDENTITY STAMP. Without it outbox._dispatch_one suppresses the row and
+    # nothing is ever posted.
+    assert row["meta"]["identity"] == "echo"
+    assert row["meta"]["surface"] == "mpim"
     assert row["meta"]["lane"] == wiring.REPLY_META_LANE
     assert row["meta"]["template_id"] == "drive_synced"
     # It rides the STATUS kind, never the D67-locked answer lane.
@@ -561,25 +601,25 @@ def test_with_the_flag_on_a_case1_ticket_produces_one_ready_reply_row():
 
 def test_with_the_flag_on_an_ad_ticket_produces_one_held_escalation_row():
     bus = _bus_for("please raise my ad budget to 100 a day")
-    out = consumer.run_once(bus=bus, flag_on=True, deps={})
+    out = consumer.run_once(bus=bus, flag_on=True, deps={}, **_consumer_kw())
     assert out["replied"] == 0 and out["escalated"] == 1
     row = bus.out[0]
-    assert row["delivery_status"] == "held"
+    # THE SAFETY PATH MUST ACTUALLY REACH A HUMAN. outbox.run_once reads only
+    # bus.outbox("ready"); a 'held' escalation lands in the DB and surfaces to nobody.
+    assert row["delivery_status"] == "ready"
+    assert row["meta"]["identity"] == "echo"
     assert row["meta"]["foundation_trigger"] == sg.TRIGGER_AD_MONEY
 
 
 def test_a_non_dm_surface_is_left_alone():
     bus = _bus_for("my posts have no photos", surface="channel")
-    out = consumer.run_once(bus=bus, flag_on=True, deps={})
+    out = consumer.run_once(bus=bus, flag_on=True, deps={}, **_consumer_kw())
     assert out["handled"] == 0 and bus.out == []
 
 
 def test_staff_text_is_not_treated_as_the_clients_support_request():
-    bus = FakeBus(
-        tickets=[{"id": "T1", "surface": "mpim", "account_key": CHAD_KEY}],
-        messages={"T1": [{"direction": "inbound", "author_type": "staff",
-                          "body": "my posts have no photos"}]})
-    out = consumer.run_once(bus=bus, flag_on=True, deps={})
+    bus = _bus_for("my posts have no photos", author_type="staff")
+    out = consumer.run_once(bus=bus, flag_on=True, deps={}, **_consumer_kw())
     assert out["handled"] == 0
 
 
@@ -602,7 +642,8 @@ def test_run_once_uses_the_real_sinks_by_default_not_none():
     store = FakeStore(sources=[CHAD_SOURCE], assets=[])
     bus = _bus_for("no photos on my posts")
     out = consumer.run_once(bus=bus, flag_on=True,
-                            deps=drive_deps(store, make_sync(2, store)))
+                            deps=drive_deps(store, make_sync(2, store)),
+                            **_consumer_kw())
     assert out["replied"] == 1
     assert len(bus.out) == 1
 
@@ -646,3 +687,142 @@ def test_every_registered_template_is_reachable_from_a_planned_remedy():
         planned.add(r.reply_template_id)
     assert planned == set(reply.TEMPLATES), (
         f"unreachable template(s): {set(reply.TEMPLATES) - planned}")
+
+
+# ===========================================================================
+# THE REAL BUS CONTRACTS (the two CRITICALs from the independent audit).
+#
+# Every one of these was wrong first time, and each alone made the lane return
+# {'ok': True, 'handled': 0} — the D68 signature where the inert state is
+# byte-for-byte identical to a healthy one. They are asserted against the values
+# agent/slack_convo/ ACTUALLY uses, read from that code, not assumed.
+# ===========================================================================
+def test_the_poll_source_is_the_one_the_adapter_actually_writes():
+    """bus.get_or_create_ticket hardcodes source='slack_conversation'. Polling
+    'slack' matched zero rows forever."""
+    import inspect
+    from agent.slack_convo import bus as real_bus
+    src = inspect.getsource(real_bus.Bus.get_or_create_ticket)
+    assert f'"source": "{consumer.POLL_SOURCE}"' in src, (
+        f"consumer.POLL_SOURCE={consumer.POLL_SOURCE!r} does not match what "
+        f"get_or_create_ticket writes")
+
+
+def test_the_poll_does_not_reuse_the_portal_workers_classification_filter():
+    """bus.find_new_tickets also requires classification is.null — the portal
+    worker's 'nobody picked this up' predicate. The adapter classifies a DM ticket at
+    creation, so that filter makes every client DM invisible."""
+    bus = _bus_for("my posts have no photos")
+    consumer.default_poll(bus, limit=5)
+    _table, params = bus.queries[0]
+    assert "classification" not in params
+    assert params["source"] == "eq.slack_conversation"
+    assert params["product"] == "eq.echo"
+
+
+def test_the_surface_is_read_off_the_message_not_the_ticket():
+    """support_tickets has NO surface column; the adapter writes it into the inbound
+    MESSAGE's attachments. A ticket row carrying a bogus surface must not help."""
+    bus = _bus_for("my posts have no photos", surface="mpim")
+    bus.tickets[0]["surface"] = "channel"      # a column that does not exist
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(3, store)),
+                            **_consumer_kw())
+    assert out["handled"] == 1
+
+
+def test_the_gym_key_is_resolved_from_the_portal_uuid_not_read_off_the_ticket():
+    """support_tickets.client_id is the PORTAL GYM UUID (adapter.py:715) — exactly the
+    key the diagnostics refuse. It must go through the anti-divergence primitive."""
+    ticket = {"id": "T1", "client_id": CHAD_UUID}
+    assert consumer.resolve_gym_key(
+        ticket, portal_key_for_gym=lambda u: CHAD_KEY) == CHAD_KEY
+    # "" on any uncertainty, and "" escalates rather than guessing.
+    assert consumer.resolve_gym_key(ticket, portal_key_for_gym=lambda u: "") == ""
+    assert consumer.resolve_gym_key({"id": "T1"}, portal_key_for_gym=lambda u: "x") == ""
+
+    def boom(_u):
+        raise RuntimeError("plane unreadable")
+    assert consumer.resolve_gym_key(ticket, portal_key_for_gym=boom) == ""
+
+
+def test_an_unresolvable_gym_key_escalates_and_never_queries():
+    bus = _bus_for("my posts have no photos")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(9, store)),
+                            portal_key_for_gym=lambda u: "")
+    assert out["escalated"] == 1 and out["replied"] == 0
+    assert store.asset_reads == []
+
+
+def test_the_reply_row_carries_the_identity_stamp_the_outbox_requires():
+    """outbox._dispatch_one suppresses any row whose attachments carry no 'identity'.
+    Without it every reply was silently suppressed and nothing was ever posted."""
+    import inspect
+    from agent.slack_convo import outbox as real_outbox
+    src = inspect.getsource(real_outbox)
+    assert 'att.get("identity")' in src
+    assert "row carries no identity stamp" in src
+
+    bus = _bus_for("my posts have no photos")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    consumer.run_once(bus=bus, flag_on=True,
+                      deps=drive_deps(store, make_sync(4, store)), **_consumer_kw())
+    assert bus.out[0]["meta"]["identity"] == "echo"
+
+
+def test_a_ticket_with_no_bot_identity_is_refused_not_silently_written():
+    bus = _bus_for("my posts have no photos")
+    bus.tickets[0].pop("bot_identity")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(4, store)),
+                            **_consumer_kw())
+    # The delivery failed loudly rather than writing a row the outbox would drop.
+    assert bus.out == []
+    assert out["handled"] == 1
+
+
+def test_the_escalation_row_is_ready_so_a_human_actually_sees_it():
+    """outbox.run_once reads ONLY bus.outbox('ready'). A 'held' escalation lands in
+    the database and surfaces to nobody — and this is the SAFETY path."""
+    import inspect
+    from agent.slack_convo import adapter as real_adapter
+    from agent.slack_convo import outbox as real_outbox
+    assert 'bus.outbox("ready"' in inspect.getsource(real_outbox.run_once)
+    # ...and 'ready' is what the adapter itself uses for every INTERNAL kind.
+    df = inspect.getsource(real_adapter.delivery_for)
+    assert "if kind in INTERNAL_KINDS:" in df and 'return "ready"' in df
+
+    bus = _bus_for("please raise my ad budget to 100 a day")
+    out = consumer.run_once(bus=bus, flag_on=True, deps={}, **_consumer_kw())
+    assert out["escalated"] == 1
+    assert bus.out[0]["delivery_status"] == "ready"
+
+
+def test_a_ticket_this_lane_already_answered_is_not_answered_twice():
+    """Idempotency with no schema change: a ticket carrying an outbound row stamped
+    with this lane is skipped."""
+    bus = _bus_for("my posts have no photos")
+    bus.msgs["T1"].append({"direction": "outbound", "author_type": "echo",
+                           "body": "...", "attachments": {
+                               "lane": wiring.REPLY_META_LANE}})
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(4, store)),
+                            **_consumer_kw())
+    assert out["handled"] == 0 and out["skipped"] == 1
+    assert bus.out == []
+
+
+def test_run_once_has_a_real_production_caller():
+    """D68's named class, checked directly: a capability with a status line, a green
+    suite and nothing invoking it is 'built but not wired'. agent/runner.py must call
+    it, gated on the flag."""
+    import inspect
+    from agent import runner
+    src = inspect.getsource(runner)
+    assert "client_dm_support.consumer import run_once" in src
+    assert "config.client_dm_autofix_enabled()" in src

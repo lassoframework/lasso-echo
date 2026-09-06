@@ -4269,9 +4269,15 @@ def client_dm_autofix_enabled() -> bool:
         does not turn any of those on, and this lane never writes an 'answer' row
         on the slack_convo answer lane.
       * ad spend, ad targeting, campaign/ad-set launch or pause. This is not a gate
-        that could misfire: agent/client_dm_support/ has NO import of, and no call
-        path to, any Meta/Pipeboard ad-write surface at all
-        (tests/test_client_dm_ad_block.py proves it by AST over the whole package).
+        that could misfire. agent/client_dm_support/ contains NO import of and NO call
+        to any ad-write surface, and no dynamic-dispatch escape hatch (no importlib,
+        no subprocess, no eval/exec, no computed getattr, no HTTP client of its own)
+        through which one could be reached indirectly -- so a static AST scan over the
+        package is a sound proof, and tests/test_client_dm_ad_block.py runs it.
+        Precisely: this is a claim about DIRECT imports and about call paths. Modules
+        the package legitimately calls (e.g. agent.jobs.sync_gym_media) have their own
+        transitive import closures, and no ad WRITE is reachable through any of them;
+        the ad rails live in the portal, not in this repo.
       * billing -- Stripe, invoicing, plan/tier, payment methods.
       * feature flags, env vars, secrets, tokens, auth/identity config.
       * schema, migrations, RLS policies.
