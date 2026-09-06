@@ -3375,6 +3375,51 @@ def mentions_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_MENTIONS", "false"))
 
 
+def cta_variety_enabled() -> bool:
+    """
+    Closing-ask variety and CTA shape validation (AGENT_CTA_VARIETY). OFF by
+    default = zero behavior change: grade_fix picks exactly the CTA it picked
+    before and appends it to every craft-flagged day, and an ask-less caption
+    still fails the craft bar.
+
+    Armed, three things change, all of them from Dean Holcomb's CrossFit Reverb
+    ticket 4941e162 (2026-09-05, "All the captions are almost the same as one
+    another. Also, they all end with 'How do I get started with training at
+    CrossFit Reverb?' which doesn't make sense."):
+
+      1. SHAPE. Every CTA candidate must pass copy_gate.is_cta_shaped, which
+         rejects questions and headings. Reverb's line was an FAQ heading out
+         of his own source doc that matched ASK_RE because it contains the
+         phrase "get started". It is now rejected as cta_is_question.
+      2. ROTATION. grade_fix rotates over the gym's whole approved CTA pool
+         instead of stapling one string onto every day, and skips a CTA whose
+         closing signature is already used inside the anti-repetition window.
+         Measured before: 90 of Reverb's 93 rows shared one closing line.
+      3. ASK RATE. The booking CTA is appended only while the book is short of
+         its booking-ask floor. Once the floor is met, a repaired caption with
+         NO ask passes the craft bar. Not every post should end in an ask;
+         Dean was right that an ask on all of them reads wrong.
+
+    Never invents a CTA. Everything in the pool is copy the gym already
+    approved, and a gym with no usable CTA still gets an honest skip.
+    Arm by hand: AGENT_CTA_VARIETY=true.
+    """
+    return _truthy(os.environ.get("AGENT_CTA_VARIETY", "false"))
+
+
+def caption_variety_window() -> int:
+    """
+    How many POSTS back the caption anti-repetition rail looks (AGENT_CAPTION_
+    VARIETY_WINDOW, default 10). Only consulted while AGENT_CTA_VARIETY is
+    armed. 10 posts is roughly what a reader sees scrolling a gym's recent grid.
+    """
+    try:
+        n = int(os.environ.get("AGENT_CAPTION_VARIETY_WINDOW", "10"))
+    except (TypeError, ValueError):
+        return 10
+    return n if n > 0 else 10
+
+
 def calendar_grade_enabled_for(gym_id: str) -> bool:
     """Per-gym grade enforcement. Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper()} first,
     then falls back to AGENT_CALENDAR_GRADE. Rollout order: lasso first, then ENG,
