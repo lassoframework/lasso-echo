@@ -497,12 +497,54 @@ def _clears_craft(caption, allow_no_ask=False) -> bool:
     return True
 
 
+def _ask_target_posts(n_posts: int) -> int:
+    """How many POSTS of an `n_posts` book should carry a booking ask.
+
+    `max(grader floor, share)` because the two constraints are both real and
+    the larger one wins:
+
+      * the grader's path_to_join GYM leg still wants `min(5, n)` posts carrying
+        a booking-SPECIFIC term, and
+      * Blake's ask-rate target (config.caption_ask_rate_target, 0.33) is the
+        share of the book that should close on an ask at all.
+
+    On a normal ~31 post month the share is the binding one (10 posts, 32.3%).
+    On a book shorter than ~15 posts the grader's floor of 5 binds instead and
+    the realised rate runs above the target; that is the grader's own hard
+    minimum, not a miscalculation, and lowering it is a separate decision.
+    """
+    if n_posts <= 0:
+        return 0
+    share = int(round(config.caption_ask_rate_target() * n_posts))
+    return min(n_posts, max(1, min(5, n_posts), share))
+
+
 def _booking_deficit(rows) -> int:
-    """How many more booking-term rows the path_to_join GYM leg wants
-    (>= min(5, n) rows carrying a booking-specific ask)."""
-    n = len(rows)
-    have = sum(1 for r in rows if _BOOKING_RE.search(r.get("caption") or ""))
-    return max(0, min(5, n) - have)
+    """How many more booking asks the book still wants.
+
+    FLAG OFF: rows, and a flat floor of `min(5, n)` -- byte for byte the
+    pre-2026-09-06 behavior.
+
+    AGENT_CTA_VARIETY ARMED: POSTS, and the target is `_ask_target_posts`.
+    Counting POSTS is what makes the rate mean anything: one calendar post
+    deliberately spans several rows (the IG feed, its Facebook mirror and the
+    paired story share one caption on one date), so Reverb's 31 posts are 93
+    rows. A share taken over ROWS would ask for 31 posts' worth of CTA on a
+    31 post book -- 100%, the exact defect this is meant to end -- because the
+    caller decrements this deficit once per POST repaired, not once per row.
+    """
+    if not config.cta_variety_enabled():
+        n = len(rows)
+        have = sum(1 for r in rows if _BOOKING_RE.search(r.get("caption") or ""))
+        return max(0, min(5, n) - have)
+
+    posts = {}
+    for r in rows or []:
+        key = (str(r.get("post_date") or "")[:10], caption_hash(r.get("caption") or ""))
+        posts.setdefault(key, r.get("caption") or "")
+    n = len(posts)
+    have = sum(1 for cap in posts.values() if _BOOKING_RE.search(cap or ""))
+    return max(0, _ask_target_posts(n) - have)
 
 
 def _booking_cta_pool(gym_id, log):

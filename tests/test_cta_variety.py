@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import caption_variety as cv
+from agent import calendar_grade, caption_variety as cv, copy_gate
 from agent.jobs import grade_fix
 
 
@@ -209,17 +209,21 @@ def test_identical_bodies_still_collide_and_the_cta_layer_cannot_fix_that():
 # 4. Armed: not every post ends in an ask
 # ---------------------------------------------------------------------------
 
-def test_armed_stops_appending_once_the_book_has_its_ask_floor(monkeypatch):
+def test_armed_stops_appending_once_the_book_has_its_ask_target(monkeypatch):
     """Dean is right that an ask on every post reads wrong. The booking CTA is
-    appended only while the book is short of the grader's floor of 5 booking
-    asks; after that a repaired caption legitimately carries none."""
+    appended only while the book is short of its ask TARGET; after that a
+    repaired caption legitimately carries none.
+
+    The target was `min(5, n)` when this test was written (5 of 20). Blake moved
+    it to a 33% share on 2026-09-06, so 20 posts now want 7. The invariant this
+    test exists for is unchanged and is the second assertion: appending STOPS
+    somewhere well short of the whole book."""
     rows = _run(_book(20), monkeypatch, variety=True, pool=POOL)
     pool_sigs = {cv.normalize(c) for c in POOL}
     appended = [r for r in rows if cv.closing_signature(r["caption"]) in pool_sigs]
-    # The grader's GYM floor is min(5, n) booking asks. Appending stops there:
-    # 5 of 20 posts, not 20 of 20. Before this gate every craft-flagged day got
+    # 20 posts * 0.33 = 6.6 -> 7. Before this gate every craft-flagged day got
     # the CTA, which is how one line reached 90 of Reverb's 93 rows.
-    assert len(appended) == 5, f"{len(appended)} of {len(rows)}"
+    assert len(appended) == 7, f"{len(appended)} of {len(rows)}"
     assert len(appended) < len(rows), "an ask on every post is the defect"
     # A CTA may only recur once it is OUTSIDE the window, never inside it.
     assert [c for c in cv.collisions(rows, window=10) if c["kind"] == "closing"] == []
@@ -425,3 +429,119 @@ def test_local_rows_carry_the_new_levers_before_any_store_re_read(monkeypatch):
     assert any(r["ask_type"] != "none" for r in rows), rows
     for r in rows:
         assert r["ask_type"] == lever_stamp.ask_type(r["caption"])
+
+
+# ---------------------------------------------------------------------------
+# THE 33% ASK RATE (Blake, 2026-09-06: "every post should not have an ask, make
+# it 33% of post"). The shipped target was `min(5, n)` -- 5 of 31 posts, 16.1%.
+#
+# Two halves, and the second one is the point: moving the REPAIR without moving
+# the GRADER would build a system that fights itself, because the grader's rule
+# was "every post carries an ask" and it was scored on TWO legs at once.
+# ---------------------------------------------------------------------------
+
+def test_ask_target_is_a_share_of_the_book_not_a_flat_five(monkeypatch):
+    """31 posts at 0.33 wants 10, not 5. The old flat floor is what produced
+    16.1% on Dean's real book."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    assert grade_fix._ask_target_posts(31) == 10
+    assert grade_fix._ask_target_posts(30) == 10
+    assert grade_fix._ask_target_posts(0) == 0
+
+
+def test_the_graders_booking_floor_still_binds_on_a_short_book(monkeypatch):
+    """A share below the grader's own `min(5, n)` floor would hand the repair a
+    target the grader still marks down. The larger of the two wins."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    assert grade_fix._ask_target_posts(6) == 5      # share would be 2
+    assert grade_fix._ask_target_posts(3) == 3      # never more posts than exist
+
+
+def test_the_target_is_configurable_and_refuses_nonsense(monkeypatch):
+    from agent import config
+    monkeypatch.setenv("AGENT_CAPTION_ASK_RATE", "0.5")
+    assert config.caption_ask_rate_target() == 0.5
+    for bad in ("0", "-1", "1.5", "banana", ""):
+        monkeypatch.setenv("AGENT_CAPTION_ASK_RATE", bad)
+        assert config.caption_ask_rate_target() == 0.33, bad
+
+
+def test_the_deficit_counts_posts_not_rows(monkeypatch):
+    """One post spans several rows (IG feed + FB mirror + paired story share one
+    caption on one date). A share taken over ROWS asks for 31 posts' worth of CTA
+    on a 31 post book, because the caller decrements the deficit once per POST.
+    Reverb's book is 93 rows and 31 posts, which is exactly the 3x that hides it.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = []
+    for i in range(30):
+        cap = _no_ask_caption(i)
+        for plat in ("instagram", "facebook", "story"):
+            rows.append({"id": f"r{i}_{plat}", "gym_id": "reverb",
+                         "post_date": f"2026-09-{i + 1:02d}", "caption": cap,
+                         "status": "pending", "account": plat, "format": "feed"})
+    assert len(rows) == 90
+    # 30 POSTS at 0.33 -> 10. Counting the 90 ROWS would give 30.
+    assert grade_fix._booking_deficit(rows) == 10
+
+
+def test_flag_off_keeps_the_flat_five_row_deficit(monkeypatch):
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _book(30)
+    assert grade_fix._booking_deficit(rows) == 5
+
+
+def test_repairing_a_no_ask_book_lands_near_the_target(monkeypatch):
+    """END TO END on the real repair loop: a 31 post book of ask-less captions
+    comes out of _fix_craft with ~a third of its posts asking, not a twentieth
+    and not all of them."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None)
+    asking = [r for r in rows if copy_gate.ASK_RE.search(r["caption"])]
+    assert len(asking) == 10, [r["caption"][-60:] for r in asking]
+    assert 0.28 <= len(asking) / len(rows) <= 0.38
+
+
+def test_the_grader_does_not_mark_down_a_book_that_hits_the_target(monkeypatch):
+    """THE RECONCILIATION. Measured on Dean's real book before this: a book
+    repaired exactly as intended scored 71 (C) with 25 'no ask' defects, because
+    the grader still wanted an ask on every post AND counted `no_ask` twice --
+    once on path_to_join (up to 7) and again as a caption_craft soft flag (up to
+    12). Both legs now agree with the target."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert no_ask == [], no_ask
+    assert grade.scores["path_to_join"] == 10, grade.scores
+    soft_no_ask = [d for d in grade.defects if "soft flag: no_ask" in str(d[2])]
+    assert soft_no_ask == [], soft_no_ask
+
+
+def test_a_book_with_no_asks_at_all_still_loses_the_full_penalty(monkeypatch):
+    """The band must not become a licence to never ask. 0% keeps the same worst
+    case path_to_join always had."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    # 7 for the ask rule + 5 for the booking-specific leg takes the leg to 0.
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert len(no_ask) == 10, len(no_ask)   # the SHORTFALL, not all 31
+
+
+def test_flag_off_the_grader_still_wants_an_ask_on_every_post(monkeypatch):
+    """Regression guard: unarmed gyms see byte-for-byte the old rule."""
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert len(no_ask) == 31, len(no_ask)
+    soft_no_ask = [d for d in grade.defects if "soft flag: no_ask" in str(d[2])]
+    assert len(soft_no_ask) == 31, len(soft_no_ask)

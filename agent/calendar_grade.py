@@ -82,6 +82,14 @@ _ATHLETE_WORDS = re.compile(
 def _athlete_rail_on() -> bool:
     from . import config
     return config.avatar_athlete_rail_enabled()
+
+
+def _ask_rate_rail() -> tuple:
+    """(armed, target share) for the ask-rate rule. Lazily imported like
+    _athlete_rail_on, for the same reason: agent.config must not be imported at
+    module scope here."""
+    from . import config
+    return config.cta_variety_enabled(), config.caption_ask_rate_target()
 # Hook-intent mismatch: elite language
 _ELITE_WORDS = re.compile(r"\b(elite|advanced athlete)\b", re.I)
 
@@ -380,9 +388,19 @@ def _caption_craft(rows, defects, exempt=None) -> int:
     # Soft flags, scored PER POST at a RATE (see module docstring). A book where
     # every post is flagged lands on the same floor of 8 it always did; a book
     # that repaired most of its posts now scores like it.
+    # ONE RULE, ONE OWNER (2026-09-06). `no_ask` was scored on BOTH legs: here
+    # as a soft flag worth up to 12, and again on path_to_join as the ask rule
+    # worth up to 7. That double count was survivable while the doctrine was
+    # "every post asks", because a compliant book tripped neither. Under the
+    # 33% target two thirds of a CORRECT book carry no ask, and leaving `no_ask`
+    # here would take up to 8 points off caption_craft for doing exactly what
+    # was asked. path_to_join owns the ask rule now; this leg scores craft.
+    ask_rail_on, _target = _ask_rate_rail()
     flagged = 0
     for (day, _h), grp in eligible:
         flags = copy_gate.soft_flags(grp[0].get("caption") or "")
+        if ask_rail_on:
+            flags = [f for f in flags if f != "no_ask"]
         if flags:
             flagged += 1
             for f in flags:
@@ -525,16 +543,35 @@ def _path(rows, profile, defects, exempt=None) -> int:
     if not n:
         return score
 
-    # Every post carries an ask. Scored at a RATE so repairing most of a book
-    # actually moves the leg (see module docstring); a book where NO post asks
-    # still loses the same worst case it always did.
-    missing = 0
-    for (day, _h), grp in eligible:
-        cap = grp[0].get("caption") or ""
-        if not copy_gate.ASK_RE.search(cap):
+    # THE ASK RULE.
+    #
+    # FLAG OFF: every post carries an ask, scored at a RATE so repairing most of
+    # a book actually moves the leg (see module docstring); a book where NO post
+    # asks still loses the same worst case it always did.
+    #
+    # AGENT_CTA_VARIETY ARMED (Blake, 2026-09-06: "every post should not have an
+    # ask, make it 33% of post"): the leg wants a SHARE of the book to close on
+    # an ask, not all of it, and the share is the same number the repair loop
+    # sizes itself to (config.caption_ask_rate_target, read by both sides so
+    # they cannot drift). At or above the target the rule costs nothing and
+    # names no defect; below it, the deduction scales with the SHORTFALL, so a
+    # book with no asks at all still loses the full _ASK_MAX_PENALTY exactly as
+    # it always did. Only the shortfall is named as defects, in date order, so
+    # the digest lists days that actually need repairing instead of listing 21
+    # perfectly good ask-less posts as broken.
+    ask_less = [(day, grp) for (day, _h), grp in eligible
+                if not copy_gate.ASK_RE.search(grp[0].get("caption") or "")]
+    ask_rail_on, ask_rate_target = _ask_rate_rail()
+    if ask_rail_on:
+        want = max(1, min(n, int(round(ask_rate_target * n))))
+        short = max(0, want - (n - len(ask_less)))
+        for day, _grp in sorted(ask_less)[:short]:
             defects.append(("path_to_join", day, "no ask in caption"))
-            missing += 1
-    score -= int(round(_ASK_MAX_PENALTY * missing / n))
+        score -= int(round(_ASK_MAX_PENALTY * short / want))
+    else:
+        for day, _grp in ask_less:
+            defects.append(("path_to_join", day, "no ask in caption"))
+        score -= int(round(_ASK_MAX_PENALTY * len(ask_less) / n))
 
     # GYM: >= 5 posts pointing at booking-specific terms
     if profile != "B2B":
