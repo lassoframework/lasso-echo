@@ -12,6 +12,21 @@ import re
 # em/en/figure/horizontal-bar/minus and friends
 _BANNED_DASHES = "‐‑‒–—―−"
 _DASH_RE = re.compile("[" + _BANNED_DASHES + "]")
+
+# ZERO-WIDTH / INVISIBLE CHARACTERS (Dean Holcomb, CrossFit Reverb, 2026-09-05).
+# 90 of Reverb's 93 forward-book rows ended with a line that began U+200B, because
+# the CTA was mined out of a source doc PASTED from a web page and nothing on the
+# caption path ever normalized invisible characters: Python's \s does not match
+# U+200B (category Cf), str.strip() does not remove it, and scrub only handled
+# dashes. An invisible character in published copy is never intentional, so it is
+# scrubbed the same way a banned dash is: rewritten out, never rejected.
+#
+# DELIBERATELY NOT STRIPPED: U+200D ZERO WIDTH JOINER and U+200C ZERO WIDTH
+# NON-JOINER. Those are load-bearing inside emoji sequences (a ZWJ family or
+# profession emoji is one grapheme held together by U+200D) and inside several
+# scripts. Stripping them would corrupt emoji that gyms legitimately post.
+_ZERO_WIDTH = "​⁠﻿­"
+_ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH + "]")
 _INTRAWORD_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
 # protect URLs and @handles/#tags: hyphens inside them are load-bearing
 _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit|gym)\S*|[@#][\w.]+)", re.I)
@@ -39,9 +54,10 @@ ASK_RE = re.compile(
 
 def scrub(text: str) -> str:
     """Rewrite, never reject. Long dashes become ', '; intraword hyphens become a
-    space; URLs, @handles and #tags pass through untouched."""
+    space; zero-width/invisible characters are removed; URLs, @handles and #tags
+    pass through untouched."""
     out, last = [], 0
-    s = str(text)
+    s = _ZERO_WIDTH_RE.sub("", str(text))
     for m in _PROTECTED_RE.finditer(s):
         out.append(_scrub_plain(s[last:m.start()])); out.append(m.group(0)); last = m.end()
     out.append(_scrub_plain(s[last:]))
@@ -51,10 +67,11 @@ def scrub_prompt(text: str) -> str:
     """Scrub banned dashes from AI generation prompt text (not client-facing copy).
     Banned dashes become a space (not ', ') and intraword hyphens are preserved
     because they are valid technical markup in generation prompts (e.g. 'left-aligned').
+    Zero-width/invisible characters are removed.
     URLs, @handles and #tags pass through untouched."""
     if not text:
         return ""
-    s = str(text)
+    s = _ZERO_WIDTH_RE.sub("", str(text))
     cleaned = _DASH_RE.sub(" ", s)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
@@ -64,6 +81,58 @@ def _scrub_plain(t: str) -> str:
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t
+
+# ---------------------------------------------------------------------------
+# CTA SHAPE (Dean Holcomb, CrossFit Reverb, 2026-09-05)
+# ---------------------------------------------------------------------------
+# "they all end with 'How do I get started with training at CrossFit Reverb?'
+#  which doesn't make sense."
+#
+# He is right, and the reason is mechanical. ASK_RE asks only "does this text
+# CONTAIN an ask phrase". An FAQ HEADING out of the gym's own source doc
+# ("How do I get started with training at CrossFit Reverb?") contains the ask
+# phrase "get started", so it passed ASK_RE and got stapled onto 90 captions as
+# if it were a call to action. It is a QUESTION THE READER IS BEING ASKED, not
+# a thing the reader is being asked to DO.
+#
+# A closing ask must tell the reader what to do. These rules say what a CTA is
+# NOT. They are deliberately narrow: reject what is provably not an ask, and
+# never try to judge whether approved copy is "good".
+_INTERROGATIVE_OPENERS = re.compile(
+    r"^\s*(how|what|why|when|where|who|which|whose|whom|"
+    r"can|could|should|would|will|do|does|did|is|are|was|were|am|have|has|had)\b",
+    re.I)
+
+# A rhetorical hook inside a caption body is fine; this only judges text being
+# used AS the closing ask.
+def cta_defects(text: str) -> list[str]:
+    """Why this text cannot serve as a post's closing call to action.
+
+    Empty list means the text is usable as a CTA. Any entry means it is not,
+    and the caller must pick a different one or leave the post with no ask
+    (an ask-less post is legitimate; see calendar_grade's ask-rate band).
+    """
+    d = []
+    t = _ZERO_WIDTH_RE.sub("", str(text or "")).strip()
+    if not t:
+        return ["cta_empty"]
+    if not ASK_RE.search(t):
+        d.append("cta_no_ask_phrase")
+    # A question is not an instruction. Either terminal '?' or an interrogative
+    # opener is enough; the Reverb line had both.
+    if t.endswith("?") or _INTERROGATIVE_OPENERS.match(t):
+        d.append("cta_is_question")
+    # A heading, not a sentence: no terminal punctuation AND title-ish length.
+    # Kept generous so a bare imperative ("Book your free intro") still passes.
+    if len(t) > 120:
+        d.append("cta_too_long")
+    return d
+
+
+def is_cta_shaped(text: str) -> bool:
+    """True when `text` can honestly serve as a post's closing ask."""
+    return not cta_defects(text)
+
 
 def violations(text: str) -> list[str]:
     """Hard failures. A caption with any of these never reaches the queue."""

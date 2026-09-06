@@ -1973,6 +1973,23 @@ def alert_repeat_gate_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ALERT_REPEAT_GATE", "false"))
 
 
+def slot_dedupe_enabled() -> bool:
+    """AGENT_SLOT_DEDUPE — the calendar slot idempotency belt. DEFAULT ON.
+
+    Default-on is deliberate and matches the plan-horizon belt: this PREVENTS damage
+    rather than adding a capability. On 2026-09-05 the fleet held 155 genuine duplicate
+    future slots across 14 gyms and the number was still climbing hour over hour, because
+    a re-plan appended instead of replacing. Shipping the guard OFF would have left the
+    leak open.
+
+    A slot is (account, post_date, time_slot, format). Date alone is NOT a slot: a gym
+    running 2x a day plus a story legitimately owns three rows on one date, and keying on
+    the date alone called 441 rows duplicates when only 155 were.
+
+    Set AGENT_SLOT_DEDUPE=false as an emergency escape hatch."""
+    return _truthy(os.environ.get("AGENT_SLOT_DEDUPE", "true"))
+
+
 def alert_repeat_window_hours() -> float:
     """How long an unchanged NEEDS_TRIAGE alert stays quiet. 72h by default: long enough
     that human onboarding work (a gym owner clicking a connect link) gets a working week
@@ -2025,6 +2042,78 @@ def slack_convo_staff_reply_armed(identity: str) -> bool:
     """SLACK_CONVO_<IDENTITY>_STAFF_REPLY — may this bot post replies to LASSO staff in a
     thread directly? OFF by default."""
     return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_STAFF_REPLY", "false"))
+
+
+def slack_convo_classifier_llm_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CLASSIFIER_LLM — may this bot consult the model for the
+    ambiguous middle of classification? OFF by default (every new capability ships behind a
+    flag that defaults OFF).
+
+    Found live 2026-09-05: listener_wiring.live_deps() passed classify_llm=None
+    unconditionally, so the LLM fallback slack_convo_model()'s docstring has always promised
+    did not exist in production at all. With this flag off, behaviour is byte for byte what
+    it was: deterministic rules, then escalate. With it on, the model is consulted ONLY after
+    every deterministic rule has declined, and only to pick one of the fixed labels."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CLASSIFIER_LLM", "false"))
+
+
+def slack_convo_auto_answer_armed(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_AUTO_ANSWER — may this bot SEND a grounded answer to a client
+    with no human tap? OFF by default, and narrower than CLIENT_REPLY in every direction.
+
+    It gates exactly one path: a message classified answerable_question whose answer_lane
+    reply came back with a grounding snapshot. Everything else still holds for a tap no
+    matter what this flag says -- code fixes, action requests, anything the classifier was
+    unsure about, and the hard-line topics in adapter.AUTO_ANSWER_FORBIDDEN (billing and
+    price, refunds, hours and schedule changes, injuries and liability). Those are not
+    tunable; they are re-checked at draft time and again at post time."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    if not slack_convo_client_reply_armed(identity):
+        return False
+    if not _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_AUTO_ANSWER", "false")):
+        return False
+    # ARMING LOCK (2026-09-05, after nine independent audits).
+    #
+    # Nine rounds found twelve CRITICALs. Rounds 8 and 9 both found the same one, in
+    # different clothes: Blake's named hard lines -- billing, gym hours, class-schedule
+    # changes, injuries, liability -- DO NOT HOLD. Round 8 measured 8/10 injury messages
+    # auto-sending; round 9, after the structural rewrite meant to fix exactly that, measured
+    # 15 of 16 must-hold messages still posting to a client ("we open at 5 now, does the
+    # calendar know?", "can you cancel the story scheduled for tonight?").
+    #
+    # Four separate attempts to gate this by classifying the QUESTION -- topic denylists,
+    # allowlists, publish-request shapes, message shape -- have each closed the cases they
+    # were measured against and left a new set open. The conclusion this lock encodes is that
+    # the approach is wrong, not that the regex needs one more pass: a safe auto-answer gate
+    # has to be grounded in what the ANSWER is derived from (a small enumerated set of fact
+    # keys, restating them and nothing else), not in guessing a free-text question's subject.
+    # That is a design decision, and it is Blake's, not a thing to keep patching at 3am.
+    #
+    # So the flag alone can no longer arm this. Setting it without the override logs what is
+    # known to be broken and refuses. The override exists so Blake can say "I have read the
+    # finding and I want it on anyway" in one deliberate act, rather than discovering that a
+    # flag he set weeks ago quietly means something he never reviewed.
+    if not _truthy(os.environ.get("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "false")):
+        print(f"[slack-convo/{identity}] AUTO_ANSWER is set but REFUSED: the hard-line gate "
+              f"has a known open CRITICAL (audits 8 and 9 -- billing, hours, schedule "
+              f"changes and injury messages reach a client with no tap). See DECISIONS.md "
+              f"D67. Set SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true only if you have "
+              f"read that entry and accept it.")
+        return False
+    return True
+
+
+def slack_convo_cross_product_routing_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT — may a CONFIDENT website question that arrived
+    on this identity be drafted with the website identity's knowledge and voice (D50)? OFF by
+    default. This never moves the ticket, the channel, the gym, or the delivery surface; it
+    only changes which product's knowledge drafts the answer."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CROSS_PRODUCT", "false"))
 
 
 def slack_convo_daily_ticket_cap() -> int:
@@ -3399,6 +3488,33 @@ def learning_loop_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_LEARNING_LOOP", "false"))
 
 
+def cross_gym_brain_enabled() -> bool:
+    """
+    Cross gym brain switch (AGENT_CROSS_GYM_BRAIN). OFF by default = zero behavior
+    change: agent/jobs/cross_gym_brain.py is a no-op (no store constructed, nothing
+    read, nothing written) and agent/cross_gym_guidance.guidance_for() returns an
+    empty result. When ON, a nightly READ ONLY job pools every gym's matured
+    post_metrics (the Zernio ingestion lane), scores each post with the same
+    learning_score scorer the per gym monthly retro uses, and tests each FORM lever
+    (hook_family, caption length band, sentence band, pillar, ask presence and
+    type, time slot, format, media product type, member face) with Welch's t test
+    on log1p engagement plus a Benjamini Hochberg false discovery correction across
+    the run. A finding needs BOTH cells at or above the sample floor (6), BOTH
+    cells drawn from at least 2 DISTINCT gyms, survival of the FDR correction, and
+    an effect size at or above 0.30 before it becomes guidance; everything else is
+    reported honestly as insufficient_data / not_significant / directional and
+    produces NO guidance. external=true and is_ad=true rows never train anything
+    (the monthly_retro rail); Apify social_baseline is reporting context only.
+    Output is FORM ONLY, enforced by a whitelist of lever names and lever values,
+    so no caption fragment, stat, offer, member name, or handle can ever reach the
+    artifact or cross from one gym to another. The only write is the append only
+    cross_gym_brain row. Nothing here publishes, approves, or touches any social
+    account, and the approval gate is untouched. Arm by hand:
+    AGENT_CROSS_GYM_BRAIN=true (Railway env). HUMAN TAP REQUIRED.
+    """
+    return _truthy(os.environ.get("AGENT_CROSS_GYM_BRAIN", "false"))
+
+
 def mentions_enabled() -> bool:
     """
     Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior
@@ -3410,6 +3526,73 @@ def mentions_enabled() -> bool:
     never tags a member without explicit consent. Arm by hand: AGENT_MENTIONS=true.
     """
     return _truthy(os.environ.get("AGENT_MENTIONS", "false"))
+
+
+def cta_variety_enabled() -> bool:
+    """
+    Closing-ask variety and CTA shape validation (AGENT_CTA_VARIETY). OFF by
+    default = zero behavior change: grade_fix picks exactly the CTA it picked
+    before and appends it to every craft-flagged day, and an ask-less caption
+    still fails the craft bar.
+
+    Armed, three things change, all of them from Dean Holcomb's CrossFit Reverb
+    ticket 4941e162 (2026-09-05, "All the captions are almost the same as one
+    another. Also, they all end with 'How do I get started with training at
+    CrossFit Reverb?' which doesn't make sense."):
+
+      1. SHAPE. Every CTA candidate must pass copy_gate.is_cta_shaped, which
+         rejects questions and headings. Reverb's line was an FAQ heading out
+         of his own source doc that matched ASK_RE because it contains the
+         phrase "get started". It is now rejected as cta_is_question.
+      2. ROTATION. grade_fix rotates over the gym's whole approved CTA pool
+         instead of stapling one string onto every day, and skips a CTA whose
+         closing signature is already used inside the anti-repetition window.
+         Measured before: 90 of Reverb's 93 rows shared one closing line.
+      3. ASK RATE. The booking CTA is appended only while the book is short of
+         its booking-ask floor. Once the floor is met, a repaired caption with
+         NO ask passes the craft bar. Not every post should end in an ask;
+         Dean was right that an ask on all of them reads wrong.
+
+    Never invents a CTA. Everything in the pool is copy the gym already
+    approved, and a gym with no usable CTA still gets an honest skip.
+    Arm by hand: AGENT_CTA_VARIETY=true.
+    """
+    return _truthy(os.environ.get("AGENT_CTA_VARIETY", "false"))
+
+
+def caption_form_plan_enabled() -> bool:
+    """
+    Per-post caption SHAPE planning (AGENT_CAPTION_FORM_PLAN). OFF by default =
+    zero behavior change: the SB7 prompt is byte-for-byte today's, including its
+    fixed "Max 260 characters".
+
+    Armed, every post is handed a concrete shape from caption_variety.form_plan
+    (an opening move out of six, and a sentence/character band out of three)
+    instead of the identical soft "VARY the ENTRY POINT" instruction on all of
+    them. A soft instruction repeated 31 times produced 31 similar captions:
+    measured on the live fleet, 90.3% of CrossFit Reverb's captions opened
+    "You + problem", 100% of rows sat in one caption_len_band, and sentence
+    count sd was 1.3 on a mean of 4.9.
+
+    STYLE ONLY. A form plan carries no fact, no topic and no copy; every claim
+    still comes from the approved source and the figure/fabrication gates,
+    banned-word gate and no-dash law all still run on the output unchanged.
+    Arm by hand: AGENT_CAPTION_FORM_PLAN=true.
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_FORM_PLAN", "false"))
+
+
+def caption_variety_window() -> int:
+    """
+    How many POSTS back the caption anti-repetition rail looks (AGENT_CAPTION_
+    VARIETY_WINDOW, default 10). Only consulted while AGENT_CTA_VARIETY is
+    armed. 10 posts is roughly what a reader sees scrolling a gym's recent grid.
+    """
+    try:
+        n = int(os.environ.get("AGENT_CAPTION_VARIETY_WINDOW", "10"))
+    except (TypeError, ValueError):
+        return 10
+    return n if n > 0 else 10
 
 
 def calendar_grade_enabled_for(gym_id: str) -> bool:
@@ -3803,3 +3986,40 @@ def portal_echo_tickets_poll_minutes() -> int:
         return max(1, int(os.environ.get("AGENT_PORTAL_ECHO_TICKETS_POLL_MINUTES", "3")))
     except ValueError:
         return 3
+
+
+def gym_deep_brain_enabled() -> bool:
+    """PER-GYM DEEP BRAIN (AGENT_GYM_DEEP_BRAIN, Blake 2026-09-06: "create a deeper
+    brain for each gym scraping their website and all their social media prior to
+    starting with us").
+
+    OFF by default = zero behavior change: agent/gym_deep_brain.py fetches nothing,
+    writes no artifact, lands no client_sources row, and every entry point returns a
+    blocked result naming this flag. Nothing in the draft path reads the artifact
+    while the flag is off. Arm by hand: AGENT_GYM_DEEP_BRAIN=true."""
+    return _truthy(os.environ.get("AGENT_GYM_DEEP_BRAIN", "false"))
+
+
+def gym_deep_brain_crawl_delay() -> float:
+    """Minimum seconds between two requests to the SAME host during a deep-brain
+    scrape (AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY, default 2.0). A robots.txt Crawl-delay
+    LARGER than this always wins; this is the floor, never a ceiling. Values below
+    0.0 or unparseable values fall back to the default."""
+    try:
+        v = float(os.environ.get("AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY", "2.0"))
+    except ValueError:
+        return 2.0
+    return v if v >= 0.0 else 2.0
+
+
+def gym_deep_brain_dir() -> str:
+    """The DURABLE root for per-gym DEEP BRAIN artifacts: <DATA_DIR>/deep_brains.
+
+    Deliberately NOT <DATA_DIR>/brains (tenant_brain's append-only learning log, a
+    different format and a different lifecycle) and emphatically never
+    ~/LASSO/lasso-brain, which is the READ-ONLY shared LASSO corpus. Override with
+    AGENT_GYM_DEEP_BRAIN_DIR for a custom mount / tests."""
+    override = os.environ.get("AGENT_GYM_DEEP_BRAIN_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(data_dir(), "deep_brains")

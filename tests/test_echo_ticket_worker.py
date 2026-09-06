@@ -24,6 +24,17 @@ from agent.slack_convo import identity_gate as IG
 @pytest.fixture(autouse=True)
 def _armed(monkeypatch):
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
+    # C2 (2026-09-05 audit): the bridge's QUESTION branch now obeys the same D54 gates as
+    # every other client-facing path -- a grounded answer sends unattended ONLY with that
+    # identity's AUTO_ANSWER armed on top of CLIENT_REPLY. These tests are about the intake
+    # behaviour, not the permission, so they arm it explicitly; the tests that are about the
+    # permission live in tests/test_portal_escalation_loop.py and turn it off deliberately.
+    for ident in ("ECHO", "SCOUT"):
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_ENABLED", "true")
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_CLIENT_REPLY", "true")
+        monkeypatch.setenv(f"SLACK_CONVO_{ident}_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     yield
 
 
@@ -175,7 +186,7 @@ def test_intake_pass_is_a_full_noop_when_the_flag_is_off(monkeypatch):
 
 def test_fixed_pass_is_a_full_noop_when_the_flag_is_off(monkeypatch):
     _off(monkeypatch)
-    bus = FakeBus([_ticket(status="fixing", verification_after={"fix_pr_url": "x"})])
+    bus = FakeBus([_ticket(status="fixing", verification_after={"verified": True, "fix_pr_url": "x"})])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert result == {"notified": 0}
@@ -412,9 +423,88 @@ def test_intake_pass_holds_a_code_fix_behind_the_fixer_tap_same_as_any_other():
 
 # ---- fixed_pass -------------------------------------------------------------------
 
-def test_fixed_pass_notifies_once_verification_after_is_present():
+# ---- D68 (2026-09-06): the fix lane refuses instead of being inert ------------------
+#
+# Blake: "Either wire the producer or make the field refuse to be read as a pass. An inert
+# verification field is worse than no field."
+#
+# FIX_VERIFICATION_PRODUCERS is empty in production, so every test below that wants the
+# DELIVERY path must say so out loud by registering a producer. That is the point: the only
+# thing between a ticket in 'fixing' and a client being told "fixed it" is a registry entry
+# that no process currently earns, and these tests fail if that stops being true.
+
+@pytest.fixture
+def _wired(monkeypatch):
+    """Pretend a fix producer exists, so the delivery path stays covered and cannot rot."""
+    monkeypatch.setattr(W, "FIX_VERIFICATION_PRODUCERS", frozenset({"ops_fix"}))
+    yield
+
+
+def _verdict(**kw):
+    """A snapshot shaped like something a REGISTERED producer wrote."""
+    base = {"producer": "ops_fix", "verified": True}
+    base.update(kw)
+    return base
+
+
+def test_the_fix_verification_lane_is_unwired_in_production():
+    """The two-way guard (D55's lesson). If someone fills this registry, they have to come
+    here and say why -- and every 'refuses' test below stops being vacuous at that moment."""
+    assert W.FIX_VERIFICATION_PRODUCERS == frozenset(), (
+        "A fix-verification producer was registered. That is a real cross-repo wiring "
+        "change: confirm the producer writes verification_after onto the ORIGINATING "
+        "ticket (not a row it mints), then update D68 and this test.")
+    assert W.fix_verification_lane_is_wired() is False
+
+
+def test_fixed_pass_refuses_rather_than_silently_polling_a_gate_that_cannot_open():
+    """THE MUTATION CHECK for D68. This ticket is verified as hard as a ticket can be --
+    an affirmative verdict AND a PR url. The OLD code notified this client. The new code
+    must refuse, because nothing can actually put that value there, and 'notified: 0' with
+    no reason is exactly the inert state the ruling forbids.
+
+    Revert the refusal in fixed_pass and this test fails: it would return {'notified': 1}."""
     bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
-                          verification_after={"fix_pr_url": "https://github.com/x/y/pull/1"})])
+                          verification_after={"verified": True,
+                                              "fix_pr_url": "https://github.com/x/y/pull/1"})])
+    log, open_dm, post = _calls()
+    result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
+    assert result["notified"] == 0
+    # Not merely zero -- zero WITH A NAMED REASON. A caller, a log line or a metric can now
+    # tell "impossible" from "not yet", which is the whole ruling.
+    assert result["refused"] == "fix_verification_lane_unwired"
+    assert result["fixing"] == 1
+    assert bus.tickets["t-1"]["status"] == "fixing"   # never resolved on a refusal
+    assert log["opened"] == []                        # and the client is never told anything
+
+
+def test_read_fix_verification_raises_loudly_while_the_lane_is_unwired():
+    """'Loud, not a comment.' The accessor raises; it does not return a falsy 'not yet'."""
+    with pytest.raises(W.InertVerificationLane) as e:
+        W.read_fix_verification({"verification_after": _verdict()})
+    assert "no registered fix producer" in str(e.value)
+    assert "D68" in str(e.value)
+
+
+def test_the_answer_lanes_grounding_snapshot_is_never_read_as_a_fix_verdict(_wired):
+    """The column is overloaded: answer_pass writes its grounding snapshot to this same
+    verification_after. That lane is wired and correct and is NOT what this pass gates on.
+    Even with a producer registered, an unattributed snapshot is not a fix verdict."""
+    grounding = {"social_status": {"connected": True}, "calendar_this_month": 4}
+    assert W.read_fix_verification({"verification_after": grounding}) is None
+    bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
+                          verification_after=grounding)])
+    log, open_dm, post = _calls()
+    result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
+    assert result == {"notified": 0}
+    assert bus.tickets["t-1"]["status"] == "fixing"
+    assert log["opened"] == []
+
+
+def test_fixed_pass_notifies_once_a_registered_producer_has_verified(_wired):
+    """The delivery path still works -- the refusal is the ONLY thing holding it."""
+    bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
+                          verification_after=_verdict(fix_pr_url="https://github.com/x/y/pull/1"))])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert result == {"notified": 1}
@@ -423,7 +513,7 @@ def test_fixed_pass_notifies_once_verification_after_is_present():
     assert "https://github.com/x/y/pull/1" in log["posted"][0][1]
 
 
-def test_fixed_pass_leaves_an_unverified_ticket_alone():
+def test_fixed_pass_leaves_an_unverified_ticket_alone(_wired):
     bus = FakeBus([_ticket(status="fixing", slack_user_id="U_CLIENT",
                           verification_after=None)])
     log, open_dm, post = _calls()
@@ -433,9 +523,9 @@ def test_fixed_pass_leaves_an_unverified_ticket_alone():
     assert log["opened"] == []
 
 
-def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
+def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted(_wired):
     bus = FakeBus([_ticket(status="fixing",
-                          verification_after={"fix_pr_url": "x"})])
+                          verification_after=_verdict(fix_pr_url="x"))])
     log, open_dm, post = _calls()
     W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post)
     assert bus.tickets["t-1"]["status"] == "hold"
@@ -449,7 +539,10 @@ def test_fixed_pass_escalates_if_slack_user_id_was_never_persisted():
 # the identity map, not bolted onto ranger's ad-engine-specific worker.
 
 def test_intake_pass_routes_product_portal_to_scout_identity():
-    bus = FakeBus([_ticket(product="portal", raw_text="how do I add my group class schedule?")])
+    # The question text is deliberately NOT a gym-schedule one: "group class schedule" is on
+    # the D54 hard-line list (a real-world commitment about a client's classes), so it would
+    # hold for a tap and this test is about ROUTING, not about the permission.
+    bus = FakeBus([_ticket(product="portal", raw_text="is my instagram connected?")])
     log, open_dm, post = _calls()
     _, notice = _notices()
 
@@ -493,9 +586,9 @@ def test_intake_pass_still_defaults_to_echo_when_called_with_no_product_override
     assert result == {"processed": 1}
 
 
-def test_fixed_pass_routes_product_portal_to_scout_identity():
+def test_fixed_pass_routes_product_portal_to_scout_identity(_wired):
     bus = FakeBus([_ticket(product="portal", status="fixing", slack_user_id="U_CLIENT",
-                          verification_after={"fix_pr_url": "https://github.com/x/y/pull/2"})])
+                          verification_after=_verdict(fix_pr_url="https://github.com/x/y/pull/2"))])
     log, open_dm, post = _calls()
     result = W.fixed_pass(bus, open_group_dm=open_dm, post_first_message=post,
                          product="portal", identity_name="scout")

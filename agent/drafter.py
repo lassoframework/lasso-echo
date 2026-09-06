@@ -608,6 +608,54 @@ class StoryBrandGenerator:
                          + ", ".join(phrases) + ".")
         return "\n".join(block) + "\n\n"
 
+    _HOOK_INSTRUCTIONS = {
+        "second_person_problem":
+            "open by naming the reader's problem directly in the second person",
+        "scene":
+            "open on what is physically happening in the photo or in the gym, "
+            "a moment, not a diagnosis of the reader",
+        "myth_bust":
+            "open by naming a belief the reader holds that is not true, then correct it",
+        "question":
+            "open with ONE real question the reader is actually asking themselves",
+        "outcome_first":
+            "open with where the reader ends up, the result, before any mention "
+            "of the problem",
+        "flat_statement":
+            "open with a short flat declarative sentence. No wind up, no second "
+            "person, no question",
+    }
+
+    @classmethod
+    def _form_block(cls, plan):
+        """A STYLE-only instruction giving THIS post a concrete shape.
+
+        The prompt used to ask for the identical shape every time ("Body max 260
+        characters") plus a soft "vary the entry point", and a soft instruction
+        repeated 31 times produces 31 similar captions. Measured on the live
+        fleet: 90.3% of Reverb's captions opened "You + problem", 100% of rows
+        sat in one length band, sentence count sd was 1.3.
+
+        Carries no fact, no topic and no copy; the approved source still owns
+        every claim and the figure gate still runs. Returns "" when no plan is
+        supplied (flag OFF), so the prompt is byte-for-byte today's.
+        """
+        if not plan:
+            return ""
+        hook = str(plan.get("hook_family") or "")
+        how = cls._HOOK_INSTRUCTIONS.get(hook)
+        lines = ["SHAPE FOR THIS CAPTION (style only, never a new fact and never an "
+                 "override of the approved source above). Other posts in this book "
+                 "get DIFFERENT shapes on purpose, so follow this one exactly:"]
+        if how:
+            lines.append(f"- OPENING: {how}.")
+        smin, smax = plan.get("min_sentences"), plan.get("max_sentences")
+        if smin and smax:
+            lines.append(f"- LENGTH: write {smin} to {smax} sentences, "
+                         f"no more than {plan.get('max_chars')} characters total.")
+        lines.append("- Do not restate the opening move of any recent post listed below.")
+        return "\n".join(lines) + "\n\n"
+
     @staticmethod
     def _brain_guidance(account):
         """Fold THIS gym's learned preferences into the prompt so every edit
@@ -653,8 +701,17 @@ class StoryBrandGenerator:
         return "\n".join(parts) + "\n\n"
 
     def build(self, voice, creative, account=None, avoid_openings=(),
-              angle="", avoid_angles=()):
+              angle="", avoid_angles=(), form_plan=None):
         """Write one SB7 caption.
+
+        form_plan (Dean Holcomb / CrossFit Reverb, 2026-09-05,
+        AGENT_CAPTION_FORM_PLAN): the concrete SHAPE this post should take
+        (opening move, sentence count, character cap) from
+        caption_variety.form_plan, so consecutive posts are told to be different
+        shapes instead of being asked identically to "vary the entry point".
+        STYLE-ONLY: it carries no fact and never overrides the approved source;
+        the figure and fabrication gates are unchanged. None (the default, flag
+        OFF) => the prompt is byte-for-byte today's.
 
         avoid_openings (optional): normalized opening phrases used on RECENT planned
         days (see opening_signature). Folded into the prompt as a HARD "do not open
@@ -682,6 +739,7 @@ class StoryBrandGenerator:
         guidance = self._brain_guidance(account)
         avoid_block = self._avoid_openings_block(avoid_openings)
         angle_block = self._angle_block(angle, avoid_angles)
+        form_block = self._form_block(form_plan)
         avoid_list = [p for p in (avoid_openings or ()) if (p or "").strip()]
 
         def _compose(extra_nudge=""):
@@ -690,10 +748,19 @@ class StoryBrandGenerator:
                 f"CLIENT NOTE ON THIS POST:\n{client_note}\n\n"
                 f"{guidance}"
                 f"{angle_block}"
+                f"{form_block}"
                 f"{avoid_block}"
                 f"{extra_nudge}"
                 "Write a StoryBrand-structured caption body. Problem-first. "
-                "Gym as guide, not hero. Max 260 characters. Caption body only."
+                "Gym as guide, not hero. "
+                # The fixed 260 char cap is what flattened every book into one
+                # length band. With a form plan the SHAPE block above owns the
+                # length, and repeating a contradictory cap here would just
+                # confuse the model.
+                + ("The SHAPE block above sets this caption's length; follow it "
+                   "and ignore any other length limit. "
+                   if form_block else "Max 260 characters. ")
+                + "Caption body only."
             )
             return _strip_llm_scaffold(_call_llm_caption(self._SYSTEM, user) or "")
 
