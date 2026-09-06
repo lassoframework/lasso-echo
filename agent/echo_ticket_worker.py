@@ -556,6 +556,82 @@ def _fix_summary_text(verification):
 STUCK_FIXING_HOURS = 24
 
 
+class InertVerificationLane(RuntimeError):
+    """Raised when the fix lane is asked to gate on a field nothing can populate.
+
+    See D68. This exists so that "no producer is wired" is a LOUD, catchable condition
+    rather than a `continue` that looks exactly like "nothing to verify yet"."""
+
+
+# ---------------------------------------------------------------------------------
+# D68 (2026-09-06): the fix lane's verification field refuses to be read as a pass.
+#
+# THE REGISTRY IS EMPTY ON PURPOSE. It is the single source of truth for "is there a
+# process that can write a FIX verdict onto support_tickets.verification_after for the
+# ticket this pass is watching". Today there is none: ~/scout-listener's ops-fix worker
+# polls status='new', mints a BRAND NEW support_tickets row (src/fixer/intake.js), and
+# writes its verification onto THAT row (src/fixer/store.js setVerificationAfter). The
+# originating portal ticket's verification_after is NULL forever.
+#
+# Blake's ruling (2026-09-06): "Either wire the producer or make the field refuse to be
+# read as a pass. An inert verification field is worse than no field."
+#
+# Two things made "refuse" the right half of that choice, both recorded in D68:
+#
+#   1. THE COLUMN IS OVERLOADED. The ANSWER lane writes its grounding snapshot to this
+#      same column (answer_pass below, and slack_convo/adapter.py). That lane is wired and
+#      correct and is NOT touched by any of this. But it means a non-NULL
+#      verification_after has never, on this column, meant "a fix was verified" -- so
+#      "populated" was never a safe proxy for "verified", even before the producer gap.
+#
+#   2. A verdict this pass cannot attribute to a known producer is a guess about another
+#      repo's vocabulary, which is the exact failure mode D62/D63 are written about.
+#
+# So: a fix verification is only readable as a pass when it carries a `producer` this
+# registry recognises. Filling this set is a deliberate act that says "I wired a producer
+# and I checked what it writes" -- and test_echo_ticket_worker.py holds it to that in both
+# directions (empty -> fixed_pass refuses; non-empty -> an unattributed snapshot is still
+# refused). It is not a config flag and it is not settable from the environment.
+FIX_VERIFICATION_PRODUCERS = frozenset()
+
+
+def fix_verification_lane_is_wired():
+    """True only when some process can actually write a fix verdict onto the ticket this
+    pass polls. False today -- see FIX_VERIFICATION_PRODUCERS."""
+    return bool(FIX_VERIFICATION_PRODUCERS)
+
+
+def read_fix_verification(ticket):
+    """The ONLY sanctioned way to read verification_after AS A FIX VERDICT.
+
+    Refuses loudly instead of returning a falsy "not yet":
+
+      * lane unwired  -> raises InertVerificationLane. There is no such thing as "not
+        verified yet" when nothing can ever write the verdict, and returning None here is
+        precisely the inert-but-plausible state Blake's ruling names as worse than no
+        field at all.
+      * wired, but the snapshot carries no `producer` this module recognises -> returns
+        None. That is a genuine "not from a fix producer" (the answer lane's grounding
+        snapshot lands on this same column), not a refusal.
+
+    Does NOT decide whether the fix SUCCEEDED -- verification_succeeded() still owns that,
+    unchanged. This function only decides whether the value is a fix verdict at all."""
+    if not fix_verification_lane_is_wired():
+        raise InertVerificationLane(
+            "support_tickets.verification_after has no registered fix producer, so this "
+            "field can never become true for a ticket in 'fixing' and must not be read as "
+            "a pass. FIX_VERIFICATION_PRODUCERS is empty; see D68 in "
+            "docs/slack_convo/DECISIONS.md. Wiring the producer (ops-fix writing back to "
+            "the ORIGINATING ticket rather than the row it mints) is a cross-repo change "
+            "and Blake's call.")
+    verification = ticket.get("verification_after")
+    if not isinstance(verification, dict) or not verification:
+        return None
+    if verification.get("producer") not in FIX_VERIFICATION_PRODUCERS:
+        return None
+    return verification
+
+
 def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
     """One honest card per stuck ticket per day. Never claims anything to the client."""
     from datetime import datetime as _dt, timezone as _tz
@@ -735,9 +811,39 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
     # this code CAN do is refuse to be silently inert -- D56's whole lesson -- so a ticket
     # that has waited too long says so, once per ticket per day, in plain words.
     _report_stuck_fixing(bus, tickets, identity_name=identity_name, log=log)
+
+    # D68 (2026-09-06), Blake's ruling: "Either wire the producer or make the field refuse
+    # to be read as a pass. An inert verification field is worse than no field."
+    #
+    # The loop below used to open with `if not ticket.get("verification_after"): continue`.
+    # That line is indistinguishable, at every call site and in every log, from the healthy
+    # state "this fix just is not verified YET" -- while in fact NOTHING can ever populate
+    # it (see FIX_VERIFICATION_PRODUCERS). A reader of this function, of its metrics, or of
+    # its return value could not tell "waiting" from "impossible". That is the exact failure
+    # this ruling names.
+    #
+    # So the pass no longer pretends to poll a gate that cannot open. It refuses, by name,
+    # every cycle, and says so in the return value so a caller or a metric can see it too.
+    # _report_stuck_fixing above still runs FIRST, so the humans who have tickets sitting in
+    # 'fixing' keep getting told about them -- refusing to claim a fix is not refusing to
+    # report one.
+    if not fix_verification_lane_is_wired():
+        if tickets:
+            log(f"[ticket-worker/{identity_name}] REFUSING the fix lane: "
+                f"{len(tickets)} ticket(s) in 'fixing' and "
+                f"support_tickets.verification_after has no registered fix producer, so no "
+                f"fix can ever be confirmed to a client from here. This is not 'not yet'. "
+                f"See D68 in docs/slack_convo/DECISIONS.md.")
+        return {"notified": 0, "refused": "fix_verification_lane_unwired",
+                "fixing": len(tickets or [])}
+
     for ticket in tickets:
         tid = ticket["id"]
-        verification = ticket.get("verification_after")
+        # Not `.get("verification_after")`: a value that did not come from a registered fix
+        # producer is not a fix verdict, whatever else it is. The ANSWER lane writes its
+        # grounding snapshot to this same column, and that lane is wired, correct, and
+        # untouched by any of this -- but it means "populated" has never meant "verified".
+        verification = read_fix_verification(ticket)
         if not verification:
             continue  # not verified yet -- next poll
         who = _ig.Identity(_ig.CLIENT, ticket.get("slack_user_id") or "",
