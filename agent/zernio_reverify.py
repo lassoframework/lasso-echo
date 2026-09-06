@@ -73,6 +73,12 @@ def reverify_gym(base, client=None, store=None, logger=None):
                 "reason": f"list_accounts failed: {type(exc).__name__}"}
 
     status_map = _z.map_status(accounts)
+    # AUD-005: the Zernio account id per connected platform, stamped onto the SAME row the
+    # state goes on. echo_social_connections is the source of truth for who is connected;
+    # the account id was the one fact it lacked, which is the only reason anything still
+    # had to consult the legacy gym_social_accounts table. A separate mapper rather than a
+    # new key on map_status, because map_status's shape IS the portal status contract.
+    account_ids = _z.map_account_ids(accounts)
     results = []
     for platform in _z.STATUS_PLATFORMS:
         state, handle = _state_for_platform(status_map, platform)
@@ -81,10 +87,13 @@ def reverify_gym(base, client=None, store=None, logger=None):
         # bit the poisoning cron cleared.
         mark_ever = state == "connected"
         try:
+            acct_id = account_ids.get(platform)
             store.rewrite_social_connection(base, platform, state, handle=handle,
-                                            mark_ever_connected=mark_ever)
+                                            mark_ever_connected=mark_ever,
+                                            late_account_id=acct_id)
             results.append({"platform": platform, "state": state,
-                            "handle": handle or "", "ever_connected_repaired": mark_ever})
+                            "handle": handle or "", "ever_connected_repaired": mark_ever,
+                            "late_account_id": acct_id or ""})
         except Exception as exc:  # noqa: BLE001 - one platform never blocks the rest
             results.append({"platform": platform, "error": type(exc).__name__})
     log(f"{base}: reverified profile={pid} -> " +
