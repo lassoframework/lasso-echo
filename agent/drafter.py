@@ -344,11 +344,20 @@ def openings_collide(caption, avoid_openings, prefix=_OPENING_COLLIDE_WORDS):
 
 
 def _output_claims_cleared(body, voice, client_note):
-    """True when every figure in `body` appears verbatim in an approved input (the
-    client note or the voice doc). No approved figure -> clean. This blocks an LLM
-    from smuggling an invented stat/price/count into a caption; a rephrased but real
-    number (its digits are in the sources) still passes."""
-    sources = f"{client_note}\n{getattr(voice, 'raw', '') or ''}"
+    """True when every figure in `body` appears verbatim in an APPROVED input (the
+    client note or a human-owned voice doc). No approved figure -> clean. This blocks
+    an LLM from smuggling an invented stat/price/count into a caption; a rephrased but
+    real number (its digits are in the sources) still passes.
+
+    An AUTO-DRAFTED bible is NOT an approved input (finding 2026-09-06). A bible a
+    machine wrote off a gym's public website carries voice.auto_drafted=True, and its
+    text is excluded from `sources` here: a scraped figure ("847 members since 2015")
+    that no human ever approved must not be able to clear the very gate that exists to
+    stop unapproved figures. Human-written bibles are unaffected."""
+    voice_raw = getattr(voice, "raw", "") or ""
+    if getattr(voice, "auto_drafted", False):
+        voice_raw = ""  # scraped, unapproved: it clears nothing
+    sources = f"{client_note}\n{voice_raw}"
     for tok in _FIGURE_RE.findall(body or ""):
         norm = tok.strip(".,")
         if norm and norm not in sources:
