@@ -163,12 +163,13 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
         return {"ok": False, "reason": "AGENT_GRADE_SELF_FIX off",
                 "captions_fixed": 0, "repillared": 0, "craft_fixed": 0,
                 "craft_attempted": 0, "booking_asks_added": 0, "ask_trimmed": 0,
+                "invalid_closings_removed": 0,
                 "gap_fill": "none", "skipped": 0, "actions": []}
 
     actions = []
     result = {"ok": True, "captions_fixed": 0, "repillared": 0,
               "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
-              "ask_trimmed": 0,
+              "ask_trimmed": 0, "invalid_closings_removed": 0,
               "audience_fixed": 0, "audience_attempted": 0, "scrubbed": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
@@ -204,6 +205,17 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     result["skipped"] += over_skipped
     if over_fixed:
         actions.append(f"re-pillared {over_fixed} over-cap day(s) from a different approved source")
+
+    # ---- d0) closings that were never valid CTAs ----------------------------
+    # BEFORE the craft pass, because the ask deficit has to be counted against
+    # REAL asks. An invalid closing makes a book look like it is already asking,
+    # which is exactly why the craft pass found only 1 flagged day on a book
+    # where 30 of 31 posts carried the same nonsensical line.
+    invalid_closings = _fix_invalid_closings(gym_id, rows, store, log)
+    result["invalid_closings_removed"] = invalid_closings
+    if invalid_closings:
+        actions.append(f"removed a closing line that is not a valid CTA from "
+                       f"{invalid_closings} post(s)")
 
     # ---- d) caption craft + path (booking asks) ------------------------------
     craft_fixed, craft_attempted, booking_added = _fix_craft(
@@ -879,6 +891,82 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
 # ---------------------------------------------------------------------------
 # e) off-avatar hooks (right_audience)
 # ---------------------------------------------------------------------------
+
+def _fix_invalid_closings(gym_id, rows, store, log):
+    """Strip a closing line that was never a valid ask, from EVERY post carrying
+    it, regardless of the book's ask rate.
+
+    BLAKE'S RULING, 2026-09-06: *"If a gym's CTA pool is empty or too thin to
+    supply a real ask, DO NOT force one in. No fake/generic/repeated CTA just to
+    hit a target. On those gyms, write the caption with no booking ask at all --
+    good copy, no ask -- rather than degrade quality or repeat the same CTA to
+    hit 33%."*
+
+    That ruling corrected this module's own first answer, and the correction is
+    worth stating plainly because it is easy to get backwards. `_fix_ask_excess`
+    trims a book DOWN TO the target, which on Dean Holcomb's book meant KEEPING
+    the nonsensical FAQ heading on ten posts in order to reach 33%. Hitting the
+    number by preserving copy the client complained about is exactly the
+    "degrade quality to hit a target" Blake ruled out. A line that is not a
+    valid CTA is not a partial ask to be rationed. It is wrong copy, and it goes
+    from every post that carries it.
+
+    WHAT COUNTS AS INVALID. `copy_gate.cta_defects` decides, not this function:
+    a question, an interrogative opener, an over-long heading. Dean's line --
+    "How do I get started with training at CrossFit Reverb?", complete with the
+    U+200B it was pasted in with -- trips `cta_is_question`. It reached 90 of his
+    93 rows because the OLD selector asked only "does this contain an ask
+    phrase", and "get started" is an ask phrase.
+
+    WHAT IS PROTECTED. Same bar as every other repair here: flag armed, wipeable
+    row only, the line must be the caption's LAST line, it must currently read as
+    an ask (so ordinary body copy is never mistaken for a CTA), and the remainder
+    must still clear the craft bar. A caption that would be left worse keeps its
+    line.
+
+    WHY IT RUNS FIRST. The ask DEFICIT must be counted against REAL asks. Left
+    in place, an invalid closing makes the book look like it is already asking,
+    which is precisely why `_fix_craft` had nothing to grip on Dean's book: 30 of
+    31 posts "had an ask" and only 1 day was flagged.
+
+    Returns the number of POSTS cleaned.
+    """
+    if not config.cta_variety_enabled():
+        return 0
+
+    groups: dict = {}
+    for r in rows or []:
+        d = str(r.get("post_date") or "")[:10]
+        cap = r.get("caption") or ""
+        if not d or not str(cap).strip():
+            continue
+        groups.setdefault((d, caption_hash(cap)), []).append(r)
+
+    cleaned = 0
+    for key in sorted(groups):
+        grp = groups[key]
+        if any(not _is_wipeable(r) for r in grp):
+            continue                                # human-owned day: never touched
+        cap = grp[0].get("caption") or ""
+        lines = list(cap.splitlines())
+        idx = max((i for i, ln in enumerate(lines) if ln.strip()), default=-1)
+        if idx < 0:
+            continue
+        last = lines[idx]
+        if not copy_gate.ASK_RE.search(last):
+            continue                    # not read as an ask: ordinary body copy
+        if copy_gate.is_cta_shaped(last):
+            continue                    # a real CTA: the rate rules own it, not this
+        candidate = "\n".join(lines[:idx]).rstrip()
+        if not _clears_craft(candidate, allow_no_ask=True):
+            continue                    # removing it would leave a worse caption
+        if _patch_date_rows(gym_id, grp, store, candidate, None, log):
+            cleaned += 1
+    if cleaned:
+        log(f"{gym_id}: removed a closing line that is not a valid CTA from "
+            f"{cleaned} post(s) (copy_gate.cta_defects rejected it)")
+    return cleaned
+
 
 def _fix_ask_excess(gym_id, rows, store, log):
     """Remove the STAPLED closing ask from a book that carries far too many.
