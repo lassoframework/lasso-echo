@@ -519,29 +519,41 @@ def _clears_craft(caption, allow_no_ask=False) -> bool:
     return True
 
 
-def _ask_target_posts(n_posts: int) -> int:
+def _ask_target_posts(n_posts: int, pool_size=None) -> int:
     """How many POSTS of an `n_posts` book should carry a booking ask.
 
-    `max(grader floor, share)` because the two constraints are both real and
-    the larger one wins:
+    `max(grader floor, share)`, then CAPPED BY WHAT THE GYM CAN HONESTLY SUPPLY:
 
-      * the grader's path_to_join GYM leg still wants `min(5, n)` posts carrying
-        a booking-SPECIFIC term, and
+      * the grader's path_to_join GYM leg wants `min(5, n)` posts carrying a
+        booking-SPECIFIC term,
       * Blake's ask-rate target (config.caption_ask_rate_target, 0.33) is the
-        share of the book that should close on an ask at all.
+        share of the book that should close on an ask at all, and
+      * caption_variety.honest_ask_ceiling is the most the gym's APPROVED CTA
+        pool can cover without repeating a closing inside the window.
 
-    On a normal ~31 post month the share is the binding one (10 posts, 32.3%).
-    On a book shorter than ~15 posts the grader's floor of 5 binds instead and
-    the realised rate runs above the target; that is the grader's own hard
-    minimum, not a miscalculation, and lowering it is a separate decision.
+    THE CAP IS THE POINT (Blake, 2026-09-06: "No fake/generic/repeated CTA just
+    to hit a target"). A gym with ONE approved CTA physically cannot ask more
+    than once per window; asking it for a third of its book is asking it to
+    repeat, which is exactly what Dean complained about. Measured on the live
+    fleet at window 10, only 2 of 18 gyms have a ceiling at or above the 33%
+    target. Targeting the unreachable number would mark 11 gyms down nightly
+    for a defect no code can clear, and burn LLM budget re-attempting it.
+
+    pool_size None means "not known here": the cap is not applied and the
+    behavior is the pre-cap one. A caller that knows the pool should pass it.
     """
     if n_posts <= 0:
         return 0
     share = int(round(config.caption_ask_rate_target() * n_posts))
-    return min(n_posts, max(1, min(5, n_posts), share))
+    want = min(n_posts, max(1, min(5, n_posts), share))
+    if pool_size is None:
+        return want
+    ceiling = caption_variety.honest_ask_ceiling(
+        n_posts, pool_size, config.caption_variety_window())
+    return min(want, ceiling)
 
 
-def _booking_deficit(rows) -> int:
+def _booking_deficit(rows, pool_size=None) -> int:
     """How many more booking asks the book still wants.
 
     FLAG OFF: rows, and a flat floor of `min(5, n)` -- byte for byte the
@@ -566,7 +578,7 @@ def _booking_deficit(rows) -> int:
         posts.setdefault(key, r.get("caption") or "")
     n = len(posts)
     have = sum(1 for cap in posts.values() if _BOOKING_RE.search(cap or ""))
-    return max(0, _ask_target_posts(n) - have)
+    return max(0, _ask_target_posts(n, pool_size) - have)
 
 
 def _booking_cta_pool(gym_id, log):
@@ -746,17 +758,20 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
     llm_ok = caption_regen is not None and profile != "B2B"
     variety = config.cta_variety_enabled()
 
-    deficit = _booking_deficit(rows)
     cta_pool = []
     if variety:
         # The whole approved pool, so the append can ROTATE instead of stapling
-        # one line onto every day (Dean Holcomb, Reverb, 2026-09-05).
+        # one line onto every day (Dean Holcomb, Reverb, 2026-09-05). Resolved
+        # BEFORE the deficit now, because the deficit is capped by what this
+        # pool can honestly cover without repeating inside the window.
         cta_pool = _booking_cta_pool(gym_id, log)
         if booking_cta is not None and booking_cta not in cta_pool:
             cta_pool = [booking_cta] + cta_pool
         booking_cta = cta_pool[0] if cta_pool else None
     elif booking_cta is None:
         booking_cta = _booking_cta_for(gym_id, log)
+
+    deficit = _booking_deficit(rows, len(cta_pool) if variety else None)
 
     # The book's closing line PER DATE, kept in date order. The anti-repetition
     # rule is "no two posts inside the window share a closing", NOT "never
