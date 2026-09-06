@@ -71,6 +71,13 @@ class OutreachResult:
     opened: bool
     channel_id: str = ""
     reason: str = ""
+    # C2 (2026-09-05 audit 2, CRITICAL): `opened` means conversations.open succeeded --
+    # nothing more. It is True on claim_failed, lost_claim AND post_failed, and every caller
+    # was reading it as "the client was told". A failed chat.postMessage therefore resolved
+    # the ticket and wrote a receipt asserting "the client was told this, SENT AUTOMATICALLY
+    # (no tap)" over a row whose own delivery_status was 'failed'. `delivered` is the fact
+    # callers actually need, and it is True only after the post came back ok.
+    delivered: bool = False
 
 
 def _base_eligible(ticket, who):
@@ -319,7 +326,8 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             except Exception as e:  # noqa: BLE001 - the failure is already logged above
                 log(f"[outreach] mark_message(failed) itself failed row={row_id}: "
                     f"{type(e).__name__}")
-        return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed")
+        return OutreachResult(opened=True, channel_id=channel_id, reason="post_failed",
+                              delivered=False)
 
     if mark_message is not None and row_id is not None:
         try:
@@ -347,7 +355,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             log(f"[outreach] stamp_ticket failed ticket={(ticket or {}).get('id')}: "
                 f"{type(e).__name__}")
 
-    return OutreachResult(opened=True, channel_id=channel_id, reason="ok")
+    return OutreachResult(opened=True, channel_id=channel_id, reason="ok", delivered=True)
 
 
 # ---- D45: the human-tap path (Blake's ruling, 2026-09-04, resolving D42) -----------------
@@ -462,11 +470,42 @@ def release_approved_outreach(message_id, ticket, who, ident, *, get_held_messag
     # closes. Best-effort, same as every other mark_message call in this module: the
     # real DM is already sent, a bookkeeping-close failure here must never look like the
     # send itself failed.
-    if result.opened and mark_message is not None:
+    # Finding 3 (2026-09-05 audit 3): this read `opened`, which is True even when the post
+    # FAILED -- so a held outreach row was marked 'posted' with nothing sent. In the portal
+    # that row's kind (outreach_request) is not on migration 0310's hidden list, so a client
+    # could read a "message" they were never sent. `delivered` is the only correct predicate
+    # for "the client has this".
+    if getattr(result, "delivered", False) and mark_message is not None:
         try:
             mark_message(message_id, "posted")
         except Exception as e:  # noqa: BLE001 - the send already succeeded
             log(f"[outreach] held row {message_id} close-out failed (send itself "
                 f"succeeded): {type(e).__name__}")
+    elif not getattr(result, "delivered", False):
+        # Nothing reached the client, so the row must never read as delivered -- but WHICH
+        # non-delivery matters (audit 4, finding 6). Only a definitive send failure burns the
+        # row; a transient one (the DM would not open, another consumer held the claim) LEAVES
+        # IT HELD so Blake's Release card still works on the next tap. Burning it on a
+        # transient fault re-created the exact silent no-op card that listener_wiring's own
+        # dispatch fix exists to prevent.
+        # Audit 5, finding 5: "leave it held so a retap works" is right for open_failed and
+        # WRONG for claim_failed / lost_claim. On those two, _send has ALREADY written a
+        # 'ready' outbound row that another consumer owns and will post -- so a retap writes
+        # a second row and the client gets the same DM twice. Three outcomes, three states:
+        #   open_failed  -> held      (nothing was written; a retap is the correct retry)
+        #   post_failed  -> failed    (definitive: the send was attempted and refused)
+        #   claim_*      -> suppressed(another consumer has it; a retap must NOT duplicate)
+        state = {"post_failed": "failed",
+                 "claim_failed": "suppressed",
+                 "lost_claim": "suppressed"}.get(result.reason)
+        if state and mark_message is not None:
+            try:
+                mark_message(message_id, state,
+                             meta_update={"outreach_reason": result.reason})
+            except Exception as e:  # noqa: BLE001
+                log(f"[outreach] held row {message_id} state mark failed: "
+                    f"{type(e).__name__}")
+        log(f"[outreach] release did NOT deliver row={message_id} reason={result.reason} "
+            f"(row left {state or 'held for a retap'})")
 
     return result
