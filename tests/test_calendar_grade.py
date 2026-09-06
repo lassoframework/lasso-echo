@@ -499,3 +499,33 @@ def test_mix_cap_still_applies_to_a_month_sized_book():
     g = grade_month(rows, profile="GYM")
     assert [d for d in g.defects if "over 25%" in d[2]], g.defects
     assert g.scores["content_mix"] < 20
+
+
+def test_ask_rule_does_not_crash_on_two_distinct_posts_the_same_date(monkeypatch):
+    """LIVE PRODUCTION CRASH, 2026-09-06, found running the fleet-wide sweep on
+    'lasso': `sorted(ask_less)` sorted (day, grp) tuples. Two ask-less POSTS
+    sharing the same post_date (a real "2x day", different caption_hash) tie on
+    `day`, and Python's tuple comparison then falls back to comparing `grp` --
+    a list of row dicts -- which raises `TypeError: '<' not supported between
+    instances of 'dict' and 'dict'`. This crashed calendar_grade.grade_month for
+    every LASSO-shaped book with an ask-less multi-post day once AGENT_CTA_
+    VARIETY was armed, which is exactly the profile the nightly sweep runs.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = []
+    for i in range(20):
+        cap = (f"Filler caption number {i} with no ask anywhere in it at all, "
+               f"long enough to clear the caption floor for sure today.")
+        rows.append({"id": f"a{i}", "post_date": f"2026-09-{i + 1:02d}",
+                     "caption": cap, "account": "instagram", "format": "feed"})
+    # Two DISTINCT posts (different caption -> different hash) on the SAME
+    # date -- the tie that crashed the old sort.
+    rows.append({"id": "tie1", "post_date": "2026-10-01",
+                 "caption": "First distinct post on a shared date with no ask at all here.",
+                 "account": "instagram", "format": "feed"})
+    rows.append({"id": "tie2", "post_date": "2026-10-01",
+                 "caption": "Second distinct post on that same shared date, also no ask.",
+                 "account": "facebook", "format": "feed"})
+    # Must not raise.
+    grade = grade_month(rows, profile="GYM")
+    assert grade.total >= 0
