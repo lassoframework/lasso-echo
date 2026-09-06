@@ -53,7 +53,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import List
 
-from agent import copy_gate
+from agent import caption_variety, copy_gate
 from agent.caption_ledger import caption_hash
 
 WEIGHTS = {
@@ -84,19 +84,21 @@ def _athlete_rail_on() -> bool:
     return config.avatar_athlete_rail_enabled()
 
 
-def _gym_has_usable_cta(rows) -> bool:
-    """Does this book's gym have at least ONE approved CTA that passes the shape
-    gate?
+def _gym_cta_pool_size(rows):
+    """How many approved CTAs this book's gym has that pass the shape gate.
+
+    Returns None when it cannot be determined, which every caller must treat as
+    "grade exactly as before".
 
     The gym id comes off the rows, so every existing grade_month caller keeps
     working unchanged. Lazily imported for the same reason _athlete_rail_on is:
     jobs.grade_fix imports from THIS module at module scope, so the reverse
     import has to happen inside the call.
 
-    FAILS OPEN (returns True) on any error or when the gym cannot be identified.
+    FAILS OPEN (returns None) on any error or when the gym cannot be identified.
     An exemption is a relaxation of the rule, and a relaxation must never be
-    granted by accident -- if we cannot prove the pool is empty, the gym is
-    graded exactly as it was before.
+    granted by accident -- if we cannot read the pool, the gym is graded exactly
+    as it was before.
     """
     gym_id = ""
     for r in rows or []:
@@ -104,12 +106,17 @@ def _gym_has_usable_cta(rows) -> bool:
         if gym_id:
             break
     if not gym_id:
-        return True
+        return None
     try:
         from agent.jobs import grade_fix
-        return bool(grade_fix._booking_cta_pool(gym_id, lambda _m: None))
+        return len(grade_fix._booking_cta_pool(gym_id, lambda _m: None) or [])
     except Exception:  # noqa: BLE001 - never let a grade fail on a pool read
-        return True
+        return None
+
+
+def _variety_window() -> int:
+    from . import config
+    return config.caption_variety_window()
 
 
 def _ask_rate_rail() -> tuple:
@@ -597,14 +604,32 @@ def _path(rows, profile, defects, exempt=None) -> int:
     # rule below and the booking-term rule further down are exempted together,
     # because they are two halves of one question the gym has no way to answer.
     # Computed once: the pool read touches the voice doc and client_sources.
-    no_cta_lane = ask_rail_on and not _gym_has_usable_cta(rows)
+    pool_size = _gym_cta_pool_size(rows) if ask_rail_on else None
+    no_cta_lane = pool_size == 0
     if no_cta_lane and exempt is not None:
         exempt["path_to_join: no approved CTA to ask with"] = n
+
+    # THE HONEST CEILING (Blake, 2026-09-06: "No fake/generic/repeated CTA just
+    # to hit a target"). A gym with one approved CTA cannot ask more than once
+    # per anti-repetition window, so a third of its book is a target it can only
+    # reach by repeating -- the very thing the ruling forbids. Both ask rules
+    # are scored against min(target, ceiling), the SAME cap the repair loop
+    # sizes itself to (grade_fix._ask_target_posts). Measured on the live fleet:
+    # only 2 of 18 gyms have a ceiling at or above 33%, so without this 11 gyms
+    # would be marked down nightly for a number no code can reach for them.
+    ceiling = None
+    if ask_rail_on and pool_size:
+        ceiling = caption_variety.honest_ask_ceiling(
+            n, pool_size, _variety_window())
+        if ceiling < max(1, min(n, int(round(ask_rate_target * n)))) and exempt is not None:
+            exempt["path_to_join: ask target capped by the gym's approved CTA pool"] = ceiling
 
     if no_cta_lane:
         pass                        # exempt: scored on neither ask rule
     elif ask_rail_on:
         want = max(1, min(n, int(round(ask_rate_target * n))))
+        if ceiling is not None:
+            want = max(1, min(want, ceiling))
         short = max(0, want - (n - len(ask_less)))
         for day, _grp in sorted(ask_less)[:short]:
             defects.append(("path_to_join", day, "no ask in caption"))
@@ -634,6 +659,10 @@ def _path(rows, profile, defects, exempt=None) -> int:
             pass                    # exempt, recorded once above
         else:
             want_booking = min(5, n)
+            if ceiling is not None:
+                # Same cap: a gym cannot carry 5 booking asks if its pool can
+                # only honestly cover 2 of them.
+                want_booking = min(want_booking, ceiling)
             booking_posts = sum(
                 1 for _k, grp in eligible
                 if _BOOKING_RE.search(grp[0].get("caption") or "")

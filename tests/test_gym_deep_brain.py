@@ -18,7 +18,21 @@ Covered, one test per rule the module claims:
     the cited page does not state;
   - facts land PENDING with the page URL as the citation, even with
     AGENT_INTAKE_AUTO_APPROVE armed;
-  - an existing brand bible is never overwritten;
+  - A SCRAPE NEVER AUTHORS THE BRAND BIBLE (the 2026-09-06 CRITICAL): a build
+    leaves the active voice slot empty, never calls the bible writer, and writes
+    exactly ONE file (the artifact) across the whole data tree;
+
+NOTE ON TEST STYLE (D68, and the 2026-09-06 finding). Five checks here used to be
+`assert "<some string>" in inspect.getsource(gdb)` — including the one nominally
+covering the CRITICAL, which asserted only that the bible writer was CALLED and
+nothing at all about whether that was safe. A test that greps source text is not
+a test: it passes for any rewrite that keeps the substring and fails for any that
+does not, regardless of behaviour. All five are now behavioural (the post fields
+actually read are recorded by watched dicts, the headers actually sent are
+recorded by a permissive fake requests.get, the files actually written are
+diffed, reuse is proved by calling), and each was mutation-checked with
+__pycache__ cleared. The one remaining use of inspect.getsource parses the module
+into an AST to enumerate real imports, which is a structural fact, not a string.
   - missing data BLOCKS and produces no artifact (no domain / no handle / social
     read failed);
   - social capture is FORM only and never reads comments or commenter identities;
@@ -297,6 +311,122 @@ def test_byte_cap_stops_a_runaway_crawl(monkeypatch):
     assert len(crawl.skipped_cap) == 2
 
 
+def test_one_huge_response_is_bounded_by_the_per_fetch_cap(monkeypatch):
+    """The cumulative MAX_BYTES budget is only consulted BEFORE a request, so a
+    single 5MB page used to sail past it in full. The per-fetch ceiling bounds ONE
+    response: whatever the fetcher hands back is cut at the line, the URL is
+    recorded, and the cumulative budget stays honest."""
+    huge = _html("x " * 3_000_000)                 # ~6MB from one page
+    assert len(huge) > 5_000_000
+    site = FakeSite(pages={_HOME: None})
+    site.pages = {}
+
+    def _fetch(url):
+        site.requested.append(url)
+        if url.endswith("/robots.txt"):
+            return _ROBOTS_OPEN
+        return huge if url == _HOME else None
+
+    clock = FakeClock()
+    crawl = gdb.crawl_site(_DOM, ("/",), fetch=_fetch, sleep=clock.sleep,
+                           clock=clock, max_page_bytes=1000)
+    assert crawl.truncated == [_HOME]
+    assert crawl.bytes_used <= 1000, "a single response blew the byte budget"
+    assert len(crawl.pages[_HOME]) <= 1000
+
+
+def test_the_real_fetcher_stops_reading_a_huge_body_at_the_cap():
+    """And it stops at the WIRE, not after the download: the streaming fetcher
+    abandons the response mid-body, so the 5MB is never pulled down."""
+    huge = "y" * 200_000
+    get = _RecordingGet(body=huge)
+    fetcher = gdb.CappedFetcher(get=get, max_bytes=2048)
+    body = fetcher("https://gymx.com/")
+    assert len(body) <= 2048
+    assert fetcher.truncated == ["https://gymx.com/"]
+    (_url, kwargs), = get.calls
+    assert kwargs.get("stream") is True, "the body was not streamed"
+
+
+def test_robots_5xx_denies_the_whole_host(monkeypatch):
+    """A server error is NOT permission. robots.txt answering 503 used to be
+    indistinguishable from 404 ('no rules stated') and silently opened the host."""
+    policy = gdb.RobotsPolicy(fetch=lambda url: (503, ""))
+    assert policy.allowed(_HOME) is False
+    assert policy.allowed(_ABOUT) is False
+    assert policy.denied_hosts and "503" in policy.denied_hosts[0]
+
+
+def test_an_unreachable_robots_txt_denies_too():
+    """Undetermined is not yes: a fetcher that cannot answer at all fails closed."""
+    def _boom(url):
+        raise OSError("connection reset")
+
+    assert gdb.RobotsPolicy(fetch=_boom).allowed(_HOME) is False
+    assert gdb.RobotsPolicy(fetch=lambda url: (None, None)).allowed(_HOME) is False
+
+
+def test_robots_404_still_means_no_restriction_stated():
+    """The other side of the rule, so failing closed does not become failing shut:
+    an explicit 4xx is a host stating no restriction, which stays a crawl."""
+    assert gdb.RobotsPolicy(fetch=lambda url: (404, "")).allowed(_HOME) is True
+    assert gdb.RobotsPolicy(fetch=lambda url: _ROBOTS_OPEN).allowed(_HOME) is True
+
+
+def test_a_robots_5xx_blocks_the_whole_build(monkeypatch):
+    """End to end: a gym whose robots.txt is erroring produces NO artifact and NO
+    rows, and nothing but robots.txt is ever requested."""
+    class _Erroring(FakeSite):
+        def __call__(self, url):
+            self.requested.append(url)
+            if url.endswith("/robots.txt"):
+                return (500, "")
+            return _html(self.pages.get(url) or "")
+
+    out, site, _ = _build(monkeypatch, site=_Erroring())
+    assert out["ok"] is False and out["blocked"] is True
+    assert "robots" in out["reason"].lower()
+    assert site.requested == [f"https://{_DOM}/robots.txt"]
+    assert not os.path.exists(gdb.deep_brain_path("gymx"))
+    assert cs.all_sources("gymx_ig") == []
+
+
+def test_a_cross_host_redirect_is_re_checked_against_robots():
+    """We checked gymx.com's robots.txt; a 301 to another host lands us somewhere
+    whose rules we never read. The final URL is re-checked and the body DISCARDED
+    when that host disallows us."""
+    # a robots policy that says yes to gymx.com and no to the redirect target
+    policy = gdb.RobotsPolicy(fetch=lambda url: (
+        _ROBOTS_NO_EVERYTHING if "elsewhere.example" in url else _ROBOTS_OPEN))
+    get = _RecordingGet(body=_html("secret content"),
+                        url="https://elsewhere.example/landing")
+    fetcher = gdb.CappedFetcher(policy, get=get)
+    assert fetcher("https://gymx.com/about") is None
+    assert fetcher.blocked_redirects and "elsewhere.example" in \
+        fetcher.blocked_redirects[0]
+
+
+def test_a_cross_host_redirect_that_robots_allows_still_reads():
+    """The re-check is a gate, not a ban on redirects: an allowing host reads."""
+    policy = gdb.RobotsPolicy(fetch=lambda url: _ROBOTS_OPEN)
+    get = _RecordingGet(body=_html("moved but public"),
+                        url="https://www2.gymx.com/about")
+    fetcher = gdb.CappedFetcher(policy, get=get)
+    body = fetcher("https://gymx.com/about")
+    assert body and "moved but public" in body
+    assert fetcher.blocked_redirects == []
+
+
+def test_a_same_host_redirect_needs_no_re_check():
+    """http -> https or /about -> /about/ on the SAME host keeps the decision we
+    already made; no second robots lookup is forced."""
+    policy = gdb.RobotsPolicy(fetch=lambda url: _ROBOTS_OPEN)
+    get = _RecordingGet(body=_html("same host"), url="https://gymx.com/about/")
+    fetcher = gdb.CappedFetcher(policy, get=get)
+    assert "same host" in fetcher("https://gymx.com/about")
+    assert fetcher.blocked_redirects == []
+
+
 # ---- 5. PII ---------------------------------------------------------------------
 
 def test_business_contacts_are_the_business_own_published_details():
@@ -427,33 +557,143 @@ def test_intake_auto_approve_never_reaches_a_scrape(monkeypatch):
     assert cs.approved_sources("gymx_ig") == []
 
 
-# ---- 8. never overwrite human work ---------------------------------------------
+# ---- 8. a scrape never authors the voice doc (the 2026-09-06 CRITICAL) ---------
 
-def test_an_existing_bible_is_never_overwritten(monkeypatch, tmp_path):
-    from agent import config
+def _voice_slot(base="gymx"):
+    """The ACTIVE voice-doc path the drafter actually reads for this gym."""
+    from agent.client_media_sync import _resolve_client_voice_path
+    return _resolve_client_voice_path(base, os.path.join("brand_voice", base,
+                                                         "lasso_voice.md"))
+
+
+def test_a_deep_brain_never_writes_the_brand_bible(monkeypatch):
+    """THE CRITICAL. A pre-onboarding scrape must not author the gym's voice doc.
+
+    It used to: build_deep_brain handed its scraped bundle to
+    website_intake._write_bible_if_missing, which rendered those unapproved facts
+    into <DATA_DIR>/brand_voice/<base>/lasso_voice.md — the slot
+    _resolve_client_voice_path prefers over everything — with the citations
+    stripped. voice.load_voice reads that file and drafter puts voice.raw straight
+    into the LLM prompt as APPROVED material.
+
+    So this asserts the OUTCOME, not the absence of a line: after a full,
+    successful build, the active voice slot is still empty and load_voice still
+    says 'no voice doc, do not draft'."""
+    slot = _voice_slot()
+    assert not os.path.exists(slot)
+    out, _, _ = _build(monkeypatch)
+    assert out["ok"] is True and out["landed"] == 2   # the build really ran
+    assert not os.path.exists(slot), "a scrape wrote the gym's active voice doc"
+    from agent import voice as vmod
+    assert vmod.load_voice(slot) is None              # no voice doc -> no draft
+    assert "not written" in out["bible"]
+
+
+def test_the_scraped_bible_writer_is_never_called_by_a_deep_brain(monkeypatch):
+    """The same rule from the other side, so an equivalent rewrite is caught too:
+    the bible writer BLOWS UP if a deep brain reaches it, and a full build still
+    succeeds — meaning nothing on the path touched it."""
+    called = []
+
+    def _explode(*a, **kw):
+        called.append((a, kw))
+        raise AssertionError("a scrape must never write a brand bible")
+
+    monkeypatch.setattr(wi, "_write_bible_if_missing", _explode)
+    out, _, _ = _build(monkeypatch)
+    assert out["ok"] is True and out["facts"] == 2
+    assert called == []
+
+
+def test_a_scraped_figure_never_becomes_approved_prompt_material(monkeypatch):
+    """END TO END. After a real build, every route by which a scraped figure could
+    reach the drafter as APPROVED material is closed: not an approved source row,
+    not an active voice doc. The figure lives only in the pending rows and the
+    derived artifact, both of which a human reads before anything is drafted."""
+    out, _, _ = _build(monkeypatch)
+    assert out["ok"] is True
+    assert cs.approved_sources("gymx_ig") == []
+    rows = cs.all_sources("gymx_ig")
+    assert rows and {r.status for r in rows} == {"pending"}
+    # "2018" is a real scraped figure (from _GOOD_ABOUT). It is in the pending
+    # material and NOWHERE the drafter reads as approved.
+    assert any("2018" in r.text for r in rows)
+    from agent import voice as vmod
+    assert vmod.load_voice(_voice_slot()) is None
+
+
+def test_a_human_bible_is_untouched_and_stays_human(monkeypatch):
+    """A gym that already has a HUMAN bible keeps it byte for byte, and it stays
+    APPROVED: nothing here stamps an existing doc auto-drafted."""
+    from agent import config, voice as vmod
     voice_dir = os.path.join(config.client_voice_dir(), "gymx")
     os.makedirs(voice_dir, exist_ok=True)
     path = os.path.join(voice_dir, "lasso_voice.md")
+    human = "# Gym X Brand Bible\nHUMAN REVIEWED, DO NOT TOUCH. We opened in 2015."
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write("HUMAN REVIEWED BIBLE, DO NOT TOUCH")
+        fh.write(human)
     out, _, _ = _build(monkeypatch)
     assert out["ok"] is True
-    assert open(path, encoding="utf-8").read() == "HUMAN REVIEWED BIBLE, DO NOT TOUCH"
-    assert "untouched" in out["bible"]
+    assert open(path, encoding="utf-8").read() == human
+    doc = vmod.load_voice(path)
+    assert doc is not None and doc.auto_drafted is False
 
 
-def test_the_artifact_is_a_separate_per_gym_file_never_the_shared_brain(monkeypatch):
+def _tree(root):
+    """{path: (size, mtime)} for every file under root — a snapshot to diff."""
+    out = {}
+    for dirpath, _dirs, names in os.walk(root):
+        for n in names:
+            p = os.path.join(dirpath, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            out[p] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def test_a_build_writes_exactly_one_file_and_that_is_the_artifact(monkeypatch,
+                                                                  tmp_path):
+    """The behavioral form of 'a separate per-gym file, never the shared brain'.
+
+    Snapshot the whole data tree (decoys included: a stand-in shared lasso-brain
+    corpus, a tenant_brain learning log, an existing bible), run a full build, and
+    diff. Exactly ONE file may appear — the per-gym artifact — and no file that
+    existed before may change. That covers the READ-ONLY corpus, the learning log
+    and the brand bible in one assertion, without grepping a line of source."""
+    from agent import config, tenant_brain
+    monkeypatch.setenv("AGENT_TENANT_BRAIN_DIR", str(tmp_path / "brains"))
+    decoys = {
+        os.path.join(str(tmp_path), "lasso-brain", "book-doctrine.md"):
+            "SHARED READ-ONLY CORPUS",
+        os.path.join(config.client_voice_dir(), "gymx", "lasso_voice.md"):
+            "HUMAN BIBLE",
+        tenant_brain.brain_path("gymx"): "## learning log\n",
+    }
+    for path, body in decoys.items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+
+    db_path = os.environ["AGENT_DB_PATH"]
+
+    def _snap():
+        return {p: v for p, v in _tree(str(tmp_path)).items()
+                if not p.startswith(db_path)}   # sqlite + its -wal/-shm churn
+
+    before = _snap()
     out, _, _ = _build(monkeypatch)
-    path = os.path.abspath(out["artifact"])
-    assert path.endswith(os.path.join("deep_brains", "gymx.md"))
-    assert "lasso-brain" not in path
-    # the shared READ-ONLY corpus is named in the module docstring (to say it is
-    # never touched) and NOWHERE in the code itself
-    code = inspect.getsource(gdb).split('"""', 2)[-1]
-    assert "lasso-brain" not in code and "lasso_brain" not in code
-    # and NOT the tenant_brain learning log
-    from agent import tenant_brain
-    assert os.path.abspath(tenant_brain.brain_path("gymx")) != path
+    assert out["ok"] is True
+    after = _snap()
+
+    created = set(after) - set(before)
+    changed = {p for p in set(before) & set(after) if before[p] != after[p]}
+    artifact = os.path.abspath(out["artifact"])
+    assert {os.path.abspath(p) for p in created} == {artifact}
+    assert changed == set(), f"a build modified existing files: {changed}"
+    assert artifact.endswith(os.path.join("deep_brains", "gymx.md"))
+    assert os.path.abspath(tenant_brain.brain_path("gymx")) != artifact
 
 
 # ---- 9. blocked, never guessed --------------------------------------------------
@@ -526,7 +766,36 @@ def test_social_profile_is_form_only_and_never_reads_comments(monkeypatch):
     assert "SECRETCOMMENTTOKEN" not in blob and "nosypete" not in blob
     assert "someMemberHandle" not in blob
     assert "latestComments" not in gdb._POST_FIELDS_READ
-    assert "latestComments" not in inspect.getsource(gdb)
+
+
+def test_the_social_read_touches_no_field_outside_the_declared_set():
+    """_POST_FIELDS_READ is a PROMISE. This measures it: every post handed to
+    social_form_profile records which keys anyone asked it for, and the union of
+    those reads must be a subset of the declared set. A future line that reaches
+    for latestComments, taggedUsers or any other user-generated field fails here,
+    which grepping the source for one field name could never do."""
+
+    class _WatchedPost(dict):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.read = set()
+
+        def get(self, key, default=None):
+            self.read.add(key)
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            self.read.add(key)
+            return super().__getitem__(key)
+
+    watched = [_WatchedPost(p) for p in _POSTS]
+    obs, top, err = gdb.social_form_profile("gymx", apify=FakeApify(posts=watched),
+                                            today=_TODAY)
+    assert err == "" and obs and top          # the read really happened
+    touched = set().union(*(p.read for p in watched))
+    assert touched, "nothing was read at all; the assertion below would be vacuous"
+    extra = touched - set(gdb._POST_FIELDS_READ)
+    assert extra == set(), f"read undeclared post field(s): {sorted(extra)}"
 
 
 def test_top_posts_are_the_gyms_own_and_carry_permalinks(monkeypatch):
@@ -561,11 +830,66 @@ def test_no_handle_is_an_honest_empty():
 
 # ---- 11. public-only, no credentials --------------------------------------------
 
-def test_the_module_never_builds_an_auth_header():
-    src = inspect.getsource(gdb)
-    for banned in ("Authorization", "Cookie", "cookies=", "auth=", "login",
-                   "password", "sessionid"):
-        assert banned not in src, f"{banned!r} has no place in a public scrape"
+class _RecordingGet:
+    """A stand-in for requests.get that records exactly how it was called and
+    hands back a permissive response: 200, no redirect, a small body. It enforces
+    NOTHING itself, so only the module under test can hold the no-credentials line
+    (a fake that refused auth headers would pass even with the guard reverted)."""
+
+    def __init__(self, body="<html><body>hi</body></html>", status=200, url=None):
+        self.body = body
+        self.status = status
+        self._url = url
+        self.calls = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FakeResponse(self.body, status=self.status,
+                             url=self._url or url)
+
+
+class _FakeResponse:
+    def __init__(self, body, status=200, url="", chunk=64):
+        self.text = body
+        self.status_code = status
+        self.url = url
+        self.encoding = "utf-8"
+        self.closed = False
+        self._chunk = chunk
+
+    def iter_content(self, chunk_size=1024):
+        raw = self.text.encode("utf-8")
+        step = max(1, int(chunk_size or self._chunk))
+        for i in range(0, len(raw), step):
+            yield raw[i:i + step]
+
+    def close(self):
+        self.closed = True
+
+
+def test_the_real_page_fetcher_sends_nothing_but_a_user_agent():
+    """Measured at the wire, not grepped: drive the PRODUCTION fetcher with a
+    recording requests.get and inspect what it actually sent."""
+    get = _RecordingGet()
+    body = gdb.CappedFetcher(get=get)("https://gymx.com/about")
+    assert body and "hi" in body               # the fetch really happened
+    (url, kwargs), = get.calls
+    assert url == "https://gymx.com/about"
+    assert set(kwargs["headers"]) == {"User-Agent"}
+    assert kwargs["headers"]["User-Agent"] == gdb._UA
+    for banned in ("cookies", "auth", "cert", "data", "json"):
+        assert banned not in kwargs, f"{banned!r} has no place in a public scrape"
+
+
+def test_the_real_robots_fetcher_sends_nothing_but_a_user_agent():
+    get = _RecordingGet(body="User-agent: *\nAllow: /\n")
+    status, body = gdb._fetch_robots("https://gymx.com/robots.txt", get=get)
+    assert status == 200 and "Allow" in body
+    (url, kwargs), = get.calls
+    assert url == "https://gymx.com/robots.txt"
+    assert set(kwargs["headers"]) == {"User-Agent"}
+    for banned in ("cookies", "auth", "cert", "data", "json"):
+        assert banned not in kwargs
 
 
 # ---- 12. CLI --------------------------------------------------------------------
@@ -612,13 +936,52 @@ def test_cli_without_an_account_prints_usage(capsys):
 
 # ---- 13. reuse, not a rebuild ---------------------------------------------------
 
-def test_it_reuses_the_existing_scraper_and_apify_paths():
-    src = inspect.getsource(gdb)
-    assert "website_intake._strip_html" in src
-    assert "website_intake._digits_cleared" in src
-    assert "website_intake.extract_sources" in src
-    assert "website_intake._write_bible_if_missing" in src
-    assert "social_baseline.ApifyClient" in src
+def test_it_reuses_the_existing_scraper_and_apify_paths(monkeypatch):
+    """Reuse proven by CALLING, not by grepping: swap each shared helper for a
+    recorder and watch a real build go through it."""
+    seen = []
+    real_extract, real_strip = wi.extract_sources, wi._strip_html
+    real_digits = wi._digits_cleared
+
+    def _extract(*a, **kw):
+        seen.append("extract_sources")
+        return real_extract(*a, **kw)
+
+    def _strip(*a, **kw):
+        seen.append("_strip_html")
+        return real_strip(*a, **kw)
+
+    def _digits(*a, **kw):
+        seen.append("_digits_cleared")
+        return real_digits(*a, **kw)
+
+    monkeypatch.setattr(wi, "extract_sources", _extract)
+    monkeypatch.setattr(wi, "_strip_html", _strip)
+    monkeypatch.setattr(wi, "_digits_cleared", _digits)
+    apify = FakeApify()
+    out, _, _ = _build(monkeypatch, apify=apify)
+    assert out["ok"] is True
+    assert {"extract_sources", "_strip_html", "_digits_cleared"} <= set(seen)
+    assert apify.calls, "the existing Apify client path was not used"
     assert gdb._UA is wi._UA
-    # no new dependency crept in
-    assert "bs4" not in src and "BeautifulSoup" not in src and "httpx" not in src
+
+
+def test_the_deep_brain_pulled_in_no_new_dependency():
+    """Every module name gym_deep_brain imports, read off its AST (module level
+    and inside functions alike). A heavyweight scraper or a second HTTP client
+    would show up here as a real import, not as a lucky substring."""
+    import ast
+    tree = ast.parse(inspect.getsource(gdb))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            imported.update(a.name.split(".")[0] for a in node.names)
+    for banned in ("bs4", "BeautifulSoup", "httpx", "selenium", "playwright",
+                   "scrapy", "lxml"):
+        assert banned not in imported, f"{banned} is a new dependency"
+    # and it really does sit on the shared plumbing
+    assert {"website_intake", "client_sources", "social_baseline"} <= imported
