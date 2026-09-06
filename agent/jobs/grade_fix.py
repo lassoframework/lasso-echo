@@ -48,6 +48,16 @@ WHAT IT FIXES (never fabricates, never publishes, never auto-approves):
      forever. The replacement lands only when it is BOTH on-avatar and
      craft-clean; an off-avatar hook is never traded for a worse caption.
 
+  g. BODY sameness (AGENT_CTA_VARIETY, Blake 2026-09-06): two posts whose
+     MIDDLE reads as the same template — caption_variety.body_similarity at or
+     above BODY_SIMILARITY_THRESHOLD — get the LATER one regenerated fresh on
+     the same photo. This is a real repair, not a trim: the replacement is an
+     actual new caption grounded in the gym's own approved sources, and it
+     lands only when it is craft-clean AND genuinely different from every
+     other body in the book. A gym whose approved sources cannot supply a
+     genuinely different post is an HONEST SKIP, counted and logged, never a
+     forced or fabricated difference.
+
 HARD GUARANTEES:
   * Only WIPEABLE (pending/draft/queued) rows are ever patched. The store's
     patch_pending_plan carries a server-side status filter, so an approved /
@@ -78,6 +88,12 @@ it is actually the honest limit:
      are asked once and an unfillable gap is recorded once, never re-announced.
   5. B2B CAPTION CONTENT. LASSO's captions come from the pillar builders; only
      the mechanical repair applies here, never the regen.
+  6. BODY SAMENESS ON A THIN LIBRARY. The body repair needs the regen to hand
+     back a caption whose MIDDLE is genuinely different from every other post
+     in the book. A gym with too few approved sources or pillars physically
+     cannot supply one, and the pass says so (`body_unrepairable`) rather than
+     writing a difference that is not real. Fixed by adding approved source
+     material, not by code.
 """
 from __future__ import annotations
 
@@ -156,14 +172,17 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
         db:            injectable kv module (agent.db).
 
     Returns {ok, captions_fixed, repillared, craft_fixed, craft_attempted,
-             booking_asks_added, gap_fill, skipped, actions}.
+             booking_asks_added, ask_trimmed, invalid_closings_removed,
+             body_pairs, body_fixed, body_unrepairable,
+             gap_fill, skipped, actions}.
     """
     log = logger or (lambda m: print(f"[grade-fix] {m}"))
     if not config.grade_self_fix_enabled():
         return {"ok": False, "reason": "AGENT_GRADE_SELF_FIX off",
                 "captions_fixed": 0, "repillared": 0, "craft_fixed": 0,
                 "craft_attempted": 0, "booking_asks_added": 0, "ask_trimmed": 0,
-                "invalid_closings_removed": 0,
+                "invalid_closings_removed": 0, "body_pairs": 0,
+                "body_fixed": 0, "body_unrepairable": 0,
                 "gap_fill": "none", "skipped": 0, "actions": []}
 
     actions = []
@@ -171,6 +190,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
               "craft_fixed": 0, "craft_attempted": 0, "booking_asks_added": 0,
               "ask_trimmed": 0, "invalid_closings_removed": 0,
               "audience_fixed": 0, "audience_attempted": 0, "scrubbed": 0,
+              "body_pairs": 0, "body_fixed": 0, "body_unrepairable": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
     deadline = _deadline(llm_budget_s)
@@ -248,6 +268,32 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     result["skipped"] += max(0, aud_attempted - aud_fixed)
     if aud_fixed:
         actions.append(f"rewrote {aud_fixed} off-avatar hook(s) back onto the gym's avatar")
+
+    # ---- g) body sameness (the MIDDLE of two posts, not their closing) -------
+    # LAST of the caption passes, deliberately, and the order is load bearing:
+    # `caption_variety.body_text` measures a caption with its CLOSING LINE
+    # STRIPPED, so every pass above that touches a closing line MOVES the cut
+    # this pass measures from. d0 removes an invalid closing, d appends a real
+    # one and d2 trims a stapled one; a caption reading "hook / body / CTA" has
+    # a two line body before those passes and a one line body after. Measuring
+    # body sameness first would score a book that no longer exists by the end of
+    # the run -- and it is exactly that shape that produces the real 1.0 pairs
+    # (hillcountry, topfuel and train7164ae502 all repeat a HOOK verbatim, which
+    # only becomes the whole body once the closing is off). Running last also
+    # means the fresh captions written by c) over-cap and e) audience are
+    # themselves checked for body sameness instead of being trusted.
+    body_pairs, body_fixed, body_unrepairable = _fix_body_sameness(
+        gym_id, rows, store, caption_regen, avoid, log, deadline=deadline)
+    result["body_pairs"] = body_pairs
+    result["body_fixed"] = body_fixed
+    result["body_unrepairable"] = body_unrepairable
+    result["skipped"] += body_unrepairable
+    if body_fixed:
+        actions.append(f"rewrote {body_fixed} post(s) whose body read as a repeat "
+                       "of another post in the book")
+    if body_unrepairable:
+        actions.append(f"{body_unrepairable} near-duplicate body/bodies could not "
+                       "be honestly rewritten (source material too thin)")
 
     # ---- b) day gaps ---------------------------------------------------------
     gap_dates = [str(d[1])[:10] for d in (defects or [])
@@ -1146,6 +1192,174 @@ def _fix_audience(gym_id, rows, store, profile, caption_regen, avoid, log,
             fixed += 1
             avoid.add(new_cap)
     return fixed, attempted
+
+
+# ---------------------------------------------------------------------------
+# g) body sameness — the same template in the MIDDLE of two posts
+# ---------------------------------------------------------------------------
+
+def _body_posts(rows):
+    """The book as (date, caption) POST groups in date order.
+
+    Same grouping every other pass here uses: one calendar post deliberately
+    spans several rows (the IG feed, its Facebook mirror and the paired story
+    share one caption on one date), and a 2x day's two distinct captions stay
+    two independent posts. Rows with no caption (a caption-less story / GBP
+    photo post) have no body to compare and are left out entirely."""
+    groups: dict = {}
+    for r in rows or []:
+        d = str(r.get("post_date") or "")[:10]
+        cap = r.get("caption") or ""
+        if not d or not str(cap).strip():
+            continue
+        groups.setdefault((d, caption_hash(cap)), []).append(r)
+    return [(key, groups[key]) for key in sorted(groups)]
+
+
+def _body_collides(caption, others, threshold) -> bool:
+    """True when this caption's BODY reads as the same template as any of
+    `others` (already-normalized comparison lives in caption_variety)."""
+    return any(caption_variety.body_similarity(caption, other) >= threshold
+               for other in others)
+
+
+def _fix_body_sameness(gym_id, rows, store, caption_regen, avoid, log,
+                       deadline=None, threshold=None):
+    """Regenerate the LATER post of every near-duplicate BODY pair.
+
+    BLAKE'S RULING, 2026-09-06: *"Build the actual body-copy repair, not just
+    detection ... build the repair path that acts when a post's body copy is a
+    near-duplicate of another post in the same gym's book (not just the closing
+    line, the actual middle content/structure). Same rules as before apply: no
+    forced/fake content, real repair only, don't touch gyms where the pool /
+    source material can't support a genuinely different post, flag those
+    honestly rather than papering over them."*
+
+    WHY THIS IS A REGEN AND NOT A TRIM. `_fix_ask_excess` and
+    `_fix_invalid_closings` only ever DELETE a line, which is the honest repair
+    for a stapled closing. There is no line you can delete to make a caption's
+    MIDDLE different; the middle is the post. So this pass is the duplicate
+    lane's repair (a fresh caption from the gym's own approved sources, through
+    the same injectable `caption_regen`, on the SAME photo), aimed at a defect
+    `_fix_duplicates` cannot see: those two captions are not identical, they are
+    merely the same template.
+
+    SCOPE: BOOK-WIDE, not the 10-post anti-repetition window. This is a
+    deliberate departure from the other collision kinds and it follows
+    `caption_variety.report()`, whose body-similarity metric is book-wide for a
+    stated reason: "a template can recur outside the anti-repetition window and
+    a client reviewing a full month still sees it." Measured on the real fleet
+    the same morning this shipped, both scopes are needed and the window alone
+    would miss real repeats -- train7164ae502 repeats "You've tried the big box
+    gyms." on 2026-09-18 and 2026-09-30 (12 posts apart, OUTSIDE the window,
+    body similarity 1.0), and gritx repeats a whole caption verbatim 2026-08-27
+    -> 2026-10-01 (30+ posts apart). O(n^2) over a month's book is ~800 string
+    comparisons and costs nothing; the LLM spend is what is bounded, by the same
+    `deadline` every other regen pass here shares.
+
+    WHICH SIDE MOVES: THE LATER DATE, always. Three reasons, in order of
+    weight: (1) it is the rule `_fix_duplicates` already uses -- the earliest
+    date keeps its caption -- and one file should not hold two different answers
+    to the same question; (2) the earlier post is nearer to publishing, so it
+    has had the longest exposure to human review and is the more expensive one
+    to churn; (3) it makes the pass deterministic, so the same book repairs
+    identically and a diff stays reviewable.
+
+    CHAINS OF THREE OR MORE. Each post is considered for regeneration AT MOST
+    ONCE, as the later side. train7164ae502's real book has six posts opening
+    "You've tried solo workouts and ..."; naive pairwise repair would rewrite
+    the same day up to five times. Instead the earliest member of a chain is
+    the anchor and each later member gets one attempt, in date order, checked
+    against the book AS REPAIRED SO FAR -- so a repair that already broke the
+    chain spares the days after it (re-checked, not assumed).
+
+    WHAT LANDS. A fresh caption is written only when it is ALL of: non-empty,
+    not already on the book (`avoid`), craft-clean (`_clears_craft`, ask-less
+    allowed -- the ask-rate rail owns the closing line, not this pass), and
+    genuinely different: BELOW the threshold against every other body in the
+    book, including the ones this pass has already written. Anything short of
+    that and the day KEEPS ITS CURRENT CAPTION and is counted
+    `body_unrepairable` -- the gym's approved sources cannot honestly supply a
+    different post today, and that is a content-supply fact to report, not a
+    defect to paper over with a forced difference.
+
+    Returns (pairs_found, days_fixed, days_unrepairable)."""
+    if not config.cta_variety_enabled():
+        return 0, 0, 0
+
+    thresh = (caption_variety.BODY_SIMILARITY_THRESHOLD if threshold is None
+              else float(threshold))
+    posts = _body_posts(rows)
+    caps = [grp[0].get("caption") or "" for _key, grp in posts]
+
+    # The pairs as FOUND, before anything is repaired, counted exactly the way
+    # caption_variety.report()["body_similarity"]["pairs_over_threshold"] counts
+    # them, so the before/after numbers are directly comparable.
+    later_sides, pairs_found = [], 0
+    for i in range(len(caps)):
+        for j in range(i + 1, len(caps)):
+            if caption_variety.body_similarity(caps[i], caps[j]) >= thresh:
+                pairs_found += 1
+                if j not in later_sides:
+                    later_sides.append(j)      # the LATER date is the one that moves
+    if not pairs_found:
+        return 0, 0, 0
+
+    fixed = unrepairable = 0
+    for j in sorted(later_sides):
+        (day, _h), grp = posts[j]
+        others = [caps[k] for k in range(len(caps)) if k != j]
+        if not _body_collides(caps[j], others, thresh):
+            continue                # an earlier repair already broke this chain
+        if any(not _is_wipeable(r) for r in grp):
+            # Floor 1: a human approved this caption. Echo does not rewrite it.
+            log(f"{gym_id} {day}: body reads as a repeat of another post but the "
+                "day is human owned; left in place")
+            continue
+        if caption_regen is None:
+            unrepairable += 1
+            log(f"{gym_id} {day}: body reads as a repeat of another post and no "
+                "caption regen context is available for this gym; left in place")
+            continue
+        if not _budget_left(deadline):
+            # Bounded LLM spend, honest stop: the nightly sweep always finishes.
+            log(f"{gym_id} {day}: body repair stopped, the pass is out of LLM "
+                "budget; remaining near-duplicate bodies left in place")
+            break
+        out = None
+        try:
+            out = caption_regen(grp[0], avoid, "")
+        except Exception as exc:  # noqa: BLE001 - remediation is best effort
+            log(f"{gym_id} {day}: body regen raised {type(exc).__name__}")
+        new_cap = ((out or (None, None))[0] or "").strip()
+        new_cat = (out or (None, None))[1] if out else None
+        if not new_cap or new_cap in avoid:
+            unrepairable += 1
+            log(f"{gym_id} {day}: no fresh caption could be built for the "
+                "near-duplicate body; left in place (source material too thin)")
+            continue
+        if _body_collides(new_cap, others, thresh):
+            unrepairable += 1
+            log(f"{gym_id} {day}: the regenerated caption's body still reads as "
+                "the same template as another post; left in place rather than "
+                "forcing a difference the gym's sources cannot support")
+            continue
+        if not _clears_craft(new_cap, allow_no_ask=True):
+            unrepairable += 1
+            log(f"{gym_id} {day}: the regenerated caption does not clear the "
+                "craft bar; keeping the current caption")
+            continue
+        if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
+            fixed += 1
+            avoid.add(new_cap)
+            caps[j] = new_cap          # later chain members re-check against this
+        else:
+            unrepairable += 1
+    if fixed or unrepairable:
+        log(f"{gym_id}: body sameness, {pairs_found} pair(s) at or above "
+            f"{thresh}; rewrote {fixed}, {unrepairable} could not be honestly "
+            "made different")
+    return pairs_found, fixed, unrepairable
 
 
 # ---------------------------------------------------------------------------
