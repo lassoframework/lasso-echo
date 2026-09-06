@@ -36,8 +36,13 @@ CONNECTED_IG = {
 # =============================================================================
 def test_map_status_connected_ig_with_handle():
     out = z.map_status({"accounts": [CONNECTED_IG]})
-    assert out["platforms"]["instagram"] == {"connected": True, "handle": "lassoframework", "expired": False}
-    assert out["platforms"]["facebook"] == {"connected": False, "handle": None, "expired": False}
+    assert out["platforms"]["instagram"] == {
+        "connected": True, "handle": "lassoframework", "expired": False,
+        # P-10: the REAL grant expiry off the fixture, not a placeholder. IG/FB grants
+        # run about 60 days, which is what makes an early warning possible at all.
+        "expires_at": "2026-09-27T13:14:03.205000+00:00"}
+    assert out["platforms"]["facebook"] == {"connected": False, "handle": None,
+                                           "expired": False, "expires_at": None}
 
 
 def test_map_status_disconnect_flag_is_expired():
@@ -62,7 +67,8 @@ def test_account_state_time_expiry():
 
 def test_map_status_missing_platform_is_not_connected_no_handle():
     out = z.map_status({"accounts": []})
-    assert out["platforms"]["facebook"] == {"connected": False, "handle": None, "expired": False}
+    assert out["platforms"]["facebook"] == {"connected": False, "handle": None,
+                                           "expired": False, "expires_at": None}
 
 
 def test_map_status_defensive_on_garbage():
@@ -87,7 +93,8 @@ def test_bare_account_without_signal_is_not_connected():
     # A malformed/partial payload with only a platform must NOT read as connected.
     assert z.account_state({"platform": "instagram"}) == "not_connected"
     out = z.map_status({"accounts": [{"platform": "instagram"}]})
-    assert out["platforms"]["instagram"] == {"connected": False, "handle": None, "expired": False}
+    assert out["platforms"]["instagram"] == {"connected": False, "handle": None,
+                                            "expired": False, "expires_at": None}
 
 
 def test_map_pages_renames_underscore_id():
@@ -687,7 +694,9 @@ def test_status_folds_live_shape(db_env):
     fake = _FakeClient(accounts={"accounts": [CONNECTED_IG]})
     status, body = zr.handle_social_status("gymA", client=fake)
     assert status == 200
-    assert body["platforms"]["instagram"] == {"connected": True, "handle": "lassoframework", "expired": False}
+    assert body["platforms"]["instagram"] == {
+        "connected": True, "handle": "lassoframework", "expired": False,
+        "expires_at": "2026-09-27T13:14:03.205000+00:00"}
     assert ("accounts", "P1") in fake.calls
 
 
