@@ -1307,6 +1307,32 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
+    # CROSS GYM BRAIN (AGENT_CROSS_GYM_BRAIN, default OFF -> no-op): nightly
+    # fleet rollup of every gym's matured post_metrics into FORM statistics —
+    # which hook shape, caption length, structure, pillar, ask, slot and format
+    # actually correlate with engagement ACROSS gyms, each finding carrying its
+    # per cell n, effect size, p value and Benjamini Hochberg q value. Only a
+    # finding that clears the sample floor on BOTH sides, draws on >= 2 distinct
+    # gyms on BOTH sides, survives the FDR correction and clears the effect floor
+    # becomes guidance; everything else is reported as insufficient_data /
+    # not_significant / directional and changes nothing. external and is_ad rows
+    # never train (the monthly_retro rail). READ ONLY apart from the append only
+    # cross_gym_brain row; the output is FORM ONLY by whitelist, so no caption
+    # text or client content can cross between gyms. Isolated: a brain failure
+    # never blocks the draft run.
+    try:
+        from .jobs.cross_gym_brain import run as _cross_gym_brain_run
+        _cgb = _cross_gym_brain_run()
+        if _cgb.get("ok"):
+            print(f"[cross-gym-brain] {len(_cgb.get('findings') or [])} finding(s), "
+                  f"{len(_cgb.get('guidance') or [])} cleared the bar")
+        else:
+            print(f"[cross-gym-brain] skipped: {_cgb.get('reason')}")
+    except Exception as e:
+        print(f"[cross-gym-brain] failed: {type(e).__name__}: {e}")
+        ops_alerts.alert(f"cross gym brain failed: {type(e).__name__}: {e}. "
+                         "The draft run is unaffected.")
+
     # GYM MEDIA DRIVE SYNC (gym_media_drive): nightly walk of each connected gym's
     # shared Drive folder into media_asset — MIME filter, content_hash dedupe,
     # eligibility gate, budgeted ffprobe, removed/revoked handling, deny sweep, a

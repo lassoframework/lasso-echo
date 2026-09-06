@@ -290,6 +290,7 @@ def _status():
     print(f"  mentions       : {config.mentions_enabled()}  (env AGENT_MENTIONS; Wave 4 tag_allowlist @mention tagging, default OFF)")
     print(f"  metrics_sync   : {config.metrics_sync_enabled()}  (env AGENT_METRICS_SYNC; Wave 7 nightly Zernio analytics -> post_metrics snapshots, read only, default OFF)")
     print(f"  learning_loop  : {config.learning_loop_enabled()}  (env AGENT_LEARNING_LOOP; Wave 7 lever stamping + gym_playbook consumption + monthly retro, default OFF)")
+    print(f"  cross_gym_brain: {config.cross_gym_brain_enabled()}  (env AGENT_CROSS_GYM_BRAIN; nightly fleet rollup of post_metrics into FORM statistics (Welch t + Benjamini Hochberg, sample floor 6, >= 2 gyms per cell), read only + append only cross_gym_brain row, form only by whitelist, default OFF)")
     print(f"  horizon_sweep  : {config.plan_horizon_sweep_enabled()}  (env AGENT_PLAN_HORIZON_SWEEP; nightly retirement of pending rows already past today+{config.plan_horizon_days()} — the belt's retroactive counterpart, exempt dated lanes kept, default ON)")
     print(f"  media_repeat   : {config.media_repeat_sweep_enabled()}  (env AGENT_MEDIA_REPEAT_SWEEP; nightly cross-day same-photo sweep, published/approved rows never touched, default ON)")
     print(f"  posting_tz     : {config.posting_tz_watch_enabled()}  (env AGENT_POSTING_TZ_WATCH; backfill gyms.posting_timezone from GBP/brand-bible evidence + alert on any gym still without one, default ON)")
