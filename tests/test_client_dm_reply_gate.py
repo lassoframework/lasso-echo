@@ -354,3 +354,20 @@ def test_a_wellformed_account_key_is_accepted():
     for good in ("crossfitlocal", "top-fuel", "toughtemple52040e",
                  "district-h-strength-fitness", "pierce_ig"):
         assert d.require_account_key(good) == good.lower()
+
+
+def test_a_missing_SLOT_refuses_even_when_every_requires_true_fact_holds():
+    """The `missing` guard in render(), asserted on its own. The earlier test for it
+    went green under mutation because requires_true happened to catch the same case
+    first; this snapshot satisfies every requires_true fact and is short one SLOT."""
+    partial = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "crossfitlocal",
+        {"media_source_revoked": True})          # drive_revoked's slot is absent
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply.compose("drive_revoked", partial)
+    assert "media_asset_count" in str(e.value)
+    # ...and adding the slot makes it render, so the test is measuring that guard.
+    whole = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "crossfitlocal",
+        {"media_source_revoked": True, "media_asset_count": 0})
+    assert "0 file(s)" in reply.render("drive_revoked", whole)

@@ -49,6 +49,18 @@ from __future__ import annotations
 
 REPLY_META_LANE = "client_dm_autofix"
 
+# The delivery status each kind must be written with, as named constants rather than
+# inline literals, because both of them are contracts of the EXISTING outbox and
+# getting either wrong silently drops the row:
+#   * outbox.run_once reads ONLY bus.outbox("ready") (outbox.py:271). An escalation
+#     written "held" lands in the database and surfaces to nobody -- and that is the
+#     safety path, the one carrying every refusal this lane makes to a human.
+#   * "ready" for an INTERNAL kind does NOT mean "post to the client": escalations go
+#     to the fixer channel. It is what adapter.delivery_for returns for every internal
+#     kind (adapter.py:569-570).
+ESCALATION_DELIVERY_STATUS = "ready"
+REPLY_DELIVERY_STATUS = "ready"
+
 
 class WiringError(RuntimeError):
     """A row could not be written in a shape the existing outbox will actually
@@ -96,7 +108,7 @@ def bus_reply_sink(bus):
             ticket_id=ticket.get("id"),
             author_type=meta["identity"],
             body=decision.reply_text,
-            delivery_status="ready",
+            delivery_status=REPLY_DELIVERY_STATUS,
             kind=kind_status,
             meta=meta,
         )
@@ -125,7 +137,7 @@ def bus_escalation_sink(bus):
             ticket_id=ticket.get("id"),
             author_type=meta["identity"],
             body=body,
-            delivery_status="ready",
+            delivery_status=ESCALATION_DELIVERY_STATUS,
             kind=kind_escalation,
             meta=meta,
         )

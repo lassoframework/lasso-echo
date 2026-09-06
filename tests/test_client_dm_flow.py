@@ -826,3 +826,41 @@ def test_run_once_has_a_real_production_caller():
     src = inspect.getsource(runner)
     assert "client_dm_support.consumer import run_once" in src
     assert "config.client_dm_autofix_enabled()" in src
+
+
+def test_a_leaked_source_belonging_TO_ANOTHER_GYM_never_grounds_a_reply():
+    """THE AUDITOR'S REPRO. The store's gym filter is broken and returns ONLY a rival
+    gym's source. The drive_revoked path takes no executor, so the executor's own
+    tenant check never runs — which is exactly why the DIAGNOSTIC needs its own.
+
+    Before the fix this auto-posted 'Your Google Drive folder "Rival Gym Q4 Launch
+    Photos" is no longer shared with us' to a different client."""
+    class OnlyRival(FakeStore):
+        def list_sources(self, gym_id=None, include_inactive=False):
+            return [{"id": 9, "gym_id": "rivalgym", "kind": "gym_drive",
+                     "folder_name": "Rival Gym Q4 Launch Photos", "active": True,
+                     "revoked_externally": True,
+                     "connected_at": "2026-09-01T00:00:00+00:00"}]
+
+    store = OnlyRival(sources=[], assets=[])
+    d = flow.handle_ticket(text="my posts have no photos", gym_key=CHAD_KEY,
+                           deps=drive_deps(store, make_sync(0, store)))
+    assert d.decision == flow.DECISION_ESCALATE
+    assert not d.will_post
+    assert "Rival" not in (d.reply_text or "")
+
+
+def test_a_leaked_asset_row_cannot_inflate_this_gyms_count():
+    class LeakyAssets(FakeStore):
+        def list_assets(self, gym_id, source_id=None):
+            self.asset_reads.append(gym_id)
+            return [dict(a) for a in self.assets]      # ignores the gym filter
+
+    store = LeakyAssets(sources=[CHAD_SOURCE],
+                        assets=[{"id": 1, "gym_id": "someoneelse"},
+                                {"id": 2, "gym_id": "someoneelse"}])
+    snap = diag.diagnose_drive_photos(CHAD_KEY, store=store, now=NOW,
+                                      daily_hour_utc=12,
+                                      lane_active_for=lambda k: True)
+    assert snap.get("media_asset_count") == 0, (
+        "another gym's asset rows were counted as this gym's")
