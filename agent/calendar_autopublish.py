@@ -854,6 +854,67 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             skipped.append(row_id)
             continue
 
+        # CONTENT IDEMPOTENCY, WRITTEN BEFORE THE NETWORK CALL (2026-09-05 incident).
+        #
+        # Tough Temple was double posted on a live client account: six publishes in 40
+        # seconds, including a re-publish of a day that had already gone out 19 hours
+        # earlier. Fleet wide the same signature covered 84 extra publishes across 10
+        # gyms (eng 23, lasso 19, piercefitness 15). Every pair carried a DIFFERENT
+        # late_post_id, so Zernio accepted each as a separate post and they are live.
+        #
+        # The row-level claim above (mark_publishing) did not and could not stop it,
+        # because these are DIFFERENT ROWS: same gym, same account, same post_date, same
+        # caption, different time_slot. The planner wrote one caption into two slots and
+        # the publisher correctly published both. A row-id key is the wrong key. The one
+        # that matters is the CONTENT going to an ACCOUNT.
+        #
+        # The lasso case shows the window is not a day: the same caption went out on
+        # 08-14, 08-18 and 09-01.
+        #
+        # Written BEFORE the call, deliberately. If the process dies between this stamp
+        # and the network call, the row never publishes again. That is the correct
+        # direction: a post that silently fails to go out is recoverable by a human, a
+        # post that goes out twice on a client's account is not.
+        _content_key = _published_content_key(account, row)
+        if _content_key:
+            try:
+                _seen = _kv_default().get(_content_key, "")
+            except Exception:  # noqa: BLE001 - a kv fault must not double post
+                _seen = "unreadable"
+            # Same ROW re-entering this path is the row-claim's business, not a content
+            # duplicate: mark_publishing already owns exactly-once for one row. What this
+            # guard exists to catch is a DIFFERENT row carrying the same words to the same
+            # account, which is exactly the Tough Temple shape.
+            _seen_row = str(_seen).split("|", 1)[0] if _seen else ""
+            if _seen and _seen_row and _seen_row == str(row_id):
+                _seen = ""
+            if _seen:
+                _seen = str(_seen).split("|", 1)[-1]
+                skipped.append(row_id)
+                _mark_duplicate_content(store, gym_id, row_id, _seen)
+                _idx_alert = (
+                    f"DUPLICATE CONTENT REFUSED: {gym_id} {account.platform} row "
+                    f"{row_id} ({row.get('post_date')}) carries a caption already "
+                    f"published to this account on {_seen}. Not sent. The row is marked "
+                    f"so it cannot be retried. This is the guard added after the "
+                    f"2026-09-05 Tough Temple double post.")
+                print(f"[calendar-autopublish] {_idx_alert}")
+                try:
+                    from .ops_alerts import alert as _oa
+                    _oa(_idx_alert)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            try:
+                _kv_default().set(_content_key, f"{row_id}|{_now_stamp()}")
+            except Exception as e:  # noqa: BLE001
+                # Could not stamp: refuse rather than risk a repeat. Fail closed.
+                skipped.append(row_id)
+                print(f"[calendar-autopublish] content stamp failed for {row_id} "
+                      f"({type(e).__name__}); refusing to publish rather than risk a "
+                      f"duplicate")
+                continue
+
         draft = _draft_for(row)
         draft.account_key = account.key
         draft.platform = account.platform
@@ -1114,6 +1175,66 @@ def _kv_default():
     return _KV()
 
 
+def _now_stamp():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _published_content_key(account, row):
+    """The idempotency key for CONTENT reaching ONE account, or "" when it cannot be
+    formed.
+
+    Scoped to the account, not the gym: the same caption legitimately cross-posts to a
+    gym's Instagram and its Facebook, and blocking that would be a regression. Two rows
+    carrying the same words to the SAME account is the defect.
+
+    Uses the caption ledger's own verbatim normalisation so whitespace and case changes
+    cannot slip a repeat past the guard. A story row has an empty body by design and is
+    exempt: keying stories on content would collapse every story a gym ever posts."""
+    try:
+        caption = str(row.get("caption") or "").strip()
+        fmt = str(row.get("format") or "feed").strip().lower()
+        if not caption or fmt == "story":
+            return ""
+        from .caption_ledger import verbatim_hash
+        platform = str(getattr(account, "platform", "") or "").strip().lower()
+        key_acct = str(getattr(account, "key", "") or "").strip().lower()
+        if not (platform or key_acct):
+            return ""
+        return f"published_content_{key_acct}_{platform}_{verbatim_hash(caption)}"
+    except Exception:  # noqa: BLE001 - an unformable key means no guard, never a crash
+        return ""
+
+
+def _mark_duplicate_content(store, gym_id, row_id, seen_at):
+    """Take a refused duplicate OUT of the publish lane, reversibly.
+
+    mark_publishing already flipped the row to 'publishing'; leaving it there would strand
+    it exactly like the row this build spent the morning un-sticking. 'deleted' is the
+    schema's soft delete, is excluded from LIVE_CALENDAR_STATUSES and from the publisher's
+    own approved_only filter, and is reversible with one UPDATE."""
+    reason = (f"duplicate content refused 2026-09-05: this caption was already published "
+              f"to this account on {seen_at}. REVERSIBLE: set status back to approved.")
+    for method, args in (("set_status", (gym_id, row_id, "deleted")),
+                         ("mark_publish_failed", (row_id,))):
+        try:
+            fn = getattr(store, method, None)
+            if fn is None:
+                continue
+            if method == "set_status":
+                fn(*args)
+            else:
+                fn(*args, revert_status="deleted")
+            break
+        except Exception:  # noqa: BLE001 - try the next shape
+            continue
+    try:
+        from . import db as _db
+        _db.audit("duplicate_content_refused", gym_id, reason, gym_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _slot_fire_key(run_date, slot_time):
     return f"calendar_slotfire_{run_date}_{slot_time}"
 
@@ -1205,8 +1326,24 @@ def client_gym_bases():
 # would double-publish). It only ALERTS a human, once per row: first sighting
 # records the time in kv; a row still stuck past the threshold alerts and is
 # marked so it never re-alerts.
+#
+# THAT LAST SENTENCE WAS THE BUG (AUD-106, 2026-09-05). "Marked so it never re-alerts"
+# and "cleared on recovery" are different promises, and only the first was implemented.
+# The marker was written as the literal string "alerted" and cleared NOWHERE, so a row
+# that stays stuck is muted permanently after one alert. Caught red-handed: the LASSO
+# Instagram row d4574f62 carried stuck_publishing_d4574f62... = 'alerted' in production
+# while STILL sitting in status 'publishing' with published_at NULL, post_date 2026-08-28
+# -- eight days stranded, one alert, then silence. That is the same shape as the four
+# safety nets that already shipped inert.
+#
+# Two changes: the marker now records WHEN the alert fired (a timestamp, never a magic
+# word, so the value is comparable with the first-sighting stamp written above it), and a
+# row still stuck after STALE_PUBLISHING_REALERT_SECONDS alerts again with its age. A row
+# that leaves 'publishing' stops appearing in publishing_rows(), so its key simply goes
+# unread; nothing has to clear it for the alert to be correct on the next genuine stall.
 
 STALE_PUBLISHING_SECONDS = 2 * 3600   # 2h: far beyond the seconds-wide claim window
+STALE_PUBLISHING_REALERT_SECONDS = 24 * 3600   # re-alert daily while it is still stuck
 
 
 def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
@@ -1238,8 +1375,44 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
             seen = kv.get(key, "")
         except Exception:
             seen = ""
-        if seen == "alerted":
-            continue                              # already alerted, human owns it
+        if seen.startswith("alerted"):
+            # ALREADY ALERTED, BUT NOT FOREVER. Re-alert on a daily cadence while the row
+            # is still stuck, so a stall that nobody actioned resurfaces instead of going
+            # silent. Legacy value: a bare "alerted" with no timestamp (what the old code
+            # wrote) is treated as "alerted just now" and re-alerts one interval later,
+            # rather than being trusted forever or re-alerting instantly on every sweep.
+            stamp = seen.partition(":")[2]
+            try:
+                last = datetime.fromisoformat(stamp) if stamp else now_dt
+            except ValueError:
+                last = now_dt
+            # A stamp written by an older build (or by a test) can be naive while
+            # _local_now is aware; subtracting the two raises TypeError, which the caller
+            # would swallow and the row would go silent again -- the exact failure this
+            # fix exists to remove.
+            if (last.tzinfo is None) != (now_dt.tzinfo is None):
+                last = last.replace(tzinfo=now_dt.tzinfo) if last.tzinfo is None \
+                    else last.astimezone(None).replace(tzinfo=None)
+            if not stamp:
+                try:
+                    kv.set(key, f"alerted:{now_dt.isoformat()}")
+                except Exception:
+                    pass
+                continue
+            if (now_dt - last).total_seconds() < STALE_PUBLISHING_REALERT_SECONDS:
+                continue
+            alert(f"calendar row {rid} (gym {row.get('gym_id')}, {row.get('account')}, "
+                  f"{row.get('post_date')}) is STILL stuck in 'publishing'. It was first "
+                  f"alerted on {stamp[:19]} and nothing has changed since. This row "
+                  "cannot publish and cannot be seen by the client. Check the account's "
+                  "feed: if the post is live, mark the row published by hand; if not, "
+                  "flip it back to approved.")
+            try:
+                kv.set(key, f"alerted:{now_dt.isoformat()}")
+            except Exception:
+                pass
+            alerted.append(rid)
+            continue
         if not seen:
             try:
                 kv.set(key, now_dt.isoformat())   # first sighting: start the clock
@@ -1259,7 +1432,7 @@ def sweep_stuck_publishing(*, store=None, kv=None, now=None, alert=None):
               "could double-post). Check the account's feed: if the post is live, "
               "mark the row published by hand; if not, flip it back to approved.")
         try:
-            kv.set(key, "alerted")
+            kv.set(key, f"alerted:{now_dt.isoformat()}")
         except Exception:
             pass
         alerted.append(rid)

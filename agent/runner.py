@@ -235,10 +235,7 @@ def _autonomous_publish(draft, store, poster):
     if not getattr(result, "ok", False):
         # e.g. media not ready / not authorized: NOTHING published, so release the claim
         # for a clean retry, then hold PENDING. Never fake success.
-        try:
-            _db.socialapi_claim_release(draft.draft_id, account_key)
-        except Exception:  # noqa: BLE001
-            pass
+        _release_claim(draft.draft_id, account_key, "publish returned not-ok")
         return False
     detail = str(getattr(result, "detail", "") or "")
     if detail.startswith("published"):
@@ -249,10 +246,7 @@ def _autonomous_publish(draft, store, poster):
     else:
         # would_publish: the dry run sent nothing, so the claim must not stand or the
         # post could never go out once publishing is armed.
-        try:
-            _db.socialapi_claim_release(draft.draft_id, account_key)
-        except Exception:  # noqa: BLE001
-            pass
+        _release_claim(draft.draft_id, account_key, "dry run, nothing sent")
     # handle_action set draft.status to APPROVED on success; persist that record.
     store.put(draft)
     from . import db
@@ -391,6 +385,37 @@ def _claimed_meta_publish(draft, acct):
         # would_publish: no network call happened; release so an armed run can send.
         db.socialapi_claim_release(draft.draft_id, acct.key)
     return ("published", result)
+
+
+def _release_claim(draft_id, account_key, why):
+    """Release a publish claim, and NEVER swallow the failure.
+
+    AUD-107, 2026-09-05. Both release paths sat inside `except Exception: pass`. A claim
+    that fails to release is not a cosmetic problem: the row stays claimed, the publish
+    lane skips it forever, and the client's approved post silently never goes out. The
+    intended backstop (a claim_hold_alerted_* watchdog) had never fired once, because a
+    swallowed release leaves nothing for it to see. Production at the time of the fix:
+    socialapi_claims held an in_flight row for welcf_64fbd8ce8368 / lasso_ig claimed
+    2026-09-01 12:29:55, four days stale, with zero claim_hold_alerted_* keys anywhere.
+
+    Same shape as the four safety nets that shipped inert: a component that logs nothing,
+    raises nothing, and does nothing. A release failure now logs loudly AND raises one ops
+    alert so it is visible, while still never taking the publish pass down with it."""
+    from . import db as _db
+    try:
+        _db.socialapi_claim_release(draft_id, account_key)
+        return True
+    except Exception as e:  # noqa: BLE001 - never break the publish pass
+        msg = (f"claim release FAILED for {account_key} draft {draft_id} ({why}): "
+               f"{type(e).__name__}: {e}. The row stays CLAIMED, so the publish lane will "
+               f"skip it on every future pass and the post can never go out. Release it by "
+               f"hand or the client's approved post is stranded.")
+        print(f"[runner] {msg}")
+        try:
+            ops_alerts.alert(msg)
+        except Exception:  # noqa: BLE001 - alerting must not break publishing either
+            pass
+        return False
 
 
 def _post_and_save(draft, store, poster, idempotent):
