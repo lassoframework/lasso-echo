@@ -236,3 +236,107 @@ def test_rotate_delivers_every_option_before_repeating():
     pool = ["a", "b", "c"]
     assert [cv.rotate(pool, i) for i in range(6)] == ["a", "b", "c", "a", "b", "c"]
     assert cv.rotate([], 3) is None
+
+
+# ---------------------------------------------------------------------------
+# 6. Per-post FORM PLAN (AGENT_CAPTION_FORM_PLAN)
+# ---------------------------------------------------------------------------
+# The SB7 prompt asked every post for the same shape ("Body max 260 characters")
+# plus a soft "VARY the ENTRY POINT". A soft instruction repeated 31 times
+# produced 31 similar captions: 90.3% of Reverb's opened "You + problem", 100%
+# of rows sat in one length band, sentence-count sd was 1.3 on a mean of 4.9.
+
+def test_consecutive_posts_get_different_shapes():
+    """THE point of the plan. Neighbours must differ on BOTH axes, otherwise the
+    book flattens exactly the way it did."""
+    plans = [cv.form_plan(i) for i in range(12)]
+    for a, b in zip(plans, plans[1:]):
+        assert a["hook_family"] != b["hook_family"], (a, b)
+        assert a["length_band"] != b["length_band"], (a, b)
+
+
+def test_form_plan_covers_every_hook_family_within_a_book():
+    """A month must exercise the whole repertoire, not two of six families."""
+    seen = {cv.form_plan(i)["hook_family"] for i in range(31)}
+    assert seen == set(cv.HOOK_FAMILIES)
+
+
+def test_form_plan_spreads_length_across_every_band():
+    bands = [cv.form_plan(i)["length_band"] for i in range(31)]
+    assert set(bands) == {p[0] for p in cv.LENGTH_PLANS}
+    # and no band dominates the book the way 'mid' held 100% of Reverb's
+    assert max(bands.count(b) for b in set(bands)) / len(bands) < 0.4
+
+
+def test_hook_and_length_pair_does_not_repeat_early():
+    """6 families x 3 length plans must not cycle back before a month is out."""
+    pairs = [(p["hook_family"], p["length_band"])
+             for p in (cv.form_plan(i) for i in range(18))]
+    assert len(set(pairs)) == 18
+
+
+def test_form_plan_is_deterministic():
+    assert cv.form_plan(7) == cv.form_plan(7)
+
+
+def test_form_plan_carries_no_content():
+    """STYLE ONLY. A plan must never contain a topic, a claim, or copy."""
+    plan = cv.form_plan(3)
+    assert set(plan) == {"hook_family", "length_band", "min_sentences",
+                         "max_sentences", "max_chars"}
+    assert plan["hook_family"] in cv.HOOK_FAMILIES
+    assert isinstance(plan["max_chars"], int)
+
+
+# --- the prompt block ------------------------------------------------------
+
+def test_form_block_is_empty_without_a_plan():
+    """Flag OFF must leave the prompt byte-for-byte as it was."""
+    from agent.drafter import StoryBrandGenerator
+    assert StoryBrandGenerator._form_block(None) == ""
+    assert StoryBrandGenerator._form_block({}) == ""
+
+
+def test_form_block_states_the_opening_move_and_the_length():
+    from agent.drafter import StoryBrandGenerator
+    block = StoryBrandGenerator._form_block(cv.form_plan(2))
+    assert "OPENING:" in block and "LENGTH:" in block
+    assert "sentences" in block
+
+
+def test_every_hook_family_has_a_prompt_instruction():
+    """A family with no instruction would silently degrade to no guidance."""
+    from agent.drafter import StoryBrandGenerator
+    for fam in cv.HOOK_FAMILIES:
+        assert fam in StoryBrandGenerator._HOOK_INSTRUCTIONS, fam
+        block = StoryBrandGenerator._form_block({"hook_family": fam})
+        assert "OPENING:" in block
+
+
+def test_different_indexes_produce_different_prompt_blocks():
+    from agent.drafter import StoryBrandGenerator
+    blocks = {StoryBrandGenerator._form_block(cv.form_plan(i)) for i in range(6)}
+    assert len(blocks) == 6
+
+
+def test_form_plan_helper_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("AGENT_CAPTION_FORM_PLAN", raising=False)
+    from agent import client_content
+    assert client_content._form_plan_for_day("2026-09-04") is None
+
+
+def test_form_plan_helper_returns_a_plan_when_armed(monkeypatch):
+    monkeypatch.setenv("AGENT_CAPTION_FORM_PLAN", "true")
+    from agent import client_content
+    plan = client_content._form_plan_for_day("2026-09-04")
+    assert plan and plan["hook_family"] in cv.HOOK_FAMILIES
+
+
+def test_form_plan_helper_advances_with_the_day(monkeypatch):
+    """Keyed on the day ordinal, the same index category_for_day already uses,
+    so the shape moves with the book instead of being constant."""
+    monkeypatch.setenv("AGENT_CAPTION_FORM_PLAN", "true")
+    from agent import client_content
+    a = client_content._form_plan_for_day("2026-09-04")
+    b = client_content._form_plan_for_day("2026-09-05")
+    assert a["hook_family"] != b["hook_family"]

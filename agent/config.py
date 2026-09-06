@@ -3407,6 +3407,28 @@ def cta_variety_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_CTA_VARIETY", "false"))
 
 
+def caption_form_plan_enabled() -> bool:
+    """
+    Per-post caption SHAPE planning (AGENT_CAPTION_FORM_PLAN). OFF by default =
+    zero behavior change: the SB7 prompt is byte-for-byte today's, including its
+    fixed "Max 260 characters".
+
+    Armed, every post is handed a concrete shape from caption_variety.form_plan
+    (an opening move out of six, and a sentence/character band out of three)
+    instead of the identical soft "VARY the ENTRY POINT" instruction on all of
+    them. A soft instruction repeated 31 times produced 31 similar captions:
+    measured on the live fleet, 90.3% of CrossFit Reverb's captions opened
+    "You + problem", 100% of rows sat in one caption_len_band, and sentence
+    count sd was 1.3 on a mean of 4.9.
+
+    STYLE ONLY. A form plan carries no fact, no topic and no copy; every claim
+    still comes from the approved source and the figure/fabrication gates,
+    banned-word gate and no-dash law all still run on the output unchanged.
+    Arm by hand: AGENT_CAPTION_FORM_PLAN=true.
+    """
+    return _truthy(os.environ.get("AGENT_CAPTION_FORM_PLAN", "false"))
+
+
 def caption_variety_window() -> int:
     """
     How many POSTS back the caption anti-repetition rail looks (AGENT_CAPTION_

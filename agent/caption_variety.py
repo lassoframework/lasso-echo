@@ -289,6 +289,59 @@ def pick_non_colliding(pool, recent, *, key=None):
         f"all {len(pool or [])} option(s) already used in the window")
 
 
+# ---------------------------------------------------------------------------
+# Per-post FORM PLAN
+# ---------------------------------------------------------------------------
+#
+# WHY. The SB7 prompt asks for the same shape on every post: "Body max 260
+# characters", plus a soft "VARY the ENTRY POINT. Do not open every caption the
+# same way." A soft instruction repeated identically 31 times produces 31
+# similar captions, which is what the fleet actually shows: 90.3% of Reverb's
+# captions opened "You + problem", every caption sat in one length band, and
+# mean sentence count was 4.9 with an sd of 1.3.
+#
+# The model was never told to write a DIFFERENT SHAPE today. These plans tell
+# it, concretely, one shape per post. They are STYLE ONLY: a plan never carries
+# a fact, never names a topic, and never overrides the approved source. The
+# fabrication gate downstream is unchanged.
+
+HOOK_FAMILIES = (
+    "second_person_problem",   # "You're staring at the rig wondering..."
+    "scene",                   # what is actually happening in the photo
+    "myth_bust",               # a belief the reader holds that is not true
+    "question",                # a real question, asked once
+    "outcome_first",           # lead with where they end up
+    "flat_statement",          # a short declarative, no wind up
+)
+
+LENGTH_PLANS = (
+    ("short", 1, 2, 220),
+    ("mid", 3, 4, 450),
+    ("long", 4, 6, 700),
+)
+
+
+def form_plan(index, hook_families=HOOK_FAMILIES, length_plans=LENGTH_PLANS):
+    """The FORM this post should take, as a function of its position in the book.
+
+    The hook cycles every 6 and the length every 3, but 6 and 3 share a factor,
+    so indexing both on `i` would pair the same hook with the same length every
+    time and the book would carry only 6 distinct shapes. The length index
+    carries a `i // len(hook_families)` drift so the PAIR does not repeat until
+    post 18, which comfortably covers a month, while consecutive posts still
+    always differ on both axes.
+
+    Deterministic, so the same book replans identically and a diff stays
+    reviewable. STYLE ONLY: returns no topic, no claim and no copy.
+    """
+    i = int(index)
+    nh, nl = len(hook_families), len(length_plans)
+    hook = hook_families[i % nh]
+    band, smin, smax, cap = length_plans[(i + i // nh) % nl]
+    return {"hook_family": hook, "length_band": band,
+            "min_sentences": smin, "max_sentences": smax, "max_chars": cap}
+
+
 def rotate(pool, index):
     """Deterministic round robin over `pool`.
 
