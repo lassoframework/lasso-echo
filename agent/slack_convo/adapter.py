@@ -243,7 +243,7 @@ import re as _re
 # injuries and liability stay deliberately broad, because a false hold there costs nothing.
 AUTO_ANSWER_FORBIDDEN = _re.compile(
     r"\b(price|prices|pricing|cost|costs|charge|charged|bill|billing|billed|invoice|refund|"
-    r"refunds|subscription|payment|stripe|credit card|"
+    r"refunds|subscription|payment|pay|pays|paying|stripe|credit card|"
     r"injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
     r"liability|waiver|insurance|lawsuit|legal)\b|"
     r"\b(?:gym|class|classes|session|sessions|group sessions|studio|business|holiday|"
@@ -341,8 +341,15 @@ _REQ_CLAIM = rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,40}}?\b(?:{_AUTHORED_CLAIM})"
 _REQ_EDIT = (r"\b(?:update|change|edit|fix|redo|rewrite|pull|delete|take down)\s+"
              r"(?:the|our|my|that|this)?\s*"
              r"(?:post|caption|story|reel|announcement|graphic|flyer)\b")
+# (f) "can you get that on instagram" -- a publish request that names no publishing verb at
+# all, which is how people actually ask (audit 8, F3's second leak).
+_REQ_ONTO = (r"\b(?:get|put|push|throw|stick|drop)\s+(?:that|this|it|these|them|the \w+)?"
+             r"\s*(?:up\s+)?(?:on|onto|out on|to|in)\s+"
+             r"(?:instagram|ig|facebook|fb|social|socials|the calendar|the site|"
+             r"the website|stories|our page)\b")
 _ASK_TO_PUBLISH = _re.compile(
-    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM, _BROADCAST, _REQ_EDIT)),
+    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM, _BROADCAST, _REQ_EDIT,
+              _REQ_ONTO)),
     _re.IGNORECASE)
 
 # MAJOR 1 (audit 7): removing the body-side guard entirely was a net regression -- it took
@@ -353,12 +360,25 @@ _ASK_TO_PUBLISH = _re.compile(
 # now" -- a promise of future action with no mechanism behind it, which is V-M6 and D52's
 # named class, on the exact capability being armed. So the body is checked for COMMITMENTS
 # only, and descriptive statements ("your post about the new class went out tuesday") pass.
+# F4 (audit 8, MAJOR): the first version listed the verbs it had been written against, so 14
+# of 24 realistic promises walked past it -- "I'll add a third post for friday", "I'll queue
+# it up for monday", "Let me get that scheduled", "That will go up this afternoon",
+# "Consider it posted". Listing verbs was the same mistake as listing topics.
+#
+# A promise is a FIRST-PERSON FUTURE MARKER, whatever verb follows. The only first-person
+# futures that are not promises are perception and reporting ("I can see that...", "I can
+# confirm..."), so those are excepted explicitly and everything else holds.
+_NOT_A_PROMISE = r"(?:see|tell|confirm|find|check|report|show|read|look|understand)\b"
 _ANSWER_COMMITS = _re.compile(
-    r"\b(?:i|we)\s*(?:'ll|will|can|could|shall|am going to|are going to|would be happy to|"
-    r"am happy to|would)\s+(?:go ahead and\s+|just\s+)?"
-    rf"(?:{_CONTENT_VERB}|set up|get .{{0,15}}(?:posted|published|out))\b|"
-    r"\b(?:happy to|glad to)\s+(?:post|publish|announce|share|schedule|draft)\b|"
-    r"\bi(?:'ll| will)\s+(?:take care of|handle|sort)\b", _re.IGNORECASE)
+    rf"\b(?:i|we)\s*(?:'ll|ll\b|will|can|could|shall|am going to|'m going to|am gonna|"
+    rf"are going to|'re going to|would be happy to|am happy to|would)\s+"
+    rf"(?:go ahead and\s+|just\s+|also\s+)?(?!{_NOT_A_PROMISE})|"
+    rf"\blet me\s+(?!{_NOT_A_PROMISE})|"
+    rf"\b(?:happy|glad|able)\s+to\s+(?!{_NOT_A_PROMISE})|"
+    rf"\bconsider it\s+\w+|"
+    rf"\bthat(?:'ll| will)\s+(?:go|be)\b|"
+    rf"\b(?:will be|is going to be)\s+(?:posted|published|scheduled|live|up|sent|out)\b|"
+    rf"\bi(?:'ll| will)\s+(?:take care of|handle|sort)\b", _re.IGNORECASE)
 
 
 def answer_commits_to_action(text):
@@ -371,14 +391,48 @@ def asks_us_to_publish(text):
     return bool(_ASK_TO_PUBLISH.search(text or ""))
 
 
-def auto_answer_allowed(text):
-    """True only when the question is about live account state this system can observe.
+# F3 (2026-09-05 audit 8, MAJOR): the allowlist and the denylist were both bag-of-words ORs
+# over the whole message, so a message that named ANY allowlisted noun passed however much
+# else it carried. Measured: 8 of 10 injury/liability messages, 4 of 5 gym-hours messages and
+# 4 of 5 billing messages auto-sent, because each also mentioned a post or the calendar --
+# "a member pulled a hamstring doing the workout in our reel, should we take the post down".
+# The comment claiming these hold "however it is phrased" was simply false.
+#
+# Widening the denylist again would be the whack-a-mole this system has now lost to four
+# times. The structural property that actually separates them: an auto-answerable message is
+# a SINGLE SELF-CONTAINED QUESTION ABOUT STATE. The moment it carries a second subject -- a
+# person, a real-world decision, advice being sought -- it is not that, whatever nouns it
+# contains. Length and advice-seeking shape are checkable without enumerating topics.
+_ADVICE_SHAPE = _re.compile(
+    r"\b(?:should (?:we|i|they)|what (?:do|should) (?:we|i) (?:tell|say|do)|do we need|"
+    r"are we (?:covered|liable|ok|okay)|what do we owe|how much do we|can we get|"
+    r"is (?:that|this|it) (?:ok|okay|fine|a problem|an issue)|what happens if|"
+    r"do (?:you|we) think|any advice|what would you)\b", _re.IGNORECASE)
+# A person other than the person writing: the moment someone else is in the message, an
+# unattended answer is speaking about a third party we know nothing about.
+_THIRD_PARTY = _re.compile(
+    r"\b(?:a |one of our |our |the )?(?:member|members|client|clients|athlete|athletes|"
+    r"student|students|customer|customers|guy|lady|woman|man|kid|kids|someone|somebody|"
+    r"she|he|they|her|him|them)\b", _re.IGNORECASE)
+MAX_AUTO_ANSWER_WORDS = 25
 
-    The allowlist is the primary gate for unattended sending; auto_answer_forbidden is the
-    second layer. A message must pass BOTH to send with no tap."""
-    t = text or ""
-    return (bool(AUTO_ANSWER_ALLOWED.search(t)) and not auto_answer_forbidden(t)
-            and not asks_us_to_publish(t))
+
+def auto_answer_allowed(text):
+    """True only when the message is a single self-contained question about live account
+    state this system can observe.
+
+    Four conditions, all required, and the last three are the ones that make the rule
+    structural rather than a topic list: the message names something observable, it is not on
+    the hard-line topic list, it is not asking us to publish, and it carries NO SECOND
+    SUBJECT -- no third party, no advice being sought, and short enough to be one question."""
+    t = (text or "").strip()
+    if not t or not AUTO_ANSWER_ALLOWED.search(t):
+        return False
+    if auto_answer_forbidden(t) or asks_us_to_publish(t):
+        return False
+    if _ADVICE_SHAPE.search(t) or _THIRD_PARTY.search(t):
+        return False
+    return len(t.split()) <= MAX_AUTO_ANSWER_WORDS
 
 
 def may_auto_answer(question, body=""):

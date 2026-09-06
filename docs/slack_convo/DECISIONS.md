@@ -1896,3 +1896,81 @@ the portal's actual TypeScript Set and SQL predicate at `origin/main`.
 
 Two consecutive rounds with no CRITICAL. The gate is two consecutive rounds with no CRITICAL
 **and** no MAJOR, and that has not happened, so nothing arms.
+
+---
+
+## D66 (2026-09-05) -- the eighth audit: the hard lines were never structural
+
+Zero CRITICAL for the third round running. Four MAJORs, and one of them is the finding that
+matters most for arming, because it is about the promise Blake made non-negotiable.
+
+**F3 -- "these are hard lines, not tunable" was not true.** `AUTO_ANSWER_FORBIDDEN` and
+`AUTO_ANSWER_ALLOWED` were both bag-of-words ORs over the whole message, ANDed together. So any
+message that ALSO named a post or a calendar passed both. Measured on the auditor's own corpus:
+**8 of 10 injury/liability messages, 4 of 5 gym-hours messages and 4 of 5 billing messages would
+have auto-sent with no tap** -- *"a member pulled a hamstring doing the workout in our reel,
+should we take the post down"*, *"how many posts do we get for what we pay"*. The comment
+claiming these hold "however it is phrased" was false, and had been since the hard lines were
+written. Not introduced by any recent wave -- measured identical on the old code -- which makes
+it worse, not better: it was the load-bearing safety claim of the whole capability.
+
+Widening the denylist again was not an option; this system has now lost to whack-a-mole four
+separate times (D61's verdict strings, D62's exit codes, D63's publish verbs, D65's polite
+forms). The property that actually separates the two classes is **shape, not vocabulary**: an
+auto-answerable message is a SINGLE SELF-CONTAINED QUESTION ABOUT OBSERVABLE STATE. The moment
+it carries a second subject -- a third party, advice being sought, or simply too many words to
+be one question -- it is not that, whatever nouns it contains. Three structural conditions on
+top of the two lists, all checkable without enumerating a single topic. Measured after: 9/9
+mixed-subject messages held, 15/15 ordinary questions still answered.
+
+**F4 -- the commitment guard listed the verbs it was written against**, so 14 of 24 realistic
+promises walked past it: *"I'll add a third post for friday"*, *"Let me get that scheduled"*,
+*"That will go up this afternoon"*, *"Consider it posted"*. Listing verbs was the same mistake
+as listing topics, made one round after the ruling against it. A promise is a **first-person
+future marker**, whatever verb follows; the only first-person futures that are not promises are
+perception and reporting ("I can see...", "I can confirm..."), so those are excepted and
+everything else holds.
+
+**F1 -- last round's fix was inert for the exact case it named.** The resolve notice was
+threading inside a DM; D65 fixed it by reading the surface off the ticket's own inbound row
+instead of its source -- and a portal ticket's inbound row carries `portal_ticket_bridge`,
+which gate 7 does not recognise as a top-level surface, so the behaviour was byte-identical to
+the bug. Its test asserted the HELPER on a Slack MPIM ticket, never `resolve_and_notify`, never
+a portal ticket. The auditor's mutation test is the damning part: reverting the call site to the
+old code left all 449 tests in the touched files green.
+
+**F2 -- the stuck-fixing card still stated three things it did not know**: an unreadable bus
+read became "was dispatched, close this by hand" (the wrong remedy, as fact); a request sitting
+in `ready`/`failed`/`suppressed` counted as dispatched; and a HELD ack counted as the client
+having been acknowledged. When it cannot tell, it now says it cannot tell.
+
+Also: three helpers added last round scanned `bus.messages` (ordered ASC) and so read the
+OLDEST 200 rows -- the exact bug `count_escalation_cards_since` was added to fix, reintroduced
+by hand in three places at once, with a duplicate resolve notice to a client as one failure
+direction; and `find_fixing_tickets` was the one poll with no test-ticket filter, so a probe
+parked in `fixing` produced a card every day forever.
+
+### Reported, not fixed: a cross-repo hazard to settle before arming anything
+
+`~/scout-listener`'s FIXER worker polls `support_tickets?product=eq.echo&status=eq.new` with
+**no `source` filter**, claims `new -> triage`, and hands `raw_text` to a Bash-armed headless
+`claude -p --permission-mode acceptEdits`. Both the portal and this repo insert client-typed
+tickets at `status='new'`. If `FIXER_ENABLED` + `FIXER_ECHO_ENABLED` are ever armed there, a
+client's raw text reaches that worker **with no tap**, contradicting this repo's own "a code_fix
+from a client is ALWAYS held behind Blake's #fixer tap" -- and the portal bridge silently loses
+the ticket, because its status leaves `new` and `find_new_tickets` never returns it again.
+Verified latent today: `FIXER_ENABLED` is absent from that service's env, so the poll loop never
+starts. This is Blake's to rule on; it is not something to quietly patch from here.
+
+### Eight rounds
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+| 8 | 0 | 4 | 2 |

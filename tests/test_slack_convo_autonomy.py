@@ -1721,9 +1721,12 @@ def test_the_stuck_fixing_card_reads_the_ticket_instead_of_guessing():
                   "attachments": {"kind": A.KIND_FIXER_REQUEST}},
                  {"direction": "outbound", "delivery_status": "posted",
                   "attachments": {"kind": A.KIND_ACK}}])
+    # audit 8, F2: `acked` must require the ack to have actually POSTED -- a held ack means
+    # the client has nothing.
     ETW._report_stuck_fixing(held, [ticket], identity_name="echo", log=lambda *a, **k: None)
     body = held.written[0]["body"]
-    assert "still HELD in #fixer awaiting your tap" in body
+    assert "never reached the worker" in body and "'held'" in body
+    assert "Release card in #fixer" in body
     assert "close this by hand" not in body, "the wrong remedy for this cause"
     assert "has an acknowledgement" in body, \
         "it must not claim the client heard nothing when an ack is right there"
@@ -1810,3 +1813,166 @@ def test_the_resolve_notice_goes_top_level_in_a_dm_not_threaded():
     bus = FakeBus()
     d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
     assert OB2._surface_of(bus, d.ticket_id) == A.SURFACE_MPIM
+
+
+def test_the_stuck_card_says_it_cannot_tell_rather_than_guessing():
+    """Audit 8, F2: three ways the card stated what it did not know -- an unreadable bus read
+    became "was dispatched, close it by hand" (the wrong remedy, as fact); a request in
+    ready/failed/suppressed counted as dispatched; and a HELD ack counted as the client
+    having been acknowledged."""
+    from agent import echo_ticket_worker as ETW
+    old = "2020-01-01T00:00:00+00:00"
+    ticket = {"id": "t-1", "created_at": old, "verification_after": None}
+
+    class _Bus:
+        def __init__(self, rows, raises=False):
+            self.rows = rows
+            self.raises = raises
+            self.written = []
+
+        def recent_messages(self, tid, limit=200):
+            if self.raises:
+                raise RuntimeError("bus down")
+            return self.rows
+
+        def count_escalation_cards_since(self, tid, since):
+            return 0
+
+        def record_outbound(self, **kw):
+            self.written.append(kw)
+            return {"id": "m1"}
+
+    unreadable = _Bus([], raises=True)
+    ETW._report_stuck_fixing(unreadable, [ticket], identity_name="echo",
+                             log=lambda *a, **k: None)
+    body = unreadable.written[0]["body"]
+    assert "could not be read" in body and "cannot say whether" in body
+    assert "close this by hand" not in body
+    assert "unknown from here" in body
+    assert unreadable.written[0]["meta"]["rows_readable"] is False
+
+    failed_req = _Bus([{"direction": "outbound", "delivery_status": "failed",
+                        "attachments": {"kind": A.KIND_FIXER_REQUEST}}])
+    ETW._report_stuck_fixing(failed_req, [ticket], identity_name="echo",
+                             log=lambda *a, **k: None)
+    body2 = failed_req.written[0]["body"]
+    assert "never reached the worker" in body2 and "'failed'" in body2
+    assert "ops-fix channel is set" in body2
+
+    held_ack = _Bus([{"direction": "outbound", "delivery_status": "posted",
+                      "attachments": {"kind": A.KIND_FIXER_REQUEST}},
+                     {"direction": "outbound", "delivery_status": "held",
+                      "attachments": {"kind": A.KIND_ACK}}])
+    ETW._report_stuck_fixing(held_ack, [ticket], identity_name="echo",
+                             log=lambda *a, **k: None)
+    assert "told nothing at all" in held_ack.written[0]["body"], \
+        "a HELD ack means the client has nothing"
+
+
+def test_the_resolve_notice_on_a_portal_ticket_is_not_threaded(monkeypatch):
+    """Audit 8, F1: a portal ticket's inbound row carries surface='portal_ticket_bridge',
+    which gate 7 did not recognise, so the notice still posted as a thread reply inside the
+    group DM -- byte-identical to the bug the previous round claimed to fix, and its test
+    asserted the helper on an MPIM ticket instead of the portal case it was written for."""
+    monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    bus = FakeBus()
+    ticket, _ = bus.get_or_create_ticket(
+        channel_id="D_GROUP", thread_ts="111.222", product="echo", bot_identity="echo",
+        slack_user_id="U_C", identity_kind=IG.CLIENT, client_id="g-1",
+        reporter="o@g.com", raw_text="is my instagram connected?")
+    bus.tickets[ticket["id"]]["status"] = "hold"
+    bus.tickets[ticket["id"]]["source"] = "website_tab"
+    bus.record_inbound(ticket_id=ticket["id"], slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="o@g.com", body="hi",
+                       meta={"surface": "portal_ticket_bridge"})
+    assert OB.resolve_and_notify(bus, ticket["id"], approved_by="U06EPUUCL13",
+                                 identity=IDS.get("echo"), log=lambda *a: None) is True
+    calls = []
+
+    def post(channel, text, thread_ts=None, blocks=None):
+        calls.append({"channel": channel, "text": text, "thread_ts": thread_ts})
+        return "1.0"
+
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    notice = [c for c in calls if OB.RESOLVED_NOTICE[:30] in c["text"]]
+    assert notice, "the notice must actually post"
+    assert notice[0]["thread_ts"] is None, \
+        "people do not thread in a DM, whatever brought the ticket there"
+
+
+# ---- audit 8: the gates, measured on mixed-subject and promise corpora --------------------
+
+MIXED_SUBJECT_HOLDS = [
+    "a member pulled a hamstring doing the workout in our reel, should we take the post down",
+    "one of our members says the class time on the post is wrong, what do we tell her",
+    "someone got hurt in the video we posted, are we covered",
+    "what do we owe you for the posts this month",
+    "how many posts do we get for what we pay",
+    "we moved open gym to 7, can you get that on instagram",
+    "can you put that on instagram for us",
+    "stick this up on facebook please",
+    "our rates are going up, get that on social",
+]
+
+MORE_PROMISES = [
+    "I'll add a third post for friday.",
+    "I'll queue it up for monday.",
+    "I'll write the caption and send it over.",
+    "That will go up this afternoon.",
+    "Consider it posted.",
+    "I'm going to schedule that for tuesday.",
+    "Let me get that scheduled for you.",
+    "It will be posted this afternoon.",
+]
+
+PERCEPTION_ANSWERS = [
+    "I can see that your facebook page disconnected on the 3rd.",
+    "I can confirm the october schedule is loaded with twelve posts.",
+    "I can tell you that nothing published yesterday.",
+]
+
+
+@pytest.mark.parametrize("text", MIXED_SUBJECT_HOLDS)
+def test_a_message_carrying_a_second_subject_never_auto_answers(text):
+    """Audit 8, F3: the allowlist and denylist were both bag-of-words ORs over the whole
+    message, so anything that ALSO named a post or the calendar passed -- 8 of 10
+    injury/liability messages, 4 of 5 gym-hours, 4 of 5 billing. Widening the denylist again
+    would be the whack-a-mole this system has lost to four times. An auto-answerable message
+    is a SINGLE SELF-CONTAINED QUESTION ABOUT STATE; a third party, advice being sought, or
+    sheer length means it is not, whatever nouns it contains."""
+    assert not A.may_auto_answer(text), f"mixed-subject message auto-answered: {text!r}"
+
+
+@pytest.mark.parametrize("body", MORE_PROMISES)
+def test_every_shape_of_promise_is_held_not_just_the_listed_verbs(body):
+    """Audit 8, F4: the first commitment guard listed the verbs it had been written against,
+    so 14 of 24 realistic promises walked past -- listing verbs was the same mistake as
+    listing topics. A promise is a first-person future marker, whatever verb follows."""
+    assert not A.may_auto_answer("is my instagram connected?", body), \
+        f"a promise sent with no tap: {body!r}"
+
+
+@pytest.mark.parametrize("body", PERCEPTION_ANSWERS)
+def test_perception_and_reporting_are_not_promises(body):
+    """The exception that keeps the guard from swallowing ordinary answers."""
+    assert A.may_auto_answer("is my instagram connected?", body), f"held: {body!r}"
+
+
+def test_a_probe_parked_in_fixing_does_not_produce_a_card_forever():
+    """Audit 8, MINOR 5: find_fixing_tickets was the one poll with no test-ticket filter."""
+    from agent.slack_convo import testdata as TD2
+    probe = {"id": "t-1", "status": "fixing", "raw_text": "[phase4-audit 1] probe",
+             "reporter": "blake+zztest@lassoframework.com"}
+    assert TD2.exclude_test_strict([probe]) == []
+
+
+def test_recent_messages_reads_the_newest_rows_not_the_oldest():
+    """Audit 8, MINOR 1: three helpers scanned bus.messages (created_at.asc), i.e. the OLDEST
+    200 rows -- for _resolve_notice_exists the failure direction is a DUPLICATE notice to a
+    client."""
+    from agent.slack_convo import bus as BUS
+    import inspect
+    src = inspect.getsource(BUS.Bus.recent_messages)
+    assert "created_at.desc" in src

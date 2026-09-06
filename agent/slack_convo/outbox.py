@@ -72,6 +72,11 @@ from datetime import datetime, timezone
 from . import adapter as _a
 from .. import config
 
+# Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do
+# not thread there), and a portal-bridge ticket, whose Slack home is the group DM this system
+# opened for it.
+TOP_LEVEL_SURFACES = frozenset({"im", "mpim", "portal_ticket_bridge"})
+
 STALE_AFTER_SECONDS = 6 * 3600
 RELEASE_ACTION_ID = "slack_convo_release"
 RESOLVE_ACTION_ID = "slack_convo_resolve"
@@ -437,7 +442,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     # 7. destination
     channel = ticket.get("slack_channel_id")
     surface = att.get("surface") or ""
-    thread_ts = None if surface in (_a.SURFACE_IM, _a.SURFACE_MPIM) else ticket.get("slack_thread_ts")
+    # F1 (audit 8, MAJOR): the audit-7 fix read the surface off the ticket's own inbound row
+    # instead of its source -- and a portal ticket's inbound row carries
+    # 'portal_ticket_bridge', which is not in this tuple, so the notice STILL posted as a
+    # thread reply inside the group DM. Byte-identical behaviour to the bug it replaced, and
+    # its test asserted the helper on a Slack MPIM ticket, never the portal case it was for.
+    # People do not thread in a DM whatever brought the ticket there.
+    thread_ts = (None if surface in TOP_LEVEL_SURFACES
+                 else ticket.get("slack_thread_ts"))
     if not channel:
         # D48: no Slack thread is not automatically a dead end. A portal-submitted ticket
         # is delivered to the thread the person wrote it in; only a ticket with neither
@@ -655,12 +667,26 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     return True
 
 
+def _recent(bus, ticket_id, limit=200):
+    """The NEWEST rows on a ticket, newest first.
+
+    MINOR 1 (audit 8): bus.messages orders created_at.asc, so a client-side scan of its first
+    200 rows reads the OLDEST 200 -- the exact bug count_escalation_cards_since was added to
+    fix, reintroduced by hand in three helpers at once. For _resolve_notice_exists the
+    failure direction was a DUPLICATE resolve notice to a client."""
+    try:
+        return bus.recent_messages(ticket_id, limit=limit)
+    except AttributeError:
+        rows = bus.messages(ticket_id, limit=limit) or []
+        return list(reversed(rows))
+
+
 def _resolve_notice_exists(bus, ticket_id):
     """True once a resolve notice has been written for this ticket, in any delivery state.
     Fails CLOSED (True) on a read failure: a duplicate notice to a client is worse than a
     tap that reports nothing happened."""
     try:
-        for m in bus.messages(ticket_id, limit=200) or []:
+        for m in _recent(bus, ticket_id) or []:
             att = m.get("attachments") or {}
             if m.get("direction") == "outbound" and att.get("resolve_notice"):
                 return True
@@ -672,7 +698,7 @@ def _resolve_notice_exists(bus, ticket_id):
 def _surface_of(bus, ticket_id):
     """The surface this ticket's human actually spoke on, from its own inbound rows."""
     try:
-        for m in reversed(bus.messages(ticket_id, limit=200) or []):
+        for m in _recent(bus, ticket_id) or []:
             if m.get("direction") == "inbound":
                 s = ((m.get("attachments") or {}).get("surface") or "").strip()
                 if s:

@@ -176,10 +176,15 @@ class Bus:
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer
         worker (status='fixing', set by the worker that wrote the fixer_request), whose
-        verification the worker may or may not have written back yet."""
-        return self._get(_TICKETS, {
+        verification the worker may or may not have written back yet.
+
+        MINOR 5 (audit 8): this was the one poll with no test-ticket filter, so a probe
+        parked in 'fixing' produced a #fixer card every day forever -- the opposite of the
+        "never resurface" the probe purge was for."""
+        rows = self._get(_TICKETS, {
             "product": f"eq.{product}", "status": "eq.fixing", "select": "*",
             "order": "created_at.asc", "limit": str(int(limit))})
+        return _td.exclude_test_strict(rows)
 
     def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
@@ -264,6 +269,12 @@ class Bus:
     def messages(self, ticket_id, limit=40):
         return self._get(_MESSAGES, {"ticket_id": f"eq.{ticket_id}", "select": "*",
                                      "order": "created_at.asc", "limit": str(int(limit))})
+
+    def recent_messages(self, ticket_id, limit=200):
+        """The NEWEST rows on a ticket, newest first. `messages` is ascending, which makes a
+        client-side scan of a long ticket read only its oldest rows (audit 8, MINOR 1)."""
+        return self._get(_MESSAGES, {"ticket_id": f"eq.{ticket_id}", "select": "*",
+                                     "order": "created_at.desc", "limit": str(int(limit))})
 
     def message(self, message_id):
         rows = self._get(_MESSAGES, {"id": f"eq.{message_id}", "select": "*", "limit": "1"})

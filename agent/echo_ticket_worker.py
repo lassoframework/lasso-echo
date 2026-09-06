@@ -576,31 +576,60 @@ def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
         # ticket row alone. The right action there is to tap Release, and the card said the
         # opposite. It looks at the ticket's own rows now instead of guessing, and it does
         # not claim the client has heard nothing when an ack is sitting right there.
-        rows = []
+        # F2 (audit 8, MAJOR): three ways this still stated things it did not know.
+        #   (a) an unreadable bus read left rows=[] and the card then asserted "was
+        #       dispatched" and "close this by hand" -- the wrong remedy, stated as fact;
+        #   (b) only delivery_status=='held' counted as not-dispatched, so a request sitting
+        #       in ready/failed/suppressed (failed is directly reachable when the ops-fix
+        #       channel is unset) was asserted dispatched;
+        #   (c) `acked` ignored delivery_status, so a HELD ack produced "the client has an
+        #       acknowledgement" when the client had nothing.
+        # When we cannot tell, the card now says we cannot tell.
+        rows = None
         try:
-            rows = bus.messages(tid, limit=200) or []
+            rows = bus.recent_messages(tid, limit=200)
+        except AttributeError:
+            try:
+                rows = bus.messages(tid, limit=200)
+            except Exception:  # noqa: BLE001
+                rows = None
         except Exception:  # noqa: BLE001
-            rows = []
+            rows = None
 
-        def _kind(k):
-            return [m for m in rows
-                    if (m.get("attachments") or {}).get("kind") == k]
-
-        held_request = [m for m in _kind(_a.KIND_FIXER_REQUEST)
-                        if m.get("delivery_status") == "held"]
-        acked = bool(_kind(_a.KIND_ACK) or _kind(_a.KIND_TEMPLATE))
-        if held_request:
-            cause = ("Its fix request is still HELD in #fixer awaiting your tap, so it was "
-                     "never dispatched to the worker. Tapping Release on that card is what "
-                     "moves this.")
+        if rows is None:
+            cause = ("Its rows could not be read just now, so this card cannot say whether "
+                     "the fix request was ever dispatched. Open the ticket before acting on "
+                     "it.")
+            client_state = "Whether the client has heard anything is unknown from here."
         else:
-            cause = ("Its fix request was dispatched, and no verification has been written "
-                     "back to THIS row. Known cause: the ops-fix worker mints its own "
-                     "source='ops_fix' ticket and writes the verification there, so this "
-                     "pass cannot see it. Check the fix and close this by hand, or wire the "
-                     "worker to write verification_after back to the originating ticket.")
-        client_state = ("The client has an acknowledgement but has heard nothing since."
-                        if acked else "The client has been told nothing at all.")
+            def _kind(k):
+                return [m for m in rows
+                        if (m.get("attachments") or {}).get("kind") == k]
+
+            requests = _kind(_a.KIND_FIXER_REQUEST)
+            dispatched = [m for m in requests if m.get("delivery_status") == "posted"]
+            undispatched = [m for m in requests if m.get("delivery_status") != "posted"]
+            acked = [m for m in (_kind(_a.KIND_ACK) + _kind(_a.KIND_TEMPLATE))
+                     if m.get("delivery_status") == "posted"]
+            if not requests:
+                cause = ("No fix request was ever written for it, which should be "
+                         "impossible on this path. This one needs eyes on the ticket "
+                         "itself.")
+            elif undispatched and not dispatched:
+                states = ", ".join(sorted({str(m.get("delivery_status") or "?")
+                                           for m in undispatched}))
+                cause = (f"Its fix request never reached the worker: the row is "
+                         f"'{states}'. If it is held, the Release card in #fixer is what "
+                         f"moves this; if it failed, check that the ops-fix channel is set.")
+            else:
+                cause = ("Its fix request was dispatched, and no verification has been "
+                         "written back to THIS row. Known cause: the ops-fix worker mints "
+                         "its own source='ops_fix' ticket and writes the verification "
+                         "there, so this pass cannot see it. Check the fix and close this "
+                         "by hand, or wire the worker to write verification_after back to "
+                         "the originating ticket.")
+            client_state = ("The client has an acknowledgement but has heard nothing since."
+                            if acked else "The client has been told nothing at all.")
         try:
             bus.record_outbound(
                 ticket_id=tid, author_type="system",
@@ -609,8 +638,7 @@ def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
                       f"{client_state}"),
                 delivery_status="ready", kind=_a.KIND_ESCALATION,
                 meta={"identity": identity_name, "surface": "portal_ticket_bridge",
-                      "stuck_in_fixing": True,
-                      "fixer_request_held": bool(held_request)})
+                      "stuck_in_fixing": True, "rows_readable": rows is not None})
         except Exception as e:  # noqa: BLE001 - a report failure never breaks the pass
             log(f"[ticket-worker/{identity_name}] stuck-report failed ticket={tid}: "
                 f"{type(e).__name__}")
