@@ -1820,3 +1820,79 @@ boot-assertion guard RUNS `live_deps` instead of grepping its source.
 The severity curve finally broke. Round 1 was "the classifier never ran in production at all";
 round 6 is a regex applied to one argument too many and a docstring one repo-read short. But
 the gate is two CONSECUTIVE clean rounds, and round 6 was not clean, so nothing arms yet.
+
+---
+
+## D65 (2026-09-05) -- the seventh audit: two auditors disagreed, and the disagreement was the answer
+
+Zero CRITICAL for the second round running. Three MAJORs, two of them mine from the previous
+wave, and one of them is the most interesting thing in this whole sequence.
+
+**MAJOR 1 -- the two audits contradicted each other, and both were right.** Audit 6 measured
+that the body-side publish guard held 4 of 10 realistic answers, so D64 removed it. Audit 7
+replayed the same predicate against the same commit and found it returned False for all six of
+this repo's own `REALISTIC_ANSWERS` and for all 39 of its own legitimate bodies -- and then
+measured that removing it cost **four new leaks for zero recovered answers**:
+
+> "I **will publish** the open house flyer that afternoon so the slot is not empty."
+> "I **can post** the third one for you now if you want it out today."
+
+Both measurements were correct on their own corpora. What separated them is a distinction
+neither round had named: **our own reply cannot REQUEST anything, but it absolutely can COMMIT
+to something.** D64 removed the whole check on the strength of the first half of that sentence.
+Descriptive answers ("your post about the new class went out tuesday") now pass; answers that
+promise future action -- V-M6 and D52's named class, on the very capability being armed -- are
+held by a separate, narrower `answer_commits_to_action`. Measured after: 0 false positives over
+25 questions x 6 bodies, 0 false negatives over 16 requests and 5 committing answers.
+
+**The lesson: when two independent measurements disagree, the disagreement is data.** The
+temptation is to pick the newer one. The right move was to find the distinction that makes both
+true, which is also the only version that survives a third corpus.
+
+**MAJOR 2 -- the guard held 55% of natural phrasing, and the repo's corpus could not see it.**
+`tell` and `let ... know` were CONTENT VERBS, and the polite-request rule matched a content verb
+anywhere within 25 characters -- so *"can you tell me if my instagram is connected"* was a
+publish request **by construction**. 11 of 20 natural questions held. Every corpus in this repo
+was written by me, and none of them contained a single "can you tell me..." or "please let me
+know..." -- the commonest way a person actually asks a bot something. Two fixes: telling ME is a
+question and telling EVERYONE is a broadcast, so audience decides; and the polite rule now
+requires the verb in VERB POSITION, because "how many posts are scheduled" is a noun and a
+participle, not a request. 0/25 held after.
+
+**MAJOR 3 -- the stuck-fixing card I added one round ago stated the wrong cause as fact.**
+`_intake_one` sets `status='fixing'` BEFORE writing the fixer_request card, so a ticket whose
+card is still HELD awaiting a tap is indistinguishable from the cross-repo gap by looking at the
+ticket row alone -- and my card asserted the gap, and told Blake to close the ticket by hand,
+when the correct action was to tap the Release button sitting in #fixer. It reads the ticket's
+own rows now. It also claimed "nothing has been said to the client" while the acknowledgement
+was two rows away.
+
+Also: the resolve notice was posted as a THREAD REPLY INSIDE A DM (`surface` was the ticket's
+*source*, which gate 7 does not recognise) where nobody looks; the ticket was stamped resolved
+before the notice was delivered, so a post failure left a ticket permanently asserting a
+resolution over a failed row -- and moving that stamp to delivery time quietly broke the
+idempotence the status check had been doing double duty for, which the existing suite caught
+immediately (the notice row is the record of the tap now); `_domain_guidance_only` truncated at
+2000 chars against a 3396-char doc, dropping 41% of the routed guidance including its entire
+Escalation section; and a compiled regex with an unformatted `{}` placeholder and no call site
+sat in `answer_lane.py` -- D56's pattern, inside the wave that cites D56.
+
+All four behaviours this wave shipped untested now have tests, the receipt test drives the REAL
+`bus.Bus` over a PostgREST-shaped transport instead of reimplementing the filter inside its own
+fake, and the "cross-repo contract test" that compared two constants in the same file now reads
+the portal's actual TypeScript Set and SQL predicate at `origin/main`.
+
+### Seven rounds
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+
+Two consecutive rounds with no CRITICAL. The gate is two consecutive rounds with no CRITICAL
+**and** no MAJOR, and that has not happened, so nothing arms.

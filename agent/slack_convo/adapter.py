@@ -306,13 +306,30 @@ def auto_answer_forbidden(text):
 #     interrogative shape are what make it one.
 # So the claim markers are only the ones that introduce AUTHORED CONTENT (that / saying /
 # announcing / telling), never ordinary words like "were" or "our" that any question contains.
-_CONTENT_VERB = (r"post|posts|publish|announce|share|schedule|draft|write|send out|put up|"
-                 r"throw up|put out|tell|let .{0,25}know")
+# Audit 7, MAJOR 2: `tell` and `let ... know` were CONTENT VERBS, and _REQ_POLITE is a
+# politeness marker plus a content verb within 25 characters -- so "can you tell me if my
+# instagram is connected" matched by construction, and 11 of 20 natural state questions were
+# held. They are not publishing verbs. What makes them publishing is the AUDIENCE: telling ME
+# is a question, telling EVERYONE is a request to broadcast. Split accordingly.
+# "write" is out: "can you write back with the connection status" is a question, and "write a
+# post" is caught by _REQ_MAKE below. Nouns that double as verbs (post, posts, schedule) are
+# handled by _REQ_POLITE requiring the verb to sit in VERB POSITION, not merely nearby.
+_CONTENT_VERB = (r"post|posts|publish|announce|share|schedule|draft|send out|put up|"
+                 r"throw up|put out")
+_BROADCAST = (r"\btell (?:everyone|everybody|the )?(?:members|our members|people|them|"
+              r"clients|folks|the gym|the class)\b|"
+              r"\blet (?:everyone|everybody|our members|the members|people|them|clients|"
+              r"folks|the gym)\s+know\b")
 _AUTHORED_CLAIM = (r"that\b|saying\b|says\b|announcing\b|telling\b|to say\b|about how\b|"
                    r"letting .{0,25}know")
-# (a) a polite request form wrapped around a content verb
-_REQ_POLITE = (rf"\b(?:can|could|would|will|please|pls|need|want|wanna|mind)\b"
-               rf"[^.?!]{{0,25}}?\b(?:{_CONTENT_VERB})\b")
+# (a) a polite request form wrapped around a content verb IN VERB POSITION.
+# Audit 7, MAJOR 2: "within 25 characters" matched the NOUN sense -- "could you tell me how
+# many posts are scheduled" and "will my posts still go out" are questions, and both matched
+# because `posts` / `schedule` happened to be nearby. The verb has to be what is being asked
+# for: modal, optional subject, optional adverb, then the verb.
+_REQ_POLITE = (rf"\b(?:can|could|would|will|please|pls|need|want|wanna|mind)\b\s+"
+               rf"(?:you|we|u|to|ya)?\s*(?:please\s+|go ahead and\s+|just\s+|also\s+)?"
+               rf"(?:{_CONTENT_VERB})\b")
 # (b) an imperative opening the message
 _REQ_IMPERATIVE = rf"^\s*(?:please\s+|pls\s+|hey\s+)?(?:{_CONTENT_VERB})\b"
 # (c) asking for a piece of content to exist
@@ -320,8 +337,33 @@ _REQ_MAKE = (r"\b(?:make|need|want|create|write|draft|put together|get)\b[^.?!]{
              r"\b(?:a |an |the )?(?:post|caption|story|reel|announcement|graphic|flyer)\b")
 # (d) a content verb bound to a claim we would be asserting for them
 _REQ_CLAIM = rf"\b(?:{_CONTENT_VERB})\b[^.?!]{{0,40}}?\b(?:{_AUTHORED_CLAIM})"
+# (e) editing a piece of content we published is publishing too ("can you update the post")
+_REQ_EDIT = (r"\b(?:update|change|edit|fix|redo|rewrite|pull|delete|take down)\s+"
+             r"(?:the|our|my|that|this)?\s*"
+             r"(?:post|caption|story|reel|announcement|graphic|flyer)\b")
 _ASK_TO_PUBLISH = _re.compile(
-    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM)), _re.IGNORECASE)
+    "|".join((_REQ_POLITE, _REQ_IMPERATIVE, _REQ_MAKE, _REQ_CLAIM, _BROADCAST, _REQ_EDIT)),
+    _re.IGNORECASE)
+
+# MAJOR 1 (audit 7): removing the body-side guard entirely was a net regression -- it took
+# four new leaks for zero recovered answers. The premise ("a real answer trips the request
+# guard") did not reproduce against the code it was written for. But the reasoning was only
+# half wrong: our own reply cannot REQUEST anything, and it absolutely can COMMIT to
+# something. "I will publish the flyer that afternoon", "I can post the third one for you
+# now" -- a promise of future action with no mechanism behind it, which is V-M6 and D52's
+# named class, on the exact capability being armed. So the body is checked for COMMITMENTS
+# only, and descriptive statements ("your post about the new class went out tuesday") pass.
+_ANSWER_COMMITS = _re.compile(
+    r"\b(?:i|we)\s*(?:'ll|will|can|could|shall|am going to|are going to|would be happy to|"
+    r"am happy to|would)\s+(?:go ahead and\s+|just\s+)?"
+    rf"(?:{_CONTENT_VERB}|set up|get .{{0,15}}(?:posted|published|out))\b|"
+    r"\b(?:happy to|glad to)\s+(?:post|publish|announce|share|schedule|draft)\b|"
+    r"\bi(?:'ll| will)\s+(?:take care of|handle|sort)\b", _re.IGNORECASE)
+
+
+def answer_commits_to_action(text):
+    """True when OUR OWN drafted answer promises to do something rather than reporting."""
+    return bool(_ANSWER_COMMITS.search(text or ""))
 
 
 def asks_us_to_publish(text):
@@ -355,7 +397,8 @@ def may_auto_answer(question, body=""):
     # only. The topic denylist still reads both, because a hard-line SUBJECT can surface in
     # an answer that a benign question invited.
     return (auto_answer_allowed(question)
-            and not auto_answer_forbidden(body or ""))
+            and not auto_answer_forbidden(body or "")
+            and not answer_commits_to_action(body or ""))
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------

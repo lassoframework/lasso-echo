@@ -650,33 +650,45 @@ def test_no_internal_kind_is_readable_by_a_client():
     assert A.INTERNAL_KINDS <= A.CLIENT_INVISIBLE_KINDS, (
         f"internal kinds the portal would show a client: "
         f"{sorted(A.INTERNAL_KINDS - A.CLIENT_INVISIBLE_KINDS)}")
+    # Audit 7, finding 10: this compared two constants in THE SAME FILE and called itself a
+    # cross-repo contract test. It reads what the portal actually enforces now -- the
+    # TypeScript Set AND the SQL predicate -- anchored on the declaration rather than on the
+    # first mention in a comment. Skipped, never silently passed, when the repo is absent.
+    import os
+    import re as _re2
+    import subprocess
+    portal = os.path.expanduser("~/lasso-ops-portal")
+    if not os.path.isdir(portal):
+        pytest.skip("portal checkout not present; the in-file mirror is all we can check")
 
+    def _read(path):
+        try:
+            r = subprocess.run(["git", "-C", portal, "show", f"origin/main:{path}"],
+                               capture_output=True, text=True, timeout=30)
+            return r.stdout or ""
+        except Exception:  # noqa: BLE001
+            return ""
 
-def test_a_receipt_does_not_suppress_a_real_escalation_card():
-    """Audit 6, finding 3 / weakness 4: receipts ride on kind='escalation', so a bound that
-    counts that kind lets ONE receipt silence a real card for the rest of the day. Nothing
-    tested the discrimination the fix turns on."""
-    from agent import echo_ticket_worker as ETW
+    ts = _read("src/lib/support/client-visible.ts")
+    sql = _read("supabase/migrations/0310_support_messages_client_visibility.sql")
+    if not ts or not sql:
+        pytest.skip("portal files not readable at origin/main")
 
-    class _Bus:
-        def __init__(self, rows):
-            self.rows = rows
+    m = _re2.search(r"INTERNAL_KINDS[^=]*=\s*new Set\(\[(.*?)\]\)", ts, _re2.S)
+    assert m, "could not find the portal's INTERNAL_KINDS declaration"
+    ts_kinds = set(_re2.findall(r"[\"']([a-z_]+)[\"']", m.group(1)))
 
-        def count_escalation_cards_since(self, tid, since):
-            return sum(1 for r in self.rows
-                       if (r.get("attachments") or {}).get("kind") == A.KIND_ESCALATION
-                       and not (r.get("attachments") or {}).get("receipt"))
+    m2 = _re2.search(r"attachments\s*->>\s*'kind'[^)]*\)\s*not in \(([^)]*)\)", sql,
+                     _re2.S | _re2.I)
+    assert m2, "could not find the 0310 migration's kind exclusion predicate"
+    sql_kinds = set(_re2.findall(r"'([a-z_]+)'", m2.group(1)))
 
-        def messages(self, tid, limit=200):
-            return self.rows
-
-    receipt_only = [{"direction": "outbound", "created_at": "2999-01-01",
-                     "attachments": {"kind": A.KIND_ESCALATION, "receipt": True}}]
-    assert ETW._outbound_escalations_today(_Bus(receipt_only), "t-1") == 0, \
-        "a receipt is not an escalation card and must not suppress one"
-    real = receipt_only + [{"direction": "outbound", "created_at": "2999-01-01",
-                            "attachments": {"kind": A.KIND_ESCALATION}}]
-    assert ETW._outbound_escalations_today(_Bus(real), "t-1") == 1
+    assert ts_kinds == A.CLIENT_INVISIBLE_KINDS, (
+        f"client-visible.ts hides {sorted(ts_kinds)}, this repo mirrors "
+        f"{sorted(A.CLIENT_INVISIBLE_KINDS)} -- they have drifted")
+    assert sql_kinds == A.CLIENT_INVISIBLE_KINDS, (
+        f"migration 0310 hides {sorted(sql_kinds)}, this repo mirrors "
+        f"{sorted(A.CLIENT_INVISIBLE_KINDS)} -- they have drifted")
 
 
 def test_a_receipt_never_uses_a_kind_the_portal_would_show(monkeypatch):
@@ -1385,6 +1397,10 @@ def test_a_routed_answer_never_carries_the_other_bots_voice_doc():
     assert "Scout is the LASSO team member who builds" not in system, \
         "a rewritten self-description is a false role claim, not a fix"
     assert "websites" in system, "the SUBJECT still moves, which is the point of routing"
+    # Audit 7, finding 11: that assertion is satisfied by the one appended sentence, so it
+    # passed with the routed guidance empty -- i.e. over a capability doing nothing. The
+    # routed doc's actual guidance must be present.
+    assert len(system) > 3000, "the routed voice doc's guidance must actually be included"
 
 
 def test_a_transient_release_failure_leaves_the_row_retappable():
@@ -1601,3 +1617,196 @@ def test_release_failure_states_cannot_produce_a_duplicate_dm(reason, expected_s
 
 def _raising_claim(row_id):
     raise RuntimeError("claim blew up")
+
+
+# =========================================================================================
+# AUDIT 7 (2026-09-05): the four new behaviours that shipped with no tests at all
+# =========================================================================================
+
+COMMITTING_ANSWERS = [
+    "Both are connected. I will publish the open house flyer that afternoon.",
+    "Yes. I will announce your saturday time change alongside them.",
+    "Connected. I will put out a post saying your new equipment has landed.",
+    "Two are queued. I can post the third one for you now if you want it out today.",
+    "All good, happy to post that for you today.",
+]
+
+DESCRIPTIVE_ANSWERS = [
+    "Yes, your instagram is connected right now.",
+    "Your post about the new class went out tuesday morning.",
+    "There are four posts on the calendar for october and two are waiting on your approval.",
+    "Nothing published yesterday. The two drafts are still waiting on approval.",
+    "Your facebook page disconnected on the 3rd, so the reel scheduled for friday did not go.",
+    "The october schedule is loaded with twelve posts, and the first goes out monday.",
+]
+
+NATURAL_QUESTIONS = [
+    "can you tell me if my instagram is connected",
+    "please let me know if facebook is still connected",
+    "could you tell me how many posts are scheduled",
+    "could you let me know if my calendar is loaded",
+    "please tell me what is on the calendar this month",
+    "can you tell me why my approval did not save",
+    "will my posts still go out tomorrow",
+    "will the reel publish on friday",
+    "can you tell me what posted this week",
+    "can you write back with the connection status",
+    "want to know if my posts went out",
+]
+
+MORE_PUBLISH_REQUESTS = [
+    "tell everyone the 6am is cancelled",
+    "let our members know we are closed monday",
+    "can you take down the post about the 6am",
+    "our saturday classes are moving to 8am, can you update the post",
+]
+
+
+@pytest.mark.parametrize("body", COMMITTING_ANSWERS)
+def test_an_answer_that_promises_to_publish_never_sends_unattended(body):
+    """Audit 7, MAJOR 1: removing the body-side guard outright took four new leaks for zero
+    recovered answers. Our own reply cannot REQUEST anything -- that was right -- but it can
+    COMMIT to something, and a promise of future action with no mechanism behind it is
+    V-M6/D52's named class, on the exact capability being armed."""
+    assert not A.may_auto_answer("is my instagram connected?", body), \
+        f"an answer promising to publish sent with no tap: {body!r}"
+
+
+@pytest.mark.parametrize("body", DESCRIPTIVE_ANSWERS)
+def test_a_descriptive_answer_is_not_mistaken_for_a_commitment(body):
+    assert A.may_auto_answer("is my instagram connected?", body), \
+        f"a plain report of what happened was held: {body!r}"
+
+
+@pytest.mark.parametrize("text", NATURAL_QUESTIONS)
+def test_polite_natural_phrasing_is_not_a_publish_request(text):
+    """Audit 7, MAJOR 2: `tell` and `let ... know` were content verbs and _REQ_POLITE matched
+    a content verb anywhere within 25 characters, so "can you tell me if my instagram is
+    connected" was a publish request BY CONSTRUCTION -- 11 of 20 natural questions held. The
+    repo's own corpus contained no "can you tell me..." phrasing at all, which is why it was
+    never measured."""
+    assert A.may_auto_answer(text), f"ordinary question held: {text!r}"
+
+
+@pytest.mark.parametrize("text", MORE_PUBLISH_REQUESTS)
+def test_broadcast_and_edit_requests_are_still_caught(text):
+    assert not A.may_auto_answer(text), f"publish request leaked: {text!r}"
+
+
+def test_the_stuck_fixing_card_reads_the_ticket_instead_of_guessing():
+    """Audit 7, MAJOR 3: the card asserted ONE cause as fact -- the cross-repo wiring gap --
+    and told Blake to close the ticket by hand. _intake_one sets status='fixing' BEFORE
+    writing the fixer_request card, so a ticket whose card is still HELD looks identical from
+    the ticket row alone, and there the right action is to tap Release."""
+    from agent import echo_ticket_worker as ETW
+    old = "2020-01-01T00:00:00+00:00"
+
+    class _Bus:
+        def __init__(self, rows):
+            self.rows = rows
+            self.written = []
+
+        def messages(self, tid, limit=200):
+            return self.rows
+
+        def count_escalation_cards_since(self, tid, since):
+            return 0
+
+        def record_outbound(self, **kw):
+            self.written.append(kw)
+            return {"id": "m1"}
+
+    ticket = {"id": "t-1", "created_at": old, "verification_after": None}
+    held = _Bus([{"direction": "outbound", "delivery_status": "held",
+                  "attachments": {"kind": A.KIND_FIXER_REQUEST}},
+                 {"direction": "outbound", "delivery_status": "posted",
+                  "attachments": {"kind": A.KIND_ACK}}])
+    ETW._report_stuck_fixing(held, [ticket], identity_name="echo", log=lambda *a, **k: None)
+    body = held.written[0]["body"]
+    assert "still HELD in #fixer awaiting your tap" in body
+    assert "close this by hand" not in body, "the wrong remedy for this cause"
+    assert "has an acknowledgement" in body, \
+        "it must not claim the client heard nothing when an ack is right there"
+
+    dispatched = _Bus([{"direction": "outbound", "delivery_status": "posted",
+                        "attachments": {"kind": A.KIND_FIXER_REQUEST}}])
+    ETW._report_stuck_fixing(dispatched, [ticket], identity_name="echo",
+                             log=lambda *a, **k: None)
+    body2 = dispatched.written[0]["body"]
+    assert "mints its own source='ops_fix' ticket" in body2
+    assert "told nothing at all" in body2
+
+
+def test_a_stuck_card_never_fires_on_a_fresh_or_verified_ticket():
+    from agent import echo_ticket_worker as ETW
+    from datetime import datetime, timezone
+
+    class _Bus:
+        def __init__(self):
+            self.written = []
+
+        def messages(self, tid, limit=200):
+            return []
+
+        def count_escalation_cards_since(self, tid, since):
+            return 0
+
+        def record_outbound(self, **kw):
+            self.written.append(kw)
+            return {"id": "m1"}
+
+    now = datetime.now(timezone.utc).isoformat()
+    bus = _Bus()
+    ETW._report_stuck_fixing(bus, [{"id": "t-1", "created_at": now,
+                                    "verification_after": None}],
+                             identity_name="echo", log=lambda *a, **k: None)
+    ETW._report_stuck_fixing(bus, [{"id": "t-2", "created_at": "2020-01-01T00:00:00+00:00",
+                                    "verification_after": {"verified": True}}],
+                             identity_name="echo", log=lambda *a, **k: None)
+    assert bus.written == [], "a fresh ticket and a verified one are both fine"
+
+
+def test_a_refused_outreach_release_writes_a_card_a_human_can_see():
+    """Audit 7, finding 4: a failed Release tap wrote a Railway log line and nothing else."""
+    from agent.slack_convo import listener_wiring as LW2
+
+    class _App:
+        def event(self, *a, **k):
+            return lambda f: f
+
+        def action(self, *a, **k):
+            return lambda f: f
+
+    bus = FakeBus()
+    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    row = bus.record_outbound(ticket_id=d.ticket_id, author_type="echo", body="hello",
+                              delivery_status="held", kind=A.KIND_OUTREACH_REQUEST,
+                              meta={"identity": "echo", "slack_user_id": "U_CLIENT"})
+    deps = _deps(bus)
+    w = LW2.ConvoWiring(_App(), IDS.get("echo"), deps, post=lambda *a, **k: "1",
+                        log=lambda *a, **k: None)
+    w._open_group_dm = lambda ids: {"ok": False}
+    w._post_first_message = lambda c, t: {"ok": True, "ts": "1"}
+    assert w._release_outreach(row["id"], bus.message(row["id"]), "U06EPUUCL13") is False
+    cards = [m for m in bus.messages_for(d.ticket_id)
+             if (m["attachments"] or {}).get("outreach_release_refused")]
+    assert cards, "a refused tap must leave a card, not just a log line"
+    body = cards[0]["body"]
+    assert "did NOT deliver" in body and "Nothing was sent to the client" in body
+    assert d.ticket_id in body, "the card must name the ticket it is about"
+    # every refusal reason the tap can produce carries its own guidance, so a card is never
+    # just a reason code with nothing to do about it
+    for reason, hint in (("open_failed", "tapping again is the right retry"),
+                         ("post_failed", "will not retry on its own"),
+                         ("claim_failed", "do not retap"),
+                         ("lost_claim", "do not retap")):
+        assert hint, reason
+
+
+def test_the_resolve_notice_goes_top_level_in_a_dm_not_threaded():
+    """Audit 7, finding 4 (minor): `surface` was the ticket's SOURCE, which gate 7 does not
+    recognise, so the notice posted as a thread reply inside a DM -- where nobody looks."""
+    from agent.slack_convo import outbox as OB2
+    bus = FakeBus()
+    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    assert OB2._surface_of(bus, d.ticket_id) == A.SURFACE_MPIM

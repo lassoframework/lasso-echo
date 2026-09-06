@@ -1163,11 +1163,18 @@ def test_resolve_button_on_an_escalation_card_actually_notifies_not_a_silent_dea
     handler = app._actions[OB.RESOLVE_ACTION_ID]
     handler(ack=lambda: None, body={"user": {"id": "U06EPUUCL13"}}, action={"value": tid})
 
-    assert bus.tickets[tid]["status"] == "resolved", \
-        "the ticket must actually close, not sit open after a tap that appears to work"
     notices = [m for m in bus.messages_for(tid)
               if m["direction"] == "outbound" and m["attachments"]["kind"] == A.KIND_STATUS]
     assert len(notices) == 1, "the person must actually be told, once"
+    # MINOR 5 (audit 7): the ticket closes when the person HAS the notice, not when the tap
+    # is registered -- a post failure must never leave a ticket asserting it was resolved.
+    assert bus.tickets[tid]["status"] != "resolved", "not resolved before it is delivered"
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert any(OB.RESOLVED_NOTICE[:30] in c["text"] for c in calls), \
+        "the notice must actually reach the person"
+    assert bus.tickets[tid]["status"] == "resolved", \
+        "and the ticket closes once it has"
     assert notices[0]["body"] == OB.RESOLVED_NOTICE
     assert w.counts["resolve:ok"] == 1
     assert w.counts.get("resolve:noop", 0) == 0

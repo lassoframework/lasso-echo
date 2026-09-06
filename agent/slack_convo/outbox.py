@@ -451,7 +451,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
             return
         bus.mark_message(row["id"], "posted", meta_update={"delivered_via": "portal_thread"})
         summary["posted"] += 1
-        _resolve_on_answer(bus, ticket, kind, summary)
+        _resolve_on_answer(bus, ticket, kind, summary, att)
         # m4: no Slack call happens on this branch -- "posted" here means migration 0310 now
         # lets the client read it in the thread they wrote from. The receipt says exactly
         # that rather than claiming a message was pushed to them.
@@ -462,7 +462,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
     ts = post(channel, row["body"], thread_ts=thread_ts, blocks=None)
     bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
-    _resolve_on_answer(bus, ticket, kind, summary)
+    _resolve_on_answer(bus, ticket, kind, summary, att)
     _receipt(bus, ticket, row, identity, kind, att, where=f"Slack {channel}", summary=summary)
 
 
@@ -533,11 +533,19 @@ def _receipt(bus, ticket, row, identity, kind, att, *, where, summary):
         pass
 
 
-def _resolve_on_answer(bus, ticket, kind, summary):
-    """V-M4: the ticket closes when the person HAS the answer, not when we drafted it."""
+def _resolve_on_answer(bus, ticket, kind, summary, att=None):
+    """V-M4: the ticket closes when the person HAS the message, not when we drafted it.
+
+    Two rows close a ticket: the ANSWER that answered it, and the resolve NOTICE a human
+    tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
+    delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
     if kind == _a.KIND_ANSWER and ticket.get("status") == "verification":
         bus.set_ticket(ticket["id"], status="resolved")
         summary["resolved"] += 1
+    elif kind == _a.KIND_STATUS and (att or {}).get("resolve_notice"):
+        if ticket.get("status") != "resolved":
+            bus.set_ticket(ticket["id"], status="resolved")
+            summary["resolved"] += 1
 
 
 def release_held(bus, message_id, *, approved_by, identity=None, log=print):
@@ -591,6 +599,12 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         return False
     if ticket.get("status") == "resolved":
         return False
+    # MINOR 5's fix moved the resolved stamp to delivery time, which quietly broke what the
+    # status check had been doing double duty for: idempotence. A second tap before the
+    # notice posts would have written a SECOND notice. The notice row itself is the record of
+    # "this tap already happened", so that is what is checked.
+    if _resolve_notice_exists(bus, ticket_id):
+        return False
     if not portal_deliverable(ticket) and not ticket.get("slack_channel_id"):
         log(f"[slack-convo/outbox] resolve refused: ticket {ticket_id} has no delivery "
             "surface (no portal thread, no group DM)")
@@ -620,6 +634,10 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         except Exception:  # noqa: BLE001 - the refusal itself already stands
             pass
         return False
+    # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
+    # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
+    # a place people do not look. The real surface is on the ticket's own inbound rows.
+    surface = _surface_of(bus, ticket_id) or (ticket.get("source") or "")
     bus.record_outbound(
         ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
         body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
@@ -627,8 +645,38 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         # own identity_kind, so a staff ticket with STAFF_REPLY on and CLIENT_REPLY off
         # passed the gate and then held the row -- the exact lie the gate was added to close.
         meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
-              "surface": (ticket.get("source") or ""), "resolved_by": approved_by})
-    bus.set_ticket(ticket_id, status="resolved", approved_by=approved_by,
-                   approved_via="slack_button",
+              "surface": surface, "resolved_by": approved_by, "resolve_notice": True})
+    # MINOR 5 (audit 7): the ticket used to be stamped resolved HERE, before the notice had
+    # been delivered -- so a post failure left a ticket permanently asserting it was resolved
+    # over a row marked failed. Same rule as an answer (V-M4): the ticket closes when the
+    # person HAS the message. _resolve_on_answer closes it when this row posts.
+    bus.set_ticket(ticket_id, approved_by=approved_by, approved_via="slack_button",
                    approved_at=datetime.now(timezone.utc).isoformat())
     return True
+
+
+def _resolve_notice_exists(bus, ticket_id):
+    """True once a resolve notice has been written for this ticket, in any delivery state.
+    Fails CLOSED (True) on a read failure: a duplicate notice to a client is worse than a
+    tap that reports nothing happened."""
+    try:
+        for m in bus.messages(ticket_id, limit=200) or []:
+            att = m.get("attachments") or {}
+            if m.get("direction") == "outbound" and att.get("resolve_notice"):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _surface_of(bus, ticket_id):
+    """The surface this ticket's human actually spoke on, from its own inbound rows."""
+    try:
+        for m in reversed(bus.messages(ticket_id, limit=200) or []):
+            if m.get("direction") == "inbound":
+                s = ((m.get("attachments") or {}).get("surface") or "").strip()
+                if s:
+                    return s
+    except Exception:  # noqa: BLE001
+        pass
+    return ""

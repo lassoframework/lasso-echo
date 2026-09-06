@@ -310,14 +310,30 @@ def test_no_resolve_button_when_there_is_nowhere_to_send_the_notice():
 
 def test_resolve_and_notify_writes_the_person_a_notice_and_closes_the_ticket():
     bus = Bus([_ticket(status="hold", escalated=True)])
+    # the human's own message, which every real ticket has and which outbox gate 1 (first
+    # contact: the bot never speaks first) requires before anything can post
+    bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
+                       author_type="client", author_id="owner@gym.com",
+                       body="is my instagram connected?",
+                       meta={"surface": "portal_ticket_bridge"})
     assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                  log=lambda *a: None) is True
     notice = bus.of_kind(A.KIND_STATUS)
     assert len(notice) == 1
     assert notice[0]["body"] == OB.RESOLVED_NOTICE
     assert notice[0]["delivery_status"] == "ready"
-    assert bus.ticket("t-1")["status"] == "resolved"
+    # Audit 7, MINOR 5: the ticket closes when the person HAS the notice, not when the tap is
+    # registered -- a post failure must never leave a ticket asserting it was resolved. The
+    # approval is stamped at tap time; the status follows the delivery.
     assert bus.ticket("t-1")["approved_by"] == "U_BLAKE"
+    assert bus.ticket("t-1")["status"] != "resolved"
+    # This ticket's delivery surface is the portal support thread (D48), so "delivered"
+    # means the row reached delivery_status='posted' and migration 0310 now lets the client
+    # read it -- no Slack call is involved. Either way the ticket closes only after that.
+    OB.run_once(bus, lambda ch, text, thread_ts=None, blocks=None: "1",
+                identity=ECHO, log=lambda *a: None)
+    assert bus.of_kind(A.KIND_STATUS)[0]["delivery_status"] == "posted"
+    assert bus.ticket("t-1")["status"] == "resolved"
 
 
 def test_resolve_and_notify_is_idempotent():

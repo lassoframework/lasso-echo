@@ -569,20 +569,48 @@ def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
         tid = ticket["id"]
         if _outbound_escalations_today(bus, tid) >= 1:
             continue
+        # Audit 7, MAJOR 3: the first version asserted ONE cause as fact -- the cross-repo
+        # wiring gap -- and told Blake to close the ticket by hand. In the ordinary case that
+        # is simply wrong: _intake_one sets status='fixing' BEFORE writing the fixer_request
+        # card, so a ticket whose card is still HELD awaiting a tap looks identical from the
+        # ticket row alone. The right action there is to tap Release, and the card said the
+        # opposite. It looks at the ticket's own rows now instead of guessing, and it does
+        # not claim the client has heard nothing when an ack is sitting right there.
+        rows = []
+        try:
+            rows = bus.messages(tid, limit=200) or []
+        except Exception:  # noqa: BLE001
+            rows = []
+
+        def _kind(k):
+            return [m for m in rows
+                    if (m.get("attachments") or {}).get("kind") == k]
+
+        held_request = [m for m in _kind(_a.KIND_FIXER_REQUEST)
+                        if m.get("delivery_status") == "held"]
+        acked = bool(_kind(_a.KIND_ACK) or _kind(_a.KIND_TEMPLATE))
+        if held_request:
+            cause = ("Its fix request is still HELD in #fixer awaiting your tap, so it was "
+                     "never dispatched to the worker. Tapping Release on that card is what "
+                     "moves this.")
+        else:
+            cause = ("Its fix request was dispatched, and no verification has been written "
+                     "back to THIS row. Known cause: the ops-fix worker mints its own "
+                     "source='ops_fix' ticket and writes the verification there, so this "
+                     "pass cannot see it. Check the fix and close this by hand, or wire the "
+                     "worker to write verification_after back to the originating ticket.")
+        client_state = ("The client has an acknowledgement but has heard nothing since."
+                        if acked else "The client has been told nothing at all.")
         try:
             bus.record_outbound(
                 ticket_id=tid, author_type="system",
                 body=(f"Ticket {tid} ({identity_name}) has been in 'fixing' for over "
-                      f"{STUCK_FIXING_HOURS}h with no verification written to it, so nothing "
-                      f"has been said to the client and nothing will be. Known cause: the "
-                      f"ops-fix worker mints its own source='ops_fix' ticket and writes the "
-                      f"verification there, not onto this row, so this pass can never see "
-                      f"it. This needs a person: either close it by hand after checking the "
-                      f"fix, or wire the worker to write verification_after back to the "
-                      f"originating ticket."),
+                      f"{STUCK_FIXING_HOURS}h with no verification on it. {cause} "
+                      f"{client_state}"),
                 delivery_status="ready", kind=_a.KIND_ESCALATION,
                 meta={"identity": identity_name, "surface": "portal_ticket_bridge",
-                      "stuck_in_fixing": True})
+                      "stuck_in_fixing": True,
+                      "fixer_request_held": bool(held_request)})
         except Exception as e:  # noqa: BLE001 - a report failure never breaks the pass
             log(f"[ticket-worker/{identity_name}] stuck-report failed ticket={tid}: "
                 f"{type(e).__name__}")

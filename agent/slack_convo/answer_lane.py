@@ -126,9 +126,6 @@ def _speaker_identity(speaker, fallback):
         return fallback
 
 
-_IDENTITY_SENTENCE = _re.compile(r"[^.\n]*\b{}\b[^.\n]*[.\n]?", _re.IGNORECASE)
-
-
 def _domain_guidance_only(doc, routed_name):
     """The routed voice doc minus every line that names the routed bot.
 
@@ -142,8 +139,13 @@ def _domain_guidance_only(doc, routed_name):
         if _re.search(rf"\b{_re.escape(routed_name)}\b", line, _re.IGNORECASE):
             continue
         kept.append(line)
+    # Audit 7, MINOR 6: a 2000-char cap silently dropped 41% of Wrangler's 3396-char doc,
+    # including its whole Escalation section -- the routed guidance is the entire point of
+    # routing, and truncating it below the size of the only doc it is used with made the
+    # capability quietly partial. Bounded generously instead (the system prompt as a whole is
+    # still far inside any model limit).
     text = "\n".join(kept).strip()
-    return text[:2000]
+    return text[:6000]
 
 
 def _voice_rules(identity):
