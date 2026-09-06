@@ -322,6 +322,7 @@ def _status():
     print(f"  audience_demos : {config.audience_demographics_enabled()}  (env AGENT_AUDIENCE_DEMOGRAPHICS; weekly IG follower + engaged demographics -> gym_audience_demographics, read only, default OFF)")
     print(f"  cadence_2x     : {config.cadence_2x_enabled()}  (env ECHO_CADENCE_2X_ENABLED; per-gym posts_per_day toggle honored at 2x, slot times {config.cadence_slot_times()}, default OFF)")
     print(f"  brains->captions: {config.brain_feeds_captions_enabled()}  (env AGENT_BRAIN_FEEDS_CAPTIONS; the WEEKLY cross gym rollup's FORM guidance appended to the SB7 prompt as form hints ONLY, below the brand bible and below the approved source, never as content; needs AGENT_CROSS_GYM_BRAIN armed too; default OFF)")
+    print(f"  client_dm_autofix: {config.client_dm_autofix_enabled()}  (env AGENT_CLIENT_DM_AUTOFIX; the direct client DM support lane -- enumerated diagnostic, one gym scoped data only fix, SAME diagnostic re-run to verify, reply only if byte identical to a registered template over the verified fact keys; NO ad write call path exists anywhere in that package; never billing, flags, schema, secrets or another gym; separate from every SLACK_CONVO auto answer flag; default OFF)")
     # sources & paths (where the drafting content actually comes from)
     print("  -- sources & paths --")
     print(f"  source doc     : {config.SOURCE_DOC_PATH}  (env AGENT_SOURCE_DOC_PATH)")

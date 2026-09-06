@@ -4243,3 +4243,42 @@ def brain_feeds_captions_enabled() -> bool:
     nothing on its own without AGENT_CROSS_GYM_BRAIN also armed and the weekly
     rollup's top_posts migration applied."""
     return _truthy(os.environ.get("AGENT_BRAIN_FEEDS_CAPTIONS", "false"))
+
+
+# ---- Client DM support autofix (client_dm_support) ---------------------------
+def client_dm_autofix_enabled() -> bool:
+    """AGENT_CLIENT_DM_AUTOFIX -- arms agent/client_dm_support/, the direct-client-DM
+    support lane: a gym owner's message in their own group DM is routed to an
+    ENUMERATED diagnostic, a scoped fix is executed, the SAME diagnostic is re-run to
+    verify it, and only then is a reply auto-posted. Default OFF; a human arms it.
+
+    WHAT IT ARMS (and only this):
+      * agent/client_dm_support/consumer.run_once() stops returning
+        {'ok': False, 'reason': 'flag off'} and begins reading tickets the EXISTING,
+        UNMODIFIED agent/slack_convo/adapter.py already wrote.
+      * the four data-only remedies in agent/client_dm_support/remedies.py
+        (per-gym Drive sync, per-gym asset re-index, ask-the-client, fact-derived
+        code-fix brief) become executable for ONE gym at a time.
+      * a reply may be auto-posted ONLY when it is byte-identical to a registered
+        template rendered from verified fact keys (reply.assert_is_template_render).
+
+    WHAT IT DOES NOT TOUCH, EVER, ARMED OR NOT:
+      * the #fixer bus's own auto-answer gate. This flag is unrelated to every
+        SLACK_CONVO_<IDENTITY>_AUTO_ANSWER flag and to
+        SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE (D67/D68). Turning this on
+        does not turn any of those on, and this lane never writes an 'answer' row
+        on the slack_convo answer lane.
+      * ad spend, ad targeting, campaign/ad-set launch or pause. This is not a gate
+        that could misfire: agent/client_dm_support/ has NO import of, and no call
+        path to, any Meta/Pipeboard ad-write surface at all
+        (tests/test_client_dm_ad_block.py proves it by AST over the whole package).
+      * billing -- Stripe, invoicing, plan/tier, payment methods.
+      * feature flags, env vars, secrets, tokens, auth/identity config.
+      * schema, migrations, RLS policies.
+      * pixel / CAPI setup.
+      * any other gym's data. Every remedy carries exactly one gym scope value and
+        scope_gate.check() refuses an action that names zero or more than one.
+
+    Inert on its own: with no Supabase creds and no bus the consumer returns a
+    reason string and posts nothing."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_AUTOFIX", "false"))
