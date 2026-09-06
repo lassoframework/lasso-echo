@@ -36,12 +36,26 @@ capability must not ride it, re-enable it, or depend on `verification_after` sem
 that belong to it. KIND_STATUS is plain-language status on the ticket, is not gated on
 `verification_after`, and is already a receipt kind.
 
-ONE THING TO KNOW WHEN ARMING. A reply row is written 'ready' directly, so it does not
-also consult the identity's SLACK_CONVO_<IDENTITY>_CLIENT_REPLY flag. That is
-deliberate — AGENT_CLIENT_DM_AUTOFIX is this lane's own authorization, and a lane that
-verified its fix should not be silently muted by a flag reviewed for a different
-capability — but it means arming this flag DOES put client-visible messages on the
-wire. It is stated here and in the flag's own docstring so nobody discovers it later.
+ARMING TAKES TWO FLAGS, NOT ONE. An earlier version of this docstring claimed the
+opposite -- that writing the row 'ready' bypassed the identity's client-reply flag, and
+that arming AGENT_CLIENT_DM_AUTOFIX alone put client-visible messages on the wire. Both
+halves were FALSE, and the tests that "closed" the delivery bug asserted it by
+string-matching outbox.py's source instead of executing it, which is exactly why a third
+contract on that same function went unnoticed (D68: a test shaped like the code, not
+like the rule).
+
+The truth, from outbox._dispatch_one: KIND_STATUS is a CONVERSATIONAL kind, so the row
+is checked AGAIN at POST time by _recipient_armed(identity, recipient_kind) ->
+slack_convo_client_reply_armed(identity) (outbox.py:429). delivery_status='ready' is a
+claim about the row, not a bypass of a post-time gate. With that flag off the reply is
+HELD with held_why='flag off at post time' and a hold card goes to a human -- it fails
+safe, but it does not reach the client.
+
+So a full arming is: AGENT_CLIENT_DM_AUTOFIX (this lane runs at all) AND the identity's
+SLACK_CONVO_<IDENTITY>_CLIENT_REPLY (client-visible messages may leave). This lane reads
+neither flag itself and does not touch the D67-locked AUTO_ANSWER gate, which governs
+KIND_ANSWER only. tests/test_client_dm_flow.py drives a written row through the REAL
+_dispatch_one in both flag states rather than grepping its source.
 
 Nothing under agent/slack_convo/ is modified by this file; it is called, not changed.
 """

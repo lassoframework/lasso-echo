@@ -410,3 +410,19 @@ def test_normalisation_does_not_break_ordinary_allowed_paths():
         paths=("./agent/jobs/sync_gym_media.py", "tests//test_gym_media_sync.py"),
         scope_column="gym_id", scope_values=("crossfitlocal",)))
     assert v.allowed, v.reason
+
+
+@pytest.mark.parametrize("path", [
+    "vendor/tests/evil.py",
+    "scripts/tests/deploy_key.py",
+    "docs/agent/media_x.py",
+    "third_party/agent/jobs/thing.py",
+])
+def test_a_path_merely_CONTAINING_an_allowed_root_is_refused(path):
+    """The allowlist was `p.startswith(root) or f"/{root}" in p` — a substring test
+    doing an allowlist's job, so anything containing '/tests/' or '/agent/jobs/'
+    anywhere passed. Paths are normalised, so a prefix test is exact."""
+    v = sg.check(sg.ProposedAction(
+        kind=sg.KIND_CODE_FIX, paths=(path,),
+        scope_column="gym_id", scope_values=("crossfitlocal",)))
+    assert v.escalate, path

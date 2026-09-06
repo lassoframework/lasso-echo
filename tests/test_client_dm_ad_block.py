@@ -221,3 +221,76 @@ def test_the_package_uses_no_dynamic_dispatch_of_its_own():
     """The positive form: the ad tables are only sound if the ONLY way out of this
     package is a static import."""
     assert ad_block.assert_no_ad_call_path() is True
+
+
+# ---------------------------------------------------------------------------
+# ROUND-2 BYPASSES: module-object aliasing, sys.modules, bytes literals,
+# self-exemption. Each scanned CLEAN before.
+# ---------------------------------------------------------------------------
+def test_package_root_import_is_refused_module_object_aliasing(tmp_path):
+    """`import agent` then `agent.meta_publisher.publish(...)` imports nothing
+    forbidden BY NAME and calls nothing in the call table, yet reaches the module."""
+    (tmp_path / "b1.py").write_text(
+        "import agent\ndef go(): return agent.meta_publisher.publish(1)\n")
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("package root" in f for f in findings), findings
+
+
+def test_an_attribute_chain_into_a_forbidden_module_is_refused(tmp_path):
+    (tmp_path / "b1b.py").write_text(
+        "def go(agent): return agent.meta_publisher.publish(1)\n")
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("attribute chain" in f for f in findings), findings
+
+
+def test_sys_modules_is_refused(tmp_path):
+    """sys.modules is a dynamic import by another name."""
+    (tmp_path / "b2.py").write_text(
+        "import sys\ndef go(): return sys.modules['agent.meta_publisher'].publish(1)\n")
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("'sys'" in f for f in findings), findings
+
+
+def test_a_graph_url_hidden_as_bytes_is_refused(tmp_path):
+    (tmp_path / "b3.py").write_text(
+        'URL = b"graph.facebook.com/v19.0/act_1/campaigns"\n')
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("Graph API" in f for f in findings), findings
+
+
+def test_the_guard_file_no_longer_exempts_itself_from_the_call_table(tmp_path):
+    """ad_block.py exempted ITSELF from the dynamic-call table — for no benefit, since
+    no call in it was ever in the table — while opening a hole in the one file whose
+    whole job is to have no holes. Asserted behaviourally: a file NAMED ad_block.py
+    containing an escape hatch must be flagged.
+
+    (The LITERAL-table exemption is different and stays: that file's forbidden-URL
+    fragments are themselves string literals, so scanning them would always self-flag.
+    The test below pins that distinction.)"""
+    (tmp_path / "ad_block.py").write_text(
+        "def go(x):\n    return eval(x)\n")
+    findings = ad_block.scan_for_ad_call_paths(str(tmp_path))
+    assert any("eval" in f for f in findings), findings
+
+
+def test_the_literal_table_self_exemption_is_still_needed_and_present(tmp_path):
+    """The real ad_block.py holds 'graph.facebook.com' and '/act_' as constants. It
+    must not flag itself for them, or the guarantee could never be clean."""
+    assert any(frag in open(os.path.join(PKG, "ad_block.py"), encoding="utf-8").read()
+               for frag in ad_block.FORBIDDEN_AD_LITERAL_FRAGMENTS)
+    assert ad_block.scan_for_ad_call_paths() == []
+
+
+def test_computed_getattr_is_refused_but_a_literal_one_is_not(tmp_path):
+    (tmp_path / "c1.py").write_text(
+        'def go(m, n): return getattr(m, "create_" + n)()\n')
+    assert any("reflection" in f
+               for f in ad_block.scan_for_ad_call_paths(str(tmp_path))), "computed"
+    (tmp_path / "c1.py").write_text('def go(m): return getattr(m, "available", None)\n')
+    assert ad_block.scan_for_ad_call_paths(str(tmp_path)) == [], "literal must pass"
+
+
+def test_ordinary_relative_imports_are_not_flagged_as_root_aliasing():
+    """`from .. import config` resolves to the bare root but names no module of its
+    own; flagging it would make the scanner refuse the whole package."""
+    assert ad_block.scan_for_ad_call_paths() == []

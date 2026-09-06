@@ -4256,9 +4256,12 @@ def client_dm_autofix_enabled() -> bool:
       * agent/client_dm_support/consumer.run_once() stops returning
         {'ok': False, 'reason': 'flag off'} and begins reading tickets the EXISTING,
         UNMODIFIED agent/slack_convo/adapter.py already wrote.
-      * the four data-only remedies in agent/client_dm_support/remedies.py
-        (per-gym Drive sync, per-gym asset re-index, ask-the-client, fact-derived
-        code-fix brief) become executable for ONE gym at a time.
+      * remedies.py's ONE executor (per_gym_drive_sync) becomes runnable, for one
+        gym at a time. The other planned outcomes write nothing at all: ask-the-client
+        (Case 2) and a truthful statement about a revoked Drive share. There is no
+        code-fix executor and no asset-re-index executor -- scope_gate knows how to
+        scope-check a code fix, but remedies.plan never returns one and EXECUTORS has
+        no entry for it, held shut by a two-way guard in the test suite.
       * a reply may be auto-posted ONLY when it is byte-identical to a registered
         template rendered from verified fact keys (reply.assert_is_template_render).
 
@@ -4273,7 +4276,12 @@ def client_dm_autofix_enabled() -> bool:
         to any ad-write surface, and no dynamic-dispatch escape hatch (no importlib,
         no subprocess, no eval/exec, no computed getattr, no HTTP client of its own)
         through which one could be reached indirectly -- so a static AST scan over the
-        package is a sound proof, and tests/test_client_dm_ad_block.py runs it.
+        package can enumerate everything this code can reach, and
+        tests/test_client_dm_ad_block.py runs that scan. The SOUND part of the proof is
+        the import table plus the no-dynamic-dispatch rule: a module that cannot be
+        imported and cannot be reached by reflection cannot have a function called on
+        it. The forbidden-call-name table is a secondary check and is, on its own, an
+        enumeration -- it is not what the guarantee rests on.
         Precisely: this is a claim about DIRECT imports and about call paths. Modules
         the package legitimately calls (e.g. agent.jobs.sync_gym_media) have their own
         transitive import closures, and no ad WRITE is reachable through any of them;
@@ -4284,6 +4292,14 @@ def client_dm_autofix_enabled() -> bool:
       * pixel / CAPI setup.
       * any other gym's data. Every remedy carries exactly one gym scope value and
         scope_gate.check() refuses an action that names zero or more than one.
+
+    ARMING TAKES TWO FLAGS. This one lets the lane RUN. A client-visible reply is
+    checked again at POST time by the existing outbox, which holds any conversational
+    row unless the identity's SLACK_CONVO_<IDENTITY>_CLIENT_REPLY is armed
+    (outbox.py:429) -- writing a row 'ready' is not a bypass of that. With this flag on
+    and that one off, the lane still diagnoses, still fixes, still verifies, and its
+    reply is HELD for a human with a hold card. Escalations are an INTERNAL kind and go
+    to the fixer channel regardless.
 
     Inert on its own: with no Supabase creds and no bus the consumer returns a
     reason string and posts nothing."""

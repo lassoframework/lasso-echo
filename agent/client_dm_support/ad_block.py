@@ -54,6 +54,14 @@ FORBIDDEN_AD_IMPORT_PREFIXES = frozenset({
 
 # Attribute/function names that mean "write to an ad account". A call to any of
 # these -- however the callee was obtained -- is a build error in this package.
+#
+# THIS TABLE IS AN ENUMERATION AND IS NOT WHAT THE GUARANTEE RESTS ON. A hand list of
+# names loses to `api.adsets_insert(...)` like every enumeration loses to novel input.
+# It is a secondary check. The SOUND argument is the pair above and below it: a module
+# that cannot be imported (FORBIDDEN_AD_IMPORT_PREFIXES, now including the package root
+# and every aliasing route) and cannot be reached by reflection
+# (FORBIDDEN_DYNAMIC_MODULES / _CALLS) cannot have any function called on it, whatever
+# that function is named.
 FORBIDDEN_AD_CALL_NAMES = frozenset({
     "create_campaign", "update_campaign", "bulk_update_campaigns",
     "duplicate_campaign", "create_adset", "update_adset",
@@ -90,7 +98,20 @@ FORBIDDEN_AD_LITERAL_FRAGMENTS = (
 FORBIDDEN_DYNAMIC_MODULES = frozenset({
     "importlib", "subprocess", "runpy", "ctypes", "socket",
     "requests", "httpx", "urllib", "urllib.request", "http.client",
+    # `sys` gives sys.modules, which is a dynamic import by another name:
+    # sys.modules['agent.meta_publisher'] reaches a module this file forbids
+    # importing. The package has no need for sys.
+    "sys",
 })
+
+# Module names refused by EXACT match only (never as a prefix).
+#
+# MODULE-OBJECT ALIASING: `import agent` then `agent.meta_publisher.publish(...)`
+# imports nothing forbidden by name and calls nothing in the call table, yet reaches
+# the module. So importing the package ROOT is refused. It must be exact-match: every
+# legitimate import in this package resolves to `agent.something`, and forbidding that
+# as a prefix would refuse the whole package.
+FORBIDDEN_EXACT_MODULES = frozenset({"agent"})
 
 # Names that can ONLY mean an escape hatch. Deliberately tight: `compile` is
 # re.compile, `run` is diagnostics.run, and flagging those would make the scanner
@@ -158,9 +179,37 @@ def _imported_names(tree, package=PACKAGE_DOTTED):
                 base = _resolve_relative(node.module, node.level, package)
             if not base:
                 continue
-            yield base
+            # `from .. import config` names no module of its own -- its base is the
+            # package root, and yielding that would flag every ordinary relative
+            # import as package-root aliasing. Only the CHILDREN it actually binds
+            # are imports; a bare `import agent` still yields the root and is refused.
+            if node.level == 0 or node.module:
+                yield base
             for a in node.names:
                 yield f"{base}.{a.name}"
+
+
+def _dotted(node):
+    """The dotted name of an attribute chain, e.g. `agent.meta_publisher.publish` for
+    that expression. None when the chain is not rooted in a plain name."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _attribute_chains(tree):
+    """Every dotted attribute chain in the file. Catches module-object aliasing, where
+    a forbidden module is reached through an object rather than by importing its name."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            d = _dotted(node)
+            if d:
+                yield d
 
 
 def _called_names(tree):
@@ -180,6 +229,12 @@ def _fold(node):
     reader and must be one string to the scanner too."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        # A URL hidden as a bytes literal reads the same to a human.
+        try:
+            return node.value.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return ""
     if isinstance(node, ast.JoinedStr):
         return "".join(_fold(v) or "" for v in node.values)
     if isinstance(node, ast.FormattedValue):
@@ -199,8 +254,10 @@ def _string_literals(tree):
             folded = _fold(node)
             if folded:
                 yield folded
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            yield node.value
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            folded = _fold(node)
+            if folded:
+                yield folded
 
 
 def scan_for_ad_call_paths(pkg_dir=None):
@@ -235,11 +292,16 @@ def scan_for_ad_call_paths(pkg_dir=None):
                         f"I/O are forbidden here -- they would make the ad import/call "
                         f"tables unenforceable."
                     )
+            if name in FORBIDDEN_EXACT_MODULES:
+                findings.append(
+                    f"{path}: imports the package root {name!r}, which reaches every "
+                    f"module under it by attribute access without naming any of them"
+                )
 
         for name in _called_names(tree):
             if name in FORBIDDEN_AD_CALL_NAMES:
                 findings.append(f"{path}: calls forbidden ad-write function {name!r}")
-            if name in FORBIDDEN_DYNAMIC_CALLS and os.path.basename(path) != "ad_block.py":
+            if name in FORBIDDEN_DYNAMIC_CALLS:
                 findings.append(
                     f"{path}: calls {name!r}, a dynamic-dispatch or subprocess escape "
                     f"hatch; it could reach an ad write the static tables cannot see"
@@ -249,6 +311,15 @@ def scan_for_ad_call_paths(pkg_dir=None):
         # attribute access with a default). A COMPUTED name is reflection, and
         # `getattr(m, "create_" + "campaign")` is exactly the bypass the call table
         # cannot see, so only that form is refused.
+        # Module-object aliasing, e.g. `import agent` + `agent.meta_publisher.x(...)`.
+        for chain in _attribute_chains(tree):
+            for bad in FORBIDDEN_AD_IMPORT_PREFIXES:
+                if chain == bad or chain.startswith(bad + "."):
+                    findings.append(
+                        f"{path}: reaches forbidden module {bad!r} through the "
+                        f"attribute chain {chain!r} without importing it by name"
+                    )
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

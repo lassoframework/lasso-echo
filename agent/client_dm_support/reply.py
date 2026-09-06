@@ -93,6 +93,12 @@ class ReplyTemplate:
     # is not enough for a template that claims Echo did something: a snapshot carrying
     # sync_ran=False satisfied presence and rendered "I ran the photo sync just now".
     requires_true: tuple = ()
+    # Facts that must be present AND FALSE. The polarity twin of requires_true, and it
+    # exists for the same reason: cta_missing_section says "It has no CTA rotation
+    # section at all" while only requiring cta_section_present to be PRESENT, so it
+    # rendered that sentence off a snapshot where the section was present. A template
+    # may not state a claim its own facts contradict, in EITHER direction.
+    requires_false: tuple = ()
     # True when the template asserts Echo performed an action. Such a template must
     # require a run fact AND require it to be true; assert_templates_wellformed()
     # enforces both.
@@ -105,7 +111,7 @@ class ReplyTemplate:
     @property
     def fact_keys(self):
         return tuple(sorted(set(self.slots) | set(self.requires)
-                            | set(self.requires_true)))
+                            | set(self.requires_true) | set(self.requires_false)))
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +183,7 @@ CTA_MISSING_SECTION = _register(ReplyTemplate(
     diagnostic_id=_diag.DIAG_CTA_POOL,
     requires=("voice_doc_present", "cta_section_present"),
     requires_true=("voice_doc_present",),
+    requires_false=("cta_section_present",),   # it says "no CTA section AT ALL"
     text=(
         "I checked your brand voice doc. It has no \"CTA rotation\" section at all, "
         "so your posts have {cta_pool_count} call(s) to action to draw from. What "
@@ -197,7 +204,7 @@ def assert_templates_wellformed():
                     f"template {t.id!r} interpolates {{{slot}}}, which is not a fact "
                     f"key in facts.ALL_FACT_KEYS"
                 )
-        for req in t.requires:
+        for req in tuple(t.requires) + tuple(t.requires_true) + tuple(t.requires_false):
             if req not in _facts.ALL_FACT_KEYS:
                 problems.append(
                     f"template {t.id!r} requires {req!r}, which is not a fact key"
@@ -214,6 +221,12 @@ def assert_templates_wellformed():
                 f"value can carry whole sentences, and the byte-identical gate cannot "
                 f"see them because the reconstruction contains the same text. A reply "
                 f"slot may only be a value Echo itself computes."
+            )
+        contradiction = set(t.requires_true) & set(t.requires_false)
+        if contradiction:
+            problems.append(
+                f"template {t.id!r} requires {sorted(contradiction)} to be both true "
+                f"and false; it can never render"
             )
         if t.claims_action and not (set(t.requires_true) & _facts.RUN_FACT_KEYS):
             problems.append(
@@ -297,6 +310,12 @@ def render(template, snapshot):
             f"template {template.id!r} requires fact(s) {falsy} to be TRUE, but the "
             f"snapshot has them false/zero; refusing to state something that did not "
             f"happen"
+        )
+    truthy = [k for k in template.requires_false if snapshot.get(k)]
+    if truthy:
+        raise ReplyRefused(
+            f"template {template.id!r} requires fact(s) {truthy} to be FALSE, but the "
+            f"snapshot has them true; refusing to state something the facts contradict"
         )
     values = {}
     for slot in template.slots:

@@ -137,7 +137,7 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
         return {"ok": False, "reason": f"poll failed: {type(e).__name__}",
                 "handled": 0, "replied": 0, "escalated": 0}
 
-    replied = escalated = handled = skipped = 0
+    replied = escalated = handled = skipped = undelivered = 0
     decisions = []
     for t in tickets:
         msgs = _messages(bus, t)
@@ -163,12 +163,25 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
                 escalation_sink(t, decision)
                 escalated += 1
         except Exception as e:  # noqa: BLE001 - one ticket never sinks the pass
+            # A swallowed delivery failure was silence: the fix had already run, the
+            # client was told nothing, no escalation row existed, and the counters read
+            # {replied:0, escalated:0} -- indistinguishable from "nothing to do". Try
+            # the escalation sink so a human sees it; if that fails too, count it as an
+            # explicit failure rather than letting the pass look clean.
             log(f"delivery failed for ticket {t.get('id')}: {type(e).__name__}: {e}")
+            try:
+                escalation_sink(t, decision)
+                escalated += 1
+            except Exception as e2:  # noqa: BLE001
+                log(f"escalation ALSO failed for ticket {t.get('id')}: "
+                    f"{type(e2).__name__}: {e2}")
+                undelivered += 1
 
     log(f"client-dm autofix: {handled} handled, {replied} grounded reply(ies), "
-        f"{escalated} escalated, {skipped} already handled")
+        f"{escalated} escalated, {skipped} already handled, {undelivered} UNDELIVERED")
     return {"ok": True, "handled": handled, "replied": replied,
-            "escalated": escalated, "skipped": skipped, "decisions": decisions}
+            "escalated": escalated, "skipped": skipped,
+            "undelivered": undelivered, "decisions": decisions}
 
 
 def _messages(bus, ticket):
@@ -185,7 +198,11 @@ def _att(m):
 
 def _surface_of(msgs):
     """The surface, read off the INBOUND message's attachments where the adapter
-    actually writes it (adapter.py:729) — support_tickets has no surface column."""
+    actually writes it (adapter.py:729) — support_tickets has no surface column.
+
+    ORDERING: bus.recent_messages returns created_at.desc, i.e. NEWEST FIRST
+    (bus.py:273-277). Iterating forward therefore reads the most recent inbound
+    message, which is what we want."""
     for m in msgs:
         if str(m.get("direction")) != "inbound":
             continue
@@ -209,8 +226,15 @@ def _already_handled(msgs):
 def _latest_client_text(msgs):
     """The most recent CLIENT-authored inbound message. Staff text is ignored on
     purpose: this lane answers the gym owner, and a staff instruction in the same
-    thread is not a support request."""
-    for m in reversed(list(msgs)):
+    thread is not a support request.
+
+    ORDERING BUG, FIXED: bus.recent_messages orders created_at.DESC — newest first
+    (bus.py:273-277, and its own docstring says so). The first version reversed that
+    list and returned the OLDEST client message, so the lane diagnosed and replied to
+    the client's first sentence and never saw a follow-up -- including a follow-up the
+    ad belt would have caught ("forget the photos, can you double my ad budget?").
+    Newest-first is the order we are given, so iterate it forward."""
+    for m in msgs:
         if str(m.get("direction")) != "inbound":
             continue
         if str(m.get("author_type") or "").lower() in ("staff", "bot"):

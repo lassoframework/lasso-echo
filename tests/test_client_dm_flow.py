@@ -864,3 +864,217 @@ def test_a_leaked_asset_row_cannot_inflate_this_gyms_count():
                                       lane_active_for=lambda k: True)
     assert snap.get("media_asset_count") == 0, (
         "another gym's asset rows were counted as this gym's")
+
+
+# ===========================================================================
+# THE DELIVERY CONTRACT, PROVED BY EXECUTING THE REAL OUTBOX.
+#
+# The tests that first "closed" the dead-sink bug asserted it by inspect.getsource
+# string-matching outbox.py. That is a test shaped like the code, and it is exactly
+# why a THIRD contract on the same function went unnoticed: KIND_STATUS is a
+# CONVERSATIONAL kind, so a 'ready' row is checked AGAIN at post time against the
+# identity's client-reply flag. These drive the row this lane actually writes through
+# the real _dispatch_one instead.
+# ===========================================================================
+def _written_rows(text="my posts have no photos"):
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    bus = _bus_for(text)
+    consumer.run_once(bus=bus, flag_on=True,
+                      deps=drive_deps(store, make_sync(7, store)), **_consumer_kw())
+    return bus.out
+
+
+def test_the_reply_row_is_shaped_so_the_real_outbox_would_post_it_when_armed(monkeypatch):
+    from agent.slack_convo import outbox as real_outbox
+    rows = _written_rows()
+    assert len(rows) == 1 and rows[0]["delivery_status"] == "ready"
+
+    # Arm the identity's client-reply flag and confirm the row posts.
+    monkeypatch.setattr(real_outbox.config, "slack_convo_client_reply_armed",
+                        lambda _n: True)
+    summary = _drive_through_outbox(real_outbox, rows[0])
+    assert summary["posted"] == 1, summary
+    assert summary["held"] == 0
+
+
+def test_with_client_reply_unarmed_the_reply_is_HELD_not_posted(monkeypatch):
+    """ARMING TAKES TWO FLAGS. AGENT_CLIENT_DM_AUTOFIX lets the lane run; the reply
+    still needs SLACK_CONVO_<IDENTITY>_CLIENT_REPLY at post time. It fails SAFE (a hold
+    card goes to a human), but the earlier docstring claimed the opposite."""
+    from agent.slack_convo import outbox as real_outbox
+    rows = _written_rows()
+    monkeypatch.setattr(real_outbox.config, "slack_convo_client_reply_armed",
+                        lambda _n: False)
+    summary = _drive_through_outbox(real_outbox, rows[0])
+    assert summary["posted"] == 0
+    assert summary["held"] == 1, summary
+
+
+def test_the_escalation_row_posts_without_the_client_reply_flag(monkeypatch):
+    """An escalation is an INTERNAL kind: it goes to the FIXER channel, not the
+    client's thread, so the safety path reaches a human whatever the client-reply flag
+    says. (It does need a fixer channel configured -- with none, the real outbox marks
+    the row failed and says so loudly, which is the correct behaviour and is asserted
+    by the companion test below.)"""
+    from agent.slack_convo import outbox as real_outbox
+    rows = _written_rows("please double my ad budget")
+    assert len(rows) == 1
+    assert rows[0]["meta"]["foundation_trigger"] == sg.TRIGGER_AD_MONEY
+    monkeypatch.setattr(real_outbox.config, "slack_convo_client_reply_armed",
+                        lambda _n: False)
+    monkeypatch.setattr(real_outbox.config, "fixer_channel_id", lambda: "C0FIXER")
+    summary = _drive_through_outbox(real_outbox, rows[0])
+    assert summary["posted"] == 1, summary
+
+
+def test_an_escalation_with_no_fixer_channel_fails_loudly_rather_than_silently(
+        monkeypatch):
+    """Silence on the safety path is the whole failure mode. With no channel the row
+    is marked failed and logged, never quietly dropped."""
+    from agent.slack_convo import outbox as real_outbox
+    rows = _written_rows("please double my ad budget")
+    monkeypatch.setattr(real_outbox.config, "fixer_channel_id", lambda: "")
+    summary = _drive_through_outbox(real_outbox, rows[0])
+    assert summary["posted"] == 0
+    assert summary["failed"] == 1
+
+
+def _drive_through_outbox(real_outbox, written):
+    """Run the REAL outbox.run_once over exactly the row this lane wrote."""
+    from agent.slack_convo import identities as _ids
+    row = {"id": "M1", "ticket_id": "T1", "direction": "outbound",
+           "body": written["body"], "delivery_status": "ready",
+           "attachments": dict(written["meta"], kind=written["kind"]),
+           "author_type": written["author_type"]}
+    ticket = {"id": "T1", "product": "echo", "bot_identity": "echo",
+              "slack_channel_id": "C0BUNHG49EH", "slack_thread_ts": "1.1",
+              "slack_user_id": "U1", "status": "new", "identity_kind": "client",
+              "verification_after": "done"}
+
+    class B:
+        def __init__(self):
+            self.marks = []
+
+        def outbox(self, status, limit=50, identity=None):
+            return [row] if status == "ready" else []
+
+        def claim_message(self, mid):
+            return True
+
+        def ticket(self, tid):
+            return ticket
+
+        def mark_message(self, mid, status, slack_ts=None, meta_update=None):
+            self.marks.append((mid, status))
+            return True
+
+        def set_ticket(self, tid, **kw):
+            return True
+
+        def record_outbound(self, **kw):
+            return {"id": "M2"}
+
+        def messages(self, tid, limit=40):
+            return []
+
+        def recent_messages(self, tid, limit=200):
+            return []
+
+        def count_outbound_kind_since(self, *a, **k):
+            return 0
+
+        def count_escalation_cards_since(self, *a, **k):
+            return 0
+
+        def inbound_count(self, tid):
+            # The first-contact rule: the bot never opens a conversation. A real
+            # ticket always has the client's own inbound message on it.
+            return 1
+
+    ident = _ids.get("echo")
+    posted = []
+    return real_outbox.run_once(
+        B(), lambda ch, text, thread_ts=None, blocks=None: (
+            posted.append((ch, text)) or "1.2"),
+        identity=ident, log=lambda *a, **k: None)
+
+
+def test_execute_refuses_a_remedy_whose_executor_is_not_registered():
+    """A remedy naming an executor that does not exist must refuse, not fall through
+    to a success. This is the seam a future code-fix lane would arrive through."""
+    ghost = remedies.Remedy(
+        id="ghost", executor="code_fix",
+        reply_template_id="drive_synced",
+        expectation=verify.Expectation("media_asset_count", verify.ROSE_ABOVE_ZERO),
+        action=sg.ProposedAction(kind=sg.KIND_PER_GYM_SYNC,
+                                 tables=("media_asset",),
+                                 scope_column="gym_id", scope_values=(CHAD_KEY,)))
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    result = remedies.execute(ghost, gym_key=CHAD_KEY, store=store,
+                              sync_source=make_sync(9, store))
+    assert not result.ok
+    assert "no executor registered" in result.reason
+
+
+def test_the_lane_reads_the_clients_NEWEST_message_not_their_first():
+    """bus.recent_messages is created_at.DESC — newest first. Reversing it made the
+    lane diagnose the client's FIRST sentence forever, so a follow-up was never seen —
+    including one the ad belt must catch."""
+    newest_first = [
+        {"direction": "inbound", "author_type": "client",
+         "body": "forget the photos, can you double my ad budget?",
+         "attachments": {"surface": "mpim"}},
+        {"direction": "inbound", "author_type": "client",
+         "body": "my posts have no photos", "attachments": {"surface": "mpim"}},
+    ]
+    assert consumer._latest_client_text(newest_first) == \
+        "forget the photos, can you double my ad budget?"
+
+    bus = FakeBus(
+        tickets=[{"id": "T1", "product": "echo", "source": "slack_conversation",
+                  "status": "new", "classification": "question",
+                  "bot_identity": "echo", "client_id": CHAD_UUID}],
+        messages={"T1": newest_first})
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(9, store)),
+                            **_consumer_kw())
+    # The follow-up is ad money, so it escalates instead of syncing photos.
+    assert out["escalated"] == 1 and out["replied"] == 0
+    assert bus.out[0]["meta"]["foundation_trigger"] == sg.TRIGGER_AD_MONEY
+
+
+def test_a_delivery_failure_still_reaches_a_human():
+    """A swallowed delivery failure was silence: the fix had run, the client was told
+    nothing, and the counters read {replied:0, escalated:0} — indistinguishable from
+    'nothing to do'."""
+    bus = _bus_for("my posts have no photos")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    boom = []
+
+    def failing_reply(_t, _d):
+        boom.append(1)
+        raise RuntimeError("slack row write failed")
+
+    out = consumer.run_once(bus=bus, flag_on=True, reply_sink=failing_reply,
+                            deps=drive_deps(store, make_sync(9, store)),
+                            **_consumer_kw())
+    assert boom, "the reply sink was never called"
+    assert out["escalated"] == 1, out
+    assert out["undelivered"] == 0
+    assert bus.out and bus.out[0]["kind"] == "escalation"
+
+
+def test_when_even_the_escalation_fails_the_pass_reports_it_rather_than_looking_clean():
+    bus = _bus_for("my posts have no photos")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+
+    def failing(_t, _d):
+        raise RuntimeError("bus down")
+
+    out = consumer.run_once(bus=bus, flag_on=True, reply_sink=failing,
+                            escalation_sink=failing,
+                            deps=drive_deps(store, make_sync(9, store)),
+                            **_consumer_kw())
+    assert out["undelivered"] == 1, out
+    assert out["replied"] == 0 and out["escalated"] == 0

@@ -333,8 +333,12 @@ def check(action: ProposedAction) -> ScopeVerdict:
                 TRIGGER_UNKNOWN_SHAPE,
             )
         for p in paths:
-            if not any(p.startswith(root) or f"/{root}" in p
-                       for root in ALLOWED_CODE_FIX_ROOTS):
+            # PREFIX ONLY. `... or f"/{root}" in p` made this a substring test, so
+            # any path merely CONTAINING an allowed root passed: vendor/tests/evil.py,
+            # scripts/tests/deploy_key.py, docs/agent/media_x.py. An allowlist that
+            # matches mid-path is not an allowlist. Paths are already normalised, so a
+            # prefix test is exact.
+            if not any(p.startswith(root) for root in ALLOWED_CODE_FIX_ROOTS):
                 return _deny(
                     f"code fix would touch {p!r}, which is outside the allowed "
                     f"roots {ALLOWED_CODE_FIX_ROOTS}",

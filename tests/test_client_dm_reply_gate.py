@@ -371,3 +371,157 @@ def test_a_missing_SLOT_refuses_even_when_every_requires_true_fact_holds():
         diag.DIAG_DRIVE_PHOTOS, "diagnosis", "crossfitlocal",
         {"media_source_revoked": True, "media_asset_count": 0})
     assert "0 file(s)" in reply.render("drive_revoked", whole)
+
+
+# ===========================================================================
+# GUARDS AN INDEPENDENT MUTATION RUN FOUND ASSERTED BY NOTHING.
+#
+# The whole of the "bound client-controlled slot values" commit could be deleted
+# and the suite stayed green — the tests written alongside it were replaced when
+# the slot itself was removed, and nothing was left holding the remaining defence
+# in depth. These assert the rules directly.
+# ===========================================================================
+def test_safe_slot_refuses_a_control_character_or_newline():
+    """Defence in depth behind the structural rule: even a slot value Echo computes
+    must not be able to forge message structure."""
+    for hostile in ("a\nb", "a\rb", "a\tb", "a\x00b", "a\x07b", "a\x7fb"):
+        with pytest.raises(reply.ReplyRefused) as e:
+            reply._safe_slot("media_source_folder_name", hostile)
+        assert "control character" in str(e.value)
+
+
+def test_safe_slot_refuses_an_over_long_value_rather_than_truncating():
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply._safe_slot("media_source_folder_name", "x" * (reply.MAX_SLOT_CHARS + 1))
+    assert "cap" in str(e.value)
+    # ...and accepts one exactly at the cap, so the boundary is asserted too.
+    ok = "x" * reply.MAX_SLOT_CHARS
+    assert reply._safe_slot("media_source_folder_name", ok) == ok
+
+
+def test_safe_slot_escapes_slack_markup():
+    assert reply._safe_slot("k", "<!channel>") == "&lt;!channel&gt;"
+    assert reply._safe_slot("k", "a & b") == "a &amp; b"
+    # Ampersand first, so escaping is not reversible by one un-escape pass.
+    assert reply._safe_slot("k", "&lt;") == "&amp;lt;"
+
+
+def test_safe_slot_passes_non_strings_through():
+    assert reply._safe_slot("media_asset_count", 34) == 34
+    assert reply._safe_slot("scheduled_sync_elapsed", False) is False
+
+
+def test_render_slack_escapes_the_whole_body():
+    """The single-point whole-body escape, matching the adapter's own DV4 fix.
+
+    It is a NO-OP for today's registry -- every slot is an integer Echo computed and no
+    template constant contains & < > -- so it cannot be exercised through the shipped
+    templates. That is precisely why it needs a direct test: a defence that is
+    currently inert is the easiest thing to delete by accident, and the next template
+    to carry a character like that would post live Slack markup. So this plants one."""
+    planted = reply.ReplyTemplate(
+        id="planted_escape", diagnostic_id=diag.DIAG_DRIVE_PHOTOS,
+        requires=("media_source_revoked",), requires_true=("media_source_revoked",),
+        text="Ping <!channel> & check {media_asset_count} files <now>")
+    reply.TEMPLATES["planted_escape"] = planted
+    try:
+        snap = _drive_snapshot(media_asset_count=0, media_source_revoked=True)
+        body = reply.render("planted_escape", snap)
+        assert "<!channel>" not in body
+        assert "<" not in body and ">" not in body
+        assert "&lt;!channel&gt;" in body and "&amp;" in body
+        # The escape is INSIDE render(), so the gate's reconstruction matches it and
+        # a candidate carrying the raw markup is refused.
+        assert reply.assert_is_template_render(body, planted, snap) == body
+        with pytest.raises(reply.ReplyRefused):
+            reply.assert_is_template_render(
+                "Ping <!channel> & check 0 files <now>", planted, snap)
+    finally:
+        del reply.TEMPLATES["planted_escape"]
+
+
+def test_todays_templates_carry_no_characters_the_escape_would_change():
+    """The companion fact, stated so the no-op above is understood rather than
+    rediscovered: nothing shipped needs escaping, and that is by design."""
+    for t in reply.TEMPLATES.values():
+        assert not (set("&<>") & set(t.text)), t.id
+
+
+def test_a_template_may_not_state_a_claim_its_facts_contradict():
+    """MAJOR-5 with the polarity flipped. cta_missing_section says 'It has no CTA
+    rotation section at all'; requiring cta_section_present to be merely PRESENT let it
+    render off a snapshot where the section WAS present."""
+    contradicted = facts.GroundingSnapshot.build(
+        diag.DIAG_CTA_POOL, "diagnosis", "toughtemple52040e",
+        {"voice_doc_present": True, "cta_section_present": True,
+         "cta_section_is_todo": False, "cta_pool_count": 0})
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply.compose("cta_missing_section", contradicted)
+    assert "FALSE" in str(e.value)
+    # ...and it renders when the fact actually says what the sentence says.
+    truthful = facts.GroundingSnapshot.build(
+        diag.DIAG_CTA_POOL, "diagnosis", "toughtemple52040e",
+        {"voice_doc_present": True, "cta_section_present": False,
+         "cta_section_is_todo": False, "cta_pool_count": 0})
+    assert "no \"CTA rotation\" section" in reply.render("cta_missing_section", truthful)
+
+
+def test_the_registry_rejects_a_template_requiring_a_fact_both_ways():
+    bad = reply.ReplyTemplate(
+        id="planted3", diagnostic_id=diag.DIAG_CTA_POOL,
+        requires_true=("cta_section_present",),
+        requires_false=("cta_section_present",),
+        text="{cta_pool_count}")
+    reply.TEMPLATES["planted3"] = bad
+    try:
+        with pytest.raises(reply.ReplyRefused) as e:
+            reply.assert_templates_wellformed()
+        assert "both true" in str(e.value)
+    finally:
+        del reply.TEMPLATES["planted3"]
+
+
+def test_requires_false_keys_must_be_real_fact_keys():
+    bad = reply.ReplyTemplate(
+        id="planted4", diagnostic_id=diag.DIAG_CTA_POOL,
+        requires_false=("not_a_fact",), text="{cta_pool_count}")
+    reply.TEMPLATES["planted4"] = bad
+    try:
+        with pytest.raises(reply.ReplyRefused):
+            reply.assert_templates_wellformed()
+    finally:
+        del reply.TEMPLATES["planted4"]
+
+
+# --- facts / verify guards -------------------------------------------------
+def test_an_unknown_snapshot_stage_is_rejected():
+    with pytest.raises(facts.FactError):
+        facts.GroundingSnapshot.build(diag.DIAG_CTA_POOL, "probably_fine", "x",
+                                      {"cta_pool_count": 0})
+    for good in ("diagnosis", "verification"):
+        assert facts.GroundingSnapshot.build(
+            diag.DIAG_CTA_POOL, good, "x", {"cta_pool_count": 0}).stage == good
+
+
+def test_verify_refuses_a_before_snapshot_that_is_not_a_diagnosis():
+    from agent.client_dm_support import verify
+    a = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"media_asset_count": 0})
+    b = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"media_asset_count": 5})
+    r = verify.check(verify.Expectation("media_asset_count", verify.ROSE_ABOVE_ZERO),
+                     a, b)
+    assert not r.verified
+    assert "expected 'diagnosis'" in r.reason
+
+
+def test_verified_snapshot_is_stamped_as_a_verification():
+    from agent.client_dm_support import verify
+    after = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"media_asset_count": 5})
+    merged = verify.verified_snapshot(after, {"sync_ran": True,
+                                              "assets_inserted_this_run": 5})
+    assert merged.stage == "verification"
+    assert merged.get("sync_ran") is True
+    # A diagnosis-stamped merge would let a reply be composed off unverified facts.
+    assert merged.diagnostic_id == diag.DIAG_DRIVE_PHOTOS
