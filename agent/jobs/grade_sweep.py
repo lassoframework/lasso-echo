@@ -283,6 +283,127 @@ def _held_alert_text(gym_id: str, grade, fix: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# C7 — a gym stuck below A must ASK A NAMED HUMAN, not wait forever
+#
+# THE DEFECT: the remediation loop is bounded (_MAX_FIX_PASSES = 3 here, 4 in the
+# planner gate) and fix["passes"] / fix["trajectory"] live only in memory for the
+# length of one sweep. Nothing is persisted, so there is no such thing as "this gym
+# has been stuck at B for four nights". The held alert is deduped on (score, defect
+# set) -- which means a gym that is stuck in EXACTLY the same way goes SILENT after
+# the first night, precisely when it most needs a person. Nobody is named, nothing
+# is greppable, and the mechanics have already proven they cannot fix it.
+#
+# THE FIX: persist a consecutive-nights-held streak. Once a gym has been held for
+# grade_stuck_nights() runs in a row with the mechanics no longer moving the score,
+# raise a DIFFERENT alert: one stable tag (GRADE-STUCK) so it can be searched and
+# routed, the named approver so it lands on a person, the trajectory so the reader
+# can see the loop has flattened, and the exact decision being asked for.
+#
+# Flag: config.grade_stuck_escalation_enabled() (ECHO_GRADE_STUCK_ESCALATION,
+# default OFF). Flag off, not one extra kv read or alert happens.
+# ---------------------------------------------------------------------------
+
+STUCK_TAG = "GRADE-STUCK"
+
+
+def _streak_key(gym_id):
+    return f"grade_stuck_streak_{gym_id}"
+
+
+def _bump_stuck_streak(gym_id, grade, today_str, db=None):
+    """Advance (or start) this gym's consecutive-nights-held streak and return it as
+    {nights, first_seen, first_total, last_total, escalated_on}. A run on a day
+    already counted is idempotent, so a double sweep cannot inflate the count.
+    Never raises: streak plumbing may not break the sweep."""
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        raw = _db.kv_get(_streak_key(gym_id), "")
+        st = json.loads(raw) if raw else {}
+        if st.get("last_seen") == today_str:
+            return st                            # already counted today
+        if not st:
+            st = {"nights": 0, "first_seen": today_str,
+                  "first_total": grade.total, "escalated_on": ""}
+        st["nights"] = int(st.get("nights") or 0) + 1
+        st["last_seen"] = today_str
+        st["last_total"] = grade.total
+        st["letter"] = grade.letter
+        _db.kv_set(_streak_key(gym_id), json.dumps(st))
+        return st
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _clear_stuck_streak(gym_id, db=None):
+    """A book that reached A is not stuck. Clearing on recovery is what keeps the
+    escalation honest: the count means CONSECUTIVE nights, never a lifetime total."""
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        if _db.kv_get(_streak_key(gym_id), ""):
+            _db.kv_set(_streak_key(gym_id), "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _should_escalate_stuck(streak, threshold, today_str):
+    """True when this gym has been held for `threshold` consecutive nights and has
+    not already been escalated today. Deliberately NOT deduped on the defect set:
+    an unchanging defect set is the WHOLE POINT of this alert, and the existing
+    (score, defects) dedup is exactly why a stuck gym went quiet."""
+    if not streak:
+        return False
+    if int(streak.get("nights") or 0) < int(threshold):
+        return False
+    return streak.get("escalated_on") != today_str
+
+
+def _mark_escalated(gym_id, streak, today_str, db=None):
+    try:
+        _db = db
+        if _db is None:
+            from agent import db as _dbmod
+            _db = _dbmod
+        st = dict(streak or {})
+        st["escalated_on"] = today_str
+        _db.kv_set(_streak_key(gym_id), json.dumps(st))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stuck_alert_text(gym_id, grade, fix, streak, approver_id=""):
+    """The escalation a human can actually act on. One stable tag to route and
+    search on, the gym, how long, what the loop has stopped doing, the defect that
+    will not move, and the decision being asked for. Names a person so it is not
+    addressed to nobody."""
+    nights = int((streak or {}).get("nights") or 0)
+    first = (streak or {}).get("first_total")
+    traj = (fix or {}).get("trajectory") or []
+    traj_txt = " -> ".join(str(t[0]) for t in traj) if traj else str(grade.total)
+    stuck_on = [str(d[2]) for d in (grade.defects or [])[:3]] or ["no named defect"]
+    who = f"<@{approver_id}> " if approver_id else ""
+    moved = ("" if first is None or first == grade.total
+             else f" It has moved {first} to {grade.total} over that time.")
+    return (
+        f"{STUCK_TAG} {gym_id}: the forward book has been held at {grade.total} "
+        f"({grade.letter}) for {nights} run(s) in a row and the automatic "
+        f"remediation loop has stopped improving it (this run: {traj_txt})." "\n"
+        f"{who}this one needs a person: the mechanics have had "
+        f"{int((fix or {}).get('passes') or 0)} pass(es) and cannot close it."
+        f"{moved}" "\n"
+        f"Stuck on: {stuck_on}" "\n"
+        f"Decide one: fix the source material (photos / approved sources / the "
+        f"gym's own asks), accept the grade for this gym, or change the rule that "
+        f"is firing. Nothing was published and nothing was fabricated."
+    )
+
+
 def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     """
     Main entry point: grade each gym's trailing 30 days and forward book.
@@ -337,6 +458,7 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     self_fix = config.grade_self_fix_enabled()
     fixed_gyms, held_gyms, alerted_gyms = [], [], []
     dropped_gyms = []
+    stuck_gyms = []          # C7: gyms escalated to a NAMED human this run
 
     results = {}
     for gym_id in gyms:
@@ -423,6 +545,22 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                                                               today_str):
                         alert_fn(_held_alert_text(gym_id, f_grade, fix))
                         alerted_gyms.append(gym_id)
+                    # C7: a gym stuck for several nights running is waiting on a
+                    # HUMAN, and the (score, defect set) dedup above goes silent on
+                    # exactly that gym. Count the nights and name a person.
+                    if fix is not None and config.grade_stuck_escalation_enabled():
+                        streak = _bump_stuck_streak(gym_id, f_grade, today_str)
+                        if _should_escalate_stuck(streak,
+                                                  config.grade_stuck_nights(),
+                                                  today_str):
+                            alert_fn(_stuck_alert_text(
+                                gym_id, f_grade, fix, streak,
+                                approver_id=getattr(config, "APPROVER_SLACK_ID", "")))
+                            _mark_escalated(gym_id, streak, today_str)
+                            stuck_gyms.append(gym_id)
+                            alerted_gyms.append(gym_id)
+                elif config.grade_stuck_escalation_enabled():
+                    _clear_stuck_streak(gym_id)   # reached A: the streak is over
             # REGRESSION GUARD: a book that got WORSE than its last run means a
             # build is re-creating defects. That fires whatever the letter is —
             # a book sliding from A to B is the early warning that the below-B
@@ -463,6 +601,10 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
     if self_fix:
         out["self_fixed"] = fixed_gyms
         out["held"] = held_gyms
+        # C7 reports only when it is ARMED: flag off leaves the return shape
+        # byte for byte what every existing caller already reads.
+        if config.grade_stuck_escalation_enabled():
+            out["stuck_escalated"] = stuck_gyms
     out["dropped"] = dropped_gyms
     return out
 

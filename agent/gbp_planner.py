@@ -181,6 +181,48 @@ def _row(portal_gym_key, account_gen_key, day_key, caption, image_url, *,
     return row
 
 
+# ---- B9: an empty GBP month must name what is MISSING ---------------------------
+# ENG, 2026-09: the month sweep failed for four gyms with the single line "nothing
+# planned (no A+ captions or media)". That sentence is true and useless -- it names
+# two possible causes and tells the gym which of them applies for neither. The planner
+# already knows: every skipped slot has exactly one reason. This turns the ledger into
+# one sentence a gym owner can act on today.
+#
+# GBP KEEPS ITS OWN BAR. The A+ caption gate is NOT relaxed and no threshold is lowered
+# here: a slot that cannot clear the gate is still skipped, and nothing is ever
+# fabricated to fill it. The only thing that changes is what we SAY about the empty
+# month. "Give GBP its own threshold" was the alternative; naming the gap is the honest
+# half of that choice, and it is the half that does not put weaker copy in front of
+# Google.
+_SKIP_LANGUAGE = (
+    ("no_media", "add photos (connect the gym's Drive folder or upload in the portal)"),
+    ("no_fact", "add approved content sources (the intake form's about / offers / "
+                "events sections are empty)"),
+    ("caption_rejected", "the drafted captions did not clear the quality gate"),
+    ("no_event_schedule", "the events on file have no schedule, so they cannot be posted"),
+)
+
+
+def empty_month_reason(skips, counts=None):
+    """One sentence naming the LARGEST real cause of an empty GBP month, in the gym's
+    own language. Falls back to the historical wording only when the ledger is empty
+    (a month with no slots attempted at all), so no caller loses its reason string."""
+    skips = dict(skips or {})
+    ranked = [(n, name, text) for name, text in _SKIP_LANGUAGE
+              for n in (int(skips.get(name) or 0),) if n > 0]
+    if not ranked:
+        return "nothing planned (no A+ captions or media)"
+    ranked.sort(key=lambda r: (-r[0], r[1]))
+    top_n, _top_name, top_text = ranked[0]
+    total = sum(n for n, _nm, _t in ranked)
+    rest = ""
+    if len(ranked) > 1:
+        rest = " Also skipped for: " + ", ".join(
+            f"{t} ({n})" for n, _nm, t in ranked[1:]) + "."
+    return (f"nothing planned: {total} Google Business slot(s) were skipped. "
+            f"The biggest gap is {top_n} slot(s) where {top_text}." + rest)
+
+
 def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city,
                    store, start=None, days=30, offer=None, events=(),
                    gbp_location_id=None, cta_url="", caption_fn=None, image_fn=None,
@@ -224,6 +266,12 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     used = set()
     rows = []
     counts = {"standard": 0, "offer": 0, "event": 0, "photo": 0, "skipped": 0}
+    # B9 (ENG, month sweep): a bare "nothing planned (no A+ captions or media)"
+    # told four gyms nothing they could act on. Every skipped slot now records WHY,
+    # so an empty month names the ONE thing the gym has to fix. Counting only; no
+    # slot is filled differently and nothing is fabricated to fill one.
+    skips = {"no_fact": 0, "no_media": 0, "caption_rejected": 0,
+             "no_event_schedule": 0}
 
     # GBP uses its own rotation namespace (_gbp suffix) so that IG/FB calendar
     # placement history doesn't block photos from appearing on Google Business.
@@ -269,6 +317,12 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             counts["standard"] += 1
         else:
             counts["skipped"] += 1
+            if not fact:
+                skips["no_fact"] += 1
+            elif not img_url:
+                skips["no_media"] += 1
+            else:
+                skips["caption_rejected"] += 1
         day += timedelta(days=3)
 
     # ---- 1 OFFER (GATE 1: only when a real offer + redeem url resolved AND confirmed) ----
@@ -285,6 +339,10 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             counts["offer"] += 1
         else:
             counts["skipped"] += 1
+            if not img_url:
+                skips["no_media"] += 1
+            else:
+                skips["caption_rejected"] += 1
         day += timedelta(days=2)
     elif offer and offer[0] and offer[1] and not offer_confirmed:
         log(f"{portal_gym_key}: offer '{offer[0]}' resolved but NOT confirmed -> OFFER "
@@ -305,6 +363,12 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             counts["event"] += 1
         else:
             counts["skipped"] += 1
+            if not img_url:
+                skips["no_media"] += 1
+            elif not ev.get("schedule"):
+                skips["no_event_schedule"] += 1
+            else:
+                skips["caption_rejected"] += 1
         day += timedelta(days=2)
 
     # ---- 4 PHOTO drops (gallery uploads; image only, no caption gate) ----
@@ -320,8 +384,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
         pday += timedelta(days=7)
 
     if not rows:
-        return {"ok": False, "reason": "nothing planned (no A+ captions or media)",
-                "planned": 0, **counts}
+        return {"ok": False, "reason": empty_month_reason(skips, counts),
+                "planned": 0, "skips": dict(skips), **counts}
 
     if not hasattr(store, "insert_rows"):
         # never report a phantom success: a store that cannot persist means 0 rows landed
@@ -331,4 +395,5 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     log(f"{portal_gym_key}: planned {len(rows)} GBP rows "
         f"(std {counts['standard']}, offer {counts['offer']}, event {counts['event']}, "
         f"photo {counts['photo']}, skipped {counts['skipped']})")
-    return {"ok": True, "planned": len(inserted) or len(rows), **counts}
+    return {"ok": True, "planned": len(inserted) or len(rows),
+            "skips": dict(skips), **counts}

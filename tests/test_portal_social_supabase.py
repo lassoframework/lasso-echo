@@ -588,3 +588,72 @@ def test_approve_rejects_mid_claim_publishing_row(monkeypatch):
     assert status == 409 and body["ok"] is False
     assert "publishing right now" in body["error"]
     assert store.patches == [], "a publishing row must never be status-patched by approve"
+
+
+# ---------------------------------------------------------------------------
+# B12 — a post the client already rejected must leave their calendar
+#
+# Denying a post issues a REPLACEMENT (client_month_run.backfill_denied_slots) but
+# that lane is INSERT ONLY, and nothing transitions the original row out of 'denied'
+# (portal_calendar_store._WIPEABLE_STATUSES deliberately protects it from a rebuild).
+# The client render carried exactly one status filter, `!= "coach_review"`, so the
+# denied row was mapped into a card and shipped back to the owner beside its
+# replacement. Measured on production 2026-09-05 (September book): LASSO 45% of rows,
+# ENG 40%, pierce 34%, zanshin 33% denied or deleted.
+# ---------------------------------------------------------------------------
+
+def test_denied_row_and_its_replacement_do_not_both_show(monkeypatch):
+    store = _FakeStore([
+        _row("denied-1", status="denied", caption="the post the client rejected"),
+        _row("fresh-1", status="pending", caption="its replacement"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    ids = [p["id"] for p in body["posts"]]
+    assert ids == ["fresh-1"], "the client must not see a post they already denied"
+
+
+def test_killed_and_deleted_rows_are_hidden_from_the_client_too(monkeypatch):
+    store = _FakeStore([
+        _row("k-1", status="killed"),
+        _row("d-1", status="deleted"),
+        _row("live-1", status="approved"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    assert [p["id"] for p in body["posts"]] == ["live-1"]
+
+
+def test_escape_hatch_restores_the_historical_payload(monkeypatch):
+    monkeypatch.setenv("ECHO_PORTAL_SHOW_REJECTED", "true")
+    store = _FakeStore([
+        _row("denied-1", status="denied"),
+        _row("live-1", status="pending"),
+        _row("hidden-1", status="coach_review"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("lasso", "2026-08")
+    ids = sorted(p["id"] for p in body["posts"])
+    assert ids == ["denied-1", "live-1"], "coach_review stays hidden either way"
+
+
+def test_hiding_rejected_rows_never_raises_the_waiting_on_uploads_banner(monkeypatch):
+    # A month that is ENTIRELY denied is still a BUILT month. If the red banner were
+    # computed from the filtered cards, this gym would be told Echo is waiting on
+    # uploads it already has -- the exact wrong message after a bad approval week.
+    store = _FakeStore([
+        _row("denied-1", gym_id="eng", status="denied"),
+        _row("denied-2", gym_id="eng", status="denied"),
+    ])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    _, body = ps.handle_social("eng", "2026-08")
+    assert body["posts"] == []
+    assert body["awaiting_media"] is False
+
+
+def test_rejected_rows_are_hidden_never_deleted_or_restatused(monkeypatch):
+    store = _FakeStore([_row("denied-1", status="denied")])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    ps.handle_social("lasso", "2026-08")
+    assert store.patches == [] and store.caption_patches == []
+    assert store._rows["denied-1"]["status"] == "denied"   # the audit row survives
