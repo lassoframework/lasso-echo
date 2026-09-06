@@ -12,7 +12,8 @@ HARD RULES:
   it may call are the GET-only inbox/demographics reads.
 - ONE card per gym per day MAX, deduped via kv stamp `inbox_alert_<gym>_<date>`.
   The stamp is written only after a card is actually sent, so a morning with
-  nothing actionable does not eat the day's card.
+  nothing actionable does not eat the day's card -- and (AUD-108) neither does a
+  Slack outage: the notifier reports delivery and a False leaves the day open.
 - A card is sent ONLY when there are actionable items (member comments waiting
   for a reply, or spam to hide). Neutral items (emoji-only, friend tags) are
   counted nowhere and never carded.
@@ -286,7 +287,14 @@ def _coach_channel(gym_id):
 
 def _default_notifier(gym_id, text):
     """Coach channel when the gym has one; ops channel fallback (the
-    monthly_retro digest pattern). A failed post is logged, never raised."""
+    monthly_retro digest pattern). A failed post is logged, never raised.
+
+    RETURNS whether the card actually went out (AUD-108). It used to swallow every
+    failure and return None, and run() then wrote the one-card-per-day kv stamp
+    unconditionally -- so a Slack outage silently ATE that gym's card for the whole
+    day, and the module's own docstring ("written only after a card is actually
+    sent") was not true. Production carried 23 inbox_alert_* stamps with no way to
+    tell which of them stood for a card a coach ever saw."""
     try:
         ch = None if gym_id == "lasso" else _coach_channel(gym_id)
         if ch:
@@ -295,9 +303,11 @@ def _default_notifier(gym_id, text):
         else:
             from . import ops_alerts
             ops_alerts.alert(text)
+        return True
     except Exception as exc:  # noqa: BLE001
         print(f"[inbox-alerts] card post failed for {gym_id}: "
               f"{type(exc).__name__}")
+        return False
 
 
 def _default_gyms():
@@ -348,10 +358,24 @@ def run(gyms=None, zernio=None, now=None, notifier=None, kv_get=None, kv_set=Non
                 continue
             card = build_card(gym_id, summary.get("items") or [])
             if card:
-                notifier(gym_id, card)
-                kv_set(stamp, now.isoformat())
-                cards_sent += 1
-                summary["card_sent"] = True
+                # AUD-108: STAMP ONLY WHAT WAS ACTUALLY SENT. The stamp is this
+                # gym's ONE card for the day, so writing it on a failed post throws
+                # the card away and stays quiet about it. A notifier that reports
+                # False did not deliver; the day stays open and the next run retries.
+                #
+                # An injected notifier that returns None (every existing caller and
+                # test fake) is still treated as SENT, so this changes nothing for
+                # them -- only an explicit False is a failure.
+                delivered = notifier(gym_id, card)
+                if delivered is False:
+                    summary["card_sent"] = False
+                    summary["notify_failed"] = True
+                    print(f"[inbox-alerts] {gym_id}: card NOT delivered; the daily "
+                          "stamp is left unwritten so the next run retries")
+                else:
+                    kv_set(stamp, now.isoformat())
+                    cards_sent += 1
+                    summary["card_sent"] = True
             else:
                 summary["card_sent"] = False
             summary.pop("items", None)

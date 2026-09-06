@@ -1177,6 +1177,115 @@ def portal_approvals_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_PORTAL_APPROVALS", "false"))
 
 
+def reply_engine_watch_enabled() -> bool:
+    """AGENT_REPLY_ENGINE_WATCH, default OFF. The watchdog over the comment reply
+    engine (AUD-008 / AUD-105).
+
+    Verified live 2026-09-05: echo_reply_accounts holds 6 rows covering eng and
+    topfuel ONLY, echo_reply_settings holds 2, and echo_reply_queue holds 10 rows
+    that were ALL created 2026-08-31T14:27:20 (five days of zero ingest), while
+    gym_social_accounts holds 42 accounts and 26 instagram/facebook accounts across
+    13 gyms have no mapping at all. The portal's reply webhook answers HTTP 200
+    with ignored='account not mapped to a gym' (or 'gym disabled'), and a 200 is
+    an error to nobody, so those gyms drop every comment in silence.
+
+    Nothing noticed because the REPLY NEEDED cards come from inbox_alerts.py, which
+    reads the Zernio inbox directly; no code in this package has ever read
+    echo_reply_queue. Two systems that disagree, and the one that can actually reply
+    is the empty one.
+
+    ON: a daily READ ONLY comparison of the four tables, kv-deduped, that names the
+    unmapped gyms and a stalled ingest. It NEVER writes a mapping or enables a gym:
+    mapping a gym arms replying on that client's behalf, which is a person's call.
+    OFF (default): a no-op that reads nothing.
+    """
+    return _truthy(os.environ.get("AGENT_REPLY_ENGINE_WATCH", "false"))
+
+
+def media_repeat_report_enabled() -> bool:
+    """AGENT_MEDIA_REPEAT_REPORT, default OFF. Say out loud what the nightly
+    cross-day photo sweep deliberately did NOT fix (B5).
+
+    Measured live 2026-09-05 with the guard armed and the sweep running nightly:
+    zanshin had 5 photo repeats, dates_fixed 0, approved_left 5, small library --
+    one photo on 09-03 (live), 09-08 (approved) and 09-09 (approved), the same
+    picture three times inside seven days. LASSO had 28 repeats, dates_fixed 0.
+
+    The sweep is RIGHT to refuse both cases: it never swaps an APPROVED row's media
+    (the gym approved that exact card) and never fabricates media for a small
+    library. Recording those refusals as an integer on a stdout table is the defect
+    -- approved_left has been counted since the job was written and has never
+    reached a person, so the photos repeated for weeks while the machine reported
+    itself working.
+
+    ON: one kv-deduped sentence per gym per month (and again when it gets worse)
+    naming the photo, the dates, and which repeats fall inside 7 days. It changes
+    NO write behavior. OFF (default): byte for byte today, no extra kv read.
+    """
+    return _truthy(os.environ.get("AGENT_MEDIA_REPEAT_REPORT", "false"))
+
+
+def grade_stuck_escalation_enabled() -> bool:
+    """ECHO_GRADE_STUCK_ESCALATION, default OFF. The named-human escalation for a
+    calendar book that the remediation loop cannot fix (C7).
+
+    The loop is bounded (grade_sweep._MAX_FIX_PASSES = 3, the planner gate 4) and its
+    pass count lives only in memory for one sweep, so "stuck at B for four nights" is
+    not a thing the system can currently know. Worse, the held alert is deduped on
+    (score, defect set), so a gym stuck in EXACTLY the same way goes SILENT after the
+    first night -- precisely when it needs a person.
+
+    ON: consecutive held nights are counted in kv, and at grade_stuck_nights() the
+    sweep raises a GRADE-STUCK alert that names the approver and states the decision
+    being asked for. OFF (default): not one extra kv read, not one extra alert.
+    """
+    return _truthy(os.environ.get("ECHO_GRADE_STUCK_ESCALATION", "false"))
+
+
+def grade_stuck_nights() -> int:
+    """Consecutive nights a forward book may sit below A before C7 escalates to a
+    named human (ECHO_GRADE_STUCK_NIGHTS, default 3, floor 1)."""
+    try:
+        return max(1, int(os.environ.get("ECHO_GRADE_STUCK_NIGHTS", "3") or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def media_swap_free_enabled() -> bool:
+    """ECHO_MEDIA_SWAP_FREE, default OFF. The client-initiated FREE photo swap (B6).
+
+    A gym gets 15 recreates a month. The portal's only levers are approve / edit /
+    deny / kill, so "use a different photo" and "the caption needs work" are both a
+    deny and both burn one of the 15. Pete (zanshin) ran out of recreates swapping
+    PHOTOS. The counter was never wrong; the two actions were never separated.
+
+    ON: a media swap is FREE and unlimited (the caption Echo wrote is kept, only the
+    pixels change, so nothing is regenerated and nothing is spent). A caption
+    recreate still costs one of 15. OFF (default): byte-for-byte today's behavior --
+    the swap endpoint 403s and every deny charges the budget.
+
+    NEW client capability, so it ships dark. Arm by hand: ECHO_MEDIA_SWAP_FREE=true.
+    """
+    return _truthy(os.environ.get("ECHO_MEDIA_SWAP_FREE", "false"))
+
+
+def portal_show_rejected() -> bool:
+    """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
+
+    Default OFF means the guard is ARMED: a post the gym owner already denied or
+    killed, and a row that was deleted, no longer comes back to them as a card on
+    their own calendar (agent/portal_social._client_visible). Measured on production
+    2026-09-05, that was 45% of LASSO's September rows, 40% of ENG's, 34% of pierce's
+    and 33% of zanshin's -- one card in three was content the client had rejected.
+
+    Set ECHO_PORTAL_SHOW_REJECTED=true to restore the historical payload byte for
+    byte (only 'coach_review' hidden). Nothing is deleted or re-statused either way:
+    the rows stay in content_calendar for audit and the publisher's own exclusions
+    (portal_calendar_store.due_rows) are untouched.
+    """
+    return _truthy(os.environ.get("ECHO_PORTAL_SHOW_REJECTED", "false"))
+
+
 def social_billing_delegated() -> bool:
     """The LASSO portal now owns the $99.99/mo social subscription and enforces
     entitlement (isSocialEntitled) BEFORE it ever calls Echo. When this flag is ON,
@@ -3630,6 +3739,211 @@ def cadence_2x_enabled() -> bool:
     Arm by hand: ECHO_CADENCE_2X_ENABLED=true.
     """
     return _truthy(os.environ.get("ECHO_CADENCE_2X_ENABLED", "false"))
+
+
+def day_shape_assert_enabled() -> bool:
+    """
+    The DAY SHAPE guard (ECHO_DAY_SHAPE_ASSERT, default ON).
+
+    At plan time, before a single row reaches content_calendar, two rows on the
+    same (gym_id, account, post_date, format) must differ in BOTH caption and
+    image_url. A violation FAILS the plan pass and the build writes nothing.
+
+    This is the assertion that was missing on 2026-08-30, when a piercefitness
+    build wrote slot_index 0 and slot_index 1 of 2026-09-27 with one identical
+    caption, and on 2026-09-04, when Tough Temple published six times in forty
+    seconds off a plan exactly like it.
+
+    Armed by DEFAULT because it only ever PREVENTS a write that would repeat a
+    paying client's post on their own account. It can never cause a publish, and
+    it can never publish something new. Escape hatch, restoring the old silent
+    behavior exactly: ECHO_DAY_SHAPE_ASSERT=false.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ASSERT", "true"))
+
+
+def deny_streak_alarm_enabled() -> bool:
+    """
+    The DENY STREAK ALARM (AGENT_DENY_STREAK_ALARM, default ON).
+
+    Three (deny_streak_threshold()) consecutive coach denials on one
+    (gym_id, account), uninterrupted by an approval, posts ONE ops alert per
+    streak-ending date. Blake, 2026-09-06: "Tough Temple told us with the deny
+    button for a week and nobody read it." This is the detection this repo
+    never had -- purely informational, cannot block a write or change a post,
+    so it may default ON under the same "can only add a signal" doctrine as
+    day-shape and the CTA gate.
+
+    Escape hatch: AGENT_DENY_STREAK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DENY_STREAK_ALARM", "true"))
+
+
+def deny_streak_threshold() -> int:
+    """DENY_STREAK_THRESHOLD (default 3): consecutive denials on one account
+    that count as a content alarm. See agent.jobs.deny_streak_alarm."""
+    try:
+        return int(os.environ.get("DENY_STREAK_THRESHOLD", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def stale_escalation_reminder_enabled() -> bool:
+    """
+    The STALE ESCALATION REMINDER (AGENT_STALE_ESCALATION_REMINDER, default ON).
+
+    A ticket sitting in status='hold', escalated=True, unresolved past
+    stale_hold_hours() gets ONE re-fire reminder posted to #fixer per calendar
+    day it remains unresolved, naming its age. Checked against production
+    2026-09-06: the escalation path itself was never broken (Dean's ticket
+    posted to #fixer and acked within 5 seconds) -- what read as "parked" was
+    silence AFTER that single post, while the ticket sat unresolved for hours.
+    Same doctrine as day-shape and the ledger-key claim: a guard that can only
+    ADD a reminder, never silence one, may default ON.
+
+    Escape hatch, restoring today's silent-after-one-post behavior exactly:
+    AGENT_STALE_ESCALATION_REMINDER=false.
+    """
+    return _truthy(os.environ.get("AGENT_STALE_ESCALATION_REMINDER", "true"))
+
+
+def stale_hold_hours() -> float:
+    """
+    STALE_HOLD_HOURS (default 4.0): how long a ticket may sit in
+    status='hold', escalated=True before agent.jobs.stale_escalation_reminder
+    considers it stale and re-fires. Long enough that a human triaging #fixer
+    is not nagged every poll cycle for a ticket they are actively working; not
+    so long that a client's content complaint waits a full day for anyone to
+    notice it never got a second look.
+    """
+    try:
+        return float(os.environ.get("STALE_HOLD_HOURS", "4.0"))
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def day_shape_block_alarm_enabled() -> bool:
+    """
+    The DAY SHAPE BLOCK ALARM (AGENT_DAY_SHAPE_BLOCK_ALARM, default ON).
+
+    Purely additive to the existing day_shape.py alert: adds the gym's
+    remaining runway to the message, and posts ONE extra SOCIAL escalation
+    the day a gym's consecutive-blocked streak first reaches
+    day_shape_escalate_days(). Cannot block or change a write -- same
+    "can only add a signal" doctrine as the other alarms shipped 2026-09-06.
+
+    Escape hatch: AGENT_DAY_SHAPE_BLOCK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DAY_SHAPE_BLOCK_ALARM", "true"))
+
+
+def day_shape_escalate_days() -> int:
+    """DAY_SHAPE_ESCALATE_DAYS (default 3): consecutive day-shape-blocked days
+    for one gym that trigger the SOCIAL content-review escalation. See
+    agent.jobs.day_shape_block_alarm."""
+    try:
+        return int(os.environ.get("DAY_SHAPE_ESCALATE_DAYS", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def cta_self_question_gate_enabled() -> bool:
+    """
+    The CTA SELF-QUESTION guard (ECHO_CTA_SELF_QUESTION_GATE, default ON).
+
+    At plan time, alongside the day-shape assertion and before a single row
+    reaches content_calendar, no caption may carry the banned Reverb FAQ line
+    verbatim, and no caption's closing line may be an FAQ-mined self-question CTA
+    (a question naming the gym's own display name asking how to get started/
+    join/sign up/begin at itself). A violation FAILS the plan pass and the build
+    writes nothing. See agent/cta_self_question_gate.py.
+
+    This is the CONTENT rule sitting next to caption_variety.py's measured fix
+    (PR #54, which stopped that exact line from being selected as the shortest
+    "qualifying sentence") -- this module blocks the shape at plan time so it
+    cannot be written again by a different route.
+
+    Armed by DEFAULT because it only ever PREVENTS a write, never causes one.
+    Escape hatch, restoring the old silent behavior exactly:
+    ECHO_CTA_SELF_QUESTION_GATE=false.
+    """
+    return _truthy(os.environ.get("ECHO_CTA_SELF_QUESTION_GATE", "true"))
+
+
+def day_shape_roles_enabled() -> bool:
+    """
+    The DAY SHAPE producer (ECHO_DAY_SHAPE_ROLES, default OFF).
+
+    The content half of the two post day (agent/day_shape.py): slot 0 in the
+    morning carries PROOF (story led, a real member moment, a soft ask) and slot
+    1 in the evening carries the INVITATION (offer led, a named next step, a hard
+    ask), drawing from different pillar pools and different SB7 entry angles.
+
+    Without this, the day shape guard keeps a 2x gym SAFE but leaves it thin: the
+    second slot is a fallback concept and a repeat is dropped rather than
+    replaced, so the gym reliably receives one post a day on a two post cadence
+    (Dale's B8). With it, the second slot is asked for a genuinely different post.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_DAY_SHAPE_ROLES=true.
+    """
+    return _truthy(os.environ.get("ECHO_DAY_SHAPE_ROLES", "false"))
+
+
+def opening_formula_cap_enabled() -> bool:
+    """
+    The OPENING FORMULA cap (ECHO_OPENING_FORMULA_CAP, default OFF).
+
+    drafter.openings_collide compares the first four words of two captions, so it
+    cannot see a gym whose every caption opens on the same FRAME with different
+    words. Measured on production 2026-09-05, Tough Temple had fifteen consecutive
+    captions all opening on the second person pronoun ("You walk in ...", "You
+    showed up ...", "You've been ...", "You're holding ..."). Not one pair collided.
+    The client denied 13 rows across five straight days (2026-09-09 to
+    2026-09-13, both accounts), every reject_reason NULL.
+
+    Armed, a build refuses to accept a caption that would extend an unbroken run of
+    opening_formula_max_run() posts sharing one opening formula, and walks the
+    neighbouring days for a genuinely different frame. It NEVER drops a day for this:
+    if no alternative varies the frame, the best available post is still placed, so
+    the cap can only improve variety and can never thin a calendar.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_OPENING_FORMULA_CAP=true.
+    """
+    return _truthy(os.environ.get("ECHO_OPENING_FORMULA_CAP", "false"))
+
+
+def opening_formula_max_run() -> int:
+    """
+    How many consecutive posts may share one opening formula before the next must
+    vary (ECHO_OPENING_FORMULA_MAX_RUN, default 3). A run of three second person
+    opens reads as a voice; a run of fifteen reads as a template. 0 or less
+    disables the run check even when the cap flag is armed.
+    """
+    raw = os.environ.get("ECHO_OPENING_FORMULA_MAX_RUN", "")
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 3
+
+
+def gym_ask_coverage_enabled() -> bool:
+    """
+    Ask coverage on a CLIENT GYM month (ECHO_GYM_ASK_COVERAGE, default OFF).
+
+    agent/ask_coverage.py has enforced one clear ask per reel and a month wide
+    coverage floor since 2026-08-28, but its only call site guards on the B2B
+    profile, so it has never once run on a gym. Measured on production
+    2026-09-05 with the real grader: Tough Temple scores path_to_join 0 out of
+    10 with 'no ask in caption' on every eligible post, and it is not alone
+    (crossfitnine7f7dadc is also 0).
+
+    Armed, a gym month runs the same lane using the gym's OWN approved CTA from
+    its voice doc. A gym whose voice doc carries no CTA that reads as exactly one
+    ask family is SKIPPED rather than given an invented ask.
+
+    A NEW capability, so it ships OFF. Arm by hand: ECHO_GYM_ASK_COVERAGE=true.
+    """
+    return _truthy(os.environ.get("ECHO_GYM_ASK_COVERAGE", "false"))
 
 
 def cadence_slot_times() -> tuple:

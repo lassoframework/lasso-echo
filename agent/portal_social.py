@@ -406,6 +406,40 @@ def _base_of_account(account_key):
     return key
 
 
+# ---- B12: a post the client already rejected must leave their calendar ----------
+# THE DEFECT: a client denies a post, Echo issues a replacement (deny backfill,
+# client_month_run.backfill_denied_slots), and the ORIGINAL row stays on the calendar
+# forever. backfill_denied_slots is INSERT ONLY and nothing anywhere transitions a
+# denied row out of 'denied' -- portal_calendar_store._WIPEABLE_STATUSES deliberately
+# treats it as human owned so a rebuild cannot destroy it. Meanwhile the client render
+# carried exactly ONE status filter, `!= "coach_review"`, so denied / killed / deleted
+# rows were mapped into cards and shipped to the owner beside their replacements.
+#
+# MEASURED ON PRODUCTION 2026-09-05, September book: LASSO 45% of rows, ENG 40%,
+# pierce 34%, zanshin 33% were denied or deleted. One in three cards on a client's
+# calendar was content they had already rejected or that had been removed.
+#
+# THIS IS A GUARD, SO IT DEFAULTS ON, with a named escape hatch
+# (ECHO_PORTAL_SHOW_REJECTED=true restores the old payload byte for byte). Rows are
+# never deleted or re-statused by this -- they stay in content_calendar for audit, the
+# publisher still excludes them (portal_calendar_store.due_rows), and every derived
+# signal (low_creative, days_remaining, awaiting_media, recreate_budget) is computed
+# from the SAME row set as before so no banner changes behavior.
+_CLIENT_HIDDEN_STATUSES = ("coach_review", "denied", "killed", "deleted")
+
+
+def _client_visible(rows):
+    """The rows a gym owner should see on their own calendar. Hides content they have
+    already rejected (denied / killed), content that was removed (deleted), and content
+    a coach has not released yet (coach_review, the pre-existing rule)."""
+    from . import config as _cfg
+    hidden = _CLIENT_HIDDEN_STATUSES
+    if getattr(_cfg, "portal_show_rejected", None) and _cfg.portal_show_rejected():
+        hidden = ("coach_review",)          # escape hatch: the historical behavior
+    return [r for r in (rows or [])
+            if str((r or {}).get("status") or "").strip().lower() not in hidden]
+
+
 def _handle_social_supabase(account_key, month, now=None):
     """/social from the SHARED content_calendar table (the live portal data plane).
     Reads every row for THIS gym in the month via the same SupabaseCalendarStore that
@@ -425,7 +459,12 @@ def _handle_social_supabase(account_key, month, now=None):
             str((r or {}).get("status") or "").lower() == "coach_review" for r in rows)
         rows = [r for r in rows
                 if str((r or {}).get("status") or "").lower() != "coach_review"]
-        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        # B12: the CARDS drop rejected/removed content; `rows` (and therefore
+        # low_creative) stays exactly what it was, so no banner flips behind this.
+        posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(rows)]
+        signal_posts = [_content_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in rows]
     except Exception as exc:
         return 500, {"error": f"store error: {type(exc).__name__}"}
 
@@ -435,7 +474,9 @@ def _handle_social_supabase(account_key, month, now=None):
     low_creative = not any((r.get("image_url") or "").strip() for r in rows)
     _, days_remaining = _low_creative_and_days(
         account_key, month, today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    # Signal on the UNFILTERED set: a month that is entirely denied is still a BUILT
+    # month, and must not raise the red "Echo is waiting on your uploads" banner.
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     if has_withheld_calendar:
         awaiting_media = False        # built + coach-screened is NOT "waiting on uploads"
     return 200, {
@@ -488,13 +529,17 @@ def handle_social(account_key, month, reader=None, now=None):
                 "SELECT * FROM gym_calendar_queue WHERE account_key=? AND day_key LIKE ? "
                 "ORDER BY day_key",
                 (account_key, prefix + "%")).fetchall()
-        posts = [_calendar_post(dict(r), is_lasso=_is_lasso_gym(account_key)) for r in rows]
+        all_rows = [dict(r) for r in rows]
+        posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                 for r in _client_visible(all_rows)]
+        signal_posts = [_calendar_post(r, is_lasso=_is_lasso_gym(account_key))
+                        for r in all_rows]
     except Exception as exc:
         return 500, {"error": f"db error: {type(exc).__name__}"}
 
     low_creative, days_remaining = _low_creative_and_days(account_key, month,
                                                           today=(now.date() if now else None))
-    awaiting_media, upload_url = _awaiting_media_signal(account_key, posts)
+    awaiting_media, upload_url = _awaiting_media_signal(account_key, signal_posts)
     return 200, {
         "account_key": account_key,
         "month": month,
@@ -877,6 +922,76 @@ def _handle_deny_supabase(account_key, draft_id, actor_id, note, reader, sb_stor
                  "recreate_budget": _budget_state(account_key)}
 
 
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/swap-media  (B6: FREE, never charges the budget)
+#
+# THE BUDGET DESIGN BUG (Pete, zanshin): the portal's only levers are approve /
+# edit / deny / kill, so "use a different photo" and "the caption needs work" are
+# BOTH a deny and both burn one of the 15 monthly recreates. Pete ran out of
+# recreates swapping PHOTOS and then could not fix a caption. The counter was never
+# wrong -- the two actions were never separated.
+#
+# THE SPLIT: swapping the pixels regenerates nothing, so it is free and unlimited.
+# Regenerating COPY still costs one of 15. The write goes through
+# SupabaseCalendarStore.swap_media, which is status-guarded server-side to
+# pending / coach_review, so an approved or live post can never be repointed and
+# the gym's approval always keeps exactly the pixels it approved.
+# ==========================================================================
+
+def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                      picker=None):
+    """Swap this post's photo for a fresh one. FREE and unlimited: the budget is
+    neither read nor charged, and the response echoes the UNCHANGED budget so the
+    client can see it cost nothing. The caption is untouched.
+
+    Flag: config.media_swap_free_enabled() (ECHO_MEDIA_SWAP_FREE, default OFF).
+    Flag off -> 403 and not one store read is issued."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import media_swap as _ms
+    if not _ms.enabled():
+        return 403, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "error": "photo swap is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                     "error": "photo swap needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "swap-media", draft_id)
+        if final is not None:
+            return final
+        pick = (picker or _ms.pick_replacement)(account_key, row, store=sb_store)
+        if not pick.get("ok"):
+            # A swap that cannot happen is a 409 the client can read, NOT a charge.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": _ms.client_message(pick.get("reason")),
+                         "reason": pick.get("reason"),
+                         "recreate_budget": _budget_state(account_key)}
+        updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
+                                      source_media_url=pick.get("source_media_url"))
+        if updated is None:
+            # swap_media filters to pending / coach_review server-side: a row that
+            # matched nothing was approved or live between the read and the write.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": ("This post is already approved or live, so its "
+                                   "photo is locked. Deny it if you want it redone."),
+                         "recreate_budget": _budget_state(account_key)}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
+                 "image_public_url": updated.get("image_url", ""),
+                 "caption": updated.get("caption", ""),
+                 "status": updated.get("status", "pending"),
+                 "day_key": updated.get("post_date", ""),
+                 "free": True,
+                 "recreate_budget": _budget_state(account_key)}
+
+
 def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -961,12 +1076,25 @@ def handle_edit(account_key, draft_id, actor_id, note="", store=None, reader=Non
 # POST /portal/<token>/posts/<id>/deny  (decrements the 15/month budget -> 409)
 # ==========================================================================
 
-def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None, sb_store=None):
+def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                sb_store=None, intent=""):
     """Deny a post with a reason. Each deny burns one unit of the server-enforced
     15/month recreate budget; the 16th deny in a month is refused with 409 (the gym
     asks for a fresh concept instead). The budget is spent ONLY when the underlying
     deny succeeds, so a failed deny never costs the gym a unit. With Supabase creds
-    present, a successful deny flips the shared row's status to 'denied' (NO publish)."""
+    present, a successful deny flips the shared row's status to 'denied' (NO publish).
+
+    intent (B6): the portal's deny reason chips are "Use a different photo" and
+    "Caption needs work", and both used to land here and charge. intent="media"
+    routes the photo chip to the FREE swap instead, so a gym can never run out of
+    recreates fixing pixels. Any other value (including the default) is a caption
+    recreate and charges exactly as before. Gated on ECHO_MEDIA_SWAP_FREE: with the
+    flag off the intent is IGNORED and every deny charges, byte for byte as today."""
+    if str(intent or "").strip().lower() == "media":
+        from . import media_swap as _ms
+        if _ms.enabled():
+            return handle_swap_media(account_key, draft_id, actor_id, reader=reader,
+                                     sb_store=sb_store)
     if config.portal_calendar_supabase_enabled():
         return _handle_deny_supabase(account_key, draft_id, actor_id, note, reader,
                                      sb_store or _pcs.SupabaseCalendarStore())
