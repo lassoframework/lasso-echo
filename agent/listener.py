@@ -429,8 +429,10 @@ def _print_scheduled_lanes():
         ("nightly backup", config.backup_enabled(), "AGENT_BACKUP_ENABLED"),
         ("portal echo ticket bridge", config.portal_echo_tickets_enabled(),
          "AGENT_PORTAL_ECHO_TICKETS_ENABLED"),
-        ("cross gym brain", config.cross_gym_brain_enabled(),
+        ("cross gym brain (weekly)", config.cross_gym_brain_enabled(),
          "AGENT_CROSS_GYM_BRAIN"),
+        ("brains feed captions", config.brain_feeds_captions_enabled(),
+         "AGENT_BRAIN_FEEDS_CAPTIONS"),
     ]
     for name, armed, env in lanes:
         state = "ARMED" if armed else f"dormant ({env} off)"
