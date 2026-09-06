@@ -617,12 +617,14 @@ class StoryBrandGenerator:
         Benjamini Hochberg FDR correction and cleared the effect floor is here.
 
         WHY THIS CANNOT LEAK ONE GYM'S CONTENT INTO ANOTHER'S CAPTION, structurally:
-          * every line is rendered by cross_gym_guidance.prompt_lines() from
-            cross_gym_brain's WHITELISTED lever NAME and lever VALUE tokens plus
-            two integers. A caption fragment, a stat, an offer, a price, a member
-            name or a handle is not a whitelisted token, so it is dropped at the
-            writer, dropped again by _clean() on the read, and has no way to
-            reach this string. There is no branch here that reads post text.
+          * NO STRING THAT CAME OUT OF A DATABASE REACHES THIS BLOCK AT ALL. Every
+            line is rendered by cross_gym_guidance.prompt_lines() from that
+            module's OWN fixed phrase table plus two integers: the stored lever
+            and value SELECT a constant phrase and are never themselves printed.
+            So a caption fragment, a stat, an offer, a price, a member name or a
+            handle cannot appear here even if one somehow survived the writer's
+            whitelist and _clean()'s re-validation on the read. There is no
+            branch here that reads post text.
           * the guidance is IDENTICAL for every gym (fleet statistics), which is
             the isolation guarantee made structural rather than promised.
           * it is FORM ONLY. It is placed BELOW the brand voice doc and BELOW the
