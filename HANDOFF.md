@@ -225,17 +225,36 @@ fleet after LASSO's clean 24 hours. Dean's message is Blake's to send, mine to d
 4. **Day-shape alert**: on assertion failure alert #echoclaude the same hour naming gym,
    date and which field collided; include that gym's remaining runway; **RE-FIRE daily while
    blocked**; escalate to SOCIAL at 3 consecutive days as a content defect.
-5. **Fill-rate across EVERY `posts_per_day=2` gym — INVESTIGATED, NUMBERS NOT TRUSTWORTHY
-   YET, DO NOT CITE THE OLD "ENG 24/24, Pierce 6/24, Chateau 6/16" FIGURES.** The
-   `posts_per_day=2` gyms are confirmed (queried `echo_gym_settings`, joined to `gyms` for
-   names): ENG, Pierce Fitness, CrossFit Chateau, and LASSO itself. A relative gap is real
-   — Chateau's Instagram had noticeably fewer distinct posting days than ENG/Pierce across
-   the same trailing window — but **my own date-window filter (`post_date=gte.<date>`)
-   returned MORE distinct days than the window should allow (47 in a supposed 24-day
-   window), meaning the filter did not apply and every number from that query is
-   unreliable.** Did not have time to find the bug tonight. **Next session: fix the query
-   before trusting any percentage, then add fill rate to the metrics contract and the
-   portal report.**
+5. **Fill-rate across EVERY `posts_per_day=2` gym — DONE, corrected against production;
+   the old "ENG 24/24, Pierce 6/24, Chateau 6/16" figures were wrong, do not cite them.**
+   The `posts_per_day=2` gyms, confirmed via `echo_gym_settings` joined to `gyms`: ENG,
+   Pierce Fitness, CrossFit Chateau, LASSO itself.
+
+   First pass used `post_date=gte.<24 days ago>` with no upper bound and returned numbers
+   that looked impossible (more distinct posting days than the window allowed) — not a
+   query bug, a methodology error: `gte` alone has no ceiling, so it silently captured the
+   ENTIRE forward-looking calendar (planned out to 09-29+), not a trailing window. Fixed
+   with an explicit `lte.<today>` upper bound; re-ran against the corrected 25-day trailing
+   window (2026-08-13 through 2026-09-06):
+
+   | Gym | Instagram days with a post / 25 |
+   |---|---|
+   | ENG | 25/25 (100%) |
+   | Pierce Fitness | 18/25 (72%) |
+   | LASSO | 25/25 (100%) |
+   | CrossFit Chateau | 3/25 (12%) **— but checked, unfair**: Chateau's calendar only
+     starts 2026-09-04, two days before this window's end. Against the ONLY fair window
+     (since onboarding, 3 calendar days), it is **3/3 — 100%, not under-delivering at
+     all.** The original "6/16" estimate treated a newly onboarded gym as if it should
+     already have 16 days of history.
+
+   **Real, corrected finding: only Pierce Fitness is actually under-delivering (72%, not
+   the ~25% originally claimed) — moderate, not the "silent under-delivery on both gyms"
+   framing this file previously carried.** Suspected cause still unconfirmed (media
+   library depth vs. a logic gap) — next session should check Pierce's library depth
+   before assuming either. Add fill rate to the metrics contract and the portal report,
+   with the "since onboarding" floor baked in so a newly onboarded gym is never counted
+   against a window that predates it.
 6. **Tough Temple to SOCIAL — DONE.** Verified against production: instagram carries 14
    consecutive denied rows, 2026-09-09 through 09-15, zero approvals between (the "twelve"
    estimate was close but short, same pattern as every other approximate count corrected
