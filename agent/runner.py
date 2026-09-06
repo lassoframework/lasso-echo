@@ -1332,25 +1332,45 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         ops_alerts.alert(f"metrics sync failed: {type(e).__name__}: {e}. "
                          "The draft run is unaffected.")
 
-    # CROSS GYM BRAIN (AGENT_CROSS_GYM_BRAIN, default OFF -> no-op): nightly
+    # CROSS GYM BRAIN (AGENT_CROSS_GYM_BRAIN, default OFF -> no-op): the WEEKLY
     # fleet rollup of every gym's matured post_metrics into FORM statistics —
     # which hook shape, caption length, structure, pillar, ask, slot and format
-    # actually correlate with engagement ACROSS gyms, each finding carrying its
-    # per cell n, effect size, p value and Benjamini Hochberg q value. Only a
-    # finding that clears the sample floor on BOTH sides, draws on >= 2 distinct
-    # gyms on BOTH sides, survives the FDR correction and clears the effect floor
-    # becomes guidance; everything else is reported as insufficient_data /
-    # not_significant / directional and changes nothing. external and is_ad rows
-    # never train (the monthly_retro rail). READ ONLY apart from the append only
-    # cross_gym_brain row; the output is FORM ONLY by whitelist, so no caption
-    # text or client content can cross between gyms. Isolated: a brain failure
-    # never blocks the draft run.
+    # actually correlate with engagement ACROSS gyms, plus the BEST POST DIGEST
+    # (what the fleet's top decile of posts share in FORM, Fisher exact, or an
+    # honest "not distinguishable"). Each finding carries its per cell n, effect
+    # size, p value and Benjamini Hochberg q value. Only a finding that clears
+    # the sample floor on BOTH sides, draws on >= 2 distinct gyms on BOTH sides,
+    # survives the FDR correction and clears the effect floor becomes guidance;
+    # everything else is reported as insufficient_data / not_significant /
+    # directional and changes nothing. external and is_ad rows never train (the
+    # monthly_retro rail). READ ONLY apart from the append only cross_gym_brain
+    # row; the output is FORM ONLY by whitelist, so no caption text or client
+    # content can cross between gyms.
+    #
+    # CADENCE (Blake, 2026-09-06: "digest weekly"): this block ticks NIGHTLY but
+    # calls run_weekly, which fires the job at most ONCE per ISO week and is a
+    # true no-op the other six nights (no store, no fleet read, no write). Do not
+    # swap this back to jobs.cross_gym_brain.run — that is the nightly entry
+    # point and it has no cadence gate of its own.
+    # Isolated: a brain failure never blocks the draft run.
     try:
-        from .jobs.cross_gym_brain import run as _cross_gym_brain_run
-        _cgb = _cross_gym_brain_run()
-        if _cgb.get("ok"):
+        from .jobs.cross_gym_brain import run_weekly as _cross_gym_brain_weekly
+        _cgb = _cross_gym_brain_weekly()
+        if _cgb.get("ok") and _cgb.get("ran"):
             print(f"[cross-gym-brain] {len(_cgb.get('findings') or [])} finding(s), "
                   f"{len(_cgb.get('guidance') or [])} cleared the bar")
+        elif _cgb.get("failed"):
+            # A REAL failure the job caught and reported rather than raised: the
+            # rollup write 400'd, the form only whitelist refused the artifact,
+            # or the cadence marker is unreadable. This branch exists because the
+            # except below could never see any of them — the job swallows its own
+            # exceptions one frame earlier — so before it, a genuine write failure
+            # printed "skipped" and alerted NOBODY, indistinguishable from a
+            # dormant flag. Most likely cause after arming: the top_posts column
+            # migration has not been hand-applied yet.
+            print(f"[cross-gym-brain] FAILED: {_cgb.get('reason')}")
+            ops_alerts.alert(f"cross gym brain: {_cgb.get('reason')}. "
+                             "The draft run is unaffected.")
         else:
             print(f"[cross-gym-brain] skipped: {_cgb.get('reason')}")
     except Exception as e:
