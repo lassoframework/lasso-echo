@@ -36,15 +36,21 @@ SCRAPING LAW (all enforced in code, all tested)
     this module: the only header sent is User-Agent, and no auth/cookie header is
     ever constructed. The social side goes through the same public Apify actor
     social_baseline already uses.
-  - robots.txt is RESPECTED. Per host, /robots.txt is fetched once and cached;
-    a URL its rules disallow for the UA we send is SKIPPED and recorded as
-    skipped, never requested. Crawl-delay is honored when it is larger than our
-    own floor.
+  - robots.txt is RESPECTED, and FAILS CLOSED. Per host, /robots.txt is fetched
+    once and cached; a URL its rules disallow for the UA we send is SKIPPED and
+    recorded as skipped, never requested. A 5xx or an unreachable robots.txt
+    DENIES the whole host (a server error is not permission); only an explicit
+    4xx means "this host states no restriction". Crawl-delay is honored when it
+    is larger than our own floor. A redirect that lands on a DIFFERENT host is
+    re-checked against that host's robots.txt and the body discarded if it
+    disallows us.
   - RATE LIMITED: at least config.gym_deep_brain_crawl_delay() seconds between
     two requests to the same host (default 2.0), and at least robots' own
     Crawl-delay when that is larger. The sleep is injectable so tests never sleep.
-  - CAPPED: MAX_PAGES pages and MAX_BYTES bytes per gym, so a scrape cannot run
-    away on a site that serves a page for every path.
+  - CAPPED TWICE: MAX_PAGES pages and MAX_BYTES bytes per gym (cumulative), so a
+    scrape cannot run away on a site that serves a page for every path, AND
+    MAX_PAGE_BYTES for ONE response, streamed and abandoned at the line so a
+    single huge page is never pulled down in full.
   - NO PII beyond what the business publishes about ITSELF. Coach names as the
     gym itself publishes them are business information and are kept. Emails and
     phone numbers that are NOT the business's own published contact details are
@@ -58,10 +64,22 @@ handle, robots disallowing everything, a failed fetch, or an Apify error each
 produce an honest {"ok": False, "blocked": True, "reason": ...} and NO artifact
 file, NO client_sources row, NO bible. Nothing is synthesized to fill a hole.
 
-NEVER OVERWRITES HUMAN WORK. The brand bible is written through
-website_intake._write_bible_if_missing, whose contract is exact: an existing
-bible (human-reviewed or from a real intake) is never touched. Only the derived
-deep-brain artifact itself is regenerated on a re-run.
+A SCRAPE NEVER AUTHORS THE BRAND BIBLE (finding 2026-09-06, CRITICAL). This
+module used to hand its scraped bundle to website_intake._write_bible_if_missing,
+which rendered those facts into <DATA_DIR>/brand_voice/<base>/lasso_voice.md —
+the ACTIVE voice-doc slot client_media_sync._resolve_client_voice_path prefers
+over everything else — with the citations stripped. voice.load_voice reads that
+file, drafter puts voice.raw straight into the LLM prompt, and
+drafter._output_claims_cleared treats the voice doc as an APPROVED source, so a
+scraped, unapproved figure cleared the exact gate that exists to block invented
+figures. That call is GONE. The build writes the derived artifact and PENDING
+client_sources rows and nothing else; a human writes or activates the bible, and
+the human bible-drafting path (intake_onboard -> bible_drafter, which holds its
+output under brand_voice/drafts/ for approval) is untouched.
+
+NEVER OVERWRITES HUMAN WORK. Only the derived deep-brain artifact itself is
+written here, and a re-run regenerates that one file. No voice doc, no brand
+bible, no approved source row is ever written by this module.
 
 Behind AGENT_GYM_DEEP_BRAIN (config.gym_deep_brain_enabled, default OFF: every
 entry point returns blocked, nothing is fetched, nothing is written). Manual
@@ -106,6 +124,20 @@ DEFAULT_PATHS = ("/", "/about", "/services", "/programs", "/pricing", "/faq",
 MAX_PAGES = 12
 MAX_BYTES = 2_000_000
 
+# PER-FETCH ceiling (finding 2026-09-06). MAX_BYTES alone is CUMULATIVE and is
+# only consulted BEFORE a request, so a single 5MB response downloaded in full
+# before the budget noticed. MAX_PAGE_BYTES bounds ONE response: the default
+# fetcher streams and abandons the body the moment it crosses this line, and
+# crawl_site truncates whatever any fetcher hands back to the same ceiling. A
+# gym marketing page is tens of KB; half a megabyte is already generous.
+MAX_PAGE_BYTES = 500_000
+
+# robots.txt is a small text file. A host that answers with megabytes is not
+# stating rules, and we stop reading at this line.
+ROBOTS_MAX_BYTES = 100_000
+
+_CHUNK = 8192
+
 # How far back the social read looks. Six months is enough to see cadence and
 # form without paying for a whole feed.
 SOCIAL_WINDOW_DAYS = 180
@@ -136,6 +168,60 @@ PHONE_REDACTION = "[phone redacted]"
 
 # ---- 1. robots.txt ------------------------------------------------------------
 
+# What a host says when it will not tell us its rules. RFC 9309 §2.3.1.4: an
+# "unavailable for legal reasons" or server-error response means the crawler MUST
+# assume complete disallow. This is the parsed form of that assumption.
+_DENY_ALL_LINES = ["User-agent: *", "Disallow: /"]
+
+
+def _robots_result(value):
+    """Normalize whatever a robots fetcher returned into (status, body).
+
+    Three shapes are accepted so the same policy object works in production and
+    under an injected test fetcher:
+      (status, body)  -> used as is (this is what _fetch_robots returns);
+      a string        -> a body that was read, i.e. HTTP 200;
+      None            -> nothing readable came back, status unknown.
+    """
+    if isinstance(value, tuple) and len(value) == 2:
+        status, body = value
+        try:
+            status = None if status is None else int(status)
+        except (TypeError, ValueError):
+            status = None
+        return status, body
+    if value is None:
+        return None, None
+    return 200, value
+
+
+def _fetch_robots(url, *, get=None, max_bytes=ROBOTS_MAX_BYTES):
+    """(status, body) for a robots.txt. The STATUS is the point: the old fetcher
+    collapsed every non-200 into None, so a 503 was indistinguishable from a 404
+    and both meant "no rules stated" — i.e. a host having a bad five minutes
+    silently granted us permission to crawl it. Returns (None, None) when the
+    request could not be made at all, which the policy also treats as a denial."""
+    if get is None:
+        import requests
+        get = requests.get
+    try:
+        r = get(url, timeout=15, headers={"User-Agent": _UA},
+                allow_redirects=True)
+    except Exception:  # noqa: BLE001 - unreachable is not permission either
+        return None, None
+    try:
+        status = int(getattr(r, "status_code", 200) or 200)
+    except (TypeError, ValueError):
+        status = 200
+    body = ""
+    if status < 400:
+        try:
+            body = str(getattr(r, "text", "") or "")[:max_bytes]
+        except Exception:  # noqa: BLE001
+            body = ""
+    return status, body
+
+
 class RobotsPolicy:
     """Per-host robots.txt, fetched once and cached, on stdlib
     urllib.robotparser (no new dependency).
@@ -144,15 +230,24 @@ class RobotsPolicy:
     never requested. Crawl-delay, when the host states one, is returned by
     crawl_delay(url) and the caller takes the LARGER of it and our own floor.
 
-    A robots.txt we cannot read (404, timeout, blank) means the host states no
-    restriction, which per RFC 9309 is unrestricted crawling. We do NOT invent a
-    restriction the site did not state, and we do NOT invent permission either:
-    the page fetch that follows still has to succeed on its own."""
+    HOW EACH ANSWER IS READ (finding 2026-09-06):
+      * 2xx/3xx      -> parse the body; the host stated its rules.
+      * 4xx (404 …)  -> the host states NO restriction, which per RFC 9309 is
+                        unrestricted crawling. We do not invent a rule it did
+                        not write.
+      * 5xx          -> DENY EVERYTHING. A server error is not permission. This
+                        used to read as "no rules", so a host erroring out
+                        silently opened itself to the crawler.
+      * unreachable  -> DENY EVERYTHING, for the same reason: we could not
+                        determine the rules, and undetermined is not yes.
+    Nothing else in the module can override a denial: allowed() is consulted
+    before the fetch callable ever sees a URL."""
 
     def __init__(self, fetch=None):
-        self._fetch = fetch or website_intake._default_fetch
+        self._fetch = fetch or _fetch_robots
         self._cache = {}
         self.fetched_hosts = []
+        self.denied_hosts = []   # hosts we failed CLOSED on, with the reason
 
     def _parser(self, url):
         host = urllib.parse.urlsplit(url).netloc.lower()
@@ -160,15 +255,21 @@ class RobotsPolicy:
             return self._cache[host]
         scheme = urllib.parse.urlsplit(url).scheme or "https"
         rp = urllib.robotparser.RobotFileParser()
-        body = None
+        raw = None
         try:
-            body = self._fetch(f"{scheme}://{host}/robots.txt")
-        except Exception:  # noqa: BLE001 - an unreadable robots.txt is not a crash
-            body = None
+            raw = self._fetch(f"{scheme}://{host}/robots.txt")
+        except Exception:  # noqa: BLE001 - a raising fetcher is not permission
+            raw = (None, None)
+        status, body = _robots_result(raw)
+        deny = status is None or status >= 500
         try:
-            rp.parse(str(body or "").splitlines())
+            rp.parse(_DENY_ALL_LINES if deny else str(body or "").splitlines())
         except Exception:  # noqa: BLE001 - malformed robots.txt states nothing
-            rp.parse([])
+            rp.parse([] if not deny else _DENY_ALL_LINES)
+        if deny:
+            self.denied_hosts.append(
+                f"{host}: robots.txt answered {status if status else 'nothing'}; "
+                "failing closed, nothing on this host is crawled")
         self._cache[host] = rp
         self.fetched_hosts.append(host)
         return rp
@@ -204,6 +305,101 @@ class RobotsPolicy:
                 continue
             best = d if best is None else max(best, d)
         return best
+
+
+# ---- 1b. the page fetcher: per-fetch cap + redirect re-check -------------------
+
+class CappedFetcher:
+    """The deep brain's own page fetcher. Two things website_intake's plain
+    requests.get could not do, both from the 2026-09-06 finding:
+
+    1. PER-FETCH BYTE CAP. The body is STREAMED and abandoned the moment it
+       crosses max_bytes, so a 5MB response is never pulled down in full. The
+       old cumulative MAX_BYTES check ran only BEFORE a request, so the first
+       oversized page was always downloaded whole before anything noticed.
+
+    2. ROBOTS RE-CHECK AFTER A CROSS-HOST REDIRECT. We ask https://gymx.com/about
+       having checked gymx.com's robots.txt; a 301 to blog.othersite.com lands us
+       on a host whose rules we never read. When the final URL's host differs from
+       the one we asked for, this re-runs the robots gate against the FINAL url
+       and DISCARDS the body if that host disallows it.
+
+    `get` is injectable so the whole thing is unit-testable with no network."""
+
+    def __init__(self, robots=None, *, max_bytes=MAX_PAGE_BYTES, get=None):
+        self.robots = robots
+        self.max_bytes = int(max_bytes)
+        self._get = get
+        self.blocked_redirects = []   # final URLs dropped by the robots re-check
+        self.truncated = []           # URLs cut off at the per-fetch cap
+
+    def _requests_get(self):
+        if self._get is not None:
+            return self._get
+        import requests
+        return requests.get
+
+    def __call__(self, url):
+        try:
+            resp = self._requests_get()(
+                url, timeout=15, headers={"User-Agent": _UA},
+                allow_redirects=True, stream=True)
+        except Exception:  # noqa: BLE001 - a failed page is not a crash
+            return None
+        try:
+            try:
+                if int(getattr(resp, "status_code", 200) or 200) >= 400:
+                    return None
+            except (TypeError, ValueError):
+                pass
+            final = str(getattr(resp, "url", "") or url)
+            if not self._redirect_allowed(url, final):
+                return None
+            return self._read_capped(url, resp)
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _redirect_allowed(self, asked, final):
+        """False when a redirect took us to a DIFFERENT host that robots.txt
+        disallows. Same host (or no policy to ask) keeps the original decision."""
+        asked_host = urllib.parse.urlsplit(asked).netloc.lower()
+        final_host = urllib.parse.urlsplit(final).netloc.lower()
+        if not final_host or final_host == asked_host:
+            return True
+        if self.robots is None:
+            return True
+        try:
+            ok = self.robots.allowed(final)
+        except Exception:  # noqa: BLE001 - an unreadable policy is not permission
+            ok = False
+        if not ok:
+            self.blocked_redirects.append(
+                f"{asked} redirected to {final}; robots.txt on {final_host} "
+                "disallows it, so the response was discarded unread")
+        return ok
+
+    def _read_capped(self, url, resp):
+        buf = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=_CHUNK):
+                if not chunk:
+                    continue
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", "replace")
+                buf.extend(chunk)
+                if len(buf) >= self.max_bytes:
+                    self.truncated.append(url)
+                    break
+        except Exception:  # noqa: BLE001 - keep whatever arrived before the break
+            pass
+        encoding = getattr(resp, "encoding", None) or "utf-8"
+        try:
+            return bytes(buf[:self.max_bytes]).decode(encoding, "replace")
+        except Exception:  # noqa: BLE001 - an unknown encoding is not a crash
+            return bytes(buf[:self.max_bytes]).decode("utf-8", "replace")
 
 
 # ---- 2. rate limit ------------------------------------------------------------
@@ -309,6 +505,8 @@ class CrawlResult:
     fetched: list = field(default_factory=list)    # urls actually requested
     skipped_robots: list = field(default_factory=list)
     skipped_cap: list = field(default_factory=list)
+    skipped_redirect: list = field(default_factory=list)
+    truncated: list = field(default_factory=list)
     bytes_used: int = 0
     crawl_delay: float = 0.0
     business_emails: set = field(default_factory=set)
@@ -316,7 +514,8 @@ class CrawlResult:
 
 
 def crawl_site(domain, paths=DEFAULT_PATHS, *, fetch=None, sleep=None, clock=None,
-               robots=None, delay=None, max_pages=MAX_PAGES, max_bytes=MAX_BYTES):
+               robots=None, delay=None, max_pages=MAX_PAGES, max_bytes=MAX_BYTES,
+               max_page_bytes=MAX_PAGE_BYTES):
     """Fetch up to max_pages PUBLIC pages of https://<domain>, obeying robots.txt
     and rate-limiting per host, and return a CrawlResult whose page text has
     already been PII-scrubbed.
@@ -324,13 +523,25 @@ def crawl_site(domain, paths=DEFAULT_PATHS, *, fetch=None, sleep=None, clock=Non
     A URL robots disallows is recorded in skipped_robots and NEVER requested (the
     fetch callable does not see it). Requests to the same host are separated by
     at least max(config.gym_deep_brain_crawl_delay(), robots' Crawl-delay).
-    Never raises: a page that fails is simply absent."""
+    Never raises: a page that fails is simply absent.
+
+    BYTE CAPS, both of them (finding 2026-09-06). max_bytes is the CUMULATIVE
+    budget for the gym and is checked before each request. max_page_bytes bounds
+    ONE response: the production fetcher streams and abandons a body that crosses
+    it, and whatever ANY fetcher hands back is truncated to it here, so an
+    injected or third-party fetcher cannot blow the budget with a single page
+    either. Truncated URLs are recorded in result.truncated."""
     dom = _registrable(domain)
     result = CrawlResult(domain=dom)
     if not dom:
         return result
-    fetch = fetch or website_intake._default_fetch
-    robots = robots if robots is not None else RobotsPolicy(fetch=fetch)
+    # No injected fetcher = production: robots.txt goes through the STATUS-AWARE
+    # reader (a 5xx must deny, see RobotsPolicy) and pages go through the capped,
+    # redirect-re-checking fetcher. An injected fetcher is a test/caller's own and
+    # is used for both, exactly as before.
+    robots = robots if robots is not None else RobotsPolicy(
+        fetch=fetch if fetch is not None else _fetch_robots)
+    fetch = fetch or CappedFetcher(robots, max_bytes=max_page_bytes)
     limiter = HostRateLimiter(sleep=sleep, clock=clock)
     floor = config.gym_deep_brain_crawl_delay() if delay is None else float(delay)
     stated = robots.crawl_delay(f"https://{dom}/")
@@ -354,11 +565,23 @@ def crawl_site(domain, paths=DEFAULT_PATHS, *, fetch=None, sleep=None, clock=Non
         result.fetched.append(url)
         if not html:
             continue
+        # PER-FETCH CEILING, enforced on whatever came back. The production
+        # fetcher already stopped reading at this line; this is the belt for an
+        # injected fetcher, and it is what keeps bytes_used honest.
+        if len(html) > max_page_bytes:
+            html = html[:max_page_bytes]
+            result.truncated.append(url)
         result.bytes_used += len(html)
         text = website_intake._strip_html(html)[:website_intake.PAGE_TEXT_CAP]
         if not text or text in raw.values():
             continue  # many gym sites serve the homepage for every unknown path
         raw[url] = text
+
+    # What the fetcher itself refused or cut, so the artifact can say so.
+    result.skipped_redirect = list(getattr(fetch, "blocked_redirects", ()) or ())
+    for u in (getattr(fetch, "truncated", ()) or ()):
+        if u not in result.truncated:
+            result.truncated.append(u)
 
     emails, phones = business_contacts(raw, dom)
     result.business_emails, result.business_phones = emails, phones
@@ -564,7 +787,7 @@ class DeepBrain:
     def write(self, base_dir=None):
         """Write the DERIVED deep-brain artifact. This file is Echo's own output
         and a re-run regenerates it; the human-owned brand bible and voice doc are
-        NEVER touched here (see website_intake._write_bible_if_missing)."""
+        NEVER touched here: this module writes no bible and no voice doc at all."""
         path = deep_brain_path(self.base, base_dir)
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -730,6 +953,10 @@ def build_deep_brain(base, *, domain=None, handle=None, fetch=None, llm=None,
     everything, no page could be read, no verifiable fact could be extracted, or
     the public social read failed. Nothing is ever synthesized to fill a hole.
 
+    WRITES EXACTLY TWO THINGS: the derived artifact file, and PENDING
+    client_sources rows. It does NOT write the brand bible / voice doc — see the
+    module docstring. The "bible" key in the summary says so out loud.
+
     LANDS the grounded facts through client_sources.add_source with
     status="pending" and the page URL as the citation. Scraped material is NEVER
     auto-approved, not even when AGENT_INTAKE_AUTO_APPROVE is armed: a machine
@@ -795,6 +1022,13 @@ def build_deep_brain(base, *, domain=None, handle=None, fetch=None, llm=None,
         if crawl.skipped_cap:
             brain.notes.append(f"{len(crawl.skipped_cap)} page(s) skipped at the "
                                f"{MAX_PAGES}-page / {MAX_BYTES}-byte cap")
+        for note in crawl.skipped_redirect:
+            brain.notes.append(note)
+        if crawl.truncated:
+            brain.notes.append(
+                f"{len(crawl.truncated)} response(s) cut off at the "
+                f"{MAX_PAGE_BYTES}-byte per-page ceiling: "
+                + ", ".join(crawl.truncated))
         brain.notes.append(f"crawl delay honored between requests: "
                            f"{crawl.crawl_delay}s")
 
@@ -802,7 +1036,9 @@ def build_deep_brain(base, *, domain=None, handle=None, fetch=None, llm=None,
             return {"ok": True, "base": base, "domain": dom, "handle": ig,
                     "artifact": "", "facts": len(brain.facts),
                     "voice": len(brain.voice), "top_posts": len(brain.top_posts),
-                    "landed": 0, "bible": "dry run, nothing written",
+                    "landed": 0,
+                    "bible": "not written: a scrape never authors the brand "
+                             "bible (and this is a dry run)",
                     "notes": list(brain.notes), "dry_run": True,
                     "markdown": brain.to_markdown()}
 
@@ -815,8 +1051,12 @@ def build_deep_brain(base, *, domain=None, handle=None, fetch=None, llm=None,
             client_sources.add_source(account_key, f.category, f.text,
                                       citation=f.source_url, status="pending")
             landed += 1
-        bible = website_intake._write_bible_if_missing(base, gym_name, dom,
-                                                       brain.bundle())
+        # NO BIBLE. A scrape never authors a gym's voice doc (see the module
+        # docstring, "A SCRAPE NEVER AUTHORS THE BRAND BIBLE"). The facts above
+        # are pending client_sources rows; a human approves them, and a human
+        # writes or activates the bible.
+        bible = ("not written: a scrape never authors the brand bible; the "
+                 "facts above are PENDING for a human to approve")
         db.audit("gym_deep_brain", base,
                  f"deep brain from {dom} + @{ig}: {len(brain.facts)} fact(s) "
                  f"landed pending, {len(brain.voice)} voice observation(s)",
