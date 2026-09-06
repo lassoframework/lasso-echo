@@ -173,11 +173,15 @@ def _followers_for_post(post, accounts):
     return None
 
 
-def build_metric_row(gym_id, post, accounts, snapshot_day, calendar_row=None):
+def build_metric_row(gym_id, post, accounts, snapshot_day, calendar_row=None,
+                     captured_at=None):
     """ONE post_metrics row for this post at this snapshot day. Lever columns
     (pillar, format, hook_family, ...) come from the matched calendar row when
     one exists; an external post carries calendar_id null and external=true.
-    Metrics that Zernio does not report stay None (null-not-zero)."""
+    Metrics that Zernio does not report stay None (null-not-zero).
+
+    `captured_at` is when Echo took the snapshot (AUD-006). None is honest and allowed:
+    it means the caller did not record one, not that the snapshot happened at epoch."""
     a = post.get("analytics") or {}
     cal = calendar_row or {}
     matched = bool(cal.get("id"))
@@ -219,6 +223,12 @@ def build_metric_row(gym_id, post, accounts, snapshot_day, calendar_row=None):
         # the analytics dict is the fallback. Column is not-null default false.
         "is_ad": bool(post.get("isAd") if post.get("isAd") is not None
                       else a.get("isAd") or False),
+        # AUD-006: when ECHO TOOK THE SNAPSHOT, which is a different fact from
+        # published_at (when the GYM posted). Without it "is the nightly pull running"
+        # is unanswerable from this table in either direction, which is how a reported
+        # staleness could be neither confirmed nor cleared. Stamped by the caller so
+        # every row in one run shares one instant.
+        "captured_at": captured_at,
     }
 
 
@@ -321,6 +331,10 @@ def sync_gym(gym_id, analytics_json, store, now, posts_map=None):
     {platformPostId -> zernio post _id} bridge (build_posts_map) that lets an
     analytics entry reach content_calendar.late_post_id. Returns a summary
     dict carrying per-gym matched/external counts."""
+    # AUD-006: one capture instant for every row this run writes, taken from the
+    # run's own clock rather than each row's, so a snapshot batch is stamped
+    # coherently and a test can control it. `now` is tz-aware UTC.
+    captured = now.isoformat() if hasattr(now, "isoformat") else None
     aj = analytics_json or {}
     posts_map = posts_map or {}
     accounts = aj.get("accounts") or []
@@ -357,7 +371,8 @@ def sync_gym(gym_id, analytics_json, store, now, posts_map=None):
         else:
             external_posts += 1
         for day in due:
-            row = build_metric_row(gym_id, post, accounts, day, calendar_row=cal)
+            row = build_metric_row(gym_id, post, accounts, day, calendar_row=cal,
+                                   captured_at=captured)
             if row["external"]:
                 external_rows += 1
             rows.append(row)

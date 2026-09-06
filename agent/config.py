@@ -160,6 +160,73 @@ def social_baseline_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_SOCIAL_BASELINE", "false"))
 
 
+def social_metrics_daily_enabled() -> bool:
+    """
+    The DAILY follower series pull into gym_social_metrics_daily
+    (AGENT_SOCIAL_METRICS_DAILY, default OFF).
+
+    Gates agent/social_metrics_daily.py. Reads Zernio /v1/accounts/follower-stats
+    (one request for the whole org) and upserts one row per gym per account per day.
+    Read-only against Zernio; the only write is the metrics table. OFF by default:
+    nothing this track builds arms itself.
+
+    Fixes AUD-007 / D1: gym_social_metrics_daily has 0 rows because nothing has ever
+    written to it.
+    """
+    return _truthy(os.environ.get("AGENT_SOCIAL_METRICS_DAILY", "false"))
+
+
+def social_metrics_backfill_days() -> int:
+    """How far back a single social-metrics run will write, in days
+    (AGENT_SOCIAL_METRICS_BACKFILL_DAYS, default 90).
+
+    Zernio's follower-stats endpoint ignores every date parameter and returns its full
+    history, so the window is applied by Echo, not asked for. 0 or a negative value means
+    no limit: take everything Zernio holds.
+    """
+    try:
+        return int(os.environ.get("AGENT_SOCIAL_METRICS_BACKFILL_DAYS", "90"))
+    except (TypeError, ValueError):
+        return 90
+
+
+def gbp_failed_retry_enabled() -> bool:
+    """
+    Retry + re-alert for Google Business rows stuck in failed
+    (AGENT_GBP_FAILED_RETRY, default OFF).
+
+    Fixes AUD-003: a failed googlebusiness row is never retried and never alerted a
+    second time, so lasso sat failed from 2026-08-20 (16 days) and crossfitnine7f7dadc
+    from 2026-09-03 with nobody told. Gates the retry sweep in agent/gbp_failed_retry.py.
+    """
+    return _truthy(os.environ.get("AGENT_GBP_FAILED_RETRY", "false"))
+
+
+def apify_social_backfill_enabled() -> bool:
+    """
+    The Apify BEFORE-WINDOW backfill lane (AGENT_APIFY_SOCIAL_BACKFILL, default OFF).
+
+    One run per gym at onboarding to capture the public feed from BEFORE Echo took over.
+    Zernio owns the ongoing series; this lane must NEVER run daily. Also needs APIFY_TOKEN
+    in env; without it the lane reports the absence and does nothing, never a crash.
+
+    Every number it writes carries actor id, build id and run id (see
+    docs/METRICS_DATA_CONTRACT.md s3). A scraped number with no run id is not admissible.
+    """
+    return _truthy(os.environ.get("AGENT_APIFY_SOCIAL_BACKFILL", "false"))
+
+
+def apify_run_ceiling() -> int:
+    """Hard cap on Apify actor runs a single process may start
+    (AGENT_APIFY_RUN_CEILING, default 20). FAIL CLOSED: at the ceiling the lane stops
+    and reports, it does not keep spending. A 0 or negative value means no run is
+    permitted at all, which is the safe reading of a misconfigured ceiling."""
+    try:
+        return int(os.environ.get("AGENT_APIFY_RUN_CEILING", "20"))
+    except (TypeError, ValueError):
+        return 20
+
+
 def socialapi_enabled() -> bool:
     """
     SocialAPI.ai publish-lane master switch. OFF by default. When OFF, EVERY
@@ -3484,6 +3551,46 @@ def caption_variety_window() -> int:
     except (TypeError, ValueError):
         return 10
     return n if n > 0 else 10
+
+
+# The share of a book's POSTS that should carry a closing ask. Blake, 2026-09-06:
+# "every post should not have an ask, make it 33% of post."
+CAPTION_ASK_RATE_DEFAULT = 0.33
+
+
+def caption_ask_rate_target() -> float:
+    """
+    Target share of a book's POSTS that carry an ask (AGENT_CAPTION_ASK_RATE,
+    default 0.33). ONE number, read by both sides of the loop, which is the
+    whole point of it living here:
+
+      * jobs/grade_fix._booking_deficit sizes the REPAIR to it (how many posts
+        the booking CTA is appended to), and
+      * calendar_grade._path SCORES against it (a book at or above the target
+        loses nothing on the ask rule).
+
+    Before this, the repair targeted `min(5, n)` -- 5 of 31 posts, 16.1% -- while
+    the grader still demanded an ask on EVERY post and deducted the ask rule
+    TWICE (`no_ask` was also a caption_craft soft flag). A book repaired exactly
+    as intended therefore scored as 84% defective: the system fighting itself.
+    Both readers now come from this function, so the target cannot drift apart
+    from what is graded.
+
+    Only consulted while AGENT_CTA_VARIETY is armed; with the flag off the
+    repair still targets `min(5, n)` and the grader still wants an ask on every
+    post, byte for byte.
+
+    Clamped to (0, 1]: a target of 0 would mean "never ask", which no gym wants,
+    and above 1 is not a share.
+    """
+    try:
+        r = float(os.environ.get("AGENT_CAPTION_ASK_RATE",
+                                 str(CAPTION_ASK_RATE_DEFAULT)))
+    except (TypeError, ValueError):
+        return CAPTION_ASK_RATE_DEFAULT
+    if not (0.0 < r <= 1.0):
+        return CAPTION_ASK_RATE_DEFAULT
+    return r
 
 
 def calendar_grade_enabled_for(gym_id: str) -> bool:
