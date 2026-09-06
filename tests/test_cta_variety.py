@@ -526,8 +526,13 @@ def test_the_grader_does_not_mark_down_a_book_that_hits_the_target(monkeypatch):
 
 def test_a_book_with_no_asks_at_all_still_loses_the_full_penalty(monkeypatch):
     """The band must not become a licence to never ask. 0% keeps the same worst
-    case path_to_join always had."""
+    case path_to_join always had.
+
+    The gym must HAVE a usable CTA pool for this rule to apply at all: a gym
+    with nothing approved to ask with is exempt by design (Blake, 2026-09-06),
+    which is the test immediately below."""
     monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
     rows = _book(31)
     grade = calendar_grade.grade_month(rows, profile="GYM")
     # 7 for the ask rule + 5 for the booking-specific leg takes the leg to 0.
@@ -675,10 +680,13 @@ def test_a_human_owned_day_is_never_trimmed(monkeypatch):
     assert [r["caption"] for r in rows] == before
 
 
-def test_remediate_forward_book_actually_runs_the_trim_pass(monkeypatch):
-    """THE WIRING. A pass that is built and never called is the failure this
-    repo keeps repeating; nothing above this line would notice if the call site
-    were deleted."""
+def test_remediate_forward_book_removes_an_invalid_closing(monkeypatch):
+    """THE WIRING, and the order. A pass that is built and never called is the
+    failure this repo keeps repeating.
+
+    Reverb's staple is not a valid CTA (it is a question), so the INVALID pass
+    owns it and the trim pass never sees it -- which is the point of running
+    the invalid pass first."""
     monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
     monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
     monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [])
@@ -687,6 +695,25 @@ def test_remediate_forward_book_actually_runs_the_trim_pass(monkeypatch):
         "reverb", rows, _FakeStore(rows), profile="GYM", defects=[],
         today_iso=TODAY, caption_regen=lambda *a, **k: None,
         gap_filler=lambda *a, **k: "none", logger=lambda m: None)
+    assert out["invalid_closings_removed"] == 31, out
+    assert any("not a valid CTA" in a for a in out["actions"]), out["actions"]
+    assert not any(REVERB_CTA.strip() in r["caption"] for r in rows)
+
+
+def test_remediate_forward_book_actually_runs_the_trim_pass(monkeypatch):
+    """THE OTHER WIRING. A VALID CTA repeated on every post is the trim pass's
+    job, not the invalid pass's, and it must be trimmed back to target."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [])
+    valid = "Book your free No Sweat Intro"
+    assert copy_gate.is_cta_shaped(valid)
+    rows = _stapled_book(31, staple=valid)
+    out = grade_fix.remediate_forward_book(
+        "reverb", rows, _FakeStore(rows), profile="GYM", defects=[],
+        today_iso=TODAY, caption_regen=lambda *a, **k: None,
+        gap_filler=lambda *a, **k: "none", logger=lambda m: None)
+    assert out["invalid_closings_removed"] == 0, out
     assert out["ask_trimmed"] > 0, out
     assert any("trimmed the stapled closing ask" in a for a in out["actions"]), out["actions"]
     asking = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
@@ -777,3 +804,136 @@ def test_one_failing_row_does_not_abort_the_whole_pass(monkeypatch):
     grade_fix._fix_ask_excess("reverb", rows, store, lambda m: None)
     assert store.patched, "the pass aborted on the first failing row"
     assert "row_0" not in store.patched
+
+
+# ---------------------------------------------------------------------------
+# BLAKE'S RULING, 2026-09-06: "If a gym's CTA pool is empty or too thin to
+# supply a real ask, DO NOT force one in. No fake/generic/repeated CTA just to
+# hit a target. On those gyms, write the caption with no booking ask at all --
+# good copy, no ask -- rather than degrade quality or repeat the same CTA to
+# hit 33%."
+#
+# That corrected this module's first answer. _fix_ask_excess trims a book DOWN
+# TO the target, which on Dean's book meant KEEPING his nonsensical FAQ heading
+# on ten posts in order to reach 33%. A line that is not a valid CTA is not a
+# partial ask to be rationed -- it is wrong copy, and it goes from every post.
+# ---------------------------------------------------------------------------
+
+def test_an_invalid_closing_is_removed_from_every_post_not_rationed(monkeypatch):
+    """Dean's exact case. His line is a question, so it is not a CTA at all and
+    the ask rate is irrelevant to whether it stays."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    assert not copy_gate.is_cta_shaped(REVERB_CTA)
+    rows = _stapled_book(31)
+    removed = grade_fix._fix_invalid_closings("reverb", rows,
+                                              _PermissiveStore(rows), lambda m: None)
+    assert removed == 31, removed
+    assert not any("get started with training" in r["caption"] for r in rows)
+    # And NOT rationed down to the 33% target: none survive.
+    assert sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"])) == 0
+
+
+def test_a_valid_cta_is_never_removed_by_the_invalid_pass(monkeypatch):
+    """The rate rules own a real CTA; this pass must not touch one."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    valid = "Book your free No Sweat Intro"
+    assert copy_gate.is_cta_shaped(valid)
+    rows = _stapled_book(31, staple=valid)
+    removed = grade_fix._fix_invalid_closings("reverb", rows,
+                                              _PermissiveStore(rows), lambda m: None)
+    assert removed == 0, removed
+    assert all(valid in r["caption"] for r in rows)
+
+
+def test_the_invalid_pass_never_touches_ordinary_body_copy(monkeypatch):
+    """A closing line that is not read as an ask at all is left alone, even
+    though it is also not CTA-shaped."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    closing = "That is how a beginner turns into a regular here every week."
+    assert not copy_gate.ASK_RE.search(closing)
+    rows = _stapled_book(31)
+    for i, r in enumerate(rows):
+        r["caption"] = f"{_no_ask_caption(i)}\n{closing}"
+    assert grade_fix._fix_invalid_closings("reverb", rows, _PermissiveStore(rows),
+                                           lambda m: None) == 0
+    assert all(r["caption"].rstrip().endswith(closing) for r in rows)
+
+
+def test_the_invalid_pass_never_touches_a_human_owned_day(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    for r in rows:
+        r["status"] = "approved"
+    before = [r["caption"] for r in rows]
+    assert grade_fix._fix_invalid_closings("reverb", rows, _PermissiveStore(rows),
+                                           lambda m: None) == 0
+    assert [r["caption"] for r in rows] == before
+
+
+def test_the_invalid_pass_is_inert_with_the_flag_off(monkeypatch):
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _stapled_book(31)
+    before = [r["caption"] for r in rows]
+    assert grade_fix._fix_invalid_closings("reverb", rows, _PermissiveStore(rows),
+                                           lambda m: None) == 0
+    assert [r["caption"] for r in rows] == before
+
+
+def test_the_invalid_pass_skips_a_removal_that_leaves_a_worse_caption(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    for r in rows:
+        r["caption"] = f"Short line.\n{REVERB_CTA}"
+    assert grade_fix._fix_invalid_closings("reverb", rows, _PermissiveStore(rows),
+                                           lambda m: None) == 0
+    assert all(REVERB_CTA.strip() in r["caption"] for r in rows)
+
+
+# --- the grader half of the same ruling -------------------------------------
+
+def test_a_gym_with_no_usable_cta_is_exempt_from_both_ask_rules(monkeypatch):
+    """A gym told not to force an ask must not then be marked down for not
+    asking. Without this, obeying Blake's rule costs Dean's book 11 points and
+    grade_sweep re-attempts the same unfixable days every night forever."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [])
+    rows = _book(31)                       # no asks anywhere
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 10, grade.scores
+    assert any("no approved CTA" in k for k in grade.exempt), grade.exempt
+    assert [d for d in grade.defects if d[0] == "path_to_join"] == []
+
+
+def test_a_gym_that_HAS_a_cta_is_still_held_to_both_ask_rules(monkeypatch):
+    """The mutation guard for the exemption: same ask-less book, but this gym
+    has something to ask with, so it is scored exactly as before."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    assert not any("no approved CTA" in k for k in grade.exempt), grade.exempt
+
+
+def test_the_exemption_fails_OPEN_when_the_pool_cannot_be_read(monkeypatch):
+    """A relaxation must never be granted by accident. If we cannot prove the
+    pool is empty, the gym is graded exactly as it was before."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+
+    def _boom(gym_id, log):
+        raise RuntimeError("client_sources unavailable")
+
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", _boom)
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    assert not any("no approved CTA" in k for k in grade.exempt), grade.exempt
+
+
+def test_the_exemption_needs_the_flag(monkeypatch):
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [])
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    assert not any("no approved CTA" in k for k in grade.exempt), grade.exempt
