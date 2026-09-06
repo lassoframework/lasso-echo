@@ -94,6 +94,9 @@ before this file existed.
 | AGENT_SOCIAL_INTAKE_SYNC | false | BLAKE | Sweeper that routes captured-but-unforwarded portal intakes into Echo. OFF means a cold Stripe buyer's intake sits in Supabase indefinitely with no alert. |
 | AGENT_CONNECTION_WATCH | false | BLAKE | Alerts on a gym whose social connections are partly missing. OFF means nobody is told a connect silently failed. Skips 0-of-3 by design, so a gym that connected nothing never alerts either way. |
 | AGENT_DYNAMIC_ACCOUNTS | false | BLAKE | Auto-provisions the Account record for a newly onboarded gym. OFF means a new gym needs its record added by hand before anything drafts. |
+| AGENT_GYM_DEEP_BRAIN | false | BLAKE | PRE-ONBOARD per-gym deep brain (`python -m agent gym-deep-brain --account <base>`). Reads a gym's OWN public website (robots.txt respected, min gap per host, page/byte capped, non-business emails and phone numbers redacted) and its OWN public Instagram feed (FORM only: caption length, hook shape, emoji/hashtag habits, cadence, ask rate; comments and commenter identities never read) into a per-gym artifact. Every fact carries the page URL it came from and lands in client_sources as PENDING, never auto-approved. Missing domain, handle, robots permission, page or social read BLOCKS with no artifact. OFF = nothing fetched, nothing written. Manual only, there is no automatic sweep. |
+| AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY | 2.0 | code | Minimum seconds between two deep-brain requests to the same host. A robots.txt Crawl-delay larger than this always wins; this is a floor, never a ceiling. |
+| AGENT_GYM_DEEP_BRAIN_DIR | `<DATA_DIR>/deep_brains` | code | Where per-gym deep-brain artifacts land. Deliberately NOT `<DATA_DIR>/brains` (tenant_brain's append-only learning log) and never `~/LASSO/lasso-brain` (the READ-ONLY shared corpus). |
 
 ## Creative studio (Gemini)
 

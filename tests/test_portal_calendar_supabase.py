@@ -63,8 +63,13 @@ class _FakeHTTP:
 
 
 def _row(row_id, gym_id="lasso", post_date="2026-08-06", account="instagram",
-         status="pending", caption="hello", image_url="https://cdn/x.jpg",
+         status="pending", caption=None, image_url="https://cdn/x.jpg",
          pillar="education"):
+    # UNIQUE PER ROW (2026-09-05). These fixtures defaulted every row to one caption,
+    # which is not a real month and collides with the publisher content guard added
+    # after the Tough Temple double post (a caption already sent to an account is
+    # never sent again). Tests that are ABOUT content still pass an explicit caption.
+    caption = caption if caption is not None else f"caption for {row_id}"
     return {
         "id": row_id, "gym_id": gym_id, "post_date": post_date,
         "account": account, "status": status, "caption": caption,
