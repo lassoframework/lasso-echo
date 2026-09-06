@@ -398,3 +398,30 @@ def test_lever_stamp_does_not_swallow_a_whole_sentence_as_an_ask():
     from agent import lever_stamp
     assert lever_stamp.ask_type(
         "Book your very best most incredibly memorable first class") == "none"
+
+
+def test_local_rows_carry_the_new_levers_before_any_store_re_read(monkeypatch):
+    """grade_fix regrades the book from the IN-MEMORY rows straight after a
+    repair, so the local dicts have to reflect what was written, exactly as the
+    caption line beside it already did. A store that accepts the levers kwarg but
+    echoes nothing back proves the local update is doing the work, not the fake.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+
+    class _SilentStore(_FakeStore):
+        def patch_pending_plan(self, gym_id, row_id, *, caption=None, pillar=None,
+                               levers=None):
+            # accepts levers, deliberately writes none back
+            return super().patch_pending_plan(gym_id, row_id, caption=caption,
+                                              pillar=pillar)
+
+    rows = _book(3)
+    for r in rows:
+        r["ask_type"] = "none"
+    grade_fix._fix_craft("reverb", rows, _SilentStore(rows), "GYM", None, set(),
+                         lambda m: None, booking_cta=None)
+    from agent import lever_stamp
+    assert any(r["ask_type"] != "none" for r in rows), rows
+    for r in rows:
+        assert r["ask_type"] == lever_stamp.ask_type(r["caption"])
