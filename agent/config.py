@@ -3740,3 +3740,40 @@ def portal_echo_tickets_poll_minutes() -> int:
         return max(1, int(os.environ.get("AGENT_PORTAL_ECHO_TICKETS_POLL_MINUTES", "3")))
     except ValueError:
         return 3
+
+
+def gym_deep_brain_enabled() -> bool:
+    """PER-GYM DEEP BRAIN (AGENT_GYM_DEEP_BRAIN, Blake 2026-09-06: "create a deeper
+    brain for each gym scraping their website and all their social media prior to
+    starting with us").
+
+    OFF by default = zero behavior change: agent/gym_deep_brain.py fetches nothing,
+    writes no artifact, lands no client_sources row, and every entry point returns a
+    blocked result naming this flag. Nothing in the draft path reads the artifact
+    while the flag is off. Arm by hand: AGENT_GYM_DEEP_BRAIN=true."""
+    return _truthy(os.environ.get("AGENT_GYM_DEEP_BRAIN", "false"))
+
+
+def gym_deep_brain_crawl_delay() -> float:
+    """Minimum seconds between two requests to the SAME host during a deep-brain
+    scrape (AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY, default 2.0). A robots.txt Crawl-delay
+    LARGER than this always wins; this is the floor, never a ceiling. Values below
+    0.0 or unparseable values fall back to the default."""
+    try:
+        v = float(os.environ.get("AGENT_GYM_DEEP_BRAIN_CRAWL_DELAY", "2.0"))
+    except ValueError:
+        return 2.0
+    return v if v >= 0.0 else 2.0
+
+
+def gym_deep_brain_dir() -> str:
+    """The DURABLE root for per-gym DEEP BRAIN artifacts: <DATA_DIR>/deep_brains.
+
+    Deliberately NOT <DATA_DIR>/brains (tenant_brain's append-only learning log, a
+    different format and a different lifecycle) and emphatically never
+    ~/LASSO/lasso-brain, which is the READ-ONLY shared LASSO corpus. Override with
+    AGENT_GYM_DEEP_BRAIN_DIR for a custom mount / tests."""
+    override = os.environ.get("AGENT_GYM_DEEP_BRAIN_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(data_dir(), "deep_brains")
