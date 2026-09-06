@@ -3472,6 +3472,29 @@ def day_shape_assert_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_DAY_SHAPE_ASSERT", "true"))
 
 
+def cta_self_question_gate_enabled() -> bool:
+    """
+    The CTA SELF-QUESTION guard (ECHO_CTA_SELF_QUESTION_GATE, default ON).
+
+    At plan time, alongside the day-shape assertion and before a single row
+    reaches content_calendar, no caption may carry the banned Reverb FAQ line
+    verbatim, and no caption's closing line may be an FAQ-mined self-question CTA
+    (a question naming the gym's own display name asking how to get started/
+    join/sign up/begin at itself). A violation FAILS the plan pass and the build
+    writes nothing. See agent/cta_self_question_gate.py.
+
+    This is the CONTENT rule sitting next to caption_variety.py's measured fix
+    (PR #54, which stopped that exact line from being selected as the shortest
+    "qualifying sentence") -- this module blocks the shape at plan time so it
+    cannot be written again by a different route.
+
+    Armed by DEFAULT because it only ever PREVENTS a write, never causes one.
+    Escape hatch, restoring the old silent behavior exactly:
+    ECHO_CTA_SELF_QUESTION_GATE=false.
+    """
+    return _truthy(os.environ.get("ECHO_CTA_SELF_QUESTION_GATE", "true"))
+
+
 def day_shape_roles_enabled() -> bool:
     """
     The DAY SHAPE producer (ECHO_DAY_SHAPE_ROLES, default OFF).

@@ -49,6 +49,7 @@ import os
 import re
 
 from . import client_content, config, day_shape
+from . import cta_self_question_gate
 from . import real_calendar_mirror as _mirror
 
 # Media extensions that count as a client having uploaded usable creative.
@@ -1426,6 +1427,37 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             return {"ok": False,
                     "reason": "day shape: same post twice in one day",
                     "day_shape_violations": [v.message() for v in exc.violations],
+                    "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+        # CTA SELF-QUESTION GATE (ECHO_CTA_SELF_QUESTION_GATE, default ON). Same
+        # plan-time, same fail-closed shape as the day-shape assertion above:
+        # nothing is deleted, nothing is inserted, when any row carries the
+        # banned Reverb FAQ line or an FAQ-mined self-question closing CTA. See
+        # agent/cta_self_question_gate.py for why this is scoped to CTA form
+        # only, never to audience/topic words (HYROX and competitive CrossFit
+        # remain a valid Echo audience, Blake 2026-09-06 -- this gate does not
+        # touch that).
+        from . import accounts as _accounts
+        _gym_name_for_gate = _display_name_for(
+            _accounts.get_account(f"{base_key}_ig")
+            or _accounts.get_account(f"{base_key}_fb"))
+        try:
+            cta_self_question_gate.assert_no_self_question_cta(
+                clean_rows, _gym_name_for_gate,
+                enabled=config.cta_self_question_gate_enabled())
+        except cta_self_question_gate.CtaSelfQuestionGateViolation as exc:
+            for v in exc.violations:
+                log(f"CTA SELF-QUESTION FAIL: {v.message()}")
+            try:
+                from . import ops_alerts
+                ops_alerts.alert(
+                    f"{base_key}: month build STOPPED and wrote nothing. "
+                    f"{len(exc.violations)} row(s) carried a banned or "
+                    f"self-question CTA. First: {exc.violations[0].message()}")
+            except Exception:  # noqa: BLE001 - the alert never sinks the report
+                pass
+            return {"ok": False,
+                    "reason": "cta self-question gate: banned or self-question CTA",
+                    "cta_gate_violations": [v.message() for v in exc.violations],
                     "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
         # NEVER SHRINK (TopFuel 2026-08-25): a grow-to-cap rebuild must only GROW, never
         # replace a good calendar with a SMALLER one. The grow-guard can re-trigger a build
