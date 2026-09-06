@@ -161,6 +161,64 @@ def structure_signature(caption: str) -> str:
     return f"{sent_band}/{para_band}/{opener}/{ask}"
 
 
+# Trigram-Jaccard threshold above which two captions' BODIES read as the same
+# template to a person scrolling the feed, not merely similar in topic. Chosen
+# by measurement, not a round number: on CrossFit Reverb's real post-fix book
+# (2026-09-06), the only in-window body pair a human would call a repeat --
+# "You're ready to start but don't know if CrossFit is right for you... Our
+# coaches meet with you first..." reused near-verbatim three weeks later as
+# "You're ready to start but don't know the first step... Our No Sweat Intro
+# Meeting lets you sit down with a coach..." -- scored 0.188; every other
+# in-window pair scored below 0.15. The gap between "same template" and
+# "coincidentally shares a few words" sits in that band on real data.
+BODY_SIMILARITY_THRESHOLD = 0.15
+
+# Body shingles use wider n-grams than the collision detector needs elsewhere
+# (opening_signature uses words, not shingles) because a short overlap phrase
+# ("get you started", "your first class") is common gym-voice language and
+# would false-positive at n=2 or on raw word overlap; 3 is what the anti-
+# repetition rail's own docstring already calls out as this repo's convention
+# for phrase-level (not word-level) comparison.
+_BODY_SHINGLE_N = 3
+
+
+def body_text(caption: str) -> str:
+    """The caption with its CLOSING (last non-empty line) removed.
+
+    The closing is scored separately by closing_signature/the ask-rate rail;
+    comparing it again here would make an intentional, approved CTA repeat
+    (which is fine at the target ask rate) look like body sameness, which is
+    a different defect. Falls back to the whole caption when there is only
+    one line -- nothing to strip, and a one-line caption's "body" is itself.
+    """
+    lines = [ln for ln in copy_gate.scrub(str(caption or "")).splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        return "\n".join(lines)
+    return "\n".join(lines[:-1])
+
+
+def body_shingles(caption: str, n: int = _BODY_SHINGLE_N) -> frozenset:
+    """The BODY's word n-grams (n=3 by default), normalized. Empty when the
+    body has fewer than n words -- nothing to compare, never a false match."""
+    words = _WORD_RE.findall(normalize(body_text(caption)))
+    if len(words) < n:
+        return frozenset()
+    return frozenset(tuple(words[i:i + n]) for i in range(len(words) - n + 1))
+
+
+def body_similarity(caption_a: str, caption_b: str) -> float:
+    """Trigram-Jaccard similarity of two captions' BODIES (closing stripped).
+
+    0.0 when either body has too few words to shingle -- a caption too short
+    to compare is never treated as a duplicate of anything by default; that
+    is thin_caption's defect to catch, not this one's.
+    """
+    a, b = body_shingles(caption_a), body_shingles(caption_b)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def signatures(caption: str) -> dict:
     """Every signature for one caption, in one call."""
     return {
@@ -178,7 +236,20 @@ def signatures(caption: str) -> dict:
 # The signature kinds a forward book is checked against. `length_band` is
 # deliberately NOT a collision kind: four bands cannot fill a 31 day book
 # without repeats. It is reported as a DISTRIBUTION instead (see report()).
-COLLISION_KINDS = ("opening", "closing", "structure")
+#
+# "body" is NOT an exact-signature kind like the other three -- there is no
+# discrete value two posts can share. It is checked separately, by
+# body_similarity() against BODY_SIMILARITY_THRESHOLD (see collisions()).
+# WHY IT HAD TO EXIST (2026-09-06, Blake): opening_signature (first 4 words)
+# and closing_signature (last line) each catch their own end of a caption, and
+# structure_signature is a coarse (sentence-band, paragraph-band, opener-move,
+# ask-present) fingerprint -- none of the three reads the MIDDLE of a caption.
+# Measured on Reverb's real book, in-window, post the ask-rate fix: 2026-09-24
+# and 2026-09-26 share 18.8% of their body's word-trigrams ("You're ready to
+# start but don't know..." / "Our coaches meet with you first...") with a
+# DIFFERENT opening 4 words and a DIFFERENT closing line -- a template repeat
+# invisible to all three existing kinds.
+COLLISION_KINDS = ("opening", "closing", "structure", "body")
 
 
 def _post_key(row) -> str:
@@ -190,8 +261,10 @@ def _post_key(row) -> str:
     return str(row.get("post_date") or row.get("date") or "")
 
 
-def collisions(rows, window: int = DEFAULT_WINDOW, kinds=COLLISION_KINDS) -> list[dict]:
-    """Every pair of POSTS inside `window` of each other sharing a signature.
+def collisions(rows, window: int = DEFAULT_WINDOW, kinds=COLLISION_KINDS,
+              body_threshold: float = BODY_SIMILARITY_THRESHOLD) -> list[dict]:
+    """Every pair of POSTS inside `window` of each other sharing a signature,
+    OR (when "body" is in `kinds`) whose bodies read as the same template.
 
     `rows` are content_calendar-shaped dicts with `post_date` and `caption`.
     Rows are collapsed to one post per date, then ordered by date; the window
@@ -206,13 +279,20 @@ def collisions(rows, window: int = DEFAULT_WINDOW, kinds=COLLISION_KINDS) -> lis
         by_date.setdefault(key, cap)
 
     ordered = sorted(by_date.items())
-    sigs = [(d, signatures(c)) for d, c in ordered]
+    sigs = [(d, c, signatures(c)) for d, c in ordered]
 
     out = []
-    for i, (date_i, sig_i) in enumerate(sigs):
+    for i, (date_i, cap_i, sig_i) in enumerate(sigs):
         for j in range(i + 1, min(i + 1 + window, len(sigs))):
-            date_j, sig_j = sigs[j]
+            date_j, cap_j, sig_j = sigs[j]
             for kind in kinds:
+                if kind == "body":
+                    sim = body_similarity(cap_i, cap_j)
+                    if sim >= body_threshold:
+                        out.append({"kind": "body", "value": round(sim, 4),
+                                    "dates": [date_i, date_j],
+                                    "distance": j - i})
+                    continue
                 v = sig_i.get(kind)
                 if v and v == sig_j.get(kind):
                     out.append({"kind": kind, "value": v,
@@ -253,6 +333,22 @@ def report(rows, window: int = DEFAULT_WINDOW) -> dict:
             out["length_bands"] = counts
 
     out["collisions"] = collisions(rows, window=window)
+
+    # Body sameness is a book-wide question, not only an in-window one (a
+    # template can recur outside the anti-repetition window and a client
+    # reviewing a full month still sees it). Reported over EVERY pair, not
+    # just in-window ones, alongside the in-window count already in
+    # out["collisions"].
+    body_pairs = [body_similarity(a, b)
+                  for idx, a in enumerate(caps) for b in caps[idx + 1:]]
+    over_threshold = [s for s in body_pairs if s >= BODY_SIMILARITY_THRESHOLD]
+    out["body_similarity"] = {
+        "threshold": BODY_SIMILARITY_THRESHOLD,
+        "max": round(max(body_pairs), 4) if body_pairs else 0.0,
+        "mean": round(sum(body_pairs) / len(body_pairs), 4) if body_pairs else 0.0,
+        "pairs_over_threshold": len(over_threshold),
+        "in_window_collisions": sum(1 for c in out["collisions"] if c["kind"] == "body"),
+    }
     return out
 
 

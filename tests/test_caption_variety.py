@@ -340,3 +340,146 @@ def test_form_plan_helper_advances_with_the_day(monkeypatch):
     a = client_content._form_plan_for_day("2026-09-04")
     b = client_content._form_plan_for_day("2026-09-05")
     assert a["hook_family"] != b["hook_family"]
+
+
+# ---------------------------------------------------------------------------
+# BODY SIMILARITY (2026-09-06, Blake). opening_signature/closing_signature/
+# structure_signature each read one END of a caption or a coarse fingerprint;
+# none reads the MIDDLE. Two posts with a DIFFERENT opening and a DIFFERENT
+# closing can still share a near-identical body template and pass every
+# existing kind undetected. Measured on Reverb's real post-fix book: 2026-09-24
+# and 2026-09-26 shared 18.8% of their body word-trigrams with different
+# openings and different closings.
+# ---------------------------------------------------------------------------
+
+REVERB_TEMPLATE_A = (
+    "You're ready to start but don't know if CrossFit is right for you.\n\n"
+    "Our coaches meet with you first to understand your goals and design a "
+    "program that fits where you are now. That's how we build confidence "
+    "before your first workout.")
+REVERB_TEMPLATE_B = (
+    "You're ready to start but don't know the first step.\n\n"
+    "That's where we come in. Our No Sweat Intro Meeting lets you sit down "
+    "with a coach, review your goals, and get a clear path forward before "
+    "you ever step on the floor.")
+
+
+def test_body_similarity_catches_a_real_template_repeat_from_dean_book():
+    """The pair that motivated this. Its closing lines DIFFER (so
+    closing_signature never flags it), and this pair happens to also share
+    its opening 4 words -- so opening_signature WOULD have caught it too, had
+    the two posts been inside the same anti-repetition window. They were not:
+    13 posts apart in Reverb's real book, well outside window 10. That is
+    exactly the second gap this closes -- see
+    test_report_surfaces_book_wide_body_similarity_not_only_in_window below."""
+    from agent import caption_variety as cv
+    assert cv.closing_signature(REVERB_TEMPLATE_A) != cv.closing_signature(REVERB_TEMPLATE_B)
+    sim = cv.body_similarity(REVERB_TEMPLATE_A, REVERB_TEMPLATE_B)
+    assert sim >= cv.BODY_SIMILARITY_THRESHOLD, sim
+
+
+# A SYNTHETIC pair, purpose-built to isolate the harder claim: different
+# OPENING 4 words, different CLOSING line, same body template. Reverb's real
+# pair (above) happened to also share its opening; this proves the kind
+# catches sameness even when neither end of the caption matches.
+SYNTHETIC_BODY_A = (
+    "Tuesday reminded everyone why the fundamentals matter, and see you at 6am. "
+    "Our coaches meet with you first to understand your goals and design a "
+    "program that fits where you are now, which is how we build confidence "
+    "before your first workout.")
+SYNTHETIC_BODY_B = (
+    "Nobody walks in here already knowing everything.\n\n"
+    "Our coaches meet with you first to understand your goals.\n\n"
+    "They design a program that fits where you are now.\n\n"
+    "That is how we build confidence before your first workout.\n\n"
+    "Catch you Thursday.")
+
+
+def test_the_three_existing_kinds_alone_miss_a_different_opening_and_closing():
+    """Confirms the GAP this closes: a body template repeated with a
+    DIFFERENT opening and a DIFFERENT closing produces zero collisions under
+    the three signature-equality kinds alone."""
+    from agent import caption_variety as cv
+    assert cv.opening_signature(SYNTHETIC_BODY_A) != cv.opening_signature(SYNTHETIC_BODY_B)
+    assert cv.closing_signature(SYNTHETIC_BODY_A) != cv.closing_signature(SYNTHETIC_BODY_B)
+    assert cv.structure_signature(SYNTHETIC_BODY_A) != cv.structure_signature(SYNTHETIC_BODY_B)
+    rows = [
+        {"post_date": "2026-09-01", "caption": SYNTHETIC_BODY_A},
+        {"post_date": "2026-09-03", "caption": SYNTHETIC_BODY_B},
+    ]
+    old_kinds = ("opening", "closing", "structure")
+    assert cv.collisions(rows, window=10, kinds=old_kinds) == []
+    # "body" catches exactly what the other three miss.
+    hits = [c for c in cv.collisions(rows, window=10) if c["kind"] == "body"]
+    assert len(hits) == 1, hits
+
+
+def test_body_similarity_is_a_collision_kind_by_default():
+    from agent import caption_variety as cv
+    rows = [
+        {"post_date": "2026-09-01", "caption": REVERB_TEMPLATE_A},
+        {"post_date": "2026-09-03", "caption": REVERB_TEMPLATE_B},
+    ]
+    hits = [c for c in cv.collisions(rows, window=10) if c["kind"] == "body"]
+    assert len(hits) == 1, hits
+    assert hits[0]["dates"] == ["2026-09-01", "2026-09-03"]
+
+
+def test_body_similarity_ignores_the_closing_line_by_design():
+    """A shared, INTENTIONAL, approved CTA must not itself read as body
+    sameness -- that is the ask-rate rail's job, a different defect."""
+    from agent import caption_variety as cv
+    a = "Totally different opening about a Tuesday workout.\n\nBook your free No Sweat Intro"
+    b = "A completely unrelated story about a member's first pull-up.\n\nBook your free No Sweat Intro"
+    assert cv.body_similarity(a, b) == 0.0
+
+
+def test_two_genuinely_different_bodies_score_low():
+    from agent import caption_variety as cv
+    a = ("Tuesday's workout tested grip strength more than anything else.\n\n"
+         "Three rounds of deadlifts and pull-ups left half the class laughing "
+         "at how spent their forearms were by the second set.")
+    b = ("A member hit her first strict pull-up this morning after six months "
+         "of banded work.\n\nThe whole room stopped to watch, and the coach "
+         "who had been drilling scapular pulls with her for weeks was just as "
+         "loud as everyone else.")
+    assert cv.body_similarity(a, b) < cv.BODY_SIMILARITY_THRESHOLD
+
+
+def test_a_caption_too_short_to_shingle_is_never_a_body_match():
+    from agent import caption_variety as cv
+    assert cv.body_similarity("Hi", "Hi there") == 0.0
+    assert cv.body_similarity("", "") == 0.0
+
+
+def test_report_surfaces_book_wide_body_similarity_not_only_in_window():
+    """A template can recur OUTSIDE the anti-repetition window (13 posts
+    apart, in Reverb's real case) and a client reviewing the whole month
+    still notices it. report() must not hide that behind the in-window
+    collision count."""
+    from agent import caption_variety as cv
+    # Genuinely distinct filler bodies -- NOT a word-substituted template. An
+    # earlier version of this test filled a shared sentence skeleton and every
+    # filler collided with every other filler, which asserted nothing.
+    fillers = [
+        "The 6am class hit a new PR on the clean and jerk today.",
+        "Rain did not stop the outdoor row from happening this morning.",
+        "Three new members finished their first full workout this week.",
+        "The gym restocked chalk after Tuesday's grip-heavy session.",
+        "A member celebrated her first strict pull-up in front of everyone.",
+        "Saturday's partner workout paired veterans with total beginners.",
+        "The whiteboard got a new record time posted before lunch.",
+        "Coaches spent the morning drilling squat depth with the noon class.",
+        "A birthday WOD turned into the loudest class of the month.",
+        "The parking lot was full twenty minutes before the 5pm class.",
+    ]
+    rows = [{"post_date": f"2026-09-{i:02d}", "caption": fillers[i - 1]}
+            for i in range(1, 11)]
+    rows.append({"post_date": "2026-09-11", "caption": "Placeholder eleven."})
+    rows.append({"post_date": "2026-09-12", "caption": "Placeholder twelve."})
+    rows[0]["caption"] = REVERB_TEMPLATE_A
+    rows[11]["caption"] = REVERB_TEMPLATE_B    # 12 posts apart: outside window 10
+    rep = cv.report(rows, window=10)
+    assert rep["body_similarity"]["in_window_collisions"] == 0
+    assert rep["body_similarity"]["pairs_over_threshold"] == 1
+    assert rep["body_similarity"]["max"] >= cv.BODY_SIMILARITY_THRESHOLD
