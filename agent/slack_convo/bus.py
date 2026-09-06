@@ -23,12 +23,18 @@ matching" at runtime. Catching the violation is the reliable form.
 import json
 from datetime import datetime, timedelta, timezone
 
+from . import testdata as _td
 from .. import config
 
 _TICKETS = "support_tickets"
 _MESSAGES = "support_messages"
 
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
+
+
+def _a_kind_escalation():
+    from .adapter import KIND_ESCALATION
+    return KIND_ESCALATION
 
 
 class BusError(RuntimeError):
@@ -157,28 +163,50 @@ class Bus:
         picked up by anything" means for this bus; a ticket already routed to a
         classification (question/code_fix/action_request) or otherwise past 'new' is
         never re-fetched here, so a slow worker restart can never double-process one."""
-        return self._get(_TICKETS, {
+        rows = self._get(_TICKETS, {
             "product": f"eq.{product}", "source": f"eq.{source}", "status": "eq.new",
             "classification": "is.null", "select": "*",
             "order": "created_at.asc", "limit": str(int(limit))})
+        # 2026-09-05: our own arming probes are never work. Eight of them sat in #fixer
+        # looking exactly like unhandled client tickets; a re-run of this poll must not put
+        # any of them back on a card. testdata.py is the single predicate for that, shared
+        # with every report and metric so they can never disagree.
+        return _td.exclude_test_strict(rows)
 
     def find_fixing_tickets(self, *, product, limit=20):
         """The second-stage poll: code_fix tickets already dispatched to the fixer
         worker (status='fixing', set by the worker that wrote the fixer_request), whose
-        verification the worker may or may not have written back yet."""
-        return self._get(_TICKETS, {
+        verification the worker may or may not have written back yet.
+
+        MINOR 5 (audit 8): this was the one poll with no test-ticket filter, so a probe
+        parked in 'fixing' produced a #fixer card every day forever -- the opposite of the
+        "never resurface" the probe purge was for."""
+        rows = self._get(_TICKETS, {
             "product": f"eq.{product}", "status": "eq.fixing", "select": "*",
             "order": "created_at.asc", "limit": str(int(limit))})
+        return _td.exclude_test_strict(rows)
 
     def count_tickets_for_user_today(self, slack_user_id, bot_identity=None):
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                    microsecond=0).isoformat()
+        # Finding 7 (2026-09-05 audit 3): this selected "id" only, so every row handed to
+        # the filter was {"id": ...} and the filter could never match anything -- inert in
+        # production, the exact pattern D56 names, inside the fix for a different one. The
+        # columns the predicate reads are selected now, and it uses the STRICT predicate: a
+        # daily cap is a safety limit, and loosening it on a tag a client could type would
+        # hand anyone an unbounded cap.
         params = {"slack_user_id": f"eq.{slack_user_id}", "created_at": f"gte.{start}",
-                  "select": "id"}
+                  "select": "id,raw_text,reporter,slack_user_id,is_test"}
         if bot_identity:
             params["bot_identity"] = f"eq.{bot_identity}"
-        rows = self._get(_TICKETS, params)
-        return len(rows)
+        try:
+            rows = self._get(_TICKETS, params)
+        except BusError:
+            # is_test may not exist yet on an older database; fall back to the columns that
+            # always have, rather than failing the cap read open.
+            params["select"] = "id,raw_text,reporter,slack_user_id"
+            rows = self._get(_TICKETS, params)
+        return len(_td.exclude_test_strict(rows))
 
     def find_recent_ticket_for_user_today(self, slack_user_id, bot_identity=None):
         """RB2/D25 (2026-09-03, MAJOR): the most recent ticket this user opened today, in ANY
@@ -242,6 +270,12 @@ class Bus:
         return self._get(_MESSAGES, {"ticket_id": f"eq.{ticket_id}", "select": "*",
                                      "order": "created_at.asc", "limit": str(int(limit))})
 
+    def recent_messages(self, ticket_id, limit=200):
+        """The NEWEST rows on a ticket, newest first. `messages` is ascending, which makes a
+        client-side scan of a long ticket read only its oldest rows (audit 8, MINOR 1)."""
+        return self._get(_MESSAGES, {"ticket_id": f"eq.{ticket_id}", "select": "*",
+                                     "order": "created_at.desc", "limit": str(int(limit))})
+
     def message(self, message_id):
         rows = self._get(_MESSAGES, {"id": f"eq.{message_id}", "select": "*", "limit": "1"})
         return rows[0] if rows else None
@@ -272,6 +306,22 @@ class Bus:
             "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
             "attachments->>kind": f"eq.{kind}", "created_at": f"gte.{since_iso}",
             "select": "id"})
+        return len(rows)
+
+    def count_escalation_cards_since(self, ticket_id, since_iso):
+        """Escalation rows on a ticket since a timestamp, EXCLUDING receipts.
+
+        Receipts ride on kind='escalation' (the portal's client-visibility denylist has no
+        'receipt' entry, so a new kind would be readable by the client). They are marked with
+        attachments.receipt, and every bound that means "have we already told a human about
+        this" must exclude them -- otherwise one receipt suppresses a real card for the rest
+        of the day (audit 6, finding 3). Filtered server-side, so it cannot undercount the
+        way a client-side scan of the oldest 200 rows did."""
+        rows = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "attachments->>kind": f"eq.{_a_kind_escalation()}",
+            "attachments->>receipt": "is.null",
+            "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
 
     def outbox(self, status="ready", limit=50, identity=None):

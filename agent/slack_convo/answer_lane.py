@@ -33,6 +33,7 @@ Everything is injected (fetch_state, llm) so this is offline-testable with no mo
 """
 import json
 import re
+import re as _re
 
 NO_ANSWER = "NO_ANSWER"
 
@@ -117,6 +118,36 @@ def default_llm(system, user, *, model=None):
     return "".join(parts).strip()
 
 
+def _speaker_identity(speaker, fallback):
+    from . import identities as _ids
+    try:
+        return _ids.get(speaker)
+    except KeyError:
+        return fallback
+
+
+def _domain_guidance_only(doc, routed_name):
+    """The routed voice doc minus every line that names the routed bot.
+
+    A voice doc mixes two things: who the bot IS ("Wrangler is the LASSO team member who
+    builds and maintains gym websites") and how to talk about its SUBJECT. Only the second
+    travels when another bot answers -- the first is a claim about identity that would be
+    false in the speaker's mouth however it is phrased, and rewriting the name only makes it
+    a more convincing falsehood (audit 6, finding 5)."""
+    kept = []
+    for line in (doc or "").splitlines():
+        if _re.search(rf"\b{_re.escape(routed_name)}\b", line, _re.IGNORECASE):
+            continue
+        kept.append(line)
+    # Audit 7, MINOR 6: a 2000-char cap silently dropped 41% of Wrangler's 3396-char doc,
+    # including its whole Escalation section -- the routed guidance is the entire point of
+    # routing, and truncating it below the size of the only doc it is used with made the
+    # capability quietly partial. Bounded generously instead (the system prompt as a whole is
+    # still far inside any model limit).
+    text = "\n".join(kept).strip()
+    return text[:6000]
+
+
 def _voice_rules(identity):
     try:
         import os
@@ -175,9 +206,18 @@ def conversation_for_model(messages):
     return out
 
 
-def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None):
-    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises."""
+def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, llm=None,
+           speaks_as=None):
+    """Return {'body': str, 'grounding': dict} or None (escalate). Never raises.
+
+    `speaks_as` (finding 13, 2026-09-05 audit 3): under D50 cross-product routing the
+    KNOWLEDGE and voice doc come from one identity while the message is posted by another --
+    so the system prompt used to say "You are Wrangler" on a reply going out of Scout's bot,
+    in Scout's DM. The client would see one bot introduce itself as another. The name in the
+    prompt is now the bot that will actually speak; everything else about the routing is
+    unchanged."""
     convo = conversation_for_model(messages)
+    speaker = speaks_as or identity.name
     q = (question or "").strip()
     if not q:
         inbound = [m for m in convo if m.get("direction") == "inbound"]
@@ -190,10 +230,39 @@ def answer(ticket, who, messages, question=None, *, identity, fetch_state=None, 
         facts = {"unavailable": type(e).__name__}
     if _all_unavailable(facts):
         return None   # V-M4: a snapshot of failures is not grounding
+    # Audit 5, finding 6: `bot` used to record the identity whose knowledge drafted the
+    # answer, while the client was spoken to by a different one -- a false entry in the
+    # record this system treats as evidence. It records both, named for what they are.
     grounding = {"question": q[:500], "facts": facts, "thread_len": len(convo),
-                 "bot": identity.name}
-    system = _SYSTEM.format(bot=identity.name.capitalize(), who=who.kind,
-                            voice=_voice_rules(identity))
+                 "bot": speaker, "domain_guidance_from": identity.name}
+    # Audit 4, finding 5: swapping one token of the system prompt was not enough -- the
+    # appended VOICE DOC is the longer and far more specific identity instruction, and under
+    # cross-product routing it still named the other bot throughout ("Wrangler is the LASSO
+    # team member who builds and maintains gym websites", five times over). The voice a
+    # client hears must belong to the bot that is actually speaking, so the voice doc comes
+    # from the SPEAKER; what routing moves is the subject matter, stated explicitly.
+    voice = _voice_rules(identity)
+    if speaks_as and speaks_as != identity.name:
+        # Audit 6, findings 5 and 6: rewriting the routed bot's NAME to the speaker's turned
+        # its self-description into a FALSE ROLE CLAIM in a client-facing prompt ("Scout is
+        # the LASSO team member who builds and maintains gym websites"), and the substitution
+        # was a case-insensitive \bname\b over the whole doc -- "echo" is both an identity
+        # and an ordinary English word, so the same code would silently corrupt text the day
+        # routing ever targets Echo.
+        #
+        # No substitution. The SPEAKER's own voice doc is the voice (one bot, one identity),
+        # and from the routed doc we take only the lines that do not talk about who that bot
+        # IS -- which is exactly the domain guidance routing exists to move, with none of the
+        # identity statements that made it a lie.
+        own = _voice_rules(_speaker_identity(speaker, identity))
+        routed_guidance = _domain_guidance_only(voice, identity.name)
+        voice = own
+        if routed_guidance:
+            voice += (f"\n\nGuidance for questions about a client's {identity.product} "
+                      f"(this is one):\n{routed_guidance}")
+        voice += (f"\n\nThis question is about the client's {identity.product}. Answer it "
+                  f"from the FACTS block, in your own voice as {speaker.capitalize()}.")
+    system = _SYSTEM.format(bot=speaker.capitalize(), who=who.kind, voice=voice)
     user = ("FACTS:\n" + json.dumps(facts, default=str, indent=1)[:6000] +
             "\n\nCONVERSATION SO FAR (most recent last):\n" +
             "\n".join(f"- {m.get('author_type')}: {str(m.get('body') or '')[:300]}"

@@ -1253,3 +1253,810 @@ actually talk to production. A schema-contract test, run statically against the 
 DDL rather than a description of it, is the check that closes that specific gap, and is
 worth having for any column with a narrow, hand-maintained CHECK constraint that
 application code writes literals into.
+
+---
+
+## D56 (2026-09-05) -- "built but not wired": naming the pattern after its third instance
+
+Blake, looking at #fixer with all four identities armed: *"#fixer is not autonomous. Every
+ticket says 'the classifier did not decide' and every held draft is the escalation
+placeholder, not a real answer."*
+
+The direct cause was one line, present since this package's first commit (`a5a008a`,
+2026-09-03) and never anything else:
+
+```python
+# agent/slack_convo/listener_wiring.py, live_deps()
+answer=answer, classify_llm=None, log=log)
+```
+
+`classifier.classify()` consults its injected model ONLY after every deterministic rule
+declines. With `classify_llm=None` hardcoded in the one function that builds production
+dependencies, that branch was unreachable in production for the entire life of the system.
+Every message the regexes did not recognise fell to `ESCALATE` -- not by failure, BY
+CONSTRUCTION. `config.slack_convo_model()`'s own docstring had promised "the LLM fallback of
+the classifier" the whole time; the env var could be set on the service forever and change
+nothing.
+
+Its twin, found the same day in the portal bridge (`RTF-2`): `echo_ticket_wiring.py` passed
+`answer_lane.default_llm` -- signature `(system, user, model=None)` -- as the CLASSIFIER's
+`llm`, whose contract is `(text) -> label`. Every call raised `TypeError`; `classify()`
+caught it and escalated, exactly as designed for a model fault; and the outcome was
+indistinguishable from "the classifier had nothing to say". **A wrong-shaped wire is the
+same bug as a missing one, only harder to see.** This is the path the one real client ticket
+of 2026-09-05 (`35e066d0`, the "nothing was recreated" report) actually travelled.
+
+### The pattern, now three deep in one system
+
+| # | Instance | What existed | What was connected | How it looked from outside |
+|---|----------|--------------|--------------------|----------------------------|
+| 1 | `delivery_status='posting'` | the outbox CAS, always | the CHECK constraint never allowed the state | every claim 400'd; NOTHING had ever posted |
+| 2 | `listener_watch` | the watchdog loop, in the repo | nothing started it | a safety net that shipped inert |
+| 3 | `classify_llm=None` | the LLM classifier, tested | `None`, hardcoded in `live_deps()` | "the classifier did not decide", forever |
+| 3b | `llm=` in the portal bridge | a callable WAS passed | the wrong callable's shape | identical to instance 3, one layer subtler |
+
+The shape is always the same, and it is why none of these were caught by tests: **the
+capability exists, config says it is on, and the fallback path is a legitimate one.**
+Escalating to a human when the classifier is unsure is CORRECT behaviour. Failing closed on
+a model exception is CORRECT behaviour. That is exactly what makes this class invisible --
+the broken state is byte-for-byte identical to a healthy system that simply had nothing to
+say. "All tests green" said nothing about it, because every test injected its own working
+fake into the seam that production left empty.
+
+### The check that catches the whole class
+
+`tests/test_not_wired_guard.py`, a sibling of `tests/test_db_constraint_contract.py` and
+written in the same spirit -- static, no network, no test double:
+
+1. **No hardcoded `None` capability in `live_deps()`.** The function is parsed with `ast`;
+   any `*_llm=None` / `answer=None` written as a constant fails the test by name.
+2. **The boot assertion is actually called.** `build_classify_llm()` refuses to boot
+   (`NotWiredError`) when a flag says a capability is on and nothing can be built behind it,
+   and `assert_classifier_shape()` refuses a callable whose signature is not `(text)`. The
+   test asserts both are reachable from the real wiring path -- *an assertion nobody calls is
+   itself an instance of the bug it exists to catch.*
+3. **OFF must be loud.** A deployment running deterministic-only classification says so at
+   boot. Silence is what let this live for two days; the OFF state is allowed, being unable
+   to tell OFF from BROKEN is not.
+4. **Every flag has a config reader**, so an env var set on the service cannot be inert.
+
+### The generalizable rule
+
+Pair the D55 lesson with this one and they cover both halves of the same failure:
+
+> **D55:** a test double is only as good as the constraints it models; check the code against
+> the real schema, statically.
+> **D56:** a capability is only as real as its wiring; check that the flag, the seam, and the
+> implementation are connected, statically -- and make the disconnected state fail loudly at
+> boot rather than degrade into a legitimate-looking fallback.
+
+Whenever a new capability ships behind a flag (the standing repo rule, and the right rule),
+the flag's ON state must be unable to boot into a no-op. That is the whole fix.
+
+### Live impact, checked against the bus rather than assumed
+
+Queried directly (`support_tickets`, project `ooqcvmcjspeltuuhcvlh`, 2026-09-03 onward,
+excluding `[phase4-audit]` probes and the `U0000000000` synthetic sender):
+
+* **`source='slack_conversation'`: zero real client tickets, ever.** The Slack path where
+  `classify_llm=None` lived carried no genuine client traffic in the whole window. Nobody was
+  told anything wrong, and no client saw the placeholder. That is a good outcome and it is
+  worth stating plainly rather than softening: the bug was real, its blast radius was not.
+* **`source='website_tab'`: exactly one real client ticket affected** -- `35e066d0`
+  (dale@brokerdale.realestate, 2026-09-05 01:02 UTC), a legitimate breakage report that
+  escalated with `classification=null` where a working classifier would have opened a fix
+  request. It travelled the RTF-2 wrong-shape path, not the `None` one.
+* `a9efa713` (2026-09-04, "Can we add our group sessions schedule to the website?") never
+  reached the classifier at all: it failed identity resolution first (`reporter` NULL, a row
+  created ~18 hours before the portal began stamping `reporter` at all). Structurally
+  unroutable, not a classifier failure. See D57.
+
+---
+
+## D57 (2026-09-05) -- a9efa713, and what "identity_unknown" was hiding
+
+Ticket `a9efa713-c9f0-4688-9580-5a93dfa4b4f2`, portal Website tab, 2026-09-04 02:22 UTC:
+*"Can we add our group sessions schedule to the website?"* It reached #fixer as
+`Portal ticket a9efa713... (scout) could not be routed automatically: identity_unknown` and
+stopped there. Two separate failures, traced independently.
+
+**(a) Identity: structurally unfixable for this ticket, and not a bug today.**
+`echo_ticket_worker.resolve_client_identity()` returns UNKNOWN before any lookup when the
+row has no `reporter`:
+
+```python
+email = (ticket.get("reporter") or "").strip()
+claimed_gym_id = ticket.get("client_id") or ""
+if not email or not claimed_gym_id:
+    return _ig.Identity(_ig.UNKNOWN, "", reason="ticket missing reporter or client_id")
+```
+
+This row's `reporter` is NULL and always was: the portal only began stamping `reporter`
+in `db126a60` (2026-09-04 16:45), roughly 18 hours AFTER this ticket was inserted. There is
+no email anywhere on the row to recover, so no code change can route it. A human attributing
+it to its gym (`client_id b536c122-49b6-4b98-9021-b0713750bf82`) is the only path. Of the
+five `website_tab` tickets in the table, this pre-fix row is the only one with a NULL
+reporter; all four created after the fix carry one.
+
+What WAS a bug is what the card said. `_escalate_unresolved` threw away the specific
+`Identity.reason` and printed the coarse bucket, so "identity_unknown" was true, useless, and
+indistinguishable from a Slack outage. Cards now carry the reason verbatim ("no reporter
+email on this ticket"), plus the person and gym in words -- D53.
+
+**Not closed, and reported rather than silently patched:** the current portal route can STILL
+produce `reporter: NULL`. It initialises `reporter = null` and never rejects the insert if it
+stays null, so three live paths still reach it: `clerkConfigured()` false (which ALSO skips
+the `canReadGym` check), `auth()` returning no `userId`, and the `app_users` lookup missing or
+erroring (the query's `error` is discarded, so a Supabase fault is indistinguishable from "no
+row"). Narrowed, not closed. Fixing it means changing portal auth behaviour, which is Blake's
+call, not this session's.
+
+**(b) Routing: a website question had no path to the website bot.** `product='portal'` routes
+to Scout, hardcoded as a literal pair in `listener.py`'s scheduler; Wrangler's
+`product="websites"` is a label nothing polls for, and no producer ever writes it. So this
+question could not reach the identity that knows about websites even by hand.
+
+**D50, the fix, and the shape chosen deliberately:** cross-product routing changes WHICH
+BOT'S KNOWLEDGE drafts the answer, and nothing else. When `classifier.product_hint()` is
+CONFIDENT (an unmistakable website noun with no competing product noun) and the flag
+`SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT` is armed, the answer lane is called with the website
+identity's knowledge and voice. The ticket's `bot_identity`, `product`, channel, thread,
+`client_id` and every delivery decision are untouched, and `who` (the asking person, their
+account key, their gym) is passed through unchanged, so every live fact is still keyed off
+the asking gym's own account. A website question from Gym A is still a Gym A ticket answered
+in Gym A's own conversation. Low confidence stays with the entry-point identity, unchanged.
+Lainey can never be a routing target. The Frame 2 containment argument is asserted directly
+in `tests/test_slack_convo_autonomy.py`, not just described here.
+
+---
+
+## D58 (2026-09-05) -- auto-answer is a narrower permission than CLIENT_REPLY, with hard lines
+
+Arming `SLACK_CONVO_<IDENTITY>_CLIENT_REPLY` was reviewed as "the bot may reply to a client".
+It silently also meant "the bot may send a model-written statement about that client's live
+account, unattended" -- because a `kind=answer` row went `ready` on exactly the same flag as
+an acknowledgement. Those are not the same permission and should never have shared a flag.
+
+`SLACK_CONVO_<IDENTITY>_AUTO_ANSWER` now gates the grounded-answer path alone. It requires
+the identity to be enabled AND client-reply armed (it can never be the flag that lets a bot
+speak to a client at all), and acks, templates and status rows are unaffected by it.
+
+**Hard lines, not tunable, checked at draft time AND at post time:** billing and price,
+refunds, hours and schedule changes, injuries, liability. `adapter.AUTO_ANSWER_FORBIDDEN` is
+a module constant with no env var behind it; a matching message is held for a tap no matter
+what any flag says. Code fixes, action requests and anything the classifier was unsure about
+were already held and stay held.
+
+**D55 (receipts):** whenever a client is actually told something -- auto-answered, released
+by a tap, or resolved by a human -- a RECEIPT card is written to #fixer AFTER the post
+succeeds, quoting the exact text that went out, where, when, and whether it sent with no tap.
+A receipt is never written for a delivery that did not happen, which is the whole point of
+writing it after rather than before.
+
+---
+
+## D59 (2026-09-05) -- what the first independent audit found, and why it mattered
+
+The wave above shipped green: 5415 tests passing, CI green, every new behaviour covered. A
+fresh auditor with no shared context found **three CRITICALs in it**, all of which the suite
+was green through. Recorded here because each one is a distinct lesson, not a typo.
+
+**C1 -- the boot assertion could not fire.** `default_classify_llm()` built and returned its
+closure unconditionally; the `ANTHROPIC_API_KEY` check lived inside `answer_lane.default_llm`
+at CALL time. So `build_classify_llm`'s `NotWiredError` branches were unreachable for the only
+factory production uses, and a keyless deployment booted, logged *"classifier LLM wired"*, and
+escalated every message -- **the D51 flood wearing the badge of the fix for it**. The tests
+passed because both "refuses to boot" tests injected `factory=lambda: None`: they proved the
+seam and never the rule. The key is now checked at BUILD time, and the test that would have
+caught this (flag on, key unset, production factory) exists. *A test that injects its own
+failure proves the handler, not the requirement.*
+
+**C2 -- a second door to the client with none of the gates.** The portal bridge's QUESTION
+branch sends through `outreach.initiate`, not `outbox._dispatch_one`, so D54's trust ladder,
+AUTO_ANSWER flag and hard lines never applied to it. The auditor reproduced a model-written
+answer posting to a client's group DM with CLIENT_REPLY off, AUTO_ANSWER off, on a hard-line
+topic -- using this system's own real ticket text. Every D54 test ran through
+`adapter.handle_event`, which is exactly why a green suite could not see it. The gates now sit
+in front of the send on that path too. *"Checked at draft time and post time" has to mean
+every path that can reach a client, not every path that happens to use one module.*
+
+**C3 -- a new internal kind is client-VISIBLE by default, in another repo.** Client visibility
+is decided in lasso-ops-portal by a DENYLIST (`client-visible.ts` and migration 0310, both
+listing exactly `escalation / fixer_request / hold_notice`). The new `kind='receipt'` was in
+neither, so the receipt -- the fixer channel id, the ops status, and the words *"SENT
+AUTOMATICALLY (no tap)"* -- was readable by the client in their own portal thread. Receipts
+now ride on an `escalation` row with `attachments.receipt`, and `INTERNAL_KINDS <=
+CLIENT_INVISIBLE_KINDS` is asserted by a test that fails the moment someone adds a kind. *A
+denylist in another repo means every new internal kind ships visible until someone remembers
+it; the contract needs a test on THIS side, because this side is where kinds are invented.*
+
+The through-line with D56: all three are the same family. A capability that looks armed and
+is not; a gate that exists on one path and not its twin; a safety list that defaults to
+"allowed". **Green tests plus a careful build is not evidence. An independent read is.**
+
+---
+
+## D60 (2026-09-05) -- the second audit, and the fake that hid a CRITICAL
+
+The D59 fixes shipped green (5425 tests). A second fresh auditor found **two more CRITICALs**,
+one of them introduced BY the D59 fix, plus five MAJORs. The pattern in every one is worth
+more than the individual bugs.
+
+**C1 -- the fix for C2 threw on every invocation.** The new held-answer branch called
+`write_hold_notice(tid=..., ...)` without `ident_name`, which the production callable
+(`adapter.write_hold_notice`) requires. Every held portal answer raised `TypeError` inside
+`intake_pass`'s per-ticket `except`: no hold card, no escalation row, nothing to the client --
+and the ticket was already out of `status='new'`, so the intake poll never returned it again.
+**Permanently silent in both directions**, on the exact path built to stop silence.
+
+It was invisible because every test in three files passed `write_hold_notice=lambda **kw:
+...`. A `**kwargs` sponge accepts any signature, including the broken one. *A fake that cannot
+fail the way production fails is not a test double, it is a blindfold.* The regression test now
+builds the REAL factory (`echo_ticket_wiring._write_hold_notice_factory`) and checks the call
+site against the real signature.
+
+**C2 -- `opened` is not `delivered`.** `OutreachResult.opened` means `conversations.open`
+succeeded; it is `True` on `claim_failed`, `lost_claim` AND `post_failed`. Three callers read
+it as "the client was told". So a failed `chat.postMessage` resolved the ticket AND wrote the
+new receipt asserting *"the client was told this, SENT AUTOMATICALLY (no tap)"* over a row
+whose own `delivery_status` was `failed`. The receipt -- the very thing added so Blake would
+never have to wonder whether a ticket landed -- could state a delivery that did not happen.
+`delivered` is now a separate field, true only after the post returns ok, and the three
+callers read it instead.
+
+**M1 -- the flags stopped at one branch.** D59 gated the QUESTION branch; its two siblings
+(`acknowledge_submitter`, `fixed_pass`) DM clients through the same `outreach.initiate` and
+checked no slack_convo flag at all, not even the identity master switch. "Flags off equals
+today" was simply untrue for the portal bridge. *Gating the path the audit found is not the
+same as gating the paths that share its door.*
+
+**M2 -- "re-checked at post time" was re-reading a boolean.** Gate 5a trusted the stored
+`attachments.auto_answer_forbidden`, so a row from any writer that omits it posted a hard-line
+answer unattended. The body is re-evaluated now. The old test injected the marker and asserted
+the lookup: it proved the boolean, not the rule, which is precisely how M2 shipped underneath a
+test named for it.
+
+**M3 -- a denylist of topics is whack-a-mole, and the auditor won.** Eleven ordinary sentences
+walked past `AUTO_ANSWER_FORBIDDEN`: *"what time does the gym open on saturday"*, *"our
+saturday classes are moving to 8am"*, *"a member tweaked her back, what do we tell her"*, *"how
+much is this going to run us each month"*. So the rule is **inverted** for unattended sending:
+`AUTO_ANSWER_ALLOWED` is an allowlist of what this system can actually observe in live account
+state (connection status, posts, calendar, approvals, uploads) -- the entire universe
+`answer_lane.default_fetch_state` can even fetch -- and a message must pass BOTH it and the
+denylist. Anything phrased any other way holds for a person. *When a safety rule must
+enumerate every dangerous phrasing, enumerate the safe ones instead.*
+
+**M4 -- "refuses to boot" was caught by a catch-all one level up.** `NotWiredError` raised
+inside `listener.py`'s `try` around `attach()` meant `attach` and `start_additional_identities`
+were both skipped: **all four identities silently dark while the listener reported healthy** --
+a worse instance of the exact pattern D56 named. It re-raises now, on both lanes, so a
+misconfigured deployment crashes visibly instead of lobotomising itself.
+
+**M5 -- a fix claim nobody verified.** `_fix_summary_text` said *"Fixed it and confirmed the
+change is live"* whenever `verification_after` was merely non-empty; it never looked inside. A
+snapshot saying `{"verified": false, "reason": "could not reproduce"}` would have been
+announced to the client as a confirmed fix. It reads the verdict now, and makes no claim at all
+when the snapshot does not affirmatively say the fix was verified.
+
+Also from this audit: `TEMPLATE_UNKNOWN` and `TEMPLATE_QUEUED` carried the same promise-shape
+D52 removed ("the team will pick it up there", "Someone will pick it up") and are reworded --
+**the ban is on promising future human action as a fact, not on one particular sentence**, and
+the test asserts the requirement now rather than grepping for the old string.
+
+### The lesson that outranks all seven
+
+Two independent audits, five CRITICALs between them, and the full suite was green through every
+single one. Each bug lived exactly where the tests were shaped like the build instead of like
+the requirement: a fake that accepts any signature, an injected failure that proves the
+handler, a substring assertion that survives a dropped value, a marker check that proves the
+boolean. **When a test and its subject were written by the same author in the same hour, the
+test tends to encode what the code does, not what the rule is.** That is what an independent
+read buys, and it is why the loop is two consecutive clean audits by fresh eyes, never one.
+
+---
+
+## D61 (2026-09-05) -- the third audit: half-fixes are their own failure mode
+
+Third fresh auditor, third pair of CRITICALs, and both of them were **halves of the fixes the
+second audit asked for**. That is the entry.
+
+**Finding 1 (CRITICAL) -- M5's fix moved the lie one layer in.** `verification_succeeded` was
+written as a denylist of five false strings, so `{"verified": "not verified"}`,
+`{"verified": "pending"}`, `{"passed": "0 of 3"}`, `{"ok": "timeout"}`, `{"success":
+"partial"}` and a bare PR link **all** read as success, and the client was told *"Fixed it and
+confirmed the change is live."* This is the identical whack-a-mole shape M3 had just declared
+unacceptable for auto-answer, reused one file away for the sentence that most directly lies to
+a paying client -- written in the same hour as the ruling against it. The column is produced by
+`ops-fix-triage.js`, in another repo, so its vocabulary is not ours to guess: an **allowlist of
+affirmative verdicts** now, and anything unrecognised makes no claim at all.
+
+**Finding 2 (CRITICAL) -- the allowlist existed on one of the two paths.** M3 introduced
+`AUTO_ANSWER_ALLOWED` as *the primary gate* for unattended sending, and the portal bridge --
+the exact path the previous audit's C2 was filed against -- called `auto_answer_forbidden`
+twice and `auto_answer_allowed` never. *"a member tweaked her back, what do we tell her?"*
+posted to a client's group DM, no tap, ticket resolved. The tests could not see it because they
+asserted the **predicate** (`auto_answer_allowed(text)`) rather than the **call site**, so they
+would have passed with the allowlist deleted from every caller -- which was very nearly the
+state of the code. There is now ONE function, `adapter.may_auto_answer`, called by both paths,
+and the tests drive the call sites.
+
+Also closed: `release_approved_outreach` still read `opened` instead of `delivered` (a failed
+tap marked the row `posted`, and `outreach_request` is not on the portal's hidden list, so a
+client could read a message never sent); a present-but-INVALID API key builds fine and cannot
+be caught at boot, so the classifier now LOGS every model failure loudly and escalates its own
+log level after three consecutive ones -- the requirement is not "detect a bad key", it is
+"never be silent about one"; `ACK_CODE_FIX` had restored V-M6's removed promise in a different
+constant, and the promise test now scans EVERY client-facing constant by reflection rather than
+three by name; `exclude_test` was inert in the daily cap (`select: "id"` meant the predicate saw
+no columns); M4's `raise` in the scheduler lane would have killed the entire daily scheduler
+thread, so "refuse to start" stays at boot and the same misconfiguration is merely loud per
+cycle; and a routed answer introduced itself as *"You are Wrangler"* out of Scout's bot.
+
+### The pattern this audit adds
+
+D59 and D60 said green tests are not evidence. D61 says something narrower and more
+uncomfortable: **a fix written in response to an audit is the least-reviewed code in the
+repo.** It arrives with urgency, it is written by whoever just had the bug explained to them,
+and it lands after the audit that would have caught it. Three of the seven findings here were
+introduced by the previous round's fixes; two of those were CRITICAL. The loop is two
+CONSECUTIVE clean audits for exactly this reason -- one clean pass after a fix wave proves
+nothing about the fix wave itself.
+
+---
+
+## D62 (2026-09-05) -- the fourth audit: I guessed another repo's contract instead of reading it
+
+**Finding 1 (CRITICAL) -- D61's own fix made `fixed_pass` permanently inert.** The audit-3 fix
+replaced a denylist of false verdict strings with an allowlist of affirmative ones. Both were
+guesses. The auditor did the thing neither previous round did: **went and read the producer.**
+`~/scout-listener` `src/index.js`'s `runVerify` resolves
+
+```js
+{ phase, exit_code, tail, at }
+```
+
+-- a pytest exit code and no verdict word anywhere. So the allowlist matched **nothing the real
+writer emits**: every verification snapshot fell through to "not a success", `fixed_pass` could
+never notify a client for any real ticket, and it wrote a #fixer card asserting the
+verification had failed over one that **passed**. Worse, that path flipped the ticket
+`fixing` -> `hold`, which removes it from `find_fixing_tickets` forever, so a fix that verified
+later could never be reported at all.
+
+`verification_succeeded` now reads `exit_code` first, because that is what the producer
+actually writes; keeps the affirmative-word path for other writers; requires ALL present
+verdict keys to agree (finding 10: `{"status":"completed","result":"failed"}` read as
+success); and distinguishes *unreadable* from *failed* -- an unreadable snapshot leaves the
+ticket in `fixing`, still polled, and says exactly that in one bounded card instead of
+announcing a failure that was never reported.
+
+**The lesson, and it is the sharpest one in this whole run:** two consecutive rounds wrote a
+rule about another process's data by reasoning about what such a process *probably* writes.
+Both were wrong, in opposite directions, and the second one was wrong in a way that silently
+disabled a capability rather than loudly breaking it. **A contract with another repo is read,
+never inferred** -- and this one was two directories away the entire time. The same failure
+also means the deeper gap stands and is REPORTED rather than papered over: the ops-fix worker
+writes a *new* `source='ops_fix'` ticket (`src/index.js:334`, `intake.fromOpsFix`) rather than
+writing `verification_after` back onto the portal-bridge ticket, so nothing populates that
+column for these tickets today. `fixed_pass` is correct now and still has no producer. That is
+Blake's call to wire, not this session's to invent.
+
+**Finding 2 (MAJOR)** -- `ACK_CODE_FIX`, reworded in the previous wave to fix exactly this
+class, told the client the request had been *"put in front of them"* while the card that does
+that was marked `failed`. Reworded again to claim only that it was written up, and an internal
+card that fails to post now logs CRITICAL rather than dying as a quiet `failed` row.
+
+**Finding 3 (MAJOR)** -- the publish guard, added the previous wave, leaked eight ordinary
+phrasings ("make a post that says we are moving to 8am", "let everyone know on instagram that
+we are closed"). Enumerating polite request forms was the wrong axis; it matches a CONTENT VERB
+plus a CLAIM MARKER now, in either order.
+
+**Finding 4 (MAJOR)** -- `may_auto_answer` was created so "no path can enforce half the rule",
+and the post-time gate then enforced half the rule: denylist only, never the allowlist. It runs
+the whole decision now, using the ticket's own `raw_text` as the question.
+
+**Finding 5 (MAJOR)** -- the cross-product voice fix swapped one token of the system prompt
+while the appended VOICE DOC still named the other bot five times over. The voice doc now comes
+from the bot that is actually speaking, and the routed subject is named by PRODUCT, so nothing
+in the prompt gives the client a second bot's name at all.
+
+Also: a transient release failure no longer burns Blake's Release card (finding 6); the
+dead-key counter is read and rendered on the health line instead of being written to nobody
+(finding 7 -- D56's pattern inside the fix for it, again); `is_test` got the migration file it
+never had (finding 8); and `resolve_and_notify` refuses rather than marking a ticket resolved
+when the trust ladder would hold the client's notice (finding 9).
+
+### Four audits, nine CRITICALs, and what actually generalises
+
+| Round | CRITICALs | How many were introduced by the previous round's fixes |
+|-------|-----------|--------------------------------------------------------|
+| 1 | 3 | -- |
+| 2 | 2 | 1 |
+| 3 | 2 | 2 |
+| 4 | 1 | 1 |
+
+The suite was green for every single one. Three rules earned the hard way:
+
+1. **A contract with another system is read, not inferred.** (D62)
+2. **A fix written in response to an audit is the least-reviewed code in the repo.** (D61)
+3. **A test written by the author of the code, in the same hour, encodes what the code does
+   rather than what the rule is** -- so it asserts predicates instead of call sites, injects
+   its own failures, greps source text, and accepts `**kwargs` where production requires a
+   signature. (D59, D60)
+
+---
+
+## D63 (2026-09-05) -- the fifth audit: reading one line further
+
+**Finding 1 (CRITICAL) -- D62 read the producer's SHAPE and stopped one line short of its
+SEMANTICS.** D62's whole lesson was "a contract with another system is read, not inferred",
+and the fix it produced read `~/scout-listener`'s `runVerify` output shape -- `{phase,
+exit_code, tail, at}` -- and treated `exit_code == 0` as a pass. The command that produces it
+is:
+
+```bash
+python3 -m pytest -q 2>&1 | tail -5 || true; echo "__EXIT__:$?"
+```
+
+`|| true`, and `$?` is `tail`'s status rather than pytest's. **`exit_code` is always 0**, for a
+passing suite and a failing one alike. So `verification_succeeded` became a constant `True` for
+the only producer there is, and *"Fixed it and confirmed the change is live before sending
+this"* would have gone to a paying client over a failing test suite. The inert bug D62 fixed
+was replaced by a lying one.
+
+The resolution is to stop trying to extract a verdict that is not there. **A field
+structurally incapable of expressing failure is not a verdict**, so that snapshot is
+UNREADABLE: no claim, ticket stays in `fixing` and still polled, one honest card to a human.
+Parsing the `tail` text was considered and rejected -- it is the same guess wearing a different
+hat. Announcing a verified fix requires an explicit verdict field, and until the ops-fix worker
+writes one this path stays quiet. **That wiring is a cross-repo change and Blake's call**; it
+is listed in the open items rather than invented here.
+
+**Finding 2 (CRITICAL) -- the publish guard was rewritten on the wrong axis, twice.** D62's
+rewrite REPLACED the previous alternatives rather than adding to them, and measured against a
+realistic corpus it held **37% of ordinary state questions** ("were my posts scheduled?", "any
+update on our posts?") while MISSING three publish requests the version before it caught ("post
+the flyer for the open house"). Leakier and blunter simultaneously, and the test that was meant
+to prove otherwise used five hand-picked strings.
+
+The axis is not vocabulary, it is SHAPE: a request asks us to author something (imperative, or
+a polite request form, or a content verb bound to a claim we would assert on the client's
+behalf); a question asks what is already true. Claim markers are now only the ones that
+introduce authored content ("that", "saying", "announcing", "telling") -- never ordinary words
+like "were" or "our" that any question contains. Measured on a 20-question / 14-request corpus
+that is now IN the test file: 0 false positives, 0 false negatives, both asserted per string.
+
+Also closed: `resolve_and_notify` gated on the ticket's `identity_kind` while writing
+`recipient_kind: "client"`, so a staff ticket passed the gate and held the row (finding 3); a
+refused resolve tap did nothing visible at all, which is the dead button that path exists to
+fix, and now writes the reason back to the channel it was tapped in (finding 4); leaving a
+released row `held` on `claim_failed`/`lost_claim` let a retap send the client a SECOND DM,
+because `_send` had already written a row another consumer owns -- three reasons now map to
+three distinct states (finding 5); the voice-doc swap had removed the routed identity's doc,
+which was the only thing D50 routing actually moves, so the routed guidance is kept with the
+other bot's NAME rewritten to the speaker's, and the grounding record names both roles
+honestly instead of claiming the wrong one (finding 6); and receipts ride on `kind=escalation`,
+so counting escalations let one receipt permanently suppress the unreadable-snapshot card
+(finding 7).
+
+### Five audits: what the numbers say
+
+| Round | CRITICAL | MAJOR | Introduced by the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+
+The suite was green for all eleven CRITICALs. The trend that matters is the last column: **the
+fix waves are now the primary source of new defects**, which is the strongest possible argument
+for the two-consecutive-clean-audits gate and against ever treating a single clean pass, or a
+green suite, as done. Every round has also gotten narrower -- round 1 found "the classifier
+never ran at all"; round 5 found a regex 37% too broad and a shell `|| true` two repos over.
+
+---
+
+## D64 (2026-09-05) -- the sixth audit: zero CRITICAL, and the two MAJORs worth reading
+
+First round with **no CRITICAL findings**. Two MAJORs, and both are more interesting than the
+bugs they describe.
+
+**Finding 1 -- I applied the publish guard to our own answer.** `may_auto_answer` ran
+`asks_us_to_publish` against the model-written BODY as well as the question. An answer
+legitimately says *"your post about the new class went out tuesday"* -- a content verb next to
+a claim marker -- so on an independent corpus **4 of 10 realistic answers were held**, and
+3 of 6 legitimate grounded answers never reached `ready` end to end. D63's own record claimed
+"0 false positives, 0 false negatives", measured on a corpus I wrote myself, with the default
+EMPTY body -- so the test never exercised half the predicate it was proving. A request to
+publish can only ever appear in what the PERSON wrote; our own reply cannot ask us to do
+anything. The publish guard reads the question only now; the topic denylist still reads both,
+because a hard-line subject can surface in an answer a benign question invited.
+
+**Finding 2 -- D63's own explanation of the inert path was wrong, one step short again.** D63
+said the verified-fix notification was blocked only by the absence of a verdict field. Reading
+`~/scout-listener` one step further: the ops-fix worker polls `status='new'` and mints a
+**brand new `support_tickets` row** (`src/index.js:334` -> `intake.fromOpsFix` ->
+`store.insertNew`); the verification lands on THAT row. The ticket `fixed_pass` watches keeps
+`verification_after` NULL forever. **Wiring a verdict field would not have fixed it.** That is
+the third consecutive round where a claim about another repo was one read short of the truth.
+
+The response is deliberately not a workaround: inventing our own verdict is precisely the
+guessing D62 and D63 exist to condemn. Instead the inertness is made VISIBLE -- a ticket
+sitting in `fixing` past 24h with no verification gets one honest card per day naming the exact
+cause and saying a person must close it. **A capability that cannot work should say so on a
+schedule, not wait silently to be discovered by an audit.** Wiring the worker to write back to
+the originating ticket is a cross-repo change and stays Blake's call.
+
+Also closed: the escalation-card bound had been reimplemented as a client-side scan of
+`bus.messages(tid, limit=200)` -- ordered `created_at.asc`, i.e. the OLDEST 200 rows, so on a
+long ticket today's card is outside the window and the daily bound silently vanishes. That is
+verbatim the bug `count_outbound_kind_since`'s docstring exists to prevent, reintroduced by
+hand to filter receipts out; it is a server-side filtered count now (finding 3). A failed
+outreach Release tap wrote a log line and nothing a human sees (finding 4). The routed voice
+doc's name substitution turned another bot's self-description into a FALSE ROLE CLAIM in a
+client-facing prompt ("Scout is the LASSO team member who builds and maintains gym websites"),
+and `\bname\b` case-insensitive over a whole doc would silently corrupt text the day routing
+ever targets Echo, whose name is an ordinary English word -- no substitution now; the speaker's
+own doc is the voice, and only the routed doc's non-identity lines travel (findings 5, 6).
+`classifier_health` could not tell "flag off" from "flagged on and dead" (finding 8).
+`exclude_test` called itself "the one call every report should use" and had no call site
+(finding 9) -- D56's pattern again, now described honestly instead of promising.
+
+Six of the auditor's six named test weaknesses are fixed, including the two that mattered: the
+corpus now attaches realistic answer bodies (which is where finding 1 lived), and the
+boot-assertion guard RUNS `live_deps` instead of grepping its source.
+
+### Six rounds
+
+| Round | CRITICAL | MAJOR | Introduced by the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | **0** | 2 | 1 |
+
+The severity curve finally broke. Round 1 was "the classifier never ran in production at all";
+round 6 is a regex applied to one argument too many and a docstring one repo-read short. But
+the gate is two CONSECUTIVE clean rounds, and round 6 was not clean, so nothing arms yet.
+
+---
+
+## D65 (2026-09-05) -- the seventh audit: two auditors disagreed, and the disagreement was the answer
+
+Zero CRITICAL for the second round running. Three MAJORs, two of them mine from the previous
+wave, and one of them is the most interesting thing in this whole sequence.
+
+**MAJOR 1 -- the two audits contradicted each other, and both were right.** Audit 6 measured
+that the body-side publish guard held 4 of 10 realistic answers, so D64 removed it. Audit 7
+replayed the same predicate against the same commit and found it returned False for all six of
+this repo's own `REALISTIC_ANSWERS` and for all 39 of its own legitimate bodies -- and then
+measured that removing it cost **four new leaks for zero recovered answers**:
+
+> "I **will publish** the open house flyer that afternoon so the slot is not empty."
+> "I **can post** the third one for you now if you want it out today."
+
+Both measurements were correct on their own corpora. What separated them is a distinction
+neither round had named: **our own reply cannot REQUEST anything, but it absolutely can COMMIT
+to something.** D64 removed the whole check on the strength of the first half of that sentence.
+Descriptive answers ("your post about the new class went out tuesday") now pass; answers that
+promise future action -- V-M6 and D52's named class, on the very capability being armed -- are
+held by a separate, narrower `answer_commits_to_action`. Measured after: 0 false positives over
+25 questions x 6 bodies, 0 false negatives over 16 requests and 5 committing answers.
+
+**The lesson: when two independent measurements disagree, the disagreement is data.** The
+temptation is to pick the newer one. The right move was to find the distinction that makes both
+true, which is also the only version that survives a third corpus.
+
+**MAJOR 2 -- the guard held 55% of natural phrasing, and the repo's corpus could not see it.**
+`tell` and `let ... know` were CONTENT VERBS, and the polite-request rule matched a content verb
+anywhere within 25 characters -- so *"can you tell me if my instagram is connected"* was a
+publish request **by construction**. 11 of 20 natural questions held. Every corpus in this repo
+was written by me, and none of them contained a single "can you tell me..." or "please let me
+know..." -- the commonest way a person actually asks a bot something. Two fixes: telling ME is a
+question and telling EVERYONE is a broadcast, so audience decides; and the polite rule now
+requires the verb in VERB POSITION, because "how many posts are scheduled" is a noun and a
+participle, not a request. 0/25 held after.
+
+**MAJOR 3 -- the stuck-fixing card I added one round ago stated the wrong cause as fact.**
+`_intake_one` sets `status='fixing'` BEFORE writing the fixer_request card, so a ticket whose
+card is still HELD awaiting a tap is indistinguishable from the cross-repo gap by looking at the
+ticket row alone -- and my card asserted the gap, and told Blake to close the ticket by hand,
+when the correct action was to tap the Release button sitting in #fixer. It reads the ticket's
+own rows now. It also claimed "nothing has been said to the client" while the acknowledgement
+was two rows away.
+
+Also: the resolve notice was posted as a THREAD REPLY INSIDE A DM (`surface` was the ticket's
+*source*, which gate 7 does not recognise) where nobody looks; the ticket was stamped resolved
+before the notice was delivered, so a post failure left a ticket permanently asserting a
+resolution over a failed row -- and moving that stamp to delivery time quietly broke the
+idempotence the status check had been doing double duty for, which the existing suite caught
+immediately (the notice row is the record of the tap now); `_domain_guidance_only` truncated at
+2000 chars against a 3396-char doc, dropping 41% of the routed guidance including its entire
+Escalation section; and a compiled regex with an unformatted `{}` placeholder and no call site
+sat in `answer_lane.py` -- D56's pattern, inside the wave that cites D56.
+
+All four behaviours this wave shipped untested now have tests, the receipt test drives the REAL
+`bus.Bus` over a PostgREST-shaped transport instead of reimplementing the filter inside its own
+fake, and the "cross-repo contract test" that compared two constants in the same file now reads
+the portal's actual TypeScript Set and SQL predicate at `origin/main`.
+
+### Seven rounds
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+
+Two consecutive rounds with no CRITICAL. The gate is two consecutive rounds with no CRITICAL
+**and** no MAJOR, and that has not happened, so nothing arms.
+
+---
+
+## D66 (2026-09-05) -- the eighth audit: the hard lines were never structural
+
+Zero CRITICAL for the third round running. Four MAJORs, and one of them is the finding that
+matters most for arming, because it is about the promise Blake made non-negotiable.
+
+**F3 -- "these are hard lines, not tunable" was not true.** `AUTO_ANSWER_FORBIDDEN` and
+`AUTO_ANSWER_ALLOWED` were both bag-of-words ORs over the whole message, ANDed together. So any
+message that ALSO named a post or a calendar passed both. Measured on the auditor's own corpus:
+**8 of 10 injury/liability messages, 4 of 5 gym-hours messages and 4 of 5 billing messages would
+have auto-sent with no tap** -- *"a member pulled a hamstring doing the workout in our reel,
+should we take the post down"*, *"how many posts do we get for what we pay"*. The comment
+claiming these hold "however it is phrased" was false, and had been since the hard lines were
+written. Not introduced by any recent wave -- measured identical on the old code -- which makes
+it worse, not better: it was the load-bearing safety claim of the whole capability.
+
+Widening the denylist again was not an option; this system has now lost to whack-a-mole four
+separate times (D61's verdict strings, D62's exit codes, D63's publish verbs, D65's polite
+forms). The property that actually separates the two classes is **shape, not vocabulary**: an
+auto-answerable message is a SINGLE SELF-CONTAINED QUESTION ABOUT OBSERVABLE STATE. The moment
+it carries a second subject -- a third party, advice being sought, or simply too many words to
+be one question -- it is not that, whatever nouns it contains. Three structural conditions on
+top of the two lists, all checkable without enumerating a single topic. Measured after: 9/9
+mixed-subject messages held, 15/15 ordinary questions still answered.
+
+**F4 -- the commitment guard listed the verbs it was written against**, so 14 of 24 realistic
+promises walked past it: *"I'll add a third post for friday"*, *"Let me get that scheduled"*,
+*"That will go up this afternoon"*, *"Consider it posted"*. Listing verbs was the same mistake
+as listing topics, made one round after the ruling against it. A promise is a **first-person
+future marker**, whatever verb follows; the only first-person futures that are not promises are
+perception and reporting ("I can see...", "I can confirm..."), so those are excepted and
+everything else holds.
+
+**F1 -- last round's fix was inert for the exact case it named.** The resolve notice was
+threading inside a DM; D65 fixed it by reading the surface off the ticket's own inbound row
+instead of its source -- and a portal ticket's inbound row carries `portal_ticket_bridge`,
+which gate 7 does not recognise as a top-level surface, so the behaviour was byte-identical to
+the bug. Its test asserted the HELPER on a Slack MPIM ticket, never `resolve_and_notify`, never
+a portal ticket. The auditor's mutation test is the damning part: reverting the call site to the
+old code left all 449 tests in the touched files green.
+
+**F2 -- the stuck-fixing card still stated three things it did not know**: an unreadable bus
+read became "was dispatched, close this by hand" (the wrong remedy, as fact); a request sitting
+in `ready`/`failed`/`suppressed` counted as dispatched; and a HELD ack counted as the client
+having been acknowledged. When it cannot tell, it now says it cannot tell.
+
+Also: three helpers added last round scanned `bus.messages` (ordered ASC) and so read the
+OLDEST 200 rows -- the exact bug `count_escalation_cards_since` was added to fix, reintroduced
+by hand in three places at once, with a duplicate resolve notice to a client as one failure
+direction; and `find_fixing_tickets` was the one poll with no test-ticket filter, so a probe
+parked in `fixing` produced a card every day forever.
+
+### Reported, not fixed: a cross-repo hazard to settle before arming anything
+
+`~/scout-listener`'s FIXER worker polls `support_tickets?product=eq.echo&status=eq.new` with
+**no `source` filter**, claims `new -> triage`, and hands `raw_text` to a Bash-armed headless
+`claude -p --permission-mode acceptEdits`. Both the portal and this repo insert client-typed
+tickets at `status='new'`. If `FIXER_ENABLED` + `FIXER_ECHO_ENABLED` are ever armed there, a
+client's raw text reaches that worker **with no tap**, contradicting this repo's own "a code_fix
+from a client is ALWAYS held behind Blake's #fixer tap" -- and the portal bridge silently loses
+the ticket, because its status leaves `new` and `find_new_tickets` never returns it again.
+Verified latent today: `FIXER_ENABLED` is absent from that service's env, so the poll loop never
+starts. This is Blake's to rule on; it is not something to quietly patch from here.
+
+### Eight rounds
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|-------------------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+| 8 | 0 | 4 | 2 |
+
+---
+
+## D67 (2026-09-05) -- STOPPING THE LOOP: the auto-answer gate is the wrong shape, and that is Blake's call
+
+Nine independent audits. Twelve CRITICALs. The suite was green for every one of them.
+
+**Round 9 found the same CRITICAL as round 8, after the rewrite meant to fix exactly it.**
+Round 8: Blake's named hard lines -- billing, gym hours, class-schedule changes, injuries,
+liability -- did not hold; 8 of 10 injury messages auto-sent because they also named a post.
+The fix made the gate structural (single self-contained question, no third party, no
+advice-seeking shape, word cap). Round 9 then measured, end to end through the real
+`handle_event` and the real `outbox.run_once`: **15 of 16 must-hold messages still posted to a
+client with no tap.** *"we open at 5 now, does the calendar know?"* -- a gym-hours commitment.
+*"can you cancel the story scheduled for tonight?"* -- an action request. *"did you guys take
+money out twice this month?"* -- billing.
+
+Four attempts now, each closing its measured cases and opening new ones:
+
+| Attempt | Gate | Closed | Opened |
+|---------|------|--------|--------|
+| D54 | topic denylist | the listed words | everything phrased differently |
+| D63 | + allowlist of observable nouns | most off-topic | any message that ALSO names a post |
+| D65 | + publish-request shapes | request forms | polite question forms (55% FP) |
+| D66 | + message shape (third party, advice, length) | mixed-subject examples | hours/schedule/action questions that are short, single-subject and personless |
+
+**The pattern is not that the regex needs one more pass. It is that the question is the wrong
+thing to classify.** A free-text sentence from a gym owner does not carry a reliable signal for
+"is it safe to answer this unattended", and every rule that tries to extract one is an
+enumeration -- of topics, of verbs, of shapes -- which is the failure mode this system has now
+lost to five separate times (D61 verdict strings, D62 exit codes, D63 publish verbs, D65 polite
+forms, D66 topics-again).
+
+**What would actually work, and why I am not building it tonight.** Gate on what the ANSWER is
+DERIVED FROM, not on what the question is about: auto-send only when the reply is a restatement
+of a small enumerated set of fact keys from the grounding snapshot (`social_status.connected`,
+`calendar_this_month` counts) and contains no sentence that is not traceable to one of them.
+That is checkable mechanically, it fails closed on anything novel, and it does not care how the
+question was phrased. It is also a redesign of the capability, not a patch -- it changes what
+auto-answer IS -- and after nine rounds of me deciding the next fix on my own judgment, this
+one is Blake's to make.
+
+**So the flag is locked, not left as a landmine.** `SLACK_CONVO_<IDENTITY>_AUTO_ANSWER` set on
+its own now REFUSES, logs the open finding by name, and points here.
+`SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true` is the single deliberate act that says "I
+have read D67 and I want it anyway". The point is that nobody discovers months from now that a
+flag they set once quietly meant something they never reviewed -- which is D56's lesson pointed
+the other way.
+
+### Everything that is NOT blocked by this
+
+The rest of the wave is audited clean and independent of auto-answer, and it is the part that
+actually answers Blake's original complaint:
+
+* the classifier is wired to a model in production for the first time (D51/RTF-2), behind a
+  flag that refuses to boot if it is on with nothing behind it;
+* the false-promise template is gone and cannot come back (D52), and no client-facing constant
+  may promise future human action -- asserted by reflection over every one of them;
+* cards name the person and the gym in words, with the specific unresolved-identity reason
+  (D53); receipts show what the client was actually told, written only after delivery (D55);
+* the eight arming probes are purged from #fixer and marked `is_test` so they never resurface;
+* cross-product routing, verified clean by four consecutive auditors, moves knowledge and voice
+  only -- never a ticket, a channel, a gym or a delivery.
+
+### The count
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|----------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+| 8 | 0 | 4 | 2 |
+| 9 | 1 | 3 | 2 |
+
+Round 9 also proved, by reverting each change alone against the full suite, that **five of the
+previous wave's fixes are asserted by no test at all** -- including two that the wave's own
+decision record cited as closed. Those tests were mine, and they were shaped like the code
+instead of like the rule, which is the third lesson in D65 arriving for the third time.
+
+**The honest summary: the severity curve broke (CRITICALs 3,2,2,1,2,0,0,0,1) but the loop did
+not converge, and the one CRITICAL that came back is the safety promise the whole capability
+rests on. Nothing is armed. The gate needs a redesign, and the decision is Blake's.**

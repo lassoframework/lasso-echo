@@ -1918,6 +1918,78 @@ def slack_convo_staff_reply_armed(identity: str) -> bool:
     return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_STAFF_REPLY", "false"))
 
 
+def slack_convo_classifier_llm_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CLASSIFIER_LLM — may this bot consult the model for the
+    ambiguous middle of classification? OFF by default (every new capability ships behind a
+    flag that defaults OFF).
+
+    Found live 2026-09-05: listener_wiring.live_deps() passed classify_llm=None
+    unconditionally, so the LLM fallback slack_convo_model()'s docstring has always promised
+    did not exist in production at all. With this flag off, behaviour is byte for byte what
+    it was: deterministic rules, then escalate. With it on, the model is consulted ONLY after
+    every deterministic rule has declined, and only to pick one of the fixed labels."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CLASSIFIER_LLM", "false"))
+
+
+def slack_convo_auto_answer_armed(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_AUTO_ANSWER — may this bot SEND a grounded answer to a client
+    with no human tap? OFF by default, and narrower than CLIENT_REPLY in every direction.
+
+    It gates exactly one path: a message classified answerable_question whose answer_lane
+    reply came back with a grounding snapshot. Everything else still holds for a tap no
+    matter what this flag says -- code fixes, action requests, anything the classifier was
+    unsure about, and the hard-line topics in adapter.AUTO_ANSWER_FORBIDDEN (billing and
+    price, refunds, hours and schedule changes, injuries and liability). Those are not
+    tunable; they are re-checked at draft time and again at post time."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    if not slack_convo_client_reply_armed(identity):
+        return False
+    if not _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_AUTO_ANSWER", "false")):
+        return False
+    # ARMING LOCK (2026-09-05, after nine independent audits).
+    #
+    # Nine rounds found twelve CRITICALs. Rounds 8 and 9 both found the same one, in
+    # different clothes: Blake's named hard lines -- billing, gym hours, class-schedule
+    # changes, injuries, liability -- DO NOT HOLD. Round 8 measured 8/10 injury messages
+    # auto-sending; round 9, after the structural rewrite meant to fix exactly that, measured
+    # 15 of 16 must-hold messages still posting to a client ("we open at 5 now, does the
+    # calendar know?", "can you cancel the story scheduled for tonight?").
+    #
+    # Four separate attempts to gate this by classifying the QUESTION -- topic denylists,
+    # allowlists, publish-request shapes, message shape -- have each closed the cases they
+    # were measured against and left a new set open. The conclusion this lock encodes is that
+    # the approach is wrong, not that the regex needs one more pass: a safe auto-answer gate
+    # has to be grounded in what the ANSWER is derived from (a small enumerated set of fact
+    # keys, restating them and nothing else), not in guessing a free-text question's subject.
+    # That is a design decision, and it is Blake's, not a thing to keep patching at 3am.
+    #
+    # So the flag alone can no longer arm this. Setting it without the override logs what is
+    # known to be broken and refuses. The override exists so Blake can say "I have read the
+    # finding and I want it on anyway" in one deliberate act, rather than discovering that a
+    # flag he set weeks ago quietly means something he never reviewed.
+    if not _truthy(os.environ.get("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "false")):
+        print(f"[slack-convo/{identity}] AUTO_ANSWER is set but REFUSED: the hard-line gate "
+              f"has a known open CRITICAL (audits 8 and 9 -- billing, hours, schedule "
+              f"changes and injury messages reach a client with no tap). See DECISIONS.md "
+              f"D67. Set SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true only if you have "
+              f"read that entry and accept it.")
+        return False
+    return True
+
+
+def slack_convo_cross_product_routing_enabled(identity: str) -> bool:
+    """SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT — may a CONFIDENT website question that arrived
+    on this identity be drafted with the website identity's knowledge and voice (D50)? OFF by
+    default. This never moves the ticket, the channel, the gym, or the delivery surface; it
+    only changes which product's knowledge drafts the answer."""
+    if not slack_convo_identity_enabled(identity):
+        return False
+    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_CROSS_PRODUCT", "false"))
+
+
 def slack_convo_daily_ticket_cap() -> int:
     """SLACK_CONVO_DAILY_TICKET_CAP — max new tickets one Slack user may open per UTC day.
     Default 10 (Blake's spec). The cap-th-plus-one message gets one templated 'queued for
