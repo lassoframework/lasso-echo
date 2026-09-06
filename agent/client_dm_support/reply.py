@@ -176,11 +176,48 @@ def assert_templates_wellformed():
     return True
 
 
+# Slot values that are CLIENT-CONTROLLED. `media_source_folder_name` is the name of a
+# folder in the gym owner's own Google Drive: it is read out of Drive, stored on the
+# media_source row, and interpolated into a message this capability posts into Slack
+# unattended. That makes it untrusted text on an auto-send path, so it is bounded here.
+#
+# Two controls, both total rather than enumerated (the adapter's own RT-M1/RA-M2 fix,
+# same reasoning):
+#   * ESCAPE & < > to entities. This disarms ALL Slack markup in one pass, because
+#     every piece of Slack markup needs < and > -- including <!channel>, <!here> and
+#     <@U...>, which would otherwise let a folder name ping every human in the group DM.
+#     It is not a list of bad strings, so there is no phrasing that slips past it.
+#   * REFUSE on a control character, a newline, or an over-long value, rather than
+#     silently truncating. A folder name that could forge message structure sends the
+#     whole ticket to a human instead.
+CLIENT_CONTROLLED_SLOTS = frozenset({"media_source_folder_name"})
+MAX_SLOT_CHARS = 120
+
+
+def _safe_slot(key, value):
+    """Bound one client-controlled string before it reaches an auto-sent message."""
+    if not isinstance(value, str):
+        return value
+    if len(value) > MAX_SLOT_CHARS:
+        raise ReplyRefused(
+            f"fact {key!r} is {len(value)} chars, over the {MAX_SLOT_CHARS}-char cap "
+            f"for a client-controlled slot; escalating rather than truncating"
+        )
+    for ch in value:
+        if ch == "\n" or ch == "\r" or ch == "\t" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ReplyRefused(
+                f"fact {key!r} contains a control character or newline, which could "
+                f"forge structure in an auto-sent message; escalating"
+            )
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def render(template, snapshot):
     """The ONLY producer of reply text in this capability.
 
     Refuses -- rather than rendering something partial -- when the snapshot does not
-    carry every fact the template names, or carries them from a different diagnostic.
+    carry every fact the template names, or carries them from a different diagnostic,
+    or carries a client-controlled value that cannot be safely interpolated.
     """
     if isinstance(template, str):
         try:
@@ -202,7 +239,13 @@ def render(template, snapshot):
             f"template {template.id!r} needs fact key(s) {missing} which the "
             f"grounding snapshot does not contain"
         )
-    values = {slot: snapshot.get(slot) for slot in template.slots}
+    values = {}
+    for slot in template.slots:
+        v = snapshot.get(slot)
+        # Every string slot is bounded, not only the ones currently known to be
+        # client-controlled: a fact that becomes client-influenced later must not
+        # quietly become an injection surface because this list was not updated.
+        values[slot] = _safe_slot(slot, v)
     return template.text.format(**values)
 
 

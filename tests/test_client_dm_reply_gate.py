@@ -177,3 +177,80 @@ def test_snapshots_for_different_gyms_never_merge():
         diag.DIAG_DRIVE_PHOTOS, "verification", "someoneelse", {"media_asset_count": 1})
     with pytest.raises(facts.FactError):
         a.merged_with(b)
+
+
+# ---------------------------------------------------------------------------
+# CLIENT-CONTROLLED SLOT VALUES.
+#
+# media_source_folder_name is the name of a folder in the gym owner's OWN Google
+# Drive. It is read out of Drive, stored on the media_source row, and interpolated
+# into a message this capability posts into Slack UNATTENDED. That is untrusted text
+# on an auto-send path and it is bounded, not trusted.
+# ---------------------------------------------------------------------------
+def test_slack_markup_in_a_folder_name_cannot_ping_the_channel():
+    """THE RULE: a folder name may never become Slack markup. <!channel> in a folder
+    name would otherwise notify every human in the client's group DM, from a value the
+    client controls."""
+    for hostile in ("<!channel>", "<!here>", "<@U06EPUUCL13>",
+                    "Ad Photos <!channel>", "<https://evil.example|click me>"):
+        snap = _drive_snapshot(media_source_folder_name=hostile)
+        out = reply.render("drive_synced", snap)
+        assert "<!channel>" not in out, hostile
+        assert "<!here>" not in out, hostile
+        assert "<@" not in out, hostile
+        # The characters Slack markup is built from are gone, entity-escaped.
+        assert "<" not in out and ">" not in out, hostile
+
+
+def test_ampersands_are_escaped_first_so_escaping_is_not_reversible():
+    snap = _drive_snapshot(media_source_folder_name="A &lt;!channel&gt; B")
+    out = reply.render("drive_synced", snap)
+    # The literal text the client typed must not become live markup after Slack
+    # un-escapes entities once.
+    assert "&amp;lt;" in out
+
+
+def test_a_newline_or_control_char_in_a_folder_name_refuses_the_reply():
+    """Refuse, not truncate: a value that could forge message structure sends the
+    whole ticket to a human."""
+    for hostile in ("Ad Photos\nYour ads have been paused.",
+                    "Ad\rPhotos", "Ad\tPhotos", "Ad\x00Photos", "Ad\x07Photos"):
+        with pytest.raises(reply.ReplyRefused):
+            reply.render("drive_synced",
+                         _drive_snapshot(media_source_folder_name=hostile))
+
+
+def test_an_over_long_folder_name_refuses_rather_than_truncating():
+    with pytest.raises(reply.ReplyRefused) as e:
+        reply.render("drive_synced",
+                     _drive_snapshot(media_source_folder_name="x" * 500))
+    assert "cap" in str(e.value)
+
+
+def test_an_ordinary_folder_name_is_untouched():
+    out = reply.render("drive_synced", _drive_snapshot())
+    assert '"Ad Photos"' in out
+
+
+def test_the_bounding_applies_to_every_string_slot_not_a_named_list():
+    """A fact that becomes client-influenced later must not quietly become an
+    injection surface because CLIENT_CONTROLLED_SLOTS was not updated."""
+    src = open(reply.__file__, encoding="utf-8").read()
+    assert "_safe_slot(slot, v)" in src
+    assert "for slot in template.slots" in src
+
+
+def test_escaping_is_inside_render_so_the_byte_equality_gate_stays_consistent():
+    """The gate reconstructs via render(), so both sides escape identically. A
+    candidate carrying the RAW hostile value must still be refused."""
+    hostile = "Ad Photos <!channel>"
+    snap = _drive_snapshot(media_source_folder_name=hostile)
+    good = reply.render("drive_synced", snap)
+    assert reply.assert_is_template_render(
+        good, reply.TEMPLATES["drive_synced"], snap) == good
+    raw = reply.TEMPLATES["drive_synced"].text.format(
+        media_source_folder_name=hostile,
+        assets_inserted_this_run=snap.get("assets_inserted_this_run"),
+        media_asset_count=snap.get("media_asset_count"))
+    with pytest.raises(reply.ReplyRefused):
+        reply.assert_is_template_render(raw, reply.TEMPLATES["drive_synced"], snap)
