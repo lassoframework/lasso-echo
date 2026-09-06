@@ -6,12 +6,18 @@ Dean Holcomb, CrossFit Reverb, ticket 4941e162-2923-495f-8efb-d2554dea5aec,
 2026-09-05: "Also, they all end with 'How do I get started with training at
 CrossFit Reverb?' which doesn't make sense." Measured: 90 of 93 rows carried it.
 
-This gate is CTA FORM only. It must never touch audience/topic words -- HYROX,
-competitive CrossFit, and competitive athletics are an explicit standing
-audience rule (Blake, 2026-09-06, reconfirming 2026-09-01: "confirmed we can
-talk about CrossFit, hyrox and competitive athletics"). A test below asserts
-the gate does not fire on ordinary HYROX/competitive-athlete copy, specifically
-so nobody "fixes" this module into an avatar-word ban later.
+This gate is CTA FORM only. It must never touch audience/topic words. The org
+LASSO AVATAR RULE bans writing TO a competitive-athlete/HYROX audience and
+performance framing as the primary hook -- that rule is unchanged and this
+gate does not relax it. What IS clarified (Blake, 2026-09-06, correcting an
+earlier over-broad framing of this same clarification): a gym's own brand
+name, including a CrossFit affiliate name like "CrossFit Reverb" or "CrossFit
+Zanshin", is a FACT about the client, never a targeting decision, and may
+appear in ordinary copy. A test below asserts the gate does not fire on a
+gym's own name in ordinary gen-pop-directed copy, specifically so nobody
+"fixes" this module into a brand-name ban later -- it is NOT a claim that
+athlete-targeting or performance-framed copy is fine; that stays banned by
+the org rule and is simply outside what this CTA-form-only gate checks for.
 
 Fully offline.
 """
@@ -111,13 +117,21 @@ def test_self_question_matches_join_and_sign_up_variants():
 # avatar-word ban later -- Blake's 2026-09-06 ruling is explicit and repeated.
 # ---------------------------------------------------------------------------
 
-def test_gate_never_fires_on_hyrox_or_competitive_athlete_copy():
+def test_gate_never_fires_on_a_gyms_own_brand_name_in_ordinary_copy():
+    # A gym's own brand name (including a CrossFit affiliate name) is a FACT about
+    # the client, never a targeting decision -- naming the gym is always fine, per
+    # Blake's 2026-09-06 clarification of the org avatar rule (see memory
+    # avatar-rule-hyrox-crossfit-allowed). This test is deliberately scoped to
+    # ORDINARY gen-pop-directed copy that happens to include the gym's own name;
+    # it is NOT a claim that athlete-targeting or performance-framed copy is fine
+    # for this gate to pass through -- that remains banned by the org avatar rule
+    # and is simply outside what THIS gate (CTA form only) checks for.
     captions = [
-        "Training for your first HYROX? We've got the engine work dialed in.\n\n"
+        "New member spotlight this week at CrossFit Reverb!\n\n"
         "Book your free intro today.",
-        "Competitive CrossFit athletes: this is the accessory work you're missing.\n\n"
+        "CrossFit Zanshin is turning five years old this month.\n\n"
         "Link in bio.",
-        "Our strongest athletes train here. Are you next?",
+        "Proud to be Iron Forge, your neighborhood gym since 2019.",
     ]
     for caption in captions:
         assert not contains_banned_literal(caption)
