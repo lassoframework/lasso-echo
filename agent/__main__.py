@@ -165,6 +165,7 @@ def _status():
     print(f"  onboarding_autoreg: {config.onboarding_autoregister_enabled()}  (env AGENT_ONBOARDING_AUTOREGISTER; lets that watch ACT on not_registered — adds the gym to the dynamic registry under the portal's own key, using its REAL name only; inactive record, no tokens/connection/publish)")
     print(f"  intake_autoapp : {config.intake_auto_approve()}  (env AGENT_INTAKE_AUTO_APPROVE; a gym's own intake answers land approved, not queued)")
     print(f"  website_intake : {config.website_auto_intake_enabled()}  (env AGENT_WEBSITE_AUTO_INTAKE; a client gym with ZERO client_sources gets a CITED source bundle read off its OWN website — verbatim facts with page-URL citations, invented numbers dropped by the caption digit gate — landed via the standard intake path (pending unless AGENT_INTAKE_AUTO_APPROVE) plus a durable voice doc when none exists; a gym with any sources is skipped; no publish)")
+    print(f"  gym_deep_brain : {config.gym_deep_brain_enabled()}  (env AGENT_GYM_DEEP_BRAIN; PRE-ONBOARD per-gym deep brain — reads a gym's OWN public website (robots.txt respected, {config.gym_deep_brain_crawl_delay()}s min gap per host, page/byte capped, non-business emails and phone numbers redacted) and its OWN public Instagram feed (FORM only, comments never read) into {config.gym_deep_brain_dir()}/<base>.md; every fact carries the page URL it came from and lands PENDING, never auto-approved; missing domain/handle/permission BLOCKS with no artifact; manual only, no sweep, no publish)")
     print(f"  event_lead_days: {config.event_lead_days()}  (env AGENT_EVENT_LEAD_DAYS; how many days before an event its promo arc opens)")
     print(f"  onboarding_demo: {config.onboarding_demo_enabled()}  (env AGENT_ONBOARDING_DEMO; SAMPLE month for a gym whose intake is not done, never publishes)")
     print(f"  portal_social  : {config.portal_social_enabled()}  (env AGENT_PORTAL_SOCIAL_ENABLED; per-gym calendar engine + collision-shift + approval-surface routing + Part B token-scoped portal endpoints)")
@@ -858,6 +859,7 @@ _COMMANDS = {
         ("seed-sources", "stock a gym's intake bundle into client sources (--review holds)"),
         ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
         ("website-intake", "auto-intake a gym's sources from its OWN website (--account <base> [--domain x.com] [--force])"),
+        ("gym-deep-brain", "PRE-ONBOARD deep brain: scrape a gym's OWN website (robots-respecting, rate-limited, PII-scrubbed) + its OWN public Instagram feed into a per-gym voice/grounding artifact; facts land PENDING (AGENT_GYM_DEEP_BRAIN) -- (--account <base> [--domain x.com] [--handle <ig>] [--dry-run])"),
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
@@ -2585,6 +2587,52 @@ def main(argv=None):
                           f"--account {_acct}_ig --all")
             else:
                 print(f"{_acct}: not intaken: {out.get('reason')}")
+    elif cmd == "gym-deep-brain":
+        # PER-GYM DEEP BRAIN, one gym by hand (there is no automatic sweep):
+        # read the gym's OWN public website (robots.txt respected, rate limited,
+        # PII scrubbed, page/byte capped) plus its OWN public Instagram feed, and
+        # compile the per-gym voice + grounding artifact. Every fact carries the
+        # URL it came from and lands PENDING; a scrape is never auto-approved.
+        # Blocks honestly (no artifact, no rows) when a domain, a handle, robots
+        # permission, a readable page, or the social read is missing.
+        from . import gym_deep_brain as _gdb
+        _args = argv[1:]
+        _acct, _dom, _handle = "", None, None
+        _dry = "--dry-run" in _args
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--domain" and i + 1 < len(_args):
+                _dom = _args[i + 1]; i += 2; continue
+            if _args[i] == "--handle" and i + 1 < len(_args):
+                _handle = _args[i + 1]; i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent gym-deep-brain --account <base> "
+                  "[--domain x.com] [--handle <ig>] [--dry-run]")
+        else:
+            out = _gdb.build_deep_brain(_acct, domain=_dom, handle=_handle,
+                                        dry_run=_dry)
+            if not out.get("ok"):
+                print(f"{_acct}: BLOCKED, no artifact written: {out.get('reason')}")
+            elif out.get("dry_run"):
+                print(f"{_acct}: dry run over {out['domain']} + @{out['handle']} "
+                      f"— {out['facts']} attributed fact(s), {out['voice']} voice "
+                      f"observation(s), {out['top_posts']} top post(s). "
+                      "Nothing written.")
+                print(out.get("markdown", ""))
+            else:
+                print(f"{_acct}: deep brain from {out['domain']} + @{out['handle']}")
+                print(f"  artifact: {out['artifact']}")
+                print(f"  {out['facts']} attributed fact(s) landed PENDING, "
+                      f"{out['voice']} voice observation(s), "
+                      f"{out['top_posts']} top post(s)")
+                print(f"  {out['bible']}")
+                for _n in out.get("notes", []):
+                    print(f"  note: {_n}")
+                print(f"  a human must approve before Echo may draft from these: "
+                      f"python -m agent approve-sources --account {_acct}_ig")
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])
