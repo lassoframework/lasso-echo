@@ -202,9 +202,18 @@ def _alert_low_grade(gym_id: str, window: str, grade, alert_fn) -> None:
 
 _MAX_FIX_PASSES = 3
 
+# Every integer counter remediate_forward_book returns. A count missing from
+# this tuple is silently dropped from the per-gym fix report: the pass runs,
+# the number is computed, and nothing downstream ever sees it -- this repo's
+# "built but not wired" shape (D56/D68), one layer down. `scrubbed`,
+# `ask_trimmed`, `invalid_closings_removed` and the three `body_*` counts were
+# all in that state; tests/test_body_repair.py holds the two-way guard so a
+# future counter cannot be added to the result dict and forgotten here again.
 _FIX_COUNT_KEYS = ("captions_fixed", "repillared", "craft_fixed",
                    "craft_attempted", "booking_asks_added", "audience_fixed",
-                   "audience_attempted", "skipped")
+                   "audience_attempted", "scrubbed", "ask_trimmed",
+                   "invalid_closings_removed", "body_pairs", "body_fixed",
+                   "body_unrepairable", "skipped")
 
 
 def _merge_fix(agg: dict, step: dict) -> dict:
