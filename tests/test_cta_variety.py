@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import caption_variety as cv
+from agent import calendar_grade, caption_variety as cv, copy_gate
 from agent.jobs import grade_fix
 
 
@@ -209,17 +209,21 @@ def test_identical_bodies_still_collide_and_the_cta_layer_cannot_fix_that():
 # 4. Armed: not every post ends in an ask
 # ---------------------------------------------------------------------------
 
-def test_armed_stops_appending_once_the_book_has_its_ask_floor(monkeypatch):
+def test_armed_stops_appending_once_the_book_has_its_ask_target(monkeypatch):
     """Dean is right that an ask on every post reads wrong. The booking CTA is
-    appended only while the book is short of the grader's floor of 5 booking
-    asks; after that a repaired caption legitimately carries none."""
+    appended only while the book is short of its ask TARGET; after that a
+    repaired caption legitimately carries none.
+
+    The target was `min(5, n)` when this test was written (5 of 20). Blake moved
+    it to a 33% share on 2026-09-06, so 20 posts now want 7. The invariant this
+    test exists for is unchanged and is the second assertion: appending STOPS
+    somewhere well short of the whole book."""
     rows = _run(_book(20), monkeypatch, variety=True, pool=POOL)
     pool_sigs = {cv.normalize(c) for c in POOL}
     appended = [r for r in rows if cv.closing_signature(r["caption"]) in pool_sigs]
-    # The grader's GYM floor is min(5, n) booking asks. Appending stops there:
-    # 5 of 20 posts, not 20 of 20. Before this gate every craft-flagged day got
+    # 20 posts * 0.33 = 6.6 -> 7. Before this gate every craft-flagged day got
     # the CTA, which is how one line reached 90 of Reverb's 93 rows.
-    assert len(appended) == 5, f"{len(appended)} of {len(rows)}"
+    assert len(appended) == 7, f"{len(appended)} of {len(rows)}"
     assert len(appended) < len(rows), "an ask on every post is the defect"
     # A CTA may only recur once it is OUTSIDE the window, never inside it.
     assert [c for c in cv.collisions(rows, window=10) if c["kind"] == "closing"] == []
@@ -425,3 +429,351 @@ def test_local_rows_carry_the_new_levers_before_any_store_re_read(monkeypatch):
     assert any(r["ask_type"] != "none" for r in rows), rows
     for r in rows:
         assert r["ask_type"] == lever_stamp.ask_type(r["caption"])
+
+
+# ---------------------------------------------------------------------------
+# THE 33% ASK RATE (Blake, 2026-09-06: "every post should not have an ask, make
+# it 33% of post"). The shipped target was `min(5, n)` -- 5 of 31 posts, 16.1%.
+#
+# Two halves, and the second one is the point: moving the REPAIR without moving
+# the GRADER would build a system that fights itself, because the grader's rule
+# was "every post carries an ask" and it was scored on TWO legs at once.
+# ---------------------------------------------------------------------------
+
+def test_ask_target_is_a_share_of_the_book_not_a_flat_five(monkeypatch):
+    """31 posts at 0.33 wants 10, not 5. The old flat floor is what produced
+    16.1% on Dean's real book."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    assert grade_fix._ask_target_posts(31) == 10
+    assert grade_fix._ask_target_posts(30) == 10
+    assert grade_fix._ask_target_posts(0) == 0
+
+
+def test_the_graders_booking_floor_still_binds_on_a_short_book(monkeypatch):
+    """A share below the grader's own `min(5, n)` floor would hand the repair a
+    target the grader still marks down. The larger of the two wins."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    assert grade_fix._ask_target_posts(6) == 5      # share would be 2
+    assert grade_fix._ask_target_posts(3) == 3      # never more posts than exist
+
+
+def test_the_target_is_configurable_and_refuses_nonsense(monkeypatch):
+    from agent import config
+    monkeypatch.setenv("AGENT_CAPTION_ASK_RATE", "0.5")
+    assert config.caption_ask_rate_target() == 0.5
+    for bad in ("0", "-1", "1.5", "banana", ""):
+        monkeypatch.setenv("AGENT_CAPTION_ASK_RATE", bad)
+        assert config.caption_ask_rate_target() == 0.33, bad
+
+
+def test_the_deficit_counts_posts_not_rows(monkeypatch):
+    """One post spans several rows (IG feed + FB mirror + paired story share one
+    caption on one date). A share taken over ROWS asks for 31 posts' worth of CTA
+    on a 31 post book, because the caller decrements the deficit once per POST.
+    Reverb's book is 93 rows and 31 posts, which is exactly the 3x that hides it.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = []
+    for i in range(30):
+        cap = _no_ask_caption(i)
+        for plat in ("instagram", "facebook", "story"):
+            rows.append({"id": f"r{i}_{plat}", "gym_id": "reverb",
+                         "post_date": f"2026-09-{i + 1:02d}", "caption": cap,
+                         "status": "pending", "account": plat, "format": "feed"})
+    assert len(rows) == 90
+    # 30 POSTS at 0.33 -> 10. Counting the 90 ROWS would give 30.
+    assert grade_fix._booking_deficit(rows) == 10
+
+
+def test_flag_off_keeps_the_flat_five_row_deficit(monkeypatch):
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _book(30)
+    assert grade_fix._booking_deficit(rows) == 5
+
+
+def test_repairing_a_no_ask_book_lands_near_the_target(monkeypatch):
+    """END TO END on the real repair loop: a 31 post book of ask-less captions
+    comes out of _fix_craft with ~a third of its posts asking, not a twentieth
+    and not all of them."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None)
+    asking = [r for r in rows if copy_gate.ASK_RE.search(r["caption"])]
+    assert len(asking) == 10, [r["caption"][-60:] for r in asking]
+    assert 0.28 <= len(asking) / len(rows) <= 0.38
+
+
+def test_the_grader_does_not_mark_down_a_book_that_hits_the_target(monkeypatch):
+    """THE RECONCILIATION. Measured on Dean's real book before this: a book
+    repaired exactly as intended scored 71 (C) with 25 'no ask' defects, because
+    the grader still wanted an ask on every post AND counted `no_ask` twice --
+    once on path_to_join (up to 7) and again as a caption_craft soft flag (up to
+    12). Both legs now agree with the target."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: list(POOL))
+    rows = _book(31)
+    grade_fix._fix_craft("reverb", rows, _FakeStore(rows), "GYM", None, set(),
+                         lambda m: None)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert no_ask == [], no_ask
+    assert grade.scores["path_to_join"] == 10, grade.scores
+    soft_no_ask = [d for d in grade.defects if "soft flag: no_ask" in str(d[2])]
+    assert soft_no_ask == [], soft_no_ask
+
+
+def test_a_book_with_no_asks_at_all_still_loses_the_full_penalty(monkeypatch):
+    """The band must not become a licence to never ask. 0% keeps the same worst
+    case path_to_join always had."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    # 7 for the ask rule + 5 for the booking-specific leg takes the leg to 0.
+    assert grade.scores["path_to_join"] == 0, grade.scores
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert len(no_ask) == 10, len(no_ask)   # the SHORTFALL, not all 31
+
+
+def test_flag_off_the_grader_still_wants_an_ask_on_every_post(monkeypatch):
+    """Regression guard: unarmed gyms see byte-for-byte the old rule."""
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _book(31)
+    grade = calendar_grade.grade_month(rows, profile="GYM")
+    no_ask = [d for d in grade.defects if "no ask in caption" in str(d[2])]
+    assert len(no_ask) == 31, len(no_ask)
+    soft_no_ask = [d for d in grade.defects if "soft flag: no_ask" in str(d[2])]
+    assert len(soft_no_ask) == 31, len(soft_no_ask)
+
+
+# ---------------------------------------------------------------------------
+# THE OTHER HALF OF 33%: removing the staple.
+#
+# _fix_craft can only ADD an ask, and only to a craft-FLAGGED day. A caption that
+# already ends in an ask is not flagged, so on Dean's live book -- 30 of 31 posts
+# closing on the same line, exactly ONE post craft-flagged -- the repair loop had
+# nothing to grip and his actual complaint stayed true. This pass removes the
+# staple. It only ever DELETES a line the machine stapled on.
+# ---------------------------------------------------------------------------
+
+def _stapled_book(n=31, staple=REVERB_CTA, gym_id="reverb"):
+    """A book shaped like Dean's: every post closing on the same line."""
+    rows = []
+    for i in range(n):
+        cap = f"{_no_ask_caption(i)}\n{staple}"
+        rows.append({"id": f"row_{i}", "gym_id": gym_id,
+                     "post_date": f"2026-09-{i + 1:02d}", "caption": cap,
+                     "pillar": "community", "status": "pending",
+                     "account": "instagram", "format": "feed"})
+    return rows
+
+
+def test_the_staple_is_trimmed_down_to_the_target(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    before = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
+    assert before == 31, before
+    grade_fix._fix_ask_excess("reverb", rows, _FakeStore(rows), lambda m: None)
+    after = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
+    # 31 posts * 0.33 -> 10. Trimming stops there and never goes below.
+    assert after == 10, after
+    assert 0.28 <= after / len(rows) <= 0.38
+
+
+def test_trimming_never_takes_a_book_below_the_target(monkeypatch):
+    """The pass must not be able to strip a book that is already compliant."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    grade_fix._fix_ask_excess("reverb", rows, _FakeStore(rows), lambda m: None)
+    first = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
+    # Run it again: an at-target book is left completely alone.
+    trimmed = grade_fix._fix_ask_excess("reverb", rows, _FakeStore(rows), lambda m: None)
+    assert trimmed == 0
+    assert sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"])) == first
+
+
+class _PermissiveStore(_FakeStore):
+    """Writes whatever it is handed, including onto a non-pending row.
+
+    _FakeStore refuses a non-pending row itself, which MASKS the caller's own
+    human-owned guard: revert the guard in _fix_ask_excess and the fake still
+    blocks the write, so the test stays green and asserts nothing. Mutation
+    checking caught exactly that. These guard tests use a store that protects
+    nothing, so only the code under test can hold the line.
+    """
+
+    def patch_pending_plan(self, gym_id, row_id, *, caption=None, pillar=None,
+                           levers=None):
+        for r in self.rows:
+            if r.get("id") == row_id and r.get("gym_id") == gym_id:
+                if caption is not None:
+                    r["caption"] = caption
+                return dict(r)
+        return None
+
+
+def test_a_bespoke_closing_that_appears_once_is_never_trimmed(monkeypatch):
+    """A sign-off used on ONE post is the gym's own voice, not a staple.
+
+    Every post here closes on a DIFFERENT ask, so the repeated-closing guard is
+    the only thing standing between the pass and 21 trims. If it is reverted the
+    book is gutted.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    for i, r in enumerate(rows):
+        r["caption"] = f"{_no_ask_caption(i)}\nBook your free intro on day {i} now"
+    assert all(copy_gate.ASK_RE.search(r["caption"]) for r in rows)
+    trimmed = grade_fix._fix_ask_excess("reverb", rows, _PermissiveStore(rows),
+                                        lambda m: None)
+    assert trimmed == 0, trimmed
+    assert all("Book your free intro on day" in r["caption"] for r in rows)
+
+
+def test_an_ask_woven_into_the_body_is_never_trimmed(monkeypatch):
+    """Only the LAST line is ever removed, and only when it is itself an ask.
+
+    Every post here carries its ask in the FIRST line and closes on a shared,
+    heavily repeated line that is NOT an ask. The repeated-closing guard is
+    therefore satisfied and the is-it-an-ask guard is the only one left; revert
+    it and the pass eats 21 closing lines that were never CTAs.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    closing = "That is how a beginner turns into a regular here every week."
+    rows = _stapled_book(31)
+    for i, r in enumerate(rows):
+        r["caption"] = (f"Book your free intro and the rest sorts itself out.\n\n"
+                        f"{_no_ask_caption(i)}\n{closing}")
+    assert all(copy_gate.ASK_RE.search(r["caption"]) for r in rows)
+    assert not copy_gate.ASK_RE.search(closing)
+    trimmed = grade_fix._fix_ask_excess("reverb", rows, _PermissiveStore(rows),
+                                        lambda m: None)
+    assert trimmed == 0, trimmed
+    assert all(r["caption"].rstrip().endswith(closing) for r in rows)
+
+
+def test_a_human_owned_day_is_never_trimmed(monkeypatch):
+    """EVERY post is human-owned and the store protects nothing.
+
+    HONEST NOTE, because mutation checking made it explicit: the `_is_wipeable`
+    line in _fix_ask_excess is DEFENCE IN DEPTH, not the sole guard --
+    _patch_date_rows enforces the same rule underneath it, so reverting EITHER
+    layer alone leaves this test green. Reverting BOTH turns it red (verified).
+    What this test pins is therefore the RULE, "a human-owned day is never
+    trimmed", not either individual line. Said out loud so nobody later reads a
+    green suite as proof that one of the two lines is load-bearing on its own.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    for r in rows:
+        r["status"] = "approved"
+    before = [r["caption"] for r in rows]
+    trimmed = grade_fix._fix_ask_excess("reverb", rows, _PermissiveStore(rows),
+                                        lambda m: None)
+    assert trimmed == 0, trimmed
+    assert [r["caption"] for r in rows] == before
+
+
+def test_remediate_forward_book_actually_runs_the_trim_pass(monkeypatch):
+    """THE WIRING. A pass that is built and never called is the failure this
+    repo keeps repeating; nothing above this line would notice if the call site
+    were deleted."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    monkeypatch.setattr(grade_fix, "_booking_cta_pool", lambda g, log: [])
+    rows = _stapled_book(31)
+    out = grade_fix.remediate_forward_book(
+        "reverb", rows, _FakeStore(rows), profile="GYM", defects=[],
+        today_iso=TODAY, caption_regen=lambda *a, **k: None,
+        gap_filler=lambda *a, **k: "none", logger=lambda m: None)
+    assert out["ask_trimmed"] > 0, out
+    assert any("trimmed the stapled closing ask" in a for a in out["actions"]), out["actions"]
+    asking = sum(1 for r in rows if copy_gate.ASK_RE.search(r["caption"]))
+    assert asking == 10, asking
+
+
+def test_the_trim_pass_is_inert_with_the_flag_off(monkeypatch):
+    monkeypatch.delenv("AGENT_CTA_VARIETY", raising=False)
+    rows = _stapled_book(31)
+    before = [r["caption"] for r in rows]
+    assert grade_fix._fix_ask_excess("reverb", rows, _FakeStore(rows), lambda m: None) == 0
+    assert [r["caption"] for r in rows] == before
+
+
+def test_trimming_breaks_up_the_closing_monoculture(monkeypatch):
+    """The point of the pass, measured the way Dean's complaint was measured."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    before = cv.report(rows)
+    assert before["distinct"]["closing"] == 1, before["distinct"]
+    grade_fix._fix_ask_excess("reverb", rows, _FakeStore(rows), lambda m: None)
+    after = cv.report(rows)
+    assert after["distinct"]["closing"] > before["distinct"]["closing"]
+    assert after["top_share"]["closing"] < before["top_share"]["closing"]
+    assert len(after["collisions"]) < len(before["collisions"])
+
+
+def test_a_trim_that_would_leave_a_worse_caption_is_skipped(monkeypatch):
+    """The remainder still has to clear the craft bar, same as every other repair.
+
+    EVERY post here is too short to survive on its own, so the craft re-check is
+    the ONLY guard in play: revert it and all 21 excess posts get gutted down to
+    a one line caption under the 150 char floor. An earlier version of this test
+    left only four such posts, and those four ranked last by closing frequency,
+    so the excess was exhausted before the pass ever reached them and reverting
+    the guard changed nothing. Mutation checking caught that.
+    """
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    rows = _stapled_book(31)
+    for r in rows:
+        r["caption"] = f"Short line.\n{REVERB_CTA}"
+    trimmed = grade_fix._fix_ask_excess("reverb", rows, _PermissiveStore(rows),
+                                        lambda m: None)
+    assert trimmed == 0, trimmed
+    assert all(REVERB_CTA in r["caption"] for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# A LIVE REGRESSION, unrelated to the ask rate but in the same file.
+#
+# The TypeError retry in _patch_date_rows sat BARE inside its own handler, so a
+# store that raised on the retry aborted the ENTIRE gym's grade-fix pass. Before
+# the levers change one broad `except Exception` caught every store error and
+# moved to the next row; splitting TypeError out silently removed that
+# protection from the path most likely to fail.
+# ---------------------------------------------------------------------------
+
+def test_one_failing_row_does_not_abort_the_whole_pass(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+
+    class _RetryBombStore:
+        """Rejects the levers kwarg (forcing the retry) and then blows up on the
+        retry for the first row only. Row two must still be patched."""
+
+        def __init__(self, rows):
+            self.rows = rows
+            self.patched = []
+
+        def patch_pending_plan(self, gym_id, row_id, *, caption=None,
+                               pillar=None, levers=None):
+            if levers is not None:
+                raise TypeError("this store predates the levers kwarg")
+            if row_id == "row_0":
+                raise RuntimeError("supabase 503")
+            self.patched.append(row_id)
+            for r in self.rows:
+                if r.get("id") == row_id:
+                    r["caption"] = caption
+                    return dict(r)
+            return None
+
+    # 31 posts so the book is genuinely ABOVE target and the pass has work to do
+    # (a 4 post book's target is 4, so nothing would be trimmed and the test
+    # would pass while asserting nothing).
+    rows = _stapled_book(31)
+    store = _RetryBombStore(rows)
+    # Must not raise, and must get past the exploding row.
+    grade_fix._fix_ask_excess("reverb", rows, store, lambda m: None)
+    assert store.patched, "the pass aborted on the first failing row"
+    assert "row_0" not in store.patched
