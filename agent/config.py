@@ -1864,6 +1864,23 @@ def alert_repeat_gate_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_ALERT_REPEAT_GATE", "false"))
 
 
+def slot_dedupe_enabled() -> bool:
+    """AGENT_SLOT_DEDUPE — the calendar slot idempotency belt. DEFAULT ON.
+
+    Default-on is deliberate and matches the plan-horizon belt: this PREVENTS damage
+    rather than adding a capability. On 2026-09-05 the fleet held 155 genuine duplicate
+    future slots across 14 gyms and the number was still climbing hour over hour, because
+    a re-plan appended instead of replacing. Shipping the guard OFF would have left the
+    leak open.
+
+    A slot is (account, post_date, time_slot, format). Date alone is NOT a slot: a gym
+    running 2x a day plus a story legitimately owns three rows on one date, and keying on
+    the date alone called 441 rows duplicates when only 155 were.
+
+    Set AGENT_SLOT_DEDUPE=false as an emergency escape hatch."""
+    return _truthy(os.environ.get("AGENT_SLOT_DEDUPE", "true"))
+
+
 def alert_repeat_window_hours() -> float:
     """How long an unchanged NEEDS_TRIAGE alert stays quiet. 72h by default: long enough
     that human onboarding work (a gym owner clicking a connect link) gets a working week
