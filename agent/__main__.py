@@ -297,7 +297,7 @@ def _status():
     print(f"  testimonial    : {config.lasso_testimonial_pillar_enabled()}  (env AGENT_LASSO_TESTIMONIAL_PILLAR; owner-voice proof pillar on alternate Tuesdays, approved social-proof doc ONLY, falls back when nothing approved; default OFF)")
     print(f"  mentions       : {config.mentions_enabled()}  (env AGENT_MENTIONS; Wave 4 tag_allowlist @mention tagging, default OFF)")
     print(f"  caption form   : {config.caption_form_plan_enabled()}  (env AGENT_CAPTION_FORM_PLAN; per-post caption SHAPE planning, style only, default OFF)")
-    print(f"  cta variety    : {config.cta_variety_enabled()}  (env AGENT_CTA_VARIETY; CTA shape gate + rotation + ask-rate band, window {config.caption_variety_window()} posts via AGENT_CAPTION_VARIETY_WINDOW, default OFF)")
+    print(f"  cta variety    : {config.cta_variety_enabled()}  (env AGENT_CTA_VARIETY; CTA shape gate + rotation + ask-rate band, window {config.caption_variety_window()} posts via AGENT_CAPTION_VARIETY_WINDOW, target ask rate {config.caption_ask_rate_target():.0%} via AGENT_CAPTION_ASK_RATE, default OFF)")
     print(f"  metrics_sync   : {config.metrics_sync_enabled()}  (env AGENT_METRICS_SYNC; Wave 7 nightly Zernio analytics -> post_metrics snapshots, read only, default OFF)")
     print(f"  learning_loop  : {config.learning_loop_enabled()}  (env AGENT_LEARNING_LOOP; Wave 7 lever stamping + gym_playbook consumption + monthly retro, default OFF)")
     print(f"  cross_gym_brain: {config.cross_gym_brain_enabled()}  (env AGENT_CROSS_GYM_BRAIN; nightly fleet rollup of post_metrics into FORM statistics (Welch t + Benjamini Hochberg, sample floor 6, >= 2 gyms per cell), read only + append only cross_gym_brain row, form only by whitelist, default OFF)")

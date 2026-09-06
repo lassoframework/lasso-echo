@@ -3662,6 +3662,46 @@ def caption_variety_window() -> int:
     return n if n > 0 else 10
 
 
+# The share of a book's POSTS that should carry a closing ask. Blake, 2026-09-06:
+# "every post should not have an ask, make it 33% of post."
+CAPTION_ASK_RATE_DEFAULT = 0.33
+
+
+def caption_ask_rate_target() -> float:
+    """
+    Target share of a book's POSTS that carry an ask (AGENT_CAPTION_ASK_RATE,
+    default 0.33). ONE number, read by both sides of the loop, which is the
+    whole point of it living here:
+
+      * jobs/grade_fix._booking_deficit sizes the REPAIR to it (how many posts
+        the booking CTA is appended to), and
+      * calendar_grade._path SCORES against it (a book at or above the target
+        loses nothing on the ask rule).
+
+    Before this, the repair targeted `min(5, n)` -- 5 of 31 posts, 16.1% -- while
+    the grader still demanded an ask on EVERY post and deducted the ask rule
+    TWICE (`no_ask` was also a caption_craft soft flag). A book repaired exactly
+    as intended therefore scored as 84% defective: the system fighting itself.
+    Both readers now come from this function, so the target cannot drift apart
+    from what is graded.
+
+    Only consulted while AGENT_CTA_VARIETY is armed; with the flag off the
+    repair still targets `min(5, n)` and the grader still wants an ask on every
+    post, byte for byte.
+
+    Clamped to (0, 1]: a target of 0 would mean "never ask", which no gym wants,
+    and above 1 is not a share.
+    """
+    try:
+        r = float(os.environ.get("AGENT_CAPTION_ASK_RATE",
+                                 str(CAPTION_ASK_RATE_DEFAULT)))
+    except (TypeError, ValueError):
+        return CAPTION_ASK_RATE_DEFAULT
+    if not (0.0 < r <= 1.0):
+        return CAPTION_ASK_RATE_DEFAULT
+    return r
+
+
 def calendar_grade_enabled_for(gym_id: str) -> bool:
     """Per-gym grade enforcement. Checks AGENT_CALENDAR_GRADE_{GYM_ID.upper()} first,
     then falls back to AGENT_CALENDAR_GRADE. Rollout order: lasso first, then ENG,
