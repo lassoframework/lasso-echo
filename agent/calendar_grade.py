@@ -631,7 +631,7 @@ def _path(rows, profile, defects, exempt=None) -> int:
         if ceiling is not None:
             want = max(1, min(want, ceiling))
         short = max(0, want - (n - len(ask_less)))
-        for day, _grp in sorted(ask_less)[:short]:
+        for day, _grp in sorted(ask_less, key=lambda item: item[0])[:short]:
             defects.append(("path_to_join", day, "no ask in caption"))
         score -= int(round(_ASK_MAX_PENALTY * short / want))
     else:
