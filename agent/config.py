@@ -3794,3 +3794,31 @@ def gym_deep_brain_dir() -> str:
     if override:
         return override
     return os.path.join(data_dir(), "deep_brains")
+
+
+def brain_feeds_captions_enabled() -> bool:
+    """BRAINS FEED CAPTIONS (AGENT_BRAIN_FEEDS_CAPTIONS, Blake 2026-09-06: "i want
+    echo to build a brain for all gyms it digest weekly the best post ... see trends
+    on what is working and use that + the gyms brain to create the best post").
+
+    OFF by default = zero behavior change: agent/drafter.py's SB7 prompt is
+    byte-for-byte today's prompt, cross_gym_guidance is never called from the draft
+    path, and no rollup is read at caption time. When ON, the WEEKLY cross gym
+    rollup's FORM guidance (agent/cross_gym_guidance.prompt_lines, itself gated by
+    AGENT_CROSS_GYM_BRAIN, so BOTH flags must be armed for anything to appear) is
+    appended to the caption prompt as FORM HINTS ONLY, BELOW the brand voice doc and
+    BELOW the approved source, and never as a content instruction.
+
+    THE SPLIT IS RIGID AND STRUCTURAL. Cross gym learning shapes FORM; the gym's OWN
+    material supplies CONTENT and VOICE, and it already does so through the unchanged
+    approval gate (client_sources.approved_sources -> client_content -> the client
+    note the drafter prompts on). The hint lines are rendered from cross_gym_brain's
+    whitelisted lever NAME and lever VALUE tokens plus integers only, so there is no
+    branch along which one gym's caption text, offer, stat, member name or handle
+    could become another gym's content. Nothing here weakens the figure gate, the
+    fabrication gate or the human approval gate.
+
+    Arm by hand: AGENT_BRAIN_FEEDS_CAPTIONS=true. HUMAN TAP REQUIRED, and it does
+    nothing on its own without AGENT_CROSS_GYM_BRAIN also armed and the weekly
+    rollup's top_posts migration applied."""
+    return _truthy(os.environ.get("AGENT_BRAIN_FEEDS_CAPTIONS", "false"))
