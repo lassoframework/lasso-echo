@@ -3362,6 +3362,33 @@ def learning_loop_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_LEARNING_LOOP", "false"))
 
 
+def cross_gym_brain_enabled() -> bool:
+    """
+    Cross gym brain switch (AGENT_CROSS_GYM_BRAIN). OFF by default = zero behavior
+    change: agent/jobs/cross_gym_brain.py is a no-op (no store constructed, nothing
+    read, nothing written) and agent/cross_gym_guidance.guidance_for() returns an
+    empty result. When ON, a nightly READ ONLY job pools every gym's matured
+    post_metrics (the Zernio ingestion lane), scores each post with the same
+    learning_score scorer the per gym monthly retro uses, and tests each FORM lever
+    (hook_family, caption length band, sentence band, pillar, ask presence and
+    type, time slot, format, media product type, member face) with Welch's t test
+    on log1p engagement plus a Benjamini Hochberg false discovery correction across
+    the run. A finding needs BOTH cells at or above the sample floor (6), BOTH
+    cells drawn from at least 2 DISTINCT gyms, survival of the FDR correction, and
+    an effect size at or above 0.30 before it becomes guidance; everything else is
+    reported honestly as insufficient_data / not_significant / directional and
+    produces NO guidance. external=true and is_ad=true rows never train anything
+    (the monthly_retro rail); Apify social_baseline is reporting context only.
+    Output is FORM ONLY, enforced by a whitelist of lever names and lever values,
+    so no caption fragment, stat, offer, member name, or handle can ever reach the
+    artifact or cross from one gym to another. The only write is the append only
+    cross_gym_brain row. Nothing here publishes, approves, or touches any social
+    account, and the approval gate is untouched. Arm by hand:
+    AGENT_CROSS_GYM_BRAIN=true (Railway env). HUMAN TAP REQUIRED.
+    """
+    return _truthy(os.environ.get("AGENT_CROSS_GYM_BRAIN", "false"))
+
+
 def mentions_enabled() -> bool:
     """
     Caption @mention tagging switch (AGENT_MENTIONS). OFF by default = zero behavior
