@@ -1286,6 +1286,12 @@ def test_an_unreadable_verification_leaves_the_ticket_in_the_poll(monkeypatch):
     for v in ("SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED",
               "SLACK_CONVO_ECHO_CLIENT_REPLY"):
         monkeypatch.setenv(v, "true")
+    # D68 (2026-09-06): the unreadable-snapshot branch this test is named for lives BEYOND
+    # the fix lane's refusal, which is what a real ticket now hits first (nothing can write
+    # a fix verdict onto the originating row -- see FIX_VERIFICATION_PRODUCERS). Registering
+    # a producer here is what makes this test still about what it says it is about; the
+    # refusal itself is asserted in tests/test_echo_ticket_worker.py.
+    monkeypatch.setattr(ETW, "FIX_VERIFICATION_PRODUCERS", frozenset({"ops_fix"}))
     posted = []
     state = {"status": "fixing"}
     rows = []
@@ -1294,7 +1300,8 @@ def test_an_unreadable_verification_leaves_the_ticket_in_the_poll(monkeypatch):
         def find_fixing_tickets(self, **kw):
             return [{"id": "t-1", "product": "echo", "status": state["status"],
                      "slack_user_id": "U_C", "reporter": "o@g.com", "client_id": "g-1",
-                     "verification_after": {"phase": "after", "exit_code": 0,
+                     "verification_after": {"producer": "ops_fix",
+                                            "phase": "after", "exit_code": 0,
                                             "tail": "ok", "at": "x"}}]
 
         def ticket(self, tid):

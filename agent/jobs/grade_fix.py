@@ -81,7 +81,7 @@ it is actually the honest limit:
 """
 from __future__ import annotations
 
-from agent import config, copy_gate
+from agent import caption_variety, config, copy_gate
 from agent.calendar_grade import _BOOKING_RE
 from agent.caption_ledger import caption_hash
 from agent.portal_calendar_store import _WIPEABLE_STATUSES
@@ -465,22 +465,34 @@ def _craft_flags(caption):
     return [f for f in _CRAFT_FLAGS if f in flags]
 
 
-def _clears_craft(caption) -> bool:
+def _clears_craft(caption, allow_no_ask=False) -> bool:
     """The post-regen assertion: a fresh caption replaces a flagged one ONLY
     when it is strictly clean — exactly one ask, first line inside the hook
     band, length 150 to 500, zero hard violations, zero soft flags. Anything
-    less and the row keeps its current caption (never swap in a worse one)."""
+    less and the row keeps its current caption (never swap in a worse one).
+
+    allow_no_ask (AGENT_CTA_VARIETY, Dean Holcomb 2026-09-05): once the book
+    already carries its booking-ask floor, a caption with NO ask is a legitimate
+    caption and must be allowed to pass. Without this, `no_ask` in soft_flags
+    made "every post ends in an ask" structurally unavoidable, which is the
+    doctrine that produced 90 identical closing lines on Reverb's book. The rest
+    of the bar is unchanged: an ask-less caption still has to be clean.
+    """
     cap = (caption or "").strip()
     if not cap or copy_gate.violations(cap):
         return False
-    if _ask_count(cap) != 1:
+    asks = _ask_count(cap)
+    if asks != 1 and not (allow_no_ask and asks == 0):
         return False
     first = cap.splitlines()[0].strip()
     if not first or len(first) > _HOOK_MAX:
         return False
     if not (_CAPTION_MIN <= len(cap) <= _CAPTION_MAX):
         return False
-    if copy_gate.soft_flags(cap):
+    flags = set(copy_gate.soft_flags(cap))
+    if allow_no_ask:
+        flags.discard("no_ask")
+    if flags:
         return False
     return True
 
@@ -493,12 +505,91 @@ def _booking_deficit(rows) -> int:
     return max(0, min(5, n) - have)
 
 
+def _booking_cta_pool(gym_id, log):
+    """EVERY usable booking CTA the gym has approved, in rotation order.
+
+    THE REVERB DEFECT (Dean Holcomb, ticket 4941e162, 2026-09-05). The old
+    `_booking_cta_for` returned exactly ONE string and `_mechanical_repair`
+    stapled it onto every craft-flagged day. Measured on his real book that was
+    90 of 93 rows carrying the identical closing line. Worse, the line it chose
+    was not a CTA at all: `min(candidates, key=len)` preferred the SHORTEST
+    qualifying sentence, and the shortest thing in his approved sources that
+    matched ASK_RE was an FAQ HEADING, "How do I get started with training at
+    CrossFit Reverb?" (complete with the U+200B it was pasted in with). It
+    contains the ask phrase "get started", so ASK_RE said yes. It is a question
+    the reader is asked, not an instruction, which is exactly why Dean said it
+    "doesn't make sense".
+
+    Two changes, both of which need AGENT_CTA_VARIETY armed:
+      * every candidate now passes copy_gate.is_cta_shaped, which rejects
+        questions and headings. The Reverb line is rejected by name;
+      * a POOL is returned instead of one string, so callers can rotate. The
+        auto-generated bible's "### CTA rotation (cycle in order, one per post)"
+        section has promised rotation since day one and no code ever delivered it.
+
+    Ordering: the voice-doc rotation first, in the order the gym wrote it (that
+    IS the gym's stated preference), then verbatim booking-ask sentences from
+    approved sources, shortest first. Everything here is copy the gym already
+    approved; nothing is invented. A gym with no usable CTA gets an empty pool
+    and an honest skip, never a fabricated ask.
+    """
+    strict = config.cta_variety_enabled()
+    pool, seen = [], set()
+
+    def _offer(text):
+        t = copy_gate.scrub(str(text or "")).strip()
+        if not t or t.lower() in seen:
+            return
+        if not (_BOOKING_RE.search(t) and copy_gate.ASK_RE.search(t)):
+            return
+        if strict:
+            defects = copy_gate.cta_defects(t)
+            if defects:
+                log(f"{gym_id}: CTA candidate rejected ({','.join(defects)}): {t[:70]}")
+                return
+        seen.add(t.lower())
+        pool.append(t)
+
+    try:
+        from agent.client_media_sync import (_account_for_base,
+                                             _resolve_client_voice_path)
+        from agent.voice import load_voice
+        account = _account_for_base(gym_id)
+        if account is not None:
+            voice = load_voice(
+                _resolve_client_voice_path(gym_id, account.voice_doc_path()))
+            for cta in (getattr(voice, "ctas", None) or []):
+                _offer(cta)
+        import re as _re
+        from agent import client_sources as _cs
+        extras = []
+        for src in _cs.approved_sources(f"{gym_id}_ig"):
+            for sent in _re.split(r"(?<=[.!?])\s+", str(src.text or "")):
+                text = copy_gate.scrub(sent).strip()
+                if text and len(text) <= 120:
+                    extras.append(text)
+        for text in sorted(extras, key=len):
+            _offer(text)
+    except Exception as exc:  # noqa: BLE001 - the bias is best effort
+        log(f"{gym_id}: booking CTA unavailable: {type(exc).__name__}")
+    return pool
+
+
 def _booking_cta_for(gym_id, log):
     """The gym's REAL booking CTA: the first CTA in its approved voice-doc
     rotation that is both a booking term and a recognized ask; when the bible's
     CTA section is empty (a hand-fill onboarding TODO — ENG 2026-08-31), a
     VERBATIM booking-ask sentence from the gym's own APPROVED sources. Both are
-    approved copy; a gym with neither gets an honest skip (never an invented CTA)."""
+    approved copy; a gym with neither gets an honest skip (never an invented CTA).
+
+    Single-CTA compatibility shim. With AGENT_CTA_VARIETY armed this is the
+    HEAD of _booking_cta_pool, so it inherits the is_cta_shaped filter and a
+    heading can no longer be chosen. Callers that want variety must use the
+    pool; this one string is what the pre-2026-09-05 callers expect.
+    """
+    if config.cta_variety_enabled():
+        pool = _booking_cta_pool(gym_id, log)
+        return pool[0] if pool else None
     try:
         from agent.client_media_sync import (_account_for_base,
                                              _resolve_client_voice_path)
@@ -589,10 +680,39 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
     is owned by the pillar builders.
     Returns (days_fixed, days_attempted, booking_asks_added)."""
     llm_ok = caption_regen is not None and profile != "B2B"
+    variety = config.cta_variety_enabled()
 
     deficit = _booking_deficit(rows)
-    if booking_cta is None:
+    cta_pool = []
+    if variety:
+        # The whole approved pool, so the append can ROTATE instead of stapling
+        # one line onto every day (Dean Holcomb, Reverb, 2026-09-05).
+        cta_pool = _booking_cta_pool(gym_id, log)
+        if booking_cta is not None and booking_cta not in cta_pool:
+            cta_pool = [booking_cta] + cta_pool
+        booking_cta = cta_pool[0] if cta_pool else None
+    elif booking_cta is None:
         booking_cta = _booking_cta_for(gym_id, log)
+
+    # The book's closing line PER DATE, kept in date order. The anti-repetition
+    # rule is "no two posts inside the window share a closing", NOT "never
+    # repeat": a gym with four approved CTAs must still be able to fill a
+    # 31 day book and clear the grader's 5 booking-ask floor. A global
+    # never-repeat rule caps the book at pool-size asks, which measured on
+    # Reverb's real pool of four left the book one ask short of an A.
+    window = config.caption_variety_window()
+    closing_by_date = {}
+    if variety:
+        for r in rows:
+            dk = str(r.get("post_date") or "")[:10]
+            sig = caption_variety.closing_signature(r.get("caption") or "")
+            if dk and sig:
+                closing_by_date[dk] = sig
+
+    def _recent_closings(day_key):
+        """Closings on the `window` dated posts immediately before day_key."""
+        earlier = sorted(k for k in closing_by_date if k < day_key)
+        return {closing_by_date[k] for k in earlier[-window:]}
 
     # One post spans same-date rows sharing a caption (IG feed + FB mirror +
     # paired story); group by (date, hash) so the day moves together and a 2x
@@ -604,6 +724,7 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
         groups.setdefault((d, h), []).append(r)
 
     fixed = attempted = booking_added = 0
+    day_index = -1
     for (d, _h), grp in sorted(groups.items()):
         if any(not _is_wipeable(r) for r in grp):
             continue                            # human-owned day: never touched
@@ -613,15 +734,45 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
         if not _craft_flags(cap):
             continue                            # already passes: never touched
         attempted += 1
+        day_index += 1
+
+        # THE ASK-RATE GATE. Append a booking CTA only while the book is still
+        # short of its booking-ask floor. Once the floor is met, this day's
+        # repair carries no ask and `allow_no_ask` lets it pass the craft bar.
+        # Before this gate every flagged day got the CTA, which is how one line
+        # ended up on 90 of 93 rows.
+        day_cta = booking_cta
+        allow_no_ask = False
+        if variety:
+            if deficit > 0 and cta_pool:
+                # Pool order is the gym's own stated preference (its bible's CTA
+                # rotation, in the order it wrote it). No index rotation is
+                # applied on top: pick_non_colliding already guarantees the
+                # window has no repeat, and a rotation offset was measured to
+                # change nothing on top of that. Unasserted no-op code is worse
+                # than no code.
+                try:
+                    day_cta = caption_variety.pick_non_colliding(
+                        cta_pool, _recent_closings(d))
+                except caption_variety.NoOptionAvailable:
+                    # Every approved CTA already closes a post inside the
+                    # window. Leaving this post ask-less is the honest outcome;
+                    # repeating one is what Dean complained about.
+                    day_cta = None
+                    allow_no_ask = True
+            else:
+                day_cta = None
+                allow_no_ask = True
 
         # --- candidate 1: the free, deterministic, zero-fabrication repair ---
-        repaired = _mechanical_repair(cap, booking_cta)
+        repaired = _mechanical_repair(cap, day_cta)
         candidates = []
         if repaired and repaired != cap:
             candidates.append((repaired, None,
                                _ask_count(cap) == 0 and _ask_count(repaired) == 1))
         winner = next(((c, cat, cta_used) for c, cat, cta_used in candidates
-                       if c and c not in avoid and _clears_craft(c)), None)
+                       if c and c not in avoid
+                       and _clears_craft(c, allow_no_ask=allow_no_ask)), None)
 
         # --- candidate 2: the LLM regen, only when mechanics could not help ---
         if winner is None and llm_ok and _budget_left(deadline):
@@ -634,15 +785,15 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
                 regen_cap, new_cat = out
                 regen_cap = (regen_cap or "").strip()
                 carried_cta = False
-                if (deficit > 0 and booking_cta
+                if (deficit > 0 and day_cta
                         and not _BOOKING_RE.search(regen_cap)
                         and _ask_count(regen_cap) == 0):
                     # The already-flagged day is the honest place to carry the
                     # gym's real booking CTA: it becomes the caption's single ask.
-                    regen_cap = f"{regen_cap}\n{booking_cta}".strip()
+                    regen_cap = f"{regen_cap}\n{day_cta}".strip()
                     carried_cta = True
                 if (regen_cap and regen_cap not in avoid
-                        and _clears_craft(regen_cap)):
+                        and _clears_craft(regen_cap, allow_no_ask=allow_no_ask)):
                     winner = (regen_cap, new_cat, carried_cta)
 
         if winner is None:
@@ -654,8 +805,20 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
         if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
             fixed += 1
             avoid.add(new_cap)
+            if variety:
+                # This day's closing line is now spoken for, so no post inside
+                # the window after it may reuse it. THE mechanical
+                # anti-repetition guarantee, and the thing nothing in the
+                # codebase did before: no code looked at a caption's tail.
+                sig = caption_variety.closing_signature(new_cap)
+                if sig:
+                    closing_by_date[d] = sig
             if _BOOKING_RE.search(new_cap):
-                deficit = max(0, deficit - len(grp))
+                # Unflagged: rows, as _booking_deficit has always counted them.
+                # Under variety: POSTS, which is what calendar_grade._path
+                # actually scores (it groups same-date rows into one post), so
+                # the ask floor is reached at the same point the grader wants it.
+                deficit = max(0, deficit - (1 if variety else len(grp)))
                 if carried_cta:
                     booking_added += 1
     return fixed, attempted, booking_added
@@ -742,11 +905,27 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
     patcher = getattr(store, "patch_pending_plan", None)
     if patcher is None:
         return False
+
+    # RE-STAMP THE LEARNING LEVERS against the caption we are actually writing.
+    # They were stamped at stage time against the pre-repair text and nothing
+    # ever corrected them: measured on Reverb's live book, ask_type='none' on
+    # 93 of 93 rows while 90 ended in an ask, and caption_len_band='mid' on
+    # 100%. metrics_sync copies these onto post_metrics and monthly_retro
+    # compares on them, so a stale lever is a lie the learner trains on.
+    levers = _restamp_levers(new_cap)
+
     patched_any = False
     for r in date_rows:
         if not _is_wipeable(r):
             continue                            # never touched, by policy
         try:
+            kwargs = {"caption": new_cap, "pillar": (new_cat or None)}
+            if levers:
+                kwargs["levers"] = levers
+            updated = patcher(gym_id, r.get("id"), **kwargs)
+        except TypeError:
+            # A store predating the levers kwarg (older fakes, other callers).
+            # The caption fix must never be lost over a metadata refresh.
             updated = patcher(gym_id, r.get("id"),
                               caption=new_cap, pillar=(new_cat or None))
         except Exception as exc:  # noqa: BLE001
@@ -757,8 +936,23 @@ def _patch_date_rows(gym_id, date_rows, store, new_cap, new_cat, log) -> bool:
             r["caption"] = new_cap
             if new_cat:
                 r["pillar"] = new_cat
+            r.update(levers)
             patched_any = True
     return patched_any
+
+
+def _restamp_levers(caption) -> dict:
+    """The learning levers this caption actually earns, or {} when the flag is
+    off. Classification only: it reads the caption and writes no copy."""
+    if not config.cta_variety_enabled():
+        return {}
+    try:
+        from agent import lever_stamp
+        return {"hook_family": lever_stamp.hook_family(caption),
+                "ask_type": lever_stamp.ask_type(caption),
+                "caption_len_band": lever_stamp.caption_len_band(caption)}
+    except Exception:  # noqa: BLE001 - a metadata refresh never blocks a fix
+        return {}
 
 
 # ---------------------------------------------------------------------------
