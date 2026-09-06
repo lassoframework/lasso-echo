@@ -56,7 +56,11 @@ def test_a_bare_gbp_account_still_reports_connected_even_with_no_handle():
 def test_map_status_surfaces_the_gbp_listing_name_as_the_handle():
     out = z.map_status({"accounts": [_gbp(metadata={"locationName": "Zanshin Fitness"})]})
     assert out["platforms"]["googlebusiness"] == {
-        "connected": True, "handle": "Zanshin Fitness", "expired": False}
+        "connected": True, "handle": "Zanshin Fitness", "expired": False,
+        # P-10 / C15: ALWAYS None for Google Business. Its tokenExpiresAt is the rolling
+        # one hour access token, not a grant deadline, so surfacing it would show every
+        # Google connected gym "expires within the hour" all day long.
+        "expires_at": None}
 
 
 def test_instagram_and_facebook_handles_are_unchanged():
