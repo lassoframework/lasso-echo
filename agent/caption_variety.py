@@ -355,3 +355,33 @@ def rotate(pool, index):
     if not items:
         return None
     return items[int(index) % len(items)]
+
+
+def honest_ask_ceiling(n_posts, pool_size, window: int = DEFAULT_WINDOW) -> int:
+    """The MOST asks a book of `n_posts` can honestly carry, given the gym has
+    `pool_size` approved CTAs and no two posts inside `window` may share a
+    closing.
+
+    Blake, 2026-09-06: *"No fake/generic/repeated CTA just to hit a target."*
+    The anti-repetition rail already refuses to repeat a closing inside the
+    window, so a gym with one approved CTA physically cannot ask more than once
+    per window. Asking it for a third of its book is asking it to repeat, which
+    is the thing the ruling forbids and the thing Dean complained about.
+
+    The rule is "no two posts INSIDE `window` of each other share a closing", so
+    one CTA may reappear only once every `window + 1` posts, not once every
+    `window`. The ceiling is therefore `p * ceil(n / (window + 1))`, never more
+    than the book itself. The off-by-one is not cosmetic and was found by
+    measuring rather than reasoning: with one CTA on a 31 post book at window
+    10, `_fix_craft` places 3 (posts 1, 12, 23), not 4.
+
+    This is a property of the gym's APPROVED CONTENT, not of the code, and it
+    moves the moment a human adds a CTA to that gym's bible.
+    """
+    n = int(n_posts or 0)
+    p = int(pool_size or 0)
+    if n <= 0 or p <= 0:
+        return 0
+    w = int(window) if int(window or 0) > 0 else DEFAULT_WINDOW
+    slots = -(-n // (w + 1))             # ceil(n / (w + 1)), integer only
+    return min(n, p * slots)

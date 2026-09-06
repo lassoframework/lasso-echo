@@ -442,11 +442,20 @@ def formula_run_exceeded(caption, recent_formulas, max_run=FORMULA_MAX_RUN):
 
 
 def _output_claims_cleared(body, voice, client_note):
-    """True when every figure in `body` appears verbatim in an approved input (the
-    client note or the voice doc). No approved figure -> clean. This blocks an LLM
-    from smuggling an invented stat/price/count into a caption; a rephrased but real
-    number (its digits are in the sources) still passes."""
-    sources = f"{client_note}\n{getattr(voice, 'raw', '') or ''}"
+    """True when every figure in `body` appears verbatim in an APPROVED input (the
+    client note or a human-owned voice doc). No approved figure -> clean. This blocks
+    an LLM from smuggling an invented stat/price/count into a caption; a rephrased but
+    real number (its digits are in the sources) still passes.
+
+    An AUTO-DRAFTED bible is NOT an approved input (finding 2026-09-06). A bible a
+    machine wrote off a gym's public website carries voice.auto_drafted=True, and its
+    text is excluded from `sources` here: a scraped figure ("847 members since 2015")
+    that no human ever approved must not be able to clear the very gate that exists to
+    stop unapproved figures. Human-written bibles are unaffected."""
+    voice_raw = getattr(voice, "raw", "") or ""
+    if getattr(voice, "auto_drafted", False):
+        voice_raw = ""  # scraped, unapproved: it clears nothing
+    sources = f"{client_note}\n{voice_raw}"
     for tok in _FIGURE_RE.findall(body or ""):
         norm = tok.strip(".,")
         if norm and norm not in sources:
@@ -700,6 +709,68 @@ class StoryBrandGenerator:
                 parts.append(f"  AFTER (preferred): {after}")
         return "\n".join(parts) + "\n\n"
 
+    @staticmethod
+    def _cross_gym_form_block(account):
+        """FLEET FORM HINTS from the WEEKLY cross gym brain (Blake, 2026-09-06:
+        "see trends on what is working and use that ... to create the best post").
+
+        This is the read side of agent/jobs/cross_gym_brain.py, which pools every
+        gym's matured post_metrics once a week and asks which FORM choices — hook
+        shape, caption length band, sentence structure band, ask presence and
+        type, pillar, slot, format, media product type, member face — actually
+        correlate with engagement across the fleet, and separately what the top
+        decile of posts share. Only a finding that cleared the sample floor on
+        both sides, drew on at least two DISTINCT gyms on both sides, survived a
+        Benjamini Hochberg FDR correction and cleared the effect floor is here.
+
+        WHY THIS CANNOT LEAK ONE GYM'S CONTENT INTO ANOTHER'S CAPTION, structurally:
+          * NO STRING THAT CAME OUT OF A DATABASE REACHES THIS BLOCK AT ALL. Every
+            line is rendered by cross_gym_guidance.prompt_lines() from that
+            module's OWN fixed phrase table plus two integers: the stored lever
+            and value SELECT a constant phrase and are never themselves printed.
+            So a caption fragment, a stat, an offer, a price, a member name or a
+            handle cannot appear here even if one somehow survived the writer's
+            whitelist and _clean()'s re-validation on the read. There is no
+            branch here that reads post text.
+          * the guidance is IDENTICAL for every gym (fleet statistics), which is
+            the isolation guarantee made structural rather than promised.
+          * it is FORM ONLY. It is placed BELOW the brand voice doc and BELOW the
+            approved source in the prompt, and it is labeled as shape guidance
+            that is never a fact and never an override, exactly like the existing
+            _form_block and _angle_block. The figure gate, the fabrication gate
+            and the human approval gate are all untouched.
+
+        Returns "" when AGENT_BRAIN_FEEDS_CAPTIONS is OFF (the default), when
+        AGENT_CROSS_GYM_BRAIN is OFF, when there is no account, when the newest
+        rollup is stale, or when nothing cleared the significance bar — so with
+        the flag off the prompt is byte-for-byte today's prompt, and with it on
+        but nothing learned yet, still byte-for-byte today's prompt."""
+        if account is None:
+            return ""
+        from . import config as _cfg
+        if not _cfg.brain_feeds_captions_enabled():
+            return ""
+        key = getattr(account, "key", "") or ""
+        if not key:
+            return ""
+        try:
+            from . import cross_gym_guidance
+            lines = cross_gym_guidance.prompt_lines(key)
+        except Exception as exc:  # noqa: BLE001 — never block a caption over a hint
+            print(f"[sb7] cross gym form hints unavailable "
+                  f"({type(exc).__name__}: {exc})")
+            return ""
+        if not lines:
+            return ""
+        parts = ["FLEET FORM SIGNALS (shape guidance ONLY, from statistics across "
+                 "every gym Echo posts for. These carry NO facts, NO offers, NO "
+                 "numbers to state and NO copy from anyone else's posts. They never "
+                 "override the brand voice doc or the approved source above, and "
+                 "you must not treat any of them as something to say):"]
+        for line in lines:
+            parts.append(f"- {line}")
+        return "\n".join(parts) + "\n\n"
+
     def build(self, voice, creative, account=None, avoid_openings=(),
               angle="", avoid_angles=(), form_plan=None):
         """Write one SB7 caption.
@@ -728,7 +799,14 @@ class StoryBrandGenerator:
         CAPTION_ANGLES), or the special 'educational' post type; avoid_angles are the
         recent angles to steer away from. Both are STYLE-only: they never carry a fact
         and never override the approved source (the figure/fabrication gate still runs).
-        Empty (the default, flag OFF) => no angle guidance, exactly today's prompt."""
+        Empty (the default, flag OFF) => no angle guidance, exactly today's prompt.
+
+        FLEET FORM HINTS (Blake, 2026-09-06, AGENT_BRAIN_FEEDS_CAPTIONS): the weekly
+        cross gym brain's FORM guidance is appended LAST, below everything else, by
+        _cross_gym_form_block. It is rendered only from whitelisted lever tokens and
+        integers, so it can carry no fact, no offer and no other gym's copy; it is
+        FORM guidance and nothing else. Flag OFF (the default) => "" => the prompt is
+        byte-for-byte today's."""
         client_note = (creative.client_note or "").strip()
         cta = _pick_cta(voice, creative)
         hashtags = _select_hashtags(voice, creative)
@@ -740,6 +818,11 @@ class StoryBrandGenerator:
         avoid_block = self._avoid_openings_block(avoid_openings)
         angle_block = self._angle_block(angle, avoid_angles)
         form_block = self._form_block(form_plan)
+        # THE FLEET half of "use that + the gyms brain". Deliberately assembled
+        # LAST and emitted LAST of the hint blocks, so it sits below the brand
+        # voice doc, below the approved source, and below this gym's OWN learned
+        # preferences. FORM only; see _cross_gym_form_block.
+        cross_gym_block = self._cross_gym_form_block(account)
         avoid_list = [p for p in (avoid_openings or ()) if (p or "").strip()]
 
         def _compose(extra_nudge=""):
@@ -750,6 +833,7 @@ class StoryBrandGenerator:
                 f"{angle_block}"
                 f"{form_block}"
                 f"{avoid_block}"
+                f"{cross_gym_block}"
                 f"{extra_nudge}"
                 "Write a StoryBrand-structured caption body. Problem-first. "
                 "Gym as guide, not hero. "
