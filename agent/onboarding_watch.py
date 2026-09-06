@@ -41,6 +41,7 @@ import os
 from datetime import date
 
 from . import config
+from . import zernio as _z
 
 # Order matters: the FIRST unmet requirement is the one the alert leads with, because
 # fixing it is what unblocks the next check.
@@ -51,13 +52,17 @@ REASON_NO_VOICE = "no_voice"
 REASON_NO_PROFILE = "no_profile"
 REASON_NOT_CONNECTED = "not_connected"
 REASON_NO_FB_PAGE = "no_fb_page"
+#: Some publishable platforms are connected and some are NOT. Carries the missing
+#: ones by name (e.g. "missing_platform:instagram"), because "not set up to post"
+#: with no platform named is a support ticket, not an answer.
+REASON_MISSING_PLATFORM = "missing_platform"
 
 # The full set, in check order. Anything summarising this watch (the onboarding-audit
 # screen) should iterate THIS rather than its own hand-listed tuple, so a new reason
 # code can never be invisible in the summary the way no_voice was invisible for months.
 REASONS = (REASON_NOT_REGISTERED, REASON_KEY_MISMATCH, REASON_NO_SOURCES,
            REASON_NO_VOICE, REASON_NO_PROFILE, REASON_NOT_CONNECTED,
-           REASON_NO_FB_PAGE)
+           REASON_NO_FB_PAGE, REASON_MISSING_PLATFORM)
 
 _FIX = {
     REASON_NOT_REGISTERED:
@@ -87,6 +92,11 @@ _FIX = {
         "Facebook is connected but no PAGE is selected, so every Facebook publish "
         "raises 'no Facebook page selected'. Stamp zernio_default_fb_page_id from the "
         "account's metadata.selectedPageId.",
+    REASON_MISSING_PLATFORM:
+        "some publishable platforms are connected and some are not, so this gym posts "
+        "on a subset of the lanes it is paying for. The reason names the missing ones. "
+        "Send the gym its connect link (python -m agent intake-link --account <key>) "
+        "and have the owner finish the platform named.",
 }
 
 
@@ -106,7 +116,14 @@ def _fix_for(reason, base_key):
     operator copies a runnable command out of the alert instead of retyping it under
     the wrong key. Only the <base> placeholder is filled: the older fixes say <key>
     (an ACCOUNT key, not always the base) and are left exactly as written."""
-    return _FIX[reason].replace("<base>", base_key)
+    # A reason may carry a payload after a colon ("missing_platform:instagram"), which
+    # is the part that makes the alert actionable. The FIX text is keyed on the bare
+    # reason, and an unknown reason must not raise out of an alert path.
+    bare = str(reason).split(":", 1)[0]
+    text = _FIX.get(bare)
+    if text is None:
+        return ""
+    return text.replace("<base>", base_key)
 
 
 def bible_is_hollow(raw):
@@ -246,10 +263,23 @@ def check_gym(base_key, gym_id="", intake_key="", *, bases=None, deps=None):
         issues.append(REASON_NO_PROFILE)
         return issues
     platforms = d["platforms"](profile_id)
-    if not platforms:
+    # PUBLISHABLE platforms only. _platforms returns EVERY platform string Zernio holds,
+    # including 'openaiads', which nothing in Echo can publish to. District H's Zernio
+    # profile carries an openaiads account and NOTHING else, so the truthiness check
+    # below used to pass and District H read completely healthy while having zero lanes
+    # it could actually post on. A platform Echo cannot publish to is not a connection.
+    publishable = {p for p in (platforms or set()) if p in _z.PLATFORMS}
+    if not publishable:
         issues.append(REASON_NOT_CONNECTED)
         return issues
-    if "facebook" in platforms and not d["fb_page"](base_key):
+    # NAME THE MISSING LANE. A gym connected on some publishable platforms but not all
+    # used to report NOTHING at all: MFLH has Facebook and no Instagram and read healthy
+    # while the main lane was dark. "not set up to post" with no platform named is a
+    # support ticket; this says which one, so the fix is one message to the owner.
+    missing = [p for p in _z.PLATFORMS if p not in publishable]
+    if missing:
+        issues.append(f"{REASON_MISSING_PLATFORM}:{','.join(missing)}")
+    if "facebook" in publishable and not d["fb_page"](base_key):
         issues.append(REASON_NO_FB_PAGE)
     return issues
 
