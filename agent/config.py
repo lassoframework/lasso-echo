@@ -3822,6 +3822,31 @@ def stale_hold_hours() -> float:
         return 4.0
 
 
+def day_shape_block_alarm_enabled() -> bool:
+    """
+    The DAY SHAPE BLOCK ALARM (AGENT_DAY_SHAPE_BLOCK_ALARM, default ON).
+
+    Purely additive to the existing day_shape.py alert: adds the gym's
+    remaining runway to the message, and posts ONE extra SOCIAL escalation
+    the day a gym's consecutive-blocked streak first reaches
+    day_shape_escalate_days(). Cannot block or change a write -- same
+    "can only add a signal" doctrine as the other alarms shipped 2026-09-06.
+
+    Escape hatch: AGENT_DAY_SHAPE_BLOCK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DAY_SHAPE_BLOCK_ALARM", "true"))
+
+
+def day_shape_escalate_days() -> int:
+    """DAY_SHAPE_ESCALATE_DAYS (default 3): consecutive day-shape-blocked days
+    for one gym that trigger the SOCIAL content-review escalation. See
+    agent.jobs.day_shape_block_alarm."""
+    try:
+        return int(os.environ.get("DAY_SHAPE_ESCALATE_DAYS", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
 def cta_self_question_gate_enabled() -> bool:
     """
     The CTA SELF-QUESTION guard (ECHO_CTA_SELF_QUESTION_GATE, default ON).

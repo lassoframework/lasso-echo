@@ -50,6 +50,7 @@ import re
 
 from . import client_content, config, day_shape
 from . import cta_self_question_gate
+from .jobs import day_shape_block_alarm
 from . import real_calendar_mirror as _mirror
 
 # Media extensions that count as a client having uploaded usable creative.
@@ -1424,6 +1425,23 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     f"twice on one account. First: {exc.violations[0].message()}")
             except Exception:  # noqa: BLE001 - the alert never sinks the report
                 pass
+            # DAY SHAPE BLOCK ALARM (queue item 4, 2026-09-06): name the gym's
+            # remaining runway, track consecutive blocked days, escalate to
+            # SOCIAL the day the streak first reaches threshold. The existing
+            # ops_alerts.alert above already re-fires daily on its own (this
+            # except branch runs every time the plan pass hits the same
+            # violation); this block only adds the runway context and the
+            # one extra escalation. Never lets a fetch failure block the
+            # day-shape refusal itself.
+            try:
+                existing_rows = []
+                for m in months:
+                    existing_rows.extend(store.list_month(base_key, m) or [])
+                day_shape_block_alarm.record_and_maybe_escalate(
+                    base_key, exc.violations, existing_rows)
+            except Exception as e:  # noqa: BLE001 - alarm failure never sinks the refusal
+                log(f"day-shape block alarm failed for {base_key}: "
+                    f"{type(e).__name__}: {e}")
             return {"ok": False,
                     "reason": "day shape: same post twice in one day",
                     "day_shape_violations": [v.message() for v in exc.violations],
