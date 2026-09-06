@@ -3655,6 +3655,66 @@ def day_shape_assert_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_DAY_SHAPE_ASSERT", "true"))
 
 
+def deny_streak_alarm_enabled() -> bool:
+    """
+    The DENY STREAK ALARM (AGENT_DENY_STREAK_ALARM, default ON).
+
+    Three (deny_streak_threshold()) consecutive coach denials on one
+    (gym_id, account), uninterrupted by an approval, posts ONE ops alert per
+    streak-ending date. Blake, 2026-09-06: "Tough Temple told us with the deny
+    button for a week and nobody read it." This is the detection this repo
+    never had -- purely informational, cannot block a write or change a post,
+    so it may default ON under the same "can only add a signal" doctrine as
+    day-shape and the CTA gate.
+
+    Escape hatch: AGENT_DENY_STREAK_ALARM=false.
+    """
+    return _truthy(os.environ.get("AGENT_DENY_STREAK_ALARM", "true"))
+
+
+def deny_streak_threshold() -> int:
+    """DENY_STREAK_THRESHOLD (default 3): consecutive denials on one account
+    that count as a content alarm. See agent.jobs.deny_streak_alarm."""
+    try:
+        return int(os.environ.get("DENY_STREAK_THRESHOLD", "3"))
+    except (TypeError, ValueError):
+        return 3
+
+
+def stale_escalation_reminder_enabled() -> bool:
+    """
+    The STALE ESCALATION REMINDER (AGENT_STALE_ESCALATION_REMINDER, default ON).
+
+    A ticket sitting in status='hold', escalated=True, unresolved past
+    stale_hold_hours() gets ONE re-fire reminder posted to #fixer per calendar
+    day it remains unresolved, naming its age. Checked against production
+    2026-09-06: the escalation path itself was never broken (Dean's ticket
+    posted to #fixer and acked within 5 seconds) -- what read as "parked" was
+    silence AFTER that single post, while the ticket sat unresolved for hours.
+    Same doctrine as day-shape and the ledger-key claim: a guard that can only
+    ADD a reminder, never silence one, may default ON.
+
+    Escape hatch, restoring today's silent-after-one-post behavior exactly:
+    AGENT_STALE_ESCALATION_REMINDER=false.
+    """
+    return _truthy(os.environ.get("AGENT_STALE_ESCALATION_REMINDER", "true"))
+
+
+def stale_hold_hours() -> float:
+    """
+    STALE_HOLD_HOURS (default 4.0): how long a ticket may sit in
+    status='hold', escalated=True before agent.jobs.stale_escalation_reminder
+    considers it stale and re-fires. Long enough that a human triaging #fixer
+    is not nagged every poll cycle for a ticket they are actively working; not
+    so long that a client's content complaint waits a full day for anyone to
+    notice it never got a second look.
+    """
+    try:
+        return float(os.environ.get("STALE_HOLD_HOURS", "4.0"))
+    except (TypeError, ValueError):
+        return 4.0
+
+
 def cta_self_question_gate_enabled() -> bool:
     """
     The CTA SELF-QUESTION guard (ECHO_CTA_SELF_QUESTION_GATE, default ON).
