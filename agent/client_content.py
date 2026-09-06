@@ -73,6 +73,21 @@ def _source_for_day(account_key, day_key, category, present):
     return items[cycle % len(items)]
 
 
+def _form_plan_for_day(day_key):
+    """This day's caption SHAPE (AGENT_CAPTION_FORM_PLAN, default OFF -> None).
+
+    Keyed on the day ordinal, the same rotation index category_for_day and
+    _source_for_day already use, so the shape advances with the book and a
+    replan is deterministic. STYLE ONLY: carries no fact and never overrides
+    the approved source. Dean Holcomb / CrossFit Reverb, 2026-09-05: every post
+    was being asked for the same shape, so every post came back the same shape.
+    """
+    if not config.caption_form_plan_enabled():
+        return None
+    from . import caption_variety
+    return caption_variety.form_plan(_day_ordinal(day_key))
+
+
 def _image_key(creative):
     return os.path.basename(creative.path)
 
@@ -294,7 +309,8 @@ def _grounded_hint(base_hint, verified):
 
 
 def make_caption(account, source, voice, creative_key, creative=None,
-                 avoid_openings=(), verified=None, angle="", avoid_angles=()):
+                 avoid_openings=(), verified=None, angle="", avoid_angles=(),
+                 form_plan=None):
     """The day's caption + hashtags. When AGENT_SB7_ENABLED, write a real StoryBrand
     caption via the SB7 generator (problem-first, gym-as-guide, grounded ONLY in the
     gym's voice doc + this source, fabrication-gated on figures) instead of dumping the
@@ -332,7 +348,11 @@ def make_caption(account, source, voice, creative_key, creative=None,
             cap, tags, _frags = StoryBrandGenerator().build(
                 voice, _SourceCreative(source, creative_key, photo_hint=hint),
                 account=account, avoid_openings=avoid_openings,
-                angle=angle, avoid_angles=avoid_angles)
+                angle=angle, avoid_angles=avoid_angles,
+                # Passed ONLY when a plan exists. With AGENT_CAPTION_FORM_PLAN
+                # off this call is byte-for-byte the one it has always been,
+                # which also keeps every existing build() stub working.
+                **({"form_plan": form_plan} if form_plan else {}))
             cap = (cap or "").strip()
             if cap and cap.lower() != (getattr(source, "text", "") or "").strip().lower():
                 return filter_platform_copy(cap).strip(), tags
@@ -557,7 +577,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
         caption, hashtags = make_caption(account, source, voice,
                                          _image_key(image), creative=image,
                                          avoid_openings=avoid_openings, verified=verified,
-                                         angle=angle, avoid_angles=avoid_angles)
+                                         angle=angle, avoid_angles=avoid_angles,
+                                         form_plan=_form_plan_for_day(day_key))
         public_url = getattr(image, "public_url", "")
         if config.hosting_enabled():
             hosted = media_host.host_media(image.path, account.key)
@@ -608,7 +629,8 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
                                      avoid_openings=avoid_openings,
-                                     angle=angle, avoid_angles=avoid_angles)
+                                     angle=angle, avoid_angles=avoid_angles,
+                                     form_plan=_form_plan_for_day(day_key))
     # Option A: a source-backed template card, when a generator is wired + armed.
     template_url = template_fn(account, source, day_key) if template_fn else None
     if template_url:
