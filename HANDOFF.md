@@ -274,13 +274,26 @@ fleet after LASSO's clean 24 hours. Dean's message is Blake's to send, mine to d
      all.** The original "6/16" estimate treated a newly onboarded gym as if it should
      already have 16 days of history.
 
-   **Real, corrected finding: only Pierce Fitness is actually under-delivering (72%, not
-   the ~25% originally claimed) — moderate, not the "silent under-delivery on both gyms"
-   framing this file previously carried.** Suspected cause still unconfirmed (media
-   library depth vs. a logic gap) — next session should check Pierce's library depth
-   before assuming either. Add fill rate to the metrics contract and the portal report,
-   with the "since onboarding" floor baked in so a newly onboarded gym is never counted
-   against a window that predates it.
+   **MEASURED per Blake's instruction, not guessed — and the finding reverses again:
+   Pierce is NOT under-delivering either.** All 7 "missing" days in the 25-day window
+   are the first 7 days of it (08-13 through 08-19), and Pierce's earliest
+   `content_calendar` row is **exactly 2026-08-20** — the same unfair-window shape as
+   Chateau, just less obvious because it was a partial edge, not near-total absence.
+   Since actual onboarding (08-20 through today, 18 calendar days): **18/18 — 100%.**
+
+   Media library checked as instructed, ruled out as a cause (not because it's fine, but
+   because there was never a live shortage to explain): 184 `media_asset` rows, 161
+   currently eligible + not-excluded-by-coach + off cooldown + not used this month.
+   Zero on the 90-day reuse cooldown, zero already used this month. The pool was never
+   the bottleneck — there was no under-delivery to explain in the first place.
+
+   **Corrected finding, final: ENG, Pierce, and LASSO are all 100% since onboarding.
+   Chateau is 100% since onboarding. There is no fill-rate defect among the
+   `posts_per_day=2` gyms once measured against each gym's own onboarding date instead of
+   a fixed calendar window.** The original "ENG 24/24, Pierce 6/24, Chateau 6/16" figures
+   were an artifact of the same measurement mistake twice, not two different real
+   findings. Add fill rate to the metrics contract with the "since onboarding" floor
+   built in from the start, so this mistake can't repeat.
 6. **Tough Temple to SOCIAL — DONE.** Verified against production: instagram carries 14
    consecutive denied rows, 2026-09-09 through 09-15, zero approvals between (the "twelve"
    estimate was close but short, same pattern as every other approximate count corrected
