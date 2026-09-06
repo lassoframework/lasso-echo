@@ -1974,3 +1974,89 @@ starts. This is Blake's to rule on; it is not something to quietly patch from he
 | 6 | 0 | 2 | 1 |
 | 7 | 0 | 3 | 2 |
 | 8 | 0 | 4 | 2 |
+
+---
+
+## D67 (2026-09-05) -- STOPPING THE LOOP: the auto-answer gate is the wrong shape, and that is Blake's call
+
+Nine independent audits. Twelve CRITICALs. The suite was green for every one of them.
+
+**Round 9 found the same CRITICAL as round 8, after the rewrite meant to fix exactly it.**
+Round 8: Blake's named hard lines -- billing, gym hours, class-schedule changes, injuries,
+liability -- did not hold; 8 of 10 injury messages auto-sent because they also named a post.
+The fix made the gate structural (single self-contained question, no third party, no
+advice-seeking shape, word cap). Round 9 then measured, end to end through the real
+`handle_event` and the real `outbox.run_once`: **15 of 16 must-hold messages still posted to a
+client with no tap.** *"we open at 5 now, does the calendar know?"* -- a gym-hours commitment.
+*"can you cancel the story scheduled for tonight?"* -- an action request. *"did you guys take
+money out twice this month?"* -- billing.
+
+Four attempts now, each closing its measured cases and opening new ones:
+
+| Attempt | Gate | Closed | Opened |
+|---------|------|--------|--------|
+| D54 | topic denylist | the listed words | everything phrased differently |
+| D63 | + allowlist of observable nouns | most off-topic | any message that ALSO names a post |
+| D65 | + publish-request shapes | request forms | polite question forms (55% FP) |
+| D66 | + message shape (third party, advice, length) | mixed-subject examples | hours/schedule/action questions that are short, single-subject and personless |
+
+**The pattern is not that the regex needs one more pass. It is that the question is the wrong
+thing to classify.** A free-text sentence from a gym owner does not carry a reliable signal for
+"is it safe to answer this unattended", and every rule that tries to extract one is an
+enumeration -- of topics, of verbs, of shapes -- which is the failure mode this system has now
+lost to five separate times (D61 verdict strings, D62 exit codes, D63 publish verbs, D65 polite
+forms, D66 topics-again).
+
+**What would actually work, and why I am not building it tonight.** Gate on what the ANSWER is
+DERIVED FROM, not on what the question is about: auto-send only when the reply is a restatement
+of a small enumerated set of fact keys from the grounding snapshot (`social_status.connected`,
+`calendar_this_month` counts) and contains no sentence that is not traceable to one of them.
+That is checkable mechanically, it fails closed on anything novel, and it does not care how the
+question was phrased. It is also a redesign of the capability, not a patch -- it changes what
+auto-answer IS -- and after nine rounds of me deciding the next fix on my own judgment, this
+one is Blake's to make.
+
+**So the flag is locked, not left as a landmine.** `SLACK_CONVO_<IDENTITY>_AUTO_ANSWER` set on
+its own now REFUSES, logs the open finding by name, and points here.
+`SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true` is the single deliberate act that says "I
+have read D67 and I want it anyway". The point is that nobody discovers months from now that a
+flag they set once quietly meant something they never reviewed -- which is D56's lesson pointed
+the other way.
+
+### Everything that is NOT blocked by this
+
+The rest of the wave is audited clean and independent of auto-answer, and it is the part that
+actually answers Blake's original complaint:
+
+* the classifier is wired to a model in production for the first time (D51/RTF-2), behind a
+  flag that refuses to boot if it is on with nothing behind it;
+* the false-promise template is gone and cannot come back (D52), and no client-facing constant
+  may promise future human action -- asserted by reflection over every one of them;
+* cards name the person and the gym in words, with the specific unresolved-identity reason
+  (D53); receipts show what the client was actually told, written only after delivery (D55);
+* the eight arming probes are purged from #fixer and marked `is_test` so they never resurface;
+* cross-product routing, verified clean by four consecutive auditors, moves knowledge and voice
+  only -- never a ticket, a channel, a gym or a delivery.
+
+### The count
+
+| Round | CRITICAL | MAJOR | From the previous round's fixes |
+|-------|----------|-------|----------------------------------|
+| 1 | 3 | 1 | -- |
+| 2 | 2 | 5 | 1 |
+| 3 | 2 | 5 | 3 |
+| 4 | 1 | 4 | 3 |
+| 5 | 2 | 4 | 5 |
+| 6 | 0 | 2 | 1 |
+| 7 | 0 | 3 | 2 |
+| 8 | 0 | 4 | 2 |
+| 9 | 1 | 3 | 2 |
+
+Round 9 also proved, by reverting each change alone against the full suite, that **five of the
+previous wave's fixes are asserted by no test at all** -- including two that the wave's own
+decision record cited as closed. Those tests were mine, and they were shaped like the code
+instead of like the rule, which is the third lesson in D65 arriving for the third time.
+
+**The honest summary: the severity curve broke (CRITICALs 3,2,2,1,2,0,0,0,1) but the loop did
+not converge, and the one CRITICAL that came back is the safety promise the whole capability
+rests on. Nothing is armed. The gate needs a redesign, and the decision is Blake's.**

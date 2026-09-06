@@ -531,6 +531,7 @@ def test_hard_line_is_re_checked_at_post_time_not_only_at_draft_time(monkeypatch
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",
@@ -599,6 +600,7 @@ def test_an_auto_answer_posts_a_receipt_naming_what_was_sent(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",
@@ -624,6 +626,7 @@ def test_a_receipt_is_never_written_before_the_post_succeeds(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",
@@ -696,6 +699,7 @@ def test_a_receipt_never_uses_a_kind_the_portal_would_show(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",
@@ -995,6 +999,7 @@ def test_the_portal_bridge_enforces_the_allowlist_not_just_the_denylist(text, mo
     for var in ("SLACK_CONVO_ENABLED", "SLACK_CONVO_ECHO_ENABLED",
                 "SLACK_CONVO_ECHO_CLIENT_REPLY", "SLACK_CONVO_ECHO_AUTO_ANSWER"):
         monkeypatch.setenv(var, "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
     posted = []
 
@@ -1093,6 +1098,7 @@ def test_post_time_hard_line_re_reads_the_body_not_just_the_marker(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",
@@ -1352,6 +1358,7 @@ def test_the_post_time_gate_runs_the_whole_rule_not_half(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     d = A.handle_event(_ev("is my instagram connected?"), "k",

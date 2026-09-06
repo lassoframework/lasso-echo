@@ -33,6 +33,7 @@ def _armed(monkeypatch):
         monkeypatch.setenv(f"SLACK_CONVO_{ident}_ENABLED", "true")
         monkeypatch.setenv(f"SLACK_CONVO_{ident}_CLIENT_REPLY", "true")
         monkeypatch.setenv(f"SLACK_CONVO_{ident}_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     yield
 

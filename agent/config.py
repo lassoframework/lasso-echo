@@ -1947,7 +1947,37 @@ def slack_convo_auto_answer_armed(identity: str) -> bool:
         return False
     if not slack_convo_client_reply_armed(identity):
         return False
-    return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_AUTO_ANSWER", "false"))
+    if not _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_AUTO_ANSWER", "false")):
+        return False
+    # ARMING LOCK (2026-09-05, after nine independent audits).
+    #
+    # Nine rounds found twelve CRITICALs. Rounds 8 and 9 both found the same one, in
+    # different clothes: Blake's named hard lines -- billing, gym hours, class-schedule
+    # changes, injuries, liability -- DO NOT HOLD. Round 8 measured 8/10 injury messages
+    # auto-sending; round 9, after the structural rewrite meant to fix exactly that, measured
+    # 15 of 16 must-hold messages still posting to a client ("we open at 5 now, does the
+    # calendar know?", "can you cancel the story scheduled for tonight?").
+    #
+    # Four separate attempts to gate this by classifying the QUESTION -- topic denylists,
+    # allowlists, publish-request shapes, message shape -- have each closed the cases they
+    # were measured against and left a new set open. The conclusion this lock encodes is that
+    # the approach is wrong, not that the regex needs one more pass: a safe auto-answer gate
+    # has to be grounded in what the ANSWER is derived from (a small enumerated set of fact
+    # keys, restating them and nothing else), not in guessing a free-text question's subject.
+    # That is a design decision, and it is Blake's, not a thing to keep patching at 3am.
+    #
+    # So the flag alone can no longer arm this. Setting it without the override logs what is
+    # known to be broken and refuses. The override exists so Blake can say "I have read the
+    # finding and I want it on anyway" in one deliberate act, rather than discovering that a
+    # flag he set weeks ago quietly means something he never reviewed.
+    if not _truthy(os.environ.get("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "false")):
+        print(f"[slack-convo/{identity}] AUTO_ANSWER is set but REFUSED: the hard-line gate "
+              f"has a known open CRITICAL (audits 8 and 9 -- billing, hours, schedule "
+              f"changes and injury messages reach a client with no tap). See DECISIONS.md "
+              f"D67. Set SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE=true only if you have "
+              f"read that entry and accept it.")
+        return False
+    return True
 
 
 def slack_convo_cross_product_routing_enabled(identity: str) -> bool:

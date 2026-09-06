@@ -203,6 +203,16 @@ def test_auto_answer_cannot_be_armed_without_its_prerequisites(monkeypatch):
     monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
     assert config.slack_convo_auto_answer_armed("echo") is False
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    # ARMING LOCK (2026-09-05): the flag alone no longer arms this. Audits 8 and 9 both found
+    # Blake's named hard lines (billing, gym hours, class-schedule changes, injuries) reaching
+    # a client with no tap -- round 9 measured 15 of 16 must-hold messages posting, AFTER the
+    # rewrite meant to fix exactly that. Four attempts to gate on the QUESTION's subject have
+    # each closed their measured cases and opened new ones, so the flag refuses until the
+    # gate is redesigned around what the ANSWER is grounded in. The override is the one
+    # deliberate act that says "I have read the finding".
+    assert config.slack_convo_auto_answer_armed("echo") is False, \
+        "the flag alone must not arm a gate with a known open CRITICAL"
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     assert config.slack_convo_auto_answer_armed("echo") is True
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "false")
     assert config.slack_convo_auto_answer_armed("echo") is False

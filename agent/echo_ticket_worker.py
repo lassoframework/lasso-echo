@@ -585,16 +585,33 @@ def _report_stuck_fixing(bus, tickets, *, identity_name, log=print):
         #   (c) `acked` ignored delivery_status, so a HELD ack produced "the client has an
         #       acknowledgement" when the client had nothing.
         # When we cannot tell, the card now says we cannot tell.
-        rows = None
-        try:
-            rows = bus.recent_messages(tid, limit=200)
-        except AttributeError:
+        # Audit 9, MINOR: reading only the NEWEST 200 rows (MINOR-1's own fix) put the
+        # fixer_request -- written at ticket creation, so the OLDEST row -- out of range on a
+        # long ticket, and the card then asserted "No fix request was ever written for it,
+        # which should be impossible on this path". Untrue at the moment it is written. Both
+        # ends are read, because the two rows this card reasons about live at opposite ends
+        # of the ticket: the request at the start, the acknowledgement anywhere after.
+        def _read(fn_name):
+            fn = getattr(bus, fn_name, None)
+            if fn is None:
+                return None
             try:
-                rows = bus.messages(tid, limit=200)
+                return fn(tid, limit=200) or []
             except Exception:  # noqa: BLE001
-                rows = None
-        except Exception:  # noqa: BLE001
+                return None
+
+        newest = _read("recent_messages")
+        oldest = _read("messages")
+        if newest is None and oldest is None:
             rows = None
+        else:
+            seen = set()
+            rows = []
+            for m in list(newest or []) + list(oldest or []):
+                key = m.get("id") or id(m)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(m)
 
         if rows is None:
             cause = ("Its rows could not be read just now, so this card cannot say whether "

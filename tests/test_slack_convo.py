@@ -556,6 +556,7 @@ def test_ticket_resolves_only_when_the_answer_posts(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "Yes, both connected.", "grounding": {"ig": "connected"}}
@@ -739,6 +740,7 @@ def test_reply_never_posts_without_verification_after(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     bus = FakeBus()
     ans = lambda t, w, m, q: {"body": "answer", "grounding": {"x": 1}}
     d = A.handle_event(_ev("are my accounts connected?"), "k",

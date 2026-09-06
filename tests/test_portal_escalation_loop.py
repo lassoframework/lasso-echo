@@ -408,6 +408,7 @@ def test_portal_bridge_never_auto_answers_a_hard_line_even_when_armed(monkeypatc
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     bus = Bus([_ticket(raw_text="Can we add our group sessions schedule to the website?")])
     seen, open_dm, post = _slack_calls()
     cards = _answering_worker(bus, (seen, open_dm, post),
@@ -422,6 +423,7 @@ def test_portal_bridge_does_auto_answer_when_fully_armed_and_writes_a_receipt(mo
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_AUTO_ANSWER", "true")
+    monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     bus = Bus([_ticket()])
     seen, open_dm, post = _slack_calls()
     _answering_worker(bus, (seen, open_dm, post))
