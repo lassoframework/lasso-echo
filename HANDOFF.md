@@ -193,20 +193,46 @@ fleet after LASSO's clean 24 hours. Dean's message is Blake's to send, mine to d
    hypothetical.** Shipped: `scripts/claim-migration.mjs` (push-first claim with automatic
    re-claim on a lost race) and `scripts/check-migration-numbers.mjs` (fails a branch that
    collides), portal PR #589. Verified by deliberate collision, not by observing a pass.
-6. **Alerts must RE-FIRE while a condition persists.** "Alerted once, muted forever" has
-   shipped twice (`stuck_publishing`, the held-grade dedupe). Never ship a third.
+6. **Alerts must RE-FIRE while a condition persists.** "Alerted once, muted forever" is
+   now confirmed **three times today**: `stuck_publishing`, the held-grade dedupe, and
+   (2026-09-06, found by checking Dean's ticket against production rather than trusting
+   the report) `agent/jobs/stale_escalation_reminder.py` — the FIXER classifier and
+   escalation path were never broken (posted to #fixer and acked Dean within 5 seconds),
+   but nothing spoke again after that one post while the ticket sat unresolved for hours.
+   A pattern that recurs three times in one day will recur again — treat any new silent
+   fallback as a candidate instance of this same class before inventing a new diagnosis.
 7. **No track reports "done" without a merged PR and a deployed SHA.** Added 2026-09-06 —
    see re-arm criteria above, section 1. An agent that says shipped while its branch has no
    PR is reporting an intention, not a result. AUDITOR checks PR state and deployed SHA on
    every close, for every track, every time.
-8. **HYROX, competitive CrossFit, and competitive athletics ARE a valid Echo audience/topic —
-   hard rule, reconfirmed 2026-09-06.** This supersedes the org-level LASSO AVATAR RULE text
-   (which is stale and predates this ruling); `avatar_athlete_rail` stays default OFF and
-   should not be re-flipped. Never ban "training", "athletes", or "competitors" as
-   audience/content words in any gate built for LASSO or Echo.
-9. **A test that asserts observed output instead of intended behaviour is worse than no
-   test.** Five found today, all rewritten from spec — including two fixture helpers that
-   defaulted every row to the caption `"hello"`.
+8. **No agent-authored memory may claim to override an org-level or doctrine-level rule.**
+   Added 2026-09-06 after this session's own avatar-rule memory did exactly that, and
+   Blake caught it: "That is the one place in this whole system where a summary can
+   quietly outrank doctrine, and it is exactly the failure shape we have been fighting all
+   day, just moved up a layer." A memory may CLARIFY or NARROW an existing rule; it must
+   quote the rule word for word, cite the instruction that authorized it (and be honest
+   about what was said verbatim versus what the agent inferred), and never describe
+   itself as replacing or superseding the source rule. AUDITOR checks every agent-authored
+   memory against this and flags any claiming override authority. See memory
+   `no-memory-override-authority`.
+9. **The avatar rule, stated properly, so nobody has to infer it again** (Blake,
+   2026-09-06, correcting an earlier over-broad framing that wrongly claimed to override
+   the org rule — see doctrine 8): **PERMITTED**, because they are facts about the
+   client, never a targeting decision: a gym's own brand name including CrossFit
+   affiliate names (CrossFit Reverb, CrossFit Zanshin are that gym's legal names), and
+   real program/class/coach names traceable to a stored source. **BANNED**, because they
+   ARE targeting decisions — the org LASSO AVATAR RULE fully applies: writing TO serious
+   athletes, competitive CrossFit, HYROX, strength athletes, or a "training" audience;
+   any copy whose implied reader is a competitor or someone already performing at a high
+   level; performance framing as the primary hook (PRs, comps, leaderboards, WOD-speak,
+   scaled vs RX, "elite", "compete", "dominate"). **The LASSO avatar itself is unchanged
+   and not overridable by any agent**: busy professionals, beginners, weight loss,
+   lifestyle fitness, post-postpartum, 40+ reclaim, dads/moms. `avatar_athlete_rail`
+   stays default OFF; that flag's scope is audience targeting, not whether a gym's own
+   name may appear in its own captions — do not conflate the two.
+10. **A test that asserts observed output instead of intended behaviour is worse than no
+    test.** Five found today, all rewritten from spec — including two fixture helpers that
+    defaulted every row to the caption `"hello"`.
 
 ---
 
@@ -270,15 +296,21 @@ fleet after LASSO's clean 24 hours. Dean's message is Blake's to send, mine to d
      track/3-content-quality: bans the exact Reverb FAQ line fleet-wide, and bans any
      closing CTA that is a question naming the gym's own name (the FAQ-mined shape).
      Wired at plan time next to day_shape, same fail-closed contract.
-   - **The avatar-word half was NOT built** — Blake, mid-build, emphatic: "you can talk
-     about hyrox and crossfit! make this a hard rule throughout!!!", reconfirming the
-     2026-09-01 ruling in `config.avatar_athlete_rail_enabled` (default OFF). This
-     **overrides the org-level LASSO AVATAR RULE text**, which is stale. Never ban
-     "training", "athletes", "competitors" as audience words. Saved as a standing
-     memory (`avatar-rule-hyrox-crossfit-allowed`) so it survives past this session.
-     A dedicated test in `test_cta_self_question_gate.py`
-     (`test_gate_never_fires_on_hyrox_or_competitive_athlete_copy`) exists so nobody
-     "helpfully" widens the CTA gate into an avatar-word ban later.
+   - **The avatar-word half was NOT built, and the first cut at recording why was
+     itself wrong and corrected.** Blake, mid-build: "you can talk about hyrox and
+     crossfit! make this a hard rule throughout!!!" — this session first saved that as
+     a memory claiming to OVERRIDE the org LASSO AVATAR RULE, which Blake caught and
+     had pulled back (see doctrine 8). Corrected memory
+     (`avatar-rule-hyrox-crossfit-allowed`) now CLARIFIES the org rule instead: a gym's
+     own brand name (including CrossFit affiliate names) is a fact, permitted; writing
+     TO an athlete/competitor audience or leading with performance framing stays banned
+     — see doctrine 9 for the full PERMITTED/BANNED text, which is Blake's own wording.
+     Test in `test_cta_self_question_gate.py`
+     (`test_gate_never_fires_on_a_gyms_own_brand_name_in_ordinary_copy`) was itself
+     corrected to match — it previously used athlete-targeting copy as "permitted"
+     examples, which was wrong under the real rule; now it asserts only that a gym's
+     own name in ordinary copy passes, and says explicitly that it is not a claim about
+     targeting-language copy either way.
 8. **FIXER classifier — CHECKED AGAINST PRODUCTION, NOT WHAT WAS REPORTED.** Dean's
    actual ticket (`4941e162-...`) shows the escalation path was never broken: classifier
    ran, could not ground an answer, escalated correctly, posted to #fixer AND acked Dean
