@@ -87,8 +87,13 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
     root = config.podcast_library_folder_id()
 
-    # 1-2. fresh walk + classify
-    files = drive.walk(root, max_depth=3, use_cache=False)
+    # 1-2. fresh walk + classify. max_depth=5: some episodes nest an extra
+    # subfolder inside Promo (e.g. 125/Promo (Canva, Reels, Audiogram)/Reels/
+    # GMMS-EP125-S1.mp4, or 42/Promo/Clips and Audiogram/Video 1.mp4) putting
+    # clips/audiograms at depth 4 from the library root. max_depth=3 silently
+    # dropped every file below that extra folder on every run (verified against
+    # the live tree 2026-09-07: episodes 125-130 and 42 lost this way).
+    files = drive.walk(root, max_depth=5, use_cache=False)
     rows, skipped = _idx.build_rows(files, now_iso=now_iso, log=log)
 
     existing = {a["id"]: a for a in store.list_assets()}
