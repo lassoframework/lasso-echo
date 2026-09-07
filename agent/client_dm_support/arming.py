@@ -43,15 +43,31 @@ Because the required token is a function of the OTHER flag's live value:
   * the refusal names, in one line, exactly what was about to go live -- the identity,
     the surface, and the conditions that could have auto-replied.
 
-So there is no environment variable in this system whose value alone flips a client
-message onto the wire, and there is no state in which the lane is live and nobody has
-read what the other flag is currently doing.
+So there is no environment variable in this system whose value alone puts a NEW
+client message onto the wire at WRITE time, and there is no state in which the lane
+writes a client-bound row and nobody has read what the other flag is currently doing.
+
+THE HONEST LIMIT OF THAT GUARANTEE, closed by a SEPARATE mechanism (GAP 2, audit of
+PR #68). The paragraph above is a claim about lane.py's WRITE path only. It says
+nothing about a row already sitting in support_messages from an earlier pass where
+this DID go LIVE: revoking AGENT_CLIENT_DM_AUTOFIX afterwards (or letting the derived
+AGENT_CLIENT_DM_LIVE_ACK go stale) stops this lane from writing anything NEW, but by
+itself it does nothing to a row already written 'ready' -- because the outbox's own
+release gate, `_recipient_armed` (outbox.py:141-144), reads only
+SLACK_CONVO_<IDENTITY>_CLIENT_REPLY, a different, pre-existing, already-armed flag
+that has no knowledge this lane -- or its revocation -- exists at all. So the real
+guarantee is: no single flag arms a NEW reply, AND (as of the fix for GAP 2)
+outbox._dispatch_one independently re-runs THIS module's own preflight() at dispatch
+time for any row carrying this lane's provenance marker, holding it the moment this
+lane's own arming no longer says LIVE -- so a revoke also retracts what was already
+queued, not only what would have been written next.
 
 WHAT THIS FILE DOES NOT DO. It does not read, write, wrap or alter any SLACK_CONVO_*
-flag's semantics, and it does not touch agent/slack_convo/*. It READS
-`slack_convo_client_reply_armed` to build its own token and to tell the operator the
-truth; the #fixer bus's own auto-answer gate (D67) is a separately-owned, still-locked
-decision and is untouched by every line here.
+flag's semantics, and it does not touch agent/slack_convo/* except for the one
+dispatch-time read described above (outbox.py calling this module's own preflight()).
+It READS `slack_convo_client_reply_armed` to build its own token and to tell the
+operator the truth; the #fixer bus's own auto-answer gate (D67) is a
+separately-owned, still-locked decision and is untouched by every line here.
 """
 from __future__ import annotations
 

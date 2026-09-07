@@ -29,8 +29,10 @@ exactly like a real finding. require_account_key() REFUSES a uuid rather than qu
 with it.
 
 WHAT LIVE DATA SAYS ABOUT THAT KEY (measured 2026-09-07 against the production
-project, read-only). Two of seventeen connected gyms have media rows that DISAGREE
-about which key owns them:
+project, read-only). Two of twelve DISTINCT connected gyms have media rows that
+DISAGREE about which key owns them (the "seventeen" this docstring said in an
+earlier draft was a media_source ROW count, not a distinct-gym count -- corrected,
+per the audit of PR #68; the fix below it was already correct either way):
 
     media_source.gym_id      media_asset.gym_id        rows
     toughtemple086f51    ->  toughtemple52040e          70

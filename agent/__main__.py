@@ -901,6 +901,7 @@ _COMMANDS = {
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
+        ("backfill-section7", "recover CTA/hashtag section 7 for already-onboarded gyms (--bases a,b=intake_key,c)"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -1857,6 +1858,43 @@ def main(argv=None):
                           f"{r['sources_created']} source(s), routed={r['marked_routed']}")
                 else:
                     print(f"  {r['base']}: SKIPPED ({r.get('reason')})")
+    elif cmd == "backfill-section7":
+        # MANUAL, one-time recovery for gyms onboarded BEFORE the section-7
+        # (CTA/hashtag) intake bridge bug was fixed: their lasso_voice.md was
+        # already written (write_brand_docs never overwrites), so fixing
+        # _build_intake_text alone only helps NEW onboardings. This re-derives
+        # section 7 from each gym's OWN real intake and patches ONLY the
+        # CTA-rotation / hashtag-strategy blocks that still hold the literal
+        # machine TODO -- anything already filled (a human edit, a generic
+        # fallback CTA, prior real content) is left untouched. Caller supplies
+        # the exact base-key list explicitly: this never auto-discovers or
+        # guesses which gyms are eligible (orphaned/duplicate account keys from
+        # the account-key split-brain issue are a judgment call, not a scan).
+        from . import social_intake_reader as _sir
+        args_rest = argv[1:]
+        bases = []
+        for i, a in enumerate(args_rest):
+            if a == "--bases" and i + 1 < len(args_rest):
+                bases = [b.strip() for b in args_rest[i + 1].split(",") if b.strip()]
+        if not bases:
+            print("usage: python -m agent backfill-section7 --bases "
+                  "<base1,base2=intake_client_key,...>\n"
+                  "  (base=intake_client_key for a self-serve gym whose "
+                  "echo_social_intake row is keyed by the portal's raw UUID)")
+        else:
+            results = _sir.backfill_section7_many(bases)
+            for r in results:
+                if not r.get("ok"):
+                    print(f"  {r['base']}: SKIPPED ({r.get('reason')})")
+                elif not r.get("had_recoverable_data"):
+                    print(f"  {r['base']}: no recoverable data -- {r.get('note')}")
+                elif r["changed"]["cta"] or r["changed"]["hashtags"]:
+                    print(f"  {r['base']}: PATCHED (cta={r['changed']['cta']}, "
+                          f"hashtags={r['changed']['hashtags']}) -> {r['bible_path']}")
+                else:
+                    print(f"  {r['base']}: recoverable data exists but the bible's "
+                          "CTA/hashtag block was already filled by something else "
+                          "(left untouched)")
     elif cmd == "onboard-client":
         # ONE-COMMAND Stage 3 onboarding from a completed intake. Missing fields
         # block with the list; touches no env, arms nothing.

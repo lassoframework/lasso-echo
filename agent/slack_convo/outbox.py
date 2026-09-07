@@ -138,6 +138,14 @@ def _person_for_card(bus, ticket, identity):
     return ", ".join(bits)
 
 
+def _client_dm_lane_meta_key():
+    """The attachments key client_dm_support stamps on every row it writes
+    (lane.py's LANE_META), imported by name rather than duplicated as a magic
+    string here so the two can never drift apart."""
+    from ..client_dm_support.lane import LANE_META
+    return LANE_META
+
+
 def _recipient_armed(identity, recipient_kind):
     if recipient_kind in ("staff", "coach"):
         return config.slack_convo_staff_reply_armed(identity.name)
@@ -425,6 +433,36 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
                 person=_person_for_card(bus, ticket, identity),
                 why=f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER is off: a grounded "
                     "answer needs your tap")
+            return
+    # 5b. GAP 2 (audit of PR #68): a row THIS SPECIFIC LANE wrote must re-verify that
+    # lane's OWN full three-flag interlock at dispatch time, not only the general
+    # _recipient_armed check above. arming.preflight() checks AGENT_CLIENT_DM_AUTOFIX,
+    # AGENT_CLIENT_DM_CLIENT_REPLY and a runtime-derived AGENT_CLIENT_DM_LIVE_ACK --
+    # none of which _recipient_armed (SLACK_CONVO_<ID>_CLIENT_REPLY alone) has ever
+    # read. Without this, a row written while the lane was briefly LIVE stays in
+    # 'ready' after AGENT_CLIENT_DM_AUTOFIX is later revoked (or the ack goes stale),
+    # and this same _recipient_armed check -- true the whole time, since it is a
+    # different, pre-existing, already-armed flag -- would still release it with zero
+    # awareness this lane, or its revocation, exists. Scoped to rows carrying this
+    # lane's own provenance marker, so no other identity's or lane's delivery changes.
+    if not att.get("released_by") and att.get(_client_dm_lane_meta_key()):
+        from ..client_dm_support import arming as _cdm_arm
+        lane_arm = _cdm_arm.preflight(identity.name)
+        if lane_arm.mode != _cdm_arm.MODE_LIVE:
+            bus.mark_message(row["id"], "held",
+                             meta_update={"held_why": "client_dm_support lane no longer "
+                                                       f"live at dispatch time: "
+                                                       f"{lane_arm.reason}"})
+            summary["held"] += 1
+            _a.write_hold_notice(
+                bus, ident_name=identity.name, tid=ticket["id"],
+                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
+                account_key=None, kind=kind, body=row.get("body") or "",
+                held_message_id=row["id"], surface=att.get("surface") or "",
+                person=_person_for_card(bus, ticket, identity),
+                why=f"client_dm_support's own arming no longer holds at dispatch "
+                    f"time (re-checked independently of SLACK_CONVO_"
+                    f"{identity.name.upper()}_CLIENT_REPLY): {lane_arm.reason}")
             return
     if not att.get("released_by") and not _recipient_armed(identity, recipient_kind):
         bus.mark_message(row["id"], "held", meta_update={"held_why": "flag off at post time"})

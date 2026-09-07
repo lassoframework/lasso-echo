@@ -540,6 +540,35 @@ def run(gyms=None, store=None, now=None, alert_fn=None) -> dict:
                             or f_grade.total >= A_THRESHOLD
                             or not improved):
                         break
+            elif self_fix:
+                # BOOK ALREADY >= A (Blake's ruling, 2026-09-07): the full
+                # remediation suite above stays gated on total < A_THRESHOLD
+                # exactly as before -- an A-graded book does not need its
+                # duplicate/overcap/craft/audience passes re-run. But
+                # calendar_grade's "total" does not weight body sameness, so a
+                # book can sit at a perfect A while still carrying a real
+                # near-duplicate BODY pair forever, since this branch is the
+                # ONLY place that would ever look again. The body-sameness
+                # pass ALONE is decoupled from the gate and always checked
+                # (agent.jobs.grade_fix.remediate_body_sameness_always) --
+                # deliberately NOT folded into `fix` / fixed_gyms/held_gyms
+                # bookkeeping below, because "already A" is not "just fixed
+                # to A" and must never alert or escalate as though it were.
+                always_body_step = None
+                try:
+                    from agent.jobs import grade_fix
+                    always_body_step = grade_fix.remediate_body_sameness_always(
+                        gym_id, forward_rows, store, profile=profile,
+                        today_iso=today_str)
+                except Exception as exc:  # noqa: BLE001 - never sink the sweep
+                    print(f"[grade-sweep] {gym_id}: always-on body pass failed: "
+                          f"{type(exc).__name__}: {exc}")
+                if always_body_step and always_body_step.get("body_fixed"):
+                    forward_rows = _fetch_rows(store, gym_id, today_str,
+                                               forward_end) or forward_rows
+                    f_grade = grade_month(forward_rows, profile=profile)
+                if always_body_step is not None:
+                    gym_result["always_on_body_fix"] = always_body_step
             _write_grade(store, gym_id, "forward_book", f_grade)
             if not self_fix:
                 _alert_low_grade(gym_id, "forward_book", f_grade, alert_fn)

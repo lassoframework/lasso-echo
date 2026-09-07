@@ -97,3 +97,40 @@ def test_run_writes_only_under_drafts_client_dir(tmp_path, monkeypatch):
     assert os.path.exists(bible_path) and os.path.exists(proof_path)
     # only the two draft files, nothing else touched
     assert sorted(os.listdir(os.path.dirname(bible_path))) == ["lasso_voice.md", "social_proof.md"]
+
+
+# ---- patch_section7: the backfill mechanism's core safety check -------------------
+def _bible_with(cta_body, hashtag_body):
+    return (
+        "# Some Gym Brand Bible\n\n"
+        "## 6. Platform rules\n\n"
+        f"{bible_drafter.CTA_HEADER}\n{cta_body}\n\n"
+        f"{bible_drafter.HASHTAG_HEADER}\n{hashtag_body}\n"
+    )
+
+
+def test_patch_section7_fills_both_todo_blocks():
+    text = _bible_with(bible_drafter.TODO, bible_drafter.TODO)
+    patched, changed = bible_drafter.patch_section7(text, "Real CTA: book a free tour")
+    assert changed == {"cta": True, "hashtags": True}
+    assert "Real CTA: book a free tour" in patched
+    assert bible_drafter.TODO not in patched
+
+
+def test_patch_section7_leaves_human_edited_cta_untouched():
+    """A block that no longer holds the literal TODO (a human already edited it, or
+    a different mechanism already filled it, e.g. a generic fallback CTA) must be
+    left BYTE FOR BYTE untouched -- this is the whole safety contract."""
+    text = _bible_with("- Learn more at gym.com  (generic fallback, already filled)",
+                        bible_drafter.TODO)
+    patched, changed = bible_drafter.patch_section7(text, "Real CTA: book a free tour")
+    assert changed == {"cta": False, "hashtags": True}
+    assert "Learn more at gym.com  (generic fallback, already filled)" in patched
+    assert "Real CTA" not in patched.split(bible_drafter.HASHTAG_HEADER)[0]
+
+
+def test_patch_section7_no_op_when_nothing_is_todo():
+    text = _bible_with("- real cta already here", "#realtag")
+    patched, changed = bible_drafter.patch_section7(text, "would-be new content")
+    assert changed == {"cta": False, "hashtags": False}
+    assert patched == text

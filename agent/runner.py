@@ -1393,7 +1393,12 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # never blocks the draft run.
     if config.client_dm_autofix_enabled():
         try:
-            from .client_dm_support.lane import run_once as _client_dm_run
+            # GAP 1 fix: run_once_all_identities loops every bot identity that can
+            # carry a client's Slack conversation (echo, ranger, scout, wrangler),
+            # not just 'echo'. See client_dm_support/lane.py's own docstring on
+            # run_once_all_identities for why a single identity was invisible to
+            # most of this system's real client traffic.
+            from .client_dm_support.lane import run_once_all_identities as _client_dm_run
             _cdsum = _client_dm_run()
             if not _cdsum.get("ok"):
                 print(f"[client-dm] not ok: {_cdsum.get('reason', '')}")
