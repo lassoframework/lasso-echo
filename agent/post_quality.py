@@ -183,13 +183,24 @@ def caption_issues(caption, banned_words=()):
     return issues
 
 
-def post_issues(draft, banned_words=()):
-    """Every reason this DRAFT is not A+ (caption issues + media + grounding). Empty == A+."""
+def post_issues(draft, banned_words=(), require_media=True):
+    """Every reason this DRAFT is not A+ (caption issues + media + grounding). Empty == A+.
+
+    require_media (2026-09-07, the CAPTION-ONLY lane): a POST needs real media and
+    that stays the default for every build path. A caption-only consumer borrows the
+    draft's words and nothing else -- grade_fix's repair passes rewrite the caption of
+    a day that ALREADY CARRIES its own approved photo -- so for them an empty creative
+    url is not a defect, it is the part of the draft they never asked for. Measured on
+    hillcountry's live book the day this shipped: every body-sameness repair failed
+    with 'not A+: no media (empty creative url)' while the captions in those very
+    drafts were clean, on-avatar and 0.01 body-similar to the book. The media rail is
+    untouched for posts; this only stops a good caption being discarded over a photo
+    nobody wanted."""
     issues = caption_issues(getattr(draft, "caption", "") or "", banned_words)
     breach = avatar_breach(getattr(draft, "caption", "") or "")
     if breach:
         issues.append(f"banned-audience term ('{breach}') violates the LASSO avatar rail")
-    if not (getattr(draft, "creative_public_url", "") or "").strip():
+    if require_media and not (getattr(draft, "creative_public_url", "") or "").strip():
         issues.append("no media (empty creative url)")
     # ECHO VISION §5/§7: a caption that CONTRADICTS the crop-verified image is not A+. The
     # month builder treats not-A+ as "walk alternatives" (regen/swap); exhausted -> drop the
@@ -209,6 +220,6 @@ def post_issues(draft, banned_words=()):
     return issues
 
 
-def is_a_plus(draft, banned_words=()):
+def is_a_plus(draft, banned_words=(), require_media=True):
     """True when the draft passes every A+ check."""
-    return not post_issues(draft, banned_words)
+    return not post_issues(draft, banned_words, require_media=require_media)
