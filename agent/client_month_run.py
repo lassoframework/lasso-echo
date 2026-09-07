@@ -233,7 +233,7 @@ def _has_real_creative(draft):
 def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, log,
                          exclude_keys=(), avoid_openings=(), allow_reuse=False,
                          angle="", avoid_angles=(), avoid_captions=(),
-                         recent_formulas=()):
+                         recent_formulas=(), require_media=True):
     """Build a draft for the day, from the gym's OWN uploaded photo (NO template_fn),
     whose caption carries NO banned word, preferring a different approved source/category
     over dropping the day.
@@ -276,7 +276,16 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
     running) is passed over and the neighbour-day walk looks for a different frame.
     PREFERENCE, not a block: if the walk finds nothing that varies the frame, the best
     otherwise-acceptable draft is still returned, so this can never thin a calendar.
-    Flag OFF or empty => unchanged."""
+    Flag OFF or empty => unchanged.
+
+    require_media (2026-09-07): DEFAULT TRUE, and every calendar-building caller keeps
+    it, because a post without a photo is not a post. FALSE is the CAPTION-ONLY lane:
+    grade_fix's repair passes rewrite the caption of a day that already carries its own
+    approved photo, so they borrow the draft's words and discard its creative. On a gym
+    whose library is fully served (hillcountry, live, 2026-09-07) the builder can still
+    write a clean caption but has no unused image to attach, and the media check alone
+    was throwing that caption away -- which is why every body-sameness repair reported
+    'source material too thin' on books whose source material was fine."""
     from . import post_quality
 
     def _norm_caption(text):
@@ -307,7 +316,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         # deterministic baseline mode (source + CTA), where only the banned-word bar
         # applies, so a thin source is not dropped and the baseline stays usable.
         if config.sb7_enabled():
-            hard_ok = post_quality.is_a_plus(d, banned_words)
+            hard_ok = post_quality.is_a_plus(d, banned_words,
+                                             require_media=require_media)
         else:
             hard_ok = not _has_banned_word(d.caption, banned_words)
         if not hard_ok:
@@ -332,7 +342,8 @@ def _clean_draft_for_day(account, day_key, voice, library_path, banned_words, lo
         return None, None
     if _accept(draft):
         return draft, None
-    first_issues = post_quality.post_issues(draft, banned_words)
+    first_issues = post_quality.post_issues(draft, banned_words,
+                                            require_media=require_media)
 
     # The day's draft is not A+ (banned word OR a thin/low-quality caption). Try
     # alternative approved sources by walking neighbouring day keys so a DIFFERENT real

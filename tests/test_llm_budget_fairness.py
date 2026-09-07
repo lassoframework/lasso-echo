@@ -145,16 +145,28 @@ def _run_craft(gym_id, rows, store, regen, deadline=None):
 
 def _regen(outcomes):
     """An injected regen. `outcomes` is an iterable of bools: True hands back a
-    caption that clears the craft bar, False one that cannot (too thin)."""
+    caption that clears the craft bar, False one that cannot (too thin).
+
+    THE PILLAR ROTATES (2026-09-07). It used to answer "education" every time,
+    which no real regen does: `_default_caption_regen` walks the gym's
+    deterministic source rotation, and measured live on hillcountry four
+    consecutive calls returned service, educational, testimonial and offer. The
+    fixed pillar mattered once `_fix_body_sameness` grew the content-mix
+    headroom guard, because a bank that answers one pillar 23 times drives that
+    pillar to 100% of the book and the guard then correctly refuses to make the
+    mix worse. Rotating restores what the fixture is meant to model: a regen
+    with real material behind it."""
     calls = []
     seq = list(outcomes)
+    pillars = ("community", "education", "proof", "behind_scenes", "offer")
 
     def regen(row, avoid, avoid_category=""):
         i = len(calls)
         calls.append(str((row or {}).get("post_date") or ""))
         ok = seq[i] if i < len(seq) else seq[-1]
-        return ((_long_clean(2000 + i), "education") if ok
-                else (_thin(7000 + i), "education"))
+        cat = pillars[i % len(pillars)]
+        return ((_long_clean(2000 + i), cat) if ok
+                else (_thin(7000 + i), cat))
     return regen, calls
 
 
