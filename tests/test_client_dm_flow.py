@@ -521,8 +521,17 @@ class FakeBus:
     "every test injects its own working fake into the exact seam production left
     empty" -- so this one carries the real column set and nothing else.
 
-    `_get` also IGNORES the query params, deliberately (D68.3's poll-fake pattern), so
-    a poll predicate that lives only in the query string cannot pass vacuously.
+    `_get` HONOURS product/source/status/limit/offset and ignores nothing that
+    decides which rows come back.
+
+    An earlier version ignored params entirely, on the D68.3 reasoning that a fence
+    living only in a query string must not pass vacuously. That reasoning is right for
+    a FENCE (a filter that keeps rows OUT) and exactly wrong for a SELECTOR (a filter
+    that decides which rows come IN): ignoring it made every status value look
+    pollable, and hid a real defect for four audit rounds -- the lane polled
+    ("new","triage") while both documented cases land in "hold". So the fake now
+    applies the selector faithfully, and the JS-side belt that must not be vacuous is
+    tested separately by asserting the emitted params.
     """
 
     def __init__(self, tickets, messages):
@@ -536,7 +545,24 @@ class FakeBus:
 
     def _get(self, table, params):
         self.queries.append((table, dict(params)))
-        return list(self.tickets)
+        rows = list(self.tickets)
+
+        def _eq(row, field):
+            want = str(params.get(field, ""))
+            if not want.startswith("eq."):
+                return True
+            return str(row.get(field, "")) == want[3:]
+
+        rows = [r for r in rows if _eq(r, "product") and _eq(r, "source")]
+        st = str(params.get("status", ""))
+        if st.startswith("in.("):
+            allowed = {x.strip() for x in st[4:-1].split(",")}
+            rows = [r for r in rows if str(r.get("status", "")) in allowed]
+        elif st.startswith("eq."):
+            rows = [r for r in rows if str(r.get("status", "")) == st[3:]]
+        offset = int(params.get("offset", 0) or 0)
+        limit = int(params.get("limit", len(rows)) or len(rows))
+        return rows[offset:offset + limit]
 
     def recent_messages(self, ticket_id, limit=200):
         return list(self.msgs.get(ticket_id, []))
@@ -546,10 +572,10 @@ class FakeBus:
         return {"id": len(self.out)}
 
 
-def _bus_for(text, surface="mpim", author_type="client"):
+def _bus_for(text, surface="mpim", author_type="client", status="hold"):
     return FakeBus(
         tickets=[{"id": "T1", "product": "echo", "source": "slack_conversation",
-                  "status": "new", "classification": "question",
+                  "status": status, "classification": "question",
                   "bot_identity": "echo", "client_id": CHAD_UUID}],
         messages={"T1": [{"direction": "inbound", "author_type": author_type,
                           "body": text, "attachments": {"surface": surface}}]},
@@ -564,7 +590,8 @@ def _consumer_kw(binding=True):
     A test must supply BOTH, because either one failing closed is the correct
     behaviour and the lane refuses to guess."""
     return {"portal_key_for_gym": lambda u: CHAD_KEY if u == CHAD_UUID else "",
-            "confirm_binding": (lambda _g, _k: binding)}
+            "confirm_binding": (lambda _g, _k: binding),
+            "notice_sink": (lambda _t, _d: None)}
 
 
 def test_the_flag_is_off_by_default_and_off_is_loud():
@@ -634,7 +661,8 @@ def test_staff_text_is_not_treated_as_the_clients_support_request():
 def test_the_delivery_producers_exist_and_are_real_callables():
     """Name the PRODUCER of every value this capability gates on, and assert it
     exists — statically, with no test double and no live service."""
-    assert wiring.DELIVERY_PRODUCERS == {"bus_reply_sink", "bus_escalation_sink"}
+    assert wiring.DELIVERY_PRODUCERS == {"bus_reply_sink", "bus_escalation_sink",
+                                        "bus_answered_notice_sink"}
     for name in wiring.DELIVERY_PRODUCERS:
         assert callable(getattr(wiring, name)), name
     bus = FakeBus([], {})
@@ -788,39 +816,70 @@ def test_a_mis_resolved_key_never_reaches_a_sync_or_a_reply():
     assert store.asset_reads == []
 
 
-def test_confirm_gym_binding_requires_agreement_AND_uniqueness():
+def test_confirm_gym_binding_checks_freshness_liveness_AND_uniqueness(monkeypatch):
+    """Three different reads, three different assertions.
+
+    The first version asserted by_gym[gid] == key against the SAME cached dict the
+    forward call had just read it out of -- a tautology, and an audit said so. Only its
+    uniqueness half could ever fire."""
+    from agent import account_key_resolve as akr
+    monkeypatch.setattr(akr, "resolve", lambda k, **kw: k)     # every key is live
+    agree = lambda _g: CHAD_KEY                                # noqa: E731
+    ok_state = lambda: ({}, {}, {CHAD_UUID: CHAD_KEY}, True)   # noqa: E731
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state, fresh_key=agree) is True
+
+    # 1. FRESHNESS: a live re-read disagrees with the cached answer -> refuse.
+    #    This is the check the tautology version could not perform at all.
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state,
+        fresh_key=lambda _g: "gymbravo") is False
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state, fresh_key=lambda _g: "") is False
+
+    def boom(_g):
+        raise RuntimeError("plane unreadable")
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state, fresh_key=boom) is False
+
+    # 2. LIVENESS: resolve() reads `live`/`mapping`, not by_gym. A key it remaps is
+    #    stale and must never pick whose data to read.
+    monkeypatch.setattr(akr, "resolve", lambda k, **kw: "canonicalkey")
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state, fresh_key=agree) is False
+    monkeypatch.setattr(akr, "resolve", lambda k, **kw: k)
+
+
+def test_confirm_gym_binding_requires_agreement_AND_uniqueness(monkeypatch):
     """Agreement alone is not enough: two gyms sharing one key IS the split-brain
     shape, and a shared key must never be used to decide whose data to read."""
+    from agent import account_key_resolve as akr
+    monkeypatch.setattr(akr, "resolve", lambda k, **kw: k)
+    agree = lambda _g: CHAD_KEY                                      # noqa: E731
     ok_state = lambda: ({}, {}, {CHAD_UUID: CHAD_KEY}, True)          # noqa: E731
-    assert consumer.confirm_gym_binding(CHAD_UUID, CHAD_KEY, state=ok_state) is True
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=ok_state, fresh_key=agree) is True
 
     # DISAGREEMENT, isolated from the uniqueness rule. The key maps cleanly and
     # uniquely to ONE gym -- just not this one. Uniqueness passes; only the agreement
     # check can refuse this, so it measures that check and nothing else.
     # (An earlier version used a case where uniqueness ALSO failed, so removing the
     # agreement check left the test green.)
-    other_owner = lambda: ({}, {}, {"other-uuid": "gymbravo"}, True)  # noqa: E731
-    assert consumer.confirm_gym_binding(
-        CHAD_UUID, "gymbravo", state=other_owner) is False
-    # ...and the gym that DOES own it is confirmed, so the rule is not simply "no".
-    assert consumer.confirm_gym_binding(
-        "other-uuid", "gymbravo", state=other_owner) is True
-
-    wrong = lambda: ({}, {}, {CHAD_UUID: "gymbravo"}, True)           # noqa: E731
-    assert consumer.confirm_gym_binding(CHAD_UUID, CHAD_KEY, state=wrong) is False
-
     # the gym is absent from the plane
     absent = lambda: ({}, {}, {}, True)                               # noqa: E731
-    assert consumer.confirm_gym_binding(CHAD_UUID, CHAD_KEY, state=absent) is False
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=absent, fresh_key=agree) is False
 
-    # SHARED KEY: two gyms map to it. Agreement holds; uniqueness does not.
+    # SHARED KEY: two gyms map to it. Freshness and liveness hold; uniqueness does not.
     shared = lambda: ({}, {}, {CHAD_UUID: CHAD_KEY,                   # noqa: E731
                                "other-uuid": CHAD_KEY}, True)
-    assert consumer.confirm_gym_binding(CHAD_UUID, CHAD_KEY, state=shared) is False
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=shared, fresh_key=agree) is False
 
     # a half-read plane proves nothing
     half = lambda: ({}, {}, {CHAD_UUID: CHAD_KEY}, False)             # noqa: E731
-    assert consumer.confirm_gym_binding(CHAD_UUID, CHAD_KEY, state=half) is False
+    assert consumer.confirm_gym_binding(
+        CHAD_UUID, CHAD_KEY, state=half, fresh_key=agree) is False
 
 
 def test_confirm_gym_binding_is_the_real_default_not_a_test_double():
@@ -1117,7 +1176,7 @@ def test_the_lane_reads_the_clients_NEWEST_message_not_their_first():
 
     bus = FakeBus(
         tickets=[{"id": "T1", "product": "echo", "source": "slack_conversation",
-                  "status": "new", "classification": "question",
+                  "status": "hold", "classification": "question",
                   "bot_identity": "echo", "client_id": CHAD_UUID}],
         messages={"T1": newest_first})
     store = FakeStore(sources=[CHAD_SOURCE], assets=[])
@@ -1280,3 +1339,158 @@ def test_an_undelivered_ticket_makes_the_pass_report_not_ok():
                             **_consumer_kw())
     assert out["undelivered"] == 1
     assert out["ok"] is False, "a pass that told nobody must not report ok"
+
+
+# ===========================================================================
+# THE POLL STATUS — the contract this file guessed while claiming it had read
+# the others out of the code. Both documented cases land in "hold".
+# ===========================================================================
+def test_the_poll_statuses_match_what_the_adapter_actually_writes():
+    """Read out of agent/slack_convo/adapter.py, not assumed. A client DM question
+    with no drafted answer, and the classifier-undecided fallback, both set
+    status="hold" — which the first poll never asked for, so the lane was inert on
+    exactly the two shapes it was built for."""
+    import inspect
+    from agent.slack_convo import adapter as real_adapter
+    src = inspect.getsource(real_adapter)
+    assert 'classification=_cls.QUESTION, status="hold"' in src
+    assert 'set_ticket(tid, status="hold", escalated=True)' in src
+    assert 'classification=_cls.CODE_FIX, status="triage"' in src
+    assert 'classification=_cls.ACTION_REQUEST, status="new"' in src
+    for st in ("hold", "triage", "new"):
+        assert st in consumer.POLL_STATUSES, st
+
+
+def test_verification_is_deliberately_excluded_and_the_reason_is_recorded():
+    """That status means the adapter drafted an answer on the D67-locked lane. Two
+    replies about one question is the cost of polling it, so it is left alone."""
+    assert "verification" not in consumer.POLL_STATUSES
+    assert "D67" in consumer.__doc__ or "D67" in open(
+        consumer.__file__, encoding="utf-8").read()
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("hold", 1), ("triage", 1), ("new", 1), ("verification", 0),
+    ("approved", 0), ("resolved", 0),
+])
+def test_a_ticket_is_polled_only_in_a_pollable_status(status, expected):
+    """The fake honours the status filter, so this measures the real predicate. An
+    earlier fake ignored params, which made every status look pollable and hid this
+    for four audit rounds."""
+    bus = _bus_for("my posts have no photos", status=status)
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(4, store)),
+                            **_consumer_kw())
+    assert out["handled"] == expected, (status, out)
+
+
+def test_answered_tickets_cannot_starve_a_new_one_out_of_the_queue():
+    """The lane never changes ticket.status and the outbox does not resolve its rows,
+    so answered tickets sit in an open status forever. With a fixed limit and
+    created_at.asc ordering they starved every new ticket behind them, permanently, at
+    {ok:True, handled:0}."""
+    tickets, msgs = [], {}
+    for i in range(60):
+        tid = f"OLD{i}"
+        tickets.append({"id": tid, "product": "echo", "source": "slack_conversation",
+                        "status": "hold", "bot_identity": "echo",
+                        "client_id": CHAD_UUID})
+        msgs[tid] = [
+            {"direction": "outbound", "author_type": "echo", "body": "...",
+             "attachments": {"lane": wiring.REPLY_META_LANE}},
+            {"direction": "inbound", "author_type": "client", "body": "old",
+             "attachments": {"surface": "mpim"}}]
+    tickets.append({"id": "NEW", "product": "echo", "source": "slack_conversation",
+                    "status": "hold", "bot_identity": "echo", "client_id": CHAD_UUID})
+    msgs["NEW"] = [{"direction": "inbound", "author_type": "client",
+                    "body": "my posts have no photos",
+                    "attachments": {"surface": "mpim"}}]
+    bus = FakeBus(tickets=tickets, messages=msgs)
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(5, store)),
+                            **_consumer_kw())
+    assert out["handled"] == 1, out
+    assert out["skipped"] == 60
+
+
+# ===========================================================================
+# EVERY AUTO-REPLY IS ALSO CARDED. The structural answer to "the keyword belt
+# misses phrasings", instead of a longer keyword list.
+# ===========================================================================
+def _cards(text):
+    bus = _bus_for(text)
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    consumer.run_once(bus=bus, flag_on=True,
+                      deps=drive_deps(store, make_sync(6, store)),
+                      portal_key_for_gym=lambda u: CHAD_KEY if u == CHAD_UUID else "",
+                      confirm_binding=lambda _g, _k: True)
+    return bus.out
+
+
+def test_an_auto_reply_always_writes_an_internal_card_too():
+    rows = _cards("my posts have no photos")
+    kinds = [r["kind"] for r in rows]
+    assert "status" in kinds and "escalation" in kinds, kinds
+    card = [r for r in rows if r["kind"] == "escalation"][0]
+    assert card["meta"]["answered_notice"] is True
+    assert card["meta"]["recipient_kind"] == "staff"
+    assert "I did NOT read their message for anything else" in card["body"]
+
+
+@pytest.mark.parametrize("text", [
+    "my posts have no photos, and please raise the daily spend on facebook",
+    "my posts have no photos. did you take money out twice this month?",
+    "the posts have no pictures. we open at 5am now, does the calendar know?",
+    "no images on my drafts, and can you cancel the story scheduled for tonight?",
+    "my posts have no photos. one of my members hurt her back in class",
+    "no photos on my posts. can you pause everything we are paying for?",
+])
+def test_a_hard_line_riding_along_with_a_routable_phrase_still_reaches_a_human(text):
+    """THE RULE, and why it is not another keyword. The belt missed ten of ten plain
+    ad-money phrasings, and a hard line inside a routable message got an unattended
+    reply and was then marked handled. Widening the belt is the loop D68 forbids. So
+    the lane never claims to have handled the whole message: a human reads every one
+    it replied to, in the client's own words."""
+    rows = _cards(text)
+    cards = [r for r in rows if r["kind"] == "escalation"]
+    assert cards, f"no human was told about: {text}"
+    assert text.split(",")[0][:20].lower() in cards[0]["body"].lower() or \
+        "what they wrote" in cards[0]["body"]
+
+
+def test_the_card_carries_both_what_they_wrote_and_what_echo_said():
+    rows = _cards("my posts have no photos. did you take money out twice this month?")
+    card = [r for r in rows if r["kind"] == "escalation"][0]
+    assert "take money out twice" in card["body"]
+    assert "I ran the photo sync" in card["body"]
+
+
+def test_the_notice_sink_is_a_real_producer_not_a_none_default():
+    assert "bus_answered_notice_sink" in wiring.DELIVERY_PRODUCERS
+    assert callable(wiring.bus_answered_notice_sink(FakeBus([], {})))
+
+
+def test_the_row_records_the_REAL_surface_not_a_hardcoded_one():
+    bus = _bus_for("my posts have no photos", surface="im")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    consumer.run_once(bus=bus, flag_on=True,
+                      deps=drive_deps(store, make_sync(2, store)), **_consumer_kw())
+    assert bus.out[0]["meta"]["surface"] == "im"
+
+
+def test_a_code_fix_may_not_rewrite_this_capabilitys_own_safety_controls():
+    """An allowlist shaped wrongly for the day it is wired is a trap for a future
+    session: the old roots would have let a code fix edit ad_block.py, scope_gate.py
+    and reply.py — the three files deciding what it may do — and then the tests."""
+    for path in ("agent/client_dm_support/ad_block.py",
+                 "agent/client_dm_support/scope_gate.py",
+                 "agent/client_dm_support/reply.py",
+                 "tests/test_client_dm_ad_block.py",
+                 "tests/test_client_dm_scope_gate.py"):
+        v = sg.check(sg.ProposedAction(
+            kind=sg.KIND_CODE_FIX, paths=(path,),
+            scope_column="gym_id", scope_values=(CHAD_KEY,)))
+        assert v.escalate, path
+    assert "agent/client_dm_support/" not in sg.ALLOWED_CODE_FIX_ROOTS

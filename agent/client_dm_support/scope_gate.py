@@ -79,8 +79,19 @@ ALLOWED_CODE_FIX_ROOTS = (
     "agent/jobs/",
     "agent/gym_media_",
     "agent/media_",
-    "agent/client_dm_support/",
     "tests/",
+)
+
+# A code fix may never rewrite this capability's OWN safety controls, or the tests
+# that hold them. The roots above used to include agent/client_dm_support/, which
+# would have let a code-fix lane edit ad_block.py, scope_gate.py and reply.py -- the
+# three files that decide what it is allowed to do -- and then edit the tests that
+# would have caught it. Unreachable today (EXECUTORS has one entry and plan() never
+# returns a code fix), but an allowlist shaped wrongly for the day it is wired is a
+# trap laid for a future session, so it is fixed while it is cheap.
+SELF_PROTECTED_PATHS = (
+    "agent/client_dm_support/",
+    "tests/test_client_dm_",
 )
 
 # ---------------------------------------------------------------------------
@@ -294,6 +305,13 @@ def check(action: ProposedAction) -> ScopeVerdict:
 
     # 8. Blocked repo paths, whatever the kind claims to be.
     for p in paths:
+        for frag in SELF_PROTECTED_PATHS:
+            if p.startswith(frag) or f"/{frag}" in p:
+                return _deny(
+                    f"{p!r} is one of this capability's own safety controls or its "
+                    f"tests; it may not rewrite the code that decides what it may do",
+                    TRIGGER_MULTI_GYM_CONFIG,
+                )
         for frag in BLOCKED_PATH_FRAGMENTS:
             if frag in p:
                 # Name the RIGHT line. A gym's own voice doc is not "config affecting

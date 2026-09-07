@@ -436,7 +436,12 @@ AD_RAIL_MARKERS = (
 )
 
 # Files that legitimately CONTAIN these strings because their job is to name them.
-AD_RAIL_MARKER_EXEMPT = ("ad_block.py", "test_client_dm_ad_block.py")
+# Matched on the path ENDING, not the bare basename: exempting by basename anywhere in
+# the tree meant any file called ad_block.py, in any directory, was skipped.
+AD_RAIL_MARKER_EXEMPT = (
+    "agent/client_dm_support/ad_block.py",
+    "tests/test_client_dm_ad_block.py",
+)
 
 
 def scan_repo_for_ad_rail(repo_root=None):
@@ -449,9 +454,12 @@ def scan_repo_for_ad_rail(repo_root=None):
                    if d not in ("__pycache__", ".git", "node_modules", ".venv",
                                 "venv", ".venv-ops", "ghl-audit")]
         for n in sorted(names):
-            if not n.endswith(".py") or n in AD_RAIL_MARKER_EXEMPT:
+            if not n.endswith(".py"):
                 continue
             path = os.path.join(root, n)
+            rel = os.path.relpath(path, repo_root).replace(os.sep, "/")
+            if any(rel == e or rel.endswith("/" + e) for e in AD_RAIL_MARKER_EXEMPT):
+                continue
             try:
                 low = open(path, "r", encoding="utf-8", errors="replace").read().lower()
             except OSError:

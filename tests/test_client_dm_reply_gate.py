@@ -609,3 +609,103 @@ def test_the_flow_refuses_an_unknown_diagnostic_id_too():
     assert "no enumerated diagnostic covers this message" in d.reason, (
         "flow fell through to diagnostics.run instead of refusing the id itself")
     assert d.diagnostic_id == ""
+
+
+# ===========================================================================
+# GUARDS A FOURTH MUTATION RUN FOUND UNHELD.
+# ===========================================================================
+def test_the_account_key_is_lowercased_before_any_query():
+    """media_source.gym_id is a lowercase slug. Querying with mixed case returns zero
+    rows and reads as 'nothing is connected' — the false-negative class this very
+    function's docstring exists to prevent."""
+    from agent.client_dm_support import diagnostics as d
+    assert d.require_account_key("CrossFitLocal") == "crossfitlocal"
+    assert d.require_account_key("TOP-FUEL") == "top-fuel"
+
+
+def test_assets_are_not_read_when_the_gym_has_no_source():
+    """A gym that never connected Drive must not cause an asset read at all: the count
+    would be reported as a fact about a lane that was never set up."""
+    from agent.client_dm_support import diagnostics as d
+
+    class Store:
+        def __init__(self):
+            self.asset_reads = []
+
+        def list_sources(self, gym_id=None, include_inactive=False):
+            return []
+
+        def list_assets(self, gym_id, source_id=None):
+            self.asset_reads.append(gym_id)
+            return [{"id": 1, "gym_id": gym_id}]
+
+    st = Store()
+    snap = d.diagnose_drive_photos("crossfitlocal", store=st, now="2026-09-06T21:45:00+00:00",
+                                   daily_hour_utc=12, lane_active_for=lambda k: True)
+    assert st.asset_reads == [], "assets were read for a gym with no media_source"
+    assert snap.get("media_asset_count") == 0
+    assert snap.get("media_source_present") is False
+
+
+def test_a_windows_style_path_is_normalised_before_the_checks():
+    """A backslash path would otherwise slip every '/'-based prefix and fragment test."""
+    from agent.client_dm_support import scope_gate as g
+    for path in (r"agent\jobs\..\config.py", r"agent\slack_convo\adapter.py",
+                 r"agent\client_dm_support\ad_block.py"):
+        v = g.check(g.ProposedAction(kind=g.KIND_CODE_FIX, paths=(path,),
+                                     scope_column="gym_id", scope_values=("x",)))
+        assert v.escalate, path
+    v = g.check(g.ProposedAction(kind=g.KIND_CODE_FIX, paths=(r"agent\jobs\sync.py",),
+                                 scope_column="gym_id", scope_values=("x",)))
+    assert v.allowed, v.reason
+
+
+def test_a_failed_execution_escalates_before_anything_is_verified():
+    """flow's own `if not result.ok` is shadowed three deep by the verification step
+    and requires_true, so asserting only 'it escalated' left it green. The REASON says
+    which guard fired."""
+    from agent.client_dm_support import flow as f
+    from agent.client_dm_support import remedies as r
+
+    def failing(remedy, **kw):
+        return r.ExecutionResult(False, "drive returned 500")
+
+    import agent.client_dm_support.remedies as rmod
+    original = rmod.EXECUTORS["per_gym_drive_sync"]
+    rmod.EXECUTORS["per_gym_drive_sync"] = failing
+    try:
+        class Store:
+            def available(self):
+                return True
+
+            def list_sources(self, gym_id=None, include_inactive=False):
+                return [{"id": 1, "gym_id": "crossfitlocal", "kind": "gym_drive",
+                         "folder_name": "Ad Photos", "active": True,
+                         "revoked_externally": False,
+                         "connected_at": "2026-09-06T21:18:00+00:00"}]
+
+            def list_assets(self, gym_id, source_id=None):
+                return []
+
+        d = f.handle_ticket(text="my posts have no photos", gym_key="crossfitlocal",
+                            deps={"store": Store(), "now": "2026-09-06T21:45:00+00:00",
+                                  "daily_hour_utc": 12,
+                                  "lane_active_for": lambda k: True,
+                                  "log": lambda m: None})
+        assert d.decision == f.DECISION_ESCALATE
+        assert "did not complete" in d.reason and "500" in d.reason, d.reason
+    finally:
+        rmod.EXECUTORS["per_gym_drive_sync"] = original
+
+
+def test_run_facts_OVERRIDE_the_post_fix_snapshot_never_defer_to_it():
+    """verified_snapshot merges the run facts over the re-read facts. Using setdefault
+    instead would let a stale diagnosis value win over what the run actually did."""
+    from agent.client_dm_support import verify
+    after = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g",
+        {"media_asset_count": 7, "assets_inserted_this_run": 0, "sync_ran": False})
+    merged = verify.verified_snapshot(
+        after, {"sync_ran": True, "assets_inserted_this_run": 7})
+    assert merged.get("assets_inserted_this_run") == 7
+    assert merged.get("sync_ran") is True

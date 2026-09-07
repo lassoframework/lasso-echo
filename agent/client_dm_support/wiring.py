@@ -97,7 +97,11 @@ def _identity_of(ticket):
     return ident
 
 
-def _base_meta(ticket, surface="mpim", recipient_kind="client"):
+def _base_meta(ticket, surface=None, recipient_kind="client"):
+    # The REAL surface, not a hardcoded "mpim". The consumer reads it off the inbound
+    # message and used to discard it, so every row and every hold card recorded a
+    # surface that might be false (a 1:1 DM is "im").
+    surface = surface or str(ticket.get("_surface") or "mpim")
     return {
         "identity": _identity_of(ticket),      # REQUIRED by outbox._dispatch_one
         "surface": surface,
@@ -183,8 +187,52 @@ def bus_escalation_sink(bus):
     return _hold
 
 
+def bus_answered_notice_sink(bus):
+    """callable(ticket, decision) -> an INTERNAL card, written for EVERY auto-reply.
+
+    Why this exists, and why it is not a bigger keyword list. This lane answers one
+    narrow, verified thing. A client's message can contain that thing AND something
+    else entirely -- an ad-budget request, a billing question, a class-schedule change,
+    an injury. An audit put ten plainly ad-money phrasings past the keyword belt, and a
+    message pairing one with a routable phrase got an auto-reply about the photos while
+    the rest was dropped in silence and the ticket marked handled.
+
+    Widening the belt is the loop D68 forbids: the phrasings are an open set. So the
+    lane stops pretending a reply means the message is handled. A human reads every
+    message this lane answered, in the client's own words, and picks up whatever Echo
+    did not address. It is indifferent to phrasing, which is the whole point.
+    """
+    _, kind_escalation = _kinds()
+
+    def _notice(ticket, decision):
+        meta = _base_meta(ticket, recipient_kind="staff",
+                          surface=str(ticket.get("_surface") or "mpim"))
+        meta["answered_notice"] = True
+        meta["template_id"] = decision.template_id
+        body = (
+            f"[{REPLY_META_LANE}] I auto-replied to this client, about ONE thing.\n"
+            f"gym: {decision.gym_key or 'unresolved'}\n"
+            f"slack user: {ticket.get('slack_user_id') or '?'}\n"
+            f"what I answered: {decision.template_id} "
+            f"(grounded in {', '.join(decision.audit.get('fact_keys', [])) or 'n/a'})\n"
+            f"verification: {decision.audit.get('verification', '')}\n"
+            f"I did NOT read their message for anything else. If it asked for anything "
+            f"beyond this, it has NOT been handled.\n"
+            f"--- what they wrote (untrusted, escaped) ---\n"
+            f"{_fenced_client_text(getattr(decision, 'client_text', ''))}\n"
+            f"--- what I said ---\n"
+            f"{_fenced_client_text(decision.reply_text)}"
+        )
+        return bus.record_outbound(
+            ticket_id=ticket.get("id"), author_type=meta["identity"], body=body,
+            delivery_status=ESCALATION_DELIVERY_STATUS, kind=kind_escalation, meta=meta)
+
+    return _notice
+
+
 # The single registry of processes allowed to deliver this capability's output. It is
 # a constant so that tests/test_client_dm_flow.py can hold a TWO-WAY guard on it:
 # writers must stay inside it, AND it must still contain what it must, so a future
 # edit cannot quietly narrow it back to an inert state and stay green (D68).
-DELIVERY_PRODUCERS = frozenset({"bus_reply_sink", "bus_escalation_sink"})
+DELIVERY_PRODUCERS = frozenset({"bus_reply_sink", "bus_escalation_sink",
+                                "bus_answered_notice_sink"})

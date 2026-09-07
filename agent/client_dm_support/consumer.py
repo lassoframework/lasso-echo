@@ -55,8 +55,29 @@ CLIENT_DM_SURFACES = frozenset({"im", "mpim"})
 POLL_SOURCE = "slack_conversation"
 POLL_PRODUCT = "echo"
 
-# Ticket statuses worth looking at. A resolved or approved ticket is finished.
-POLL_STATUSES = ("new", "triage")
+# THE FIFTH CONTRACT, and the one this file guessed wrong while claiming the other
+# four had been "read out of the code rather than guessed".
+#
+# What the UNMODIFIED adapter actually writes for a client DM (agent/slack_convo/
+# adapter.py), which is the only thing that matters here:
+#     :835  QUESTION with an answer drafted        -> status "verification"
+#     :847  QUESTION with no answer drafted        -> status "hold", escalated
+#     :881  classifier undecided (the fallback)    -> status "hold", escalated
+#     :862  CODE_FIX                               -> status "triage"
+#     :873  ACTION_REQUEST                         -> status "new"
+# Both documented cases -- "my posts have no photos" and "my posts have no call to
+# action" -- land in HOLD. Polling only ("new","triage") made the lane inert on
+# exactly the two shapes it was built for, and returned {ok:True, handled:0} doing
+# it: byte-identical to a healthy idle pass. D68's "built but not wired" again.
+#
+# "verification" is DELIBERATELY EXCLUDED. That status means the adapter has already
+# drafted an answer on the D67-locked auto-answer lane, sitting held for Blake's tap.
+# If this lane also replied, releasing that tap later would send the client a second
+# message about the same question. That lane is Blake's separate decision and this one
+# does not reach into it. The cost is real and is stated rather than hidden: when the
+# live classifier routes a client's photo question to QUESTION-with-a-draft, this
+# capability does not fire and the existing hold card is what a human sees.
+POLL_STATUSES = ("new", "triage", "hold")
 
 _TICKETS = "support_tickets"
 
@@ -66,24 +87,49 @@ def _flag_on():
     return config.client_dm_autofix_enabled()
 
 
-def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10):
-    """This lane's own ticket poll.
+# This lane never changes a ticket's status, and outbox._resolve_on_answer resolves
+# only KIND_ANSWER (or a KIND_STATUS carrying resolve_notice) -- neither of which this
+# lane writes. So an answered ticket stays in an open status forever. With a fixed
+# `limit` and created_at.asc ordering, ten already-answered tickets at the front of the
+# queue starve every new one behind them, permanently, at {ok:True, handled:0}. So the
+# poll PAGES until it holds enough tickets this lane has not already answered.
+POLL_PAGE = 50
+POLL_MAX_PAGES = 10
+
+
+def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10,
+                 already_handled=None):
+    """This lane's own ticket poll, paged past tickets it has already answered.
 
     Deliberately NOT bus.find_new_tickets: that method also requires
     classification is.null, which is the portal worker's predicate and excludes every
-    classified client DM. Same table, same transport, same test-row exclusion — only
+    classified client DM. Same table, same transport, same test-row exclusion -- only
     the predicate differs.
     """
     from ..slack_convo import testdata as _td
-    rows = bus._get(_TICKETS, {                                  # noqa: SLF001
-        "product": f"eq.{product}",
-        "source": f"eq.{source}",
-        "status": f"in.({','.join(POLL_STATUSES)})",
-        "select": "*",
-        "order": "created_at.asc",
-        "limit": str(int(limit)),
-    })
-    return _td.exclude_test_strict(rows)
+    out, offset = [], 0
+    for _page in range(POLL_MAX_PAGES):
+        rows = bus._get(_TICKETS, {                              # noqa: SLF001
+            "product": f"eq.{product}",
+            "source": f"eq.{source}",
+            "status": f"in.({','.join(POLL_STATUSES)})",
+            "select": "*",
+            "order": "created_at.asc",
+            "limit": str(POLL_PAGE),
+            "offset": str(offset),
+        })
+        rows = _td.exclude_test_strict(rows)
+        if not rows:
+            break
+        out.extend(rows)
+        offset += POLL_PAGE
+        if already_handled is None:
+            break                     # caller filters; one page is the old behaviour
+        if sum(1 for r in out if not already_handled(r)) >= int(limit):
+            break
+        if len(rows) < POLL_PAGE:
+            break
+    return out
 
 
 def resolve_gym_key(ticket, *, portal_key_for_gym=None, confirm_binding=None):
@@ -131,36 +177,68 @@ def resolve_gym_key(ticket, *, portal_key_for_gym=None, confirm_binding=None):
     return key
 
 
-def confirm_gym_binding(gym_uuid, account_key, *, state=None):
-    """True only when the portal plane maps THIS gym_id to THIS key, and maps no OTHER
-    gym to the same key. False on any uncertainty.
+def confirm_gym_binding(gym_uuid, account_key, *, state=None, fresh_key=None):
+    """Confirm a resolved account key three ways, or refuse.
 
-    Reads account_key_resolve's own cached plane rather than re-deriving anything, so
-    the two controls disagree exactly when the plane itself is inconsistent -- which is
-    the failure this is here to catch. Uniqueness matters as much as agreement: two
-    gyms sharing a key is precisely the split-brain shape, and a shared key must never
-    be used to pick whose data to read.
+    HONEST ABOUT WHAT THIS IS. The first version asserted `by_gym[gid] == key` against
+    the SAME cached dict the forward call had just read it out of -- a tautology, and
+    an audit said so. Only its uniqueness half could ever fire. These three checks are
+    different reads and different assertions:
+
+      1. FRESHNESS. Re-resolve with fresh=True, which bypasses the 300s success cache
+         and re-reads the plane. A cached answer that a live read disagrees with is
+         exactly the stale-fingerprint class this repo has been bitten by, and the
+         cached value alone cannot detect it.
+      2. LIVENESS. account_key_resolve.resolve(key) reads the `live` set and the
+         stale->live `mapping` -- different structures, built from different rows than
+         by_gym. It returns the key unchanged only when the key is genuinely live; a
+         stale key comes back remapped, and a key that resolves to something else must
+         never be used to decide whose data to read.
+      3. UNIQUENESS. No OTHER gym may map to this key. Two gyms sharing one key IS the
+         split-brain shape (7 of 19 gyms disagreed in this repo's own record), and a
+         shared key cannot identify a tenant.
+
+    False on ANY uncertainty: an unreadable plane, a half-read plane, a disagreement,
+    a remap, a shared key.
     """
+    from .. import account_key_resolve as _akr
     if state is None:
-        from .. import account_key_resolve as _akr
         state = _akr._state                                    # noqa: SLF001
+    if fresh_key is None:
+        def fresh_key(g):
+            return _akr.portal_key_for_gym(g, fresh=True)
     gid = str(gym_uuid or "").strip().lower()
     key = str(account_key or "").strip().lower()
     if not gid or not key:
         return False
+
+    # 1. FRESHNESS -- an independent read, not the cached one.
+    try:
+        if str(fresh_key(gym_uuid) or "").strip().lower() != key:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
     _live, _mapping, by_gym, ok = state()
     if not ok:
         return False                                  # a half-read plane proves nothing
-    if str(by_gym.get(gid, "")).strip().lower() != key:
+
+    # 2. LIVENESS -- read out of `live`/`mapping`, not out of by_gym.
+    try:
+        if str(_akr.resolve(key) or "").strip().lower() != key:
+            return False
+    except Exception:  # noqa: BLE001
         return False
+
+    # 3. UNIQUENESS.
     owners = [g for g, k in by_gym.items()
               if str(k or "").strip().lower() == key]
     return len(owners) == 1
 
 
 def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
-             limit=10, log=None, flag_on=None, poll=None, portal_key_for_gym=None,
-             confirm_binding=None):
+             notice_sink=None, limit=10, log=None, flag_on=None, poll=None,
+             portal_key_for_gym=None, confirm_binding=None):
     """One pass. Returns a summary dict; never raises out of a normal degrade path."""
     log = log or (lambda m: print(f"[client-dm] {m}"))
     on = _flag_on() if flag_on is None else bool(flag_on)
@@ -187,10 +265,14 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
 
     reply_sink = reply_sink or _wiring.bus_reply_sink(bus)
     escalation_sink = escalation_sink or _wiring.bus_escalation_sink(bus)
+    notice_sink = notice_sink or _wiring.bus_answered_notice_sink(bus)
     poll = poll or default_poll
 
+    def _handled_already(ticket):
+        return _already_handled(_messages(bus, ticket))
+
     try:
-        tickets = poll(bus, limit=int(limit))
+        tickets = poll(bus, limit=int(limit), already_handled=_handled_already)
     except Exception as e:  # noqa: BLE001
         log(f"poll failed: {type(e).__name__}: {e}")
         return {"ok": False, "reason": f"poll failed: {type(e).__name__}",
@@ -209,6 +291,8 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
         text = _latest_client_text(msgs)
         if not text:
             continue
+        t = dict(t)
+        t["_surface"] = surface        # the REAL surface, for the rows the sinks write
 
         gym_key = resolve_gym_key(t, portal_key_for_gym=portal_key_for_gym,
                                   confirm_binding=confirm_binding)
@@ -219,6 +303,23 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
             if decision.will_post:
                 reply_sink(t, decision)
                 replied += 1
+                # EVERY AUTO-REPLY IS ALSO CARDED TO A HUMAN, unconditionally.
+                #
+                # This replaces a keyword list that could not work. is_ad_money_topic
+                # missed 10 of 10 plainly ad-money phrasings an owner would type
+                # ("raise the daily spend on facebook", "pause everything we are
+                # paying for"), and a message pairing one of those with a routable
+                # phrase auto-replied about the photos and dropped the rest in
+                # silence. Same for a hard line riding along: "my posts have no
+                # photos. did you take money out twice this month?"
+                #
+                # Widening the keyword list is the loop D68 forbids. The structural
+                # answer is that this lane ANSWERS a narrow, verified thing and never
+                # claims to have handled the whole message -- so a human reads every
+                # message it replied to, sees the client's own words, and can follow
+                # up on whatever Echo did not address. It costs one card per reply
+                # and it does not care how anything was phrased.
+                notice_sink(t, decision)
             else:
                 escalation_sink(t, decision)
                 escalated += 1
