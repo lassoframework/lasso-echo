@@ -89,6 +89,9 @@ LANE_NAME = "client_dm_support"
 
 # Contracts of the EXISTING outbox. Getting either wrong silently drops the row.
 DELIVERY_READY = "ready"
+# The status outbox.run_once stamps once a row has ACTUALLY been posted into the
+# person's Slack thread (outbox.py:358). A row still 'ready' or 'held' reached nobody.
+DELIVERY_POSTED = "posted"
 
 _TICKETS = "support_tickets"
 
@@ -170,18 +173,24 @@ def _escalate(reason, **kw):
     return Decision(Outcome.ESCALATE, reason, **kw)
 
 
-def decide(*, text, gym_key, may_reply, deps=None):
-    """Decide what to do about ONE client message. Never raises."""
+def decide(*, text, gym_key, may_reply, deps=None, echo_already_asked=False):
+    """Decide what to do about ONE client message. Never raises.
+
+    `echo_already_asked` is a fact about the CONVERSATION, not about the words: True
+    when Echo has already spoken on this thread and the client has written since. See
+    the comment at its use below.
+    """
     deps = dict(deps or {})
     try:
-        return _decide(text=text, gym_key=gym_key, may_reply=may_reply, deps=deps)
+        return _decide(text=text, gym_key=gym_key, may_reply=may_reply, deps=deps,
+                       echo_already_asked=echo_already_asked)
     except _c.Refused as e:
         return _escalate(str(e), client_text=str(text or ""))
     except Exception as e:  # noqa: BLE001 - one ticket never sinks the pass
         return _escalate(f"{type(e).__name__}: {e}", client_text=str(text or ""))
 
 
-def _decide(*, text, gym_key, may_reply, deps):
+def _decide(*, text, gym_key, may_reply, deps, echo_already_asked=False):
     client_text = str(text or "")
 
     # 1. The hard-line belt. Unconditional, first, before anything reads a fact.
@@ -214,6 +223,37 @@ def _decide(*, text, gym_key, may_reply, deps):
             "the measured state does not match any enumerated condition for this "
             "family",
             gym_key=key, client_text=client_text,
+            audit={"probe": probe_id, "readings": dict(before.values)})
+
+    # 5b. AN ASK IS SPENT ONCE THE CLIENT HAS ANSWERED IT.
+    #
+    # Measured, not reasoned: this file's own `decide()` was run against John Weeks'
+    # REAL brand bible (read from the production volume, 2026-09-07) and his REAL
+    # latest message -- "Yes let's include a call to action to book a free intro class,
+    # similar to what our paid ads are doing". It returned Outcome.REPLY and composed
+    # "What would you like your posts to ask people to do?", which is the question he
+    # had just answered. Every control passed, correctly: the reading is right, the
+    # condition genuinely applies, and the reply is faithfully grounded.
+    #
+    # The gap is that `_already_handled` asks "has THIS LANE written here", and Echo's
+    # ORDINARY reply path is what asked him. So on a thread where Echo has spoken and
+    # the client has answered, a lane that has never itself spoken sees a fresh ticket.
+    #
+    # The tempting fix is to read his words and notice they are an answer. That is
+    # classifying the QUESTION over an open input space -- D67's failure, exactly, and
+    # this package exists because that does not work. The closed version is a fact
+    # about the CONVERSATION, which this codebase owns and can count.
+    #
+    # Scoped to ACTION-LESS conditions on purpose. A condition with an action CHANGES
+    # something; running the Drive sync for a gym Echo has spoken to before is still
+    # the right thing to do. It is only the ask/tell-only outcomes -- cta_needed,
+    # drive_reshare -- that have nothing left to say once the client has responded.
+    if echo_already_asked and not condition.action:
+        return _escalate(
+            "Echo has already spoken on this thread and the client has written since, "
+            "so an ask-only outcome has nothing left to ask; a human should read what "
+            "they said",
+            gym_key=key, condition_id=condition.id, client_text=client_text,
             audit={"probe": probe_id, "readings": dict(before.values)})
 
     # 6. Act, or do not. Either way the reply is grounded in what was measured after.
@@ -278,6 +318,81 @@ def _already_handled(bus, ticket_id):
     return False
 
 
+def _echo_already_asked(bus, ticket_id):
+    """Has ANY Echo-side message already gone out on this thread, BEFORE the client's
+    latest words?
+
+    ANY -- deliberately broader than `_already_handled`, which asks only about rows
+    carrying this lane's own LANE_META stamp. That difference is the whole finding:
+    John Weeks was asked for his CTAs by Echo's ORDINARY reply path, answered, and this
+    lane -- never having written on that thread -- saw a fresh ticket and planned the
+    same question again.
+
+    WHAT COUNTS AS "ECHO SPOKE", AND WHY IT IS NOT author_type.
+    The first version of this predicate counted any outbound row whose author_type was
+    not "staff". That was guessed, and live production data (2026-09-07) falsifies it:
+    support_messages holds `author_type='system'` rows for `escalation`, `hold_notice`
+    and `fixer_request` -- INTERNAL cards delivered to the fixer channel, which the gym
+    owner never sees -- and several carry `attachments.recipient_kind='client'`, so
+    recipient_kind is no discriminator either. Counting one as "Echo spoke" would
+    suppress a legitimate FIRST ask on any ticket that had merely been escalated
+    internally, which is most of them: over-refusal, silently.
+
+    The repo already maintains the closed set this needs, so it is READ rather than
+    re-derived. adapter.INTERNAL_KINDS ({escalation, fixer_request, hold_notice}) go to
+    the fixer channel and never into the person's thread; adapter.CONVERSATIONAL_KINDS
+    ({ack, answer, template, status}) are the client-facing ones, and `kind` rides in
+    attachments (bus.record_outbound:253). Membership is tested against
+    CONVERSATIONAL_KINDS -- an ALLOWLIST -- and not against "not internal", because
+    adapter.py's own comment records that the portal decides client visibility by a
+    DENYLIST, so a new internal kind is client-visible by default over there. This side
+    refuses by default instead.
+
+    DELIVERY IS REQUIRED. A `held`, `ready` or `failed` row never reached the gym owner,
+    so it cannot have consumed an ask.
+
+    `bus.recent_messages` orders created_at DESC (bus.py:273), so this walks newest
+    first and looks for a client-visible, delivered outbound sitting BEHIND at least one
+    gym-side message. Returns False on a read failure: absence of evidence is not
+    evidence of a prior ask, and failing closed here would mute the lane on every
+    Supabase blip.
+    """
+    from ..slack_convo import adapter as _a
+
+    try:
+        msgs = bus.recent_messages(ticket_id, limit=200) or []
+    except Exception:  # noqa: BLE001 - a read failure is not evidence of a prior ask
+        return False
+    seen_gym_side = False
+    for m in msgs:
+        direction = str(m.get("direction") or "")
+        if direction == "inbound":
+            # THE GYM SIDE IS {client, coach}; `staff` is LASSO. Read from
+            # adapter.author_type_for, whose whole range is {staff, coach, client}
+            # (adapter.py:550), over identity_gate's kinds: a gym OWNER resolves to
+            # CLIENT and a gym's COACH to COACH, while STAFF is Blake and the team.
+            # A coach answering Echo's question IS the gym answering it, so excluding
+            # them would leave the very bug this predicate exists to fix.
+            #
+            # Written as "not staff" rather than an allowlist, deliberately and in the
+            # direction that is safe HERE: an author type nobody anticipated counts as
+            # the gym having spoken, which suppresses the ask and sends a human. The
+            # opposite default would re-ask a paying client, which is the harm.
+            if str(m.get("author_type") or "") != _a._ig.STAFF:   # noqa: SLF001
+                seen_gym_side = True
+            continue
+        if direction != "outbound" or not seen_gym_side:
+            continue
+        att = m.get("attachments")
+        att = att if isinstance(att, dict) else {}
+        if str(att.get("kind") or "") not in _a.CONVERSATIONAL_KINDS:
+            continue                      # an internal card the client never saw
+        if str(m.get("delivery_status") or "") != DELIVERY_POSTED:
+            continue                      # queued, held or failed: it never reached them
+        return True
+    return False
+
+
 def _newest_client_message(bus, ticket):
     """The client's LATEST words, and the surface they arrived on.
 
@@ -285,12 +400,24 @@ def _newest_client_message(bus, ticket):
     this list forwards and therefore always saw the client's OLDEST message, so a
     follow-up -- including "forget the photos, can you double my ad budget?" -- was
     never seen by the hard-line belt at all.
+
+    THE AUTHOR SET IS THE ADAPTER'S, NOT A LOCAL GUESS. This read
+    ("client", "user", "human", "") and contained two values production never writes
+    while omitting one it does. adapter.author_type_for's whole range is
+    {staff, coach, client} (adapter.py:550): a gym OWNER resolves to CLIENT, a gym's
+    COACH to COACH, and STAFF is Blake and the LASSO team. So a thread whose newest
+    message came from a COACH skipped it entirely and fell through to
+    `ticket.raw_text` -- the ORIGINAL message -- which is the same "decided on the
+    client's oldest words" defect this docstring says was fixed, arriving through the
+    author filter instead of through the ordering.
     """
+    from ..slack_convo import adapter as _a
+
     for m in (bus.recent_messages(ticket["id"], limit=200) or []):
         if str(m.get("direction") or "") != "inbound":
             continue
-        if str(m.get("author_type") or "") not in ("client", "user", "human", ""):
-            continue
+        if str(m.get("author_type") or "") == _a._ig.STAFF:    # noqa: SLF001
+            continue                    # LASSO talking in the thread, not the gym
         att = m.get("attachments") or {}
         surface = att.get("surface") if isinstance(att, dict) else ""
         return str(m.get("body") or ""), str(surface or "")
@@ -468,7 +595,8 @@ def run_once(*, bus=None, identity=None, limit=5, product=DEFAULT_PRODUCT, deps=
         text, surface = _newest_client_message(bus, ticket)
         gym_key = _gym_key_for(ticket)
         decision = decide(text=text, gym_key=gym_key,
-                          may_reply=arm.may_reply_to_clients, deps=deps)
+                          may_reply=arm.may_reply_to_clients, deps=deps,
+                          echo_already_asked=_echo_already_asked(bus, ticket["id"]))
         wrote = _deliver(bus, ticket, ident, decision, arm, surface)
         summary["handled"] += 1
         summary["replies"] += 1 if wrote["reply"] else 0
