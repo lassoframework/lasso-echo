@@ -151,6 +151,29 @@ _LLM_BUDGET_S = 90.0
 # because that is the lane that actually clears most flagged posts.
 _CRAFT_LLM_FAILURE_CAP = 4
 
+# THE OVER-CAP PASS'S CONSECUTIVE-FAILURE CUTOFF (2026-09-07). The craft cutoff
+# above was built from a 2026-09-06 measurement that named `_fix_craft` as the
+# pass that ate the budget. Re-measured with per-pass wall clocks on the SAME
+# gym the next morning, it is not: on hillcountry `_fix_overcap` spent 97 of the
+# 90 second budget on TWO regens that both returned None, `_fix_craft` got 0.0
+# seconds (all 18 of its days fell back to mechanics, which cleared none), and
+# `_fix_body_sameness` was handed an already-expired deadline and broke on its
+# first day. A cutoff on craft alone leaves that untouched, because the pass in
+# front of craft never concedes.
+#
+# The over-cap regen fails for the same systemic reason and needs the same stop.
+# It gets its own name rather than sharing craft's because it fails FASTER: an
+# over-cap regen must come back with a DIFFERENT category, which is a stricter
+# ask than craft's, so fewer attempts are needed before the book has answered.
+# TWO consecutive failures is that answer. One can be a transient (an API
+# hiccup, one awkward source); the second, with no success between them, is the
+# book saying its approved sources cannot move a day off this category tonight.
+# A success resets the run, exactly as it does for craft, so a book where the
+# move genuinely works is never cut off. The next nightly sweep retries from
+# scratch, so the cost of conceding early is one deferred repair; the cost of
+# not conceding is measurably the whole book's budget.
+_OVERCAP_LLM_FAILURE_CAP = 2
+
 # The LLM-backed passes of `remediate_forward_book`, IN THE ORDER IT RUNS THEM.
 # Used only to hand each pass its own sub-deadline (see `_LlmBudget`); the
 # non-LLM passes (violations, invalid closings, ask excess) are absent because
@@ -545,12 +568,19 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log,
         return 0, len(over_cats)
 
     total_fixed = total_skipped = 0
+    # ONE cutoff across every iteration (see _OVERCAP_LLM_FAILURE_CAP): a regen
+    # that has failed twice running does not become likelier to work because the
+    # outer loop went round again. Armed with AGENT_CTA_VARIETY, like the craft
+    # cutoff and the budget split, so the flag-off posture is unchanged.
+    misses = [0] if config.cta_variety_enabled() else None
     for _ in range(_OVERCAP_MAX_ITER):
         if not _budget_left(deadline):
             break              # bounded: the nightly run always finishes
+        if misses is not None and misses[0] >= _OVERCAP_LLM_FAILURE_CAP:
+            break
         fixed, skipped = _overcap_pass(gym_id, rows, over_cats, store,
                                        caption_regen, avoid, log,
-                                       deadline=deadline)
+                                       deadline=deadline, misses=misses)
         total_fixed += fixed
         total_skipped += skipped
         over_cats = _over_cap_cats(rows)
@@ -560,7 +590,7 @@ def _fix_overcap(gym_id, rows, store, defects, caption_regen, avoid, log,
 
 
 def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
-                  deadline=None):
+                  deadline=None, misses=None):
     """One over-cap move wave: re-pillar excess wipeable days of each over-25%
     category by regenerating their caption from a DIFFERENT approved source
     category (the pillar label follows the caption that actually wrote the
@@ -586,6 +616,14 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
                 continue                       # human-owned day is never re-pointed
             if not _budget_left(deadline):
                 break                          # bounded LLM spend, honest stop
+            if misses is not None and misses[0] >= _OVERCAP_LLM_FAILURE_CAP:
+                # This book's approved sources cannot move a day off this
+                # category tonight. Stop paying for the answer and hand the rest
+                # of the budget to the passes behind this one.
+                log(f"{gym_id}: {misses[0]} over-cap regens in a row moved "
+                    "nothing on this book; stopping over-cap LLM regens and "
+                    "yielding the remaining budget")
+                break
             out = None
             try:
                 out = caption_regen(grp[0], avoid, cat)
@@ -593,16 +631,22 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
                 log(f"{gym_id} {day}: over-cap regen raised {type(exc).__name__}")
             if not out:
                 skipped += 1
+                if misses is not None:
+                    misses[0] += 1
                 continue
             new_cap, new_cat = out
             if not new_cat or str(new_cat).lower() == str(cat).lower():
                 skipped += 1                   # the content does not support a move
+                if misses is not None:
+                    misses[0] += 1
                 continue
             # Headroom in POST space, the same units the grader scores in: a
             # move that would push the TARGET over 25% trades one defect for
             # another and is never worth making.
             if (counts.get(new_cat, 0) + 1) / n > 0.25:
                 skipped += 1                   # target has no headroom: honest skip
+                if misses is not None:
+                    misses[0] += 1
                 continue
             if _patch_date_rows(gym_id, grp, store, new_cap, new_cat, log):
                 fixed += 1
@@ -610,8 +654,12 @@ def _overcap_pass(gym_id, rows, over_cats, store, caption_regen, avoid, log,
                 counts[cat] -= 1
                 counts[new_cat] = counts.get(new_cat, 0) + 1
                 avoid.add(new_cap.strip())
+                if misses is not None:
+                    misses[0] = 0     # the move works here: never cut it off
             else:
                 skipped += 1
+                if misses is not None:
+                    misses[0] += 1
     return fixed, skipped
 
 
@@ -1421,6 +1469,39 @@ def _fix_body_sameness(gym_id, rows, store, caption_regen, avoid, log,
     if not pairs_found:
         return 0, 0, 0
 
+    # THE CONTENT-MIX HEADROOM GUARD (2026-09-07). A fresh caption brings its own
+    # pillar, and this pass writes that pillar onto the day -- so a body repair
+    # MOVES a post between categories exactly as `_overcap_pass` does, and can
+    # push the target over the grader's 25% cap. Measured on topfuel's live book
+    # the day the repair first fired: body_max 1.0 -> 0.087 and pairs 4 -> 0, but
+    # the content_mix leg went 20 -> 17 ('offer is 26% of posts') and the book
+    # went 91 (A) -> 87 (B). `_cat_posts` already carries the ruling this breaks:
+    # "A repair must never be able to lower the grade." So this pass now uses the
+    # same headroom test the over-cap pass uses, in the same POST units the
+    # grader counts in, and a repair that would breach the cap is not made.
+    from collections import Counter
+
+    from agent.calendar_grade import _MIX_CAP_MIN_POSTS
+    cat_counts = Counter(_cat_of(grp[0]) for _k, grp in _cat_posts(rows))
+    n_cat_posts = sum(cat_counts.values()) or 1
+
+    def _cat_headroom(old_cat, new_cat) -> bool:
+        """True when writing `new_cat` onto a day that currently reads `old_cat`
+        keeps the target category at or under the grader's 25% cap.
+
+        Two ways to be fine. Staying in the same category never moves the counts.
+        And a book BELOW `calendar_grade._MIX_CAP_MIN_POSTS` is exempt from the
+        cap in the grader itself, so guarding against it here would refuse real
+        repairs to avoid a defect that is not measured: on a 4 post book the cap
+        allows ONE post per pillar, which no repair could ever satisfy. The guard
+        mirrors the grader exactly, or it is not a guard, it is a second opinion.
+        """
+        if not new_cat or str(new_cat).lower() == str(old_cat or "").lower():
+            return True
+        if n_cat_posts < _MIX_CAP_MIN_POSTS:
+            return True
+        return (cat_counts.get(new_cat, 0) + 1) / n_cat_posts <= 0.25
+
     fixed = unrepairable = 0
     for j in sorted(later_sides):
         (day, _h), grp = posts[j]
@@ -1449,6 +1530,17 @@ def _fix_body_sameness(gym_id, rows, store, caption_regen, avoid, log,
             log(f"{gym_id} {day}: body regen raised {type(exc).__name__}")
         new_cap = ((out or (None, None))[0] or "").strip()
         new_cat = (out or (None, None))[1] if out else None
+        # THE HOOK RE-LINEATION (2026-09-07). `_mechanical_repair` with no CTA
+        # moves exactly ONE line break: it re-lineates an over-long first line at
+        # its first sentence boundary and writes not a single word. `_fix_craft`
+        # has trusted it for precisely this since 2026-08-31. Without it this
+        # pass threw away good captions over a formatting detail it already owns
+        # the fix for: measured on hillcountry's live book, 15 of 16 fresh drafts
+        # cleared every CONTENT bar and were rejected on `hook_too_long` alone.
+        if new_cap and not _clears_craft(new_cap, allow_no_ask=True):
+            relined = _mechanical_repair(new_cap, None)
+            if relined and _clears_craft(relined, allow_no_ask=True):
+                new_cap = relined
         if not new_cap or new_cap in avoid:
             unrepairable += 1
             log(f"{gym_id} {day}: no fresh caption could be built for the "
@@ -1465,10 +1557,23 @@ def _fix_body_sameness(gym_id, rows, store, caption_regen, avoid, log,
             log(f"{gym_id} {day}: the regenerated caption does not clear the "
                 "craft bar; keeping the current caption")
             continue
+        old_cat = _cat_of(grp[0])
+        if not _cat_headroom(old_cat, new_cat):
+            unrepairable += 1
+            log(f"{gym_id} {day}: the fresh caption's pillar ({new_cat}) is "
+                "already at the 25% content-mix cap; keeping the current "
+                "caption rather than trading a repeated body for an over-cap "
+                "category")
+            continue
         if _patch_date_rows(gym_id, grp, store, new_cap, new_cat or None, log):
             fixed += 1
             avoid.add(new_cap)
             caps[j] = new_cap          # later chain members re-check against this
+            if new_cat and str(new_cat).lower() != str(old_cat or "").lower():
+                # Keep the running mix honest for the days still to be judged.
+                cat_counts[new_cat] = cat_counts.get(new_cat, 0) + 1
+                if old_cat:
+                    cat_counts[old_cat] = max(0, cat_counts.get(old_cat, 0) - 1)
         else:
             unrepairable += 1
     if fixed or unrepairable:
@@ -1606,12 +1711,31 @@ def _default_caption_regen(gym_id, profile, log):
         # category). _clean_draft_for_day itself walks neighbours too; the
         # record_serve/ledger is untouched (we only borrow the caption; the
         # row keeps its own photo).
+        #
+        # require_media=False FOLLOWS FROM THAT LAST CLAUSE (2026-09-07). The row
+        # keeps its own photo, so the draft's creative is the one part of it this
+        # closure never uses -- and demanding one was silently disabling EVERY
+        # repair pass on any gym whose media library is fully served. Measured
+        # live on hillcountry, with the body pass given the entire 300s budget
+        # and no competition: 5 of 5 body regens and 2 of 2 over-cap regens
+        # returned None, every one of them with the single drop reason 'not A+:
+        # no media (empty creative url)', while the captions those same drafts
+        # carried were clean, on-avatar and 0.01 body-similar to the book. This
+        # is why the shipped body-copy repair moved nothing on three real books:
+        # it was never starved of budget so much as starved of a caption.
+        #
+        # The caption bar is FULLY intact (banned words, the avatar rail, the A+
+        # caption checks, grounding). Only the photo requirement is lifted, for a
+        # caller that takes no photo. It is also ~30x cheaper: the media failure
+        # forced the builder's whole 8 day neighbour walk on every attempt, which
+        # is what turned a 1.5 second regen into a 48 second one.
         for step in range(4):
             key = (base + _td(days=step * 3)).isoformat()
             try:
                 draft, _drop = _clean_draft_for_day(
                     account, key, voice, library_path, banned, log,
-                    allow_reuse=True, avoid_captions=tuple(avoid_captions))
+                    allow_reuse=True, avoid_captions=tuple(avoid_captions),
+                    require_media=False)
             except Exception as exc:  # noqa: BLE001
                 log(f"{gym_id} {day}: caption regen failed: {type(exc).__name__}")
                 return None
