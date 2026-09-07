@@ -526,3 +526,87 @@ def test_one_active_source_is_unaffected():
     d = flow.handle_ticket(text="my posts have no photos", gym_key=F.CHAD_KEY,
                            deps=F.drive_deps(store, F.make_sync(5, store)))
     assert d.will_post and d.template_id == "drive_synced"
+
+
+def test_multiple_active_counts_ACTIVE_sources_not_every_row():
+    """`len(sources) > 1` survived a mutation run: a gym with ONE active source plus a
+    stale INACTIVE one would be escalated to a human instead of auto-fixed. Over-refusal,
+    never a false client message -- but the guard should measure what it says."""
+    import test_client_dm_flow as F
+
+    class OneActiveOneStale(F.FakeStore):
+        def list_sources(self, gym_id=None, include_inactive=False):
+            rows = [dict(F.CHAD_SOURCE, id=1, active=True),
+                    dict(F.CHAD_SOURCE, id=2, active=False,
+                         folder_name="Old Photos")]
+            return rows if include_inactive else [r for r in rows if r["active"]]
+
+    store = OneActiveOneStale(sources=[], assets=[])
+    snap = diagnostics.diagnose_drive_photos(
+        F.CHAD_KEY, store=store, now=F.NOW, daily_hour_utc=12,
+        lane_active_for=lambda k: True)
+    assert snap.get("media_source_multiple_active") is False, (
+        "a stale inactive source was counted as a second active one")
+    d = flow.handle_ticket(text="my posts have no photos", gym_key=F.CHAD_KEY,
+                           deps=F.drive_deps(store, F.make_sync(4, store)))
+    assert d.will_post and d.template_id == "drive_synced"
+
+
+def test_the_section_detector_matches_the_extractors_heading_level_exactly():
+    """A detector WIDER than agent.voice._extract_ctas re-creates the two-implementations
+    problem on the detection side: a "## CTA rotation" section with real CTAs and a TODO
+    note was detected here, found by nothing in the extractor, and so reported as an
+    empty placeholder -- auto-sending "still the blank placeholder from onboarding" over
+    three working CTAs."""
+    doc = ("## CTA rotation (cycle in order, one per post)\n"
+           "- Book your free intro at crossfitlocal.com/start\n"
+           "- Call us at 555 0101\n"
+           "> TODO: add two more\n\n## Hashtags\n")
+    facts = _cta_facts(doc)
+    assert facts["cta_section_present"] is False, facts
+    assert facts["cta_section_is_todo"] is False, facts
+    d = flow.handle_ticket(text="my posts have no call to action",
+                           gym_key="crossfitlocal",
+                           deps={"voice_dir": "/data/brand_voice",
+                                 "read_text": lambda _p: doc})
+    assert "blank placeholder" not in (d.reply_text or "")
+
+    # ...and every heading every writer in this repo emits is still detected.
+    for heading in ("### CTA rotation (cycle in order, one per post)",
+                    "###  CTA rotation", "### cta rotation"):
+        assert _cta_facts(heading + "\n> TODO: fill me\n\n### X\n")[
+            "cta_section_present"] is True, heading
+
+
+def test_capped_counts_only_tickets_this_pass_would_have_acted_on():
+    """It counted every unprocessed poll row and the log called them all "actionable"."""
+    import test_client_dm_flow as F
+    tickets, msgs = [], {}
+    for i in range(4):                                   # actionable client DMs
+        tid = f"A{i}"
+        tickets.append({"id": tid, "product": "echo", "source": "slack_conversation",
+                        "status": "hold", "bot_identity": "echo",
+                        "client_id": f"uuid-{i}"})
+        msgs[tid] = [{"direction": "inbound", "author_type": "client",
+                      "body": "my posts have no photos",
+                      "attachments": {"surface": "mpim"}}]
+    for i in range(3):                                   # never actionable
+        tid = f"N{i}"
+        tickets.append({"id": tid, "product": "echo", "source": "slack_conversation",
+                        "status": "hold", "bot_identity": "echo",
+                        "client_id": f"uuid-n{i}"})
+        msgs[tid] = [{"direction": "inbound", "author_type": "client", "body": "hi",
+                      "attachments": {"surface": "channel"}}]
+    bus = F.FakeBus(tickets=tickets, messages=msgs)
+    store = F.FakeStore(
+        sources=[dict(F.CHAD_SOURCE, gym_id=f"gym{i}") for i in range(4)], assets=[])
+    out = consumer.run_once(
+        bus=bus, flag_on=True, limit=2,
+        deps={"store": store, "now": F.NOW, "daily_hour_utc": 12,
+              "lane_active_for": lambda k: True,
+              "sync_source": F.make_sync(3, store), "log": lambda m: None},
+        portal_key_for_gym=lambda u: f"gym{u.split('-')[1]}"
+        if not u.split('-')[1].startswith('n') else "gymx",
+        confirm_binding=lambda _g, _k: True, notice_sink=lambda _t, _d: None)
+    assert out["handled"] == 2, out
+    assert out["capped"] == 2, out      # 4 actionable - 2 handled, NOT 5

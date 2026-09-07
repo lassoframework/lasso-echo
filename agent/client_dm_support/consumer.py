@@ -349,7 +349,11 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
     capped = 0
     for t in tickets:
         if handled >= int(limit):
-            capped += 1
+            # Count only what this pass would actually have acted on. Counting every
+            # unprocessed poll row and calling them all "actionable" over-reports the
+            # deferred work (safe direction, but not true).
+            if _would_act_on(t):
+                capped += 1
             continue
         msgs = _msgs(t)
         surface = _surface_of(msgs)

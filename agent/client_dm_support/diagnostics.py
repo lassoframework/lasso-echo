@@ -214,7 +214,15 @@ def diagnose_drive_photos(gym_key, *, store=None, now=None, daily_hour_utc=None,
 # ---------------------------------------------------------------------------
 # Case 2 shape: "my posts have no call to action"
 # ---------------------------------------------------------------------------
-_CTA_HEADING_RE = re.compile(r"^#{2,4}\s*CTA rotation", re.I | re.M)
+# EXACTLY the heading level agent.voice._extract_ctas requires (r"###\s+CTA rotation"),
+# not a wider #{2,4}. A wider detector re-creates the two-implementations problem this
+# module just removed from the counting side: a hand-edited "## CTA rotation" section
+# with real CTAs and a TODO note was detected here, found by nothing in the extractor,
+# and therefore reported as pool=0 + is_todo=True -- auto-sending "still the blank
+# placeholder from onboarding" over three working CTAs. Every writer in this repo emits
+# "###" (bible_drafter, onboard, website_intake, tenants), so matching the extractor
+# exactly costs nothing and means the two can no longer disagree.
+_CTA_HEADING_RE = re.compile(r"^###\s+CTA rotation", re.I | re.M)
 
 # THE POOL IS COUNTED BY THE EXTRACTOR THE CAPTION PIPELINE ACTUALLY USES.
 #
