@@ -110,10 +110,20 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     exclude_keys: creative basenames that must NOT be picked (photos already on the gym's
     approved/published rows + this build's placements).
 
-    allow_reuse (denied-slot backfill only): when True, the §3 per-platform reuse window is
-    IGNORED for the vision branch, so a photo still inside its reuse window is a valid pick.
-    This is the ONE case a photo may be reused — replacing a human-denied slot for a gym at
-    its creative cap. Default False = the reuse window is enforced exactly as before."""
+    allow_reuse (denied-slot backfill only): a LAST RESORT, not a blend. The vision branch
+    always tries the pool with the §3 reuse window ENFORCED first; a fresh photo always wins
+    when one exists. Only when that pool is empty (the gym genuinely has no fresh creative
+    left) does allow_reuse=True fall back to a second pass with the window lifted, so a
+    recently-served photo becomes eligible. Default False = no fallback pass at all (a denied
+    slot with no fresh option returns None, same as before this fallback existed).
+
+    FIX (Pete/CrossFit Zanshin, 2026-09-07): this used to lift the reuse window BEFORE
+    scoring, so fresh and recently-denied photos were scored in the same pool together —
+    recency was only a minor nudge inside content_score, not a hard preference, so a
+    strong-scoring recently-denied photo could out-score an available fresh one and get
+    picked right back into the slot it was just denied from. "Replacing a human-denied slot
+    for a gym at its creative cap" only describes the fallback pass; it was never gated on
+    the gym actually being at that cap."""
     from . import dam
     imgs = [c for c in list_creatives(library_path)
             if c.media_type in ("image", "video")]
@@ -135,22 +145,33 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
 
     if config.vision_enabled_for(account_key) and pillar:
         from . import vision
-        cands = []
-        for c in imgs:
-            if c.media_type != "image":
-                continue                   # §2.1: videos are out of scope for vision auto-pick
-            analysis = vision.stored_analysis(c.path)
-            ok, _ = vision.auto_plannable(analysis)
-            if not ok:
-                continue                   # guardrail 13: flagged/unanalyzed never auto-planned
-            rk = _rkey(c)
-            if not allow_reuse and rotation.reuse_blocked(
-                    rk, account_key, day_key, served={account_key: served}):
-                continue                   # §3 per-platform reuse window (skipped on backfill)
-            recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
-            score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
-            if ok_slot:
-                cands.append((score, rk, _image_key(c), c))
+
+        def _vision_cands(*, enforce_window):
+            out = []
+            for c in imgs:
+                if c.media_type != "image":
+                    continue               # §2.1: videos are out of scope for vision auto-pick
+                analysis = vision.stored_analysis(c.path)
+                ok, _ = vision.auto_plannable(analysis)
+                if not ok:
+                    continue               # guardrail 13: flagged/unanalyzed never auto-planned
+                rk = _rkey(c)
+                if enforce_window and rotation.reuse_blocked(
+                        rk, account_key, day_key, served={account_key: served}):
+                    continue               # §3 per-platform reuse window
+                recency = 1.0 if last_served.get(rk, "") < window_start else 0.2
+                score, ok_slot = vision.content_score(analysis, pillar, recency=recency)
+                if ok_slot:
+                    out.append((score, rk, _image_key(c), c))
+            return out
+
+        # PASS 1: reuse window always enforced. A fresh photo always wins when one exists,
+        # whether or not the caller asked for allow_reuse.
+        cands = _vision_cands(enforce_window=True)
+        # PASS 2 (fallback, allow_reuse only): the gym genuinely has no fresh creative left.
+        # Only now does a recently-served photo become eligible.
+        if not cands and allow_reuse:
+            cands = _vision_cands(enforce_window=False)
         if not cands:
             return None
         cands.sort(key=lambda t: (-t[0], t[1], t[2]))   # high score, deterministic tie-break
@@ -166,6 +187,22 @@ def pick_image(account_key, day_key, library_path, exclude_keys=(), pillar=None,
     pool = fresh if fresh else imgs
     pool.sort(key=lambda c: (last_served.get(_rkey(c), ""), _image_key(c)))
     legacy = pool[0]
+    if not fresh:
+        # STALE REUSE (Pete/Zanshin, Dean/Reverb, 2026-09-07): the library is
+        # exhausted within its 14-day window, so this pick is a repeat, not a fresh
+        # photo. A day is still filled here (a polluted served ledger — every photo
+        # re-recorded with a bogus future date — must never collapse a whole month
+        # to zero content; see test_polluted_ledger_still_places_distinct_photos),
+        # but the pick is flagged so the CALLER can choose not to treat the day as
+        # "covered": client_month_run.append_gym_drive_drafts only fills days the
+        # uploaded-media loop left uncovered, so without this flag a small stale
+        # library silently claimed every day forever and a gym's connected Drive
+        # pool (hundreds of fresh, unused photos in both reported cases) never got
+        # a chance to fill it with something better instead.
+        try:
+            legacy.stale_reuse = True
+        except Exception:  # noqa: BLE001 - a frozen creative never blocks the pick
+            pass
     # §9.4 SHADOW: for a shadow (not enabled) gym, compute what vision WOULD pick and log the
     # diff, but SHIP the legacy pick unchanged. A plumbing smoke test, zero effect on posts.
     if pillar and config.vision_shadow_for(account_key):
@@ -616,6 +653,17 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 pass
             print(f"[vision] weak_match pick for {account.key} {day_key} "
                   f"(pillar {category}) -> coach review")
+        # stale_reuse: the legacy branch's library was exhausted within the reuse
+        # window, so this photo is a repeat, not fresh (Pete/Zanshin, Dean/Reverb,
+        # 2026-09-07). Carried onto the draft so client_month_run can leave the day
+        # off covered_days — a gym's connected Drive pool then gets a chance to fill
+        # it with something fresher instead of the day silently staying "claimed" by
+        # a stale small library forever.
+        if getattr(image, "stale_reuse", False):
+            try:
+                draft.stale_reuse = True
+            except Exception:
+                pass
         # §5: carry the grounding context so the A+ gate can reject a caption that
         # CONTRADICTS the crop-verified image (a contradiction is not A+ -> the month
         # builder walks alternatives = the §7 regen/swap; exhausted -> the day drops).
