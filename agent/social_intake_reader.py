@@ -245,11 +245,28 @@ def _build_intake_text(flat, banned_words):
     # lines, already flowing unchanged into client_sources' "offer" category too.
     for line in _nonempty_lines(flat.get("offers")):
         sec7.append(f"- {line}")
-    hashtags = ""
+    # The flat "voice" block joins several labelled fields with newlines
+    # (intake_web._lines joins a LIST value with "\n" too), so a gym that typed
+    # one hashtag per line has its "Hashtags:" field itself spanning several
+    # lines with the label only on the first. Capture every line until the next
+    # KNOWN voice-field label (or the block ends), not just the first line, or
+    # every hashtag after the first is silently dropped.
+    _VOICE_LABELS = ("vibe:", "content goal:", "words to use:",
+                     "words to never use:", "hashtags:", "sample posts:")
+    hashtag_parts, capturing = [], False
     for ln in _f("voice").splitlines():
-        if ln.strip().lower().startswith("hashtags:"):
-            hashtags = ln.split(":", 1)[1].strip()
-            break
+        low = ln.strip().lower()
+        if low.startswith("hashtags:"):
+            hashtag_parts.append(ln.split(":", 1)[1].strip())
+            capturing = True
+            continue
+        if capturing:
+            if any(low.startswith(p) for p in _VOICE_LABELS):
+                capturing = False
+                continue
+            if ln.strip():
+                hashtag_parts.append(ln.strip())
+    hashtags = " ".join(p for p in hashtag_parts if p)
     if hashtags:
         sec7.append(f"Hashtags: {hashtags}")
     lines.append("\n".join(sec7))

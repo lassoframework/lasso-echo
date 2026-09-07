@@ -276,6 +276,25 @@ def test_section7_hashtags_land_in_bible_from_real_intake_hashtags():
         "real hashtags from the intake never reached the hashtag strategy block"
 
 
+def test_section7_multiline_hashtags_all_land_not_just_the_first():
+    """Train716's real intake shape: one hashtag per line, so the flattened
+    'voice' field's Hashtags label sits on its own line followed by several
+    MORE lines with no label at all. Only the first would survive a naive
+    'grab this one line' extraction."""
+    ans = {
+        "base_key": "train716",
+        "gym": {"name": "Train716"},
+        "voice": {"hashtags": "#orchardpark\n#groupfitness\n#train716\n#HYROX\n"
+                               "#strengthtraining"},
+        "offers": {"front_door_offer": "Free Intro Session + InBody Scan"},
+    }
+    m = sir.map_answers(ans)
+    hashtag_block = m["bible_text"].split("### Hashtag strategy", 1)[1]
+    for tag in ("#orchardpark", "#groupfitness", "#train716", "#HYROX",
+                "#strengthtraining"):
+        assert tag in hashtag_block, f"{tag!r} dropped from the hashtag block"
+
+
 def test_section7_stays_todo_with_no_fabrication_when_intake_carries_neither():
     ans = _gritx_answers()
     ans["offers"] = {"services": "Small group training", "front_door_offer": "",
