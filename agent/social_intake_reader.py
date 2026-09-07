@@ -171,7 +171,24 @@ def _build_intake_text(flat, banned_words):
     the ONE-parser flat dict (intake_web.normalize_portal_intake output). Section 3
     (voice + tone) ALWAYS lists the words_to_never_use so the drafted bible carries
     the banned list verbatim. Only intake facts are used: nothing invented. A
-    missing section is left blank (bible_drafter renders its own TODO)."""
+    missing section is left blank (bible_drafter renders its own TODO).
+
+    Sections 5 (content pillars) and 6 (social proof) are DELIBERATELY left
+    unemitted: pillars are never captured by this form at all (matching
+    render_intake_md's own "uncaptured section" note), and this form's proof
+    lines carry no per-entry Permission field, so an emitted section 6 would
+    never pass parse_proof_entries's permission check anyway -- omitting it
+    produces the identical, honest "no permissioned entries" result.
+
+    Section 7 (CTAs, links, and hashtags) FEEDS bible_drafter.draft_bible's
+    CTA-rotation AND hashtag-strategy blocks (both read _sec(s, 7); see
+    bible_drafter.py). It used to be silently dropped here, so EVERY gym
+    onboarded through this bridge shipped a bible with empty CTA/hashtag
+    sections even when the intake's own front-door offer / promos / hashtags
+    were real (confirmed on toughtemple52040e and crossfitreverb30b5b2).
+    Only the intake's own offer text and its own "Hashtags:" line are used;
+    an intake with neither still renders the section blank (bible_drafter's
+    own TODO), never a fabricated CTA."""
     def _f(key):
         return _clean(flat.get(key))
 
@@ -214,6 +231,45 @@ def _build_intake_text(flat, banned_words):
         lines.append(f"Exact pricing wording (use verbatim): {_f('pricing_rule')}")
     if _f("media_notes"):
         lines.append(f"Media notes: {_f('media_notes')}")
+    lines.append("")
+    lines.append("## 7. CTAs, links, and hashtags")
+    sec7 = []
+    # One BULLET per line of the intake's own front-door offer / upcoming promos:
+    # bible_drafter.draft_bible's CTA-rotation block is not just for human display,
+    # voice.load_voice's _extract_ctas parses ONLY quoted or bulleted/numbered list
+    # items out of "### CTA rotation" (drafter.py and content_planner.py both read
+    # voice.ctas for live caption CTAs). A single free-text paragraph here would
+    # render fine for a human but stay INVISIBLE to that parser, so each fact gets
+    # its own bullet -- exactly the shape the parser (and the "cycle in order, one
+    # per post" rotation) expects. Never invented: these are the intake's own
+    # lines, already flowing unchanged into client_sources' "offer" category too.
+    for line in _nonempty_lines(flat.get("offers")):
+        sec7.append(f"- {line}")
+    # The flat "voice" block joins several labelled fields with newlines
+    # (intake_web._lines joins a LIST value with "\n" too), so a gym that typed
+    # one hashtag per line has its "Hashtags:" field itself spanning several
+    # lines with the label only on the first. Capture every line until the next
+    # KNOWN voice-field label (or the block ends), not just the first line, or
+    # every hashtag after the first is silently dropped.
+    _VOICE_LABELS = ("vibe:", "content goal:", "words to use:",
+                     "words to never use:", "hashtags:", "sample posts:")
+    hashtag_parts, capturing = [], False
+    for ln in _f("voice").splitlines():
+        low = ln.strip().lower()
+        if low.startswith("hashtags:"):
+            hashtag_parts.append(ln.split(":", 1)[1].strip())
+            capturing = True
+            continue
+        if capturing:
+            if any(low.startswith(p) for p in _VOICE_LABELS):
+                capturing = False
+                continue
+            if ln.strip():
+                hashtag_parts.append(ln.strip())
+    hashtags = " ".join(p for p in hashtag_parts if p)
+    if hashtags:
+        sec7.append(f"Hashtags: {hashtags}")
+    lines.append("\n".join(sec7))
     return "\n".join(lines)
 
 
@@ -362,6 +418,76 @@ def onboard_from_social(account_key, answers, *, approve=True):
         "approver": mapped["approver"],
         "base": base,
     }
+
+
+# ---- backfill: recover section 7 (CTA/hashtags) for ALREADY-onboarded gyms --------
+# THE BUG: _build_intake_text used to never emit section 7 at all, so every gym
+# onboarded through this bridge got a bible with an empty CTA-rotation and
+# hashtag-strategy block even when its real intake carried a real front-door offer,
+# upcoming promos, or hashtags. Fixing _build_intake_text only helps NEW onboardings;
+# a gym already onboarded already has its lasso_voice.md written (write_brand_docs
+# never overwrites an existing file), so its bible is stuck with the empty section
+# forever unless something explicitly recovers it. This is that recovery, run once
+# per already-onboarded gym.
+
+def backfill_section7(base_key, *, reader=None, voice_dir=None):
+    """Recover section 7 (CTA/hashtags) for ONE already-onboarded gym's EXISTING
+    lasso_voice.md, from that SAME gym's real raw intake (never a different gym's,
+    never invented). Patches ONLY the CTA-rotation / hashtag-strategy block bodies,
+    and ONLY where the on-disk file still carries the literal machine TODO for that
+    block (bible_drafter.patch_section7's own safety check) -- so a bible a human
+    has since reviewed, edited, or that was filled by any other mechanism (e.g. a
+    generic fallback CTA) is left completely untouched. An intake with no real
+    offer/promo/hashtag data is reported honestly as such and the file is not
+    touched at all: this never fabricates a CTA. Returns a dict describing exactly
+    what happened; never raises for a missing bible or missing intake."""
+    base_key = _clean(base_key)
+    if not base_key:
+        return {"base": base_key, "ok": False, "reason": "empty base_key"}
+
+    answers = read_social_intake(base_key, reader=reader)
+    if answers is None:
+        return {"base": base_key, "ok": False, "reason": "no intake answers on file"}
+
+    mapped = map_answers(answers)
+    fresh_bible = mapped["bible_text"]
+    marker = f"{bible_drafter.CTA_HEADER}\n"
+    if marker not in fresh_bible:
+        return {"base": base_key, "ok": False,
+                "reason": "freshly-drafted bible has no CTA rotation header (unexpected)"}
+    new_body = fresh_bible.split(marker, 1)[1].split(f"\n\n{bible_drafter.HASHTAG_HEADER}",
+                                                       1)[0]
+
+    if new_body.strip() == bible_drafter.TODO:
+        return {"base": base_key, "ok": True,
+                "changed": {"cta": False, "hashtags": False},
+                "had_recoverable_data": False,
+                "note": "this gym's real intake has no front-door offer, upcoming "
+                        "promos, or hashtags to recover -- genuinely empty, not "
+                        "fabricated"}
+
+    voice_dir = voice_dir or config.client_voice_dir()
+    bible_path = os.path.join(voice_dir, base_key, "lasso_voice.md")
+    if not os.path.exists(bible_path):
+        return {"base": base_key, "ok": False, "reason": f"no existing bible at {bible_path}"}
+
+    with open(bible_path, encoding="utf-8") as fh:
+        old_text = fh.read()
+    patched, changed = bible_drafter.patch_section7(old_text, new_body)
+    if changed["cta"] or changed["hashtags"]:
+        with open(bible_path, "w", encoding="utf-8") as fh:
+            fh.write(patched)
+    return {"base": base_key, "ok": True, "changed": changed,
+            "had_recoverable_data": True, "bible_path": bible_path}
+
+
+def backfill_section7_many(base_keys, *, reader=None, voice_dir=None):
+    """backfill_section7 for a caller-supplied list of already-onboarded base keys.
+    Deliberately NOT auto-discovering: which gyms are eligible (a real canonical
+    account, not an orphaned/duplicate key from the account-key split-brain issue)
+    is a judgment call the caller makes explicitly, not something this function
+    guesses. Returns the list of per-gym result dicts."""
+    return [backfill_section7(b, reader=reader, voice_dir=voice_dir) for b in base_keys]
 
 
 # ---- automatic forward: map EVERY un-routed intake into Echo -----------------------

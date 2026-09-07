@@ -83,6 +83,34 @@ def parse_proof_entries(section6):
     return kept, skipped
 
 
+CTA_HEADER = "### CTA rotation (cycle in order, one per post)"
+HASHTAG_HEADER = "### Hashtag strategy (3 to 5 per post)"
+
+
+def patch_section7(bible_text, new_body):
+    """Backfill helper for an EXISTING, already-onboarded gym whose lasso_voice.md
+    was drafted before the intake->bible section-7 (CTA/hashtag) bridge carried real
+    data. Replaces ONLY the CTA-rotation and hashtag-strategy block bodies, and ONLY
+    where each block still holds the exact machine TODO placeholder this module
+    itself writes (see draft_bible above) -- i.e. nothing has been approved, edited,
+    or otherwise filled in there since generation. Any block that already carries
+    different text (a human edit, a generic fallback CTA, or prior real content) is
+    left BYTE FOR BYTE untouched; this function never overwrites reviewed work.
+
+    Returns (patched_text, {"cta": bool, "hashtags": bool}) reporting which blocks
+    actually changed. Pure: never reads or writes a file itself."""
+    changed = {"cta": False, "hashtags": False}
+    old_cta = f"{CTA_HEADER}\n{TODO}"
+    if old_cta in bible_text:
+        bible_text = bible_text.replace(old_cta, f"{CTA_HEADER}\n{new_body}", 1)
+        changed["cta"] = True
+    old_hash = f"{HASHTAG_HEADER}\n{TODO}"
+    if old_hash in bible_text:
+        bible_text = bible_text.replace(old_hash, f"{HASHTAG_HEADER}\n{new_body}", 1)
+        changed["hashtags"] = True
+    return bible_text, changed
+
+
 def draft_bible(client, intake_text):
     """(bible_md, social_proof_md) drafted STRICTLY from the intake's own words."""
     s = parse_intake(intake_text)
