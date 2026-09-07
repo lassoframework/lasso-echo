@@ -57,6 +57,12 @@ _STATUS_WRITER_FILES = (
     os.path.join("slack_convo", "adapter.py"),
     os.path.join("slack_convo", "outbox.py"),
     os.path.join("slack_convo", "bus.py"),
+    # The client-DM support lane writes support_messages rows through the same bus. It
+    # names its delivery status through a module constant (lane.DELIVERY_READY), which
+    # tests/test_client_dm_lane.py pins against the allow-list below; the file is
+    # listed here so any FUTURE inline literal is caught by the same AST check that
+    # covers the rest of the writer surface.
+    os.path.join("client_dm_support", "lane.py"),
 )
 
 

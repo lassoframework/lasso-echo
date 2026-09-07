@@ -1,0 +1,669 @@
+"""The lane: hard limits, routing asymmetry, delivery, cards, and the pinned
+contracts of the modules this one talks to.
+
+The two real cases this capability exists for are at the bottom, end to end.
+"""
+import pytest
+
+from agent.client_dm_support import arming as A
+from agent.client_dm_support import conditions as C
+from agent.client_dm_support import lane as L
+from agent.client_dm_support import no_ad_rail as N
+from agent.client_dm_support import probes as P
+from tests.test_client_dm_no_fakes import FaithfulBus, _ticket
+
+
+class Store:
+    def __init__(self, sources=(), assets=()):
+        self.sources, self.assets = list(sources), list(assets)
+
+    def list_sources(self, gym_id=None, include_inactive=False):
+        rows = [s for s in self.sources if gym_id in (None, s["gym_id"])]
+        return rows if include_inactive else [s for s in rows if s["active"]]
+
+    def list_assets(self, gym_id, source_id=None):
+        return [a for a in self.assets if a["gym_id"] == gym_id]
+
+
+def src(gym="crossfitlocal", sid="s1", active=True, revoked=False):
+    return {"id": sid, "gym_id": gym, "kind": "gym_drive", "active": active,
+            "revoked_externally": revoked, "folder_id": "F",
+            "folder_name": "Ad Photos"}
+
+
+def assets(n, gym="crossfitlocal", sid="s1", eligible=True):
+    return [{"id": f"{gym}-{i}", "gym_id": gym, "source_id": sid,
+             "eligible": eligible, "excluded_by_coach": False} for i in range(n)]
+
+
+VOICE_TODO = ("### CTA rotation (cycle in order, one per post)\n"
+              "> TODO: this section was missing or empty in the intake. Fill it by "
+              "hand before activation.\n### Next\n")
+VOICE_REAL = ("### CTA rotation (cycle in order, one per post)\n"
+              "1. Book a free call. Link in bio.\n"
+              "2. Send this to a friend.\n### Next\n")
+
+
+# ---------------------------------------------------------------------------
+# BLAKE'S HARD LIMITS.
+# ---------------------------------------------------------------------------
+AD_MESSAGES = [
+    "can you double my ad budget?",
+    "raise the daily spend on facebook",
+    "pause everything we are paying for",
+    "my cpl is way too high this week",
+    "change the targeting to 25-45 women",
+    "launch the new campaign tomorrow",
+    "turn off the ads for a week",
+    "boost the reel from friday",
+    "what are we spending per lead",
+    "add another ad set",
+]
+
+OTHER_HARD_LINES = [
+    "can I get a refund on last month's invoice",
+    "one of our members got injured, what do we do",
+    "our lawyer wants to see the liability waiver",
+    "what's the api token for the pixel",
+    "please change our class schedule on the site",
+]
+
+# THE PHRASINGS THIS BELT PROVABLY MISSES.
+#
+# These three are D67's round-9 cases verbatim -- the ones that ended a nine-round
+# loop, because in that design the belt WAS the last line of defence and 15 of 16
+# must-hold messages posted to a client with no tap.
+#
+# They are recorded here rather than fixed, deliberately, and this is the single most
+# important test in this file. Adding "took money out", "we open at" and "other gym"
+# to ESCALATE_ALWAYS would make this list green and would be D68's exact failure mode:
+# enumerating an open set, fitting to the sample, feeling like progress. The next three
+# phrasings would be found by the next audit.
+#
+# What changed is not the belt. It is that the belt no longer decides anything. Below,
+# each of these still produces NO reply -- not because a keyword matched, but because
+# no probe measures a fact that answers them, so no condition matches and no sentence
+# can be constructed at all. The unsafe cases stopped being cases to enumerate and
+# became a structural impossibility.
+BELT_MISSES = [
+    "did you guys take money out twice this month?",
+    "we open at 5 now, does the calendar know?",
+    "can you look at the other gym's account",
+]
+
+
+@pytest.mark.parametrize("text", AD_MESSAGES + OTHER_HARD_LINES + BELT_MISSES)
+def test_no_hard_line_message_can_ever_produce_a_reply(text):
+    """THE RULE. Asserted over every hard-line message, including the ones the belt
+    does not catch."""
+    d = L.decide(text=text, gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": Store([src()], assets(0))})
+    assert d.outcome == L.Outcome.ESCALATE, text
+    assert d.reply_text == ""
+
+
+@pytest.mark.parametrize("text", AD_MESSAGES + OTHER_HARD_LINES)
+def test_the_belt_catches_these_before_anything_reads_a_fact(text):
+    """THE MUTATION TARGET for the ad hard-block. Every ad-money phrasing is stopped
+    unconditionally, first, before a single fact is read."""
+    assert L.hard_line(text) is True
+    d = L.decide(text=text, gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": Store([src()], assets(0))})
+    assert d.reason == L.ESCALATE_ALWAYS_REASON
+
+
+@pytest.mark.parametrize("text", BELT_MISSES)
+def test_the_belt_misses_these_and_it_changes_nothing(text):
+    """Read the BELT_MISSES comment above before touching this test."""
+    assert L.hard_line(text) is False, (
+        "somebody added this phrasing to ESCALATE_ALWAYS. That is the enumeration loop "
+        "D68 names. The point of this test is that the belt does NOT need to catch it.")
+    d = L.decide(text=text, gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": Store([src()], assets(0))})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.reply_text == ""
+    # held by the SHAPE of the capability, not by a keyword: nothing measures this.
+    assert "no enumerated condition family" in d.reason
+
+
+def test_a_hard_line_riding_along_with_a_routable_phrase_still_escalates():
+    """Round 4's finding: the routable half must not win. This is the follow-up shape
+    that matters most -- 'forget the photos, can you double my ad budget?'"""
+    d = L.decide(text="forget the photos, can you double my ad budget?",
+                 gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": Store([src()], assets(0))})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.reason == L.ESCALATE_ALWAYS_REASON
+
+
+def test_the_hard_line_belt_is_checked_before_the_gym_key_is_even_resolved():
+    d = L.decide(text="raise the ad budget", gym_key="", may_reply=True, deps={})
+    assert d.reason == L.ESCALATE_ALWAYS_REASON
+
+
+def test_the_package_contains_no_ad_rail():
+    assert N.assert_no_ad_rail() is True
+
+
+def test_the_ad_tripwire_actually_fires(monkeypatch):
+    """A two-way guard on the tripwire: a scanner that can no longer see a rail
+    returns the same empty list as a repo with no rail -- D68's inert-identical-to-
+    healthy shape, landing on the ad guarantee."""
+    monkeypatch.setattr(N, "TRIPWIRE_LITERALS", ("gym_drive",))
+    with pytest.raises(N.AdRailPresent):
+        N.assert_no_ad_rail()
+
+
+def test_the_tripwire_module_list_is_pinned():
+    assert N.TRIPWIRE_MODULES == frozenset({"facebook_business", "pipeboard"})
+    assert "/act_" in N.TRIPWIRE_LITERALS
+    assert "graph.facebook.com" in N.TRIPWIRE_LITERALS
+
+
+def test_the_package_imports_no_ad_module_transitively():
+    """The real argument, not the tripwire: nothing in this package's own imports
+    reaches an ads surface."""
+    import ast
+    import os
+    pkg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "agent", "client_dm_support")
+    imported = set()
+    for fname in sorted(os.listdir(pkg)):
+        if not fname.endswith(".py"):
+            continue
+        with open(os.path.join(pkg, fname), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=fname)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[-1])
+                imported.update(a.name for a in node.names)
+    for banned in ("meta_ads", "pipeboard", "facebook_business", "marketing_api",
+                   "ad_writer", "campaigns"):
+        assert banned not in imported, f"{banned} is now importable from this package"
+
+
+# ---------------------------------------------------------------------------
+# THE ROUTER, WHICH IS NOT A SAFETY GATE.
+# ---------------------------------------------------------------------------
+def test_a_routable_message_picks_exactly_one_family():
+    assert L.route("the posts have no photos") == P.PROBE_DRIVE
+    assert L.route("we need a real call to action") == P.PROBE_CTA
+
+
+def test_a_message_matching_two_families_escalates_rather_than_picking_one():
+    assert L.route("the photos have no cta on them") is None
+
+
+def test_an_unroutable_message_escalates():
+    d = L.decide(text="hey how's it going", gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": Store([src()], assets(0))})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "no enumerated condition family" in d.reason
+
+
+def test_routing_to_the_WRONG_family_still_cannot_produce_a_reply():
+    """The asymmetry the router's safety rests on: a misroute means that probe's
+    readings match no condition, so it escalates. Safety is downstream of the router,
+    in what the answer is derived from."""
+    d = L.decide(text="anything", gym_key="crossfitlocal", may_reply=True,
+                 deps={"probe_id": P.PROBE_CTA, "voice_dir": "/v",
+                       "read_text": lambda p: VOICE_REAL})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "does not match any enumerated condition" in d.reason
+
+
+# ---------------------------------------------------------------------------
+# THE JOIN KEY.
+# ---------------------------------------------------------------------------
+def test_a_portal_uuid_is_refused_rather_than_queried_with():
+    d = L.decide(text="no photos", gym_key="43f2707f-6c25-4b18-ae12-bb3abd48907c",
+                 may_reply=True, deps={})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "portal gym uuid" in d.reason
+
+
+def test_a_leaky_store_cannot_make_this_gym_sync_a_rival_gyms_folder():
+    """Round 2's actual repro, and the reason the action re-asserts the tenant at the
+    WRITE path and not only at the read path: a store whose gym filter is broken (a
+    docstring lie, a dropped param, a cached client) returns another gym's source, and
+    everything downstream trusts it. A first mutation run found this check unheld
+    because every other fixture's store filters correctly."""
+    class Leaky(Store):
+        def list_sources(self, gym_id=None, include_inactive=False):
+            return [src("SOMEBODY_ELSE", "rival")]          # ignores gym_id entirely
+
+    ran = []
+    d = L.decide(text="my posts have no photos", gym_key="crossfitlocal",
+                 may_reply=True,
+                 deps={"store": Leaky(),
+                       "sync_source": lambda s, **kw: ran.append(s["id"]) or
+                       {"ok": True, "inserted": 9}})
+    assert ran == [], "this lane ran a sync on another gym's Drive folder"
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "SOMEBODY_ELSE" in d.reason and "not 'crossfitlocal'" in d.reason
+
+
+def test_an_unresolvable_gym_key_escalates_rather_than_guessing():
+    d = L.decide(text="no photos", gym_key="", may_reply=True, deps={})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "account key" in d.reason
+
+
+def test_the_gym_key_comes_from_the_repos_anti_divergence_primitive(monkeypatch):
+    from agent import account_key_resolve as _akr
+    seen = []
+    monkeypatch.setattr(_akr, "portal_key_for_gym",
+                        lambda gid, **kw: seen.append(gid) or "crossfitlocal")
+    assert L._gym_key_for({"client_id": "uuid-1"}) == "crossfitlocal"  # noqa: SLF001
+    assert seen == ["uuid-1"]
+
+
+# ---------------------------------------------------------------------------
+# ESCALATE-ONLY MODE COMPOSES NOTHING.
+# ---------------------------------------------------------------------------
+def test_with_may_reply_false_no_client_text_is_ever_produced():
+    store = Store([src()], assets(0))
+
+    def sync(source, **kw):
+        store.assets.extend(assets(5))
+        return {"ok": True, "inserted": 5}
+
+    d = L.decide(text="my posts have no photos", gym_key="crossfitlocal",
+                 may_reply=False, deps={"store": store, "sync_source": sync})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.reply_text == ""
+    assert "not armed to reply" in d.reason
+    # the fix still ran and was still verified -- escalate-only is not "do nothing"
+    assert d.audit["verification"].startswith("drive_library_usable rose")
+
+
+# ---------------------------------------------------------------------------
+# DELIVERY AND THE CARD.
+# ---------------------------------------------------------------------------
+def live_arm():
+    return A.preflight("echo", env={A.ENV_MASTER: "true", A.ENV_CLIENT_REPLY: "true",
+                                    A.ENV_LIVE_ACK: A.required_ack(
+                                        "echo", client_reply_armed=True)},
+                       client_reply_armed=True)
+
+
+class Ident:
+    name = "echo"
+    product = "echo"
+
+
+def test_every_reply_also_writes_a_human_card():
+    """Round 4's conclusion, and it is the reason the keyword belt is never the thing
+    standing between a client and a wrong outcome: a human sees every message this
+    lane touches, either way."""
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.REPLY, "ok", gym_key="crossfitlocal",
+                   condition_id="drive_library_empty",
+                   reply_text="I ran your photo sync just now.",
+                   client_text="no photos and also please raise my budget")
+    wrote = L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    assert wrote == {"reply": True, "card": True, "undelivered": 0}
+    kinds = [w["kind"] for w in bus.written]
+    assert kinds == ["status", "escalation"]
+    card = bus.written[1]["body"]
+    assert "no photos and also please raise my budget" in card
+    assert "Nothing else in their message was read" in card
+
+
+def test_every_written_row_carries_the_identity_stamp():
+    """outbox._dispatch_one suppresses any row with no identity stamp (outbox.py:325),
+    so a row without it lands in the DB and reaches nobody."""
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.REPLY, "ok", reply_text="x", client_text="y")
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    for w in bus.written:
+        assert w["meta"]["identity"] == "echo"
+        assert w["meta"][L.LANE_META] == L.LANE_NAME
+
+
+def test_a_reply_row_is_written_ready_and_marks_the_recipient_as_a_client():
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.REPLY, "ok", reply_text="x", client_text="y")
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    reply = bus.written[0]
+    assert reply["delivery_status"] == L.DELIVERY_READY
+    assert reply["meta"]["recipient_kind"] == "client"
+    assert reply["meta"]["surface"] == "mpim"
+
+
+def test_the_card_says_QUEUED_not_SENT():
+    """Round 5's finding: with the outbox's own flag off, the reply is HELD at post
+    time and the client gets nothing, so a card saying 'I auto-replied' was false on
+    100% of replies."""
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.REPLY, "ok", reply_text="x", client_text="y")
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    card = bus.written[1]["body"]
+    assert "QUEUED" in card and "the receipt is the record" in card
+    assert "I auto-replied" not in card
+
+
+def test_an_undelivered_reply_is_reported_loudly_not_swallowed():
+    class Broken(FaithfulBus):
+        def record_outbound(self, **kw):
+            if kw["kind"] == "status":
+                raise RuntimeError("insert failed")
+            return super().record_outbound(**kw)
+
+    bus = Broken([_ticket("1")])
+    d = L.Decision(L.Outcome.REPLY, "ok", reply_text="x", client_text="y")
+    wrote = L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    assert wrote["undelivered"] == 1 and wrote["reply"] is False
+    assert "Nobody has told this client anything" in bus.written[0]["body"]
+
+
+def test_the_clients_own_words_are_bounded_and_escaped_on_the_card():
+    """A pasted message or a Drive folder name must not forge structure in a card a
+    human reads."""
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.ESCALATE, "why",
+                   client_text="<!channel> ```x``` " + "z" * 50_000)
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    card = bus.written[0]["body"]
+    assert "<!channel>" not in card and "&lt;!channel&gt;" in card
+    assert "```" not in card
+    # bounded, not merely escaped: a card body must stay readable and must fit the
+    # 8000-char column bus.record_outbound truncates at.
+    assert card.count("z") <= L._fenced.__defaults__[0]                # noqa: SLF001
+    assert len(card) < 1500
+
+
+def test_the_fence_caps_at_its_declared_length():
+    assert len(L._fenced("q" * 50_000)) < 700                          # noqa: SLF001
+    assert L._fenced("q" * 50_000).endswith(" ...")                    # noqa: SLF001
+
+
+def test_the_arming_verdict_is_re_checked_at_delivery_not_only_at_decision():
+    """Belt and braces, and the belt must actually hold: even handed a Decision that
+    carries reply text, _deliver must write NO client row unless the arming verdict
+    permits it. A first mutation run found this branch could be deleted with nothing
+    going red, because decide() already refuses to compose when unarmed."""
+    d = L.Decision(L.Outcome.REPLY, "ok", condition_id="drive_library_empty",
+                   reply_text="I ran your photo sync just now.", client_text="hi")
+    for env in ({A.ENV_MASTER: "true"},
+                {A.ENV_MASTER: "true", A.ENV_CLIENT_REPLY: "true"}):
+        bus = FaithfulBus([_ticket("1")])
+        arm = A.preflight("echo", env=env, client_reply_armed=True)
+        wrote = L._deliver(bus, _ticket("1"), Ident(), d, arm, "mpim")  # noqa: SLF001
+        assert wrote["reply"] is False, env
+        assert [w["kind"] for w in bus.written] == ["escalation"], env
+
+
+def test_an_already_handled_ticket_is_never_answered_twice():
+    bus = FaithfulBus([_ticket("1")])
+    assert L._actionable(bus, _ticket("1")) is True         # noqa: SLF001
+    d = L.Decision(L.Outcome.REPLY, "ok", reply_text="x", client_text="y")
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    assert L._actionable(bus, _ticket("1")) is False        # noqa: SLF001
+
+
+def test_the_lane_reads_the_clients_NEWEST_message_not_their_oldest():
+    """bus.recent_messages orders created_at DESC. The previous build read it forwards
+    and therefore never saw a follow-up -- including the ad-budget one."""
+    bus = FaithfulBus([_ticket("1")], messages={"1": [
+        {"direction": "inbound", "author_type": "client", "created_at": "2026-09-01",
+         "body": "my posts have no photos", "attachments": {"surface": "mpim"}},
+        {"direction": "inbound", "author_type": "client", "created_at": "2026-09-05",
+         "body": "forget the photos, double my ad budget",
+         "attachments": {"surface": "mpim"}},
+    ]})
+    text, surface = L._newest_client_message(bus, _ticket("1"))   # noqa: SLF001
+    assert "double my ad budget" in text
+    assert surface == "mpim"
+
+
+# ---------------------------------------------------------------------------
+# THE PASS.
+# ---------------------------------------------------------------------------
+def test_run_once_with_the_master_off_reads_nothing_and_says_so(monkeypatch):
+    monkeypatch.delenv(A.ENV_MASTER, raising=False)
+    out = L.run_once(bus=FaithfulBus([_ticket("1")]), identity=Ident())
+    assert out["mode"] == A.MODE_OFF and out["handled"] == 0
+    assert A.ENV_MASTER in out["reason"]
+
+
+def test_run_once_in_escalate_only_cards_every_ticket_and_replies_to_none(monkeypatch):
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.delenv(A.ENV_CLIENT_REPLY, raising=False)
+    monkeypatch.delenv(A.ENV_LIVE_ACK, raising=False)
+    monkeypatch.setattr(L, "_gym_key_for", lambda t: "crossfitlocal")
+    bus = FaithfulBus([_ticket("1", raw_text="my posts have no photos")])
+    store = Store([src()], assets(0))
+    out = L.run_once(bus=bus, identity=Ident(), deps={"store": store})
+    assert out["mode"] == A.MODE_ESCALATE_ONLY
+    assert out["handled"] == 1 and out["replies"] == 0 and out["cards"] == 1
+    assert [w["kind"] for w in bus.written] == ["escalation"]
+
+
+def test_run_once_refuses_to_run_at_all_if_a_boot_check_fails(monkeypatch):
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.setattr(N, "TRIPWIRE_LITERALS", ("gym_drive",))
+    out = L.run_once(bus=FaithfulBus([]), identity=Ident())
+    assert out["ok"] is False and "boot check failed" in out["reason"]
+    assert out["handled"] == 0
+
+
+def test_one_exploding_ticket_never_sinks_the_pass(monkeypatch):
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.setattr(L, "_gym_key_for", lambda t: "crossfitlocal")
+
+    class Boom(Store):
+        def list_sources(self, **kw):
+            raise RuntimeError("supabase 503")
+
+    bus = FaithfulBus([_ticket("1", raw_text="no photos"),
+                       _ticket("2", raw_text="no photos")])
+    out = L.run_once(bus=bus, identity=Ident(), deps={"store": Boom()})
+    assert out["handled"] == 2 and out["cards"] == 2 and out["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# PINNED CONTRACTS OF THE MODULES THIS LANE TALKS TO.
+# ---------------------------------------------------------------------------
+def test_the_polled_statuses_and_sources_are_legal_values():
+    from tests.test_db_constraint_contract import SUPPORT_TICKETS_STATUS_VALUES
+    for s in L.POLL_STATUSES:
+        assert s in SUPPORT_TICKETS_STATUS_VALUES
+    assert set(L.POLL_STATUSES) == {"new", "triage", "hold"}
+    assert set(L.POLL_SOURCES) == {"slack_conversation", "website_tab"}
+
+
+def test_verification_is_deliberately_excluded_from_the_poll():
+    """That status means the adapter already drafted an answer on the D67-locked lane,
+    held for a tap. Replying here too would give the client two messages about one
+    question."""
+    assert "verification" not in L.POLL_STATUSES
+
+
+def test_the_delivery_status_this_lane_writes_is_a_legal_value():
+    from tests.test_db_constraint_contract import (
+        SUPPORT_MESSAGES_DELIVERY_STATUS_VALUES)
+    assert L.DELIVERY_READY in SUPPORT_MESSAGES_DELIVERY_STATUS_VALUES
+    assert L.DELIVERY_READY == "ready"
+
+
+def test_the_kinds_this_lane_writes_are_real_adapter_kinds():
+    from agent.slack_convo import adapter as _a
+    status, escalation = L._kinds()                            # noqa: SLF001
+    assert status == _a.KIND_STATUS and status in _a.CONVERSATIONAL_KINDS
+    assert escalation == _a.KIND_ESCALATION and escalation in _a.INTERNAL_KINDS
+
+
+def test_this_lane_never_writes_a_kind_answer_row():
+    """KIND_ANSWER routes through the D67-locked auto-answer gate. This lane must not
+    reach into that decision in either direction."""
+    import os
+    pkg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "agent", "client_dm_support")
+    for fname in os.listdir(pkg):
+        if fname.endswith(".py"):
+            with open(os.path.join(pkg, fname), encoding="utf-8") as fh:
+                assert "KIND_ANSWER" not in fh.read(), fname
+
+
+def test_the_lane_marker_is_pinned():
+    """Renaming it makes every historical record invisible, so the lane re-replies
+    once to every ticket it has ever answered."""
+    assert L.LANE_META == "client_dm_lane"
+    assert L.LANE_NAME == "client_dm_support"
+
+
+def test_the_flag_defaults_off():
+    import os
+    from agent import config
+    os.environ.pop("AGENT_CLIENT_DM_AUTOFIX", None)
+    os.environ.pop("AGENT_CLIENT_DM_CLIENT_REPLY", None)
+    assert config.client_dm_autofix_enabled() is False
+    assert config.client_dm_client_reply_enabled() is False
+
+
+def test_the_runner_calls_this_lane_behind_its_flag():
+    """A capability with no production caller is inert in exactly the way a healthy
+    idle one is (D68). Assert the wiring statically."""
+    import inspect
+    from agent import runner
+    source = inspect.getsource(runner.run_daily)
+    assert "config.client_dm_autofix_enabled()" in source
+    assert "from .client_dm_support.lane import run_once" in source
+
+
+# ---------------------------------------------------------------------------
+# THE TWO REAL CASES, END TO END.
+# ---------------------------------------------------------------------------
+def test_chad_edwards_crossfitlocal_the_case_with_a_fix():
+    """'the approval-queue posts have no photos'. Real state on 2026-09-06: one active
+    gym_drive source ('Ad Photos', connected 21:18 UTC, active, not revoked) and ZERO
+    media_asset rows, because the nightly sync at AGENT_DAILY_HOUR_UTC=12 had already
+    run before he connected.
+
+    The success condition is mechanical, not a judgement: usable assets 0 -> >0."""
+    store = Store([src("crossfitlocal")], [])
+    ran = []
+
+    def sync(source, **kw):
+        ran.append(source["id"])
+        store.assets.extend(assets(54, "crossfitlocal"))
+        return {"ok": True, "inserted": 54}
+
+    d = L.decide(text="the posts waiting for my approval have no photos on them",
+                 gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": store, "sync_source": sync})
+
+    assert d.outcome == L.Outcome.REPLY
+    assert d.condition_id == "drive_library_empty"
+    assert ran == ["s1"], "the scoped fix did not run"
+    assert d.reply_text == (
+        "I ran your photo sync just now. It added 54 new file(s). "
+        "Your media library has 54 file(s) Echo can post.")
+    # every sentence traces to a reading measured AFTER the fix
+    assert d.audit["stage"] == "verification"
+    assert d.audit["verification"] == "drive_library_usable rose from 0 to 54"
+    assert d.audit["readings"] == {"drive_sync_ran": True, "drive_files_added": 54,
+                                   "drive_library_usable": 54}
+
+
+def test_chad_edwards_gets_no_reply_if_the_sync_inserts_nothing():
+    """The verification is what stops 'I ran it' becoming a lie: an empty folder, a
+    MIME filter that rejects everything, a share that reads but yields nothing."""
+    store = Store([src("crossfitlocal")], [])
+    d = L.decide(text="my posts have no photos", gym_key="crossfitlocal",
+                 may_reply=True,
+                 deps={"store": store,
+                       "sync_source": lambda s, **kw: {"ok": True, "inserted": 0}})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "did not increase" in d.reason
+
+
+def test_chad_edwards_gets_no_reply_if_the_share_was_actually_revoked():
+    store = Store([src("crossfitlocal")], [])
+    d = L.decide(text="my posts have no photos", gym_key="crossfitlocal",
+                 may_reply=True,
+                 deps={"store": store,
+                       "sync_source": lambda s, **kw: {"ok": False, "revoked": True}})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert "share revoked" in d.reason
+
+
+def test_crossfitlocal_as_it_stands_today_gets_no_reply():
+    """Measured live 2026-09-07: crossfitlocal now holds 54 usable assets. The
+    scheduled run happened, so no condition matches and a human looks at it. A lane
+    that replied here would be answering a question the data says is already closed."""
+    store = Store([src("crossfitlocal")], assets(54, "crossfitlocal"))
+    d = L.decide(text="my posts have no photos", gym_key="crossfitlocal",
+                 may_reply=True, deps={"store": store})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.audit["readings"]["drive_library_usable"] == 54
+
+
+def test_john_weeks_toughtemple_the_case_with_NO_fix_only_a_question():
+    """'wants a real CTA'. Real state: the gym's lasso_voice.md '### CTA rotation'
+    section is literally the unfilled intake placeholder.
+
+    There is NO fix Echo may perform. A CTA is client-specific content, and inventing
+    one violates CLAUDE.md's hardest rule -- client content only, no invented facts,
+    offers, prices or stats. The correct behaviour is to ask him."""
+    d = L.decide(text="the posts need a real call to action",
+                 gym_key="toughtemple52040e", may_reply=True,
+                 deps={"voice_dir": "/vd", "read_text": lambda p: VOICE_TODO})
+
+    assert d.outcome == L.Outcome.REPLY
+    assert d.condition_id == "cta_pool_empty"
+    assert C.CONDITIONS["cta_pool_empty"].action == "", (
+        "the no-fix path grew an action; a CTA is the client's own content")
+    assert d.reply_text == (
+        "Your brand voice doc has 0 call(s) to action for Echo to rotate through, "
+        "which is why your posts are going out without one. I cannot write one for "
+        "you, because a call to action has to be your real booking link, phone number "
+        "or offer. What would you like your posts to ask people to do?")
+    assert d.audit["stage"] == "diagnosis"
+    assert d.audit["verification"] == "no write was performed; nothing to verify"
+
+
+def test_john_weeks_gets_no_reply_once_his_doc_has_real_ctas():
+    """Round 7's defect: a gym with three working CTAs and one leftover '> TODO' note
+    was auto-told its section was the blank onboarding placeholder, that it had zero
+    CTAs, and asked to redo work already done -- while the caption pipeline was
+    appending one of those three to every post."""
+    doc = VOICE_REAL.replace("### Next",
+                             "> TODO: add two more before spring\n### Next")
+    d = L.decide(text="we need a real call to action", gym_key="toughtemple52040e",
+                 may_reply=True,
+                 deps={"voice_dir": "/vd", "read_text": lambda p: doc})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.audit["readings"]["cta_pool_count"] == 2
+
+
+def test_a_gym_with_no_voice_doc_at_all_gets_no_reply():
+    d = L.decide(text="we need a call to action", gym_key="somegym", may_reply=True,
+                 deps={"voice_dir": "/vd", "read_text": lambda p: None})
+    assert d.outcome == L.Outcome.ESCALATE
+
+
+def test_a_gym_whose_media_rows_disagree_about_their_owner_gets_no_reply():
+    """Live 2026-09-07: toughtemple52040e carries 70 media_asset rows whose source
+    belongs to toughtemple086f51, and has no media_source of its own. Told 'my posts
+    have no photos', a gym-id-keyed probe sees zero sources and 70 assets."""
+    store = Store([], assets(70, "toughtemple52040e", sid="FOREIGN"))
+    snap = P.probe_drive("toughtemple52040e", store=store)
+    assert snap.get("drive_identity_split") is True
+    assert snap.get("drive_active_sources") == 0
+    d = L.decide(text="my posts have no photos", gym_key="toughtemple52040e",
+                 may_reply=True, deps={"store": store})
+    assert d.outcome == L.Outcome.ESCALATE
+
+
+def test_a_gym_with_six_active_folders_gets_no_reply():
+    """Live 2026-09-07: train7164ae502 really has six. Every Drive sentence here is
+    singular, so pluralising copy nobody has reviewed is not an option."""
+    store = Store([src("train7164ae502", f"s{i}") for i in range(6)], [])
+    d = L.decide(text="my posts have no photos", gym_key="train7164ae502",
+                 may_reply=True, deps={"store": store})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.audit["readings"]["drive_active_sources"] == 6
