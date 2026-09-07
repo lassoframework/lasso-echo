@@ -517,9 +517,20 @@ def _fenced(text, cap=600):
 
 
 def _card_text(ticket, decision, arm, wrote):
+    gym_key = decision.gym_key or ticket.get("client_id") or "?"
+    # OWNER + GYM NAME (Blake, 2026-09-07): resolved server-side from gym_key (OUR
+    # OWN gyms/clients rows), never anything the client typed or set themselves.
+    gym_line = f"gym: {gym_key}"
+    try:
+        from .. import gym_identity
+        label = gym_identity.submitter_label_for(gym_key)
+        if label:
+            gym_line = f"{gym_line} ({label})"
+    except Exception:  # noqa: BLE001 - a lookup failure never blocks the card
+        pass
     lines = [
         f"CLIENT DM SUPPORT ({LANE_NAME}) on ticket {ticket.get('id')}",
-        f"gym: {decision.gym_key or ticket.get('client_id') or '?'}",
+        gym_line,
         f"they wrote: {_fenced(decision.client_text)}",
     ]
     if decision.will_reply and wrote.get("reply"):

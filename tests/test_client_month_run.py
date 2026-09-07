@@ -388,6 +388,36 @@ def test_polluted_ledger_still_places_distinct_photos(tmp_path, monkeypatch):
     assert len(set(urls)) == 5, "a photo was reused across feeds"
 
 
+# ---- 9b. a stale repeat is left for a CONNECTED Drive pool instead of placed -----
+def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
+    """Same exhausted-library setup as the polluted-ledger test above, but this gym
+    has an active Drive connection (Pete/Zanshin, Dean/Reverb, 2026-09-07): the
+    uploaded-media loop must NOT place a stale repeat -- it leaves the day uncovered
+    so append_gym_drive_drafts gets the chance instead, rather than a small stale
+    library silently claiming every day forever."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    # No Drive builder is wired into this fake store, so the Drive lane itself
+    # produces nothing here -- the point is that the STALE repeat was never placed
+    # either, unlike the no-Drive-connection baseline (5/5 placed).
+    assert len(feed_ig) == 0, (
+        f"expected the stale-reuse day to be left for the Drive pool, not filled "
+        f"with a repeat, got {len(feed_ig)} feed day(s)"
+    )
+
+
 # ---- 10. locked (approved) days are skipped; their photos never re-picked --------
 class _LockedStore(_FakeStore):
     """FakeStore that also reports existing rows, like the live list_month."""
