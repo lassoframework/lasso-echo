@@ -1269,6 +1269,33 @@ def media_swap_free_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_MEDIA_SWAP_FREE", "false"))
 
 
+def caption_recreate_scoped_enabled() -> bool:
+    """ECHO_CAPTION_RECREATE_SCOPED, default OFF. The client-initiated SCOPED caption
+    recreate (partial-regen, piece 1/2 of "rotate only copy or image" — Blake,
+    2026-09-07).
+
+    media_swap_free_enabled (above) already split "the photo is wrong" into a FREE,
+    photo-only swap that keeps the caption untouched. This is the OTHER half: "the
+    caption is wrong" rewrites ONLY the copy on the gym's EXACT SAME photo, instead
+    of today's deny -> full recreate, which can (and often does) hand the gym a
+    DIFFERENT photo too even though the coach only disliked the words. People like
+    one or the other; changing both when only one was wrong is the bug.
+
+    ON: caption-only recreate rewrites the caption via the same SB7 path every build
+    uses (client_content.make_caption), re-verifies the photo/caption pairing via
+    the vision grounding gate exactly like a normal build, and keeps the SAME photo.
+    It still costs one of the monthly 15 recreates -- regenerating copy is the
+    expensive act (media_swap_free_enabled's own docstring); this flag changes WHAT
+    gets regenerated, never the budget. OFF (default): byte-for-byte today's
+    behavior -- the caption-only endpoint 403s and a caption deny falls through to
+    the existing full recreate.
+
+    NEW client capability, so it ships dark. Arm by hand:
+    ECHO_CAPTION_RECREATE_SCOPED=true.
+    """
+    return _truthy(os.environ.get("ECHO_CAPTION_RECREATE_SCOPED", "false"))
+
+
 def portal_show_rejected() -> bool:
     """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
 

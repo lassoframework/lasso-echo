@@ -992,6 +992,114 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
                  "recreate_budget": _budget_state(account_key)}
 
 
+def _account_for(account_key):
+    """Best-effort Account for a gym's generation account (_ig, else base). Never
+    raises; None when the registry has nothing for this key."""
+    try:
+        from .accounts import get_account
+        return get_account(f"{account_key}_ig") or get_account(account_key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _voice_for(account_key, account=None):
+    """The gym's loaded VoiceDoc, via the SAME durable-first resolution every other
+    build-time caller uses (client_media_sync._resolve_client_voice_path). None when
+    the account or its bible is missing -- callers must treat that as 'cannot draft'."""
+    account = account if account is not None else _account_for(account_key)
+    if account is None:
+        return None
+    try:
+        from . import client_media_sync as _cms
+        from .voice import load_voice
+        return load_voice(
+            _cms._resolve_client_voice_path(account_key, account.voice_doc_path()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ==========================================================================
+# POST /portal/<token>/posts/<id>/recreate-caption
+#
+# THE MISSING HALF OF B6 (partial-regen, Blake, 2026-09-07): swap-media (above) made
+# "the photo is wrong" free by keeping the caption and changing only the pixels. This
+# is the other half -- "the caption is wrong" -- and rewrites ONLY the copy on the
+# gym's EXACT SAME photo, instead of today's full deny/recreate, which regenerates
+# BOTH and can hand back a different photo even when only the words were the
+# problem. Unlike swap-media this STILL charges the budget: regenerating copy is the
+# expensive act (see media_swap.py's own docstring). The write goes through
+# SupabaseCalendarStore.patch_caption -- the SAME call a human caption edit already
+# uses -- so an approved or live post can never have its caption silently rewritten.
+# ==========================================================================
+
+def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
+                            sb_store=None):
+    """Rewrite ONLY this post's caption, on its EXACT SAME photo. Costs one of the
+    monthly 15 recreates. Flag: config.caption_recreate_scoped_enabled()
+    (ECHO_CAPTION_RECREATE_SCOPED, default OFF -> 403, no store read)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import caption_swap as _cs
+    if not _cs.enabled():
+        return 403, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "caption-only recreate is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "caption recreate needs the shared calendar plane"}
+    if recreate_remaining(account_key) <= 0:
+        return 409, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "recreate budget for this month is used up",
+                     "reason": "budget_exhausted",
+                     "recreate_budget": _budget_state(account_key)}
+    account = _account_for(account_key)
+    voice = _voice_for(account_key, account)
+    if account is None or voice is None:
+        return 500, {"ok": False, "action": "recreate-caption", "draft_id": draft_id,
+                     "error": "this gym's voice doc is not configured"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "recreate-caption", draft_id)
+        if final is not None:
+            return final
+        from . import client_media_sync as _cms
+        result = _cs.recreate_caption(
+            account_key, row, account=account, voice=voice,
+            banned_words=_cms._banned_words_for(account_key))
+        if not result.get("ok"):
+            # A scoped attempt that could not produce a clean result is a 409 the
+            # client can read, NOT a charge -- the post's caption is unchanged.
+            return 409, {"ok": False, "action": "recreate-caption",
+                         "draft_id": draft_id,
+                         "error": _cs.client_message(result.get("reason")),
+                         "reason": result.get("reason"),
+                         "recreate_budget": _budget_state(account_key)}
+        updated = sb_store.patch_caption(account_key, draft_id, result["caption"])
+        if updated is None:
+            # patch_caption filters to status NOT IN (publishing, published): a row
+            # that matched nothing went live between the read and the write.
+            return 409, {"ok": False, "action": "recreate-caption",
+                         "draft_id": draft_id,
+                         "error": ("This post is already approved or live, so its "
+                                   "caption is locked. Deny it if you want it "
+                                   "redone."),
+                         "recreate_budget": _budget_state(account_key)}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # Charge the budget only after a successful, persisted recreate.
+    spend_recreate(account_key)
+    return 200, {"ok": True, "action": "recreate-caption", "draft_id": draft_id,
+                 "caption": updated.get("caption", ""),
+                 "status": updated.get("status", "pending"),
+                 "day_key": updated.get("post_date", ""),
+                 "free": False,
+                 "recreate_budget": _budget_state(account_key)}
+
+
 def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:
@@ -1087,14 +1195,35 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
     intent (B6): the portal's deny reason chips are "Use a different photo" and
     "Caption needs work", and both used to land here and charge. intent="media"
     routes the photo chip to the FREE swap instead, so a gym can never run out of
-    recreates fixing pixels. Any other value (including the default) is a caption
-    recreate and charges exactly as before. Gated on ECHO_MEDIA_SWAP_FREE: with the
-    flag off the intent is IGNORED and every deny charges, byte for byte as today."""
+    recreates fixing pixels. intent="caption" (partial-regen, 2026-09-07) routes the
+    "Caption needs work" chip to a SCOPED caption-only recreate (caption_swap.py) that
+    keeps the gym's EXACT SAME photo instead of today's full recreate, which can (and
+    often does) hand back a different photo too even though only the words were
+    wrong -- symmetric to the media chip's fix, and it still charges the budget
+    (regenerating copy is the expensive act; see caption_swap.py). Gated on
+    ECHO_CAPTION_RECREATE_SCOPED: with the flag off (or the scoped attempt itself
+    refusing, e.g. no approved source left) this falls straight through to today's
+    full deny/recreate, so a gym is never left with no path forward. Any other intent
+    value (including the default) is the full recreate, charges exactly as before."""
     if str(intent or "").strip().lower() == "media":
         from . import media_swap as _ms
         if _ms.enabled():
             return handle_swap_media(account_key, draft_id, actor_id, reader=reader,
                                      sb_store=sb_store)
+    if str(intent or "").strip().lower() == "caption":
+        from . import caption_swap as _cs
+        if _cs.enabled():
+            status, body = handle_recreate_caption(
+                account_key, draft_id, actor_id, reader=reader, sb_store=sb_store)
+            # A scoped attempt that could not produce a clean caption-only result
+            # (no approved source, photo unreachable, gate exhausted, budget) falls
+            # through to the full recreate below rather than dead-ending the coach —
+            # EXCEPT a budget-exhausted 409, which must stay a 409 (falling through
+            # would double-spend nothing, since deny below re-checks the same budget
+            # and correctly still refuses).
+            if status == 200 or (isinstance(body, dict)
+                                 and body.get("reason") == "budget_exhausted"):
+                return status, body
     if config.portal_calendar_supabase_enabled():
         return _handle_deny_supabase(account_key, draft_id, actor_id, note, reader,
                                      sb_store or _pcs.SupabaseCalendarStore())

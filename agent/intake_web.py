@@ -77,8 +77,11 @@ def _rate_per_minute():
 # offer must exist HERE first. "swap-media" is the free photo swap (B6): the portal
 # could not build "use a different photo" as its own button because Echo had only
 # approve / edit / deny / kill, which left deny as the single lever and made a photo
-# change cost one of the gym's 15 monthly recreates.
-PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media")
+# change cost one of the gym's 15 monthly recreates. "recreate-caption" (partial-
+# regen, 2026-09-07) is the missing other half: "the caption is wrong" rewrites ONLY
+# the copy on the SAME photo instead of a full recreate that can swap the photo too.
+PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
+                       "recreate-caption")
 
 
 def client_for_token(token):
@@ -2022,11 +2025,12 @@ def build_server(port=None):
         def _portal_post_action_route(self):
             """Part B token-scoped client-social ACTION routes.
             Returns (token, post_id, action) for
-            /portal/<token>/posts/<id>/{approve|edit|deny|kill|swap-media}, else
-            (None,None,None).
+            /portal/<token>/posts/<id>/{approve|edit|deny|kill|swap-media|
+            recreate-caption}, else (None,None,None).
             Gated by AGENT_PORTAL_SOCIAL_ENABLED at the handler; a disabled route 404s.
-            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE, which is
-            default OFF: the route exists but the handler 403s until it is armed."""
+            swap-media (B6) is additionally gated by ECHO_MEDIA_SWAP_FREE, and
+            recreate-caption by ECHO_CAPTION_RECREATE_SCOPED -- both default OFF: the
+            route exists but the handler 403s until armed."""
             m = re.match(
                 r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
                 r"(" + "|".join(PORTAL_POST_ACTIONS) + r")$",
@@ -2879,6 +2883,9 @@ def build_server(port=None):
                 elif ps_action == "swap-media":
                     status, resp = _ps.handle_swap_media(account_key, ps_post_id,
                                                          actor_id)
+                elif ps_action == "recreate-caption":
+                    status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
+                                                               actor_id)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)
