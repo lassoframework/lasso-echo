@@ -86,28 +86,81 @@ def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10):
     return _td.exclude_test_strict(rows)
 
 
-def resolve_gym_key(ticket, *, portal_key_for_gym=None):
+def resolve_gym_key(ticket, *, portal_key_for_gym=None, confirm_binding=None):
     """support_tickets.client_id -> the Echo account key, or "".
 
     Uses the repo's anti-divergence primitive rather than deriving a key here: Echo
     deriving its OWN key from a gym_id is what produced two live keys per gym in the
     first place (see agent/account_key_resolve.py). "" on any uncertainty, and ""
     escalates rather than guessing.
+
+    TWO CONTROLS AT THIS SEAM, NOT ONE.
+    This is the single binding between a support_tickets row and an Echo account key,
+    and everything downstream trusts it: the diagnostic queries that key, the sync runs
+    for that key, and the reply is posted into THIS ticket's thread. So one wrong
+    answer here routes another gym's data into this client's DM -- reproduced by an
+    audit, and not hypothetical in a repo with a documented account-key split-brain
+    (7 of 19 gyms disagreed).
+
+    The package's own written standard, from diagnostics.py, is "two independent
+    controls must both fail for one gym to see another's data", and it was not applied
+    at the seam where it matters most. So the forward answer is now CONFIRMED against
+    the inverse map: the key must belong to this gym_id, and to NO OTHER gym. Any
+    disagreement, or any uncertainty at all, returns "" and escalates.
     """
     if portal_key_for_gym is None:
         from .. import account_key_resolve as _akr
         portal_key_for_gym = _akr.portal_key_for_gym
+    if confirm_binding is None:
+        confirm_binding = confirm_gym_binding
     gym_uuid = str(ticket.get("client_id") or "").strip()
     if not gym_uuid:
         return ""
     try:
-        return str(portal_key_for_gym(gym_uuid) or "").strip()
+        key = str(portal_key_for_gym(gym_uuid) or "").strip()
     except Exception:  # noqa: BLE001 - an unreadable plane is not a reason to guess
         return ""
+    if not key:
+        return ""
+    # CONTROL 2: the inverse map must agree, and the key must be unique to this gym.
+    try:
+        if not confirm_binding(gym_uuid, key):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return key
+
+
+def confirm_gym_binding(gym_uuid, account_key, *, state=None):
+    """True only when the portal plane maps THIS gym_id to THIS key, and maps no OTHER
+    gym to the same key. False on any uncertainty.
+
+    Reads account_key_resolve's own cached plane rather than re-deriving anything, so
+    the two controls disagree exactly when the plane itself is inconsistent -- which is
+    the failure this is here to catch. Uniqueness matters as much as agreement: two
+    gyms sharing a key is precisely the split-brain shape, and a shared key must never
+    be used to pick whose data to read.
+    """
+    if state is None:
+        from .. import account_key_resolve as _akr
+        state = _akr._state                                    # noqa: SLF001
+    gid = str(gym_uuid or "").strip().lower()
+    key = str(account_key or "").strip().lower()
+    if not gid or not key:
+        return False
+    _live, _mapping, by_gym, ok = state()
+    if not ok:
+        return False                                  # a half-read plane proves nothing
+    if str(by_gym.get(gid, "")).strip().lower() != key:
+        return False
+    owners = [g for g, k in by_gym.items()
+              if str(k or "").strip().lower() == key]
+    return len(owners) == 1
 
 
 def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
-             limit=10, log=None, flag_on=None, poll=None, portal_key_for_gym=None):
+             limit=10, log=None, flag_on=None, poll=None, portal_key_for_gym=None,
+             confirm_binding=None):
     """One pass. Returns a summary dict; never raises out of a normal degrade path."""
     log = log or (lambda m: print(f"[client-dm] {m}"))
     on = _flag_on() if flag_on is None else bool(flag_on)
@@ -116,7 +169,13 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
         return {"ok": False, "reason": "AGENT_CLIENT_DM_AUTOFIX is off",
                 "handled": 0, "replied": 0, "escalated": 0}
 
-    # The structural ad guarantee, checked on the real path before any work.
+    # THE AD GUARANTEE, both controls, on the real path before any ticket is read.
+    #   control 1 (load-bearing): this service has no ad-write rail at all, so there
+    #     is nothing for any code path to reach and no credential to reach it with.
+    #   the tripwire: no obvious ad import or ad-write call inside this package. It
+    #     catches the careless case; it is NOT a proof, and ad_block's docstring says
+    #     so plainly after two rounds of audit falsified the stronger claim.
+    _ad.assert_no_ad_rail_in_repo()
     _ad.assert_no_ad_call_path()
 
     if bus is None:
@@ -151,7 +210,8 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
         if not text:
             continue
 
-        gym_key = resolve_gym_key(t, portal_key_for_gym=portal_key_for_gym)
+        gym_key = resolve_gym_key(t, portal_key_for_gym=portal_key_for_gym,
+                                  confirm_binding=confirm_binding)
         decision = _flow.handle_ticket(text=text, gym_key=gym_key, deps=deps)
         decisions.append(decision)
         handled += 1
@@ -179,7 +239,18 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
 
     log(f"client-dm autofix: {handled} handled, {replied} grounded reply(ies), "
         f"{escalated} escalated, {skipped} already handled, {undelivered} UNDELIVERED")
-    return {"ok": True, "handled": handled, "replied": replied,
+    if undelivered:
+        # A ticket whose fix RAN and whose outcome reached nobody is not a healthy
+        # pass, and one log line is not enough to notice it.
+        try:
+            from .. import ops_alerts
+            ops_alerts.alert(
+                f"client DM autofix: {undelivered} ticket(s) were diagnosed and acted "
+                f"on but NEITHER the reply NOR the escalation could be written. Nobody "
+                f"has been told. Check the bus.")
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": not undelivered, "handled": handled, "replied": replied,
             "escalated": escalated, "skipped": skipped,
             "undelivered": undelivered, "decisions": decisions}
 
@@ -213,13 +284,26 @@ def _surface_of(msgs):
 
 
 def _already_handled(msgs):
-    """True when this lane has already written an outbound row on this ticket. The
-    schema-free idempotency check: no new column, no migration, no foundation trigger."""
+    """True when this lane has already answered the client's LATEST message.
+
+    The schema-free idempotency check: no new column, no migration, no foundation
+    trigger. `msgs` is newest-first, so "has this lane written since the client last
+    spoke" is answered by walking forward and seeing which comes first.
+
+    WHY NOT "EVER ANSWERED THIS TICKET", which is what this used to mean: a client
+    follow-up -- "no, they're still blank" -- was then dropped with no reply, no
+    escalation, and a `skipped` counter that reads healthy. Silence on a client who
+    wrote back twice is the failure mode this whole capability exists to avoid. Now a
+    follow-up is handled like any other message, and if it is not groundable it
+    escalates to a human instead of vanishing.
+    """
     for m in msgs:
-        if str(m.get("direction")) != "outbound":
-            continue
-        if _att(m).get("lane") == _wiring.REPLY_META_LANE:
-            return True
+        direction = str(m.get("direction"))
+        if direction == "outbound" and _att(m).get("lane") == _wiring.REPLY_META_LANE:
+            return True                      # our own reply is the most recent event
+        if direction == "inbound" and \
+                str(m.get("author_type") or "").lower() not in ("staff", "bot"):
+            return False                     # the client has spoken since; handle it
     return False
 
 

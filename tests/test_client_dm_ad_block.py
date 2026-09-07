@@ -294,3 +294,75 @@ def test_ordinary_relative_imports_are_not_flagged_as_root_aliasing():
     """`from .. import config` resolves to the bare root but names no module of its
     own; flagging it would make the scanner refuse the whole package."""
     assert ad_block.scan_for_ad_call_paths() == []
+
+
+# ===========================================================================
+# CONTROL 1 — THE LOAD-BEARING ONE.
+#
+# Two audit rounds falsified the claim that the AST scan is a SOUND PROOF that no ad
+# write is reachable: round 2 found three bypasses, round 3 found eleven more,
+# including Bus()._client() returning the live `requests` module through a module this
+# package legitimately imports. Patching the tables a third time is the loop D68 says
+# to stop ("you are not one case away; change what you are gating on"), so the claim
+# was withdrawn instead. What actually holds is that this SERVICE has no ad-write rail.
+# ===========================================================================
+def test_this_repository_contains_no_meta_marketing_api_rail():
+    """The control. While this holds, no code path in this package can reach an ad
+    write, because there is nothing to reach and no credential to reach it with — and
+    that is true regardless of any property of the scanner."""
+    findings = ad_block.scan_repo_for_ad_rail()
+    assert findings == [], "\n".join(findings[:20])
+    assert ad_block.assert_no_ad_rail_in_repo() is True
+
+
+def test_the_ad_rail_check_would_actually_fire(tmp_path):
+    """Prove the control is capable of failing, by planting each marker."""
+    for marker in ad_block.AD_RAIL_MARKERS:
+        d = tmp_path / marker.replace("/", "_").replace(".", "_")
+        d.mkdir()
+        (d / "rail.py").write_text(f'X = "{marker}"\n')
+        assert ad_block.scan_repo_for_ad_rail(str(d)), marker
+        with pytest.raises(ad_block.AdCallPathError):
+            ad_block.assert_no_ad_rail_in_repo(str(d))
+
+
+def test_run_once_asserts_the_ad_rail_control_before_reading_any_ticket(monkeypatch):
+    """D68: an assertion nobody calls is itself an instance of the bug it exists to
+    catch. This one runs on the real path, ahead of the tripwire."""
+    polled = []
+
+    class Bus:
+        def available(self):
+            return True
+
+        def _get(self, table, params):
+            polled.append(table)
+            return []
+
+    def boom(*_a, **_k):
+        raise ad_block.AdCallPathError("planted rail")
+
+    monkeypatch.setattr(consumer._ad, "assert_no_ad_rail_in_repo", boom)
+    with pytest.raises(ad_block.AdCallPathError):
+        consumer.run_once(bus=Bus(), flag_on=True)
+    assert polled == []
+
+
+def test_control_2_this_capability_can_perform_exactly_one_action():
+    """A closed set of one is a stronger statement than a list of what cannot be
+    imported: there is no branch that runs arbitrary code, no shell, no tool-granted
+    model. What it CAN do is enumerable, and it is a per-gym media sync."""
+    assert set(remedies.EXECUTORS) == {"per_gym_drive_sync"}
+    assert remedies.EXECUTORS["per_gym_drive_sync"].__name__ == \
+        "_exec_per_gym_drive_sync"
+
+
+def test_the_docstring_no_longer_claims_the_scan_is_a_proof():
+    """The overclaim is the finding, so its absence is the assertion. Two audits
+    reported the same false sentence in two different files."""
+    src = open(os.path.join(PKG, "ad_block.py"), encoding="utf-8").read()
+    assert "sound proof" not in src.lower() or "was false" in src.lower()
+    assert "TRIPWIRE" in src
+    import agent.config as cfg
+    doc = cfg.client_dm_autofix_enabled.__doc__ or ""
+    assert "sound proof" not in doc.lower()

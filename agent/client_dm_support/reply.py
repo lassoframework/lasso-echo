@@ -171,7 +171,7 @@ CTA_ASK = _register(ReplyTemplate(
     text=(
         "I checked your brand voice doc. The \"CTA rotation\" section is still the "
         "blank placeholder from onboarding, so your posts have "
-        "{cta_pool_count} call(s) to action to draw from — that is why they are "
+        "{cta_pool_count} call(s) to action to draw from. That is why they are "
         "going out without one. I cannot write this one for you, because a CTA has "
         "to be your real booking link, phone number or offer. What would you like "
         "your posts to ask people to do?"
@@ -239,21 +239,10 @@ def assert_templates_wellformed():
     return True
 
 
-# Slot values that are CLIENT-CONTROLLED. `media_source_folder_name` is the name of a
-# folder in the gym owner's own Google Drive: it is read out of Drive, stored on the
-# media_source row, and interpolated into a message this capability posts into Slack
-# unattended. That makes it untrusted text on an auto-send path, so it is bounded here.
-#
-# Two controls, both total rather than enumerated (the adapter's own RT-M1/RA-M2 fix,
-# same reasoning):
-#   * ESCAPE & < > to entities. This disarms ALL Slack markup in one pass, because
-#     every piece of Slack markup needs < and > -- including <!channel>, <!here> and
-#     <@U...>, which would otherwise let a folder name ping every human in the group DM.
-#     It is not a list of bad strings, so there is no phrasing that slips past it.
-#   * REFUSE on a control character, a newline, or an over-long value, rather than
-#     silently truncating. A folder name that could forge message structure sends the
-#     whole ticket to a human instead.
-CLIENT_CONTROLLED_SLOTS = frozenset({"media_source_folder_name"})
+# NOTE: the list of client-controlled facts lives in ONE place,
+# CLIENT_CONTROLLED_FACT_KEYS above, which assert_templates_wellformed enforces.
+# A second, identically-populated constant used to sit here and was referenced by
+# nothing -- two spellings of one rule, where only one was the control.
 MAX_SLOT_CHARS = 120
 
 

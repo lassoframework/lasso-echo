@@ -6,28 +6,45 @@ Blake, 2026-09-06: "no code path in this capability may call into the Meta/Pipeb
 ad-write tools AT ALL — not gated by a check that could misfire, but literally no
 import, no call path, nothing wired."
 
-So there are two things in this file and only ONE of them is the control.
+READ THIS BEFORE TRUSTING THE SCANNER BELOW.
 
-  THE CONTROL is structural absence. agent/client_dm_support/ imports no ad module
-  and calls no ad-write function, anywhere, on any branch. assert_no_ad_call_path()
-  proves that by parsing every source file in the package with `ast` and failing if
-  an import or a call name in the tables below appears. It is asserted statically by
-  tests/test_client_dm_ad_block.py AND called at runtime from consumer.run_once()
-  before any ticket is read -- because D68 records that "an assertion nobody calls is
-  itself an instance of the bug it exists to catch."
+Two earlier versions of this file claimed the AST scan was a SOUND PROOF that no ad
+write is reachable. That claim was false, and it was falsified twice: round 2 of the
+audit found three bypasses, round 3 found eleven more (subscript-rooted calls,
+`os.execvp`/`posix_spawn`, attribute chains not rooted in a plain Name, `chr()`-built
+URLs, and -- the sharpest one -- `Bus()._client()`, which returns the live `requests`
+module through a module this package legitimately imports).
 
-  THE BELT is is_ad_money_topic(), a keyword list that makes an ad-shaped message
-  escalate unconditionally and early, before any diagnostic runs. It is deliberately
-  NOT the control, and must never be treated as one: a keyword list over natural
-  language is an ENUMERATION OF AN OPEN SET, the exact failure mode D68 Part 1 is
-  about, and it will miss phrasings. It exists so the common case escalates with a
-  useful reason rather than falling through to "no diagnostic matched". Safety comes
-  from the fact that even a message this list misses cannot reach an ad-write call,
-  because no such call exists to reach.
+Patching the tables a third time is the exact loop D68 Part 1 says to stop:
+"If you are on round three of 'add the missed case to the list', stop. You are not one
+case away. Change what you are gating on." A denylist of call names and module names
+over a Turing-complete language is an ENUMERATION OF AN OPEN SET, and it will keep
+losing. So the claim is withdrawn rather than re-patched.
 
-Note the asymmetry that makes this safe: the belt can only ever cause MORE
-escalation, never less. There is no branch on which is_ad_money_topic() returning
-False permits an ad action -- the only ad action available to this package is none.
+WHAT ACTUALLY MAKES AD MONEY IMPOSSIBLE HERE, in order of strength:
+
+  1. THERE IS NO AD-WRITE RAIL IN THIS REPOSITORY. lasso-echo has no Meta Marketing
+     API client, no ad-account id, no system-user token, no campaign/adset/ad writer.
+     Those rails live in the portal, in a different codebase, behind different
+     credentials. assert_no_ad_rail_in_repo() checks this and is the load-bearing
+     control: code cannot call an ad write that does not exist and cannot authenticate
+     to one with a credential this service does not hold.
+  2. THIS CAPABILITY EXECUTES EXACTLY ONE ACTION. remedies.EXECUTORS has a single
+     entry, a per-gym media sync, and flow.py can reach no other. There is no branch
+     that runs arbitrary code, no shell, no model with a tool grant. What it can DO is
+     a closed set of one, which is a stronger statement than what it cannot import.
+  3. EVERY AD-SHAPED MESSAGE ESCALATES UNCONDITIONALLY, before any diagnostic runs
+     (flow.handle_ticket step 1), and scope_gate refuses any ad-related action first,
+     before any allowlist could rescue it.
+  4. The AST scan below is a TRIPWIRE, not a proof. It catches the careless case --
+     somebody importing an ad module or calling an obvious ad-write name -- and it
+     fails the build loudly when it fires. It is genuinely useful for that. It is NOT
+     evidence that no path exists, it cannot be, and nothing in this package should be
+     described as if it were.
+
+If an ad-write rail is ever added to this repository, control 1 stops holding and this
+capability must be re-reviewed from scratch. assert_no_ad_rail_in_repo() is what turns
+that from a thing somebody must remember into a test failure.
 """
 from __future__ import annotations
 
@@ -35,12 +52,19 @@ import ast
 import os
 
 # ---------------------------------------------------------------------------
-# THE FORBIDDEN SURFACE. Any module whose dotted name starts with one of these,
-# imported anywhere in this package, is a build error.
+# TRIPWIRE TABLE 1: modules this package must not import.
 #
-# These cover the three ways an ad write could reach Meta from this repo:
-# Echo's own Meta modules, the Pipeboard/Meta MCP + SDK client surfaces, and the
-# ads-triage lane that already holds live campaign write rails.
+# HONEST LABELLING, because an earlier version of this comment was wrong. The
+# `agent.*` entries here are NOT ad-money surfaces -- this repo has none:
+#   agent.meta_publisher  organic Instagram/Facebook publishing
+#   agent.meta_check      IG/FB token verification
+#   agent.pixel_gate      the creative FABRICATION gate on rendered pixels; the name
+#                         collides with the Meta tracking pixel and means the opposite
+#   agent.spend           Gemini generation spend, not ad spend
+#   agent.runway          creative runway, not ad delivery
+# They are listed because this lane has no business importing any of them, and because
+# a future rename could turn one into something that matters. facebook_business and
+# pipeboard are the real ad SDK/MCP names and are not present in this repo at all.
 # ---------------------------------------------------------------------------
 FORBIDDEN_AD_IMPORT_PREFIXES = frozenset({
     "agent.meta_publisher",
@@ -390,3 +414,69 @@ AD_ESCALATION_REASON = (
     "are never autonomous for this capability (Blake, 2026-09-06). This lane has no "
     "ad-write call path at all; a human handles this."
 )
+
+
+# ---------------------------------------------------------------------------
+# CONTROL 1, the load-bearing one: there is no ad-write rail in this repository.
+# ---------------------------------------------------------------------------
+# Markers of a Meta Marketing API surface. Unlike the tripwire tables above, this is
+# not trying to enumerate the ways code could be written -- it is asking whether the
+# ingredients of an ad write exist ANYWHERE in the service at all: an ad-account id, a
+# marketing-API endpoint, or an SDK that speaks to one. If none of them exists, no
+# amount of cleverness inside this package reaches an ad write, because there is
+# nothing to reach and nothing to authenticate with.
+AD_RAIL_MARKERS = (
+    "facebook_business",           # the Meta Marketing API python SDK
+    "graph.facebook.com/v",        # a versioned Graph endpoint
+    "/act_",                       # an ad-account path segment
+    "adaccount",                   # AdAccount SDK object
+    "META_AD_ACCOUNT",
+    "META_SYSTEM_USER_TOKEN",
+    "MARKETING_API",
+)
+
+# Files that legitimately CONTAIN these strings because their job is to name them.
+AD_RAIL_MARKER_EXEMPT = ("ad_block.py", "test_client_dm_ad_block.py")
+
+
+def scan_repo_for_ad_rail(repo_root=None):
+    """Findings naming any Meta Marketing API rail in this service. Empty == none."""
+    if repo_root is None:
+        repo_root = os.path.dirname(os.path.dirname(_package_dir()))
+    findings = []
+    for root, dirs, names in os.walk(repo_root):
+        dirs[:] = [d for d in dirs
+                   if d not in ("__pycache__", ".git", "node_modules", ".venv",
+                                "venv", ".venv-ops", "ghl-audit")]
+        for n in sorted(names):
+            if not n.endswith(".py") or n in AD_RAIL_MARKER_EXEMPT:
+                continue
+            path = os.path.join(root, n)
+            try:
+                low = open(path, "r", encoding="utf-8", errors="replace").read().lower()
+            except OSError:
+                continue
+            for marker in AD_RAIL_MARKERS:
+                if marker.lower() in low:
+                    findings.append(f"{path}: contains ad-rail marker {marker!r}")
+    return findings
+
+
+def assert_no_ad_rail_in_repo(repo_root=None):
+    """THE CONTROL. Raise if this service has acquired an ad-write rail.
+
+    While this holds, "ad money is structurally impossible for this capability" is a
+    statement about the whole service and does not depend on any property of the
+    scanner above. If it ever fires, this capability must be re-reviewed from scratch
+    before it is armed again -- which is the point of asserting it rather than
+    remembering it.
+    """
+    findings = scan_repo_for_ad_rail(repo_root)
+    if findings:
+        raise AdCallPathError(
+            "this repository has acquired a Meta Marketing API rail, so 'no ad write "
+            "is reachable' no longer follows from the absence of one. "
+            "agent/client_dm_support/ must be re-reviewed before it is armed:\n  - "
+            + "\n  - ".join(findings[:20])
+        )
+    return True

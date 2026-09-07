@@ -145,6 +145,7 @@ TRIGGER_OTHER_CLIENT = "another_clients_data"
 TRIGGER_BILLING = "billing_stripe_invoicing_or_plan_tier"
 TRIGGER_PIXEL_CAPI = "pixel_or_capi_setup"
 TRIGGER_UNKNOWN_SHAPE = "unrecognised_action_shape_refuse_by_default"
+TRIGGER_CLIENT_AUTHORED_CONTENT = "client_authored_content_echo_may_not_write"
 
 
 @dataclass(frozen=True)
@@ -295,9 +296,14 @@ def check(action: ProposedAction) -> ScopeVerdict:
     for p in paths:
         for frag in BLOCKED_PATH_FRAGMENTS:
             if frag in p:
+                # Name the RIGHT line. A gym's own voice doc is not "config affecting
+                # more than one gym" -- it is that client's own authored copy, which
+                # Echo may never write (CLAUDE.md: no invented facts, offers or stats).
+                # The card should say which rule was hit.
                 trigger = (
                     TRIGGER_SCHEMA if "migrations/" in frag
                     else TRIGGER_SECRETS if frag in (".env", "secrets", "credentials")
+                    else TRIGGER_CLIENT_AUTHORED_CONTENT if frag == "brand_voice/"
                     else TRIGGER_MULTI_GYM_CONFIG
                 )
                 return _deny(

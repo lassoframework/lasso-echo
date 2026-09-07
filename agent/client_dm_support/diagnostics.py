@@ -118,9 +118,12 @@ def diagnose_drive_photos(gym_key, *, store, now=None, daily_hour_utc=None,
     now_dt = _now(now)
 
     if daily_hour_utc is None:
-        from .. import config
+        # The nightly gym-media sync shares the daily slot at AGENT_DAILY_HOUR_UTC
+        # (agent/runner.py's run_daily). Read straight from the env, the same way the
+        # scheduler does. (An earlier version imported config here and immediately
+        # deleted it "to keep the dependency explicit" -- a comment describing an
+        # effect the code did not have.)
         daily_hour_utc = int(os.environ.get("AGENT_DAILY_HOUR_UTC", "12"))
-        del config  # only imported to keep the module dependency explicit
 
     if lane_active_for is None:
         from .. import config as _cfg

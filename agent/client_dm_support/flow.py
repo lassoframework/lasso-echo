@@ -58,6 +58,7 @@ class DmDecision:
     reply_text: str = ""
     template_id: str = ""
     foundation_trigger: str = ""
+    client_text: str = ""          # the client's own words, for the escalation card
     audit: dict = field(default_factory=dict)
 
     @property
@@ -67,6 +68,17 @@ class DmDecision:
 
 def _escalate(reason, *, trigger="", **kw):
     return DmDecision(DECISION_ESCALATE, reason, foundation_trigger=trigger, **kw)
+
+
+def _with_text(decision, text):
+    """Attach the client's own words so the escalation card can show them. Never used
+    to decide anything -- only to tell the human what they are looking at."""
+    return DmDecision(
+        decision.decision, decision.reason, gym_key=decision.gym_key,
+        diagnostic_id=decision.diagnostic_id, remedy_id=decision.remedy_id,
+        reply_text=decision.reply_text, template_id=decision.template_id,
+        foundation_trigger=decision.foundation_trigger,
+        client_text=str(text or ""), audit=decision.audit)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +114,11 @@ def handle_ticket(*, text, gym_key, deps=None, diagnostic_id=None):
     only implementation of a seam (D68's "built but not wired" class).
     """
     deps = dict(deps or {})
+    return _with_text(_decide(text=text, gym_key=gym_key, deps=deps,
+                              diagnostic_id=diagnostic_id), text)
 
+
+def _decide(*, text, gym_key, deps, diagnostic_id=None):
     # 1. THE AD HARD STOP. Unconditional, first, before anything reads a fact.
     #    Note this is the BELT, not the control: the control is that this package
     #    has no ad-write call path at all (ad_block.assert_no_ad_call_path).

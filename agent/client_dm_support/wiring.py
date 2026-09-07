@@ -130,10 +130,31 @@ def bus_reply_sink(bus):
     return _post
 
 
+# The client's own words are UNTRUSTED TEXT on a card a human reads and acts on, so
+# they are Slack-escaped and bounded before they are fenced -- the adapter's RT-M1/RA-M2
+# rule, applied here for the same reason. Escaping & < > disarms every piece of Slack
+# markup in one pass (all of it needs < and >), including <!channel> and <@U...>.
+CARD_TEXT_MAX = 1200
+
+
+def _fenced_client_text(text):
+    body = str(text or "").strip()
+    if not body:
+        return "(no client text on this ticket)"
+    if len(body) > CARD_TEXT_MAX:
+        body = body[:CARD_TEXT_MAX] + " ...[truncated]"
+    return body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def bus_escalation_sink(bus):
     """callable(ticket, decision) -> writes a 'ready' ESCALATION row. Internal kinds go
     to the fixer channel, not the client's thread, so a human actually sees every
-    refusal this lane makes."""
+    refusal this lane makes.
+
+    The card carries the CLIENT'S OWN MESSAGE. Without it the reader was asked to close
+    a loop on a request they could not read: outbox.escalation_blocks renders only
+    row["body"] plus a "Resolved, tell them" button, so whatever this sink omits is
+    simply absent from the human's screen."""
     _, kind_escalation = _kinds()
 
     def _hold(ticket, decision):
@@ -143,9 +164,12 @@ def bus_escalation_sink(bus):
         body = (
             f"[{REPLY_META_LANE}] held for a human.\n"
             f"gym: {decision.gym_key or 'unresolved'}\n"
+            f"slack user: {ticket.get('slack_user_id') or '?'}\n"
             f"diagnostic: {decision.diagnostic_id or 'none matched'}\n"
             f"trigger: {trigger}\n"
-            f"reason: {decision.reason}"
+            f"reason: {decision.reason}\n"
+            f"--- what they wrote (untrusted, escaped) ---\n"
+            f"{_fenced_client_text(getattr(decision, 'client_text', ''))}"
         )
         return bus.record_outbound(
             ticket_id=ticket.get("id"),

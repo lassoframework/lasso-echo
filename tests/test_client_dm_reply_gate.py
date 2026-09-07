@@ -525,3 +525,87 @@ def test_verified_snapshot_is_stamped_as_a_verification():
     assert merged.get("sync_ran") is True
     # A diagnosis-stamped merge would let a reply be composed off unverified facts.
     assert merged.diagnostic_id == diag.DIAG_DRIVE_PHOTOS
+
+
+# ===========================================================================
+# GUARDS A THIRD MUTATION RUN FOUND UNHELD.
+# ===========================================================================
+def test_a_duplicate_template_id_is_refused_not_silently_replaced():
+    """Unshadowed: a second registration would replace a REVIEWED client-facing
+    constant with an unreviewed one, under the same id, and nothing else would notice."""
+    with pytest.raises(ValueError):
+        reply._register(reply.ReplyTemplate(
+            id="cta_ask", diagnostic_id=diag.DIAG_CTA_POOL, text="{cta_pool_count}"))
+
+
+def test_a_template_slot_outside_ALL_FACT_KEYS_is_refused():
+    bad = reply.ReplyTemplate(id="planted5", diagnostic_id=diag.DIAG_CTA_POOL,
+                              text="you have {invented_metric} things")
+    reply.TEMPLATES["planted5"] = bad
+    try:
+        with pytest.raises(reply.ReplyRefused) as e:
+            reply.assert_templates_wellformed()
+        assert "ALL_FACT_KEYS" in str(e.value)
+    finally:
+        del reply.TEMPLATES["planted5"]
+
+
+def test_verify_refuses_a_fact_absent_from_one_snapshot():
+    from agent.client_dm_support import verify
+    before = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "g", {"media_asset_count": 0})
+    after = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"sync_ran": True})
+    r = verify.check(verify.Expectation("media_asset_count", verify.ROSE_ABOVE_ZERO),
+                     before, after)
+    assert not r.verified
+    assert "absent" in r.reason
+
+
+def test_verify_refuses_anything_that_is_not_a_GroundingSnapshot():
+    from agent.client_dm_support import verify
+    exp = verify.Expectation("media_asset_count", verify.ROSE_ABOVE_ZERO)
+    good = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "g", {"media_asset_count": 0})
+    for bad in ({"media_asset_count": 5}, None, "verified!", 5):
+        assert not verify.check(exp, good, bad).verified, bad
+        assert not verify.check(exp, bad, good).verified, bad
+
+
+def test_merged_with_refuses_a_different_diagnostic():
+    a = facts.GroundingSnapshot.build(
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "g", {"media_asset_count": 0})
+    b = facts.GroundingSnapshot.build(
+        diag.DIAG_CTA_POOL, "verification", "g", {"cta_pool_count": 0})
+    with pytest.raises(facts.FactError) as e:
+        a.merged_with(b)
+    assert "different diagnostics" in str(e.value)
+
+
+def test_an_empty_gym_key_is_refused():
+    from agent.client_dm_support import diagnostics as d
+    for empty in ("", None, "   "):
+        with pytest.raises(d.DiagnosticError):
+            d.require_account_key(empty)
+
+
+def test_an_unknown_diagnostic_id_raises_rather_than_defaulting():
+    from agent.client_dm_support import diagnostics as d
+    with pytest.raises(d.DiagnosticError) as e:
+        d.run("general_vibes", "crossfitlocal")
+    assert "unknown diagnostic" in str(e.value)
+
+
+def test_the_flow_refuses_an_unknown_diagnostic_id_too():
+    """Belt and braces: flow checks membership AND diagnostics.run raises. Break one
+    and the other still holds -- which is why asserting only "it escalated" left this
+    green under mutation. The REASON distinguishes which guard fired, so assert that:
+    flow's own membership check must refuse it BEFORE any diagnostic is attempted."""
+    from agent.client_dm_support import flow as f
+    d = f.handle_ticket(text="anything", gym_key="crossfitlocal",
+                        diagnostic_id="general_vibes")
+    assert d.decision == f.DECISION_ESCALATE
+    assert not d.will_post
+    assert "no enumerated diagnostic covers this message" in d.reason, (
+        "flow fell through to diagnostics.run instead of refusing the id itself")
+    assert d.diagnostic_id == ""
