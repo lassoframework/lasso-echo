@@ -1396,6 +1396,29 @@ def run_daily(poster=None, voice_path=None, library_path=None,
             ops_alerts.alert(f"gym media Drive sync failed: {type(e).__name__}: {e}. "
                              "The draft run is unaffected.")
 
+    # CLIENT DM AUTOFIX (AGENT_CLIENT_DM_AUTOFIX, default OFF): the direct-client-DM
+    # support lane. Reads tickets the UNMODIFIED slack_convo adapter already wrote,
+    # runs an enumerated diagnostic, executes a fix scoped to that ONE gym's own data,
+    # re-runs the SAME diagnostic to verify it, and writes either a grounded reply row
+    # or an escalation card for a human. Posts nothing itself (the existing outbox
+    # delivers). Runs AFTER the media sync above on purpose: a gym whose Drive sync
+    # just landed should be diagnosed against the fresh state. Isolated -- a failure
+    # here never blocks the draft run.
+    #
+    # This is the PRODUCTION CALLER for client_dm_support.consumer.run_once. Without
+    # it the capability would be "built but not wired" (D68's named class): a status
+    # line, a green suite, and nothing ever invoking it.
+    if config.client_dm_autofix_enabled():
+        try:
+            from .client_dm_support.consumer import run_once as _client_dm_run
+            _cdsum = _client_dm_run()
+            if not _cdsum.get("ok"):
+                print(f"[client-dm] skipped: {_cdsum.get('reason', '')}")
+        except Exception as e:
+            print(f"[client-dm] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"client DM autofix failed: {type(e).__name__}: {e}. "
+                             "The draft run is unaffected.")
+
     # ACCOUNT-KEY DOCTOR (AGENT_ACCOUNT_KEY_DOCTOR_ALERTS, default OFF -> alert
     # suppressed, report still computed): nightly READ-ONLY coverage check that every
     # social-product gym's base still resolves to exactly one non-archived gyms row

@@ -4243,3 +4243,64 @@ def brain_feeds_captions_enabled() -> bool:
     nothing on its own without AGENT_CROSS_GYM_BRAIN also armed and the weekly
     rollup's top_posts migration applied."""
     return _truthy(os.environ.get("AGENT_BRAIN_FEEDS_CAPTIONS", "false"))
+
+
+# ---- Client DM support autofix (client_dm_support) ---------------------------
+def client_dm_autofix_enabled() -> bool:
+    """AGENT_CLIENT_DM_AUTOFIX -- arms agent/client_dm_support/, the direct-client-DM
+    support lane: a gym owner's message in their own group DM is routed to an
+    ENUMERATED diagnostic, a scoped fix is executed, the SAME diagnostic is re-run to
+    verify it, and only then is a reply auto-posted. Default OFF; a human arms it.
+
+    WHAT IT ARMS (and only this):
+      * agent/client_dm_support/consumer.run_once() stops returning
+        {'ok': False, 'reason': 'flag off'} and begins reading tickets the EXISTING,
+        UNMODIFIED agent/slack_convo/adapter.py already wrote.
+      * remedies.py's ONE executor (per_gym_drive_sync) becomes runnable, for one
+        gym at a time. The other planned outcomes write nothing at all: ask-the-client
+        (Case 2) and a truthful statement about a revoked Drive share. There is no
+        code-fix executor and no asset-re-index executor -- scope_gate knows how to
+        scope-check a code fix, but remedies.plan never returns one and EXECUTORS has
+        no entry for it, held shut by a two-way guard in the test suite.
+      * a reply may be auto-posted ONLY when it is byte-identical to a registered
+        template rendered from verified fact keys (reply.assert_is_template_render).
+
+    WHAT IT DOES NOT TOUCH, EVER, ARMED OR NOT:
+      * the #fixer bus's own auto-answer gate. This flag is unrelated to every
+        SLACK_CONVO_<IDENTITY>_AUTO_ANSWER flag and to
+        SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE (D67/D68). Turning this on
+        does not turn any of those on, and this lane never writes an 'answer' row
+        on the slack_convo answer lane.
+      * ad spend, ad targeting, campaign/ad-set launch or pause. This is not a gate
+        that could misfire. agent/client_dm_support/ contains NO import of and NO call
+        to any ad-write surface, and no dynamic-dispatch escape hatch (no importlib,
+        no subprocess, no eval/exec, no computed getattr, no HTTP client of its own)
+        through which one could be reached indirectly -- so a static AST scan over the
+        package can enumerate everything this code can reach, and
+        tests/test_client_dm_ad_block.py runs that scan. The SOUND part of the proof is
+        the import table plus the no-dynamic-dispatch rule: a module that cannot be
+        imported and cannot be reached by reflection cannot have a function called on
+        it. The forbidden-call-name table is a secondary check and is, on its own, an
+        enumeration -- it is not what the guarantee rests on.
+        Precisely: this is a claim about DIRECT imports and about call paths. Modules
+        the package legitimately calls (e.g. agent.jobs.sync_gym_media) have their own
+        transitive import closures, and no ad WRITE is reachable through any of them;
+        the ad rails live in the portal, not in this repo.
+      * billing -- Stripe, invoicing, plan/tier, payment methods.
+      * feature flags, env vars, secrets, tokens, auth/identity config.
+      * schema, migrations, RLS policies.
+      * pixel / CAPI setup.
+      * any other gym's data. Every remedy carries exactly one gym scope value and
+        scope_gate.check() refuses an action that names zero or more than one.
+
+    ARMING TAKES TWO FLAGS. This one lets the lane RUN. A client-visible reply is
+    checked again at POST time by the existing outbox, which holds any conversational
+    row unless the identity's SLACK_CONVO_<IDENTITY>_CLIENT_REPLY is armed
+    (outbox.py:429) -- writing a row 'ready' is not a bypass of that. With this flag on
+    and that one off, the lane still diagnoses, still fixes, still verifies, and its
+    reply is HELD for a human with a hold card. Escalations are an INTERNAL kind and go
+    to the fixer channel regardless.
+
+    Inert on its own: with no Supabase creds and no bus the consumer returns a
+    reason string and posts nothing."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_AUTOFIX", "false"))
