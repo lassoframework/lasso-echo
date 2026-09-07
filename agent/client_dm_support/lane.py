@@ -121,6 +121,14 @@ ESCALATE_ALWAYS = (
     "subscription", "plan", "price", "pricing", "pixel", "capi", "conversions api",
     "password", "api key", "token", "login", "hours", "class schedule", "injur",
     "liabilit", "lawyer", "cancel my account", "another gym", "other client",
+    # MINOR (audit of PR #68): the auditor tried four plain ad-money phrasings with
+    # no line above and got an on-topic-but-wrong reply about photos instead of an
+    # escalation. Added, not to enumerate every future phrasing (see BELT_MISSES in
+    # tests/test_client_dm_lane.py for why that race is never run to completion),
+    # but because these four are ordinary ways a gym owner actually asks for more ad
+    # spend, more reach, or narrower targeting -- not edge cases.
+    "more money", "scale up", "scale us up", "promote", "our ads", "show our ads",
+    "showing our ads",
 )
 
 ESCALATE_ALWAYS_REASON = (
@@ -142,6 +150,18 @@ def hard_line(text):
     return any(t in low for t in ESCALATE_ALWAYS)
 
 
+# MINOR (audit of PR #68, John Weeks's real case): "yes let's include a call to
+# action to book a free intro class" was re-asked ASKS["cta_needed"] despite
+# already answering it. SUPERSEDED here rather than fixed with a phrase check: D70
+# (docs/slack_convo/DECISIONS.md, merged as PR #73 while this fix was in flight)
+# independently found and closed the SAME bug via a fact about the CONVERSATION
+# (`_echo_already_asked` below) rather than about the client's WORDS -- exactly the
+# right axis, and its own test (test_the_identical_message_on_a_fresh_thread_still_
+# gets_the_ask) explicitly proves a phrase-matching version of this fix is wrong: an
+# ask must still fire for John's identical words on a FRESH thread Echo has never
+# spoken on. An earlier draft of this fix here was a phrase-matching version and
+# broke exactly that test; removed in favor of D70's conversation-level fix.
+#
 # ---------------------------------------------------------------------------
 # The per-ticket decision. Posts nothing; the caller delivers.
 # ---------------------------------------------------------------------------
@@ -547,10 +567,20 @@ def _card_text(ticket, decision, arm, wrote):
     return "\n".join(lines)
 
 
-def run_once(*, bus=None, identity=None, limit=5, product=DEFAULT_PRODUCT, deps=None):
-    """One pass. Never raises. Always returns a summary that distinguishes OFF from
-    BROKEN from IDLE by name and by count."""
+def run_once(*, bus=None, identity=None, limit=5, product=None, deps=None):
+    """One pass, for ONE bot identity. Never raises. Always returns a summary that
+    distinguishes OFF from BROKEN from IDLE by name and by count.
+
+    `product` defaults to the IDENTITY'S OWN product (identities.py), not a fixed
+    constant. GAP 1 (audit of PR #68): this used to default to DEFAULT_PRODUCT
+    ("echo") regardless of which identity was passed in, so a caller that passed
+    identity=scout (or ranger, or wrangler) still polled support_tickets for
+    product='echo' -- silently reading nothing for that identity, forever. See
+    run_once_all_identities() below for why one product was never enough on its
+    own: every production caller invoked this with NO arguments at all."""
     ident = identity if identity is not None else default_identity()
+    if product is None:
+        product = getattr(ident, "product", None) or DEFAULT_PRODUCT
     arm = _arm.preflight(getattr(ident, "name", DEFAULT_IDENTITY))
     if arm.banner:
         print(arm.banner)
@@ -608,6 +638,59 @@ def run_once(*, bus=None, identity=None, limit=5, product=DEFAULT_PRODUCT, deps=
           f"replies={summary['replies']} escalated={summary['escalated']} "
           f"cards={summary['cards']} undelivered={summary['undelivered']}")
     return summary
+
+
+# GAP 1 (audit of PR #68, Blake confirmed directly): every bot identity below is
+# armed in production (SLACK_CONVO_<ID>_ENABLED=true, live per Railway, 2026-09-07)
+# and every one of them can resolve identity_kind='client' and write a
+# support_tickets row via bus.get_or_create_ticket(product=ident.product) -- Scout
+# in particular is the identity real clients' Slack group DMs go through (per
+# established practice: client sends land in a group DM with Scout, Blake and the
+# owner). But run_once() above defaulted to identity='echo' and every production
+# caller (agent/runner.py) invoked it with NO ARGUMENTS AT ALL, so this lane's poll
+# has only ever asked support_tickets for product='echo'. A real client ticket
+# filed through Scout, Ranger or Wrangler's own Bolt App was invisible to this
+# lane's diagnosis path from day one -- not because ingestion into support_tickets
+# was broken (get_or_create_ticket stamps source/reporter/client_id/identity_kind
+# correctly for every identity), but because nothing ever asked for those rows.
+# Read-only against the production project confirms this is not hypothetical:
+# zero support_tickets rows of ANY product other than 'echo' carry a real (is_test
+# is not true) client_id + slack_channel_id today.
+#
+# Lainey is excluded: no Slack surface (repo rule, identities.py).
+POLL_IDENTITIES = ("echo", "ranger", "scout", "wrangler")
+
+
+def run_once_all_identities(*, limit=5, deps=None, bus=None):
+    """Run the lane once per identity that can carry a client's Slack conversation,
+    against ONE shared bus connection. This is the function production should call
+    instead of run_once() directly -- see agent/runner.py's caller and
+    tests/test_client_dm_lane.py::test_the_runner_calls_all_client_carrying_identities.
+
+    Each identity's own arming (arming.preflight(identity.name)), own outbox loop
+    and own bot token are already correctly wired per-identity (outbox._dispatch_one
+    checks att['identity'] == ticket['bot_identity'] == the posting identity's own
+    name), so looping here is safe by construction: it does not change what any one
+    identity may do, only how many identities' own tickets get asked for.
+    """
+    bus = bus if bus is not None else default_bus()
+    from ..slack_convo import identities as _ids
+    out = {"ok": True, "mode": "", "identities": {}, "handled": 0, "replies": 0,
+           "cards": 0, "escalated": 0, "undelivered": 0}
+    for name in POLL_IDENTITIES:
+        try:
+            ident = _ids.get(name)
+        except KeyError:
+            continue
+        summary = run_once(bus=bus, identity=ident, limit=limit, deps=deps)
+        out["identities"][name] = summary
+        if not summary.get("ok", True):
+            out["ok"] = False
+        if not out["mode"]:
+            out["mode"] = summary.get("mode", "")
+        for k in ("handled", "replies", "cards", "escalated", "undelivered"):
+            out[k] += summary.get(k, 0) or 0
+    return out
 
 
 def _gym_key_for(ticket):

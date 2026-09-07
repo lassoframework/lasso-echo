@@ -25,6 +25,16 @@ the per-gym pilot allowlist). For each ACTIVE, gym-drive media_source, staggered
 Degrades cleanly: no SA key / no Supabase creds -> one log line, no-op. Nothing
 here stages, publishes, or writes calendar rows (beyond flipping a pending row
 whose media vanished). NOTHING here logs a secret.
+
+GAP 3 (audit of PR #68, client_dm_support): "the coach channel" in steps 1 and 7
+above is a CLIENT-FACING Slack channel, and this module used to post straight to
+it with no reference to conditions.compose(), the outbox, or the client_dm_support
+three-flag interlock at all -- reachable via the nightly cron with NO
+client_dm_support flag involved, and independently via the gym_drive_sync action
+(gated on AGENT_CLIENT_DM_AUTOFIX alone). `_client_channel_if_armed(gym_id)` now
+gates every one of these on `config.slack_convo_client_reply_armed('echo')` -- the
+SAME flag every other client-facing send in this repo already requires -- falling
+back to the existing internal `#ops` channel when it is not armed.
 """
 from __future__ import annotations
 
@@ -214,6 +224,36 @@ def _coach_channel(gym_id):
         return ""
 
 
+def _client_channel_if_armed(gym_id):
+    """_coach_channel(gym_id), but ONLY when this identity's client-reply flag is
+    armed -- the SAME gate every other client-facing reply in this repo requires
+    (config.slack_convo_client_reply_armed). Not armed -> '' -> the caller's
+    _post_digest falls back to the internal #ops channel, exactly like "no channel
+    configured" always has.
+
+    GAP 3 (audit of PR #68): a Drive-revoked notice and the new-media/sort-queue
+    digests used to post STRAIGHT to _coach_channel(gym_id) -- a client-facing Slack
+    channel -- with no reference to conditions.compose(), the outbox, or the
+    three-flag client_dm_support interlock at all. Reachable on
+    AGENT_CLIENT_DM_AUTOFIX alone (the gym_drive_sync action calls sync_source,
+    which calls this), and ALSO reachable with no client_dm_support flag set at all,
+    since the nightly gym_drive_connect cron calls the exact same code path. No gym
+    has slack_channel configured yet (audit, 2026-09-07), so every call has actually
+    landed on #ops -- this closes the bypass before one does, rather than after.
+    This does not make the notice pass through compose()'s grounded-reply gate (it
+    is a fixed, factual, non-conditional string, not a claim assembled from a
+    Reading), but it can no longer reach a client on any weaker condition than every
+    other client-facing send in this system already requires.
+    """
+    try:
+        from .. import config as _config
+        if not _config.slack_convo_client_reply_armed("echo"):
+            return ""
+    except Exception:  # noqa: BLE001 - a config read failure fails closed (internal only)
+        return ""
+    return _coach_channel(gym_id)
+
+
 def _flip_pending_for_missing(gym_id, asset_ids, log):
     """When an asset a PENDING calendar row is using disappears from Drive, pull that
     row off it (spec §4). Best effort: no creds -> no-op.
@@ -287,7 +327,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             msg = (f"Google Drive access for {gym_id} was revoked (the shared "
                    f"folder is no longer shared to Echo). Reconnect it in the "
                    f"portal to resume pulling photos. Nothing was lost.")
-            _post_digest(msg, channel=_coach_channel(gym_id))
+            _post_digest(msg, channel=_client_channel_if_armed(gym_id))
             log(f"source {source_id} for {gym_id} revoked_externally (Drive {status})")
             return {"ok": False, "revoked": True, "gym_id": gym_id}
         log(f"walk failed for {gym_id}: {type(e).__name__}: {e}")
@@ -453,14 +493,14 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             f"({photos} photos, {videos} videos this scan), {newly_eligible} newly "
             f"ready to use, rejected: {rejected_txt}. Review or hide any in the "
             f"portal media tab.",
-            channel=_coach_channel(gym_id))
+            channel=_client_channel_if_armed(gym_id))
     # "Sort these" coach digest (spec §0.3): fires ONLY when the queue is non-empty.
     # story_sort_queue.post_digest is a no-op on an empty queue, so this never
     # storms the channel. Best effort: a digest failure never sinks the sync.
     if config.story_classifier_enabled():
         try:
             from .. import story_sort_queue as _q
-            _q.post_digest(gym_id, channel=_coach_channel(gym_id))
+            _q.post_digest(gym_id, channel=_client_channel_if_armed(gym_id))
         except Exception as e:  # noqa: BLE001
             log(f"sort-queue digest skipped for {gym_id}: {type(e).__name__}: {e}")
     return summary

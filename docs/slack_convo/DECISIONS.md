@@ -2534,8 +2534,10 @@ which is part of why its grade was not trustworthy.
   `slack_conversation` row in the table is a phase-4 arming probe with `is_test=true`.
   The lane polled `source='slack_conversation'` with statuses `("new","triage","hold")`.
   Both are now pinned constants covering what production actually writes.
-* **`media_source.gym_id` and `media_asset.gym_id` DISAGREE for 2 of 17 connected
-  gyms** -- the documented account-key split-brain landing on this lane's flagship
+* **`media_source.gym_id` and `media_asset.gym_id` DISAGREE for 2 of 12 DISTINCT
+  connected gyms** -- corrected here per the audit of PR #68: "17" was a
+  `media_source` ROW count, not a distinct-gym count. The documented account-key
+  split-brain landing on this lane's flagship
   fact. `toughtemple086f51`'s source owns 70 assets stamped `toughtemple52040e`;
   `crossfitsunnyside2616ac`'s owns 13 stamped `crossfitsunnysidef574c0`. Asked "why do
   my posts have no photos?", a gym-id-keyed probe for `toughtemple52040e` -- which is
@@ -2673,3 +2675,149 @@ is not a shortcut.**
 the suite red -- including the one that hard-codes the argument at the single call site
 joining the helper to the decision, which is the "built but not wired" shape and was
 caught by mutation rather than by review. Full suite green. Nothing armed.
+
+## D71 (2026-09-07) -- three real gaps from an adversarial audit of D69, closed
+
+Blake, directly: "I thought we built out that the agent could read the message, submit
+to support themselves, or diagnose the issue and reply." He was right that it did not
+work, and confirmed it from his own experience with Chad Edwards's and John Weeks's real
+messages. This entry closes that (GAP 1), plus two audit findings (GAP 2, GAP 3) and four
+minor items. Nothing is armed by this entry; `AGENT_CLIENT_DM_AUTOFIX` still defaults OFF.
+
+### GAP 1 -- the lane was scoped to ONE identity's tickets, out of four armed ones
+
+`run_once()`'s `identity` defaulted to `echo`, its `product` defaulted to the fixed
+constant `"echo"`, and `agent/runner.py`'s only production caller invoked it with **no
+arguments at all**. But `identities.py` has FOUR armed identities (echo, ranger, scout,
+wrangler -- all `SLACK_CONVO_*_ENABLED=true` on Railway, verified live 2026-09-07) whose
+Bolt Apps each independently create `support_tickets` rows via
+`bus.get_or_create_ticket(product=identity.product, ...)`, correctly stamping
+source/reporter/client_id/identity_kind every time. Real clients' Slack group DMs are
+established practice to route through the SCOUT identity (Blake + owner + Scout bot), not
+Echo. So this lane's poll asked `product='echo'` forever, while real client tickets landed
+under `product='scout'` (or ranger, or wrangler) and were never once asked for -- a fourth
+instance of D68's "built but not wired" pattern, this time at the CALLER, not the callee.
+
+Read-only against production (2026-09-07) confirms this was not hypothetical: zero
+`support_tickets` rows of any product other than `echo` carry a real (`is_test` is not
+true) `client_id` + `slack_channel_id` today, and Chad Edwards has NO `support_tickets`
+row at all, under any product, ever.
+
+**Closed**: `run_once()`'s `product` now defaults to the passed identity's OWN
+`.product` (never the fixed constant), and a new `run_once_all_identities()` -- the
+function `agent/runner.py` now calls instead -- loops every client-carrying identity
+(echo, ranger, scout, wrangler; lainey excluded, no Slack surface) against one shared
+bus connection. This is safe by construction: each identity's own arming, own outbox
+loop and own bot token are untouched (`outbox._dispatch_one` already scopes delivery to
+`ticket.bot_identity == the posting identity`), so looping here only widens which
+tickets get ASKED for, not what any identity may do with them.
+
+`tests/test_client_dm_end_to_end.py` is the strongest proof: it builds a raw Slack
+`message` event shaped exactly like a real group-DM message (mpim, John Weeks's real
+words), runs it through the REAL `adapter.handle_event()` with NO ticket inserted by
+hand, and asserts the ticket the adapter itself produces (`product='scout'`,
+`source='slack_conversation'`, `status='hold'`) is invisible to the OLD call shape
+(`run_once()` with no arguments) and visible to `run_once_all_identities()`.
+
+**What this does NOT close, honestly.** If a real client's message never reaches
+`adapter.handle_event()` at all -- the Slack app's event subscription not covering that
+channel type, or the relevant bot not being a member of that specific group DM -- no
+code change in this repo can see it; that is a Slack-app-configuration question outside
+this codebase, and `ConvoWiring.health_line()`'s per-channel-type event counts (D-something,
+listener_wiring.py) are the existing instrument for checking it. This fix closes the
+gap that was provably real and in this repo's own control; it does not rule out a
+second, Slack-side contributing cause, and Blake should check bot channel membership
+for Scout/Echo in the actual gym group DMs as defense in depth.
+
+### GAP 2 -- re-examined: the described write-time escape does not reproduce; a real,
+### narrower dispatch-time gap did, and is now closed
+
+The audit's literal claim (arming.py's docstring, pre-fix) was that with
+`AGENT_CLIENT_DM_AUTOFIX=true`, `AGENT_CLIENT_DM_CLIENT_REPLY=true` and the ack token
+wrong/stale, the lane still WRITES a `ready` client reply row. Traced through
+`lane._decide()` step by step and reproduced with a script: this is **not what the
+code does**. `may_reply=arm.may_reply_to_clients` is `False` whenever the ack does not
+match, and `_decide()` returns an ESCALATE at "if not may_reply" BEFORE `conditions.
+compose()` is ever called -- no reply row is written. `arming.py`'s own docstring
+overclaimed in one respect (see below) but the write-time gate itself holds; this
+audit re-attempt could not break it.
+
+**The real, adjacent gap**: a row written to `ready` DURING a genuine LIVE window
+persists in `support_messages` after that window ends -- `AGENT_CLIENT_DM_AUTOFIX`
+revoked, or the derived `AGENT_CLIENT_DM_LIVE_ACK` gone stale. `outbox._dispatch_one`'s
+own release gate, `_recipient_armed` (outbox.py:141-144), reads only
+`SLACK_CONVO_<IDENTITY>_CLIENT_REPLY` -- a different, pre-existing, already-armed flag
+(`true` on Railway since D51) with zero awareness this lane, or its revocation, exists.
+So a revoke stops NEW writes but does nothing to rows already queued.
+
+**Closed**: `outbox._dispatch_one` now re-runs `client_dm_support.arming.preflight()`
+at DISPATCH time for any row carrying this lane's own provenance marker
+(`attachments.client_dm_lane`), holding it (with a card) the moment that lane's own
+arming no longer says LIVE -- independent of, and in addition to, the existing
+`_recipient_armed` check. `arming.py`'s module docstring is corrected to state the real
+guarantee (write-time only puts nothing new on the wire; the new dispatch-time check is
+what makes a revoke retract what was already queued) rather than the broader claim it
+made before. Two tests in `tests/test_slack_convo.py` cover both directions: held when
+the lane's own arming has lapsed with `SLACK_CONVO_ECHO_CLIENT_REPLY` unchanged and ON
+the whole time (the exact "one boolean" framing), and posted normally when the lane is
+genuinely live.
+
+### GAP 3 -- the Drive-revoked notice bypassed every gate; closed before any gym is exposed
+
+`jobs/sync_gym_media.py`'s Drive-revoked notice, new-media digest, and sort-queue
+digest all called `_post_digest(msg, channel=_coach_channel(gym_id))` -- a raw
+`SlackPoster._chat_post` straight to the gym's own coach Slack channel, entirely
+outside `conditions.compose()`, the outbox, and the three-flag interlock. Reachable via
+the `gym_drive_sync` action (itself gated on `AGENT_CLIENT_DM_AUTOFIX`) AND,
+independently, via the nightly `gym_drive_connect` cron with NO client_dm_support flag
+involved at all. No gym has `slack_channel` configured yet (confirmed against
+production), so this had only ever reached `#ops` in practice -- closed now, before one
+does, not after.
+
+**Closed**: a new `_client_channel_if_armed(gym_id)` gate requires
+`config.slack_convo_client_reply_armed('echo')` -- the SAME flag every other
+client-facing send in this repo already requires -- before returning the gym's own
+channel; unarmed, it returns `''` and the existing `_post_digest` fallback to `#ops`
+applies unchanged. This is not a full `compose()`/outbox migration (the notice is a
+fixed factual string, not a Reading-assembled claim, and building a ticket-based outbox
+path for a background-job notification is a larger, separate change); it closes the
+"reachable on no gate at all" bypass to the same bar every other client-facing string in
+this system already clears.
+
+### MINOR ITEMS
+
+* **`ASKS["cta_needed"]` re-asked a question the client had already answered.**
+  SUPERSEDED, not fixed here: a phrase-matching version of this fix was built and
+  then removed after D70 above (PR #73, merged to `main` while this fix was in
+  flight) turned out to already close the SAME live case John Weeks reported, via
+  the right axis -- a fact about the CONVERSATION (`_echo_already_asked`), not
+  about the client's WORDS. D70's own test
+  (`test_the_identical_message_on_a_fresh_thread_still_gets_the_ask`) is explicit
+  that a phrase-matching version is WRONG: the ask must still fire for John's exact
+  words on a thread Echo has never spoken on. The phrase-matching draft here broke
+  precisely that test, which is the correct outcome for that test to have and the
+  reason the draft was removed rather than kept alongside D70's fix.
+* **`ASKS["drive_reshare"]` asserted an unmeasured outcome as fact** ("will let the
+  sync resume"). Reworded as a genuine question per this module's own rule that an
+  ask must make no claim: "Would you be able to re-share that folder with Echo in
+  your portal? Once it is shared again, we can check whether the sync picks it back
+  up."
+* **`ESCALATE_ALWAYS` missed four plain ad-money phrasings** the auditor tried ("put
+  more money behind the tuesday one", "scale us up to $50 a day", "promote that post
+  to more people", "stop showing our ads to men over 60"), each producing an
+  on-topic-but-wrong reply about photos instead of an escalation. Added seven terms
+  (`more money`, `scale up`, `scale us up`, `promote`, `our ads`, `show our ads`,
+  `showing our ads`) -- not to enumerate every future phrasing (see `BELT_MISSES` in
+  `tests/test_client_dm_lane.py` for why that race is deliberately never run to
+  completion on the ROUTER), but because these are ordinary phrasings on Blake's
+  OWN always-escalate belt, which nothing in this capability's safety rests on
+  completing (see `no_ad_rail.py`) but which is worth widening anyway.
+* **"2 of 17 connected gyms" was wrong** in `probes.py` and this file: 17 was a
+  `media_source` ROW count, not a distinct-gym count. The real number is 2 of 12
+  DISTINCT gyms. The underlying fix (measuring `drive_identity_split` and refusing to
+  speak on it) was already correct either way; only the prose was wrong.
+
+Mutation-checked, `__pycache__` cleared between each: reverting the `run_once()`
+product default, the runner's caller, the outbox dispatch-time recheck, or the
+`ESCALATE_ALWAYS` additions each turns the corresponding test red, including
+`test_client_dm_end_to_end.py`'s full real-adapter path.

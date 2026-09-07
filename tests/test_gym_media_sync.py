@@ -56,6 +56,42 @@ def test_unshare_marks_revoked_and_notifies(monkeypatch):
     assert notes and "revoked" in notes[0].lower()
 
 
+def test_revoked_notice_does_not_reach_a_client_channel_when_not_armed(monkeypatch):
+    """GAP 3 (audit of PR #68): the Drive-revoked notice used to post straight to
+    the gym's own coach Slack channel via _coach_channel(gym_id), with no reference
+    to compose(), the outbox, or the three-flag client_dm_support interlock at all
+    -- reachable on AGENT_CLIENT_DM_AUTOFIX alone. It must now require the SAME
+    flag every other client-facing send in this repo requires
+    (SLACK_CONVO_ECHO_CLIENT_REPLY), which is unset/false here."""
+    import os
+    monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
+    monkeypatch.setattr(sync, "_coach_channel", lambda gym_id: "C_CLIENT_CHANNEL")
+    seen = []
+    monkeypatch.setattr(sync, "_post_digest",
+                        lambda text, channel=None, poster=None: seen.append(channel))
+    drive = FakeDrive(walk_raises=_Resp(403))
+    store = FakeMediaStore(sources=[_src()])
+    res = sync.sync_source(_src(), drive=drive, store=store)
+    assert res.get("revoked") is True
+    assert seen == [""], (
+        "the revoked notice reached a client channel with no client-reply flag armed: "
+        f"{seen!r}")
+
+
+def test_revoked_notice_reaches_the_client_channel_once_armed(monkeypatch):
+    """The negative case: with the SAME flag every other client-facing send needs,
+    this notice may reach the gym's own channel -- it is not disabled outright."""
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setattr(sync, "_coach_channel", lambda gym_id: "C_CLIENT_CHANNEL")
+    seen = []
+    monkeypatch.setattr(sync, "_post_digest",
+                        lambda text, channel=None, poster=None: seen.append(channel))
+    drive = FakeDrive(walk_raises=_Resp(403))
+    store = FakeMediaStore(sources=[_src()])
+    sync.sync_source(_src(), drive=drive, store=store)
+    assert seen == ["C_CLIENT_CHANNEL"]
+
+
 def test_sync_probes_videos_and_writes_eligibility(monkeypatch):
     monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
                         lambda *a, **k: None)

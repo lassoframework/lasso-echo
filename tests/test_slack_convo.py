@@ -814,6 +814,87 @@ def test_outbox_recheck_holds_a_ready_row_if_flag_flipped_off(monkeypatch):
     assert new_notices and "flag off at post time" in new_notices[0]["body"]
 
 
+def test_client_dm_lane_row_is_held_at_dispatch_if_the_lanes_own_arming_lapses(
+        monkeypatch):
+    """GAP 2 (audit of PR #68). A row client_dm_support wrote while its OWN
+    three-flag interlock was live must be held at dispatch time the moment that
+    interlock no longer holds -- independent of SLACK_CONVO_ECHO_CLIENT_REPLY, which
+    stays ON throughout (D51, live in production since 2026-09-05) and is exactly
+    the flag the audit's "one-variable escape" claim was about. If this recheck did
+    not exist, _recipient_armed alone (true the whole time here) would release the
+    row with zero awareness this lane, or its revocation, exists."""
+    from agent.client_dm_support import lane as L
+
+    bus = FakeBus()
+    t, _ = bus.get_or_create_ticket(
+        channel_id="G0MPIM", thread_ts="1.001", product="echo", bot_identity="echo",
+        slack_user_id="U_CLIENT", identity_kind="client", client_id="g-1",
+        reporter="chad@x.com", raw_text="my posts have no photos")
+    bus.record_inbound(ticket_id=t["id"], slack_event_id="e1", slack_ts="1.001",
+                       author_type="client", author_id="U_CLIENT",
+                       body="my posts have no photos")
+    row = bus.record_outbound(
+        ticket_id=t["id"], author_type="echo", body="I ran your photo sync just now.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "surface": "mpim",
+              L.LANE_META: L.LANE_NAME, "condition_id": "drive_library_empty"})
+
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")   # unchanged throughout
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("AGENT_OPS_FIX_CHANNEL_ID", "C_OPSFIX")
+    # client_dm_support's OWN arming was never live (AGENT_CLIENT_DM_AUTOFIX unset) --
+    # the "revoked, or never armed in the first place" shape this gate exists for.
+    monkeypatch.delenv("AGENT_CLIENT_DM_AUTOFIX", raising=False)
+    monkeypatch.delenv("AGENT_CLIENT_DM_CLIENT_REPLY", raising=False)
+    monkeypatch.delenv("AGENT_CLIENT_DM_LIVE_ACK", raising=False)
+
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+
+    assert bus.message(row["id"])["delivery_status"] == "held"
+    assert not any(c["channel"] == "G0MPIM" for c in calls), (
+        "the client_dm_support reply reached the client's own channel despite this "
+        "lane's arming never having gone live")
+    notices = [m for m in _rows(bus, t["id"], A.KIND_HOLD_NOTICE)
+              if m["attachments"].get("held_message_id") == row["id"]]
+    assert notices, "a human must still get a card explaining why this row was held"
+    assert "client_dm_support" in notices[0]["body"]
+
+
+def test_client_dm_lane_row_still_posts_when_the_lane_is_genuinely_live(monkeypatch):
+    """The negative case: the SAME row, with client_dm_support's own arming actually
+    satisfied, is not affected by the new dispatch-time recheck."""
+    from agent.client_dm_support import arming as ARM
+    from agent.client_dm_support import lane as L
+
+    bus = FakeBus()
+    t, _ = bus.get_or_create_ticket(
+        channel_id="G0MPIM", thread_ts="1.001", product="echo", bot_identity="echo",
+        slack_user_id="U_CLIENT", identity_kind="client", client_id="g-1",
+        reporter="chad@x.com", raw_text="my posts have no photos")
+    bus.record_inbound(ticket_id=t["id"], slack_event_id="e1", slack_ts="1.001",
+                       author_type="client", author_id="U_CLIENT",
+                       body="my posts have no photos")
+    row = bus.record_outbound(
+        ticket_id=t["id"], author_type="echo", body="I ran your photo sync just now.",
+        delivery_status="ready", kind=A.KIND_STATUS,
+        meta={"identity": "echo", "recipient_kind": "client", "surface": "mpim",
+              L.LANE_META: L.LANE_NAME, "condition_id": "drive_library_empty"})
+
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    monkeypatch.setenv("AGENT_CLIENT_DM_AUTOFIX", "true")
+    monkeypatch.setenv("AGENT_CLIENT_DM_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_CLIENT_DM_LIVE_ACK",
+                       ARM.required_ack("echo", client_reply_armed=True))
+
+    post, calls = _posted()
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+
+    assert bus.message(row["id"])["delivery_status"] == "posted"
+    assert any(c["channel"] == "G0MPIM" for c in calls)
+
+
 def _orphan_ticket(bus):
     t, _ = bus.get_or_create_ticket(channel_id="G0", thread_ts="1.0", product="echo",
                                     bot_identity="echo", slack_user_id="U", identity_kind="client",
