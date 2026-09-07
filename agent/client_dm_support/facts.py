@@ -35,6 +35,7 @@ from types import MappingProxyType
 # Drive-photos lane (Case 1 shape: "my posts have no photos").
 DRIVE_FACT_KEYS = frozenset({
     "drive_lane_active_for_gym",     # bool  is the Connect-Drive lane armed for THIS gym
+    "media_source_multiple_active",  # bool  MORE THAN ONE active source for this gym
     "media_source_present",          # bool  does a gym_drive media_source row exist
     "media_source_active",           # bool  media_source.active
     "media_source_revoked",          # bool  media_source.revoked_externally

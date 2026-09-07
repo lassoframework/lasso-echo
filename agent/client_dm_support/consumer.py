@@ -340,7 +340,17 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
 
     replied = escalated = handled = skipped = undelivered = 0
     decisions = []
+    # `limit` CAPS THE PASS, not just the paging. It used to be handed to the poll's
+    # stopping rule only, while this loop iterated every row the poll returned -- so
+    # run_once(limit=3) over a 40-gym backlog handled 40 tickets, queued 40 unattended
+    # client messages and ran 40 per-gym Drive syncs. Bounded only by the 500-row
+    # ceiling. The parameter an operator would reach for to ramp this safely was the
+    # one parameter that did not do it.
+    capped = 0
     for t in tickets:
+        if handled >= int(limit):
+            capped += 1
+            continue
         msgs = _msgs(t)
         surface = _surface_of(msgs)
         if surface not in CLIENT_DM_SURFACES:
@@ -412,6 +422,9 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
                     f"{type(e2).__name__}: {e2}")
                 undelivered += 1
 
+    if capped:
+        log(f"client-dm autofix: {capped} actionable ticket(s) left for the next pass "
+            f"(limit={int(limit)})")
     log(f"client-dm autofix: {handled} handled, {replied} grounded reply(ies), "
         f"{escalated} escalated, {skipped} already handled, {undelivered} UNDELIVERED")
     if undelivered:
@@ -429,6 +442,7 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
     return {"ok": not undelivered and not ceiling_hit, "handled": handled,
             "replied": replied, "escalated": escalated, "skipped": skipped,
             "undelivered": undelivered, "poll_ceiling_hit": ceiling_hit,
+            "capped": capped,
             "reason": ("the ticket poll hit its ceiling; older open tickets were not "
                        "examined") if ceiling_hit else "",
             "decisions": decisions}

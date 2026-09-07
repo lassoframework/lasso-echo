@@ -76,6 +76,10 @@ def _plan_drive(key, f):
     # The lane is not even armed for this gym -> shared config decision, not ours.
     if not f.get("drive_lane_active_for_gym"):
         return None
+    # More than one active source: every reply this lane can compose says "your
+    # folder", singular, and there is no reviewed copy for two. A human handles it.
+    if f.get("media_source_multiple_active"):
+        return None
     # No source at all, or an inactive one -> the client has not finished connecting;
     # nothing for Echo to run, and the honest reply is not in the registry, so escalate.
     if not f.get("media_source_present") or not f.get("media_source_active"):

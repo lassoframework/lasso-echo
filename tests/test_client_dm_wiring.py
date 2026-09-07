@@ -351,3 +351,178 @@ def test_confirm_gym_binding_requires_the_unique_owner_to_be_THIS_gym():
             fresh_key=lambda _g: "sharedkey") is True
     finally:
         akr.resolve = real
+
+
+# ===========================================================================
+# A FACT KEY MUST MEASURE WHAT ITS NAME SAYS.
+#
+# The byte-identity reply gate proves every SLOT traces to a fact key. It says
+# nothing about whether the fact key is RIGHT, and that is the gap these close.
+# ===========================================================================
+CTA_DOC_WITH_REAL_CTAS_AND_A_NOTE = """### CTA rotation (cycle in order, one per post)
+- Book your free intro at crossfitlocal.com/start
+- Call us at 555 0101
+- Send us a DM and we will get you booked
+> TODO: add two more before the spring campaign
+
+### Hashtags
+"""
+
+CTA_DOC_TRUE_PLACEHOLDER = """### CTA rotation (cycle in order, one per post)
+> TODO: this section was missing or empty in the intake. Fill it by hand.
+
+### Hashtags
+"""
+
+CTA_DOC_BARE_TODO_SCAFFOLD = """### CTA rotation (cycle in order, one per post)
+TODO: three to five CTA lines in their voice.
+
+### Hashtags
+"""
+
+
+def _cta_facts(doc):
+    return dict(diagnostics.diagnose_cta_pool(
+        "crossfitlocal", voice_dir="/data/brand_voice",
+        read_text=lambda _p: doc).facts)
+
+
+def test_a_todo_note_beside_real_ctas_is_not_a_blank_section():
+    """THE REPRODUCTION. `> TODO` was searched for ANYWHERE in the section and the
+    count was hard-zeroed from that same boolean, so a gym with three working CTAs and
+    one leftover note was auto-told, in four separate false clauses, that its section
+    was the blank onboarding placeholder, that it had zero CTAs, and that this was why
+    its posts had none -- while drafter.py was appending one of those three to every
+    caption. Leaving a note beside real copy is ordinary editing."""
+    facts = _cta_facts(CTA_DOC_WITH_REAL_CTAS_AND_A_NOTE)
+    assert facts["cta_pool_count"] == 3, facts
+    assert facts["cta_section_is_todo"] is False, facts
+
+    d = flow.handle_ticket(text="my posts have no call to action",
+                           gym_key="crossfitlocal",
+                           deps={"voice_dir": "/data/brand_voice",
+                                 "read_text": lambda _p: CTA_DOC_WITH_REAL_CTAS_AND_A_NOTE})
+    assert not d.will_post, d.reply_text
+    assert "blank placeholder" not in (d.reply_text or "")
+
+
+def test_the_pool_is_counted_by_the_extractor_the_drafter_actually_uses():
+    """One implementation, not two. The fact the client is told must be the fact their
+    posts run on, so the count comes from agent.voice._extract_ctas -- which accepts
+    quoted CTAs and '-' bullets and skips [placeholder] entries, none of which the
+    diagnostic's own regex did."""
+    from agent import voice
+    for doc in (CTA_DOC_WITH_REAL_CTAS_AND_A_NOTE, CTA_DOC_TRUE_PLACEHOLDER,
+                CTA_DOC_BARE_TODO_SCAFFOLD,
+                '### CTA rotation\n"Save this post." "Tag a gym owner."\n\n### X\n',
+                "### CTA rotation\n1. Book a free call.\n2. [placeholder]\n\n### X\n"):
+        assert _cta_facts(doc)["cta_pool_count"] == len(voice._extract_ctas(doc)), doc
+
+
+@pytest.mark.parametrize("doc,writer", [
+    (CTA_DOC_TRUE_PLACEHOLDER, "bible_drafter (> TODO)"),
+    (CTA_DOC_BARE_TODO_SCAFFOLD, "onboard.py (bare TODO)"),
+])
+def test_a_genuinely_unfilled_section_still_asks_the_client(doc, writer):
+    """Both scaffold writers are recognised. onboard.py's bare "TODO:" used to be
+    missed entirely, silently reducing half the Case-2 population to a card."""
+    facts = _cta_facts(doc)
+    assert facts["cta_section_is_todo"] is True, (writer, facts)
+    assert facts["cta_pool_count"] == 0, (writer, facts)
+    d = flow.handle_ticket(text="my posts have no call to action",
+                           gym_key="toughtemple52040e",
+                           deps={"voice_dir": "/data/brand_voice",
+                                 "read_text": lambda _p: doc})
+    assert d.template_id == "cta_ask", writer
+
+
+# ---------------------------------------------------------------------------
+# `limit` must cap CLIENT-FACING SENDS, not only paging.
+# ---------------------------------------------------------------------------
+def _backlog_bus(n):
+    import test_client_dm_flow as F
+    tickets, msgs = [], {}
+    for i in range(n):
+        tid = f"G{i}"
+        tickets.append({"id": tid, "product": "echo", "source": "slack_conversation",
+                        "status": "hold", "bot_identity": "echo",
+                        "client_id": f"uuid-{i}"})
+        msgs[tid] = [{"direction": "inbound", "author_type": "client",
+                      "body": "my posts have no photos",
+                      "attachments": {"surface": "mpim"}}]
+    return F.FakeBus(tickets=tickets, messages=msgs)
+
+
+@pytest.mark.parametrize("limit", [1, 3, 10])
+def test_limit_caps_the_pass_not_only_the_paging(limit):
+    """run_once(limit=3) over a 40-gym backlog handled 40 tickets, queued 40 unattended
+    client messages and ran 40 per-gym Drive syncs: `limit` reached only the poll's
+    stopping rule while the loop iterated everything the poll returned. The one
+    parameter an operator would reach for to ramp this safely was the one that did not
+    do it."""
+    import test_client_dm_flow as F
+    bus = _backlog_bus(40)
+    store = F.FakeStore(
+        sources=[dict(F.CHAD_SOURCE, gym_id=f"gym{i}") for i in range(40)], assets=[])
+    sync = F.make_sync(4, store)
+    out = consumer.run_once(
+        bus=bus, flag_on=True, limit=limit,
+        deps={"store": store, "now": F.NOW, "daily_hour_utc": 12,
+              "lane_active_for": lambda k: True, "sync_source": sync,
+              "log": lambda m: None},
+        portal_key_for_gym=lambda u: f"gym{u.split('-')[1]}",
+        confirm_binding=lambda _g, _k: True, notice_sink=lambda _t, _d: None)
+    assert out["handled"] == limit, out
+    assert len(bus.out) == limit, "more client rows written than limit allows"
+    assert len(sync.calls) == limit, "more gyms synced than limit allows"
+    assert out["capped"] == 40 - limit, out
+
+
+# ---------------------------------------------------------------------------
+# A MULTI-SOURCE GYM IS NEVER DESCRIBED IN THE SINGULAR.
+# ---------------------------------------------------------------------------
+def test_a_gym_with_two_active_sources_is_escalated_not_guessed_at():
+    """`(active or sources or [None])[0]` picked the NEWEST by connected_at while
+    media_asset_count summed across all sources. The schema permits several active
+    sources per gym and gym_media_routes binds a second folder without deactivating the
+    first, so newest-revoked + older-healthy auto-told a gym with a working folder and a
+    full library that "Your connected Google Drive folder is no longer shared with us"
+    -- false, singular, and unactionable, because the folder name is deliberately
+    excluded as client-controlled so they cannot tell which one is meant."""
+    import test_client_dm_flow as F
+
+    class TwoSource(F.FakeStore):
+        def list_sources(self, gym_id=None, include_inactive=False):
+            return [dict(F.CHAD_SOURCE, id=2, folder_name="Old Photos",
+                         revoked_externally=True,
+                         connected_at="2026-09-06T22:00:00+00:00"),
+                    dict(F.CHAD_SOURCE, id=1, folder_name="Gym Photos 2026",
+                         revoked_externally=False,
+                         connected_at="2026-01-01T00:00:00+00:00")]
+
+    store = TwoSource(sources=[], assets=[{"id": 1, "gym_id": F.CHAD_KEY}])
+    snap = diagnostics.diagnose_drive_photos(
+        F.CHAD_KEY, store=store, now=F.NOW, daily_hour_utc=12,
+        lane_active_for=lambda k: True)
+    assert snap.get("media_source_multiple_active") is True
+
+    sync = F.make_sync(0, store)
+    d = flow.handle_ticket(text="my posts have no photos", gym_key=F.CHAD_KEY,
+                           deps={"store": store, "now": F.NOW, "daily_hour_utc": 12,
+                                 "lane_active_for": lambda k: True,
+                                 "sync_source": sync, "log": lambda m: None})
+    assert not d.will_post, d.reply_text
+    assert sync.calls == []
+
+
+def test_one_active_source_is_unaffected():
+    """The common case must still work, or the fix is a regression."""
+    import test_client_dm_flow as F
+    store = F.FakeStore(sources=[F.CHAD_SOURCE], assets=[])
+    snap = diagnostics.diagnose_drive_photos(
+        F.CHAD_KEY, store=store, now=F.NOW, daily_hour_utc=12,
+        lane_active_for=lambda k: True)
+    assert snap.get("media_source_multiple_active") is False
+    d = flow.handle_ticket(text="my posts have no photos", gym_key=F.CHAD_KEY,
+                           deps=F.drive_deps(store, F.make_sync(5, store)))
+    assert d.will_post and d.template_id == "drive_synced"

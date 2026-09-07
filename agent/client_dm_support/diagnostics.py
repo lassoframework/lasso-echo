@@ -159,6 +159,22 @@ def diagnose_drive_photos(gym_key, *, store=None, now=None, daily_hour_utc=None,
         and str(s.get("gym_id") or "") == key
     ]
     active = [s for s in sources if s.get("active")]
+    # ONE SOURCE, OR NONE OF THIS LANE'S BUSINESS.
+    #
+    # This used to be `(active or sources or [None])[0]` -- the newest by connected_at,
+    # while media_asset_count summed assets across ALL sources. The schema permits
+    # several active sources per gym (media_source_gym_idx is on (gym_id, active); only
+    # folder_id is globally unique) and gym_media_routes binds a second folder without
+    # deactivating the first. Newest-revoked + older-healthy therefore auto-told a gym
+    # with a working folder and a full library that "Your connected Google Drive folder
+    # is no longer shared with us" -- false, singular, and unactionable, since the
+    # folder name is deliberately excluded as client-controlled so they cannot tell
+    # which one is meant.
+    #
+    # Every reply this lane can compose speaks of "your folder", singular. Rather than
+    # pluralise copy nobody has reviewed, a gym with more than one active source is
+    # reported as such and the remedy planner refuses it, so a human handles it.
+    multi = len(active) > 1
     chosen = (active or sources or [None])[0]
 
     # ...and the same on the asset side, so a leaked list cannot inflate a count that
@@ -182,6 +198,7 @@ def diagnose_drive_photos(gym_key, *, store=None, now=None, daily_hour_utc=None,
         key,
         {
             "drive_lane_active_for_gym": bool(lane_active_for(key)),
+            "media_source_multiple_active": bool(multi),
             "media_source_present": bool(chosen),
             "media_source_active": bool(chosen and chosen.get("active")),
             "media_source_revoked": bool(chosen and chosen.get("revoked_externally")),
@@ -198,8 +215,32 @@ def diagnose_drive_photos(gym_key, *, store=None, now=None, daily_hour_utc=None,
 # Case 2 shape: "my posts have no call to action"
 # ---------------------------------------------------------------------------
 _CTA_HEADING_RE = re.compile(r"^#{2,4}\s*CTA rotation", re.I | re.M)
-_TODO_RE = re.compile(r">\s*TODO", re.I)
-_NUMBERED_RE = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
+
+# THE POOL IS COUNTED BY THE EXTRACTOR THE CAPTION PIPELINE ACTUALLY USES.
+#
+# This diagnostic used to reimplement CTA parsing: `>\s*TODO` searched ANYWHERE in the
+# section, and the count was hard-zeroed from that same boolean. So a gym with three
+# real CTAs and one leftover "> TODO: add two more before spring" was auto-told that
+# its CTA section "is still the blank placeholder from onboarding", that it had 0 CTAs,
+# and that this was why its posts had none -- four claims, all false, because
+# drafter.py appends one of those three to every caption. Leaving a note beside real
+# copy is ordinary editing, and no fixture covered it because every fixture used
+# bible_drafter's exact string.
+#
+# The byte-identity reply gate cannot catch this: it proves every SLOT traces to a fact
+# key, never that the fact key measures what its name says. So the fix is not a better
+# regex here -- it is to stop having a second implementation at all. agent.voice's
+# _extract_ctas is what the drafter consumes, so counting with it means the fact the
+# client is told is the fact their posts actually run on.
+def _extract_ctas(text):
+    from .. import voice as _voice
+    return _voice._extract_ctas(text)              # noqa: SLF001 - one implementation
+
+
+# The section is the untouched onboarding scaffold only when it contains NO usable CTA
+# and does carry a placeholder marker. Both writers are covered: bible_drafter emits
+# "> TODO: ..." and onboard.py emits a bare "TODO: ...".
+_PLACEHOLDER_RE = re.compile(r"^\s*>?\s*TODO\b", re.I | re.M)
 
 
 def diagnose_cta_pool(gym_key, *, voice_dir=None, read_text=None):
@@ -245,8 +286,13 @@ def diagnose_cta_pool(gym_key, *, voice_dir=None, read_text=None):
     nxt = re.search(r"^#{2,4}\s+", tail, re.M)
     section = tail[: nxt.start()] if nxt else tail
 
-    is_todo = bool(_TODO_RE.search(section))
-    pool = 0 if is_todo else len(_NUMBERED_RE.findall(section))
+    # The count comes from the pipeline's own extractor, over the whole doc, because
+    # that is exactly what the drafter will find at caption time.
+    pool = len(_extract_ctas(text))
+    # "Still the onboarding placeholder" means BOTH: a placeholder marker is present
+    # AND the extractor finds nothing usable. A TODO note sitting beside real CTAs is
+    # not a blank section, and must never be described as one.
+    is_todo = bool(_PLACEHOLDER_RE.search(section)) and pool == 0
 
     return _facts.GroundingSnapshot.build(
         DIAG_CTA_POOL, "diagnosis", key,
