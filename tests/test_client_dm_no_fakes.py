@@ -47,6 +47,7 @@ _ENTRY_POINTS = [
     # arguments, not seams. Everything else must default.
     (L.decide, ("text", "gym_key", "may_reply")),
     (L.run_once, ()),
+    (L.run_once_all_identities, ()),
 ]
 
 

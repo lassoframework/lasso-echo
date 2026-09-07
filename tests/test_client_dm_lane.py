@@ -58,6 +58,12 @@ AD_MESSAGES = [
     "boost the reel from friday",
     "what are we spending per lead",
     "add another ad set",
+    # MINOR (audit of PR #68): four plain phrasings the belt used to miss entirely,
+    # producing an on-topic-but-wrong reply about photos instead of escalating.
+    "put more money behind the tuesday one",
+    "scale us up to $50 a day",
+    "promote that post to more people",
+    "stop showing our ads to men over 60",
 ]
 
 OTHER_HARD_LINES = [
@@ -465,6 +471,55 @@ def test_one_exploding_ticket_never_sinks_the_pass(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# GAP 1 (audit of PR #68): the poll must not be scoped to one identity/product.
+# ---------------------------------------------------------------------------
+def test_run_once_defaults_to_the_identitys_OWN_product_not_a_fixed_constant(
+        monkeypatch):
+    """A single run_once() call for identity=scout must poll product='scout', not
+    the fixed 'echo' DEFAULT_PRODUCT -- the exact mismatch that made every non-echo
+    identity's tickets invisible."""
+    class Scout:
+        name = "scout"
+        product = "scout"
+
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.setattr(L, "_gym_key_for", lambda t: "")
+
+    bus = FaithfulBus([_ticket("1", product="scout")])
+    out = L.run_once(bus=bus, identity=Scout())
+    assert out["handled"] == 1, "run_once(identity=Scout()) did not poll product='scout'"
+
+
+def test_run_once_all_identities_finds_tickets_a_bare_run_once_would_miss(monkeypatch):
+    """THE END-TO-END PROOF for GAP 1. Every production caller used to invoke
+    run_once() with no arguments at all -- identity='echo' by default. A real client
+    ticket filed through Scout (per the established practice that client Slack group
+    DMs land with Scout, Blake and the owner) has product='scout' and was invisible.
+    run_once_all_identities must see it; the old call shape must not."""
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.setattr(L, "_gym_key_for", lambda t: "")  # escalates; we only assert visibility
+
+    old_shape_bus = FaithfulBus([_ticket("1", product="scout",
+                                         raw_text="the posts have no photos")])
+    old_shape = L.run_once(bus=old_shape_bus)  # exactly how runner.py used to call it
+    assert old_shape["handled"] == 0, (
+        "a bare run_once() saw a scout-product ticket; GAP 1 is not actually closed")
+
+    bus = FaithfulBus([_ticket("1", product="scout",
+                               raw_text="the posts have no photos")])
+    out = L.run_once_all_identities(bus=bus)
+    assert out["handled"] == 1
+    assert out["identities"]["scout"]["handled"] == 1
+    assert out["identities"]["echo"]["handled"] == 0
+    assert set(out["identities"]) == set(L.POLL_IDENTITIES)
+
+
+def test_run_once_all_identities_excludes_lainey():
+    assert "lainey" not in L.POLL_IDENTITIES
+    assert set(L.POLL_IDENTITIES) == {"echo", "ranger", "scout", "wrangler"}
+
+
+# ---------------------------------------------------------------------------
 # PINNED CONTRACTS OF THE MODULES THIS LANE TALKS TO.
 # ---------------------------------------------------------------------------
 def test_the_polled_statuses_and_sources_are_legal_values():
@@ -531,7 +586,20 @@ def test_the_runner_calls_this_lane_behind_its_flag():
     from agent import runner
     source = inspect.getsource(runner.run_daily)
     assert "config.client_dm_autofix_enabled()" in source
-    assert "from .client_dm_support.lane import run_once" in source
+    assert "from .client_dm_support.lane import run_once_all_identities" in source
+
+
+def test_the_runner_calls_all_client_carrying_identities_not_just_echo():
+    """GAP 1 (audit of PR #68): the previous caller invoked run_once() with no
+    arguments, which defaults to identity='echo' alone. Scout, Ranger and Wrangler
+    are all armed in production and all resolve identity_kind='client', so a real
+    client ticket filed through any of them was invisible to this lane. The runner
+    must call the ALL-IDENTITIES entry point, never the single-identity one."""
+    import inspect
+    from agent import runner
+    source = inspect.getsource(runner.run_daily)
+    assert "from .client_dm_support.lane import run_once_all_identities" in source
+    assert "from .client_dm_support.lane import run_once\n" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +692,30 @@ def test_john_weeks_toughtemple_the_case_with_NO_fix_only_a_question():
         "or offer. What would you like your posts to ask people to do?")
     assert d.audit["stage"] == "diagnosis"
     assert d.audit["verification"] == "no write was performed; nothing to verify"
+
+
+def test_john_weeks_already_answered_the_ask_and_is_not_asked_again():
+    """MINOR (audit of PR #68). John's REAL, verbatim words: 'yes let's include a
+    call to action to book a free intro class'. He already told Echo what he wants;
+    the old behaviour asked him to repeat it, which is the exact bug reported."""
+    d = L.decide(
+        text="yes let's include a call to action to book a free intro class",
+        gym_key="toughtemple52040e", may_reply=True,
+        deps={"voice_dir": "/vd", "read_text": lambda p: VOICE_TODO})
+    assert d.outcome == L.Outcome.ESCALATE
+    assert d.reply_text == ""
+    assert "already appears to answer" in d.reason
+    assert d.audit["ask_suppressed"] == "cta_needed"
+    assert "book a free intro class" in d.client_text
+
+
+def test_johns_original_question_still_gets_the_ask_unchanged():
+    """The suppression must be narrow: a message that merely NAMES the ask ('the
+    posts need a real call to action') is not mistaken for one that ANSWERS it --
+    'call to action' itself contains the word 'call', which must not false-positive
+    against the intent words."""
+    assert L._client_already_stated_ask(              # noqa: SLF001
+        "cta_needed", "the posts need a real call to action") is False
 
 
 def test_john_weeks_gets_no_reply_once_his_doc_has_real_ctas():

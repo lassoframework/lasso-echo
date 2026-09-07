@@ -246,8 +246,13 @@ ASKS = MappingProxyType({
         "booking link, phone number or offer. What would you like your posts to ask "
         "people to do?"
     ),
+    # MINOR (audit of PR #68): this used to assert an unmeasured outcome as fact
+    # ("will let the sync resume") -- nothing here has run the sync against a
+    # re-shared folder to know that. Rephrased as a genuine question, per this
+    # module's own rule that an ask must make no factual claim.
     "drive_reshare": (
-        "Re-sharing that folder with Echo in the portal will let the sync resume."
+        "Would you be able to re-share that folder with Echo in your portal? Once "
+        "it is shared again, we can check whether the sync picks it back up."
     ),
 })
 
