@@ -340,6 +340,52 @@ def test_backfill_section7_recovers_real_cta_for_an_already_onboarded_gym(tmp_pa
     assert bd.TODO not in on_disk
 
 
+def test_backfill_section7_uses_intake_key_for_self_serve_uuid_split(tmp_path):
+    """THE REAL PRODUCTION SHAPE: a self-serve gym's echo_social_intake.client_key
+    is the portal's raw UUID (captured before any canonical base existed), while
+    its bible lands under the RESOLVED base folder. Looking up the intake by the
+    bible's own folder name finds nothing for these gyms; intake_key must be used
+    for the lookup while base_key still names the file."""
+    from agent import bible_drafter as bd
+    voice_dir = _write_existing_bible(tmp_path, "toughtemple52040e", bd.TODO, bd.TODO)
+    ans = {
+        "base_key": "toughtemple52040e",
+        "gym": {"name": "Tough Temple"},
+        "offers": {"front_door_offer": "Free tour and intro session for new members"},
+    }
+    seen_keys = []
+
+    def _reader(key):
+        seen_keys.append(key)
+        return ans if key == "52040e09-986f-43d6-a60d-306fa8e234fe" else None
+
+    result = sir.backfill_section7(
+        "toughtemple52040e", reader=_reader, voice_dir=voice_dir,
+        intake_key="52040e09-986f-43d6-a60d-306fa8e234fe")
+    assert seen_keys == ["52040e09-986f-43d6-a60d-306fa8e234fe"]
+    assert result["ok"] is True and result["had_recoverable_data"] is True
+    on_disk = open(os.path.join(voice_dir, "toughtemple52040e",
+                                 "lasso_voice.md")).read()
+    assert "Free tour and intro session for new members" in on_disk
+
+
+def test_backfill_section7_many_parses_base_equals_intake_key():
+    calls = []
+
+    def _fake_backfill(base, *, reader=None, voice_dir=None, intake_key=None):
+        calls.append((base, intake_key))
+        return {"base": base, "ok": True, "had_recoverable_data": False}
+
+    import agent.social_intake_reader as sir_mod
+    orig = sir_mod.backfill_section7
+    sir_mod.backfill_section7 = _fake_backfill
+    try:
+        sir.backfill_section7_many(["gritx", "toughtemple52040e=52040e09-uuid"])
+    finally:
+        sir_mod.backfill_section7 = orig
+    assert calls == [("gritx", None), ("toughtemple52040e", "52040e09-uuid")]
+
+
 def test_backfill_section7_never_fabricates_when_intake_genuinely_has_nothing(tmp_path):
     """Dean's gym case: real intake carries no front-door offer, no promos, no
     hashtags. The bible must stay exactly as it was -- no invented CTA."""
