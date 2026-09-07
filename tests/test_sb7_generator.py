@@ -384,3 +384,87 @@ def test_hint_free_helper_strips_only_the_hint():
     # no marker -> the SAME object back, untouched
     c2 = _creative(note="Plain approved source text.")
     assert drafter._hint_free(c2) is c2
+
+
+# ---- named-member preservation (Pete/Zanshin, Dean/Reverb, 2026-09-07) -----------------
+# The client complaint: a caption "repeatedly refers to one of my oldest members primarily
+# by her age instead of her name." Distinct from vision.py's photo-derived identity
+# firewall (neither gym has vision on); the name here sits verbatim in the APPROVED client
+# note, so the fix is a text-only retry, not a change to any identity/consent gate.
+
+def test_named_member_detected_in_approved_source():
+    assert drafter._named_member(
+        "Shoutout to Carol for hitting her 500th class this month!") == "Carol"
+    assert drafter._named_member(
+        "Meet Carol Simmons, one of our longest members.") == "Carol"
+    assert drafter._named_member("Our 6am class is full of energy.") == ""
+    # gym vocabulary in name-cue position never false-positives
+    assert drafter._named_member("Welcome Wednesday is back this week.") == ""
+
+
+def test_dropped_name_for_age_only_fires_when_name_missing_and_age_present():
+    note = "Meet Carol, our oldest member, still going strong every week."
+    # age stand-in present AND the name is missing from the caption -> flagged
+    assert drafter._dropped_name_for_age(
+        note, "One of our oldest members, quite elderly now, never misses a class.") == "Carol"
+    # the name made it into the caption -> nothing to fix even though age words remain
+    assert drafter._dropped_name_for_age(
+        note, "Carol, our oldest member, is elderly and never misses a class.") == ""
+    # no age stand-in in the caption -> nothing to fix
+    assert drafter._dropped_name_for_age(
+        note, "Carol never misses a class, rain or shine.") == ""
+    # no name in the source at all -> nothing to fix
+    assert drafter._dropped_name_for_age(
+        "Our 6am class is full of energy.", "One of our members is in her 70s.") == ""
+
+
+def test_system_prompt_instructs_using_a_named_member():
+    assert "USE that person's actual name" in StoryBrandGenerator._SYSTEM
+
+
+def test_age_dropped_name_retries_once_and_prefers_the_named_result(monkeypatch):
+    """First attempt drops Carol's name for an age stand-in; the retry restores her name
+    and is preferred, exactly one retry."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    calls = {"n": 0}
+
+    def _fake(system, user):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "One of our oldest members, quite elderly now, never misses a class."
+        assert "Carol" in user                          # the nudge names her
+        return "Carol, our oldest member, never misses a class."
+
+    monkeypatch.setattr(drafter, "_call_llm_caption", _fake)
+    creative = _creative(
+        note="Meet Carol, our oldest member, still going strong every week.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert calls["n"] == 2
+    assert "Carol" in caption
+    assert "elderly" not in caption
+
+
+def test_age_dropped_name_never_blocks_the_post(monkeypatch):
+    """If the retry ALSO drops the name, the first (still valid) caption ships anyway --
+    a caption is never blocked over this, exactly like the opening-variety retry."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    fake = FakeLLM(body="One of our oldest members, quite elderly now, never misses a class.")
+    monkeypatch.setattr(drafter, "_call_llm_caption", fake)
+    creative = _creative(
+        note="Meet Carol, our oldest member, still going strong every week.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert caption.strip()
+    assert fake.calls == 2                               # the retry was attempted
+    assert "Book your intro session." in caption          # CTA still appended
+
+
+def test_no_named_member_means_no_retry(monkeypatch):
+    """A source with no name at all never triggers the retry, even if the caption
+    happens to use an age word (e.g. a general audience note)."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    fake = FakeLLM(body="Our seniors class keeps growing every week.")
+    monkeypatch.setattr(drafter, "_call_llm_caption", fake)
+    creative = _creative(note="Our seniors class is one of our most popular offerings.")
+    caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
+    assert fake.calls == 1                               # no retry: nothing to preserve
+    assert "seniors" in caption.lower()

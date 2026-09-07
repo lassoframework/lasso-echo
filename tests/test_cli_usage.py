@@ -89,3 +89,47 @@ def test_run_daily_print_survives_missing_drafts_key(capsys):
     mm._print_run_daily({"status": "drafted"})
     out = capsys.readouterr().out
     assert "0 draft(s)" in out
+
+
+# ---- vision-backfill (Blake, 2026-09-07: analyze a gym's library BEFORE flipping
+# AGENT_VISION_GYMS -- pick_image's vision branch returns None with zero candidates for a
+# gym with no stored analysis, so a cold flip stalls picks instead of improving them) ----
+
+def test_vision_backfill_requires_account(capsys):
+    mm.main(["vision-backfill"])
+    out = capsys.readouterr().out
+    assert "usage: python -m agent vision-backfill --account <key>" in out
+
+
+def test_vision_backfill_unknown_account(capsys):
+    mm.main(["vision-backfill", "--account", "not_a_real_gym"])
+    out = capsys.readouterr().out
+    assert "unknown account 'not_a_real_gym'" in out
+
+
+def test_vision_backfill_runs_analyze_library(monkeypatch, tmp_path, capsys):
+    from agent import vision
+    from agent.accounts import Account, Platform
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    fake_account = Account(key="zanshin_ig", display_name="Zanshin", platform=Platform.INSTAGRAM,
+                           token_env="T", target_id_env="G", library_prefix=str(lib))
+    monkeypatch.setattr("agent.accounts.get_account",
+                        lambda key: fake_account if key == "zanshin_ig" else None)
+
+    calls = {}
+
+    def _fake_analyze_library(library_path, *, force=False, gym=None, **kw):
+        calls["library_path"] = library_path
+        calls["force"] = force
+        calls["gym"] = gym
+        return {"analyzed": 3, "skipped": 0, "failed": 0}
+
+    monkeypatch.setattr(vision, "analyze_library", _fake_analyze_library)
+    mm.main(["vision-backfill", "--account", "zanshin_ig"])
+    out = capsys.readouterr().out
+    assert calls["library_path"] == str(lib)
+    assert calls["gym"] == "zanshin"          # suffix stripped to the base key
+    assert calls["force"] is False
+    assert "{'analyzed': 3, 'skipped': 0, 'failed': 0}" in out

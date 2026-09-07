@@ -510,6 +510,81 @@ def _note_sb7_fallback(account_key, reason):
 _SB7_FALLBACK_ALERT_AT = 8      # fallbacks per gym per day before a human is pinged
 
 
+# ---- named-member preservation (Pete/Zanshin, Dean/Reverb, 2026-09-07) ------------------
+# Client complaint: a caption "repeatedly refers to one of my oldest members primarily by
+# her age instead of her name and her actual story." This is DISTINCT from vision.py's
+# identity firewall (ECHO_VISION_SPEC §2.2/§8), which governs claims INFERRED FROM A PHOTO
+# and deliberately withholds a name/age/body the model only guessed at from pixels. Here
+# the name is not inferred from an image at all: it is sitting verbatim in the APPROVED
+# client note (a testimonial/about source a human at the gym wrote and a human approved —
+# client_sources.py: "testimonial: a member result or quote, permission assumed at
+# intake"). Neither Zanshin nor Reverb has vision on, so vision's firewall never runs for
+# them; this generic-descriptor behavior is the LLM's own caution, unprompted either way by
+# the SB7 _SYSTEM rules below (which say nothing about names at all). The fix is narrow and
+# text-only: when the approved source itself names a real person, tell the model plainly
+# that the name is already the client's own approved words and nudge it back to using the
+# name when a first attempt drops it for a generic age/role stand-in. This never grants
+# permission to name someone the source does NOT name, and it never touches vision.py's
+# photo-derived identity firewall.
+import re as _re_names
+
+_NAME_GYM_VOCAB = {
+    "the", "and", "for", "gym", "fitness", "studio", "club", "box", "team", "crew",
+    "class", "open", "week", "day", "days", "hours", "welcome", "coach", "coaches",
+    "member", "members", "front", "desk", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday", "january", "february", "march", "april", "may",
+    "june", "july", "august", "september", "october", "november", "december",
+    "instagram", "facebook", "crossfit", "hyrox", "wod", "amrap", "emom",
+}
+_NAME_CUE_RE = _re_names.compile(
+    r"\b(?:coach|member|welcome|congrats|congratulations|meet|shout ?out(?: to)?|"
+    r"thanks?|thank you|proud of|say hi to)\s+([A-Z][a-zA-Z]{1,})",
+    _re_names.IGNORECASE)
+_FULL_NAME_RE = _re_names.compile(r"\b([A-Z][a-z]{2,})\s+[A-Z][a-z]{2,}\b")
+
+# Generic stand-ins the model reaches for INSTEAD of a name that is right there in the
+# source: age descriptors (the exact complaint) plus the bare role words a caption can
+# always fall back to honestly, so we only flag the case the source itself outranks.
+_AGE_STANDIN_RE = _re_names.compile(
+    r"\b(?:young|old|elderly|teenage[dr]?|teens?|seniors?|middle.aged|"
+    r"\d{2,3}[- ]?years?[- ]?old|in (?:her|his|their) \d0s)\b",
+    _re_names.IGNORECASE)
+
+
+def _named_member(client_note):
+    """The first real person's name the APPROVED source itself names, or "" when none is
+    detected. Conservative by design (mirrors vision._looks_like_person_name): a name CUE
+    followed by a Titlecase word, or a Firstname Lastname pair, whose tokens are not gym
+    vocabulary. Only ever reads client_note (an approved, human-written source) — never a
+    photo/vision analysis."""
+    text = client_note or ""
+    for m in _NAME_CUE_RE.finditer(text):
+        cand = m.group(1)
+        if cand.lower() not in _NAME_GYM_VOCAB:
+            return cand
+    for m in _FULL_NAME_RE.finditer(text):
+        first = m.group(1)
+        if first.lower() not in _NAME_GYM_VOCAB:
+            return first
+    return ""
+
+
+def _dropped_name_for_age(client_note, body):
+    """The name the approved source gives that `body` silently swapped for a generic age
+    descriptor, or "" when there is nothing to fix. Fires ONLY when: (1) the source names
+    someone, (2) that name does not appear (whole word, case-insensitive) anywhere in the
+    generated caption, AND (3) the caption instead leans on an age stand-in. A caption that
+    uses the name, or one with no age stand-in at all, never triggers a retry."""
+    name = _named_member(client_note)
+    if not name:
+        return ""
+    if _re_names.search(r"\b" + _re_names.escape(name) + r"\b", body or "", _re_names.IGNORECASE):
+        return ""       # the name made it into the caption; nothing to fix
+    if not _AGE_STANDIN_RE.search(body or ""):
+        return ""       # no age stand-in either; not the pattern we're guarding against
+    return name
+
+
 class StoryBrandGenerator:
     """
     LLM-powered caption generator using the StoryBrand SB7 framework.
@@ -549,7 +624,12 @@ class StoryBrandGenerator:
         "meta labels such as [why], [reason], [edit], or [note]. The output ends "
         "with the caption's final sentence.\n"
         "- Never mention specific numbers, percentages, or prices unless they appear "
-        "verbatim in the client note."
+        "verbatim in the client note.\n"
+        "- When the client note itself names a real member or coach (the gym's own "
+        "approved words, e.g. a testimonial or spotlight), USE that person's actual name "
+        "and the specific story details given. Do not replace a person the source already "
+        "names with a generic stand-in like their age, 'a member', or a role word; the "
+        "source naming them IS the client's own approved copy, already theirs to publish."
     )
 
     @staticmethod
@@ -861,6 +941,19 @@ class StoryBrandGenerator:
                     "IMPORTANT: your opening MUST be clearly different from the recent "
                     "openings listed above. Start from a different angle entirely.\n\n")
                 if retry and not openings_collide(retry, avoid_list):
+                    body = retry
+            # NAMED-MEMBER PRESERVATION: if the approved source names a real person and
+            # this caption silently swapped them for a generic age stand-in, retry ONCE
+            # with an explicit nudge naming them. Never blocks: a caption that still drops
+            # the name after the retry is still valid copy (the figure/fabrication gate
+            # below is the only hard stop), so we only PREFER the name-preserving result.
+            dropped_name = _dropped_name_for_age(client_note, body)
+            if dropped_name:
+                retry = _compose(
+                    f"IMPORTANT: the approved source above names {dropped_name}. Use "
+                    f"{dropped_name}'s actual name when referencing them in this caption, "
+                    "not their age or a generic descriptor.\n\n")
+                if retry and not _dropped_name_for_age(client_note, retry):
                     body = retry
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
             # (stat, price, count) in the generated caption MUST trace to an approved
