@@ -944,6 +944,11 @@ _COMMANDS = {
         ("dam-scan", "scan/tag the library"),
         ("contact-sheet", "creative contact sheet"),
         ("backfill-insights", "pull insights for published posts"),
+        ("vision-backfill", "ECHO_VISION_SPEC: analyze a gym's EXISTING library images "
+                            "before adding it to AGENT_VISION_GYMS (--account <key> "
+                            "[--force]); a gym flipped on with an unanalyzed library "
+                            "auto-picks NOTHING (pick_image's vision branch returns None "
+                            "with zero candidates) rather than falling back to legacy"),
     ],
     "podcast & opus": [
         ("podcast-draft / podcast-status / podcast-transcript / podcast-cards "
@@ -2142,6 +2147,41 @@ def main(argv=None):
         else:
             from .backfill import backfill_insights
             backfill_insights(acct_f, since, dry=dry)
+    elif cmd == "vision-backfill":
+        # ECHO_VISION_SPEC §9 precondition: analyze_and_store never runs on a daily
+        # schedule (there is no job wired to it), so a gym added to AGENT_VISION_GYMS
+        # with an unanalyzed library gets ZERO vision candidates -- pick_image's vision
+        # branch returns None outright (no legacy fallback once a pillar is scored), so
+        # a gym flipped on cold stalls into "needs-media" instead of picking better
+        # photos. Run this BEFORE adding a gym's base key to AGENT_VISION_GYMS.
+        acct_f, force, args = "", False, argv[1:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--account" and i + 1 < len(args):
+                acct_f = args[i + 1]; i += 2; continue
+            if args[i] == "--force":
+                force = True
+            i += 1
+        if not acct_f:
+            print("usage: python -m agent vision-backfill --account <key> [--force]")
+        else:
+            from .accounts import get_account
+            from . import vision
+            account = get_account(acct_f)
+            if account is None:
+                print(f"vision-backfill: unknown account {acct_f!r}")
+            else:
+                library_path = account.library_path()
+                base = config._vision_base(acct_f)
+                print(f"vision-backfill: analyzing {library_path} for {acct_f} "
+                     f"(gym={base}, force={force}) ...")
+                counts = vision.analyze_library(library_path, force=force, gym=base)
+                print(f"vision-backfill: {counts}")
+                if counts.get("failed"):
+                    print("vision-backfill: some images did not analyze cleanly (spend "
+                         "cap, missing key, or a repeated read failure) -- re-run this "
+                         "command; only a clean sweep (0 failed) means the gym is ready "
+                         "for AGENT_VISION_GYMS.")
     elif cmd == "monthly-review":
         # The 30 day loop: digest + PDF per account (AGENT_MONTHLY_REVIEW_ENABLED).
         # --dry is READ ONLY: prints everything, posts/writes nothing, and runs
