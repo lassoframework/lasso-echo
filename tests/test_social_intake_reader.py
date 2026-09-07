@@ -233,6 +233,150 @@ def test_map_answers_v1_legacy_backward_compat():
     assert "testimonial" not in b
 
 
+# ---- 7. REGRESSION: section 7 (CTA/hashtags) actually reaches the bible ----------
+# bible_drafter.draft_bible's CTA-rotation AND hashtag-strategy blocks both read
+# _sec(s, 7) (bible_drafter.py:117,120). _build_intake_text used to never emit a
+# section 7 at all, so EVERY gym onboarded through this bridge shipped a bible with
+# an empty CTA/hashtag section even when the intake's own front-door offer was real.
+# Confirmed on toughtemple52040e (front_door_offer = "Free tour and intro session
+# for new members" sitting unused in the raw intake) and crossfitreverb30b5b2.
+def test_section7_cta_lands_in_bible_from_real_intake_offer():
+    m = sir.map_answers(_gritx_answers())  # front_door_offer: "21 day kickstart"
+    bible = m["bible_text"]
+    assert "### CTA rotation" in bible
+    cta_block = bible.split("### CTA rotation", 1)[1].split("### Hashtag strategy", 1)[0]
+    assert "21 day kickstart" in cta_block, \
+        "real front-door offer from the intake never reached the CTA rotation block"
+    assert "TODO" not in cta_block, \
+        "a TODO placeholder must not survive when the intake carries a real offer"
+
+
+def test_section7_ctas_are_actually_machine_parseable_by_voice_load_voice():
+    """The functional half of the fix, not just the display half. drafter.py and
+    content_planner.py both read voice.ctas (agent/voice.py's _extract_ctas), which
+    parses ONLY quoted or bulleted/numbered list items out of '### CTA rotation' --
+    a free-text paragraph there renders fine for a human but is INVISIBLE to that
+    parser. Section 7 must render as bullets so a real front-door offer actually
+    reaches the live CTA pool, not just the bible's display text."""
+    from agent import voice as voice_mod
+    ans = _gritx_answers()  # front_door_offer: "21 day kickstart"
+    m = sir.map_answers(ans)
+    doc = voice_mod.VoiceDoc(raw=m["bible_text"], hashtags=[],
+                             ctas=voice_mod._extract_ctas(m["bible_text"]))
+    assert any("21 day kickstart" in c for c in doc.ctas), \
+        f"real CTA text did not survive voice._extract_ctas parsing: {doc.ctas!r}"
+
+
+def test_section7_hashtags_land_in_bible_from_real_intake_hashtags():
+    ans = _v2_answers()  # voice.hashtags: ["#gritx", "#carmelfitness"]
+    m = sir.map_answers(ans)
+    bible = m["bible_text"]
+    hashtag_block = bible.split("### Hashtag strategy", 1)[1]
+    assert "#gritx" in hashtag_block, \
+        "real hashtags from the intake never reached the hashtag strategy block"
+
+
+def test_section7_stays_todo_with_no_fabrication_when_intake_carries_neither():
+    ans = _gritx_answers()
+    ans["offers"] = {"services": "Small group training", "front_door_offer": "",
+                      "exact_price": ""}
+    m = sir.map_answers(ans)
+    bible = m["bible_text"]
+    cta_block = bible.split("### CTA rotation", 1)[1].split("### Hashtag strategy", 1)[0]
+    # no front-door offer, no upcoming promos, no hashtags in this payload -> the
+    # honest TODO placeholder, never an invented CTA
+    assert "TODO" in cta_block
+
+
+# ---- 8. backfill_section7: recover section 7 for an ALREADY-onboarded gym --------
+def _write_existing_bible(tmp_path, base, cta_body, hashtag_body):
+    voice_dir = tmp_path / "brand_voice" / base
+    voice_dir.mkdir(parents=True)
+    from agent import bible_drafter as bd
+    text = (
+        f"# {base} Brand Bible\n\n## 6. Platform rules\n\n"
+        f"{bd.CTA_HEADER}\n{cta_body}\n\n"
+        f"{bd.HASHTAG_HEADER}\n{hashtag_body}\n"
+    )
+    (voice_dir / "lasso_voice.md").write_text(text, encoding="utf-8")
+    return str(tmp_path / "brand_voice")
+
+
+def test_backfill_section7_recovers_real_cta_for_an_already_onboarded_gym(tmp_path):
+    from agent import bible_drafter as bd
+    voice_dir = _write_existing_bible(tmp_path, "toughtemple", bd.TODO, bd.TODO)
+    ans = {
+        "base_key": "toughtemple",
+        "gym": {"name": "Tough Temple"},
+        "offers": {"front_door_offer": "Free tour and intro session for new members",
+                   "upcoming_promos": "Hyrox PFT September 19th"},
+        "voice": {"words_to_never_use": ""},
+    }
+    result = sir.backfill_section7("toughtemple", reader=lambda b: ans, voice_dir=voice_dir)
+    assert result["ok"] is True
+    assert result["had_recoverable_data"] is True
+    assert result["changed"]["cta"] is True
+    on_disk = open(os.path.join(voice_dir, "toughtemple", "lasso_voice.md")).read()
+    assert "Free tour and intro session for new members" in on_disk
+    assert bd.TODO not in on_disk
+
+
+def test_backfill_section7_never_fabricates_when_intake_genuinely_has_nothing(tmp_path):
+    """Dean's gym case: real intake carries no front-door offer, no promos, no
+    hashtags. The bible must stay exactly as it was -- no invented CTA."""
+    from agent import bible_drafter as bd
+    voice_dir = _write_existing_bible(tmp_path, "crossfitreverb", bd.TODO, bd.TODO)
+    ans = {
+        "base_key": "crossfitreverb",
+        "gym": {"name": "CrossFit Reverb"},
+        "offers": {"front_door_offer": "", "upcoming_promos": ""},
+        "voice": {"words_to_never_use": ""},
+    }
+    before = open(os.path.join(voice_dir, "crossfitreverb", "lasso_voice.md")).read()
+    result = sir.backfill_section7("crossfitreverb", reader=lambda b: ans, voice_dir=voice_dir)
+    assert result["ok"] is True
+    assert result["had_recoverable_data"] is False
+    after = open(os.path.join(voice_dir, "crossfitreverb", "lasso_voice.md")).read()
+    assert before == after                       # byte-for-byte untouched
+
+
+def test_backfill_section7_never_overwrites_an_already_filled_block(tmp_path):
+    """A bible whose CTA block was already filled (human edit, or a generic
+    fallback from a different mechanism) must be left untouched even though the
+    real intake DOES carry recoverable data -- the file no longer carries the
+    literal TODO, which is the signal this was already handled."""
+    from agent import bible_drafter as bd
+    voice_dir = _write_existing_bible(
+        tmp_path, "hillcountry", "- Learn more at hillcountrymvmt.com", bd.TODO)
+    ans = {
+        "base_key": "hillcountry",
+        "gym": {"name": "Hill Country MVMT"},
+        "offers": {"front_door_offer": "Free No Sweat Intro"},
+        "voice": {"words_to_never_use": ""},
+    }
+    result = sir.backfill_section7("hillcountry", reader=lambda b: ans, voice_dir=voice_dir)
+    assert result["ok"] is True
+    assert result["changed"]["cta"] is False     # left alone
+    on_disk = open(os.path.join(voice_dir, "hillcountry", "lasso_voice.md")).read()
+    assert "Learn more at hillcountrymvmt.com" in on_disk
+    assert "Free No Sweat Intro" not in on_disk.split(bd.HASHTAG_HEADER)[0]
+
+
+def test_backfill_section7_reports_missing_intake_honestly():
+    result = sir.backfill_section7("nosuchgym", reader=lambda b: None)
+    assert result["ok"] is False
+    assert "no intake" in result["reason"]
+
+
+def test_backfill_section7_reports_missing_bible_honestly(tmp_path):
+    ans = {"base_key": "ghost", "gym": {"name": "Ghost Gym"},
+           "offers": {"front_door_offer": "Free trial"}, "voice": {}}
+    result = sir.backfill_section7("ghost", reader=lambda b: ans,
+                                    voice_dir=str(tmp_path / "brand_voice"))
+    assert result["ok"] is False
+    assert "no existing bible" in result["reason"]
+
+
 # ---- 7. onboard on a v2 payload: sources land, no repr garbage anywhere ----------
 def test_onboard_v2_payload_lands_clean_sources():
     rep = sir.onboard_from_social("gritx_ig", _v2_answers(), approve=True)
