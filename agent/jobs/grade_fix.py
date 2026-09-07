@@ -436,6 +436,74 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 
 
 # ---------------------------------------------------------------------------
+# Body-sameness, DECOUPLED from the total < A gate (Blake's ruling, 2026-09-07)
+# ---------------------------------------------------------------------------
+
+def remediate_body_sameness_always(gym_id, rows, store, *, profile, today_iso,
+                                   caption_regen=None, db=None, logger=None,
+                                   llm_budget_s=None) -> dict:
+    """Body-copy-sameness repair ONLY, decoupled from the `total < A` gate that
+    guards `remediate_forward_book`.
+
+    THE GAP THIS CLOSES. calendar_grade's "total" does not weight body
+    sameness, so a book can sit at a perfect 100 while still carrying a real
+    near-duplicate BODY pair (measured live 2026-09-07: train7164ae502 had 4
+    genuinely-thin-source pairs left after a full repair pass, book still
+    graded 100). `remediate_forward_book`'s entire suite (duplicates, overcap,
+    craft, audience, body) only ever runs when `f_grade.total < A_THRESHOLD`
+    (grade_sweep.run), so once a book reaches A the nightly sweep never looks
+    at it again -- a residual duplicate on an A-graded book sits unrepaired
+    FOREVER, not until the next real defect drags the score down.
+
+    BLAKE'S RULING (2026-09-07): fix this by decoupling the BODY-SAMENESS PASS
+    ALONE from the total gate, not by folding body sameness into the scoring
+    formula (that would retroactively change what "A" means for every gym
+    already at equilibrium -- a client-facing consequence far bigger than this
+    bug) and not by re-running every OTHER pass on an already-A book (which
+    does not need duplicate/overcap/craft/audience repair by definition of
+    being at A). grade_sweep.run() calls this function, unconditionally, for
+    every self-fix gym whose forward book already grades >= A_THRESHOLD --
+    every other repair pass stays exactly as gated as before.
+
+    SAME GUARANTEES as remediate_forward_book: only WIPEABLE rows are ever
+    patched (the store's own status filter), a patched row re-enters the
+    pending queue, and no caption is invented -- every fresh caption comes
+    from the gym's own approved sources through the same gated builder path
+    `_fix_body_sameness` already uses. A pair the gym's source material cannot
+    honestly resolve is reported as `body_unrepairable`, never forced.
+
+    Returns {"ok", "body_pairs", "body_fixed", "body_unrepairable", "actions"}.
+    ok:False (flag off) touches nothing, exactly like remediate_forward_book."""
+    log = logger or (lambda m: print(f"[grade-fix] {m}"))
+    if not config.grade_self_fix_enabled():
+        return {"ok": False, "reason": "AGENT_GRADE_SELF_FIX off",
+                "body_pairs": 0, "body_fixed": 0, "body_unrepairable": 0,
+                "actions": []}
+
+    rows = list(rows or [])
+    if caption_regen is None:
+        caption_regen = _default_caption_regen(gym_id, profile, log)
+    # Every caption already on the book: a regenerated caption may never
+    # collide with an existing one (mirrors remediate_forward_book's `avoid`).
+    avoid = {(r.get("caption") or "").strip()
+             for r in rows if (r.get("caption") or "").strip()}
+    deadline = _deadline(llm_budget_s)
+
+    actions = []
+    body_pairs, body_fixed, body_unrepairable = _fix_body_sameness(
+        gym_id, rows, store, caption_regen, avoid, log, deadline=deadline)
+    if body_fixed:
+        actions.append(f"rewrote {body_fixed} near-duplicate body caption(s) on an "
+                       "already-A book")
+    if body_unrepairable:
+        actions.append(f"{body_unrepairable} near-duplicate body/bodies on an "
+                       "already-A book could not be honestly rewritten (source "
+                       "material too thin)")
+    return {"ok": True, "body_pairs": body_pairs, "body_fixed": body_fixed,
+            "body_unrepairable": body_unrepairable, "actions": actions}
+
+
+# ---------------------------------------------------------------------------
 # f) hard copy violations — the house scrubber, not a rewrite
 # ---------------------------------------------------------------------------
 
