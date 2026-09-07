@@ -1385,6 +1385,23 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # Pierce first). POSTS NOTHING to social; STAGE governs the planner pull. Inert
     # without a GOOGLE_DRIVE_SA_JSON key + Supabase creds. Isolated: a sync failure
     # never blocks the draft run.
+    # CLIENT-DM SUPPORT LANE (AGENT_CLIENT_DM_AUTOFIX, default OFF): a client's own
+    # Slack message is measured against a closed set of enumerated conditions; at most
+    # a per-gym Drive media sync runs; a human is carded every single time. On its own
+    # this flag sends a client NOTHING -- a reply needs AGENT_CLIENT_DM_CLIENT_REPLY
+    # and a runtime-derived AGENT_CLIENT_DM_LIVE_ACK as well. Isolated: a failure here
+    # never blocks the draft run.
+    if config.client_dm_autofix_enabled():
+        try:
+            from .client_dm_support.lane import run_once as _client_dm_run
+            _cdsum = _client_dm_run()
+            if not _cdsum.get("ok"):
+                print(f"[client-dm] not ok: {_cdsum.get('reason', '')}")
+        except Exception as e:
+            print(f"[client-dm] failed: {type(e).__name__}: {e}")
+            ops_alerts.alert(f"client DM support lane failed: {type(e).__name__}: {e}. "
+                             "No client was replied to and the draft run is unaffected.")
+
     if config.gym_drive_connect_enabled() or config.gym_drive_connect_gyms():
         try:
             from .jobs.sync_gym_media import run as _gym_media_sync_run

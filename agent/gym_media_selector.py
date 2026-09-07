@@ -61,6 +61,27 @@ def _parse_ts(s):
         return None
 
 
+def is_usable(asset):
+    """Is this media_asset row one this selector would ever hand to a post?
+
+    THE ONE IMPLEMENTATION of the eligibility half of the pick, exported so nothing
+    else has to re-derive it. `pick_media` calls it below, and so does
+    client_dm_support.probes, which reports a library size to the gym owner: counting
+    every row instead told a client their posts would draw from six unprobed videos
+    this predicate rejects. A number told to a client has to be the number their posts
+    actually run on, which means one predicate, not two.
+
+    Deliberately NOT the whole pick: the cooldown and the this-month rule are about
+    WHEN an asset may be reused, not whether it is usable at all.
+    """
+    a = asset or {}
+    if a.get("eligible") is not True:        # null (unprobed) and false fail closed
+        return False
+    if a.get("excluded_by_coach"):
+        return False
+    return True
+
+
 def base_gym_key(account_key):
     """The gym base key a per-platform account key rolls up to (pierce_ig ->
     pierce), matching podcast_selector.base_gym_key / real_month_run."""
@@ -107,9 +128,9 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
         # gym, never trust a row whose gym_id does not match this pick.
         if str(a.get("gym_id") or "") != base:
             continue
-        if a.get("eligible") is not True:      # null (unprobed) and false fail closed
-            continue
-        if a.get("excluded_by_coach"):
+        # eligible IS TRUE (null/unprobed fails closed) and not hidden by the coach.
+        # ONE implementation, shared with client_dm_support.probes — see is_usable.
+        if not is_usable(a):
             continue
         if a.get("id") in exclude_ids:
             continue

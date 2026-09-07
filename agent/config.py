@@ -2173,6 +2173,36 @@ def slack_convo_auto_answer_armed(identity: str) -> bool:
     return True
 
 
+def client_dm_autofix_enabled() -> bool:
+    """AGENT_CLIENT_DM_AUTOFIX — master for the client-DM support lane
+    (agent/client_dm_support). OFF by default. Off = the lane returns before reading a
+    single ticket; nothing is polled, diagnosed, fixed, written or sent.
+
+    ON, AND ON ITS OWN, THIS SENDS A CLIENT NOTHING. It lets the lane poll, measure,
+    run a per-gym Drive media sync when that is the measured condition, and write a
+    card to the fixer channel for a human. Composing a client-facing reply needs
+    AGENT_CLIENT_DM_CLIENT_REPLY as well, and DELIVERING one needs a third setting,
+    AGENT_CLIENT_DM_LIVE_ACK, whose required value is derived at runtime from the
+    current value of SLACK_CONVO_<IDENTITY>_CLIENT_REPLY. See
+    agent/client_dm_support/arming.py for why one flag is deliberately not enough.
+
+    This flag never touches the #fixer bus's own auto-answer gate (D67, still locked),
+    ad spend, targeting, campaigns, billing, pixel/CAPI, secrets, schema, feature
+    flags, or any gym but the one whose ticket is being read."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_AUTOFIX", "false"))
+
+
+def client_dm_client_reply_enabled() -> bool:
+    """AGENT_CLIENT_DM_CLIENT_REPLY — may the client-DM support lane COMPOSE a
+    client-facing reply at all? OFF by default. Off = every outcome, including a
+    successful verified fix, goes to a human card and the client is told nothing by
+    this lane.
+
+    On its own (master off) it does nothing whatsoever, and even with the master on it
+    is not sufficient to deliver: see AGENT_CLIENT_DM_LIVE_ACK."""
+    return _truthy(os.environ.get("AGENT_CLIENT_DM_CLIENT_REPLY", "false"))
+
+
 def slack_convo_cross_product_routing_enabled(identity: str) -> bool:
     """SLACK_CONVO_<IDENTITY>_CROSS_PRODUCT — may a CONFIDENT website question that arrived
     on this identity be drafted with the website identity's knowledge and voice (D50)? OFF by

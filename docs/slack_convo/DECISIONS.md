@@ -2418,3 +2418,161 @@ that prompt is `ops_fix` only, and the process has no shell -- but it is real. A
 `websites-worker.js` passes `raw_text` to `runFix` with no sanitisation at all, and
 `armFixer` silently drops the `workDir` it is passed (harmless only because the fallback
 literal happens to equal `cfg.ECHO_WORK_DIR`).
+
+## D69 (2026-09-07) -- the client-DM support lane, rebuilt after seven rounds of not converging
+
+PR #66 (`feat/client-dm-autofix`, ~2,900 lines across 11 modules) built an autonomous
+support lane for a client's own Slack message. Its own audit history graded
+**D -> B -> B -> C -> B -> C -> B**. That is not a convergence curve, and Blake's
+instruction was the same one D68 records: diagnose why it oscillates, then fix the
+DESIGN, not the instances. This entry is the diagnosis and what replaced it. Nothing
+is armed; `AGENT_CLIENT_DM_AUTOFIX` still defaults OFF.
+
+### PART 1 -- WHAT ACTUALLY HAPPENED, ROUND BY ROUND
+
+| Round | Grade | What it FIXED | What it BROKE or newly exposed |
+|-------|-------|---------------|-------------------------------|
+| 1 | D | 2 CRITICAL + 7 MAJOR: the poll's `source` was guessed (`slack`, not `slack_conversation`); surface read off the ticket, not the message; the gym key was a portal uuid; `find_new_tickets` filters `classification is.null` so no classified DM was visible; both delivery sinks dead (no `identity` stamp; escalations written `held` while the outbox reads `ready`); a client-controlled Drive folder name interpolated into an auto-sent reply; `requires` was a presence test; unnormalised scope paths; no tenant re-check in the diagnostic | exposed the AST ad-scanner as bypassable three ways; 6 guards asserted by nothing |
+| 2 | B | 5 MAJOR: the arming docstring was false in both halves (arming takes TWO flags); the lane read the client's OLDEST message; four more scanner bypasses; `requires_true` had no polarity twin | 8 more guards asserted by nothing, incl. the entire round-1 slot-bounding commit |
+| 3 | B | 4 MAJOR: two controls at the ticket->gym seam, not one (a wrong answer ran gym B's sync and wrote gym B's counts into gym A's thread); **the AST-scan-as-proof claim withdrawn after 11 MORE bypasses**; the "forbidden ad import" table named no ad-money surface | 10 more guards asserted by nothing; 2 first-attempt tests were shadowed by a downstream check and stayed green under mutation |
+| 4 | C | 1 CRITICAL + 4 MAJOR: **the poll asked for statuses a client question never lands in** -- both documented cases land in `hold`, the poll asked `("new","triage")`, so the lane was inert on exactly the two shapes it exists for; `confirm_gym_binding` was half tautology; the ad keyword belt missed 10 of 10 plain phrasings | the starvation fix (paging past answered tickets) |
+| 5 | B | 3 MAJOR: the round-4 starvation fix MOVED its failure (stopping rule and loop used different predicates); `AD_RAIL_MARKERS` could be emptied with all 6501 tests green (the test derived its data from the table under test); the card said "I auto-replied" before delivery was known | -- (also fixed its own mutation harness, which shared one backup path) |
+| 6 | C | 1 CRITICAL + 3 MAJOR: **`store` had no production default**, so the flagship remedy TypeErrored in production while its docstring claimed the opposite; a success reply claimed an outcome no fact key measures; one ticket's exception sank the whole pass; two of Blake's hard limits mutated GREEN | -- |
+| 7 | B | 3 MAJOR: `cta_section_is_todo` did not measure what its name said (a gym with three working CTAs was auto-told it had none); `limit` limited nothing (`run_once(limit=3)` handled 40 tickets); a single-source assumption under singular client-facing copy | 3 residuals: the section detector was wider than the extractor; `multi` counted every source not every active one |
+
+### PART 2 -- THE DIAGNOSIS. It is NOT D68's pattern, and that matters.
+
+The obvious answer was "this is D68 again -- enumerating an open set." **The evidence
+says otherwise, and getting this wrong would have produced another wrong fix.**
+
+D68's pattern requires that novel input default to ALLOW. The reply gate here did the
+opposite from commit 1: `reply.assert_is_template_render()` reconstructs the reply from
+a registered template over enumerated fact keys and demands byte equality, so novel
+input has nowhere to match and REFUSES. **And it held. After round 1's slot-injection
+fix, not one of rounds 2-7 found an escape from the reply gate.** The design D67 asked
+for was built and it worked.
+
+Three real causes, ranked by how many findings they account for:
+
+**1. Contract-guessing about other modules (rounds 1,2,3,4,5 -- the majority of all
+findings).** The poll's `source`; the surface's location; the gym key's type;
+`find_new_tickets`'s hidden `classification` filter; the outbox's `identity` stamp; the
+outbox's `ready`-only read; `bus.recent_messages`'s DESC ordering; the two-flag arming
+truth; the ticket statuses a client DM actually lands in. Nine separate contracts of
+OTHER modules, each guessed, each wrong, each found one round at a time. This IS an
+open-set problem -- D68's own sentence includes "another process's output" -- but the
+open set was **the production environment**, not the client's sentence, and no amount
+of work on the gate could reach it.
+
+**2. Fake-injection blindness.** The named finding, and it hid BOTH round-7-era
+defects. Every test injected `deps=drive_deps(store, sync)` into the exact seam
+production left empty, so `store`-with-no-default survived six rounds; the poll's fake
+ignored its query params, so a selector matching zero real rows survived four. In both
+cases the broken state was byte-identical to a healthy one.
+
+**3. The closed set was closed over KEYS, not over MEANINGS -- and this is where the
+honest answer to "did the discipline hold end to end?" is NO.** The gate proves every
+slot traces to a fact key. It cannot prove the fact key is right, and it cannot see the
+template's constant prose at all, because the reconstruction contains the same words.
+Every round-6 and round-7 finding lives in that gap: a sentence no fact measured ("New
+posts will draw from those"), a fact whose name promised more than its query
+(`cta_section_is_todo`), a detector wider than the extractor it fed, a count that
+included rows the selector rejects. So: **the closed-set discipline was applied at the
+final reply step and nowhere upstream.** Routing, diagnosis and fix-planning could and
+did hand the reply stage a wrong-but-well-formed fact set, and the gate passed it.
+
+Underneath all three: **surface area**. 11 modules, ~2,900 lines, five registries
+joined by string name, for two diagnosable conditions. D68's last column applies here
+too -- rounds 3-5 were, in the majority, the build cleaning up after itself.
+
+### PART 3 -- THE REDESIGN
+
+Six modules, ~1,500 lines including the honest docstrings. The changes that matter:
+
+1. **A Reading is ONE object holding the measurement, the production function that
+   produces it, and the only sentence Echo may say about it.** `facts.py` +
+   `diagnostics.py` + `reply.py`'s templates collapse into `readings.py`. A name, a
+   measurement and a claim can no longer drift apart, because they cannot be edited
+   separately. There is nowhere in the package to type a client-facing sentence that
+   is not attached to a measurement -- which closes round 6's constant-prose hole
+   structurally rather than by asking the next author to write carefully.
+2. **`say_when` replaces `requires`/`requires_true`/`requires_false`.** One field with
+   one meaning cannot have a missing polarity twin (rounds 1, 2 and 3 each found one).
+3. **A Condition is ONE object holding the predicate, the action, the comparator that
+   proves it worked, and the readings it reports.** `remedies.py` + `scope_gate.py`
+   collapse in. The registry refuses an action with no expectation, so "verification
+   skipped" is impossible to express rather than possible to route around.
+4. **A closed set of ONE action, in one domain.** No action-kind DSL, no code-fix lane,
+   no 420-line scope gate. Ad budget/targeting/campaigns, billing, pixel/CAPI, secrets,
+   schema, flags and cross-gym data are not cases this code declines -- they are things
+   it has no way to express. The AST scanner survives, renamed `no_ad_rail.py`,
+   labelled a TRIPWIRE, with nothing resting on it.
+5. **No second implementation of any reading.** `cta_pool_count` is
+   `agent.voice._extract_ctas`; `drive_library_usable` is
+   `agent.gym_media_selector.is_usable` (newly exported, and `pick_media` now calls it,
+   so there is one predicate rather than two). A test asserts the package compiles no
+   regex of its own outside two anchored key-shape patterns.
+6. **Tests that call the real production default with no fake**, plus a static check
+   that no entry point has a seam production cannot fill.
+
+**On the belt that still misses.** `tests/test_client_dm_lane.py::BELT_MISSES` records
+three phrasings the keyword belt provably does not catch -- *"did you guys take money
+out twice this month?"*, *"we open at 5 now, does the calendar know?"*, *"can you look
+at the other gym's account"* -- which are D67's round-9 cases verbatim. They are
+recorded rather than fixed, and there is a test asserting the belt does NOT catch them,
+because adding them is D68's failure mode. Each still produces no reply: not because a
+keyword matched, but because no probe measures a fact that answers them, so no
+condition matches and no sentence can be constructed at all.
+
+### PART 4 -- LIVE SUPABASE DISPROVED THREE THINGS
+
+Read-only against the production project, 2026-09-07 -- something no prior round did,
+which is part of why its grade was not trustworthy.
+
+* **The poll matched zero real rows on BOTH axes.** All three non-test
+  client-originated tickets are `source='website_tab'`, `status='hold'`; every
+  `slack_conversation` row in the table is a phase-4 arming probe with `is_test=true`.
+  The lane polled `source='slack_conversation'` with statuses `("new","triage","hold")`.
+  Both are now pinned constants covering what production actually writes.
+* **`media_source.gym_id` and `media_asset.gym_id` DISAGREE for 2 of 17 connected
+  gyms** -- the documented account-key split-brain landing on this lane's flagship
+  fact. `toughtemple086f51`'s source owns 70 assets stamped `toughtemple52040e`;
+  `crossfitsunnyside2616ac`'s owns 13 stamped `crossfitsunnysidef574c0`. Asked "why do
+  my posts have no photos?", a gym-id-keyed probe for `toughtemple52040e` -- which is
+  the key the portal hands us, and John Weeks's gym -- finds NO source at all while
+  counting 70 assets. `drive_identity_split` is now measured and every condition
+  refuses on it.
+* **Multiple active sources per gym is real, not an edge case:** `train7164ae502` has
+  six. Every Drive sentence here is singular, so it escalates.
+* Also confirmed: **Chad Edwards's case resolved itself.** `crossfitlocal` now holds 54
+  usable assets -- the scheduled sync ran, as the leading hypothesis said. The lane
+  therefore matches no condition for him today and cards a human, which is correct.
+
+### PART 5 -- THE TWO-FLAG LANDMINE, CLOSED
+
+A reply from this lane is a CONVERSATIONAL kind, and `outbox._dispatch_one` gates a
+client-bound conversational row on `slack_convo_client_reply_armed(identity)` alone
+(outbox.py:429 -> :141-144). `SLACK_CONVO_ECHO_CLIENT_REPLY=true` has been live on the
+Railway `echo` service since 2026-09-05 (D51). So **one boolean was the whole distance
+between "nothing has ever been sent" and real autonomous messages to paying gym
+owners.**
+
+Three settings now, and no single one of them changes what reaches a client:
+
+* `AGENT_CLIENT_DM_AUTOFIX` -- the lane runs. On its own: measures, may run the scoped
+  fix, cards a human. Composes no client reply at all.
+* `AGENT_CLIENT_DM_CLIENT_REPLY` -- may compose one. On its own (master off): nothing.
+* `AGENT_CLIENT_DM_LIVE_ACK` -- must equal a token **derived at runtime**, and the token
+  contains the CURRENT value of `SLACK_CONVO_<IDENTITY>_CLIENT_REPLY`.
+
+The third is what makes this structural rather than procedural: the required token
+cannot be written before reading what the other flag says, and it goes stale the moment
+either flag moves, dropping the lane back to escalate-only until a human re-affirms.
+The refusal names, in one line, exactly what was about to go live. All seven proper
+subsets of the three settings are asserted to be unable to reply, with
+`SLACK_CONVO_ECHO_CLIENT_REPLY` ON -- i.e. against the live production state.
+
+Nothing in `agent/slack_convo/*` is touched and no `SLACK_CONVO_*` flag's semantics
+change. The #fixer bus's own auto-answer gate (D67) remains locked and is untouched; a
+test asserts this package never names `SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE`,
+never writes an environment variable, and never writes a `KIND_ANSWER` row.

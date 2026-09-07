@@ -226,6 +226,20 @@ def _status():
               f"client_reply={config.slack_convo_client_reply_armed(_ident)} "
               f"staff_reply={config.slack_convo_staff_reply_armed(_ident)}  "
               f"(env SLACK_CONVO_{_ident.upper()}_ENABLED / _CLIENT_REPLY / _STAFF_REPLY)")
+    print(f"  client_dm      : {config.client_dm_autofix_enabled()}  (env AGENT_CLIENT_DM_AUTOFIX; "
+          f"the client-DM support lane: measure one enumerated condition, run at most a "
+          f"per-gym Drive media sync, card a human every time. On its own it sends a client "
+          f"NOTHING)")
+    try:
+        from .client_dm_support import arming as _cdm_arm
+        _cdm = _cdm_arm.preflight("echo")
+        print(f"    arming      : mode={_cdm.mode} may_reply={_cdm.may_reply_to_clients}  "
+              f"({_cdm.reason})")
+        if _cdm.mode != _cdm_arm.MODE_LIVE:
+            print(f"    to arm      : set AGENT_CLIENT_DM_CLIENT_REPLY=true and "
+                  f"AGENT_CLIENT_DM_LIVE_ACK={_cdm.required_ack}")
+    except Exception as _e:  # noqa: BLE001
+        print(f"    arming      : UNREADABLE ({type(_e).__name__}: {_e})")
     print(f"  auto_connect  : {config.auto_connect_link_enabled()}  (env AGENT_AUTO_CONNECT_LINK; "
           f"a newly auto-registered gym's connect link is sent as an Echo Slack DM to its "
           f"owner, once, resolved from the portal's own client_owner record)")
