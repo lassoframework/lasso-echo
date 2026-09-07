@@ -214,7 +214,12 @@ def _normalise_path(raw):
             f"{raw!r} is an absolute path; a code fix may only name repo-relative "
             f"files inside the allowed roots"
         )
-    norm = posixpath.normpath(p).lower()
+    # Case is preserved. Lowercasing made the ALLOWED-roots prefix test
+    # case-insensitive on a case-sensitive filesystem, so "TESTS/x.py" passed while
+    # naming a path that does not exist. The BLOCKED tests below lowercase their own
+    # comparison instead: an allowlist must be strict, a denylist must be generous,
+    # and one shared normalisation cannot be both.
+    norm = posixpath.normpath(p)
     if norm == ".." or norm.startswith("../") or "/../" in norm:
         raise _PathRefused(
             f"{raw!r} escapes the repository root after normalisation ({norm!r})"
@@ -305,15 +310,16 @@ def check(action: ProposedAction) -> ScopeVerdict:
 
     # 8. Blocked repo paths, whatever the kind claims to be.
     for p in paths:
+        low = p.lower()
         for frag in SELF_PROTECTED_PATHS:
-            if p.startswith(frag) or f"/{frag}" in p:
+            if low.startswith(frag) or f"/{frag}" in low:
                 return _deny(
                     f"{p!r} is one of this capability's own safety controls or its "
                     f"tests; it may not rewrite the code that decides what it may do",
                     TRIGGER_MULTI_GYM_CONFIG,
                 )
         for frag in BLOCKED_PATH_FRAGMENTS:
-            if frag in p:
+            if frag in low:
                 # Name the RIGHT line. A gym's own voice doc is not "config affecting
                 # more than one gym" -- it is that client's own authored copy, which
                 # Echo may never write (CLAUDE.md: no invented facts, offers or stats).

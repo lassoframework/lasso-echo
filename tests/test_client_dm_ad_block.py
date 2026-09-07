@@ -315,15 +315,69 @@ def test_this_repository_contains_no_meta_marketing_api_rail():
     assert ad_block.assert_no_ad_rail_in_repo() is True
 
 
-def test_the_ad_rail_check_would_actually_fire(tmp_path):
-    """Prove the control is capable of failing, by planting each marker."""
-    for marker in ad_block.AD_RAIL_MARKERS:
-        d = tmp_path / marker.replace("/", "_").replace(".", "_")
+# THE TEST DATA BELOW IS LITERAL ON PURPOSE. It is NOT derived from
+# ad_block.AD_RAIL_MARKERS.
+#
+# The earlier version iterated the table under test. Empty the table and the loop body
+# never runs, so the test passed vacuously -- while scan_repo_for_ad_rail() returned []
+# for a repo containing `import facebook_business`, META_SYSTEM_USER_TOKEN and a live
+# /act_/campaigns URL, and assert_no_ad_rail_in_repo() returned True. The full 6501-test
+# suite stayed green with the load-bearing ad control completely blind, because
+# `findings == []` means both "no rail exists" and "the scanner can no longer see one".
+# That is D68's inert-state-identical-to-healthy shape landing on the ad guarantee.
+#
+# D68's own prescription, applied here: "assert the allow-list still CONTAINS what it
+# must, not only that writers stay inside it."
+A_REAL_META_RAIL = '''
+import facebook_business
+from facebook_business.adobjects.adaccount import AdAccount
+
+TOKEN = "META_SYSTEM_USER_TOKEN"
+URL = "https://graph.facebook.com/v21.0/act_123456/campaigns"
+MARKETING_API = "v21.0"
+
+
+def spend(daily_budget):
+    return AdAccount("act_123456").get_campaigns()
+'''
+
+
+def test_a_planted_meta_rail_is_detected(tmp_path):
+    """The control, proved capable of failing, against a rail written out in full and
+    owing nothing to the constant it is testing."""
+    (tmp_path / "rail.py").write_text(A_REAL_META_RAIL)
+    findings = ad_block.scan_repo_for_ad_rail(str(tmp_path))
+    assert findings, "a full Meta Marketing API rail scanned clean"
+    with pytest.raises(ad_block.AdCallPathError):
+        ad_block.assert_no_ad_rail_in_repo(str(tmp_path))
+
+
+@pytest.mark.parametrize("marker", [
+    "facebook_business",
+    "graph.facebook.com/v",
+    "/act_",
+    "adaccount",
+    "META_AD_ACCOUNT",
+    "META_SYSTEM_USER_TOKEN",
+    "MARKETING_API",
+])
+def test_the_marker_table_still_contains_what_it_must(marker):
+    """THE TWO-WAY GUARD. Narrowing or emptying AD_RAIL_MARKERS is the edit that
+    silently blinds the control, so the list is pinned literally here. If an entry is
+    removed on purpose, this test is where that decision gets made."""
+    assert marker in ad_block.AD_RAIL_MARKERS
+
+
+def test_each_pinned_marker_is_individually_detected(tmp_path):
+    """And each one actually fires — a table entry that matches nothing is the same
+    blindness by another route."""
+    for i, marker in enumerate(("facebook_business", "graph.facebook.com/v", "/act_",
+                                "adaccount", "META_AD_ACCOUNT",
+                                "META_SYSTEM_USER_TOKEN", "MARKETING_API")):
+        d = tmp_path / f"m{i}"
         d.mkdir()
         (d / "rail.py").write_text(f'X = "{marker}"\n')
         assert ad_block.scan_repo_for_ad_rail(str(d)), marker
-        with pytest.raises(ad_block.AdCallPathError):
-            ad_block.assert_no_ad_rail_in_repo(str(d))
 
 
 def test_run_once_asserts_the_ad_rail_control_before_reading_any_ticket(monkeypatch):

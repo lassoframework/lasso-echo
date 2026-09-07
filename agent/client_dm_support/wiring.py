@@ -190,6 +190,17 @@ def bus_escalation_sink(bus):
 def bus_answered_notice_sink(bus):
     """callable(ticket, decision) -> an INTERNAL card, written for EVERY auto-reply.
 
+    IT SAYS "QUEUED", NOT "REPLIED", because that is what is true when it is written.
+    Arming takes two flags: with AGENT_CLIENT_DM_AUTOFIX on and the identity's
+    SLACK_CONVO_<IDENTITY>_CLIENT_REPLY off -- the first and safest arming state -- the
+    reply row is HELD at post time (outbox.py:429) and the client receives nothing. A
+    card claiming "I auto-replied to this client" would then be false on 100% of
+    replies, and this system's D55 rule exists precisely so nobody has to wonder
+    whether a message actually landed: "receipts show what the client was actually
+    told, written only after delivery." This card is written BEFORE delivery, so it
+    describes the queue, and the existing receipt/hold-notice path remains the record
+    of what was actually sent.
+
     Why this exists, and why it is not a bigger keyword list. This lane answers one
     narrow, verified thing. A client's message can contain that thing AND something
     else entirely -- an ad-budget request, a billing question, a class-schedule change,
@@ -210,7 +221,7 @@ def bus_answered_notice_sink(bus):
         meta["answered_notice"] = True
         meta["template_id"] = decision.template_id
         body = (
-            f"[{REPLY_META_LANE}] I auto-replied to this client, about ONE thing.\n"
+            f"[{REPLY_META_LANE}] I QUEUED a reply to this client, about ONE thing.\n"
             f"gym: {decision.gym_key or 'unresolved'}\n"
             f"slack user: {ticket.get('slack_user_id') or '?'}\n"
             f"what I answered: {decision.template_id} "
@@ -218,6 +229,9 @@ def bus_answered_notice_sink(bus):
             f"verification: {decision.audit.get('verification', '')}\n"
             f"I did NOT read their message for anything else. If it asked for anything "
             f"beyond this, it has NOT been handled.\n"
+            f"delivery: queued as '{REPLY_DELIVERY_STATUS}'. Whether it reached them "
+            f"depends on the identity's client-reply flag at post time; the receipt "
+            f"and any hold notice on this ticket are the record of what was sent.\n"
             f"--- what they wrote (untrusted, escaped) ---\n"
             f"{_fenced_client_text(getattr(decision, 'client_text', ''))}\n"
             f"--- what I said ---\n"

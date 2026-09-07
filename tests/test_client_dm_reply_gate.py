@@ -709,3 +709,78 @@ def test_run_facts_OVERRIDE_the_post_fix_snapshot_never_defer_to_it():
         after, {"sync_ran": True, "assets_inserted_this_run": 7})
     assert merged.get("assets_inserted_this_run") == 7
     assert merged.get("sync_ran") is True
+
+
+# ===========================================================================
+# BOUNDS AND ALLOWLIST WIDTHS. The CONDITIONS were asserted; the VALUES the
+# conditions read were not, and a value is what a future edit actually tunes.
+# ===========================================================================
+def test_every_verification_comparator_actually_discriminates():
+    """INCREASED and BECAME_TRUE could be weakened to accept 'no change' and nothing
+    went red. A comparator that cannot fail is not a verification."""
+    from agent.client_dm_support import verify
+    b4 = lambda v: facts.GroundingSnapshot.build(          # noqa: E731
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "g", {"media_asset_count": v})
+    af = lambda v: facts.GroundingSnapshot.build(          # noqa: E731
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"media_asset_count": v})
+    inc = verify.Expectation("media_asset_count", verify.INCREASED)
+    assert verify.check(inc, b4(3), af(9)).verified
+    for same in (0, 3, 100):
+        assert not verify.check(inc, b4(same), af(same)).verified, same
+    assert not verify.check(inc, b4(9), af(3)).verified
+
+    bt = lambda v: facts.GroundingSnapshot.build(          # noqa: E731
+        diag.DIAG_DRIVE_PHOTOS, "diagnosis", "g", {"scheduled_sync_elapsed": v})
+    at = lambda v: facts.GroundingSnapshot.build(          # noqa: E731
+        diag.DIAG_DRIVE_PHOTOS, "verification", "g", {"scheduled_sync_elapsed": v})
+    became = verify.Expectation("scheduled_sync_elapsed", verify.BECAME_TRUE)
+    assert verify.check(became, bt(False), at(True)).verified
+    assert not verify.check(became, bt(True), at(True)).verified
+    assert not verify.check(became, bt(False), at(False)).verified
+
+    bf = verify.Expectation("scheduled_sync_elapsed", verify.BECAME_FALSE)
+    assert verify.check(bf, bt(True), at(False)).verified
+    assert not verify.check(bf, bt(False), at(False)).verified
+
+
+def test_the_slot_cap_is_a_real_bound_not_just_a_condition():
+    """The `if len(value) > MAX_SLOT_CHARS` condition was asserted; the NUMBER was not,
+    so raising it to 100000 stayed green."""
+    assert reply.MAX_SLOT_CHARS == 120
+    assert reply._safe_slot("k", "x" * 120) == "x" * 120
+    with pytest.raises(reply.ReplyRefused):
+        reply._safe_slot("k", "x" * 121)
+
+
+def test_the_scope_column_allowlist_is_pinned_to_gym_scoped_columns():
+    """The 'exactly one value' condition was asserted; the SET was not. Adding "id"
+    would let a data_patch scope on a row id and still satisfy 'exactly one gym'."""
+    from agent.client_dm_support import scope_gate as g
+    assert g.ALLOWED_SCOPE_COLUMNS == frozenset({"gym_id", "account_key", "base_key"})
+    for bad in ("id", "any", "row_id", "uuid", "tenant", ""):
+        v = g.check(g.ProposedAction(
+            kind=g.KIND_DATA_PATCH, tables=("media_asset",),
+            scope_column=bad, scope_values=("crossfitlocal",)))
+        assert v.escalate, bad
+        assert v.trigger == g.TRIGGER_OTHER_CLIENT, bad
+
+
+def test_the_code_fix_allowlist_is_case_sensitive():
+    """Normalisation lowercased the path, so the ALLOWED-roots prefix test was
+    case-insensitive on a case-sensitive filesystem: "TESTS/x.py" passed while naming a
+    path that does not exist. An allowlist must be strict; the denylist below stays
+    generous, which is why they no longer share one normalisation."""
+    from agent.client_dm_support import scope_gate as g
+
+    def chk(p):
+        return g.check(g.ProposedAction(kind=g.KIND_CODE_FIX, paths=(p,),
+                                        scope_column="gym_id", scope_values=("x",)))
+
+    assert chk("tests/x.py").allowed
+    assert chk("agent/jobs/x.py").allowed
+    for wrong_case in ("TESTS/x.py", "Tests/x.py", "AGENT/JOBS/x.py"):
+        assert chk(wrong_case).escalate, wrong_case
+    # ...and the denylist still catches an upper-cased blocked fragment.
+    for blocked in ("tests/fixtures/.ENV", "tests/MIGRATIONS/0311.sql",
+                    "tests/BRAND_VOICE/x.md"):
+        assert chk(blocked).escalate, blocked

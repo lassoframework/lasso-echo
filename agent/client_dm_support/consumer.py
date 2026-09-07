@@ -98,7 +98,7 @@ POLL_MAX_PAGES = 10
 
 
 def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10,
-                 already_handled=None):
+                 already_handled=None, would_act_on=None):
     """This lane's own ticket poll, paged past tickets it has already answered.
 
     Deliberately NOT bus.find_new_tickets: that method also requires
@@ -123,13 +123,46 @@ def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10,
             break
         out.extend(rows)
         offset += POLL_PAGE
-        if already_handled is None:
+        # THE STOPPING RULE COUNTS ROWS run_once WOULD ACTUALLY ACT ON.
+        #
+        # It used to count "not already answered by this lane", which is a different
+        # predicate, and the gap between them was a second starvation route. run_once
+        # also discards a ticket for two reasons that mark NOTHING: a non-DM surface
+        # (a channel/group ticket) and a ticket whose only inbound rows are staff. This
+        # lane never changes a ticket's status, so those sit in an open status forever
+        # and created_at.asc parks them at the front of the queue. Fifty of them and
+        # the break fired on page one, so nothing behind them was ever fetched -- and
+        # the pass reported {ok:True, handled:0}, character-for-character identical to
+        # a healthy idle pass, because those rows `continue` before any counter.
+        #
+        # Counting the same predicate the loop uses closes the gap by construction:
+        # there is no longer a category of row that satisfies the stopping rule and is
+        # then discarded. `would_act_on` is memoised by the caller, so this does not
+        # re-read a ticket's messages once per page (it did, which made a 500-row
+        # backlog thousands of round trips).
+        if would_act_on is None and already_handled is None:
             break                     # caller filters; one page is the old behaviour
-        if sum(1 for r in out if not already_handled(r)) >= int(limit):
+        predicate = would_act_on or (lambda r: not already_handled(r))
+        if sum(1 for r in out if predicate(r)) >= int(limit):
             break
         if len(rows) < POLL_PAGE:
             break
+    if len(out) >= POLL_PAGE * POLL_MAX_PAGES:
+        # The hard ceiling was reached, so there may be actionable tickets this pass
+        # never saw. Never silent: a bounded scan that ran out of budget is not an
+        # empty queue, and the two must not look the same.
+        _alert(f"client DM autofix: the ticket poll hit its {POLL_PAGE * POLL_MAX_PAGES}"
+               f"-row ceiling without finding enough actionable tickets. Older open "
+               f"tickets were not examined this pass.")
     return out
+
+
+def _alert(message):
+    try:
+        from .. import ops_alerts
+        ops_alerts.alert(message)
+    except Exception:  # noqa: BLE001 - an alert failure never sinks a pass
+        print(f"[client-dm] {message}")
 
 
 def resolve_gym_key(ticket, *, portal_key_for_gym=None, confirm_binding=None):
@@ -268,11 +301,27 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
     notice_sink = notice_sink or _wiring.bus_answered_notice_sink(bus)
     poll = poll or default_poll
 
-    def _handled_already(ticket):
-        return _already_handled(_messages(bus, ticket))
+    # ONE read of a ticket's messages per pass, memoised, and ONE predicate shared by
+    # the poll's stopping rule and the loop below -- so they cannot disagree.
+    msg_cache = {}
+
+    def _msgs(ticket):
+        tid = ticket.get("id")
+        if tid not in msg_cache:
+            msg_cache[tid] = _messages(bus, ticket)
+        return msg_cache[tid]
+
+    def _would_act_on(ticket):
+        msgs = _msgs(ticket)
+        if _surface_of(msgs) not in CLIENT_DM_SURFACES:
+            return False
+        if _already_handled(msgs):
+            return False
+        return bool(_latest_client_text(msgs))
 
     try:
-        tickets = poll(bus, limit=int(limit), already_handled=_handled_already)
+        tickets = poll(bus, limit=int(limit), would_act_on=_would_act_on,
+                       already_handled=lambda t: _already_handled(_msgs(t)))
     except Exception as e:  # noqa: BLE001
         log(f"poll failed: {type(e).__name__}: {e}")
         return {"ok": False, "reason": f"poll failed: {type(e).__name__}",
@@ -281,7 +330,7 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
     replied = escalated = handled = skipped = undelivered = 0
     decisions = []
     for t in tickets:
-        msgs = _messages(bus, t)
+        msgs = _msgs(t)
         surface = _surface_of(msgs)
         if surface not in CLIENT_DM_SURFACES:
             continue

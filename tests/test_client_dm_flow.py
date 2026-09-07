@@ -1494,3 +1494,118 @@ def test_a_code_fix_may_not_rewrite_this_capabilitys_own_safety_controls():
             scope_column="gym_id", scope_values=(CHAD_KEY,)))
         assert v.escalate, path
     assert "agent/client_dm_support/" not in sg.ALLOWED_CODE_FIX_ROOTS
+
+
+# ===========================================================================
+# STARVATION, THE SECOND ROUTE. The round-4 fix counted a different predicate
+# from the one the loop uses, and the gap was a way back to inert.
+# ===========================================================================
+def _queue_of(unactionable, kind):
+    """`unactionable` tickets run_once discards WITHOUT marking anything, then one
+    real client DM behind them."""
+    tickets, msgs = [], {}
+    for i in range(unactionable):
+        tid = f"X{i}"
+        tickets.append({"id": tid, "product": "echo", "source": "slack_conversation",
+                        "status": "hold", "bot_identity": "echo",
+                        "client_id": CHAD_UUID})
+        if kind == "channel":
+            msgs[tid] = [{"direction": "inbound", "author_type": "client",
+                          "body": "internal chatter",
+                          "attachments": {"surface": "channel"}}]
+        else:
+            msgs[tid] = [{"direction": "inbound", "author_type": "staff",
+                          "body": "staff note", "attachments": {"surface": "mpim"}}]
+    tickets.append({"id": "REAL", "product": "echo", "source": "slack_conversation",
+                    "status": "hold", "bot_identity": "echo", "client_id": CHAD_UUID})
+    msgs["REAL"] = [{"direction": "inbound", "author_type": "client",
+                     "body": "my posts have no photos",
+                     "attachments": {"surface": "mpim"}}]
+    return FakeBus(tickets=tickets, messages=msgs)
+
+
+@pytest.mark.parametrize("kind", ["channel", "staff_only"])
+@pytest.mark.parametrize("ahead", [9, 40, 50, 120, 400])
+def test_tickets_this_lane_can_never_act_on_do_not_starve_a_real_one(kind, ahead):
+    """THE RULE: the poll must reach an actionable client DM.
+
+    A non-DM surface and a staff-only ticket are both discarded by run_once WITHOUT
+    marking anything, and this lane never changes a ticket's status — so they sit in an
+    open status forever and created_at.asc parks them at the front. The old stopping
+    rule counted "not already answered by this lane", which those satisfy, so fifty of
+    them ended the paging on page one and the pass reported {ok:True, handled:0} —
+    character-for-character a healthy idle pass."""
+    bus = _queue_of(ahead, kind)
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(4, store)),
+                            **_consumer_kw())
+    assert out["handled"] == 1, (kind, ahead, out)
+    assert out["replied"] == 1, (kind, ahead, out)
+
+
+def test_hitting_the_paging_ceiling_is_never_silent(monkeypatch):
+    """A bounded scan that ran out of budget is not an empty queue, and the two must
+    not look the same."""
+    alerts = []
+    monkeypatch.setattr(consumer, "_alert", lambda m: alerts.append(m))
+    bus = _queue_of(consumer.POLL_PAGE * consumer.POLL_MAX_PAGES + 10, "channel")
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    out = consumer.run_once(bus=bus, flag_on=True,
+                            deps=drive_deps(store, make_sync(4, store)),
+                            **_consumer_kw())
+    assert alerts, "the ceiling was hit and nobody was told"
+    assert "ceiling" in alerts[0]
+    assert out["handled"] == 0
+
+
+def test_a_tickets_messages_are_read_once_per_pass_not_once_per_page():
+    """The stopping rule re-evaluated the whole accumulator every page, each check a
+    fresh bus round trip: a 500-row backlog cost thousands of reads."""
+    bus = _queue_of(120, "channel")
+    reads = []
+    original = bus.recent_messages
+
+    def counting(tid, limit=200):
+        reads.append(tid)
+        return original(tid, limit=limit)
+
+    bus.recent_messages = counting
+    store = FakeStore(sources=[CHAD_SOURCE], assets=[])
+    consumer.run_once(bus=bus, flag_on=True,
+                      deps=drive_deps(store, make_sync(4, store)), **_consumer_kw())
+    assert len(reads) == len(set(reads)), (
+        f"{len(reads)} reads for {len(set(reads))} tickets: messages are being "
+        f"re-read per page")
+
+
+def test_the_stopping_rule_and_the_loop_use_the_SAME_predicate():
+    """The defect was a gap between two predicates. Asserted structurally so it cannot
+    reopen: run_once hands the poll the very function it filters with."""
+    import inspect
+    src = inspect.getsource(consumer.run_once)
+    assert "would_act_on=_would_act_on" in src
+    body = inspect.getsource(consumer)
+    assert "def _would_act_on(ticket):" in body
+    for predicate in ("_surface_of(msgs) not in CLIENT_DM_SURFACES",
+                      "_already_handled(msgs)", "_latest_client_text(msgs)"):
+        assert predicate in body, predicate
+
+
+def test_the_lane_key_wire_value_is_pinned():
+    """Renaming it would make every historical idempotency record invisible and the
+    lane would re-reply once to every ticket it has ever answered."""
+    assert wiring.REPLY_META_LANE == "client_dm_autofix"
+
+
+def test_the_queued_card_does_not_claim_the_client_received_anything():
+    """With AGENT_CLIENT_DM_AUTOFIX on and the identity's client-reply flag off — the
+    first and safest arming state — the reply is HELD at post time and the client gets
+    nothing. A card saying "I auto-replied to this client" would be false on 100% of
+    replies, against this system's D55 rule that a receipt says what was actually
+    told."""
+    rows = _cards("my posts have no photos")
+    card = [r for r in rows if r["kind"] == "escalation"][0]
+    assert "QUEUED a reply" in card["body"]
+    assert "I auto-replied to this client" not in card["body"]
+    assert "delivery:" in card["body"]
