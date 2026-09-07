@@ -468,3 +468,16 @@ def test_no_named_member_means_no_retry(monkeypatch):
     caption, _h, _f = StoryBrandGenerator().build(_voice(), creative)
     assert fake.calls == 1                               # no retry: nothing to preserve
     assert "seniors" in caption.lower()
+
+
+def test_named_member_ignores_the_appended_photo_hint():
+    """A name must come from the APPROVED source, never from the picked photo's own
+    filename/sidecar hint appended below a _HINT_MARKERS marker (client_content.py's
+    photo_hint is explicitly "NOT a source of facts... or names to state")."""
+    note = ("Our 6am class is filling up for the new members joining."
+            "\n\nWHAT THIS POST'S PHOTO/VIDEO SHOWS (reference this so the caption "
+            "matches the image; it is a scene hint, NOT a source of facts, numbers, "
+            "offers, or names to state): Sarah Front Squat")
+    assert drafter._named_member(note) == ""
+    assert drafter._dropped_name_for_age(
+        note, "One of our members is in her 40s and crushing it.") == ""

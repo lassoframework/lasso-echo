@@ -551,13 +551,25 @@ _AGE_STANDIN_RE = _re_names.compile(
     _re_names.IGNORECASE)
 
 
+def _approved_source_only(client_note):
+    """`client_note` truncated at the first appended scene/grounding hint marker (the same
+    markers _hint_free strips), so name detection ONLY ever reads the human-APPROVED
+    source text — never the picked photo's own sidecar note / humanized filename hint,
+    which _SourceCreative appends below one of _HINT_MARKERS and which is explicitly a
+    scene hint, "NOT a source of facts... or names to state" (client_content.py). A photo
+    filename is not consent to name someone in THIS caption."""
+    note = client_note or ""
+    cut = min((note.find(m) for m in _HINT_MARKERS if m in note), default=-1)
+    return note[:cut] if cut >= 0 else note
+
+
 def _named_member(client_note):
     """The first real person's name the APPROVED source itself names, or "" when none is
     detected. Conservative by design (mirrors vision._looks_like_person_name): a name CUE
     followed by a Titlecase word, or a Firstname Lastname pair, whose tokens are not gym
-    vocabulary. Only ever reads client_note (an approved, human-written source) — never a
-    photo/vision analysis."""
-    text = client_note or ""
+    vocabulary. Only ever reads the approved-source portion of client_note — never the
+    appended photo/scene hint, and never a vision analysis."""
+    text = _approved_source_only(client_note)
     for m in _NAME_CUE_RE.finditer(text):
         cand = m.group(1)
         if cand.lower() not in _NAME_GYM_VOCAB:
