@@ -901,7 +901,7 @@ _COMMANDS = {
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
-        ("backfill-section7", "recover CTA/hashtag section 7 for already-onboarded gyms (--bases a,b,c)"),
+        ("backfill-section7", "recover CTA/hashtag section 7 for already-onboarded gyms (--bases a,b=intake_key,c)"),
         ("welcome-kit", "client welcome kit PDF"),
         ("draft-bible", "draft a brand bible from an intake doc"),
         ("intake-doc", "turn a client PDF into held draft posts"),
@@ -1877,7 +1877,10 @@ def main(argv=None):
             if a == "--bases" and i + 1 < len(args_rest):
                 bases = [b.strip() for b in args_rest[i + 1].split(",") if b.strip()]
         if not bases:
-            print("usage: python -m agent backfill-section7 --bases <base1,base2,...>")
+            print("usage: python -m agent backfill-section7 --bases "
+                  "<base1,base2=intake_client_key,...>\n"
+                  "  (base=intake_client_key for a self-serve gym whose "
+                  "echo_social_intake row is keyed by the portal's raw UUID)")
         else:
             results = _sir.backfill_section7_many(bases)
             for r in results:

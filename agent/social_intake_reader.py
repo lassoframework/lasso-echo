@@ -430,10 +430,14 @@ def onboard_from_social(account_key, answers, *, approve=True):
 # forever unless something explicitly recovers it. This is that recovery, run once
 # per already-onboarded gym.
 
-def backfill_section7(base_key, *, reader=None, voice_dir=None):
+def backfill_section7(base_key, *, reader=None, voice_dir=None, intake_key=None):
     """Recover section 7 (CTA/hashtags) for ONE already-onboarded gym's EXISTING
     lasso_voice.md, from that SAME gym's real raw intake (never a different gym's,
-    never invented). Patches ONLY the CTA-rotation / hashtag-strategy block bodies,
+    never invented). `intake_key` is the echo_social_intake.client_key to read the
+    intake FROM when it differs from the bible's folder name (base_key) -- the
+    self-serve UUID-onboarding split (see comment above); omit it for a
+    hand-registered gym whose intake row IS keyed by its base. Patches ONLY the
+    CTA-rotation / hashtag-strategy block bodies,
     and ONLY where the on-disk file still carries the literal machine TODO for that
     block (bible_drafter.patch_section7's own safety check) -- so a bible a human
     has since reviewed, edited, or that was filled by any other mechanism (e.g. a
@@ -445,7 +449,16 @@ def backfill_section7(base_key, *, reader=None, voice_dir=None):
     if not base_key:
         return {"base": base_key, "ok": False, "reason": "empty base_key"}
 
-    answers = read_social_intake(base_key, reader=reader)
+    # A self-serve gym's echo_social_intake.client_key is the PORTAL'S RAW UUID
+    # (its intake was captured before any canonical base was resolved), while its
+    # bible landed under the RESOLVED base folder once account_key_resolve /
+    # _canonical_base minted one (see sync_unrouted's own base != raw_key split).
+    # A hand-registered gym (accounts.py's hardcoded ACCOUNTS) has no such split:
+    # its intake row's client_key IS its base. intake_key lets the caller supply
+    # the raw key explicitly for the split case; it defaults to base_key so every
+    # existing call site (and every hand-registered gym) is unaffected.
+    intake_key = _clean(intake_key) or base_key
+    answers = read_social_intake(intake_key, reader=reader)
     if answers is None:
         return {"base": base_key, "ok": False, "reason": "no intake answers on file"}
 
@@ -483,11 +496,20 @@ def backfill_section7(base_key, *, reader=None, voice_dir=None):
 
 def backfill_section7_many(base_keys, *, reader=None, voice_dir=None):
     """backfill_section7 for a caller-supplied list of already-onboarded base keys.
-    Deliberately NOT auto-discovering: which gyms are eligible (a real canonical
-    account, not an orphaned/duplicate key from the account-key split-brain issue)
-    is a judgment call the caller makes explicitly, not something this function
+    Each entry is either a plain base key ("gritx") or "base=intake_key"
+    ("toughtemple52040e=52040e09-986f-43d6-a60d-306fa8e234fe") for a self-serve
+    gym whose intake row is keyed by the portal's raw UUID rather than its
+    resolved base -- see backfill_section7's intake_key docstring. Deliberately
+    NOT auto-discovering: which gyms are eligible (a real canonical account, not
+    an orphaned/duplicate key from the account-key split-brain issue) is a
+    judgment call the caller makes explicitly, not something this function
     guesses. Returns the list of per-gym result dicts."""
-    return [backfill_section7(b, reader=reader, voice_dir=voice_dir) for b in base_keys]
+    results = []
+    for entry in base_keys:
+        base, _, intake = _clean(entry).partition("=")
+        results.append(backfill_section7(base, reader=reader, voice_dir=voice_dir,
+                                          intake_key=intake or None))
+    return results
 
 
 # ---- automatic forward: map EVERY un-routed intake into Echo -----------------------
