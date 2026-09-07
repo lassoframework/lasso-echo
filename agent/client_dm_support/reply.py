@@ -27,6 +27,16 @@ No LLM free text is auto-posted by this capability. There is no code path that
 composes a reply any other way: compose() takes a template id and a snapshot, and
 nothing else, and it is the only public producer.
 
+A TEMPLATE'S CONSTANT PROSE IS NOT CHECKED BY THE GATE, SO IT MUST BE WRITTEN AS IF
+IT WERE. The byte-identity gate proves every SLOT traces to a fact key; it says
+nothing about the fixed sentences around them. `drive_synced` used to end "New posts
+will draw from those." -- and media_asset_count counts every row the store returns,
+including eligible=False (rejected) and eligible=None (unprobed video) rows, which
+gym_media_selector excludes. Six unprobed videos synced in, the client told posts
+would draw from them, and not one of them was selectable. The sentence was deleted
+rather than hedged: a claim no fact key measures does not belong in a message Echo
+sends unattended, and "6 file(s) are in your library" is both true and enough.
+
 WHAT A TEMPLATE MAY SAY. Three rules, all asserted by assert_templates_wellformed()
 and by tests:
   * every {slot} must be a key in facts.ALL_FACT_KEYS;
@@ -137,8 +147,7 @@ DRIVE_SYNCED = _register(ReplyTemplate(
     text=(
         "Your connected Google Drive folder is active. I ran the photo sync for your "
         "gym just now and pulled in {assets_inserted_this_run} file(s); your library "
-        "now holds {media_asset_count} photo(s) and video(s). New posts will draw "
-        "from those."
+        "now holds {media_asset_count} photo(s) and video(s)."
     ),
 ))
 

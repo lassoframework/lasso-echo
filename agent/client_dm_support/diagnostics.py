@@ -99,8 +99,8 @@ def next_scheduled_sync(after, daily_hour_utc):
 # ---------------------------------------------------------------------------
 # Case 1 shape: "the posts waiting for my approval have no photos"
 # ---------------------------------------------------------------------------
-def diagnose_drive_photos(gym_key, *, store, now=None, daily_hour_utc=None,
-                         lane_active_for=None):
+def diagnose_drive_photos(gym_key, *, store=None, now=None, daily_hour_utc=None,
+                          lane_active_for=None):
     """Read-only. Answers, with facts rather than a guess:
 
       * is the Connect-Drive lane even armed for this gym
@@ -116,6 +116,23 @@ def diagnose_drive_photos(gym_key, *, store, now=None, daily_hour_utc=None,
     """
     key = require_account_key(gym_key)
     now_dt = _now(now)
+
+    # THE PRODUCTION DEFAULT. `store` was a required keyword-only argument with no
+    # default, and nothing on the real path supplies one: runner.py calls run_once()
+    # with no deps, consumer passes deps={}, and _diagnostic_kwargs therefore passes
+    # nothing. Every Case-1 ticket -- the ONLY executable remedy this capability has --
+    # died on `TypeError: missing 1 required keyword-only argument: 'store'` and
+    # escalated with that on a card, which looks exactly like a healthy refusal.
+    #
+    # D68's "built but not wired", and this module's own docstring claimed the
+    # opposite ("Every one of them has a real production default, so a test double is
+    # never the only implementation of a seam"). Every test injected a fake store, so
+    # nothing could catch it. tests/test_client_dm_wiring.py now calls every diagnostic
+    # and every executor with NO deps at all and asserts the failure is never a
+    # TypeError about a missing seam.
+    if store is None:
+        from .. import gym_media_index as _idx
+        store = _idx.default_store()
 
     if daily_hour_utc is None:
         # The nightly gym-media sync shares the daily slot at AGENT_DAILY_HOUR_UTC

@@ -151,10 +151,17 @@ def default_poll(bus, *, product=POLL_PRODUCT, source=POLL_SOURCE, limit=10,
         # The hard ceiling was reached, so there may be actionable tickets this pass
         # never saw. Never silent: a bounded scan that ran out of budget is not an
         # empty queue, and the two must not look the same.
+        POLL_CEILING_HIT.append(True)
         _alert(f"client DM autofix: the ticket poll hit its {POLL_PAGE * POLL_MAX_PAGES}"
                f"-row ceiling without finding enough actionable tickets. Older open "
                f"tickets were not examined this pass.")
     return out
+
+
+# A bounded scan that ran out of budget is not an empty queue. The alert said so; the
+# SUMMARY did not, and runner.py only prints when ok is falsy -- so the caller saw
+# {ok:True, handled:0}, byte-identical to a healthy idle pass.
+POLL_CEILING_HIT = []
 
 
 def _alert(message):
@@ -264,9 +271,12 @@ def confirm_gym_binding(gym_uuid, account_key, *, state=None, fresh_key=None):
         return False
 
     # 3. UNIQUENESS.
-    owners = [g for g, k in by_gym.items()
+    owners = [str(g).strip().lower() for g, k in by_gym.items()
               if str(k or "").strip().lower() == key]
-    return len(owners) == 1
+    # Exactly one owner, AND that owner is THIS gym. `gid` was computed and then never
+    # used again: the freshness read covers it in practice, but the cheap assertion was
+    # missing at the seam this file calls the most dangerous one.
+    return owners == [gid]
 
 
 def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
@@ -319,6 +329,7 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
             return False
         return bool(_latest_client_text(msgs))
 
+    del POLL_CEILING_HIT[:]
     try:
         tickets = poll(bus, limit=int(limit), would_act_on=_would_act_on,
                        already_handled=lambda t: _already_handled(_msgs(t)))
@@ -345,7 +356,21 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
 
         gym_key = resolve_gym_key(t, portal_key_for_gym=portal_key_for_gym,
                                   confirm_binding=confirm_binding)
-        decision = _flow.handle_ticket(text=text, gym_key=gym_key, deps=deps)
+        # ONE TICKET'S EXCEPTION MUST NOT SINK THE PASS. flow._decide guards the
+        # diagnostic but not the execute step, and the executor guards sync_source but
+        # not store.list_sources -- so a Supabase 5xx on ONE gym's source read
+        # propagated out of run_once and every other client's ticket in the pass was
+        # dropped with nothing written and no escalation. Both docstrings promised
+        # otherwise, and were true only of the delivery half.
+        try:
+            decision = _flow.handle_ticket(text=text, gym_key=gym_key, deps=deps)
+        except Exception as e:  # noqa: BLE001
+            log(f"decision failed for ticket {t.get('id')}: {type(e).__name__}: {e}")
+            decision = _flow.DmDecision(
+                _flow.DECISION_ESCALATE,
+                f"this lane errored before it could decide: {type(e).__name__}. "
+                f"Nothing was changed; a human should look.",
+                gym_key=str(gym_key or ""), client_text=text)
         decisions.append(decision)
         handled += 1
         try:
@@ -400,9 +425,13 @@ def run_once(*, bus=None, deps=None, reply_sink=None, escalation_sink=None,
                 f"has been told. Check the bus.")
         except Exception:  # noqa: BLE001
             pass
-    return {"ok": not undelivered, "handled": handled, "replied": replied,
-            "escalated": escalated, "skipped": skipped,
-            "undelivered": undelivered, "decisions": decisions}
+    ceiling_hit = bool(POLL_CEILING_HIT)
+    return {"ok": not undelivered and not ceiling_hit, "handled": handled,
+            "replied": replied, "escalated": escalated, "skipped": skipped,
+            "undelivered": undelivered, "poll_ceiling_hit": ceiling_hit,
+            "reason": ("the ticket poll hit its ceiling; older open tickets were not "
+                       "examined") if ceiling_hit else "",
+            "decisions": decisions}
 
 
 def _messages(bus, ticket):

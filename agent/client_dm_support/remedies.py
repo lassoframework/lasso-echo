@@ -149,8 +149,8 @@ def _plan_cta(key, f):
 # ---------------------------------------------------------------------------
 # EXECUTION
 # ---------------------------------------------------------------------------
-def _exec_per_gym_drive_sync(remedy, *, gym_key, store, sync_source=None, log=None,
-                             **_kw):
+def _exec_per_gym_drive_sync(remedy, *, gym_key, store=None, sync_source=None,
+                             log=None, **_kw):
     """Run the EXISTING nightly sync -- agent/jobs/sync_gym_media.sync_source -- over
     exactly this gym's own active gym_drive sources, and report what it inserted.
 
@@ -160,6 +160,9 @@ def _exec_per_gym_drive_sync(remedy, *, gym_key, store, sync_source=None, log=No
     walks every gym is deliberately NOT called.
     """
     log = log or (lambda m: None)
+    if store is None:                       # the production default; see diagnostics.py
+        from .. import gym_media_index as _idx
+        store = _idx.default_store()
     if sync_source is None:
         from ..jobs import sync_gym_media as _job
         sync_source = _job.sync_source

@@ -140,8 +140,15 @@ def test_case1_end_to_end_runs_the_sync_verifies_it_and_replies_grounded():
     assert d.reply_text == (
         'Your connected Google Drive folder is active. I ran the photo sync for your '
         'gym just now and pulled in 34 file(s); your library now holds 34 photo(s) '
-        'and video(s). New posts will draw from those.'
+        'and video(s).'
     )
+    # NOTE the sentence that is NOT here. It used to end "New posts will draw from
+    # those." -- a forward claim no fact key measures: media_asset_count counts every
+    # row the store returns, including eligible=False and eligible=None (unprobed
+    # video) rows that gym_media_selector excludes. Six unprobed videos synced in and
+    # the client was told posts would draw from them; not one was selectable. The
+    # byte-identity gate could not see it, because the false half was template prose
+    # rather than an interpolated fact.
     assert d.audit["facts"]["assets_inserted_this_run"] == 34
     # THE FOLDER NAME IS NOT IN THE REPLY. It is a label the gym owner types into
     # their own Drive, so it is client-controlled text; interpolating it let a folder
