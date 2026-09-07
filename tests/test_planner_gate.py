@@ -258,6 +258,134 @@ def test_gate_on_persistent_fail_blocks_staging(monkeypatch):
 # Test 4: AGENT_CALENDAR_GRADE=OFF -> no grade check, stages regardless
 # ---------------------------------------------------------------------------
 
+def _fake_to_calendar_rows_from_post_date(drafts, key):
+    """A to_calendar_rows stand-in that (unlike the canned-row fakes above)
+    actually reads each draft's post_date, so a test can prove a specific date
+    was dropped from the final row set."""
+    rows = []
+    for d in drafts or []:
+        rows.append({
+            "gym_id": key,
+            "post_date": d.post_date,
+            "caption": d.caption,
+            "pillar": "platform",
+            "category": "platform",
+            "format": "feed",
+            "account": "instagram",
+            "status": "pending",
+            "media_url": "https://cdn.example.com/img.jpg",
+            "template_id": "tmpl_A",
+            "media_kind": "photo",
+        })
+    return rows
+
+
+class _FakeDraftDated:
+    def __init__(self, post_date, caption):
+        self.post_date = post_date
+        self.caption = caption
+        self.id = f"draft_{post_date}"
+
+
+def test_gate_on_partial_fail_stages_reduced_plan(monkeypatch):
+    """When 4 remediation passes can't clear the bar, but the failing defects
+    all name specific dates, drop just those dates and stage the rest — never
+    block a whole month over one or two unfixable days (Blake, 2026-09-07:
+    'don't stop posting because it grades at F')."""
+    import agent.config as cfg
+    monkeypatch.setenv("AGENT_CALENDAR_GRADE", "true")
+
+    from agent import real_month_planner as rmp
+    import agent.calendar_grade as cg
+
+    BAD_DATES = {"2026-09-03", "2026-09-04"}
+    drafts = [_FakeDraftDated(f"2026-09-{i + 1:02d}", f"Clean caption body number {i}, "
+                              "book your free intro class today and get started now.")
+              for i in range(10)]
+
+    def fake_grade(rows, profile="GYM", quotas=None):
+        from agent.calendar_grade import CalendarGrade
+        present_bad = {r["post_date"] for r in rows} & BAD_DATES
+        if present_bad:
+            return CalendarGrade(total=40, letter="F", scores={
+                "consistency": 5, "content_mix": 10, "caption_craft": 10,
+                "visual_match": 5, "right_audience": 5, "path_to_join": 5,
+            }, defects=[("consistency", d, "caption hash repeated")
+                        for d in sorted(present_bad)])
+        return CalendarGrade(total=95, letter="A", scores={
+            "consistency": 20, "content_mix": 20, "caption_craft": 20,
+            "visual_match": 15, "right_audience": 10, "path_to_join": 10,
+        }, defects=[])
+
+    monkeypatch.setattr(cg, "grade_month", fake_grade)
+    # _remediate is a no-op here: the point of this test is that dropping the
+    # named dates (not remediation) is what clears the gate.
+    monkeypatch.setattr(rmp, "_remediate", lambda rows, defects: None)
+    monkeypatch.setattr(rmp, "to_calendar_rows", _fake_to_calendar_rows_from_post_date)
+    from agent import real_calendar_mirror as _mirror
+    monkeypatch.setattr(_mirror._demo, "is_demo_draft_id", lambda x: False)
+    monkeypatch.setattr(_mirror, "_row_source_id", lambda d: "")
+
+    alerts = []
+    import agent.ops_alerts as oa
+    monkeypatch.setattr(oa, "alert", lambda m: alerts.append(m))
+
+    store = _FakeStore()
+    result = rmp.apply_month_plan("testgym", drafts, store)
+
+    assert result["ok"] is True, f"Expected ok=True (partial stage), got: {result}"
+    assert len(alerts) == 1 and "PARTIAL STAGE" in alerts[0], (
+        f"Expected exactly one PARTIAL STAGE alert, got: {alerts}"
+    )
+    staged_dates = {r["post_date"] for r in store.inserted}
+    assert staged_dates & BAD_DATES == set(), (
+        f"Bad dates must never be staged, got staged dates: {staged_dates}"
+    )
+    assert staged_dates == {f"2026-09-{i + 1:02d}" for i in range(10)} - BAD_DATES, (
+        f"Every clean date should still stage, got: {staged_dates}"
+    )
+
+
+def test_gate_on_aggregate_defect_still_blocks(monkeypatch):
+    """A defect with no date (a month-wide aggregate rule, row_ref == '')
+    cannot be isolated to a day, so it must still fully block — proves the
+    partial-stage path never fires on a defect it cannot attribute."""
+    import agent.config as cfg
+    monkeypatch.setenv("AGENT_CALENDAR_GRADE", "true")
+
+    from agent import real_month_planner as rmp
+    import agent.calendar_grade as cg
+
+    call_count = [0]
+
+    def always_fail_aggregate(rows, profile="GYM", quotas=None):
+        from agent.calendar_grade import CalendarGrade
+        call_count[0] += 1
+        return CalendarGrade(total=55, letter="F", scores={
+            "consistency": 10, "content_mix": 10, "caption_craft": 5,
+            "visual_match": 10, "right_audience": 10, "path_to_join": 10,
+        }, defects=[("caption_craft", "", "median caption length 90 < 150")])
+
+    monkeypatch.setattr(cg, "grade_month", always_fail_aggregate)
+    monkeypatch.setattr(rmp, "_remediate", lambda rows, defects: None)
+    good_rows = _make_good_plan_rows()
+    monkeypatch.setattr(rmp, "to_calendar_rows", lambda drafts, key: good_rows)
+    from agent import real_calendar_mirror as _mirror
+    monkeypatch.setattr(_mirror._demo, "is_demo_draft_id", lambda x: False)
+    monkeypatch.setattr(_mirror, "_row_source_id", lambda d: "")
+
+    alerts = []
+    import agent.ops_alerts as oa
+    monkeypatch.setattr(oa, "alert", lambda m: alerts.append(m))
+
+    store = _FakeStore()
+    result = rmp.apply_month_plan("testgym", [], store)
+
+    assert result["ok"] is False, f"Expected ok=False for an unattributable defect, got: {result}"
+    assert len(alerts) == 1 and "NOT STAGING" in alerts[0]
+    assert not store.inserted
+
+
 def test_gate_off_skips_grading(monkeypatch):
     """When the flag is OFF, apply_month_plan stages without any grade check."""
     monkeypatch.setenv("AGENT_CALENDAR_GRADE", "false")
