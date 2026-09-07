@@ -1225,15 +1225,56 @@ def apply_month_plan(account_key, drafts, sb_store, *, span_months=None):
             _remediate(_grade_rows, grade.defects)
             grade = grade_month(_grade_rows, profile=_profile)
         if grade.total < _AT:
-            ops_alerts.alert(
-                f"calendar grade gate: {account_key} scored {grade.total} "
-                f"({grade.letter}) after 4 remediation passes. Top defects: "
-                f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
-            )
-            return {"ok": False,
-                    "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
-                    "grade": grade.total, "letter": grade.letter,
-                    "upserted": 0, "deleted": 0}
+            # PARTIAL STAGE (Blake, 2026-09-07): an all-or-nothing gate meant one
+            # unfixable day (source material too thin to rewrite honestly) blocked
+            # the WHOLE month, including every clean day remediation already
+            # produced. defects' row_ref is a YYYY-MM-DD for every PER-DAY rule
+            # (consistency gaps, duplicate captions, per-day craft/audience
+            # flags); a handful of rules are month-wide aggregates with no date
+            # (row_ref "") and cannot be isolated to a single day. Drop just the
+            # named dates and re-grade what remains: if the reduced book clears
+            # the bar, stage it and leave the dropped dates as gaps (nothing is
+            # invented to fill them; preserve_and_prune below still protects any
+            # already-approved/published row on those dates; the next fill pass
+            # covers the gap same as any other unfillable day). If dropping the
+            # named dates still cannot clear the bar, the failure is not
+            # isolated to any single day (an aggregate defect, or every day is
+            # bad) and this stays a real HELD — never force fabricated content
+            # through to hit a grade.
+            _bad_dates = {
+                ref for (_leg, ref, _reason) in grade.defects
+                if isinstance(ref, str) and len(ref) == 10
+                and ref[4:5] == "-" and ref[7:8] == "-"
+            }
+            _reduced_grade = None
+            if _bad_dates:
+                _reduced_rows = [r for r in _grade_rows
+                                 if r.get("post_date") not in _bad_dates]
+                if _reduced_rows:
+                    _reduced_grade = grade_month(_reduced_rows, profile=_profile)
+            if _reduced_grade is not None and _reduced_grade.total >= _AT:
+                ops_alerts.alert(
+                    f"calendar grade gate: {account_key} scored {grade.total} "
+                    f"({grade.letter}) after 4 remediation passes. Held "
+                    f"{len(_bad_dates)} date(s) {sorted(_bad_dates)} as gaps "
+                    f"(top defects: {[d[2] for d in grade.defects[:3]]}) and "
+                    f"staged the rest at {_reduced_grade.total} "
+                    f"({_reduced_grade.letter}). PARTIAL STAGE — held dates are "
+                    f"gaps, not lost; next fill pass covers them."
+                )
+                drafts = [d for d in (drafts or [])
+                          if getattr(d, "post_date", None) not in _bad_dates]
+                grade = _reduced_grade
+            else:
+                ops_alerts.alert(
+                    f"calendar grade gate: {account_key} scored {grade.total} "
+                    f"({grade.letter}) after 4 remediation passes. Top defects: "
+                    f"{[d[2] for d in grade.defects[:3]]}. NOT STAGING — human decision needed."
+                )
+                return {"ok": False,
+                        "reason": f"calendar grade gate: scored {grade.total} ({grade.letter}) after 4 passes",
+                        "grade": grade.total, "letter": grade.letter,
+                        "upserted": 0, "deleted": 0}
         # Attach grade summary to the result below
         _grade_summary = f"Grade: {grade.letter} ({grade.total}/100)"
     else:
