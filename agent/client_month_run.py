@@ -900,7 +900,15 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # this is what actually gives the Drive lane's fresh, unused photos a
             # chance instead of a small stale library silently claiming the day
             # forever.
+            # BOTH Drive flags, same pair the actual fallback below is gated on
+            # (line ~983) -- GYM_DRIVE_STAGE off would otherwise turn a stale
+            # repeat into a genuinely EMPTY day (found in independent review,
+            # 2026-09-07): connected-but-not-staged means append_gym_drive_drafts
+            # never runs, so skipping here without checking staging too would
+            # leave the gap unfilled by anything at all -- worse than the repeat
+            # this fix exists to replace.
             if (getattr(feed, "stale_reuse", False)
+                    and config.gym_drive_stage_enabled()
                     and config.gym_drive_connect_active_for(
                         getattr(account, "key", "") or base_key)):
                 log(f"skip {day_key} feed: stale repeat from an exhausted library, "

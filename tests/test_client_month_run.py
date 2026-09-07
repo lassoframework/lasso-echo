@@ -396,6 +396,7 @@ def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
     so append_gym_drive_drafts gets the chance instead, rather than a small stale
     library silently claiming every day forever."""
     monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
     _stock_clean("gritx_ig")
     lib = _lib(tmp_path, n=5)
     served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
@@ -415,6 +416,39 @@ def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
     assert len(feed_ig) == 0, (
         f"expected the stale-reuse day to be left for the Drive pool, not filled "
         f"with a repeat, got {len(feed_ig)} feed day(s)"
+    )
+
+
+def test_stale_reuse_still_placed_when_drive_connected_but_not_staged(tmp_path, monkeypatch):
+    """Independent-review finding, 2026-09-07: GYM_DRIVE_CONNECT and GYM_DRIVE_STAGE
+    are two independent flags. A gym can be Drive-CONNECTED (its media is indexed)
+    while GYM_DRIVE_STAGE is globally off (the planner isn't pulling from ANY gym's
+    Drive pool yet) -- append_gym_drive_drafts is gated on both flags together and
+    never runs in that case. Skipping the stale placement on connect-only, without
+    also checking staging, would turn a stale repeat into a genuinely EMPTY day:
+    strictly worse than the bug this fix exists to solve. With GYM_DRIVE_STAGE left
+    off, the stale repeat must still place, exactly like the no-Drive-connection
+    baseline."""
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=5)
+    served = [{"key": f"photo_{i:02d}.jpg", "date": f"2026-08-{15 + i:02d}",
+               "pillar": "service"} for i in range(5)]
+    monkeypatch.setattr(client_content.rotation, "load_served",
+                        lambda: {"gritx_ig": list(served)})
+    store = _FakeStore()
+    out = cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+    assert out["ok"] is True
+    feed_ig = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    urls = [r["image_url"] for r in feed_ig]
+    assert len(urls) == 5, (
+        f"GYM_DRIVE_STAGE off means the Drive lane can never fill the gap -- the "
+        f"stale repeat must still place rather than leaving the day empty, got "
+        f"{len(urls)} feed day(s)"
     )
 
 
