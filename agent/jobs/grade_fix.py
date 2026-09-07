@@ -121,6 +121,42 @@ _OVERCAP_MAX_ITER = 6                    # bounded convergence for the over-cap 
 # that never does.
 _LLM_BUDGET_S = 90.0
 
+# THE CRAFT PASS'S CONSECUTIVE-FAILURE CUTOFF (AGENT_CTA_VARIETY, 2026-09-06).
+#
+# Measured on production the morning this shipped: hillcountry through
+# `remediate_forward_book` with llm_budget_s=400.0 (4.4x the default) returned
+# craft_attempted=18, craft_fixed=0 -- EIGHTEEN consecutive regens, not one of
+# which cleared `_clears_craft`. train7164ae502 ran 25+ the same way. Every one
+# of those calls costs 6 to 8 seconds, so the craft pass alone spent the whole
+# per-gym budget and `_fix_body_sameness` (which runs last, by design) logged
+# "out of LLM budget" with body_fixed=0 on all three books. Raising the budget
+# did NOT help, because the failure rate was 100%: more budget bought more
+# failures. The cure is to stop asking.
+#
+# N=4. Two numbers bound it. Above: the observed streaks are 18 and 25+, so any
+# N well under 18 catches the real case; N=4 costs at most ~30s of the default
+# 90s budget before the pass concedes. Below: N must be high enough that a book
+# where the regen genuinely works is never cut off by a run of bad luck -- and
+# because a SUCCESS RESETS the counter (see below), tripping N=4 requires four
+# failures with no success anywhere between them, which on a book with a
+# working regen does not happen.
+#
+# A SUCCESS RESETS THE COUNTER, deliberately. What this cutoff detects is "this
+# book's material cannot clear the craft bar", not "this pass has done enough
+# work". A book where the regen clears 20 days should get all 20; only an
+# unbroken run of failures is evidence about the book. Mechanical wins do not
+# touch the counter either way: they consume no LLM call and say nothing about
+# whether the LLM can help. And the cutoff stops LLM REGENS ONLY -- the free,
+# deterministic `_mechanical_repair` keeps running on every remaining day,
+# because that is the lane that actually clears most flagged posts.
+_CRAFT_LLM_FAILURE_CAP = 4
+
+# The LLM-backed passes of `remediate_forward_book`, IN THE ORDER IT RUNS THEM.
+# Used only to hand each pass its own sub-deadline (see `_LlmBudget`); the
+# non-LLM passes (violations, invalid closings, ask excess) are absent because
+# they cost no wall clock.
+_LLM_PASS_ORDER = ("duplicates", "overcap", "craft", "audience", "body")
+
 
 def _deadline(budget_s=None):
     """A monotonic wall-clock deadline for this pass's LLM spend."""
@@ -132,6 +168,56 @@ def _deadline(budget_s=None):
 def _budget_left(deadline) -> bool:
     import time
     return deadline is None or time.monotonic() < deadline
+
+
+class _LlmBudget:
+    """The per-gym LLM wall clock, SHARED across passes with a floor reserved
+    for the ones that have not run yet (AGENT_CTA_VARIETY, 2026-09-06).
+
+    THE BUG THIS EXISTS FOR. Every LLM-backed pass used to be handed the SAME
+    `deadline` object, so the budget was first-come-first-served: whichever pass
+    ran first could legally spend all of it, and the passes after it got a
+    deadline already in the past. Measured on production, that is exactly what
+    happened -- the craft pass burned the entire 90s (and the entire 400s, when
+    the budget was raised to test it) on regens that cleared nothing, and
+    `_fix_body_sameness`, which runs LAST because it has to measure a caption
+    with the closing line the earlier passes move, never got a single call on
+    hillcountry, topfuel or train7164ae502.
+
+    THE RULE. With N LLM-backed passes and a total budget T, every pass is
+    handed an allowance of AT LEAST T/N when it asks for its deadline, no matter
+    how much the passes before it consumed. A pass that asks early can still use
+    the budget its predecessors left unspent -- it just may not reach into the
+    T/N floor belonging to each pass that comes after it:
+
+        allowance = max(T/N, remaining - (passes_after * T/N))
+
+    So the guaranteed invariant is a FLOOR, not a fixed slice: an early pass on
+    a book that needs it still gets most of the budget, and the last pass still
+    gets T/N. A non-positive total (the `llm_budget_s=-1` idiom callers use to
+    switch the LLM off entirely) yields a non-positive allowance and therefore a
+    deadline already past, which is the behaviour those callers rely on.
+    """
+
+    def __init__(self, total_s=None, passes=_LLM_PASS_ORDER):
+        import time
+        self.passes = tuple(passes)
+        self.total = (float(total_s) if total_s is not None else _LLM_BUDGET_S)
+        self.floor = self.total / max(1, len(self.passes))
+        self._end = time.monotonic() + self.total
+
+    def deadline_for(self, pass_name):
+        """A fresh monotonic deadline for one named pass."""
+        import time
+        now = time.monotonic()
+        try:
+            idx = self.passes.index(pass_name)
+        except ValueError:                       # an unknown pass: no reserve
+            idx = len(self.passes) - 1
+        after = len(self.passes) - idx - 1
+        remaining = self._end - now
+        allowance = max(self.floor, remaining - (after * self.floor))
+        return now + allowance
 
 
 def _default_db():
@@ -193,7 +279,15 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
               "body_pairs": 0, "body_fixed": 0, "body_unrepairable": 0,
               "gap_fill": "none", "skipped": 0, "actions": actions}
     rows = list(rows or [])
+    # BUDGET FAIRNESS (AGENT_CTA_VARIETY). With the flag armed each LLM-backed
+    # pass draws its own sub-deadline out of one shared clock, so no earlier
+    # pass can starve a later one (see `_LlmBudget`). Flag off = the old single
+    # shared deadline, unchanged, first-come-first-served.
+    budget = (_LlmBudget(llm_budget_s) if config.cta_variety_enabled() else None)
     deadline = _deadline(llm_budget_s)
+
+    def _pass_deadline(name):
+        return deadline if budget is None else budget.deadline_for(name)
 
     if caption_regen is None:
         caption_regen = _default_caption_regen(gym_id, profile, log)
@@ -211,7 +305,8 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
 
     # ---- a) true duplicate captions (same hash on more than one date) ------
     dup_fixed, dup_skipped = _fix_duplicates(
-        gym_id, rows, store, caption_regen, avoid, log, deadline=deadline)
+        gym_id, rows, store, caption_regen, avoid, log,
+        deadline=_pass_deadline("duplicates"))
     result["captions_fixed"] = dup_fixed
     result["skipped"] += dup_skipped
     if dup_fixed:
@@ -220,7 +315,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # ---- c) category over-cap (iterates to convergence) ---------------------
     over_fixed, over_skipped = _fix_overcap(
         gym_id, rows, store, defects, caption_regen, avoid, log,
-        deadline=deadline)
+        deadline=_pass_deadline("overcap"))
     result["repillared"] = over_fixed
     result["skipped"] += over_skipped
     if over_fixed:
@@ -240,7 +335,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # ---- d) caption craft + path (booking asks) ------------------------------
     craft_fixed, craft_attempted, booking_added = _fix_craft(
         gym_id, rows, store, profile, caption_regen, avoid, log,
-        booking_cta=booking_cta, deadline=deadline)
+        booking_cta=booking_cta, deadline=_pass_deadline("craft"))
     result["craft_fixed"] = craft_fixed
     result["craft_attempted"] = craft_attempted
     result["booking_asks_added"] = booking_added
@@ -262,7 +357,7 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # ---- e) off-avatar hooks (right_audience) -------------------------------
     aud_fixed, aud_attempted = _fix_audience(
         gym_id, rows, store, profile, caption_regen, avoid, log,
-        deadline=deadline)
+        deadline=_pass_deadline("audience"))
     result["audience_fixed"] = aud_fixed
     result["audience_attempted"] = aud_attempted
     result["skipped"] += max(0, aud_attempted - aud_fixed)
@@ -283,7 +378,8 @@ def remediate_forward_book(gym_id, rows, store, *, profile, defects,
     # means the fresh captions written by c) over-cap and e) audience are
     # themselves checked for body sameness instead of being trusted.
     body_pairs, body_fixed, body_unrepairable = _fix_body_sameness(
-        gym_id, rows, store, caption_regen, avoid, log, deadline=deadline)
+        gym_id, rows, store, caption_regen, avoid, log,
+        deadline=_pass_deadline("body"))
     result["body_pairs"] = body_pairs
     result["body_fixed"] = body_fixed
     result["body_unrepairable"] = body_unrepairable
@@ -850,6 +946,11 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
 
     fixed = attempted = booking_added = 0
     day_index = -1
+    # The consecutive-failure cutoff (see _CRAFT_LLM_FAILURE_CAP). Counts only
+    # LLM regens: a mechanical win neither advances nor resets it, because a
+    # mechanical win is not evidence about the regen.
+    llm_misses = 0
+    llm_conceded = False
     for (d, _h), grp in sorted(groups.items()):
         if any(not _is_wipeable(r) for r in grp):
             continue                            # human-owned day: never touched
@@ -900,7 +1001,8 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
                        and _clears_craft(c, allow_no_ask=allow_no_ask)), None)
 
         # --- candidate 2: the LLM regen, only when mechanics could not help ---
-        if winner is None and llm_ok and _budget_left(deadline):
+        if (winner is None and llm_ok and not llm_conceded
+                and _budget_left(deadline)):
             out = None
             try:
                 out = caption_regen(grp[0], avoid, "")
@@ -920,6 +1022,20 @@ def _fix_craft(gym_id, rows, store, profile, caption_regen, avoid, log,
                 if (regen_cap and regen_cap not in avoid
                         and _clears_craft(regen_cap, allow_no_ask=allow_no_ask)):
                     winner = (regen_cap, new_cat, carried_cta)
+            if winner is None:
+                llm_misses += 1
+                if variety and llm_misses >= _CRAFT_LLM_FAILURE_CAP:
+                    # This book's material cannot clear the craft bar through
+                    # the regen. Stop paying 6 to 8 seconds a call for it and
+                    # hand the rest of the budget to the passes after this one;
+                    # mechanics keeps running on every remaining day.
+                    llm_conceded = True
+                    log(f"{gym_id}: {llm_misses} craft regens in a row cleared "
+                        "nothing on this book; stopping craft LLM regens and "
+                        "yielding the remaining budget (mechanical repair "
+                        "continues)")
+            else:
+                llm_misses = 0        # the regen works here: never cut it off
 
         if winner is None:
             log(f"{gym_id} {d}: neither the mechanically repaired nor the "
