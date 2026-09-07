@@ -133,6 +133,85 @@ def test_pick_image_shadow_ships_legacy_pick(tmp_path, monkeypatch, capsys):
     assert "[vision-shadow]" in out and "gritx_ig" in out
 
 
+# ---- allow_reuse: fresh-first, reuse only as a true last resort (Pete/Zanshin, 2026-09-07) --
+
+def _mark_served(lib, name, account_key, day_key):
+    from agent import dam, rotation
+    path = os.path.join(lib, name)
+    rotation.record_served(account_key, dam.rotation_key(path), "testimonial", day_key)
+
+
+def test_allow_reuse_still_prefers_a_fresh_photo(tmp_path, monkeypatch):
+    """A denied-slot backfill (allow_reuse=True) must not resurrect a recently-served
+    photo when a fresh one is available, even if the recent one would score higher."""
+    monkeypatch.setenv("AGENT_VISION_GYMS", "zanshin")
+    lib = str(tmp_path)
+    # recently served (denied 2 days ago) — a strong fit, would win on score alone
+    _asset(lib, "recent_strong.png", _analysis(activity="coaching", people_bucket="pair"))
+    _mark_served(lib, "recent_strong.png", "zanshin_ig", "2026-08-30")
+    # fresh — a weaker fit, never served
+    _asset(lib, "fresh_ok.png", _analysis(activity="coaching", people_bucket="small_group"))
+    pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib,
+                                     pillar="testimonial", allow_reuse=True)
+    assert pick is not None and os.path.basename(pick.path) == "fresh_ok.png", (
+        "allow_reuse must never let a recently-served photo beat an available fresh one"
+    )
+
+
+def test_allow_reuse_falls_back_when_library_is_exhausted(tmp_path, monkeypatch):
+    """When every photo is inside its reuse window (the gym truly has no fresh creative
+    left), allow_reuse=True is the documented last resort: a recently-served photo is
+    picked rather than leaving the slot empty."""
+    monkeypatch.setenv("AGENT_VISION_GYMS", "zanshin")
+    lib = str(tmp_path)
+    _asset(lib, "only_one.png", _analysis(activity="coaching", people_bucket="pair"))
+    _mark_served(lib, "only_one.png", "zanshin_ig", "2026-08-30")
+    pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib,
+                                     pillar="testimonial", allow_reuse=True)
+    assert pick is not None and os.path.basename(pick.path) == "only_one.png"
+
+
+def test_allow_reuse_false_still_returns_none_when_exhausted(tmp_path, monkeypatch):
+    """Unchanged from before: without allow_reuse, an all-recently-served library still
+    returns None rather than reusing anything."""
+    monkeypatch.setenv("AGENT_VISION_GYMS", "zanshin")
+    lib = str(tmp_path)
+    _asset(lib, "only_one.png", _analysis(activity="coaching", people_bucket="pair"))
+    _mark_served(lib, "only_one.png", "zanshin_ig", "2026-08-30")
+    pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib,
+                                     pillar="testimonial", allow_reuse=False)
+    assert pick is None
+
+
+# ---- legacy branch (vision OFF): a stale repeat is still placed, but FLAGGED --------
+
+def test_legacy_still_fills_the_day_but_flags_a_stale_reuse(tmp_path, monkeypatch):
+    """A non-vision gym (Zanshin, Reverb: not in AGENT_VISION_GYMS) whose whole small
+    library was served inside the 14-day window still gets a photo — a polluted served
+    ledger must never collapse a whole month to zero content — but the pick now carries
+    `stale_reuse=True` so the caller (client_month_run.append_gym_drive_drafts only
+    fills days the uploaded-media loop left uncovered) can choose not to treat the day
+    as covered, giving the gym's connected Drive pool a chance to supply something
+    fresher instead."""
+    monkeypatch.delenv("AGENT_VISION_GYMS", raising=False)
+    lib = str(tmp_path)
+    _asset(lib, "only.png", _analysis())
+    _mark_served(lib, "only.png", "zanshin_ig", "2026-08-30")   # within the 14-day window
+    pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib, pillar="testimonial")
+    assert pick is not None and os.path.basename(pick.path) == "only.png"
+    assert getattr(pick, "stale_reuse", False) is True
+
+
+def test_legacy_fresh_photo_never_flagged_stale(tmp_path, monkeypatch):
+    """A photo outside the reuse window is a genuine fresh pick — never flagged."""
+    monkeypatch.delenv("AGENT_VISION_GYMS", raising=False)
+    lib = str(tmp_path)
+    _asset(lib, "only.png", _analysis())
+    pick = client_content.pick_image("zanshin_ig", "2026-09-01", lib, pillar="testimonial")
+    assert pick is not None
+    assert getattr(pick, "stale_reuse", False) is False
+
+
 def test_prefs_exact_match_first():
     # a single-token client pillar resolves by EXACT match (no substring ambiguity)
     prefs, key = vision._prefs_for("offer")

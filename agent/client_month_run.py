@@ -888,6 +888,32 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 log(f"skip {day_key} feed: photo already used by an earlier feed "
                     "(no reuse)")
                 continue
+            # STALE REUSE + a connected Drive pool (Pete/Zanshin, Dean/Reverb,
+            # 2026-09-07): this pick is a repeat from an exhausted small library
+            # (client_content.pick_image flagged it). When the gym has NO Drive
+            # connection, there is nothing better to try, so the repeat still
+            # places below (same as before this fix -- see
+            # test_polluted_ledger_still_places_distinct_photos, a gym with no
+            # Drive pool). When a Drive pool IS connected, skip placing the stale
+            # repeat here and leave the day uncovered: append_gym_drive_drafts
+            # below only fills days the uploaded-media loop left uncovered, so
+            # this is what actually gives the Drive lane's fresh, unused photos a
+            # chance instead of a small stale library silently claiming the day
+            # forever.
+            # BOTH Drive flags, same pair the actual fallback below is gated on
+            # (line ~983) -- GYM_DRIVE_STAGE off would otherwise turn a stale
+            # repeat into a genuinely EMPTY day (found in independent review,
+            # 2026-09-07): connected-but-not-staged means append_gym_drive_drafts
+            # never runs, so skipping here without checking staging too would
+            # leave the gap unfilled by anything at all -- worse than the repeat
+            # this fix exists to replace.
+            if (getattr(feed, "stale_reuse", False)
+                    and config.gym_drive_stage_enabled()
+                    and config.gym_drive_connect_active_for(
+                        getattr(account, "key", "") or base_key)):
+                log(f"skip {day_key} feed: stale repeat from an exhausted library, "
+                    "leaving the day for the connected Drive pool")
+                continue
             if feed_path:
                 used_paths.add(feed_path)
                 used_keys.add(os.path.basename(feed_path))
