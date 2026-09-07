@@ -694,30 +694,6 @@ def test_john_weeks_toughtemple_the_case_with_NO_fix_only_a_question():
     assert d.audit["verification"] == "no write was performed; nothing to verify"
 
 
-def test_john_weeks_already_answered_the_ask_and_is_not_asked_again():
-    """MINOR (audit of PR #68). John's REAL, verbatim words: 'yes let's include a
-    call to action to book a free intro class'. He already told Echo what he wants;
-    the old behaviour asked him to repeat it, which is the exact bug reported."""
-    d = L.decide(
-        text="yes let's include a call to action to book a free intro class",
-        gym_key="toughtemple52040e", may_reply=True,
-        deps={"voice_dir": "/vd", "read_text": lambda p: VOICE_TODO})
-    assert d.outcome == L.Outcome.ESCALATE
-    assert d.reply_text == ""
-    assert "already appears to answer" in d.reason
-    assert d.audit["ask_suppressed"] == "cta_needed"
-    assert "book a free intro class" in d.client_text
-
-
-def test_johns_original_question_still_gets_the_ask_unchanged():
-    """The suppression must be narrow: a message that merely NAMES the ask ('the
-    posts need a real call to action') is not mistaken for one that ANSWERS it --
-    'call to action' itself contains the word 'call', which must not false-positive
-    against the intent words."""
-    assert L._client_already_stated_ask(              # noqa: SLF001
-        "cta_needed", "the posts need a real call to action") is False
-
-
 def test_john_weeks_gets_no_reply_once_his_doc_has_real_ctas():
     """Round 7's defect: a gym with three working CTAs and one leftover '> TODO' note
     was auto-told its section was the blank onboarding placeholder, that it had zero
@@ -759,3 +735,262 @@ def test_a_gym_with_six_active_folders_gets_no_reply():
                  may_reply=True, deps={"store": store})
     assert d.outcome == L.Outcome.ESCALATE
     assert d.audit["readings"]["drive_active_sources"] == 6
+
+
+# ==========================================================================
+# AN ASK IS SPENT ONCE THE CLIENT HAS ANSWERED IT.
+#
+# MEASURED, NOT REASONED. lane.decide() was run against John Weeks' REAL brand bible,
+# read from the production volume on 2026-09-07, and his REAL latest message. It
+# returned Outcome.REPLY and composed "What would you like your posts to ask people to
+# do?" -- the question Echo had already asked him and that he had just answered.
+#
+# Every control passed, correctly. The reading is right, the condition genuinely
+# applies, the reply is faithfully grounded. The gap is that _already_handled asks "has
+# THIS LANE written here", and Echo's ORDINARY reply path is what asked him -- so a lane
+# that had never spoken on that thread saw a fresh ticket.
+# ==========================================================================
+JOHN_ANSWER = ("Yes let's include a call to action to book a free intro class, similar "
+               "to what our paid ads are doing")
+
+
+def _john_decide(*, echo_already_asked):
+    return L.decide(text=JOHN_ANSWER, gym_key="toughtemple52040e", may_reply=True,
+                    deps={"read_text": lambda p: VOICE_TODO},
+                    echo_already_asked=echo_already_asked)
+
+
+def test_johns_real_case_is_not_asked_the_same_question_twice():
+    d = _john_decide(echo_already_asked=True)
+    assert d.outcome is L.Outcome.ESCALATE, d.reason
+    assert "already spoken" in d.reason
+    assert not getattr(d, "reply_text", "")
+
+
+def test_the_identical_message_on_a_fresh_thread_still_gets_the_ask():
+    """The refusal must be about the CONVERSATION, not about the words -- otherwise it
+    is a phrase denylist wearing a different hat, which is D67's failure. Same text,
+    no prior Echo message, and the ask fires."""
+    d = _john_decide(echo_already_asked=False)
+    assert d.outcome is L.Outcome.REPLY, d.reason
+    assert "What would you like your posts to ask people to do?" in d.reply_text
+
+
+def test_a_condition_WITH_an_action_still_runs_on_a_thread_echo_has_spoken_on():
+    """Scoped to action-less outcomes on purpose. A condition with an action CHANGES
+    something; running a gym's Drive sync is still right after Echo has spoken to them,
+    and over-refusing would quietly turn the capability off."""
+    store = Store(sources=[src()], assets=[])
+    calls = []
+
+    def _sync(source, **kw):
+        calls.append(source)
+        store.assets.extend(assets(4))
+        return {"ok": True, "inserted": 4}
+
+    d = L.decide(text="the posts waiting for me have no photos",
+                 gym_key="crossfitlocal", may_reply=True,
+                 deps={"store": store, "sync_source": _sync, "log": lambda m: None},
+                 echo_already_asked=True)
+    assert d.outcome is L.Outcome.REPLY, d.reason
+    assert calls, "the scoped fix did not run"
+
+
+def _thread(*rows):
+    return FaithfulBus([_ticket("1")], {"1": list(rows)})
+
+
+def _in(author, at, body="x"):
+    return {"direction": "inbound", "author_type": author, "created_at": at,
+            "body": body, "attachments": {"surface": "mpim"}}
+
+
+def _out(author, at, kind, status, body="?"):
+    return {"direction": "outbound", "author_type": author, "created_at": at,
+            "body": body, "delivery_status": status,
+            "attachments": {"kind": kind, "recipient_kind": "client"}}
+
+
+def test_prior_echo_speech_is_counted_off_the_thread_not_guessed():
+    """The predicate against the REAL row shapes production writes."""
+    # Echo answered, and the gym wrote afterwards -> the ask is spent.
+    assert L._echo_already_asked(_thread(
+        _in("client", "T03", JOHN_ANSWER),
+        _out("echo", "T02", "answer", "posted"),
+        _in("client", "T01")), "1") is True
+
+    # An `ack` counts too: the client saw it, it is part of the exchange.
+    assert L._echo_already_asked(_thread(
+        _in("client", "T03"),
+        _out("echo", "T02", "ack", "posted"),
+        _in("client", "T01")), "1") is True
+
+    # The client has only just written; Echo has said nothing.
+    assert L._echo_already_asked(_thread(_in("client", "T01")), "1") is False
+
+    # Echo spoke LAST -- no answer has come back, so nothing is spent.
+    assert L._echo_already_asked(_thread(
+        _out("echo", "T02", "answer", "posted"),
+        _in("client", "T01")), "1") is False
+
+
+def test_a_COACH_answering_is_the_gym_answering():
+    """FOUND BY AN ADVERSARIAL AUDIT of the first version of this predicate.
+
+    adapter.author_type_for's whole range is {staff, coach, client} (adapter.py:550),
+    over identity_gate's kinds: a gym OWNER resolves to CLIENT, a gym's COACH to COACH,
+    and STAFF is Blake and the LASSO team. The first version listed
+    ("client","user","human","") -- a guessed set that contained two values production
+    never writes and omitted the one it does. A coach answering Echo's question left
+    `seen_client` False, so the re-ask bug survived untouched on every coach-authored
+    thread.
+    """
+    from agent.slack_convo import identity_gate as _ig
+    # The whole range of adapter.author_type_for, pinned: anything outside it is not a
+    # value production writes, and anything inside it must be handled deliberately.
+    assert {_ig.STAFF, _ig.COACH, _ig.CLIENT} == {"staff", "coach", "client"}
+
+    assert L._echo_already_asked(_thread(
+        _in("coach", "T03", JOHN_ANSWER),
+        _out("echo", "T02", "answer", "posted"),
+        _in("coach", "T01")), "1") is True, (
+        "a coach answered Echo's question and it was not counted as the gym answering"
+    )
+
+
+def test_a_LASSO_staff_message_is_not_the_gym_answering():
+    """The other side of the same rule: `staff` is Blake and the team, not the gym."""
+    assert L._echo_already_asked(_thread(
+        _in("staff", "T03"),
+        _out("echo", "T02", "answer", "posted"),
+        _in("client", "T01")), "1") is False
+
+
+@pytest.mark.parametrize("kind", ["escalation", "fixer_request", "hold_notice"])
+def test_an_internal_card_is_not_evidence_that_echo_spoke_to_the_client(kind):
+    """THE OVER-REFUSAL LIVE DATA CAUGHT.
+
+    support_messages on prod (2026-09-07) holds author_type='system' rows for these
+    three kinds -- INTERNAL cards delivered to the fixer channel, which the gym owner
+    never sees -- and several carry attachments.recipient_kind='client', so
+    recipient_kind is no discriminator either. Counting one as "Echo spoke" would
+    suppress a legitimate FIRST ask on any ticket that had merely been escalated
+    internally, which on live data is most of them.
+    """
+    from agent.slack_convo import adapter as _a
+    assert kind in _a.INTERNAL_KINDS and kind not in _a.CONVERSATIONAL_KINDS
+    assert L._echo_already_asked(_thread(
+        _in("client", "T03", JOHN_ANSWER),
+        _out("system", "T02", kind, "posted", body="internal card"),
+        _in("client", "T01")), "1") is False, (
+        f"an internal {kind!r} card the client never saw was counted as Echo having "
+        f"asked them something"
+    )
+
+
+@pytest.mark.parametrize("kind", ["receipt", "digest", "a_kind_invented_in_2027",
+                                  "", None])
+def test_a_kind_this_package_does_not_recognise_refuses_by_default(kind):
+    """Membership is an ALLOWLIST, never "not internal". The difference only shows on a
+    kind nobody has thought of: an allowlist refuses it, a denylist would count it as
+    client-visible and suppress a legitimate ask. adapter.py records that the PORTAL
+    decides client visibility by a denylist and that a new internal kind is therefore
+    visible to the client by default there -- which is exactly why this side must not
+    copy that shape."""
+    assert L._echo_already_asked(_thread(
+        _in("client", "T03", JOHN_ANSWER),
+        _out("echo", "T02", kind, "posted"),
+        _in("client", "T01")), "1") is False
+
+
+@pytest.mark.parametrize("status", ["ready", "held", "failed", "suppressed", None])
+def test_an_undelivered_reply_never_consumed_an_ask(status):
+    """A row still queued, held behind an arming flag, or failed reached nobody."""
+    assert L._echo_already_asked(_thread(
+        _in("client", "T03", JOHN_ANSWER),
+        _out("echo", "T02", "answer", status),
+        _in("client", "T01")), "1") is False
+
+
+def test_the_two_kind_sets_are_the_ones_this_predicate_was_written_against():
+    """A two-way pin. If adapter's sets move, this predicate's meaning moves with them
+    and somebody should look."""
+    from agent.slack_convo import adapter as _a
+    assert _a.CONVERSATIONAL_KINDS == {"ack", "answer", "template", "status"}
+    assert _a.INTERNAL_KINDS == {"escalation", "fixer_request", "hold_notice"}
+    assert not (_a.CONVERSATIONAL_KINDS & _a.INTERNAL_KINDS)
+
+
+def test_a_bus_read_failure_does_not_invent_a_prior_ask():
+    """Failing closed HERE would mean muting the lane on every Supabase blip, which is
+    a different harm. The absence of evidence is not evidence of a prior ask."""
+    class _Blind:
+        def recent_messages(self, *a, **k):
+            raise RuntimeError("supabase 503")
+
+    assert L._echo_already_asked(_Blind(), "1") is False
+
+
+def test_the_pass_actually_wires_the_thread_state_into_the_decision(monkeypatch):
+    """END TO END through run_once. Two correct halves and a dead wire between them is
+    the 'built but not wired' shape this package's own history is full of, so the join
+    is asserted rather than assumed."""
+    seen = []
+    real_decide = L.decide
+
+    def _spy(**kw):
+        seen.append(kw.get("echo_already_asked"))
+        return real_decide(**kw)
+
+    monkeypatch.setattr(L, "decide", _spy)
+    msgs = [{"direction": "inbound", "author_type": "client",
+             "created_at": "2026-09-06T01:00", "body": "no cta on my posts",
+             "attachments": {"surface": "mpim"}},
+            {"direction": "outbound", "author_type": "echo",
+             "created_at": "2026-09-06T02:00", "body": "what are your CTAs?",
+             "delivery_status": "posted", "attachments": {"kind": "answer"}},
+            {"direction": "inbound", "author_type": "client",
+             "created_at": "2026-09-06T03:00", "body": JOHN_ANSWER,
+             "attachments": {"surface": "mpim"}}]
+    monkeypatch.setenv(A.ENV_MASTER, "true")
+    monkeypatch.delenv(A.ENV_CLIENT_REPLY, raising=False)
+    monkeypatch.delenv(A.ENV_LIVE_ACK, raising=False)
+    bus = FaithfulBus([_ticket("1")], {"1": msgs})
+    monkeypatch.setattr(L, "_gym_key_for", lambda t: "toughtemple52040e")
+    out = L.run_once(bus=bus, identity=Ident(), deps={"read_text": lambda p: VOICE_TODO})
+    assert out["handled"] == 1, out
+    assert seen == [True], seen
+
+
+def test_the_newest_message_from_a_COACH_is_the_one_decided_on():
+    """The SAME guessed author list lived twice in this file, and fixing only one copy
+    is the two-implementations failure this whole package exists to stop.
+
+    `_newest_client_message` also read ("client","user","human","") -- so a thread whose
+    newest message came from a gym COACH skipped it and fell through to
+    `ticket.raw_text`, the ORIGINAL message. That is the "decided on the client's oldest
+    words" defect the function's own docstring says was fixed, arriving through the
+    author filter instead of through the ordering, and it takes the hard-line belt with
+    it: a coach writing "actually, just double our ad budget" would never be read.
+    """
+    bus = _thread(
+        _in("coach", "T03", "actually, just double our ad budget"),
+        _in("client", "T01", "my posts have no photos"))
+    text, surface = L._newest_client_message(
+        bus, _ticket("1", raw_text="my posts have no photos"))
+    assert "double our ad budget" in text, (
+        "a coach's newest message was skipped and the ORIGINAL text was used instead"
+    )
+    assert surface == "mpim"
+    # ...and because it IS read, the hard-line belt sees it.
+    assert L.hard_line(text) is True
+
+
+def test_a_LASSO_staff_message_is_not_mistaken_for_the_clients_words():
+    """The other direction: a human from LASSO talking in the thread is not a support
+    request, so the client's own newest words are still what gets decided on."""
+    bus = _thread(
+        _in("staff", "T03", "on it, looking now"),
+        _in("client", "T01", "my posts have no photos"))
+    text, _ = L._newest_client_message(bus, _ticket("1"))
+    assert text == "my posts have no photos"

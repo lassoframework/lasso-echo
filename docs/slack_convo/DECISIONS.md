@@ -2579,7 +2579,104 @@ change. The #fixer bus's own auto-answer gate (D67) remains locked and is untouc
 test asserts this package never names `SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE`,
 never writes an environment variable, and never writes a `KIND_ANSWER` row.
 
-## D70 (2026-09-07) -- three real gaps from an adversarial audit of D69, closed
+## D70 (2026-09-07) -- an ask is spent once the client has answered it
+
+D69's rebuilt lane is sound and this does not change its design. It closes one gap that
+only a live case could show, and the way it was found is the point.
+
+**The measurement.** `lane.decide()` was run against John Weeks' REAL brand bible --
+read byte-for-byte off the production volume at
+`/data/brand_voice/toughtemple52040e/lasso_voice.md` -- and his REAL latest message:
+
+> "Yes let's include a call to action to book a free intro class, similar to what our
+> paid ads are doing"
+
+It returned `Outcome.REPLY` and composed *"What would you like your posts to ask people
+to do?"* -- the question Echo had already asked him, and that this message IS the answer
+to.
+
+**Every control passed, and each was right to.** `cta_pool_count` is genuinely 0 (his
+CTA rotation section is still the intake TODO -- so is Dean's, and so is every gym
+onboarded through `write_brand_docs`, because `social_intake_reader._build_intake_text`
+emits only sections 1-4 while `bible_drafter.draft_bible` renders CTAs from `_sec(s, 7)`;
+that is a separate, fleet-wide bug and it is Blake's, not this lane's). `COND_CTA_EMPTY`
+genuinely applies. The reply is faithfully grounded in a measured reading. Nothing in the
+grounding discipline is capable of noticing the problem, because the problem is not in
+the grounding.
+
+**The gap.** `_already_handled` asks *"has THIS LANE written on this ticket"*. Echo's
+ORDINARY reply path is what asked John. So a lane that had never itself spoken on that
+thread saw a fresh ticket and planned the same question again.
+
+**The fix, and the shape it deliberately is not.** The tempting version reads his words
+and notices they are an answer. That is classifying the QUESTION over an open input
+space -- D67's failure exactly, and the reason this package exists. The closed version is
+a fact about the CONVERSATION, which this codebase owns and can count: *Echo has spoken
+on this thread and the client has written since.* Phrasing-independent, cheap, and it
+fails closed (escalate).
+
+Scoped to ACTION-LESS conditions on purpose. A condition with an action CHANGES
+something; running a gym's Drive sync is still right after Echo has talked to them. Only
+the ask/tell-only outcomes -- `cta_needed`, `drive_reshare` -- have nothing left to say
+once the client has responded. Over-refusing the rest would quietly turn the capability
+off, which is its own failure.
+
+**What was checked and deliberately NOT built.** Dean (CrossFit Reverb, ticket
+`4941e162`, still `hold`) is the one live actionable row the poll matches today. Echo has
+already answered him twice, and he has not written since -- so this rule does not fire
+for him. It does not need to: `route()` returns None for his message and the lane
+escalates. A second rule for "Echo already answered this exact message" is reasoned about
+and not built, because no case demonstrates it; it is recorded here rather than left as a
+silent gap.
+
+**AND THE PREDICATE ITSELF WAS GUESSED, TWICE, WHICH IS THE PART WORTH READING.** The
+first version counted any outbound whose `author_type` was not `"staff"`, and recognised
+inbound authors from the list `("client", "user", "human", "")`. Both were drawn from
+what seemed reasonable rather than from the code, and both were wrong in a different
+direction:
+
+* **Over-refusal, caught by live data.** `support_messages` on prod holds
+  `author_type='system'` rows for `escalation`, `hold_notice` and `fixer_request` --
+  INTERNAL cards delivered to the fixer channel, which the gym owner never sees. Several
+  carry `attachments.recipient_kind='client'`, so that field is no discriminator either.
+  Counting one as "Echo spoke" would have suppressed a legitimate FIRST ask on any ticket
+  that had merely been escalated internally -- which, on live data, is most of them.
+* **Under-refusal, caught by an adversarial audit.** `("client","user","human","")`
+  contains two values production never writes and omits one it does.
+  `adapter.author_type_for`'s whole range is `{staff, coach, client}` (adapter.py:550):
+  a gym OWNER resolves to CLIENT, a gym's COACH to COACH, and STAFF is Blake and the
+  LASSO team. A **coach** answering Echo's question left the predicate blind, so the
+  original re-ask bug survived untouched on every coach-authored thread.
+
+Both are now read from the producing modules. Client-visibility is
+`adapter.CONVERSATIONAL_KINDS` ({ack, answer, template, status}) -- tested as an
+ALLOWLIST, not as "not internal", because adapter.py's own comment records that the
+PORTAL decides visibility by a denylist and a new internal kind is client-visible by
+default over there. Delivery is required too: a `held` or `ready` row reached nobody.
+The gym side is "not `identity_gate.STAFF`", written that way deliberately: an author
+type nobody anticipated counts as the gym having spoken, which escalates to a human,
+and the opposite default would re-ask a paying client.
+
+**The same guessed list lived TWICE in this file**, and `_newest_client_message` had it
+too -- so a thread whose newest message came from a coach skipped it and fell through to
+`ticket.raw_text`, the ORIGINAL message. That is the "decided on the client's oldest
+words" defect that function's own docstring says was fixed, arriving through the author
+filter instead of through the ordering, and it takes the hard-line belt with it: a coach
+writing *"actually, just double our ad budget"* would never have been read. Fixed in both
+places, because correcting one copy of a duplicated wrong list and leaving the other is
+the two-implementations failure this package exists to stop.
+
+That correction is the lesson this log has now recorded a dozen times, and it arrived
+again inside the fix for it: **when a predicate needs to know what another module writes,
+read that module. The plausible answer and the true one differ often enough that guessing
+is not a shortcut.**
+
+**Evidence.** 13 mutations on the new rule, `__pycache__` cleared between each, all 7 turn
+the suite red -- including the one that hard-codes the argument at the single call site
+joining the helper to the decision, which is the "built but not wired" shape and was
+caught by mutation rather than by review. Full suite green. Nothing armed.
+
+## D71 (2026-09-07) -- three real gaps from an adversarial audit of D69, closed
 
 Blake, directly: "I thought we built out that the agent could read the message, submit
 to support themselves, or diagnose the issue and reply." He was right that it did not
@@ -2689,19 +2786,17 @@ this system already clears.
 
 ### MINOR ITEMS
 
-* **`ASKS["cta_needed"]` re-asked a question the client had already answered.** John
-  Weeks's real words -- "yes let's include a call to action to book a free intro
-  class" -- already state the CTA the ask exists to collect. `lane._client_already_
-  stated_ask()` (plain substring lists, consistent with `ROUTES`/`ESCALATE_ALWAYS`;
-  this package's no-second-parser rule is about not re-implementing a DOCUMENT
-  reading, not about reading the client's own raw message) now escalates instead of
-  re-asking when the client's own text already answers it -- never writes an
-  auto-reply that invents or restates their content, per CLAUDE.md. Deliberately
-  excludes the bare word "call" from the intent list: "call to action" itself
-  contains that word, and a first draft of this fix false-positived on John's own
-  ORIGINAL diagnostic message ("the posts need a real call to action") before that
-  exclusion was added -- covered by
-  `test_johns_original_question_still_gets_the_ask_unchanged`.
+* **`ASKS["cta_needed"]` re-asked a question the client had already answered.**
+  SUPERSEDED, not fixed here: a phrase-matching version of this fix was built and
+  then removed after D70 above (PR #73, merged to `main` while this fix was in
+  flight) turned out to already close the SAME live case John Weeks reported, via
+  the right axis -- a fact about the CONVERSATION (`_echo_already_asked`), not
+  about the client's WORDS. D70's own test
+  (`test_the_identical_message_on_a_fresh_thread_still_gets_the_ask`) is explicit
+  that a phrase-matching version is WRONG: the ask must still fire for John's exact
+  words on a thread Echo has never spoken on. The phrase-matching draft here broke
+  precisely that test, which is the correct outcome for that test to have and the
+  reason the draft was removed rather than kept alongside D70's fix.
 * **`ASKS["drive_reshare"]` asserted an unmeasured outcome as fact** ("will let the
   sync resume"). Reworded as a genuine question per this module's own rule that an
   ask must make no claim: "Would you be able to re-share that folder with Echo in
@@ -2723,7 +2818,6 @@ this system already clears.
   speak on it) was already correct either way; only the prose was wrong.
 
 Mutation-checked, `__pycache__` cleared between each: reverting the `run_once()`
-product default, the runner's caller, the outbox dispatch-time recheck, the
-`ESCALATE_ALWAYS` additions, or the `cta_needed` suppression (including re-adding
-"call" to its intent list) each turns the corresponding test red, including
+product default, the runner's caller, the outbox dispatch-time recheck, or the
+`ESCALATE_ALWAYS` additions each turns the corresponding test red, including
 `test_client_dm_end_to_end.py`'s full real-adapter path.
