@@ -473,3 +473,124 @@ def test_every_counter_the_fix_returns_reaches_the_sweep_report():
                 and not isinstance(v, bool)}
     missing = counters - set(grade_sweep._FIX_COUNT_KEYS)
     assert not missing, f"counters dropped by the sweep report: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# remediate_body_sameness_always: decoupled from the total < A gate
+# (Blake's ruling, 2026-09-07 — the follow-up to PR #71)
+# ---------------------------------------------------------------------------
+
+def test_remediate_body_sameness_always_repairs_a_near_duplicate(monkeypatch):
+    """THE POINT: grade_fix.remediate_body_sameness_always operates on rows
+    directly, with no notion of the book's overall grade at all -- proving it
+    fixes a real near-duplicate pair regardless of whether the caller thinks
+    the book is an A."""
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = _same_hook_book(2)
+    regen, calls = _regen_bank()
+    out = grade_fix.remediate_body_sameness_always(
+        "reverb", rows, _FakeStore(rows), profile="GYM", today_iso=TODAY,
+        caption_regen=regen, logger=lambda m: None)
+    assert out["ok"] is True
+    assert out["body_pairs"] == 1, out
+    assert out["body_fixed"] == 1, out
+    assert out["body_unrepairable"] == 0, out
+    assert any("already-A book" in a for a in out["actions"]), out["actions"]
+
+
+def test_remediate_body_sameness_always_flag_off_is_noop(monkeypatch):
+    monkeypatch.delenv("AGENT_GRADE_SELF_FIX", raising=False)
+    rows = _same_hook_book(2)
+    before = [r["caption"] for r in rows]
+    regen, calls = _regen_bank()
+    out = grade_fix.remediate_body_sameness_always(
+        "reverb", rows, _FakeStore(rows), profile="GYM", today_iso=TODAY,
+        caption_regen=regen, logger=lambda m: None)
+    assert out["ok"] is False
+    assert calls == []
+    assert [r["caption"] for r in rows] == before
+
+
+def test_remediate_body_sameness_always_reports_unrepairable(monkeypatch):
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    rows = _same_hook_book(2)
+    out = grade_fix.remediate_body_sameness_always(
+        "reverb", rows, _FakeStore(rows), profile="GYM", today_iso=TODAY,
+        caption_regen=lambda *a, **k: None, logger=lambda m: None)
+    assert out["body_pairs"] == 1, out
+    assert out["body_fixed"] == 0, out
+    assert out["body_unrepairable"] == 1, out
+    assert any("source material too thin" in a for a in out["actions"]), out
+
+
+def test_sweep_runs_body_pass_on_an_already_a_book_not_gated_by_total(
+        monkeypatch):
+    """THE ACTUAL GAP CLOSED: a forward book that already grades a perfect A
+    but carries a real body-sameness pair must get that pair cleaned up on the
+    VERY NEXT sweep -- not stuck forever because remediate_forward_book's full
+    suite only runs when total < A_THRESHOLD. Uses the real grade_month (no
+    mocking of the grading), so this proves the book genuinely grades A while
+    the duplicate sits there, and that the sweep's ALWAYS-ON branch (not the
+    below-A branch) is what cleans it."""
+    monkeypatch.setenv("AGENT_CALENDAR_GRADE", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+
+    from agent.calendar_grade import grade_month, A_THRESHOLD
+    rows = _same_hook_book(2, gym_id="reverb")
+    # Confirm the fixture book really is a perfect, already-A book up front.
+    before_grade = grade_month(rows, profile="GYM")
+    assert before_grade.total >= A_THRESHOLD, before_grade.total
+    assert cv.body_similarity(rows[0]["caption"], rows[1]["caption"]) >= 0.15
+
+    regen, calls = _regen_bank()
+    monkeypatch.setattr(grade_fix, "_default_caption_regen",
+                        lambda gym_id, profile, log: regen)
+
+    from tests.test_grade_self_fix import _FakeStore as _SweepFakeStore
+    store = _SweepFakeStore(rows)
+    result = grade_sweep.run(gyms=["reverb"], store=store, now=TODAY,
+                             alert_fn=lambda *a, **k: None)
+
+    assert result["ok"] is True
+    # It ran and repaired: the LATER row's caption changed.
+    assert calls, "the always-on body pass never called the regen at all"
+    assert rows[1]["caption"] != _post(0, 1), (
+        "the later duplicate must be rewritten even though the book was "
+        "already A before this sweep")
+    # It must NOT be counted as newly "self-fixed to A" (it was already A).
+    assert "reverb" not in result.get("self_fixed", [])
+    assert "reverb" not in result.get("held", [])
+    fix_report = result["gyms"]["reverb"].get("always_on_body_fix")
+    assert fix_report is not None
+    assert fix_report["body_fixed"] == 1, fix_report
+    # And the forward book still grades A afterward.
+    assert result["gyms"]["reverb"]["forward_book"]["letter"] == "A"
+
+
+def test_sweep_leaves_an_already_a_book_alone_when_no_duplicate_exists(
+        monkeypatch):
+    """The always-on branch must be a genuine no-op (no LLM call at all) on a
+    book that has nothing to repair -- it should never manufacture work."""
+    monkeypatch.setenv("AGENT_CALENDAR_GRADE", "true")
+    monkeypatch.setenv("AGENT_GRADE_SELF_FIX", "true")
+    monkeypatch.setenv("AGENT_CTA_VARIETY", "true")
+
+    rows = _rows([(f"2026-09-{6 + i:02d}", _fresh(i), "pending")
+                  for i in range(3)], gym_id="reverb")
+    regen, calls = _regen_bank()
+    monkeypatch.setattr(grade_fix, "_default_caption_regen",
+                        lambda gym_id, profile, log: regen)
+
+    from tests.test_grade_self_fix import _FakeStore as _SweepFakeStore
+    store = _SweepFakeStore(rows)
+    result = grade_sweep.run(gyms=["reverb"], store=store, now=TODAY,
+                             alert_fn=lambda *a, **k: None)
+    assert result["ok"] is True
+    assert calls == []
+    fix_report = result["gyms"]["reverb"].get("always_on_body_fix")
+    assert fix_report is not None
+    assert fix_report["body_pairs"] == 0
+    assert fix_report["body_fixed"] == 0

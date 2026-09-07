@@ -385,6 +385,139 @@ def test_sync_json_cache_never_shares_entries_across_gyms():
     assert side_eng["note"] == "eng caption"
 
 
+# ---- sync_hosted_media (recovery lane, 2026-09-07) --------------------------------
+
+def test_sync_hosted_media_recovers_already_hosted_photos_when_local_is_empty():
+    """THE CONFIRMED DEFECT (hillcountry/train7164ae502, 2026-09-07): a gym's
+    top-level content_library/<base> can be empty (local copies lost) while the
+    SAME photos are still durably hosted in R2 under echo/<base>/<sha1>/<name> from
+    when media_host.host_media() first uploaded them. sync_hosted_media must find
+    them, download them, and write a public_url sidecar so the picker can use them
+    again immediately — with NO fabricated caption/note."""
+    r2 = FakeR2({
+        "echo/hillcountry/aaaa1111bbbb2222/_DSC2749-3.jpg": b"\xff\xd8\xffPHOTOA",
+        "echo/hillcountry/cccc3333dddd4444/_DSC9841.jpg": b"\xff\xd8\xffPHOTOB",
+    })
+    out = cms.sync_hosted_media("hillcountry", r2=r2)
+    assert out == {"recovered": 2, "skipped": 0}
+
+    lib = os.path.join("content_library", "hillcountry")
+    recovered_names = sorted(n for n in os.listdir(lib) if n.endswith(".jpg"))
+    assert recovered_names == [
+        "aaaa1111bbbb2222__DSC2749-3.jpg",
+        "cccc3333dddd4444__DSC9841.jpg",
+    ]
+
+    side = json.load(open(os.path.join(
+        lib, "aaaa1111bbbb2222__DSC2749-3.json")))
+    assert side["public_url"] == (
+        "https://cdn.example.com/echo/hillcountry/aaaa1111bbbb2222/_DSC2749-3.jpg")
+    assert not side.get("note")   # no client caption is recoverable -> never invented
+
+    # round-trips through the library the drafter reads, with a real public_url
+    from agent import library as _lib
+    creatives = {os.path.basename(c.path): c for c in _lib.list_creatives(lib)}
+    assert creatives["aaaa1111bbbb2222__DSC2749-3.jpg"].public_url == (
+        "https://cdn.example.com/echo/hillcountry/aaaa1111bbbb2222/_DSC2749-3.jpg")
+
+
+def test_sync_hosted_media_is_idempotent_no_redownload():
+    r2 = FakeR2({
+        "echo/train7164ae502/1111222233334444/T716-67.jpg": b"\xff\xd8\xffPHOTOA",
+    })
+    cms.sync_hosted_media("train7164ae502", r2=r2)
+    assert len([k for k in r2.got]) == 1
+    r2.got.clear()
+    out2 = cms.sync_hosted_media("train7164ae502", r2=r2)
+    assert out2 == {"recovered": 0, "skipped": 1}
+    assert r2.got == []
+
+
+def test_sync_hosted_media_disambiguates_same_basename_across_shoots():
+    """Two different hosted objects that happen to share an original basename (two
+    different shoots both naming a file IMG_0001.jpg) must never collide locally —
+    the hash segment in the local filename is exactly what prevents that."""
+    r2 = FakeR2({
+        "echo/gritx/aaaaaaaaaaaaaaaa/IMG_0001.jpg": b"\xff\xd8\xffA",
+        "echo/gritx/bbbbbbbbbbbbbbbb/IMG_0001.jpg": b"\xff\xd8\xffB",
+    })
+    out = cms.sync_hosted_media("gritx", r2=r2)
+    assert out == {"recovered": 2, "skipped": 0}
+    lib = os.path.join("content_library", "gritx")
+    names = sorted(f for f in os.listdir(lib) if f.endswith(".jpg"))
+    assert names == ["aaaaaaaaaaaaaaaa_IMG_0001.jpg", "bbbbbbbbbbbbbbbb_IMG_0001.jpg"]
+
+
+def test_sync_hosted_media_empty_r2_zero_recovered():
+    out = cms.sync_hosted_media("hillcountry", r2=FakeR2({}))
+    assert out == {"recovered": 0, "skipped": 0}
+
+
+def test_sync_hosted_media_ignores_non_media_keys():
+    r2 = FakeR2({
+        "echo/hillcountry/aaaa1111bbbb2222/manifest.json": b"{}",
+        "echo/hillcountry/aaaa1111bbbb2222/note.txt": b"hi",
+    })
+    out = cms.sync_hosted_media("hillcountry", r2=r2)
+    assert out == {"recovered": 0, "skipped": 0}
+
+
+def test_sync_hosted_media_no_r2_client_no_op(monkeypatch):
+    # r2=None forces the module to try _default_r2(); with no creds configured in
+    # this test env that resolves to None -> a clean no-op, never a crash.
+    monkeypatch.setattr(cms, "_default_r2", lambda: None)
+    out = cms.sync_hosted_media("hillcountry")
+    assert out == {"recovered": 0, "skipped": 0}
+
+
+def test_scan_and_generate_recovers_hosted_media_when_local_library_empty(
+        monkeypatch):
+    """END-TO-END WIRING: scan_and_generate must call the recovery lane for any
+    gym whose local library is empty right after its normal sync_uploads pass —
+    this is the ACTUAL production entry point (both the nightly cron and
+    grade_fix's gap-fill lane call this, not sync_hosted_media directly), so
+    the fix has to land here to reach both callers."""
+    _stock_sources("hillcountry_ig")
+    _bible("hillcountry")
+    # sync_uploads sees nothing new in intake/ (already fully processed/moved on)
+    r2 = FakeR2({
+        "echo/hillcountry/aaaa1111bbbb2222/_DSC2749-3.jpg": b"\xff\xd8\xffPHOTOA",
+    })
+    store = FakeStore()
+    out = cms.scan_and_generate(clients=["hillcountry"], store=store, r2=r2)
+    assert out["ok"] is True
+
+    lib = os.path.join("content_library", "hillcountry")
+    recovered = [n for n in os.listdir(lib) if n.endswith(".jpg")]
+    assert recovered == ["aaaa1111bbbb2222__DSC2749-3.jpg"], (
+        "the recovery lane must run automatically when the local library is "
+        "empty, through the real scan_and_generate entry point")
+
+
+def test_scan_and_generate_skips_recovery_when_local_media_already_present(
+        monkeypatch):
+    """A gym whose local library already has media never pays the extra R2
+    list-call cost for the recovery lane — it only runs on the genuine gap."""
+    _stock_sources("gritx_ig")
+    _bible("gritx")
+    lib = os.path.join("content_library", "gritx")
+    os.makedirs(lib, exist_ok=True)
+    with open(os.path.join(lib, "existing_photo.jpg"), "wb") as fh:
+        fh.write(b"\xff\xd8\xff")
+
+    calls = []
+    real_sync_hosted = cms.sync_hosted_media
+
+    def spy(base_key, **kw):
+        calls.append(base_key)
+        return real_sync_hosted(base_key, **kw)
+
+    monkeypatch.setattr(cms, "sync_hosted_media", spy)
+    store = FakeStore()
+    cms.scan_and_generate(clients=["gritx"], store=store, r2=FakeR2({}))
+    assert calls == []
+
+
 # ---- scan_and_generate -----------------------------------------------------------
 
 def _feed_ig_rows(rows):
