@@ -255,10 +255,21 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     if cal_err:
         # Never claim staged when the client-visible artifact was not created. The
         # segments are stamped at step 9 (below), so nothing needs rolling back here.
+        #
+        # ALREADY PERSISTED (Pete/CrossFit Zanshin, 2026-09-08): _persist() above already
+        # INSERTed story_request + story_render as PENDING for this same request_id, so
+        # _held() must UPDATE those rows, not insert again. A plain re-insert hits the
+        # table's primary key in production (PostgREST 409), _held()'s own try/except
+        # swallows that as a log line, and the row is left stuck at status=pending
+        # forever: no approval-queue card, no honest hold_reason anywhere, and the coach
+        # sees nothing happen. A real Zanshin request (8e1b4bdf-..., 2026-09-07) reproduced
+        # exactly this: story_render.status stayed "pending" with calendar_row_id still the
+        # fabricated draft id, though create_story had already returned "held" to the caller.
         return _held(request_id, gym_id,
                      f"the story rendered but could not be added to your approval "
                      f"queue ({cal_err}); nothing was scheduled",
-                     store, request, tmpl_name, music_sel.shelf)
+                     store, request, tmpl_name, music_sel.shelf,
+                     already_persisted=True)
     story_render["calendar_row_id"] = row_id or draft.draft_id
     # story_render was persisted BEFORE the insert, so its stored calendar_row_id is
     # still the fabricated draft id. Record the REAL one where deny() can find it.
@@ -397,21 +408,41 @@ def _stage_calendar_row(gym_id, draft, *, cal_store=None):
     return (written[0] or {}).get("id"), None
 
 
-def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf):
+def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf,
+          *, already_persisted=False):
     """Record a HELD outcome: NOTHING is staged, an honest reason is logged, and no
-    asset usage is stamped (so the pool is untouched)."""
+    asset usage is stamped (so the pool is untouched).
+
+    already_persisted=True means _persist() already INSERTed a PENDING story_request +
+    story_render row for this exact request_id (the calendar-staging step failed AFTER
+    persisting) -- so this must UPDATE those rows, never insert again. Inserting a
+    second row with the same id is a duplicate-key error in production; the try/except
+    below used to swallow that silently, leaving the row stuck at status=pending forever
+    with no card in the approval queue and no reason anywhere a human could see.
+
+    story_render.status is constrained to exactly ('pending', 'denied') in production
+    (see deny()'s own note) -- there is no 'held' value for it, so the render row goes
+    to DENIED (this render is dead, nothing will ever use it) while story_request, which
+    does support 'held', carries the actual honest reason a human can read."""
     from . import db
     try:
         if store is not None and store.available():
-            store.insert_request({
-                "id": request_id, "gym_id": gym_id,
-                "asset_ids": request.get("asset_ids") or [],
-                "brief": request.get("brief") or "",
-                "template": tmpl_name,
-                "music_mood": shelf,
-                "requested_by": request.get("requested_by") or "",
-                "status": STATUS_HELD, "hold_reason": reason,
-                "created_at": _now_iso()})
+            if already_persisted:
+                store.update_request(
+                    request_id, {"status": STATUS_HELD, "hold_reason": reason},
+                    gym_id=gym_id)
+                store.update_render(
+                    request_id, {"status": STATUS_DENIED}, gym_id=gym_id)
+            else:
+                store.insert_request({
+                    "id": request_id, "gym_id": gym_id,
+                    "asset_ids": request.get("asset_ids") or [],
+                    "brief": request.get("brief") or "",
+                    "template": tmpl_name,
+                    "music_mood": shelf,
+                    "requested_by": request.get("requested_by") or "",
+                    "status": STATUS_HELD, "hold_reason": reason,
+                    "created_at": _now_iso()})
     except Exception as e:  # noqa: BLE001 - a store failure never turns a HOLD into a post
         print(f"[story-studio] held-request persist failed: {type(e).__name__}: {e}")
     db.audit("story_studio", request_id, f"HELD: {reason} (nothing staged)")
