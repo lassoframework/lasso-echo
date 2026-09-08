@@ -31,6 +31,17 @@ _INTRAWORD_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
 # protect URLs and @handles/#tags: hyphens inside them are load-bearing
 _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit|gym)\S*|[@#][\w.]+)", re.I)
 
+# A real email address, anywhere in the text. HARD violation (2026-09-08, Zanshin Fitness /
+# Pete Mongeau): a Story Studio "brief" is client-typed free text that story_grounding takes
+# VERBATIM as the on-video overlay copy ("brief present -> source=brief, text=brief... never
+# contradicted, never added to" -- story_grounding.py), and nothing between the text box and the
+# burned pixels ever checked it for PII. A coach who types their own email into a one-line "what
+# is this story about?" field -- testing it, a copy-paste slip, habit -- got it rendered ALL-CAPS
+# onto a video and staged into the approval queue. copy_gate is the single house-style gate every
+# piece of client-facing text already passes through (captions, overlays, reports, quote cards),
+# so this belongs here once, not as a Story-Studio-only special case.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 _FILLER_OPENERS = re.compile(
     r"^(we're excited|we are excited|exciting news|just a reminder|don't forget|happy \w+day)\b", re.I)
 
@@ -137,9 +148,14 @@ def is_cta_shaped(text: str) -> bool:
 def violations(text: str) -> list[str]:
     """Hard failures. A caption with any of these never reaches the queue."""
     v = []
-    plain = _PROTECTED_RE.sub("", str(text))
+    s = str(text)
+    plain = _PROTECTED_RE.sub("", s)
     if _DASH_RE.search(plain): v.append("banned_dash")
     if _INTRAWORD_HYPHEN_RE.search(plain): v.append("intraword_hyphen")
+    # Checked on the RAW text, never the _PROTECTED_RE-stripped `plain`: an email's domain half
+    # (zanshin.fit) is exactly the shape _PROTECTED_RE exists to protect (real URLs/domains), so
+    # stripping it first would hide the email behind its own protection.
+    if _EMAIL_RE.search(s): v.append("email_address")
     return v
 
 def soft_flags(text: str) -> list[str]:

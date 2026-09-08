@@ -269,6 +269,32 @@ def test_avatar_breach_holds(monkeypatch, tmp_path):
     assert "avatar" in res["reason"].lower() or "hyrox" in res["reason"].lower()
 
 
+def test_brief_containing_an_email_holds_never_burns_it_onto_the_video(monkeypatch, tmp_path):
+    """REAL DATA EXPOSURE (Zanshin Fitness / Pete Mongeau, 2026-09-07 live incident): the
+    Story Studio brief is client-typed free text that story_grounding takes VERBATIM as the
+    overlay copy (source=brief). Pete typed his own email, pete@zanshin.fit, into the
+    one-line "what is this story about?" field and it was rendered ALL CAPS onto a video and
+    staged into the approval queue -- nothing on the path from text box to burned pixels ever
+    checked for PII. copy_gate.violations now hard-blocks any email address in client-facing
+    text (the same gate every caption/overlay/report already passes through), so this must
+    HOLD honestly instead of rendering."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    store = _FakeStore()
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "pete@zanshin.fit",
+         "identity_tokens": ["Pierce"]},
+        candidates=_cands("pierce"), store=store,
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path))
+    assert res["status"] == "held"
+    assert "copy_gate" in res["reason"] or "email" in res["reason"].lower()
+    # Nothing reached the render/persist steps at all: no story_render row, no approval card.
+    assert store.renders == []
+    assert not _STAGED_ROWS
+
+
 # ---- deny returns segments to the pool -------------------------------------
 def test_deny_rolls_back_and_logs(monkeypatch, tmp_path):
     _arm(monkeypatch)
@@ -354,15 +380,23 @@ def test_calendar_insert_failure_holds_instead_of_claiming_staged(monkeypatch, t
         def insert_rows(self, gym_id, rows):
             raise RuntimeError("supabase down")
 
+    store = _FakeStore()
     res = ss.create_story(
         {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
          "identity_tokens": ["Pierce"]},
-        candidates=_cands("pierce"), store=_FakeStore(),
+        candidates=_cands("pierce"), store=store,
         music_library=_RealPathLibrary(str(audio)),
         render_fn=_fake_render, output_dir=str(tmp_path), cal_store=_Boom())
     assert res["status"] == "held"
     assert "approval queue" in res["reason"]
     assert not _STAGED_ROWS
+    # REGRESSION (found live 2026-09-08, Zanshin Fitness / Pete Mongeau): step 8 already wrote
+    # story_render PENDING before this calendar attempt ran, and nothing used to clean it up
+    # on a HELD outcome — an orphaned "pending" render, with whatever overlay copy it burned,
+    # sat there forever even though the coach was correctly told nothing was staged.
+    assert [r["status"] for r in store.renders] == [ss.STATUS_DENIED], (
+        "a HELD outcome must not leave story_render claiming pending"
+    )
 
 
 class _UniqueIdStore:
