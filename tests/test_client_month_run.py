@@ -705,6 +705,93 @@ def test_deny_backfill_prefers_a_connected_drive_pool_over_local_reuse(monkeypat
     assert "drive_asset" in ig_feed[0]["image_url"]
 
 
+def test_deny_backfill_excludes_the_denied_posts_own_drive_asset(monkeypatch, tmp_path):
+    """Independent audit, 2026-09-08: the denied row's own source_media_asset_id (and
+    every asset already live elsewhere in the book) must be threaded into the Drive
+    builder call as exclude_ids -- without it, the exact photo just denied could come
+    right back as its own "fresh" replacement (gym_media_selector.rollback_use resets
+    its used_count the moment it's denied, making it the pool's least-used candidate
+    again)."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    denied_row = _denied_feed_row("2026-08-19")
+    denied_row["source_media_asset_id"] = "denied-drive-asset-9"
+    live_row = {"gym_id": "gritx", "account": "instagram", "format": "feed",
+               "post_date": "2026-08-05", "status": "approved",
+               "caption": "already live", "image_url": "https://gritx.media/live.jpg",
+               "source_media_asset_id": "live-drive-asset-7"}
+    store = _FakeStoreLM({("gritx", "2026-08"): [denied_row, live_row]})
+
+    from agent.drafter import Draft, DraftStatus
+    drive_draft = Draft(
+        draft_id="drive-1", account_key="gritx_ig", platform="instagram",
+        caption="A fresh Drive-sourced caption, grounded in an approved source.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    seen_exclude_ids = []
+
+    def fake_build(account, day_key, pillar, voice, source, *, exclude_ids=(), **kw):
+        seen_exclude_ids.append(set(exclude_ids))
+        return drive_draft
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft", fake_build)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert seen_exclude_ids, "the Drive builder must have been called"
+    excl = seen_exclude_ids[0]
+    assert "denied-drive-asset-9" in excl, "the denied post's own asset must be excluded"
+    assert "live-drive-asset-7" in excl, "an asset already live elsewhere must be excluded"
+
+
+def test_deny_backfill_drive_draft_still_clears_the_banned_word_gate(monkeypatch, tmp_path):
+    """Independent audit, 2026-09-08: backfill_denied_slots's own docstring promises
+    "every replacement clears the same A+/banned-word/fabrication gates as a normal
+    build" -- true for local reuse, but a Drive-sourced draft skipped the check
+    entirely. A banned-word Drive draft must be refused, falling back to local
+    reuse, not silently placed just because it came from a different lane."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    from agent.drafter import Draft, DraftStatus
+    bad_draft = Draft(
+        draft_id="drive-bad", account_key="gritx_ig", platform="instagram",
+        caption="This caption mentions our forbidden word explicitly.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: bad_draft)
+    monkeypatch.setattr(cmr.config, "sb7_enabled", lambda: False)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=("forbidden",))
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, "must still fall back to a clean local-reuse replacement"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "forbidden" not in ig_feed[0]["caption"]
+    assert "drive_asset" not in ig_feed[0]["image_url"], (
+        "the banned-word Drive draft must never be the one placed"
+    )
+
+
 def test_deny_backfill_falls_back_to_local_reuse_when_drive_declines(monkeypatch, tmp_path):
     """Both Drive flags on, but the Drive builder itself declines (no fresh Drive
     asset fit the slot, or the lane is unarmed underneath) -- must fall through to

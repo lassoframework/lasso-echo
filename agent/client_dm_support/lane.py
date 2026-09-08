@@ -540,12 +540,16 @@ def _card_text(ticket, decision, arm, wrote):
     gym_key = decision.gym_key or ticket.get("client_id") or "?"
     # OWNER + GYM NAME (Blake, 2026-09-07): resolved server-side from gym_key (OUR
     # OWN gyms/clients rows), never anything the client typed or set themselves.
+    # FENCED (independent audit, 2026-09-08): gyms.name/clients.name can originate
+    # from a self-serve client's own onboarding input -- the two sibling call sites
+    # in slack_convo/adapter.py already wrap this same lookup in _slack_escape; this
+    # one didn't. _fenced is this file's own escaping helper, same guarantee.
     gym_line = f"gym: {gym_key}"
     try:
         from .. import gym_identity
         label = gym_identity.submitter_label_for(gym_key)
         if label:
-            gym_line = f"{gym_line} ({label})"
+            gym_line = f"{gym_line} ({_fenced(label, cap=200)})"
     except Exception:  # noqa: BLE001 - a lookup failure never blocks the card
         pass
     lines = [

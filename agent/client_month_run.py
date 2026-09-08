@@ -1631,6 +1631,17 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     denied_rows = []            # [{"day", "photo", "row_id"}] -- every denied row, each
                                  # replaced 1:1 regardless of other same-day active content.
     live_photo_keys = set()     # photos on approved/published/publishing rows (never reused)
+    # DRIVE ASSET EXCLUSION (independent audit, 2026-09-08): live_photo_keys is a set of
+    # LOCAL-library basenames; gym_media_builder.build_gym_media_draft picks from the
+    # separate Drive asset pool by Drive file id, a different id space entirely, so the
+    # local exclusion set can never protect it. Tracked in parallel so the Drive-first
+    # replacement (below) can be told the same two things the local-reuse path already
+    # enforces: never a photo live elsewhere in the book, never the denied post's own
+    # photo -- without this, a denied Drive asset's used_count/last_used_at is reset by
+    # gym_media_selector.rollback_use the moment it's denied, making it the pool's
+    # LEAST-used candidate again and letting the exact photo just denied come right back
+    # as its own "fresh" replacement.
+    live_drive_asset_ids = set()
     for month in months:
         try:
             rows = list_month(base_key, month) or []
@@ -1648,6 +1659,9 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                 k = _url_basename(row.get("image_url") or "")
                 if k:
                     live_photo_keys.add(k)
+                aid = row.get("source_media_asset_id")
+                if aid:
+                    live_drive_asset_ids.add(str(aid))
             pd = str(row.get("post_date") or "")[:10]
             if not pd or pd < win_start or pd > win_end:
                 continue
@@ -1656,7 +1670,8 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             if fmt == "feed" and acct in ("instagram", "ig", "") and status == "denied":
                 denied_rows.append({"day": pd,
                                     "photo": _url_basename(row.get("image_url") or ""),
-                                    "row_id": row.get("id")})
+                                    "row_id": row.get("id"),
+                                    "asset_id": row.get("source_media_asset_id")})
 
     # Per-ROW idempotency: a denied row already replaced (kv-marked after a successful
     # insert below) is never retried, no matter what else is or isn't active on its day.
@@ -1714,13 +1729,38 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
         feed = drop = None
         if drive_first:
             try:
-                from . import gym_media_builder
+                from . import gym_media_builder, post_quality
                 pillar = _GYM_DRIVE_PILLARS[drive_pillar_i % len(_GYM_DRIVE_PILLARS)]
                 source = _gym_drive_source_for(
                     getattr(account, "key", "") or base_key, day_key)
                 if source is not None:
+                    # Same two exclusions the local-reuse path enforces below, in the
+                    # Drive pool's own id space (independent audit, 2026-09-08): the
+                    # denied post's OWN Drive asset (its used_count is reset by
+                    # gym_media_selector.rollback_use the moment it's denied, making
+                    # it the pool's least-used candidate again) + every asset already
+                    # live elsewhere in the book.
+                    drive_exclude = set(live_drive_asset_ids)
+                    own_asset = denied.get("asset_id")
+                    if own_asset:
+                        drive_exclude.add(str(own_asset))
                     feed = gym_media_builder.build_gym_media_draft(
-                        account, day_key, pillar, voice, source)
+                        account, day_key, pillar, voice, source,
+                        exclude_ids=drive_exclude)
+                    # SAME HARD GATE the local-reuse path enforces (this function's
+                    # own docstring promises it fleet-wide): a Drive-sourced draft
+                    # that fails A+/banned-word is never silently placed just
+                    # because it came from a different lane.
+                    if feed is not None:
+                        gate_ok = (post_quality.is_a_plus(feed, banned_words,
+                                                          require_media=True)
+                                  if config.sb7_enabled()
+                                  else not _has_banned_word(feed.caption, banned_words))
+                        if not gate_ok:
+                            log(f"{base_key} {day_key}: drive-first replacement "
+                                "failed the A+/banned-word gate; falling back to "
+                                "local reuse")
+                            feed = None
                     if feed is not None:
                         drive_pillar_i += 1
                         log(f"{base_key} {day_key}: denied slot replaced from the "
