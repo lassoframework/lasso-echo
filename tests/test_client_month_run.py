@@ -657,6 +657,103 @@ def test_deny_backfill_replaces_denied_feed_with_reused_photo(monkeypatch, tmp_p
     assert ig_feed[0]["caption"].strip()
 
 
+# ---- 9c. denied-slot backfill tries the connected Drive pool FIRST (2026-09-07) ----
+
+def test_deny_backfill_prefers_a_connected_drive_pool_over_local_reuse(monkeypatch, tmp_path):
+    """Pete/Zanshin, 2026-09-07: a denied slot used to go straight to reusing a local
+    photo even for a gym with a connected Drive pool full of fresh, unused material --
+    the exact "I deny a photo and a repeat comes back" experience Pete reported.
+    Both flags on -> the Drive builder is tried first and its draft is used, never
+    falling through to local reuse."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    from agent.drafter import Draft, DraftStatus
+    drive_draft = Draft(
+        draft_id="drive-1", account_key="gritx_ig", platform="instagram",
+        caption="A fresh Drive-sourced caption, grounded in an approved source.",
+        hashtags=[], creative_path="/tmp/drive_asset.jpg",
+        creative_public_url="https://cdn.example.com/drive_asset.jpg",
+        scheduled_for="2026-08-19T11:30:00+00:00", status=DraftStatus.PENDING,
+        source_media_asset_id="drive-asset-42")
+
+    called = []
+
+    def fake_build(account, day_key, pillar, voice, source, **kw):
+        called.append((day_key, pillar))
+        return drive_draft
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft", fake_build)
+    # If the Drive builder is preferred correctly, local reuse must never be tried.
+    monkeypatch.setattr(cmr, "_clean_draft_for_day",
+                       lambda *a, **kw: (_ for _ in ()).throw(
+                           AssertionError("local reuse must not run when Drive covers it")))
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1
+    assert called and called[0][0] == "2026-08-19"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "drive_asset" in ig_feed[0]["image_url"]
+
+
+def test_deny_backfill_falls_back_to_local_reuse_when_drive_declines(monkeypatch, tmp_path):
+    """Both Drive flags on, but the Drive builder itself declines (no fresh Drive
+    asset fit the slot, or the lane is unarmed underneath) -- must fall through to
+    the existing local-reuse path exactly as before this fix, never leave the slot
+    empty just because Drive was tried first."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.setenv("GYM_DRIVE_CONNECT_GYMS", "gritx")
+    monkeypatch.setenv("GYM_DRIVE_STAGE", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: None)
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1, "must still fall back to a local-reuse replacement"
+    ig_feed = [r for r in store.inserted
+               if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert "photo_00" not in ig_feed[0]["image_url"]
+
+
+def test_deny_backfill_ignores_drive_when_flags_off(monkeypatch, tmp_path):
+    """No Drive flags armed (the ordinary case for most gyms tonight) -- the Drive
+    builder must never even be called; byte-for-byte the pre-existing local-reuse
+    behavior."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    monkeypatch.delenv("GYM_DRIVE_CONNECT_GYMS", raising=False)
+    monkeypatch.delenv("GYM_DRIVE_STAGE", raising=False)
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=4)
+    store = _FakeStoreLM({("gritx", "2026-08"): [_denied_feed_row("2026-08-19")]})
+
+    called = []
+    monkeypatch.setattr("agent.gym_media_builder.build_gym_media_draft",
+                       lambda *a, **kw: called.append(1))
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    assert out["backfilled"] == 1
+    assert not called, "the Drive builder must never be invoked with both flags off"
+
+
 def test_deny_backfill_idempotent_on_the_same_denied_row(monkeypatch, tmp_path):
     """ALWAYS 1:1 (Blake, 2026-09-05): idempotency is now per DENIED ROW (a kv marker
     keyed by that row's own id), not per day -- a day already having some OTHER active
