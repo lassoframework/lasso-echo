@@ -1364,6 +1364,22 @@ def portal_calendar_supabase_enabled() -> bool:
     return bool(supabase_url()) and bool(supabase_service_key())
 
 
+def slack_cancel_post_enabled() -> bool:
+    """
+    Slack "cancel my post" / "skip today's post" master switch. OFF by default: the
+    slack_convo classifier never emits CANCEL_POST and the adapter's cancel branch is
+    never reached, so the conversational adapter is byte-for-byte its current self.
+
+    When ON, a CLIENT identity's Slack message asking to cancel/skip a scheduled post
+    resolves to the client's OWN next eligible content_calendar row (pending or approved,
+    never published/publishing) and denies it through THE SAME path the portal's own
+    Cancel button uses (portal_social.handle_deny -> the 30/month budgeted, token
+    isolated, publish safe write). No new state machine, no new publish path, no
+    elevated action: this only ever flips one row of the caller's own gym to 'denied'.
+    """
+    return _truthy(os.environ.get("AGENT_SLACK_CANCEL_POST_ENABLED", "false"))
+
+
 # Zernio social-connect. The key was set in Railway as ZERNIO_API_KEY (no AGENT_ prefix), so we read
 # that exact name. The key's PRESENCE is the switch — no key means the endpoints are dark and return
 # a clean disabled response, so nothing accidentally calls a paid vendor without the credential.

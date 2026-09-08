@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from . import classifier as _cls
 from . import identity_gate as _ig
 from . import brain as _brain
+from . import cancel_lane as _cancel_lane
 
 SURFACE_IM = "im"
 SURFACE_MPIM = "mpim"
@@ -177,6 +178,11 @@ ACK_FOLLOW_UP = "Got it, I have added that to the open request for the team."
 ACK_QUESTION = "Got it, checking that for you now."
 ACK_ACTION = ("Got it. I read that as a request to change something on your ads, so it is "
               "in the Ranger lane and will be reviewed before anything changes.")
+ACK_CANCEL_POST = "Got it, cancelling that post now."
+TEMPLATE_CANCEL_NO_ACCOUNT = (
+    "I can only cancel a post for a single account I recognize, and I could not resolve "
+    "one for you here. Please use the Support page in your portal and the team will "
+    "pick it up there.")
 
 
 @dataclass
@@ -211,6 +217,11 @@ class Deps:
     answer: object = None                  # (ticket, identity, messages, question) -> dict|None
     classify_llm: object = None            # (text) -> label | None
     log: object = print
+    cancel_post_enabled: object = None     # () -> bool; None (or false) means today's
+                                            # behavior, byte identical: CANCEL_POST is
+                                            # never classified, so this whole lane is dark.
+    cancel_post: object = None             # (account_key, actor_id, text) -> dict|None;
+                                            # defaults to cancel_lane.cancel_post
     # D53 (2026-09-05, card readability). Best-effort human labels for the #fixer card:
     # (gym_id) -> "Bird Dog CrossFit". None or a failure means the card falls back to the
     # account key and then the raw id, and says so -- never a blank where a gym should be.
@@ -700,9 +711,11 @@ def handle_event(event, event_id, deps):
             hint = _brain.load_hint(ident.name)
         except Exception:  # noqa: BLE001 - a brain read failure never blocks classification
             hint = None
+        cancel_enabled = bool(deps.cancel_post_enabled()) if deps.cancel_post_enabled else False
         classification = _cls.classify(text, has_open_ticket=has_open,
                                        identity_product=ident.product,
-                                       llm=deps.classify_llm, brain_hint=hint)
+                                       llm=deps.classify_llm, brain_hint=hint,
+                                       cancel_post_enabled=cancel_enabled)
         if classification == _cls.ACTION_REQUEST:
             request_type = _cls.request_type_for(text)
 
@@ -876,6 +889,51 @@ def handle_event(event, event_id, deps):
             emit(KIND_ACK, ACK_ACTION)
         return Decision("ticketed", "action_request", surface, who.kind, tid, created,
                         _cls.ACTION_REQUEST, out)
+
+    if classification == _cls.CANCEL_POST:
+        # A CLIENT'S OWN account only. who.account_key comes from identity_gate's
+        # portal lookup (client_owner gyms only, never ambiguous -- an owner with more
+        # than one gym resolves UNKNOWN upstream, never reaches here), so this can never
+        # be pointed at another gym's calendar. Staff/coach have no account_key of their
+        # own to scope a cancel to; that is a portal job, not a Slack one, from here.
+        if not who.account_key:
+            deps.bus.set_ticket(tid, classification=_cls.CANCEL_POST, status="hold",
+                                escalated=True)
+            emit(KIND_ESCALATION,
+                 f"{who.kind} {user} asked to cancel/skip a scheduled post on "
+                 f"{ident.name} but has no single resolved account to scope the write "
+                 f"to. Ticket {tid}.", author_type="system")
+            emit(KIND_TEMPLATE, TEMPLATE_CANCEL_NO_ACCOUNT)
+            return Decision("ticketed", "cancel_post_no_account", surface, who.kind, tid,
+                            created, _cls.CANCEL_POST, out)
+        if not _is_staffish(who):
+            emit(KIND_ACK, ACK_CANCEL_POST)
+        cancel_fn = deps.cancel_post or _cancel_lane.cancel_post
+        try:
+            result = cancel_fn(who.account_key, user, text)
+        except Exception as e:  # noqa: BLE001 - a lane fault escalates, never claims success
+            deps.log(f"[slack-convo] cancel_post lane failed: {type(e).__name__}")
+            result = None
+        if not result:
+            deps.bus.set_ticket(tid, classification=_cls.CANCEL_POST, status="hold",
+                                escalated=True)
+            emit(KIND_ESCALATION,
+                 f"Cancel/skip request from {who.kind} {user} on {ident.name} "
+                 f"({who.account_key}) failed to process. Ticket {tid}.",
+                 author_type="system")
+            emit(KIND_TEMPLATE, TEMPLATE_NO_ANSWER_YET, meta={"no_draft": True})
+            return Decision("ticketed", "cancel_post_failed", surface, who.kind, tid,
+                            created, _cls.CANCEL_POST, out)
+        # PUBLISH-GATE NOTE: cancel_lane only ever DENIES a not yet published row (via
+        # the same portal_social.handle_deny the portal's own Cancel button calls); it
+        # has no publish path of its own, so there is no approval gate here to bypass.
+        # The reply itself carries verification: it either names the day it cancelled
+        # (real write, real row) or explains why nothing changed -- never a guess.
+        emit(KIND_STATUS, result.get("body") or TEMPLATE_NO_ANSWER_YET,
+             meta={"resolve_notice": True, "cancel_ok": bool(result.get("ok"))})
+        reason = "cancel_post_ok" if result.get("ok") else "cancel_post_declined"
+        return Decision("ticketed", reason, surface, who.kind, tid, created,
+                        _cls.CANCEL_POST, out)
 
     # ESCALATE: nothing decided -> a human looks. No worker, no answer.
     deps.bus.set_ticket(tid, status="hold", escalated=True)

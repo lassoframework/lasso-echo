@@ -27,6 +27,7 @@ import re
 QUESTION = "answerable_question"
 CODE_FIX = "code_fix"
 ACTION_REQUEST = "action_request"
+CANCEL_POST = "cancel_post"
 FOLLOW_UP = "follow_up"
 ESCALATE = None
 
@@ -72,6 +73,22 @@ _ACTION_RE = re.compile(
     r"budget|spend|launch|relaunch|target(?:ing)?|audience|duplicate|kill|stop the ad|"
     r"start the ad)\b", re.IGNORECASE)
 
+# A client asking to cancel/skip a scheduled content_calendar post. Two shapes:
+#   1. a cancel verb, then (not immediately, within a short gap) a post-ish noun --
+#      "cancel my post today", "can you skip tomorrow's scheduled post".
+#   2. the "don't/won't post" negation, which already carries its own noun --
+#      "please don't post today", "don't post tomorrow".
+# Deliberately narrow (post/story/reel/schedule only) so "cancel my membership" or
+# "stop calling me" never matches; this is content_calendar cancellation only, never
+# billing, ads, or anything else "cancel"/"stop"/"kill" could mean elsewhere in Echo.
+_CANCEL_NOUN = r"post|posts|posting|story|stories|reel|reels|schedule|scheduled"
+_CANCEL_POST_RE = re.compile(
+    rf"\b(?:cancel|skip|stop|pull|remove|kill|hold off on)\b"
+    rf"(?:(?!\b(?:{_CANCEL_NOUN})\b).){{0,40}}"
+    rf"\b(?:{_CANCEL_NOUN})\b"
+    rf"|\b(?:don'?t|do not|won'?t)\s+post\b",
+    re.IGNORECASE)
+
 # Ranger request_type vocabulary (migration 0303), best effort from the text.
 _REQUEST_TYPE_RULES = (
     ("pause_resume", re.compile(r"\b(pause|resume|unpause|turn (?:off|on)|stop|start)\b", re.I)),
@@ -80,7 +97,7 @@ _REQUEST_TYPE_RULES = (
     ("targeting",    re.compile(r"\b(target(?:ing)?|audience|geo|radius|age)\b", re.I)),
 )
 
-_VALID = frozenset({QUESTION, CODE_FIX, ACTION_REQUEST, FOLLOW_UP})
+_VALID = frozenset({QUESTION, CODE_FIX, ACTION_REQUEST, CANCEL_POST, FOLLOW_UP})
 
 # RT-M2: a breakage word alone is a hair trigger ("I can't make Thursday", "my bad, my
 # error"). A code fix needs the breakage to be ABOUT something we run. Word-bounded.
@@ -240,8 +257,13 @@ def default_classify_llm(model=None):
     return _llm
 
 
-def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None):
+def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=None,
+            cancel_post_enabled=False):
     """One label from the fixed set, or None (escalate). Never raises.
+
+    cancel_post_enabled (AGENT_SLACK_CANCEL_POST_ENABLED, default False): the ONLY gate
+    on the CANCEL_POST rule below. False is byte identical to before this label existed --
+    the rule is never checked and this function's behavior is unchanged.
 
     llm(text) -> one of the labels, or anything else (ignored). Only consulted when the
     rules do not decide; a wrong label from it cannot widen the set.
@@ -260,20 +282,31 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return FOLLOW_UP
     if identity_product == "ranger" and _ACTION_RE.search(t):
         return ACTION_REQUEST
+    # Checked before breakage/question so "cancel my post" and "can you skip tomorrow's
+    # post" never fall through to CODE_FIX or QUESTION (the latter's answer lane refuses
+    # ANY message containing "cancel my" as a billing question -- see answer_lane.py's
+    # _BILLING_RE -- which is exactly the escalate-with-no-help pattern this classification
+    # exists to avoid).
+    if cancel_post_enabled and _CANCEL_POST_RE.search(t):
+        return CANCEL_POST
     # RT-M2: breakage AND an Echo-domain noun. Breakage alone escalates to a human.
     if _BREAKAGE_RE.search(t) and _DOMAIN_RE.search(t):
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
+    # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
+    # fallback: the flag is the ONE switch for this whole capability, so a learned
+    # phrase or a model guess can never turn it on when it is off.
+    allowed = _VALID if cancel_post_enabled else (_VALID - {CANCEL_POST})
     if brain_hint is not None:
         hinted = brain_hint.classification_hint_for(t)
-        if hinted in _VALID and hinted != FOLLOW_UP:
+        if hinted in allowed and hinted != FOLLOW_UP:
             return hinted
     if llm is not None:
         try:
             verdict = llm(t)
         except Exception:  # noqa: BLE001 - a model fault escalates, never dispatches
             return ESCALATE
-        if verdict in _VALID and verdict != FOLLOW_UP:
+        if verdict in allowed and verdict != FOLLOW_UP:
             return verdict
     return ESCALATE
