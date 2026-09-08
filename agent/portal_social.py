@@ -1090,12 +1090,24 @@ def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
+    # STORY RE-BURN (independent audit, 2026-09-08): a story's caption is burned
+    # into the media itself, not read as text -- PR #597's UI hides this button for
+    # story-format posts, but that is client-side only, and every OTHER invariant
+    # in this file (ownership, published-is-final, budget) is enforced server-side
+    # regardless of what the client does. Without this, a direct call on a story
+    # row (curl, a retried request, a future UI regression) would patch the DB
+    # caption while the live image kept showing the OLD burned-in text -- DB and
+    # pixels silently diverge. Same call `_handle_edit_supabase` already makes;
+    # `maybe_reburn_story` is itself gated on `story_reburn.should_reburn(row)` and
+    # is a no-op for a feed row, so this is always safe to call unconditionally.
+    reburned = maybe_reburn_story(account_key, row, result["caption"], sb_store)
     # Charge the budget only after a successful, persisted recreate.
     spend_recreate(account_key)
     return 200, {"ok": True, "action": "recreate-caption", "draft_id": draft_id,
                  "caption": updated.get("caption", ""),
                  "status": updated.get("status", "pending"),
                  "day_key": updated.get("post_date", ""),
+                 "story_reburned": bool(reburned),
                  "free": False,
                  "recreate_budget": _budget_state(account_key)}
 
