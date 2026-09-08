@@ -1684,6 +1684,20 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                                                  library_path=library_path)
         except Exception as exc:  # noqa: BLE001 - the guard never sinks a backfill
             log(f"{base_key}: cross-day media guard read skipped ({type(exc).__name__})")
+    # DRIVE-FIRST REPLACEMENT (Pete/Zanshin, 2026-09-07): a denied slot used to go
+    # straight to reusing a local photo (allow_reuse=True below), even for a gym
+    # with a connected Drive pool full of fresh, unused material -- this is the
+    # exact "I deny a photo and a repeat comes back" experience Pete reported.
+    # append_gym_drive_drafts (the month-build's own Drive fallback) is never
+    # called from this function, so a denied-slot replacement never got the same
+    # chance. Try ONE fresh Drive-sourced draft per denied day first, same gating
+    # (both flags) and same builder append_gym_drive_drafts already uses; fall
+    # through to the existing local-reuse path unchanged when Drive can't cover
+    # it (source missing, lane unarmed, or the builder itself declines).
+    drive_first = (config.gym_drive_stage_enabled()
+                  and config.gym_drive_connect_active_for(
+                      getattr(account, "key", "") or base_key))
+    drive_pillar_i = 0
     drafts = []
     skipped = 0
     done_row_ids = []
@@ -1697,9 +1711,29 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             exclude.add(own)
         blocked = (media_guard.blocked_keys(guard_state, day_key)
                    if guard_state else set())
-        feed, drop = _clean_draft_for_day(
-            account, day_key, voice, library_path, banned_words, log,
-            exclude_keys=exclude | blocked, allow_reuse=True)
+        feed = drop = None
+        if drive_first:
+            try:
+                from . import gym_media_builder
+                pillar = _GYM_DRIVE_PILLARS[drive_pillar_i % len(_GYM_DRIVE_PILLARS)]
+                source = _gym_drive_source_for(
+                    getattr(account, "key", "") or base_key, day_key)
+                if source is not None:
+                    feed = gym_media_builder.build_gym_media_draft(
+                        account, day_key, pillar, voice, source)
+                    if feed is not None:
+                        drive_pillar_i += 1
+                        log(f"{base_key} {day_key}: denied slot replaced from the "
+                            "connected Drive pool (asset "
+                            f"{getattr(feed, 'source_media_asset_id', '')})")
+            except Exception as exc:  # noqa: BLE001 - Drive lane never sinks the backfill
+                log(f"{base_key} {day_key}: drive-first replacement failed "
+                    f"({type(exc).__name__}); falling back to local reuse")
+                feed = None
+        if feed is None:
+            feed, drop = _clean_draft_for_day(
+                account, day_key, voice, library_path, banned_words, log,
+                exclude_keys=exclude | blocked, allow_reuse=True)
         if (feed is None or not _has_real_creative(feed)) and blocked:
             # SMALL LIBRARY: every reusable photo already sits on another day of the
             # book. Do not leave the denied slot empty — fall back to the photo whose
