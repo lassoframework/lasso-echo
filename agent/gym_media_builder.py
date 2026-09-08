@@ -65,7 +65,7 @@ class _PickedCreative:
 
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
-                          drive=None, now=None, library_dir=None):
+                          drive=None, now=None, library_dir=None, exclude_ids=()):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -74,7 +74,15 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     account: the client account (carries .key, .platform). pillar: the slot job
     (faces/community/results/...). voice/source: the approved voice doc + the day's
     approved fact, handed straight to the caption generator so CLAIMS still come
-    only from approved sources (the frame only shapes the SCENE, never the facts)."""
+    only from approved sources (the frame only shapes the SCENE, never the facts).
+
+    exclude_ids (independent audit, 2026-09-08): Drive asset ids the caller already
+    knows must never be picked -- a photo live elsewhere in the gym's book, or (for
+    a denied-slot replacement) the denied post's own asset. Merged with this
+    function's own per-call retry tracking; without a caller-supplied set, a denied
+    Drive asset's used_count is reset by gym_media_selector.rollback_use the moment
+    it's denied, making it the pool's least-used candidate again -- so the exact
+    photo just denied could come right back as its own "fresh" replacement."""
     from .integrations import drive_client as _dc
     from . import client_content, vision, media_host
 
@@ -92,10 +100,12 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     lib = Path(library_dir or tempfile.mkdtemp(prefix="gymmedia_"))
     lib.mkdir(parents=True, exist_ok=True)
 
+    caller_excludes = {str(i) for i in (exclude_ids or ()) if i}
     tried = []
     for _attempt in range(_MAX_ASSET_ATTEMPTS):
         asset = _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
-                                now=now, exclude_ids=tuple(tried))
+                                now=now,
+                                exclude_ids=tuple(caller_excludes) + tuple(tried))
         if asset is None:
             return None  # pool empty: pick_media already fired the deduped alert
         tried.append(asset["id"])

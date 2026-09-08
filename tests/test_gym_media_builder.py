@@ -131,3 +131,27 @@ def test_empty_pool_falls_through(monkeypatch, tmp_path):
         _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
         store=store, drive=drive, library_dir=str(tmp_path))
     assert draft is None
+
+
+def test_exclude_ids_keeps_a_caller_named_asset_out_of_the_pick(monkeypatch, tmp_path):
+    """Independent audit, 2026-09-08: build_gym_media_draft had no way for a caller
+    to say "never this specific asset" -- only its own per-call retry list. Without
+    it, a denied-slot backfill (client_month_run.backfill_denied_slots) could hand
+    the SAME Drive asset right back as its own "fresh" replacement (its used_count
+    is reset by gym_media_selector.rollback_use the moment it's denied, making it
+    the pool's least-used candidate again)."""
+    _wire(monkeypatch)
+    store = FakeMediaStore(assets=[
+        make_asset("denied_one", gym_id="pierce", kind="photo"),
+        make_asset("fresh_two", gym_id="pierce", kind="photo"),
+    ])
+    drive = FakeDrive(blobs={"denied_one": b"jpgbytes", "fresh_two": b"jpgbytes"})
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=drive, library_dir=str(tmp_path),
+        exclude_ids=("denied_one",))
+    assert draft is not None
+    assert store.assets["fresh_two"]["used_count"] == 1
+    assert store.assets["denied_one"]["used_count"] == 0, (
+        "the excluded asset must never be picked or stamped used"
+    )

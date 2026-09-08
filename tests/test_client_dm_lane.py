@@ -381,6 +381,25 @@ def test_the_clients_own_words_are_bounded_and_escaped_on_the_card():
     assert len(card) < 1500
 
 
+def test_the_resolved_gym_owner_label_is_escaped_on_the_card(monkeypatch):
+    """Independent audit, 2026-09-08: gym_identity.submitter_label_for resolves
+    gyms.name/clients.name -- OUR OWN rows, but rows a self-serve client's own
+    onboarding input can end up in. The two sibling call sites in
+    slack_convo/adapter.py already wrap this same lookup in _slack_escape before it
+    reaches a card; this lane's _card_text didn't. Same rail as
+    test_the_clients_own_words_are_bounded_and_escaped_on_the_card, applied to the
+    OTHER string this card interpolates."""
+    monkeypatch.setattr(
+        "agent.gym_identity.submitter_label_for",
+        lambda gym_key: "<!channel> ```Evil Gym``` & Co.")
+    bus = FaithfulBus([_ticket("1")])
+    d = L.Decision(L.Outcome.ESCALATE, "why", gym_key="somegym", client_text="hi")
+    L._deliver(bus, _ticket("1"), Ident(), d, live_arm(), "mpim")  # noqa: SLF001
+    card = bus.written[0]["body"]
+    assert "<!channel>" not in card and "&lt;!channel&gt;" in card
+    assert "```" not in card
+
+
 def test_the_fence_caps_at_its_declared_length():
     assert len(L._fenced("q" * 50_000)) < 700                          # noqa: SLF001
     assert L._fenced("q" * 50_000).endswith(" ...")                    # noqa: SLF001
