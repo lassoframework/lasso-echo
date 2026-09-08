@@ -41,9 +41,9 @@ def _voice():
 
 
 def _row(row_id="p1", gym_id="zanshin", status="pending", caption="old caption body",
-         image="old.jpg"):
+         image="old.jpg", format="feed"):
     return {"id": row_id, "gym_id": gym_id, "post_date": "2026-09-20",
-            "account": "instagram", "status": status, "format": "feed",
+            "account": "instagram", "status": status, "format": format,
             "caption": caption, "image_url": f"https://cdn/{image}",
             "source_media_url": image}
 
@@ -232,6 +232,7 @@ class _Store:
     def __init__(self, rows=None):
         self._rows = {r["id"]: dict(r) for r in (rows or [])}
         self.caption_patches = []
+        self.image_url_patches = []
 
     def get_row(self, account_key, row_id):
         r = self._rows.get(row_id)
@@ -257,6 +258,13 @@ class _Store:
 
     def list_month(self, account_key, month):
         return [dict(r) for r in self._rows.values()]
+
+    def patch_image_url(self, account_key, row_id, new_url):
+        self.image_url_patches.append((row_id, new_url))
+        r = self._rows.get(row_id)
+        if r is not None:
+            r["image_url"] = new_url
+        return dict(r) if r else None
 
 
 def _wire_store(monkeypatch, store):
@@ -294,6 +302,63 @@ def test_handle_recreate_caption_persists_via_patch_caption_and_charges_the_budg
     assert store._rows["p1"]["caption"] == "A brand new caption."
     assert store._rows["p1"]["status"] == "pending"
     assert store.caption_patches == [("p1", "A brand new caption.")]
+
+
+def test_handle_recreate_caption_reburns_a_story_so_pixels_never_diverge_from_text(
+        monkeypatch, lib):
+    """Independent audit finding, 2026-09-08: a story's caption is burned into the
+    media itself, not read as text. PR #597's UI hides this button for story-format
+    posts, but that is client-side only -- every OTHER invariant in this file
+    (ownership, published-is-final, budget) is enforced server-side regardless of
+    what the client does. Without this call, a direct hit on a story row would patch
+    the DB caption while the live image kept showing the OLD burned-in text."""
+    monkeypatch.setenv("ECHO_CAPTION_RECREATE_SCOPED", "true")
+    _wire_source(monkeypatch)
+    store = _Store([_row("p1", format="story")])
+    _wire_store(monkeypatch, store)
+    monkeypatch.setattr(ps, "_account_for", lambda key: _acct())
+    monkeypatch.setattr(ps, "_voice_for", lambda key, account=None: _voice())
+    monkeypatch.setattr(ps, "recreate_remaining", lambda key: 15)
+    import agent.client_media_sync as _cms
+    monkeypatch.setattr(_cms, "_banned_words_for", lambda key: ())
+    monkeypatch.setattr(cs, "recreate_caption",
+                       lambda *a, **k: {"ok": True, "caption": "A new story caption.",
+                                        "hashtags": []})
+
+    import agent.story_reburn as _sr
+    monkeypatch.setattr(_sr, "should_reburn", lambda row: row.get("format") == "story")
+    monkeypatch.setattr(_sr, "reburn",
+                       lambda *a, **k: "https://cdn/reburned.jpg")
+
+    status, body = ps.handle_recreate_caption("zanshin", "p1", "u1")
+    assert status == 200
+    assert body["story_reburned"] is True
+    assert store.image_url_patches == [("p1", "https://cdn/reburned.jpg")]
+    assert store._rows["p1"]["image_url"] == "https://cdn/reburned.jpg"
+
+
+def test_handle_recreate_caption_feed_never_touches_image_url(monkeypatch, lib):
+    """Control case: a feed row's photo is untouched by a caption recreate -- the
+    reburn call is safe to make unconditionally because it no-ops for anything
+    should_reburn() does not recognize as a story."""
+    monkeypatch.setenv("ECHO_CAPTION_RECREATE_SCOPED", "true")
+    _wire_source(monkeypatch)
+    store = _Store([_row("p1", format="feed")])
+    _wire_store(monkeypatch, store)
+    monkeypatch.setattr(ps, "_account_for", lambda key: _acct())
+    monkeypatch.setattr(ps, "_voice_for", lambda key, account=None: _voice())
+    monkeypatch.setattr(ps, "recreate_remaining", lambda key: 15)
+    import agent.client_media_sync as _cms
+    monkeypatch.setattr(_cms, "_banned_words_for", lambda key: ())
+    monkeypatch.setattr(cs, "recreate_caption",
+                       lambda *a, **k: {"ok": True, "caption": "A new feed caption.",
+                                        "hashtags": []})
+
+    status, body = ps.handle_recreate_caption("zanshin", "p1", "u1")
+    assert status == 200
+    assert body["story_reburned"] is False
+    assert store.image_url_patches == []
+    assert store._rows["p1"]["image_url"] == "https://cdn/old.jpg"
 
 
 def test_handle_recreate_caption_gate_exhausted_is_a_409_that_changes_nothing(
