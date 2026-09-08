@@ -8,7 +8,7 @@ The invariants the handoff calls out, one test class each:
   * flag OFF (AGENT_PORTAL_SOCIAL_ENABLED) -> every route disabled (404), unchanged.
   * Stripe social product not ACTIVE -> 402 + empty-state payload (never a live calendar).
   * TOKEN ISOLATION on EVERY route -> gym A's token can never read or act on gym B.
-  * recreate budget -> server-enforced 15/month, 409 when exhausted, free kill.
+  * recreate budget -> server-enforced 30/month, 409 when exhausted, free kill.
   * kill requires confirm=true.
   * edit re-runs the fabrication gate -> 422 on an unsupported claim.
   * approve is idempotent.
@@ -242,35 +242,36 @@ def test_metrics_isolation_keyed_to_account(db_env, monkeypatch):
 def test_deny_budget_is_per_gym(db_env, monkeypatch):
     """gymA burning its budget never touches gymB's budget (isolation of the counter)."""
     _register(monkeypatch, _account("gymA"), _account("gymB"))
-    for _ in range(15):
+    for _ in range(ps.MONTHLY_RECREATE_BUDGET):
         assert ps.spend_recreate("gymA") is True
     assert ps.recreate_remaining("gymA") == 0
-    assert ps.recreate_remaining("gymB") == 15  # untouched
+    assert ps.recreate_remaining("gymB") == ps.MONTHLY_RECREATE_BUDGET  # untouched
 
 
 # ===========================================================================
-# 4. RECREATE BUDGET — server-enforced 15/month, 409 when exhausted, free kill
+# 4. RECREATE BUDGET — server-enforced 30/month, 409 when exhausted, free kill
 # ===========================================================================
 
 def test_deny_decrements_budget_and_409_when_exhausted(db_env, monkeypatch):
     _register(monkeypatch, _account("gymA"))
     _mark_stripe_customer("gymA")
-    # 15 distinct pending drafts so each deny has a real draft to act on
-    drafts = [_draft(f"d{i}", "gymA") for i in range(16)]
+    budget = ps.MONTHLY_RECREATE_BUDGET
+    # one distinct pending draft per budget unit, plus one more for the 409 case
+    drafts = [_draft(f"d{i}", "gymA") for i in range(budget + 1)]
     store = _DictStore(*drafts)
 
-    for i in range(15):
+    for i in range(budget):
         status, body = ps.handle_deny("gymA", f"d{i}", "U_gymA_owner",
                                       note="wrong tone", store=store, reader=_ActiveReader())
         assert status == 200, f"deny #{i} should succeed"
-        assert body["recreate_budget"]["remaining"] == 15 - (i + 1)
+        assert body["recreate_budget"]["remaining"] == budget - (i + 1)
 
-    # the 16th deny in the month is refused with 409, budget not charged further
-    status, body = ps.handle_deny("gymA", "d15", "U_gymA_owner",
+    # the (budget+1)th deny in the month is refused with 409, budget not charged further
+    status, body = ps.handle_deny("gymA", f"d{budget}", "U_gymA_owner",
                                   note="one too many", store=store, reader=_ActiveReader())
     assert status == 409
     assert body["ok"] is False
-    assert ps.recreate_spent("gymA") == 15
+    assert ps.recreate_spent("gymA") == budget
 
 
 def test_failed_deny_does_not_charge_budget(db_env, monkeypatch):
@@ -417,7 +418,7 @@ def test_no_dashes_or_vendor_in_client_strings(db_env, monkeypatch):
                                             note="cut costs 80 percent", store=store,
                                             reader=_ActiveReader())[1])
     # exhaust the budget to capture the 409 message
-    for _ in range(15):
+    for _ in range(ps.MONTHLY_RECREATE_BUDGET):
         ps.spend_recreate("gymA")
     msgs += _message_strings(ps.handle_deny("gymA", "d1", "U_gymA_owner", note="x",
                                             store=store, reader=_ActiveReader())[1])
