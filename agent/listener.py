@@ -827,6 +827,39 @@ def _daily_scheduler(store):
         time.sleep(60)
 
 
+def _chat_message_is_from_approver(message) -> bool:
+    """Bolt-level MATCHER (not a body check inside the listener) for on_chat_message
+    below: a Slack Bolt App only ever runs the FIRST listener in registration order
+    whose matcher returns True for a given event -- it does NOT run every listener
+    that would match (see ThreadListenerRunner.run: the auto-ack fires and
+    App.dispatch() returns as soon as ONE listener matches, before any later listener
+    in self._listeners is even checked). This is the root cause of the 2026-09-06 Chad
+    Edwards / John Weeks gap: `@app.message("")` used to have no matchers at all, and
+    an empty keyword matches virtually every plain human message (empty keyword + the
+    default subtype constraint covers a plain message). Because on_chat_message was
+    registered ABOVE _convo.attach(app, "echo") a few lines down, it silently swallowed
+    100% of real client Slack messages on Echo's identity, for every gym, for the
+    entire life of this project -- slack_convo's own `@app.event("message")` listener
+    (registered after) was never even reached, so it could never create a
+    support_tickets row, no matter how correct its own code was in isolation. The
+    function body's own `actor != APPROVER_SLACK_ID: return` check was always too
+    late: by the time it ran, Bolt had already committed to this listener and would
+    never fall through to slack_convo's.
+
+    Moving the actor check UP into this matcher fixes it structurally: for anyone but
+    Blake, this listener now doesn't match at all, so Bolt proceeds to the next
+    listener in self._listeners exactly as it always should have -- letting
+    slack_convo's own message listener (registered below) see every client message for
+    the first time. Verified live (2026-09-06/07): a real Slack message sent into Chad
+    Edwards's mpim channel (C0BUNHG49EH), where Echo is a verified member with
+    message.mpim/message.im subscribed, produced a health-line event count of
+    events={'message:mpim': 0} for the ENTIRE life of the prior deployment -- proof the
+    event reached Slack's dispatch to this bot but never reached slack_convo's counter.
+    Module-level (not nested in run_listener) so tests/test_listener_chat_message_
+    matcher.py can import and exercise the real function directly, not a copy of it."""
+    return message.get("user", "") == config.APPROVER_SLACK_ID
+
+
 def run_listener():
     # Startup config hygiene: placeholder AGENT_OPUS_PROJECT_IDS values (P1
     # pattern / under 6 chars) get ONE warning naming each bad value and are
@@ -952,12 +985,17 @@ def run_listener():
         out = run_daily(store=store)
         respond(f"Drafting: {out['status']} ({len(out.get('drafts', []))} card(s)) -> #echoclaude")
 
-    @app.message("")
+    @app.message("", matchers=[_chat_message_is_from_approver])
     def on_chat_message(message, say):
         """Free-text chat: Blake can publish LASSO accounts directly (explicit verb),
         client accounts only draft. Inert unless AGENT_CHAT_PUBLISH_ENABLED. Stays
         SILENT on anything that is not an actionable publish/undo command so it never
-        spams the channel."""
+        spams the channel.
+
+        The matcher above (not this body) is what keeps this listener from ever
+        intercepting another human's message -- see its docstring. This function
+        still re-checks bot_id/subtype/actor defensively (belt and suspenders; a
+        matcher change elsewhere must never silently widen who this replies to)."""
         if not config.chat_publish_enabled():
             return
         # ignore bot / edited / non-user events
