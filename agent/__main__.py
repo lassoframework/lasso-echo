@@ -226,6 +226,10 @@ def _status():
               f"client_reply={config.slack_convo_client_reply_armed(_ident)} "
               f"staff_reply={config.slack_convo_staff_reply_armed(_ident)}  "
               f"(env SLACK_CONVO_{_ident.upper()}_ENABLED / _CLIENT_REPLY / _STAFF_REPLY)")
+    print(f"    cancel_post : {config.slack_cancel_post_enabled()}  (env "
+          f"AGENT_SLACK_CANCEL_POST_ENABLED; a CLIENT's 'cancel my post'/'skip today's "
+          f"post' message denies THEIR next eligible content_calendar row through the "
+          f"same path as the portal's own Cancel button, no new state machine)")
     print(f"  client_dm      : {config.client_dm_autofix_enabled()}  (env AGENT_CLIENT_DM_AUTOFIX; "
           f"the client-DM support lane: measure one enumerated condition, run at most a "
           f"per-gym Drive media sync, card a human every time. On its own it sends a client "
