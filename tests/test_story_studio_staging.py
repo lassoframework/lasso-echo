@@ -365,6 +365,93 @@ def test_calendar_insert_failure_holds_instead_of_claiming_staged(monkeypatch, t
     assert not _STAGED_ROWS
 
 
+class _UniqueIdStore:
+    """Schema-faithful fake: story_request/story_render both have `id` as a PRIMARY
+    KEY in the real Supabase tables, so a second INSERT with the same id fails (a 409
+    in production, via story_studio_store.SupabaseStoryStudioStore.insert_request /
+    insert_render). _FakeStore above does not enforce this -- it just appends -- which
+    is why the calendar-insert-failure tests passed even though the same held path
+    left a real Zanshin row stuck at status=pending in production (2026-09-07). This
+    fake catches what a permissive fake hides: verify by making failure possible, not
+    by asserting the happy path never fails."""
+
+    def __init__(self):
+        self.requests = {}
+        self.renders = {}
+
+    def available(self):
+        return True
+
+    def insert_request(self, row):
+        rid = row.get("id")
+        if rid in self.requests:
+            raise RuntimeError("duplicate key value violates unique constraint")
+        self.requests[rid] = dict(row)
+        return dict(row)
+
+    def insert_render(self, row):
+        rid = row.get("id")
+        if rid in self.renders:
+            raise RuntimeError("duplicate key value violates unique constraint")
+        self.renders[rid] = dict(row)
+        return dict(row)
+
+    def update_request(self, rid, fields, gym_id=None):
+        if rid in self.requests:
+            self.requests[rid].update(fields)
+        return True
+
+    def update_render(self, rid, fields, gym_id=None):
+        # story_render.status is CHECK-constrained in production to exactly
+        # ('pending', 'denied') -- there is no 'held'. A fake that accepted any string
+        # here would hide the exact mistake this fix almost shipped: writing 'held' to
+        # story_render and having it silently swallowed by the caller's try/except.
+        if "status" in fields and fields["status"] not in ("pending", "denied"):
+            raise RuntimeError(
+                f"new row for relation \"story_render\" violates check constraint "
+                f"\"story_render_status_check\": {fields['status']!r}")
+        if rid in self.renders:
+            self.renders[rid].update(fields)
+        return True
+
+
+def test_calendar_insert_failure_corrects_the_persisted_rows_to_held(monkeypatch, tmp_path):
+    """Reproduces the real Zanshin bug (story_request/story_render 8e1b4bdf-...,
+    2026-09-07): _persist() already INSERTed both rows as PENDING before the
+    calendar-staging step ran. When that step then fails, _held() must UPDATE those
+    same rows to status=held with the reason -- not attempt a second INSERT, which a
+    real unique-id constraint rejects (silently swallowed by _held()'s own
+    try/except), leaving both rows stuck at status=pending forever with no card in
+    the approval queue and no honest reason anywhere a human or Pete could see."""
+    _arm(monkeypatch)
+    audio = tmp_path / "hype.mp3"
+    audio.write_bytes(b"z")
+    store = _UniqueIdStore()
+
+    class _Boom:
+        def insert_rows(self, gym_id, rows):
+            raise RuntimeError("supabase down")
+
+    res = ss.create_story(
+        {"gym_id": "pierce", "asset_ids": ["a0"], "brief": "A win",
+         "identity_tokens": ["Pierce"]},
+        candidates=_cands("pierce"), store=store,
+        music_library=_RealPathLibrary(str(audio)),
+        render_fn=_fake_render, output_dir=str(tmp_path), cal_store=_Boom())
+
+    assert res["status"] == "held"
+    assert len(store.requests) == 1, "must correct the existing row, never insert a second"
+    assert len(store.renders) == 1
+    req_row = next(iter(store.requests.values()))
+    render_row = next(iter(store.renders.values()))
+    assert req_row["status"] == "held", "orphaned pending story_request, exactly the Zanshin bug"
+    assert req_row.get("hold_reason"), "the hold reason must be recorded, not silently dropped"
+    # story_render.status only allows ('pending', 'denied') in production (see deny()'s
+    # own comment) -- there is no 'held' value for it, so DENIED is the correct terminal
+    # state for a render that will never be used, matching deny()'s own precedent.
+    assert render_row["status"] == "denied", "orphaned pending story_render, exactly the Zanshin bug"
+
+
 def test_unconfigured_calendar_store_holds(monkeypatch, tmp_path):
     """An unconfigured store must HOLD, never report a staged story nobody can approve."""
     _arm(monkeypatch)
