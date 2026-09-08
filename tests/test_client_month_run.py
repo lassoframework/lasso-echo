@@ -893,6 +893,63 @@ def test_deny_backfill_replaces_a_denied_row_even_when_another_post_covers_its_d
     assert "photo_01" not in ig_feed[0]["image_url"]
 
 
+def test_deny_backfill_spreads_multiple_denied_rows_off_the_same_day(monkeypatch, tmp_path):
+    """Pete/Zanshin, 2026-09-08: two DIFFERENT denied rows that happened to share an
+    original post_date each got their own 1:1 replacement (correct per the 2026-09-05
+    ALWAYS 1:1 fix) -- but nothing capped how many of those replacements could land on
+    that SAME day, so they stacked (reproduced live: up to 4 independent captions all
+    target-dated to one day). This must NOT regress the Dale/ENG case just above (an
+    UNRELATED active post never blocks a replacement) -- only TWO backfill replacements
+    landing on the same day should spread, one rolling forward to the next open day."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    row1 = _denied_feed_row("2026-08-19", photo="photo_00.jpg")
+    row1["id"] = "denied-row-A"
+    row2 = _denied_feed_row("2026-08-19", photo="photo_01.jpg")
+    row2["id"] = "denied-row-B"
+    store = _FakeStoreLM({("gritx", "2026-08"): [row1, row2]})
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    ig_feed = [r for r in store.inserted
+              if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 2, "both denied rows must still get their own replacement"
+    post_dates = sorted(r["post_date"] for r in ig_feed)
+    assert post_dates == ["2026-08-19", "2026-08-20"], (
+        f"the second replacement must roll forward to the next open day instead of "
+        f"stacking onto 2026-08-19 with the first, got {post_dates}")
+    assert out["backfilled"] == 2, "two distinct days' worth of backfill, not one"
+
+
+def test_deny_backfill_second_pass_still_spreads_a_previously_used_day(monkeypatch, tmp_path):
+    """The day-used marker must be DURABLE across separate runs, not just this pass's
+    in-memory set -- a real gym accumulates denied rows over many days/cron runs, not
+    all in one batch. Simulate a prior run having already placed a backfill replacement
+    on 2026-08-19 (the marker this fix sets), then a NEW denied row also originally
+    dated 2026-08-19 arrives in a later run -- it must roll forward, not stack."""
+    monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    from agent import db as _db
+    _db.kv_set("denybf_dayused_gritx_2026-08-19", "1")
+    row = _denied_feed_row("2026-08-19", photo="photo_00.jpg")
+    row["id"] = "denied-row-C"
+    store = _FakeStoreLM({("gritx", "2026-08"): [row]})
+
+    out = cmr.backfill_denied_slots(_account(), "gritx", "2026-08-19", days=30,
+                                    voice=_voice(), library_path=lib, store=store,
+                                    banned_words=())
+    assert out["ok"] is True
+    ig_feed = [r for r in store.inserted
+              if r["format"] == "feed" and r["account"] == "instagram"]
+    assert len(ig_feed) == 1
+    assert ig_feed[0]["post_date"] == "2026-08-20", (
+        "a day already used by a PRIOR run's backfill must roll this one forward too")
+
+
 def test_deny_backfill_never_reuses_a_live_photo(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DENY_BACKFILL", "true")
     _stock_clean("gritx_ig")

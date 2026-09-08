@@ -1593,6 +1593,27 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     retried, but an unrelated active post on the same day no longer blocks a different
     denied post's own replacement.
 
+    SPREAD ACROSS DAYS, NOT STACKED (Pete/Zanshin, 2026-09-08): "always 1:1, regardless of
+    the day" is correct for Dale's case (an UNRELATED active post must never block a denied
+    row's own replacement) but was silently letting MULTIPLE denied rows that happened to
+    share an original post_date each write their own fresh replacement onto that SAME date
+    — nothing capped it, so a gym that had denied several different posts originally
+    scheduled for one day accumulated 3-4 stacked posts on that single day over repeated
+    runs, while other days sat comparatively thin. Reproduced live: content_calendar for
+    zanshinfitness630e22 carried up to 4 independent captions all target-dated to the same
+    day, each one a legitimate 1:1 replacement of a DIFFERENT denied row, none a duplicate
+    of each other.
+
+    The fix is narrower than day-coverage ever was: a day is skipped for a NEW backfill
+    placement only once THIS FUNCTION has already placed a backfill replacement there (a
+    durable kv marker, denybf_dayused_<base_key>_<day>, set only after that day's insert
+    genuinely succeeds) — an unrelated published/approved/pending post from any OTHER path
+    still never blocks anything, so Dale's case is untouched. When a denied row's own day
+    already carries this function's own prior placement, the replacement rolls forward to
+    the next day inside the backfill window that does not yet have one; if the whole window
+    is already saturated, it falls back to the row's own original day rather than dropping
+    the replacement (a rare stack is better than a denied slot silently never being filled).
+
     The replacement REUSES a photo (allow_reuse — the gym has no fresh creative left) but
     NEVER the denied post's own photo and NEVER a photo consumed by an approved/published
     row. Every replacement clears the same A+ / banned-word / fabrication gates as a normal
@@ -1716,8 +1737,39 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
     drafts = []
     skipped = 0
     done_row_ids = []
+    used_days_for_marker = []    # every day a replacement was actually placed onto this
+                                 # pass, marked durable AFTER insert succeeds -- unconditional
+                                 # on the denied row having an id, unlike done_row_ids
+    day_used_this_pass = set()   # days this run has already placed a backfill row onto
+
+    def _day_already_used(day_iso):
+        if day_iso in day_used_this_pass:
+            return True
+        try:
+            return bool(_db.kv_get(f"denybf_dayused_{base_key}_{day_iso}"))
+        except Exception:  # noqa: BLE001 - a read failure never blocks a placement
+            return False
+
+    def _next_open_day(original_day):
+        """The first day >= original_day, inside [win_start, win_end], that this
+        function has not already placed a backfill replacement onto. Falls back to
+        original_day (accepting a rare stack) when the whole window is saturated --
+        never leaves a denied row unreplaced for lack of an open day."""
+        d = date.fromisoformat(original_day)
+        end = date.fromisoformat(win_end)
+        while d <= end:
+            iso = d.isoformat()
+            if not _day_already_used(iso):
+                return iso
+            d += timedelta(days=1)
+        return original_day
+
     for denied in todo:
-        day_key = denied["day"]
+        day_key = _next_open_day(denied["day"])
+        if day_key != denied["day"]:
+            log(f"{base_key}: denied row on {denied['day']} already has a backfill "
+                f"replacement there -- rolling this one forward to {day_key} instead "
+                "of stacking")
         # Exclude the denied post's OWN photo (never hand the same one back) + every photo
         # already live on the page. Everything else may be REUSED.
         exclude = set(live_photo_keys)
@@ -1804,6 +1856,8 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
             or os.path.basename(getattr(feed, "creative_path", "") or ""), day_key)
         drafts.extend(_finish_feed_with_story(account, feed, library_path, log,
                                               day_key=day_key))
+        day_used_this_pass.add(day_key)   # so the NEXT denied row this pass rolls past it too
+        used_days_for_marker.append(day_key)
         if denied.get("row_id"):
             done_row_ids.append(denied["row_id"])
 
@@ -1836,12 +1890,17 @@ def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
         log(f"{base_key}: backfill insert failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"insert failed: {type(exc).__name__}",
                 "backfilled": 0, "days_needing": len(todo), "skipped": skipped}
-    # Stamp per-row idempotency ONLY after the insert genuinely succeeded -- a failed
-    # insert must leave every denied row eligible for retry next pass, not silently
-    # marked done with no actual replacement ever written.
+    # Stamp per-row AND per-day idempotency ONLY after the insert genuinely succeeded --
+    # a failed insert must leave every denied row (and its target day) eligible for retry
+    # next pass, not silently marked done/used with no actual replacement ever written.
     for rid in done_row_ids:
         try:
             _db.kv_set(f"denybf_done_{rid}", "1")
+        except Exception:  # noqa: BLE001 - a marker failure never blocks the backfill itself
+            pass
+    for used_day in used_days_for_marker:
+        try:
+            _db.kv_set(f"denybf_dayused_{base_key}_{used_day}", "1")
         except Exception:  # noqa: BLE001 - a marker failure never blocks the backfill itself
             pass
     days_done = len({r.get("post_date") for r in clean_rows
