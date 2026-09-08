@@ -49,11 +49,12 @@ from . import rotation as _rotation
 from .drafter import DraftStatus
 
 
-# The server-enforced recreate budget: 15 denies per calendar month per gym. This is
-# NOT read from tenant data (which can default to zero); Part B guarantees every
-# social gym the same 15. A deny burns one unit; the 16th deny in a month is refused
-# with 409 so the gym asks for a fresh concept instead of burning the queue.
-MONTHLY_RECREATE_BUDGET = 15
+# The server-enforced recreate budget: 30 denies per calendar month per gym (raised
+# from 15, Blake 2026-09-08). This is NOT read from tenant data (which can default
+# to zero); Part B guarantees every social gym the same 30. A deny burns one unit;
+# the 31st deny in a month is refused with 409 so the gym asks for a fresh concept
+# instead of burning the queue.
+MONTHLY_RECREATE_BUDGET = 30
 
 
 # ==========================================================================

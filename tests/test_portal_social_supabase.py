@@ -311,12 +311,12 @@ def test_deny_sets_status_denied_and_charges_budget(db_tmp, monkeypatch):
     assert body["ok"] is True and body["action"] == "deny"
     assert store.patches == [("id-1", "denied")]
     assert ps.recreate_spent("lasso") == 1, "a successful deny burns one unit"
-    assert body["recreate_budget"]["remaining"] == 14
+    assert body["recreate_budget"]["remaining"] == ps.MONTHLY_RECREATE_BUDGET - 1
 
 
 def test_deny_409_when_budget_exhausted_no_write(db_tmp, monkeypatch):
     store = _FakeStore([_row("id-1", status="pending")])
-    for _ in range(15):
+    for _ in range(ps.MONTHLY_RECREATE_BUDGET):
         ps.spend_recreate("lasso")
     status, body = ps.handle_deny("lasso", "id-1", "U_owner", note="x", sb_store=store)
     assert status == 409
