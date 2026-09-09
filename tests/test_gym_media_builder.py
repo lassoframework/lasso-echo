@@ -155,3 +155,68 @@ def test_exclude_ids_keeps_a_caller_named_asset_out_of_the_pick(monkeypatch, tmp
     assert store.assets["denied_one"]["used_count"] == 0, (
         "the excluded asset must never be picked or stamped used"
     )
+
+
+# ---- vision allowlist gate (vision_allowlist_watch drift report, 2026-09) --------------
+
+def test_vision_never_called_for_a_gym_not_on_the_allowlist(monkeypatch, tmp_path):
+    """The exact live drift: AGENT_VISION_GYMS gates every other vision caller, but
+    this Drive lane called vision.analyze_and_store unconditionally -- confirmed live,
+    real gyms (crossfitlocal, crossfitreverb30b5b2, hillcountry, zanshinfitness630e22,
+    others) burning vision spend despite never being armed. A gym not on the allowlist
+    must get zero vision calls, and still stage successfully (ungrounded caption)."""
+    monkeypatch.delenv("AGENT_VISION_GYMS", raising=False)   # pierce is armed nowhere
+    calls = []
+    monkeypatch.setattr("agent.vision.analyze_and_store",
+                        lambda path, gym=None, alert=None: calls.append(gym) or {
+                            "version": 2, "quality": {"usable": True},
+                            "safety_flags": [], "one_line": "three people at the gym"})
+    monkeypatch.setattr("agent.vision.auto_plannable", lambda a: (True, []))
+    monkeypatch.setattr("agent.vision.crop_verify",
+                        lambda b, a, **k: (_ for _ in ()).throw(
+                            AssertionError("crop_verify must not run without an analysis")))
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: ("An ungrounded caption, no vision analysis", []))
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, gym: "https://cdn.fake/served.jpg")
+
+    store = FakeMediaStore(assets=[make_asset("p1", gym_id="pierce", kind="photo")])
+    drive = FakeDrive(blobs={"p1": b"jpgbytes"})
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=drive, library_dir=str(tmp_path))
+
+    assert calls == [], "vision.analyze_and_store must never be called for an unarmed gym"
+    assert draft is not None, "the slot must still stage, just without vision grounding"
+    assert draft.status == DraftStatus.PENDING
+    assert draft.caption == "An ungrounded caption, no vision analysis"
+
+
+def test_vision_still_called_for_a_gym_on_the_allowlist(monkeypatch, tmp_path):
+    """Regression guard for the fix above: an ARMED gym must keep getting vision
+    exactly as before -- the allowlist gate must not accidentally turn OFF vision
+    for gyms that are supposed to have it."""
+    monkeypatch.setenv("AGENT_VISION_GYMS", "pierce")
+    calls = []
+    monkeypatch.setattr("agent.vision.analyze_and_store",
+                        lambda path, gym=None, alert=None: calls.append(gym) or {
+                            "version": 2, "quality": {"usable": True},
+                            "safety_flags": [], "one_line": "three people at the gym"})
+    monkeypatch.setattr("agent.vision.auto_plannable", lambda a: (True, []))
+    monkeypatch.setattr("agent.vision.crop_verify",
+                        lambda b, a, **k: {"ok": True, "bucket": "small_group",
+                                           "verified_details": []})
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: ("A grounded caption about the class", []))
+    monkeypatch.setattr("agent.media_host.host_media",
+                        lambda path, gym: "https://cdn.fake/served.jpg")
+
+    store = FakeMediaStore(assets=[make_asset("p1", gym_id="pierce", kind="photo")])
+    drive = FakeDrive(blobs={"p1": b"jpgbytes"})
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=drive, library_dir=str(tmp_path))
+
+    assert calls == ["pierce"], "an armed gym must still get vision, exactly as before"
+    assert draft is not None
+    assert draft.status == DraftStatus.PENDING
