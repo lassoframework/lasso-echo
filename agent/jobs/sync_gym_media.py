@@ -298,8 +298,76 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
     return flipped
 
 
+def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
+                    budget_n, host_fn=None):
+    """Render (or pre-host) up to the budget's worth of eligible videos that carry no
+    rendition_url yet. Returns (rendered, prehosted, skipped). Never raises: one bad
+    file never sinks the sync; a spent budget or a timed-out clip ends the pass."""
+    from .. import media_host as _mh
+    host_fn = host_fn or _mh.host_media
+    probe_fn = probe_fn or _idx.probe_video
+    if budget_n <= 0:
+        return 0, 0, 0
+    cands = [a for a in merged.values()
+             if a["id"] in seen_ids
+             and a.get("kind") == _idx.KIND_VIDEO
+             and a.get("eligible") is True
+             and not a.get("rendition_url")]
+    cands.sort(key=lambda a: (int(a.get("used_count") or 0), str(a.get("id"))))
+    budget = _idx.RenditionBudget(budget_n)
+    rendered = prehosted = skipped = 0
+    for asset in cands[: budget_n * 2]:
+        # A spent budget stops TRANSCODES (RenditionBudgetExhausted below), not the
+        # pre-hosting of already-playable clips later in the list.
+        tmp_dir = tempfile.mkdtemp(prefix="gymrender_")
+        tmp_path = Path(tmp_dir) / os.path.basename(asset.get("title") or "clip.bin")
+        try:
+            drive.download(asset["id"], tmp_path)
+            info = probe_fn(tmp_path)
+            if not info:
+                skipped += 1
+                continue
+            if _idx.needs_rendition(asset, info):
+                url, _conv = _idx.ensure_rendition(asset, tmp_path, store=store,
+                                                   probe_info=info, budget=budget,
+                                                   host_fn=host_fn)
+                if url:
+                    rendered += 1
+                    log(f"pre-rendered {asset.get('title')!r} for {gym_id}")
+                else:
+                    skipped += 1        # converter unavailable: builder marks it
+            else:
+                url = host_fn(str(tmp_path), gym_id)
+                if url:
+                    key = _mh._key_from_public_url(url) or _idx.rendition_key(
+                        gym_id, asset.get("content_hash"), _idx._ext(asset.get("title")))
+                    _idx._persist_rendition(store, asset, key, url)
+                    prehosted += 1
+                else:
+                    skipped += 1
+        except _idx.RenditionBudgetExhausted:
+            skipped += 1                    # waits for tomorrow's budget
+        except _idx.RenditionTimeout as e:
+            skipped += 1
+            log(f"pre-render timed out for {asset.get('title')!r}: {e}")
+        except Exception as e:  # noqa: BLE001 - one bad file never sinks the pass
+            skipped += 1
+            log(f"pre-render failed for {asset.get('title')!r}: {type(e).__name__}: {e}")
+        finally:
+            try:
+                for name in os.listdir(tmp_dir):
+                    os.unlink(os.path.join(tmp_dir, name))
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+    if rendered or prehosted or skipped:
+        log(f"{gym_id}: pre-render pass rendered {rendered}, pre-hosted {prehosted}, "
+            f"skipped {skipped} (budget {budget_n})")
+    return rendered, prehosted, skipped
+
+
 def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
-                now_iso=None, probe_budget=None):
+                now_iso=None, probe_budget=None, render_budget=None, host_fn=None):
     """Sync ONE media_source. Returns a per-source summary dict. Never raises out of
     a normal degrade path; a 403 on the walk marks the source revoked_externally and
     returns a revoked summary."""
@@ -463,6 +531,19 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         if r.get("eligible") is False and r.get("reject_reason"):
             reject_counts[r["reject_reason"]] += 1
 
+    # 5b. budgeted PRE-RENDER pass (audit R-D1 #5): eligible videos with no
+    # rendition_url are downloaded, probed for codec, and either transcoded to an
+    # H.264 .mp4 (HEVC / odd container, counts against RENDITION_MAX_PER_SYNC) or,
+    # when already web-playable, hosted as-is and persisted as their own rendition so
+    # the month build never re-hosts them and this pass never re-downloads them.
+    # Bounded: at most 2x the transcode budget in candidates per source per run;
+    # converges across nights. Runs on the same synced-asset view as the probe pass.
+    rendered, prehosted, render_skipped = _prerender_pass(
+        gym_id, drive, store, merged, seen_ids, probe_fn, log,
+        budget_n=(config.rendition_max_per_sync() if render_budget is None
+                  else int(render_budget)),
+        host_fn=host_fn)
+
     # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
     # finished / ambiguous. AMBIGUOUS queues for a human (or auto-sorts); a
     # CONFIDENT FINISHED verdict is quarantined out of the raw pool (see
@@ -483,7 +564,8 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
         "updated": updated, "probed": probed, "newly_eligible": newly_eligible,
         "removed": removed, "skipped": len(skipped),
         "rejected": dict(reject_counts), "new_rows": len(new_rows),
-        "queued_ambiguous": queued_ambiguous}
+        "queued_ambiguous": queued_ambiguous,
+        "rendered": rendered, "prehosted": prehosted, "render_skipped": render_skipped}
     # 7. per-gym new-asset digest (only when something new arrived)
     if inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \
@@ -507,7 +589,7 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
 
 
 def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
-        sleep=None, probe_budget=None):
+        sleep=None, probe_budget=None, render_budget=None):
     """One sync pass over every active gym-drive source the lane is armed for.
     Returns a roll-up summary; never raises out of a normal degrade path."""
     log = log or (lambda m: print(f"[gym-media] {m}"))
@@ -561,7 +643,8 @@ def run(drive=None, store=None, probe_fn=None, log=None, now_iso=None,
         try:
             results.append(sync_source(
                 source, drive=drive, store=store, probe_fn=probe_fn, log=log,
-                now_iso=now_iso, probe_budget=probe_budget))
+                now_iso=now_iso, probe_budget=probe_budget,
+                render_budget=render_budget))
         except Exception as e:  # noqa: BLE001 - one source never sinks the run
             log(f"source {source.get('id')} failed: {type(e).__name__}: {e}")
             results.append({"ok": False, "error": type(e).__name__,

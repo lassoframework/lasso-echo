@@ -137,8 +137,12 @@ def _feeds(store):
 # ---- 2c: never an empty day ---------------------------------------------------------
 def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatch,
                                                                        tmp_path):
-    """3 pickable assets, 10 days, a stale 5-photo library: 10 feed days = 3 Drive +
-    7 spaced repeats. Before this fix: 3 posts and 7 EMPTY days."""
+    """3 pickable assets, 10 days, a stale 5-photo library. Round 2 filled all 10
+    days (3 Drive + 7 repeats) and thereby repealed Blake's standing rule (N photos ->
+    at most N feeds, never pad). Round 3 (audit R-A1): the media cap binds the whole
+    build. max_feed_days = 5 photos; the 3 Drive feeds count against it, so the
+    fallback may add at most 2 spaced repeats; the other 5 deferred days stay
+    UNCOVERED exactly as they would have before the PR."""
     _sources()
     _stale_ledger(monkeypatch)
     store = FakeMediaStore(assets=[make_asset(f"a{i}", gym_id="gritx", title=f"t{i}.jpg")
@@ -151,13 +155,39 @@ def test_partial_pool_fills_every_day_three_drive_then_spaced_repeats(monkeypatc
                                  logger=logs.append)
     assert out["ok"] is True
     feeds = _feeds(cal)
-    assert len({r["post_date"] for r in feeds}) == 10, "an empty day is never acceptable"
     drive = [r for r in feeds if r.get("source_media_asset_id")]
     repeats = [r for r in feeds if not r.get("source_media_asset_id")]
-    assert len(drive) == 3 and len(repeats) == 7
-    assert sum("placed a spaced repeat" in m for m in logs) == 7
-    # the repeats are spread: 5 distinct photos before any photo is used twice
-    assert len({r["image_url"] for r in repeats}) == 5
+    assert len(drive) == 3 and len(repeats) == 2, "cap = 5 photos -> 3 Drive + 2 repeats"
+    assert len({r["post_date"] for r in feeds}) == 5
+    assert sum("placed a spaced repeat" in m for m in logs) == 2
+    assert any("filling 2 of 7 deferred day(s)" in m for m in logs), logs
+    assert len({r["image_url"] for r in repeats}) == 2
+    # the truthful digest names the Drive pool, and the small-library alert stays quiet
+    # (5 photos vs 5 covered days is not "smaller than the book")
+    assert any("Drive pool ran short; 2 day(s)" in m for m in logs)
+
+
+def test_two_photos_one_drive_asset_never_pads_past_the_cap(monkeypatch, tmp_path):
+    """Blake's rule verbatim: 2 photos + 1 Drive asset on a 30-day span -> 2 feeds
+    (1 Drive + 1 repeat), 28 days uncovered. Pre-PR this gym got 2 feeds; it must
+    not get 30 now."""
+    _sources()
+    _stale_ledger(monkeypatch, n=2)
+    store = FakeMediaStore(assets=[make_asset("only", gym_id="gritx", title="t.jpg")])
+    _arm(monkeypatch, store, FakeDrive())
+    cal = _CalStore()
+    logs = []
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=30, voice=_voice(),
+                                 library_path=_lib(tmp_path, n=2), store=cal, banned_words=(),
+                                 logger=logs.append)
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    drive = [r for r in feeds if r.get("source_media_asset_id")]
+    repeats = [r for r in feeds if not r.get("source_media_asset_id")]
+    assert len(drive) == 1
+    assert len(repeats) <= 2 and len(feeds) == 2, f"{len(feeds)} feeds on a 2-photo gym"
+    assert len({r["post_date"] for r in feeds}) == 2
+    assert any("stay uncovered under the media cap" in m for m in logs), logs
 
 
 def test_tough_temple_like_pool_yields_zero_repeats(monkeypatch, tmp_path):
@@ -471,3 +501,397 @@ def test_facebook_video_row_publishes_through_the_real_publisher(monkeypatch):
     # and the client it goes through types that url as a video
     from agent import zernio
     assert zernio._media_type(calls["media_urls"][0]) == "video"
+
+
+# =====================================================================================
+# Round 3 (re-audit still B): R-A1 cap (above), R-D1 rendition budget, 3c/D3 residuals,
+# the Drive-lane A+ gate, D1 residual.
+# =====================================================================================
+from agent import gym_media_index as _gmi  # noqa: E402
+
+
+class _Proc:
+    def __init__(self, rc=0):
+        self.returncode = rc
+
+
+def test_hevc_to_h264_is_budgeted_scaled_and_fast(tmp_path):
+    """Audit R-D1 #2: preset veryfast, crf 23, long edge <= 1080, faststart, 180 s."""
+    seen = {}
+
+    def runner(args, **kw):
+        seen["args"], seen["kw"] = args, kw
+        out = args[-1]
+        with open(out, "wb") as fh:
+            fh.write(b"x")
+        return _Proc(0)
+    dest = tmp_path / "out.mp4"
+    _gmi.hevc_to_h264(tmp_path / "in.mov", dest, runner=runner)
+    a = seen["args"]
+    assert a[a.index("-preset") + 1] == "veryfast" and a[a.index("-crf") + 1] == "23"
+    assert "+faststart" in a and "libx264" in a
+    vf = a[a.index("-vf") + 1]
+    assert "min(1080,iw)" in vf and "force_original_aspect_ratio=decrease" in vf
+    assert seen["kw"]["timeout"] == _gmi.RENDITION_TIMEOUT_SEC == 180
+
+
+def test_hevc_to_h264_timeout_is_transient_not_unavailable(tmp_path):
+    import subprocess
+
+    def slow(args, **kw):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=kw.get("timeout"))
+    with pytest.raises(_gmi.RenditionTimeout):
+        _gmi.hevc_to_h264(tmp_path / "in.mov", tmp_path / "o.mp4", runner=slow, timeout=7)
+    assert not issubclass(_gmi.RenditionTimeout, _gmi.ConversionUnavailable)
+
+
+def test_needs_rendition_catches_hevc_in_an_mp4_container():
+    """Audit R-D1 #1: an HEVC .mp4 was never probed (hint list was ('.mov',))."""
+    mp4 = make_asset("v", gym_id="g", kind="video", title="clip.mp4", mime="video/mp4")
+    assert _gmi.needs_rendition(mp4, {"codec": "hevc"}) is True
+    assert _gmi.needs_rendition(mp4, {"codec": "h264"}) is False
+    assert _gmi.needs_rendition(mp4, None) is False            # publishable container
+    mkv = make_asset("v", gym_id="g", kind="video", title="clip.mkv")
+    assert _gmi.needs_rendition(mkv, {"codec": "h264"}) is True
+    heic = make_asset("p", gym_id="g", kind="photo", title="IMG.HEIC", mime="image/heic")
+    assert _gmi.needs_rendition(heic) is True
+
+
+def test_ensure_rendition_probes_every_video_and_persists_the_real_key(monkeypatch, tmp_path):
+    monkeypatch.setattr("agent.config.S3_PUBLIC_BASE_URL", "https://pub.r2.dev")
+    asset = make_asset("v1", gym_id="gritx", kind="video", title="clip.mp4", mime="video/mp4")
+    store = FakeMediaStore(assets=[asset])
+    calls = []
+
+    def fake_h264(src, dest, timeout=None):
+        calls.append(timeout)
+        with open(dest, "wb") as fh:
+            fh.write(b"mp4")
+        return dest
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"hevc-bytes")
+    url, conv = _gmi.ensure_rendition(
+        asset, src, store=store, hevc_fn=fake_h264,
+        probe_fn=lambda p: {"codec": "hevc", "duration_sec": 10, "width": 1080, "height": 1920},
+        host_fn=lambda path, gym: f"https://pub.r2.dev/echo/{gym}/abc123/{os.path.basename(path)}")
+    assert conv is True and url.endswith(".mp4") and calls == [180]
+    assert store.assets["v1"]["rendition_url"] == url
+    assert store.assets["v1"]["rendition_key"] == f"echo/gritx/abc123/{os.path.basename(url)}", \
+        "rendition_key must be the REAL R2 key host_media wrote, not the lookup key"
+
+
+def test_ensure_rendition_respects_the_budget_and_never_encodes_past_it(tmp_path):
+    asset = make_asset("v1", gym_id="gritx", kind="video", title="clip.mov")
+    store = FakeMediaStore(assets=[asset])
+    budget = _gmi.RenditionBudget(1)
+    encoded = []
+
+    def fake_h264(src, dest, timeout=None):
+        encoded.append(1)
+        with open(dest, "wb") as fh:
+            fh.write(b"mp4")
+        return dest
+    info = {"codec": "hevc", "duration_sec": 10, "width": 1080, "height": 1920}
+    url, _ = _gmi.ensure_rendition(asset, tmp_path / "a.mov", store=store, hevc_fn=fake_h264,
+                                   probe_info=info, budget=budget,
+                                   host_fn=lambda p, g: "https://cdn/a.mp4")
+    assert url and budget.spent and encoded == [1]
+    second = make_asset("v2", gym_id="gritx", kind="video", title="b.mov")
+    with pytest.raises(_gmi.RenditionBudgetExhausted):
+        _gmi.ensure_rendition(second, tmp_path / "b.mov", store=store, hevc_fn=fake_h264,
+                              probe_info=info, budget=budget,
+                              host_fn=lambda p, g: "https://cdn/b.mp4")
+    assert encoded == [1], "a spent budget must not encode"
+    # a video that needs no rendition costs nothing
+    plain = make_asset("v3", gym_id="gritx", kind="video", title="c.mp4")
+    assert _gmi.ensure_rendition(plain, tmp_path / "c.mp4", store=store, budget=budget,
+                                 probe_info={"codec": "h264"}) == (None, False)
+
+
+def test_builder_never_hosts_raw_hevc_when_the_budget_is_spent(monkeypatch, tmp_path):
+    """The exact Tough Temple failure: 56 HEVC .mov clips, 0 renditioned. Budget spent
+    -> the clip is skipped (rendition_missing, STILL eligible for the nightly pass),
+    never staged raw because ".mov is a publishable container"."""
+    store = FakeMediaStore(assets=[make_asset("hv", gym_id="gritx", kind="video",
+                                              title="squat.mov", mime="video/quicktime")])
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr("agent.gym_media_index.probe_video",
+                        lambda p: {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                                   "codec": "hevc"})
+    monkeypatch.setattr(_gmi, "hevc_to_h264",
+                        lambda *a, **k: pytest.fail("a spent budget must not encode"))
+
+    class _A:
+        key = "gritx_ig"
+        platform = "instagram"
+    spent = _gmi.RenditionBudget(0)
+    draft = builder.build_gym_media_draft(_A(), "2026-08-03", "faces", voice=object(),
+                                          source=object(), store=store, drive=FakeDrive(),
+                                          library_dir=str(tmp_path), now=NOW,
+                                          rendition_budget=spent)
+    assert draft is None, "raw HEVC must never become a row"
+    a = store.assets["hv"]
+    # a spent budget never even PICKS an unrenditioned video (nothing to transcode it
+    # with), so the asset is untouched: still eligible, still unstamped, nothing hosted
+    assert a["eligible"] is True and a["used_count"] == 0 and not a.get("rendition_url")
+
+
+def test_builder_transcode_timeout_skips_the_clip_transiently(monkeypatch, tmp_path):
+    store = FakeMediaStore(assets=[make_asset("hv", gym_id="gritx", kind="video",
+                                              title="squat.mov")])
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr("agent.gym_media_index.probe_video",
+                        lambda p: {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                                   "codec": "hevc"})
+
+    def slow(src, dest, timeout=None):
+        raise _gmi.RenditionTimeout("ffmpeg ran past 180s")
+    monkeypatch.setattr(_gmi, "hevc_to_h264", slow)
+
+    class _A:
+        key = "gritx_ig"
+        platform = "instagram"
+    draft = builder.build_gym_media_draft(_A(), "2026-08-03", "faces", voice=object(),
+                                          source=object(), store=store, drive=FakeDrive(),
+                                          library_dir=str(tmp_path), now=NOW,
+                                          rendition_budget=_gmi.RenditionBudget(8))
+    assert draft is None
+    assert store.assets["hv"]["reject_reason"] == _gmi.REJECT_RENDITION_MISSING
+    assert store.assets["hv"]["eligible"] is True
+
+
+def test_builder_with_spent_budget_prefers_renditioned_videos_then_photos(monkeypatch,
+                                                                          tmp_path):
+    """Audit R-D1 #3: budget spent -> a video already carrying a rendition_url is
+    picked over a never-used unrenditioned one; with no renditioned video left the
+    slot falls back to a photo, without encoding anything."""
+    store = FakeMediaStore(assets=[
+        make_asset("raw1", gym_id="gritx", kind="video", title="raw1.mov"),
+        make_asset("rend", gym_id="gritx", kind="video", title="rend.mov", used_count=0),
+        make_asset("p1", gym_id="gritx", kind="photo", title="p.jpg")])
+    store.assets["rend"]["rendition_url"] = "https://cdn.fake/rend.mp4"
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr(_gmi, "hevc_to_h264",
+                        lambda *a, **k: pytest.fail("a spent budget must not encode"))
+
+    class _A:
+        key = "gritx_ig"
+        platform = "instagram"
+    vday = next(d for d in (date(2026, 8, 1) + timedelta(days=i) for i in range(12))
+                if builder.is_video_slot(d.isoformat()))
+    spent = _gmi.RenditionBudget(0)
+    first = builder.build_gym_media_draft(_A(), vday, "faces", voice=object(),
+                                          source=object(), store=store, drive=FakeDrive(),
+                                          library_dir=str(tmp_path), now=NOW,
+                                          rendition_budget=spent)
+    assert first.source_media_asset_id == "rend"
+    assert first.creative_public_url == "https://cdn.fake/rend.mp4"
+    second = builder.build_gym_media_draft(_A(), vday, "faces", voice=object(),
+                                           source=object(), store=store, drive=FakeDrive(),
+                                           library_dir=str(tmp_path), now=NOW,
+                                           rendition_budget=spent, exclude_ids=("rend",))
+    assert second.source_media_asset_id == "p1", "no renditioned video left -> a photo"
+    assert store.assets["raw1"]["used_count"] == 0
+
+
+def test_month_build_threads_one_budget_of_rendition_max_per_build(monkeypatch, tmp_path):
+    monkeypatch.setenv("RENDITION_MAX_PER_BUILD", "2")
+    _sources()
+    _stale_ledger(monkeypatch)
+    store = FakeMediaStore(assets=[make_asset(f"hv{i}", gym_id="gritx", kind="video",
+                                              title=f"c{i}.mov") for i in range(5)])
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr("agent.gym_media_index.probe_video",
+                        lambda p: {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                                   "codec": "hevc"})
+    encoded = []
+
+    def fake_h264(src, dest, timeout=None):
+        encoded.append(os.path.basename(str(src)))
+        with open(dest, "wb") as fh:
+            fh.write(b"mp4")
+        return dest
+    monkeypatch.setattr(_gmi, "hevc_to_h264", fake_h264)
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=5, voice=_voice(),
+                                 library_path=_lib(tmp_path), store=cal, banned_words=())
+    assert out["ok"] is True
+    assert len(encoded) == 2, f"RENDITION_MAX_PER_BUILD=2 but encoded {encoded}"
+    drive = [r for r in _feeds(cal) if r.get("source_media_asset_id")]
+    assert len(drive) == 2 and all(r["image_url"].endswith(".mp4") for r in drive)
+    # the three clips the budget did not reach are untouched and still eligible for
+    # the nightly pre-render pass; none was hosted raw
+    rest = [a for a in store.assets.values() if not a.get("rendition_url")]
+    assert len(rest) == 3 and all(a["eligible"] is True and a["used_count"] == 0
+                                  for a in rest)
+    # and the days the pool could not cover fell to spaced repeats under the cap
+    assert len({r["post_date"] for r in _feeds(cal)}) == 5
+
+
+def test_swap_materialize_is_bounded_and_never_returns_raw_hevc(monkeypatch, tmp_path):
+    from agent import media_swap as msw
+    monkeypatch.setattr(_gmi, "probe_video",
+                        lambda p: {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                                   "codec": "hevc"})
+    seen = {}
+
+    def slow(src, dest, timeout=None):
+        seen["timeout"] = timeout
+        raise _gmi.RenditionTimeout("too slow")
+    monkeypatch.setattr(_gmi, "hevc_to_h264", slow)
+    asset = make_asset("hv", gym_id="gritx", kind="video", title="squat.mov")
+    cand = {"source": "drive", "kind": "video", "key": "hv", "asset": asset}
+    out = msw._materialize("gritx", cand, str(tmp_path), drive=FakeDrive(),
+                           media_store=FakeMediaStore(assets=[asset]))
+    assert out is None, "a timed-out transcode means next candidate, never raw HEVC"
+    assert seen["timeout"] == msw.SWAP_TRANSCODE_TIMEOUT_SEC == 45
+
+
+def test_sync_prerender_pass_renders_within_budget_and_prehosts_playable_clips(monkeypatch):
+    from agent.jobs import sync_gym_media as job
+    monkeypatch.setattr("agent.config.S3_PUBLIC_BASE_URL", "https://pub.r2.dev")
+    assets = [make_asset("h1", gym_id="gritx", kind="video", title="a.mov"),
+              make_asset("h2", gym_id="gritx", kind="video", title="b.mov"),
+              make_asset("h3", gym_id="gritx", kind="video", title="c.mov"),
+              make_asset("ok", gym_id="gritx", kind="video", title="d.mp4"),
+              make_asset("done", gym_id="gritx", kind="video", title="e.mov"),
+              make_asset("unp", gym_id="gritx", kind="video", title="f.mov", eligible=None),
+              make_asset("ph", gym_id="gritx", kind="photo")]
+    assets[4]["rendition_url"] = "https://cdn/e.mp4"          # already rendered
+    store = FakeMediaStore(assets=assets)
+    encoded = []
+
+    def fake_h264(src, dest, timeout=None):
+        encoded.append(os.path.basename(str(src)))
+        with open(dest, "wb") as fh:
+            fh.write(b"mp4")
+        return dest
+    monkeypatch.setattr(_gmi, "hevc_to_h264", fake_h264)
+    hosted = []
+
+    def host(path, gym):
+        hosted.append(os.path.basename(path))
+        return f"https://pub.r2.dev/echo/{gym}/k/{os.path.basename(path)}"
+
+    def probe(p):
+        return {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                "codec": "h264" if str(p).endswith(".mp4") else "hevc"}
+    merged = {a["id"]: dict(a) for a in store.assets.values()}
+    rendered, prehosted, skipped = job._prerender_pass(
+        "gritx", FakeDrive(), store, merged, set(merged), probe, lambda m: None,
+        budget_n=2, host_fn=host)
+    assert rendered == 2 and len(encoded) == 2, "RENDITION_MAX_PER_SYNC binds"
+    assert prehosted == 1 and "d.mp4" in hosted, "a playable clip is hosted as-is once"
+    assert store.assets["ok"]["rendition_url"].endswith("d.mp4")
+    assert store.assets["ok"]["rendition_key"].startswith("echo/gritx/")
+    assert not store.assets["unp"].get("rendition_url")
+    assert not store.assets["h3"].get("rendition_url"), "third HEVC clip waits for tomorrow"
+    assert skipped == 1, "the over-budget HEVC clip is counted, not silently dropped"
+
+
+def test_sync_source_threads_render_budget(monkeypatch):
+    from agent.jobs import sync_gym_media as job
+    monkeypatch.setenv("RENDITION_MAX_PER_SYNC", "3")
+    monkeypatch.setattr(job, "_post_digest", lambda *a, **k: None)
+    seen = {}
+
+    def fake_pass(*a, **k):
+        seen.update(k)
+        return 0, 0, 0
+    monkeypatch.setattr(job, "_prerender_pass", fake_pass)
+    from tests.gym_media_fakes import make_source
+    store = FakeMediaStore(sources=[make_source(gym_id="gritx")], assets=[])
+    out = job.sync_source(make_source(gym_id="gritx"), drive=FakeDrive(), store=store,
+                          probe_fn=lambda p: None, log=lambda m: None)
+    assert out["ok"] and seen["budget_n"] == 3
+    assert {"rendered", "prehosted", "render_skipped"} <= set(out)
+
+
+# ---- D3 residual -------------------------------------------------------------------
+def test_a_raise_between_release_and_apply_restores_the_released_stamps(monkeypatch,
+                                                                         tmp_path):
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    sel.stamp_use(store.get_asset("a1"), "gritx", "2026-08-01", store=store)
+    cal = _CalStore(existing=_pending_drive_rows(["a1"]))
+
+    def boom(*a, **k):
+        raise RuntimeError("mid-build crash")
+    # the ask-coverage lane sits between the picks and the apply and is not wrapped
+    monkeypatch.setenv("ECHO_GYM_ASK_COVERAGE", "true")
+    monkeypatch.setattr(cmr, "_approved_gym_ask", boom)
+    with pytest.raises(RuntimeError):
+        cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1, voice=_voice(),
+                               library_path=_lib(tmp_path, n=0), store=cal, banned_words=())
+    assert store.assets["a1"]["used_count"] == 1, "released stamp must be restored"
+    assert len(cal.existing) == 3
+
+
+def test_delete_ok_but_insert_failed_rolls_back_this_builds_new_stamps(monkeypatch,
+                                                                       tmp_path):
+    _sources()
+    _stale_ledger(monkeypatch)
+    store = FakeMediaStore(assets=[make_asset("n1", gym_id="gritx"),
+                                   make_asset("old", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    sel.stamp_use(store.get_asset("old"), "gritx", "2026-08-01", store=store)
+
+    class _Broken(_CalStore):
+        def insert_rows(self, base_key, rows):
+            raise RuntimeError("insert failed")
+    cal = _Broken(existing=_pending_drive_rows(["old"]))
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1, voice=_voice(),
+                                 library_path=_lib(tmp_path), store=cal, banned_words=())
+    assert out["ok"] is False and out.get("deleted", 0) > 0
+    picked = [a for a in ("n1", "old") if store.assets[a]["used_count"]]
+    assert picked == [], "an unlanded pick must not keep its stamp; deleted rows stay free"
+
+
+# ---- the Drive lane runs the A+ gate --------------------------------------------------
+def test_drive_lane_drops_a_caption_that_fails_the_a_plus_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="gritx"),
+                                   make_asset("a2", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    from agent import post_quality
+    verdicts = iter([False, True])
+    monkeypatch.setattr(post_quality, "is_a_plus",
+                        lambda draft, banned, require_media=True: next(verdicts))
+    logs = []
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 2, _voice(),
+                                        log=logs.append, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), banned_words=("x",))
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    assert len(feeds) == 1, "the failing caption must be dropped"
+    assert any("failed the A+/banned-word gate" in m for m in logs)
+    counts = sorted(store.assets[a]["used_count"] for a in ("a1", "a2"))
+    assert counts == [0, 1], "the dropped draft's asset returns to the pool"
+
+
+def test_drive_lane_banned_word_gate_without_sb7(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_SB7_ENABLED", raising=False)
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="gritx")])
+    _arm(monkeypatch, store, FakeDrive())
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: ("Join our BOOTCAMP today", []))
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 1, _voice(),
+                                        log=lambda m: None, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path),
+                                        banned_words=("bootcamp",))
+    assert extra == [] and store.assets["a1"]["used_count"] == 0
+
+
+# ---- D1 residual ---------------------------------------------------------------------
+def test_story_reburn_and_meta_publisher_use_the_shared_video_definition():
+    from agent import meta_publisher, story_reburn
+    assert story_reburn._VIDEO_EXTS is mt.VIDEO_EXTS
+    assert meta_publisher.is_video_url is mt.is_video_url
+    for ext in mt.VIDEO_EXTS:
+        assert meta_publisher._is_video(f"https://cdn/x{ext}") is True, ext
+    assert meta_publisher._is_video("https://cdn/x.jpg") is False
+    assert meta_publisher._is_video(None) is False

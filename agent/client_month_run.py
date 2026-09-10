@@ -644,17 +644,33 @@ def _rollback_new_drive_drafts(drafts, log):
 
 def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, log, *,
                          deferred_days, covered_days, locked_keys, used_keys, drafts,
-                         store, start, days, edited_story_caps=None):
-    """NO EMPTY DAYS (audit 2c, 2026-09-10). Lane A deferred these days to the Drive
-    pool (every local creative was inside its repeat window and the pool had at least
-    one pickable asset) and the Drive lane did not cover them all: a pool of 3 assets
-    on a 10-day span would otherwise turn 10 repeats into 3 posts and 7 EMPTY days.
-    Place the stale_reuse pick on each still-uncovered deferred day, spaced as far from
-    its other appearances as the book allows (media_guard.spaced_choice), exactly the
-    fallback the denied-slot backfill already uses. One feed+story pair per day: a
-    repeat is a floor, never a full 2x day. Never fabricated; every A+ gate still runs.
+                         store, start, days, edited_story_caps=None, max_fill=None):
+    """NO EMPTY DAYS (audit 2c, 2026-09-10), UNDER THE MEDIA CAP (audit R-A1). Lane A
+    deferred these days to the Drive pool (every local creative was inside its repeat
+    window and the pool had at least one pickable asset) and the Drive lane did not
+    cover them all: a pool of 3 assets on a 10-day span would otherwise turn 10 repeats
+    into 3 posts and 7 EMPTY days. Place the stale_reuse pick on each still-uncovered
+    deferred day, spaced as far from its other appearances as the book allows
+    (media_guard.spaced_choice), exactly the fallback the denied-slot backfill already
+    uses. One feed+story pair per day: a repeat is a floor, never a full 2x day. Never
+    fabricated; every A+ gate still runs.
+
+    max_fill: Blake's standing rule, N photos -> at most N feeds, never pad. The
+    caller passes max_feed_days minus every feed this build already placed (Lane A
+    AND the Drive lane count against the same cap); beyond it days stay uncovered
+    exactly as before this PR. None = no cap (callers always pass one).
     Returns the number of days filled."""
     todo = sorted(d for d in (deferred_days or ()) if d not in covered_days)
+    if max_fill is not None:
+        if max_fill <= 0:
+            if todo:
+                log(f"{base_key}: {len(todo)} deferred day(s) left uncovered, the "
+                    "media cap is already met (N photos, at most N feeds)")
+            return 0
+        if len(todo) > max_fill:
+            log(f"{base_key}: filling {max_fill} of {len(todo)} deferred day(s); the "
+                "rest stay uncovered under the media cap")
+            todo = todo[:max_fill]
     if not todo:
         return 0
     from . import media_guard
@@ -706,8 +722,16 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         log(f"{base_key} {day_key}: Drive pool exhausted for the day; placed a spaced "
             f"repeat ({key}) so the day is never empty")
     if filled:
+        # TRUTHFUL DIGEST (audit R-A3): the reason these days repeated is that the
+        # Drive pool ran short, not that the local library is small. The small-library
+        # digest fires ONLY when the local library really is smaller than the forward
+        # book (fewer usable photos than covered days).
+        log(f"{base_key}: Drive pool ran short; {filled} day(s) filled with spaced "
+            "repeats from the uploaded library")
         try:
-            media_guard.alert_small_library(base_key, todo[0], log)
+            lib_n = len(media_guard.library_keys(library_path))
+            if lib_n and lib_n < len(covered_days):
+                media_guard.alert_small_library(base_key, todo[0], log)
         except Exception:  # noqa: BLE001
             pass
     return filled
@@ -715,7 +739,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             covered_days, drive=None, store=None,
-                            library_path="", slots_per_day=1):
+                            library_path="", slots_per_day=1, banned_words=(),
+                            rendition_budget=None):
     """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
     (gym_media_drive spec §7). This is the production caller of
     gym_media_builder.build_gym_media_draft: for each day in the span that the
@@ -763,7 +788,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 # the same photo/video shape.
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
-                    slot_index=slot_i)
+                    slot_index=slot_i, rendition_budget=rendition_budget)
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
                     f"{type(e).__name__}: {e}")
@@ -771,6 +796,26 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
             if draft is None:
                 # Empty pool / gate miss: the builder already alerted if needed. Stop
                 # this day rather than retry the same starved pool for slot 2.
+                break
+            # A+ GATE (Blake grades calendars; the denied-slot backfill already
+            # enforces this on its Drive-first replacement and the uploaded-media
+            # loop on every pick): a Drive caption that fails A+ / carries a banned
+            # word is DROPPED, its asset returned to the pool, never staged because
+            # it came from a different lane.
+            try:
+                from . import post_quality as _pq
+                _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()), require_media=True)
+                            if config.sb7_enabled()
+                            else not _has_banned_word(getattr(draft, "caption", "") or "",
+                                                      tuple(banned_words or ())))
+            except Exception as e:  # noqa: BLE001 - a gate error is a fail, never a pass
+                log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
+                    f"({type(e).__name__}); dropping the draft")
+                _gate_ok = False
+            if not _gate_ok:
+                log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
+                    "failed the A+/banned-word gate")
+                _rollback_drive_asset(draft, day_key, log)
                 break
             # NEVER THE SAME CONCEPT TWICE IN ONE DAY (the uploaded loop's rule). The
             # slot-offset source rotation above should already differ, but this is the
@@ -924,6 +969,45 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # Days Lane A handed to the Drive pool instead of placing a stale repeat; whatever
     # the Drive lane does not cover is filled by _fill_uncovered_days (never empty).
     drive_deferred_days = set()
+    # ONE transcode budget for the whole build (audit R-D1 #3).
+    from . import gym_media_index as _gmi
+    rendition_budget = _gmi.RenditionBudget(config.rendition_max_per_build())
+    drafts = []
+    # RELEASE -> APPLY is one transaction from the pool's point of view (audit D3
+    # residual): an uncaught raise anywhere between here and the write must put the
+    # released stamps back and undo this build's own unlanded picks.
+    _applied = {"result": None}
+    try:
+        _result = _build_client_month_body(
+            account, base_key, start, days, voice=voice, library_path=library_path,
+            store=store, banned_words=banned_words, log=log, allow_reshape=allow_reshape,
+            media_count=media_count, locked_feed_days=locked_feed_days,
+            used_keys=used_keys, locked_keys=locked_keys, drafts=drafts,
+            drive_deferred_days=drive_deferred_days, rendition_budget=rendition_budget)
+        _applied["result"] = _result
+        return _result
+    finally:
+        _res = _applied["result"] or {}
+        wrote = bool(_res.get("inserted"))
+        if not wrote:
+            # Nothing landed (a no-op, a gate refusal, a raise, or a delete whose
+            # insert then failed): this build's own Drive picks never became rows.
+            _rollback_new_drive_drafts(drafts, log)
+            if not _res.get("deleted"):
+                # ...and the OLD rows survive, so their released assets are stamped
+                # again. (deleted>0 with no insert: the old rows are gone, so their
+                # assets stay free, which is correct.)
+                _restore_released_drive_assets(base_key, released_drive, log)
+        client_content.clear_drive_pool_cache()
+
+
+def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
+                             store, banned_words, log, allow_reshape, media_count,
+                             locked_feed_days, used_keys, locked_keys, drafts,
+                             drive_deferred_days, rendition_budget):
+    """The picking + apply half of build_client_month, split out so the caller can
+    wrap release -> apply in ONE try/finally (see build_client_month)."""
+    from datetime import timedelta
     # Client-EDITED story captions per day: honor them on re-render so a saved story
     # caption is not discarded by the rebuild (Dale, 2026-08-17).
     edited_story_caps = _edited_story_captions(base_key, start, days, store, log)
@@ -950,7 +1034,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
         _used_in_lib = len(used_keys)
     max_feed_days = min(days * slots_per_day, max(0, media_count - _used_in_lib))
 
-    drafts = []
+    # `drafts` is the caller's list (build_client_month's try/finally reads it back to
+    # roll unlanded Drive picks out of the pool); never rebound here.
     skipped_banned = 0
     built_days = 0
     banned_words = tuple(banned_words or ())
@@ -1182,7 +1267,8 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             drive_extra = append_gym_drive_drafts(
                 account, base_key, start, days, voice, log=log,
                 covered_days=covered_days, library_path=library_path,
-                slots_per_day=slots_per_day)
+                slots_per_day=slots_per_day, banned_words=banned_words,
+                rendition_budget=rendition_budget)
             if drive_extra:
                 drafts.extend(drive_extra)
                 # append_gym_drive_drafts tracks coverage on its own copy; the
@@ -1200,12 +1286,18 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     # the book. A repeat is worse than fresh footage; an empty day is worse than both.
     if drive_deferred_days:
         try:
+            # THE MEDIA CAP HOLDS (audit R-A1): Lane A feeds + Drive feeds + these
+            # repeats together never exceed max_feed_days (N photos -> at most N feeds).
+            _drive_feeds = sum(
+                1 for d in drafts
+                if getattr(d, "source_media_asset_id", "") and not getattr(d, "is_story", False))
             filled = _fill_uncovered_days(
                 account, base_key, voice, library_path, banned_words, log,
                 deferred_days=drive_deferred_days, covered_days=covered_days,
                 locked_keys=locked_keys, used_keys=used_keys, drafts=drafts,
                 store=store, start=start, days=days,
-                edited_story_caps=edited_story_caps)
+                edited_story_caps=edited_story_caps,
+                max_fill=max_feed_days - built_feeds - _drive_feeds)
             if filled:
                 built_feeds += filled
                 built_days += filled
@@ -1272,14 +1364,9 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     result = _apply(base_key, rows, start, days, store, log,
                     locked_days=locked_feed_days, allow_reshape=allow_reshape)
     # NOTHING WRITTEN (never-wipe-to-empty, never-shrink, a gate refusal, a store
-    # failure before the delete): the old rows survive, so their released Drive assets
-    # are stamped again, and this build's own Drive drafts never landed, so their
-    # build-time stamps are rolled back. Both idempotent; a rebuild is now safe to run
-    # any number of times (audit D3).
-    if not (result.get("inserted") or result.get("deleted")):
-        _restore_released_drive_assets(base_key, released_drive, log)
-        _rollback_new_drive_drafts(drafts, log)
-    client_content.clear_drive_pool_cache()
+    # failure): build_client_month's try/finally reads `inserted` / `deleted` off this
+    # result and restores the released stamps / rolls back this build's unlanded picks
+    # (audit D3 + residual). Nothing to do here.
     result["gbp_mirrored"] = len(_gbp_rows)
     result["days"] = built_days
     result["feeds"] = built_feeds
@@ -1332,6 +1419,10 @@ def _attach_video_poster(account, draft, library_path, log):
     card. Best effort: no poster just means the existing blank, never a blocked post."""
     path = (getattr(draft, "creative_path", "") or "").strip()
     if not path or not path.lower().endswith(_VIDEO_EXTS):
+        return
+    # A Drive-lane video already carries the poster its builder made while the
+    # download was on disk; its creative_path is the asset TITLE, not a file.
+    if getattr(draft, "thumbnail_url", "") or not os.path.isfile(path):
         return
     try:
         from . import action_reel, media_host

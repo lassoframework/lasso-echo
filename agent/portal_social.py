@@ -971,7 +971,15 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
         # same-post siblings, and have the picker shape the SAME new creative for each
         # (a story sibling is re-burned with its own caption).
         month_rows = _month_rows_for(sb_store, account_key, row)
-        siblings = _ms.sibling_rows(row, month_rows, lib=_ms.library_path_for(account_key))
+        # Only siblings that CAN move are asked for (pending / coach_review); an
+        # approved or live sibling keeps the pixels the gym approved and is reported
+        # below. Every requested variant is computed by the picker BEFORE any write
+        # (all or nothing): one failed variant is a 409 and nothing changes.
+        all_siblings = _ms.sibling_rows(row, month_rows or [],
+                                        lib=_ms.library_path_for(account_key))
+        siblings = [s for s in all_siblings
+                    if str(s.get("status") or "").lower() in ("pending", "coach_review")]
+        locked_siblings = [str(s.get("id") or "") for s in all_siblings if s not in siblings]
         pick = (picker or _ms.pick_replacement)(account_key, row, store=sb_store,
                                                  siblings=siblings)
         if not pick.get("ok"):
@@ -979,6 +987,16 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
             return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
                          "error": _ms.client_message(pick.get("reason")),
                          "reason": pick.get("reason"),
+                         "failed_sibling": pick.get("failed_sibling"),
+                         "recreate_budget": _budget_state(account_key)}
+        variants = pick.get("siblings") or {}
+        missing = [str(s.get("id")) for s in siblings
+                   if not (variants.get(str(s.get("id"))) or {}).get("ok")]
+        if missing:
+            # A picker that could not shape one sibling: nothing is written.
+            return 409, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                         "error": _ms.client_message(_ms.REASON_STORY_REBURN),
+                         "reason": _ms.REASON_STORY_REBURN, "failed_sibling": missing[0],
                          "recreate_budget": _budget_state(account_key)}
         # The media identity travels WITH the pixels (2026-09-10): a video's poster
         # frame (or a cleared poster when a video row becomes a photo) and the Drive
@@ -993,18 +1011,13 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
                          "error": ("This post is already approved or live, so its "
                                    "photo is locked. Deny it if you want it redone."),
                          "recreate_budget": _budget_state(account_key)}
-        # Same-post siblings, one operation, the SAME per-row status guard: only a
-        # pending / coach_review sibling moves; an approved or live one is reported as
-        # left in place (the gym approved exactly those pixels).
-        swapped, left = [draft_id], []
-        variants = pick.get("siblings") or {}
+        # Same-post siblings, one operation, the SAME per-row server-side status guard
+        # (a sibling approved between the read and this write matches nothing and is
+        # reported as left).
+        swapped, left = [draft_id], list(locked_siblings)
         for sib in siblings:
             sid = str(sib.get("id") or "")
-            var = variants.get(sid) or {}
-            if (not var.get("ok")
-                    or str(sib.get("status") or "").lower() not in ("pending", "coach_review")):
-                left.append(sid)
-                continue
+            var = variants[sid]
             try:
                 done = sb_store.swap_media(account_key, sid, var["image_url"],
                                            source_media_url=var.get("source_media_url"),
@@ -1015,9 +1028,10 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
             (swapped if done is not None else left).append(sid)
         # The write landed: settle the Drive usage ledger + the served ledger so the
         # asset now on the row cools down, and the one it replaced returns to the pool
-        # ONLY when no remaining row on the book still carries it.
+        # ONLY when no remaining row on the book still carries it. A failed re-read
+        # is None = unknown = leave it stamped (never [] = "nothing carries it").
         _ms.after_swap(account_key, row, pick,
-                       book_rows=_month_rows_for(sb_store, account_key, row) or month_rows,
+                       book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
@@ -1042,16 +1056,17 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
 
 def _month_rows_for(sb_store, account_key, row):
     """The gym's rows for the clicked row's month (the sibling search space + the
-    post-swap book read). [] on any failure: a missing read means no sibling is
-    swapped and the old asset is left stamped, never the other way round."""
+    post-swap book read). None on any failure = UNKNOWN: no sibling is swapped and
+    media_swap.after_swap leaves the old asset stamped (an empty LIST would read as
+    "nothing else carries it" and roll the asset back; audit 3c residual)."""
     lister = getattr(sb_store, "list_month", None)
     month = str((row or {}).get("post_date") or "")[:7]
     if lister is None or len(month) != 7:
-        return []
+        return None
     try:
         return [r for r in (lister(account_key, month) or []) if isinstance(r, dict)]
     except Exception:  # noqa: BLE001
-        return []
+        return None
 
 
 def _account_for(account_key):

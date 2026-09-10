@@ -83,11 +83,13 @@ class _Store:
         return [dict(r) for r in self._rows.values()]
 
 
-def _picker(_gym, _row, **_kw):
-    return {"ok": True, "image_url": "https://cdn/new.jpg",
-            "source_media_url": None, "key": "new.jpg", "kind": "photo",
-            "source": "local", "thumbnail_url": "", "source_media_asset_id": "",
-            "path": ""}
+def _picker(_gym, _row, siblings=(), **_kw):
+    var = {"ok": True, "image_url": "https://cdn/new.jpg",
+           "source_media_url": None, "key": "new.jpg", "kind": "photo",
+           "source": "local", "thumbnail_url": "", "source_media_asset_id": "",
+           "path": ""}
+    # the real picker shapes one variant per sibling BEFORE any write (all or nothing)
+    return dict(var, siblings={str(s["id"]): dict(var) for s in siblings})
 
 
 def _wire(monkeypatch, store):
@@ -290,18 +292,24 @@ def test_candidates_are_least_recently_used_first_not_alphabetical():
         "m_never_used.jpg", "z_used_last_month.jpg", "a_used_yesterday.jpg"]
 
 
-def test_a_still_swaps_to_a_video_when_footage_exists():
-    """The row holds a still and the gym has eligible footage: only videos remain,
-    least recently used first. A gym with 57 unused videos must never be handed a
-    tenth still."""
-    cands = [_cand("a_photo.jpg"), _cand("clipB.mp4", kind="video", source="drive",
-                                          last_used="2026-06-01"),
-             _cand("clipA.mp4", kind="video", source="drive")]
+def test_a_still_swaps_to_ready_footage_first_then_photos_then_unrenditioned_video():
+    """Audit R-D1 #4: the swap runs inside a portal request, so the order is
+    never-used video WITH a rendition (ready to serve) > never-used photo >
+    never-used video WITHOUT a rendition (would need a transcode) > anything used
+    (LRU). A gym with ready footage is handed footage, never a tenth still; a gym
+    whose footage is all unrenditioned gets a fresh photo before it waits on ffmpeg."""
+    ready = _cand("clipA.mp4", kind="video", source="drive")
+    ready["asset"]["rendition_url"] = "https://cdn/clipA.mp4"
+    raw = _cand("clipR.mov", kind="video", source="drive")            # no rendition yet
+    used = _cand("clipB.mp4", kind="video", source="drive", last_used="2026-06-01")
+    used["asset"]["rendition_url"] = "https://cdn/clipB.mp4"
+    local_vid = _cand("gym.mp4", kind="video", source="local")         # served as-is
+    cands = [_cand("a_photo.jpg"), used, raw, ready, local_vid]
     ordered = msw.order_candidates(cands, current_is_video=False)
-    assert [c["key"] for c in ordered] == ["clipA.mp4", "clipB.mp4"]
-    # a row already holding a video keeps the plain LRU order across both kinds
-    mixed = msw.order_candidates(cands, current_is_video=True)
-    assert [c["key"] for c in mixed] == ["a_photo.jpg", "clipA.mp4", "clipB.mp4"]
+    assert [c["key"] for c in ordered] == [
+        "clipA.mp4", "gym.mp4", "a_photo.jpg", "clipR.mov", "clipB.mp4"]
+    assert msw.has_rendition(ready) and msw.has_rendition(local_vid)
+    assert not msw.has_rendition(raw) and not msw.has_rendition(_cand("a_photo.jpg"))
 
 
 def test_no_videos_means_photos_still_swap():
@@ -397,9 +405,15 @@ def test_after_swap_stamps_the_new_drive_asset_and_returns_the_old_one(monkeypat
     assert store.assets["old_a"]["used_count"] == 1
     row = dict(_row("p1"), source_media_asset_id="old_a")
     pick = {"ok": True, "source": "drive", "source_media_asset_id": "new_v", "kind": "video"}
-    msw.after_swap("zanshin", row, pick, media_store=store, now=now)
-    assert store.assets["old_a"]["used_count"] == 0, "the replaced asset returns to the pool"
+    # book UNKNOWN (the re-read failed -> None): the old asset is left stamped, the
+    # swapped-in asset still cools down
+    msw.after_swap("zanshin", row, pick, media_store=store, now=now, book_rows=None)
+    assert store.assets["old_a"]["used_count"] == 1, "unknown book must never roll back"
     assert store.assets["new_v"]["used_count"] == 1, "the swapped-in asset cools down"
+    # book KNOWN and empty: nothing else carries it -> back to the pool
+    local_pick = {"ok": True, "source": "local", "source_media_asset_id": "", "path": ""}
+    msw.after_swap("zanshin", row, local_pick, media_store=store, now=now, book_rows=[])
+    assert store.assets["old_a"]["used_count"] == 0, "the replaced asset returns to the pool"
 
 
 # ---- audit 3c: the FB mirror + paired story move WITH the clicked row -------------
@@ -492,6 +506,75 @@ def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch
     # the ledger settle saw the post-swap book and the ids that moved
     assert sorted(settled["swapped_ids"]) == ["p1", "p2", "p3"]
     assert any(r["id"] == "p6" for r in settled["book_rows"])
+
+
+def test_a_failed_sibling_variant_writes_nothing_and_answers_409(monkeypatch):
+    """Audit 3c residual: all or nothing. The story sibling's re-burn fails -> the
+    picker fails the WHOLE swap before any write; the clicked row keeps its media."""
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    rows = _sib_rows()
+    rows[1]["status"] = "pending"
+    out = msw.pick_replacement(
+        "zanshin", rows[0], store=_Store(), library_path="",
+        candidates_fn=lambda g, r: [_cand("new.jpg")], materialize_fn=_mat,
+        host_fn=lambda p: "https://cdn/new.jpg",
+        feed_fn=lambda p: "https://cdn/new__feed.jpg",
+        reburn_fn=lambda *a: None,                  # the story re-burn fails
+        siblings=[rows[1], rows[2]])
+    assert out == {"ok": False, "reason": msw.REASON_STORY_REBURN, "failed_sibling": "p3"}
+
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store(rows)
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    monkeypatch.setattr(msw, "after_swap",
+                        lambda *a, **k: pytest.fail("nothing to settle on a failed swap"))
+    status, body = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store,
+        picker=lambda *a, **k: {"ok": False, "reason": msw.REASON_STORY_REBURN,
+                                "failed_sibling": "p3"})
+    assert status == 409 and body["reason"] == msw.REASON_STORY_REBURN
+    assert body["failed_sibling"] == "p3" and "siblings_left" not in body
+    assert store.swaps == [], "no row may move when one sibling cannot"
+
+
+def test_a_picker_that_forgets_a_sibling_variant_is_refused_before_any_write(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    rows = _sib_rows()
+    rows[1]["status"] = "pending"
+    store = _Store(rows)
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    forgetful = lambda _g, _r, siblings=(), **_k: {   # noqa: E731
+        "ok": True, "image_url": "https://cdn/new.jpg", "source_media_url": None,
+        "key": "new.jpg", "kind": "photo", "source": "local", "thumbnail_url": "",
+        "source_media_asset_id": "", "path": "", "siblings": {}}
+    status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                        picker=forgetful)
+    assert status == 409 and body["failed_sibling"] in ("p2", "p3")
+    assert store.swaps == []
+
+
+def test_a_failed_book_reread_leaves_the_old_asset_stamped(monkeypatch):
+    """Audit 3c residual: None (the re-read failed) is UNKNOWN, never 'nothing carries
+    it'. The handler passes None through; after_swap must not roll the asset back."""
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    rows = _sib_rows()[:1]
+    store = _Store(rows)
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    calls = {"n": 0}
+    real_list = store.list_month
+
+    def _flaky(account_key, month):
+        calls["n"] += 1
+        if calls["n"] >= 2:                 # the post-swap re-read fails
+            raise RuntimeError("supabase hiccup")
+        return real_list(account_key, month)
+    store.list_month = _flaky
+    seen = {}
+    monkeypatch.setattr(msw, "after_swap", lambda base, row, pick, **kw: seen.update(kw))
+    status, _ = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store, picker=_picker)
+    assert status == 200
+    assert seen["book_rows"] is None, "a failed re-read must reach after_swap as None"
+    assert ps._month_rows_for(store, "zanshin", rows[0]) is None
 
 
 def test_book_carries_asset_and_after_swap_keeps_the_old_asset_stamped(monkeypatch,

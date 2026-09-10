@@ -108,7 +108,7 @@ class _PickedCreative:
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
                           drive=None, now=None, library_dir=None, exclude_ids=(),
-                          slot_index=0):
+                          slot_index=0, rendition_budget=None):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -129,7 +129,12 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
 
     slot_index: the slot ordinal within the day (0 = the day's first post, 1 = the
     PM post on a 2x day). Feeds the media-mix pattern together with day_key so the
-    two slots of one day can differ in kind and a re-run stages the same shape."""
+    two slots of one day can differ in kind and a re-run stages the same shape.
+
+    rendition_budget: the build's gym_media_index.RenditionBudget (audit R-D1 #3).
+    None = one transcode allowed for this call (a single denied-slot replacement).
+    Once spent, video picks are restricted to assets that ALREADY carry a
+    rendition_url, then the slot falls back to photos."""
     from .integrations import drive_client as _dc
     from . import client_content, vision, media_host
 
@@ -153,13 +158,26 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         _sel.pool_kinds(gym_base, store=store, now=now,
                         exclude_ids=tuple(caller_excludes)),
         day_key, slot_index)
+    if rendition_budget is None:
+        rendition_budget = _idx.RenditionBudget(1)
+
+    def _pick(kind_pref, excl):
+        # BUDGET SPENT (audit R-D1 #3): only a video that already carries a rendition
+        # may be picked (nothing left to transcode it with); an unrenditioned video is
+        # left for the nightly pre-render pass and the slot moves on to photos.
+        if kind_pref == _idx.KIND_VIDEO and rendition_budget.spent:
+            cands = [c for c in _sel.pickable(gym_base, kind_pref, store=store, now=now,
+                                              exclude_ids=excl)
+                     if c.get("rendition_url")]
+            return cands[0] if cands else None
+        return _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
+                               now=now, exclude_ids=excl)
+
     tried = []
     for _attempt in range(_MAX_ASSET_ATTEMPTS):
         asset = None
         for kind_pref in (kind_prefs or [None]):
-            asset = _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
-                                    now=now,
-                                    exclude_ids=tuple(caller_excludes) + tuple(tried))
+            asset = _pick(kind_pref, tuple(caller_excludes) + tuple(tried))
             if asset is not None:
                 break
             # The preferred kind is exhausted (or every one of it just failed
@@ -183,42 +201,9 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                       f"{type(e).__name__}: {e}")
                 return None
 
-            # HEIC/HEVC -> rendition (cached by content_hash; §5). A missing
-            # converter marks the asset not-eligible and tries the next asset.
-            local_for_vision = tmp_path
-            public_override = None
-            rend_url, _converted = _idx.ensure_rendition(
-                asset, tmp_path, store=store, probe_fn=_idx.probe_video)
-            if rend_url:
-                public_override = rend_url
-                if asset.get("kind") == _idx.KIND_PHOTO:
-                    # For a HEIC photo, vision must analyze the JPEG rendition, not
-                    # the undecodable original. Re-download the rendition locally.
-                    # (In practice ensure_rendition wrote it to the bucket; for
-                    # analysis we convert once more to a temp JPEG.)
-                    jpeg = lib / (os.path.splitext(os.path.basename(title))[0] + ".jpg")
-                    try:
-                        _idx.heic_to_jpeg(tmp_path, jpeg)
-                        local_for_vision = jpeg
-                    except _idx.ConversionUnavailable:
-                        _mark_not_eligible(store, asset,
-                                           _idx.REJECT_CONVERT_UNAVAILABLE)
-                        continue
-            elif asset.get("kind") == _idx.KIND_PHOTO and _idx.is_heic(
-                    title, asset.get("mime_type")):
-                # HEIC but no converter available: not eligible, try the next.
-                _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
-                continue
-            elif (asset.get("kind") == _idx.KIND_VIDEO
-                    and not _idx._is_publishable_video(title)):
-                # A .webm/.avi/.mkv/.hevc that could not be transcoded to .mp4: Zernio
-                # cannot carry the container, so it is never staged raw (audit D1).
-                print(f"[gym-media-builder] {title!r} is not a publishable video "
-                      "container and no H.264 rendition could be made; skipping")
-                _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
-                continue
-
-            # Re-gate from real bytes (fail closed) + probe videos.
+            # Re-gate a VIDEO from real bytes FIRST (fail closed): the probe also
+            # yields the codec every rendition decision below needs.
+            info = None
             poster_url = ""
             if asset.get("kind") == _idx.KIND_VIDEO:
                 info = _idx.probe_video(tmp_path)
@@ -234,6 +219,52 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                     print(f"[gym-media-builder] {title!r} failed the video gate "
                           f"({reason}); trying the next asset")
                     continue
+
+            # HEIC / HEVC / odd container -> rendition (cached by content_hash; §5),
+            # BUDGETED (audit R-D1): a spent budget or a clip past its per-clip
+            # timeout skips the asset (rendition_missing, still eligible, the nightly
+            # pre-render pass catches up); a missing converter marks it not-eligible.
+            local_for_vision = tmp_path
+            public_override = None
+            needs = _idx.needs_rendition(asset, info)
+            try:
+                rend_url, _converted = _idx.ensure_rendition(
+                    asset, tmp_path, store=store, probe_info=info,
+                    budget=rendition_budget)
+            except _idx.RenditionBudgetExhausted:
+                print(f"[gym-media-builder] transcode budget spent; {title!r} skipped "
+                      "until the nightly pre-render pass renders it")
+                _note_rendition_missing(store, asset)
+                continue
+            except _idx.RenditionTimeout as e:
+                print(f"[gym-media-builder] {title!r} transcode timed out ({e}); skipped")
+                _note_rendition_missing(store, asset)
+                continue
+            if rend_url:
+                public_override = rend_url
+                if asset.get("kind") == _idx.KIND_PHOTO:
+                    # For a HEIC photo, vision must analyze the JPEG rendition, not
+                    # the undecodable original. Re-download the rendition locally.
+                    # (In practice ensure_rendition wrote it to the bucket; for
+                    # analysis we convert once more to a temp JPEG.)
+                    jpeg = lib / (os.path.splitext(os.path.basename(title))[0] + ".jpg")
+                    try:
+                        _idx.heic_to_jpeg(tmp_path, jpeg)
+                        local_for_vision = jpeg
+                    except _idx.ConversionUnavailable:
+                        _mark_not_eligible(store, asset,
+                                           _idx.REJECT_CONVERT_UNAVAILABLE)
+                        continue
+            elif needs:
+                # HEIC with no converter, or an HEVC / .webm / .avi / .mkv video that
+                # could not be transcoded: RAW is never hosted (an HEVC .mov used to
+                # slip through here because .mov is a "publishable container").
+                print(f"[gym-media-builder] {title!r} needs a rendition and none could "
+                      "be made; never staging it raw")
+                _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
+                continue
+
+            if asset.get("kind") == _idx.KIND_VIDEO:
                 # POSTER FRAME while the download still exists on disk. The month
                 # run's _attach_video_poster reads creative_path, which for a Drive
                 # draft is the asset TITLE (nothing on disk by then), so without this
@@ -367,6 +398,16 @@ def assert_tenant(asset, gym_base):
         f"{asset.get('id')} is tagged gym={asset.get('gym_id')!r} but was picked "
         f"for gym={gym_base!r}. The row was blocked and never published.")
     return False
+
+
+def _note_rendition_missing(store, asset):
+    """A TRANSIENT skip (budget spent / transcode timed out): record the reason so the
+    digest can count it, but leave the asset ELIGIBLE so the nightly pre-render pass
+    (sync_gym_media) renders it and the next build can use it."""
+    try:
+        store.update_asset(asset["id"], {"reject_reason": _idx.REJECT_RENDITION_MISSING})
+    except Exception as e:  # noqa: BLE001
+        print(f"[gym-media-builder] rendition-missing note failed: {type(e).__name__}: {e}")
 
 
 def _mark_not_eligible(store, asset, reason):

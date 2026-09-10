@@ -65,6 +65,7 @@ REASON_STORY_REBURN = "story_reburn_failed"
 
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 _MAX_MATERIALIZE_ATTEMPTS = 3      # a corrupt download / failed probe tries the next
+SWAP_TRANSCODE_TIMEOUT_SEC = 45    # the ONE transcode a portal request may wait on
 
 
 def enabled():
@@ -190,14 +191,37 @@ def drive_candidates(base_key, blocked_ids, *, media_store=None, now=None):
     return out
 
 
-def order_candidates(cands, *, current_is_video):
-    """Least recently used first (never used wins), then least used, then name.
-    When the row holds a STILL and any video is available, only videos remain."""
+def has_rendition(cand):
+    """A video candidate the swap can serve WITHOUT a transcode: a local-library video
+    (served as-is, as Lane A always has) or a Drive asset that already carries a
+    rendition_url."""
+    if cand.get("kind") != "video":
+        return False
+    if cand.get("source") == "local":
+        return True
+    return bool((cand.get("asset") or {}).get("rendition_url"))
+
+
+def _tier(cand):
+    """Audit R-D1 #4 ordering for the portal swap, which runs INSIDE an HTTP request:
+    0 never-used video WITH a rendition, 1 never-used photo, 2 never-used video
+    without a rendition (may need a transcode), 3 anything already used (LRU below)."""
+    used = bool(cand.get("last_used"))
+    if used:
+        return 3
+    if cand.get("kind") == "video":
+        return 0 if has_rendition(cand) else 2
+    return 1
+
+
+def order_candidates(cands, *, current_is_video=False):
+    """Tier first (see _tier), then least recently used, then least used, then name.
+    A still therefore swaps to fresh footage whenever a ready-to-serve video exists,
+    but never waits on a transcode when a fresh photo is available."""
+    del current_is_video   # kept for callers; the tier order supersedes the filter
     cands = list(cands or [])
-    if not current_is_video and any(c["kind"] == "video" for c in cands):
-        cands = [c for c in cands if c["kind"] == "video"]
-    cands.sort(key=lambda c: (c.get("last_used") or "", int(c.get("used_count") or 0),
-                              str(c.get("name") or "")))
+    cands.sort(key=lambda c: (_tier(c), c.get("last_used") or "",
+                              int(c.get("used_count") or 0), str(c.get("name") or "")))
     return cands
 
 
@@ -257,8 +281,7 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
         _log(f"{base_key}: Drive download failed for {title!r} ({type(exc).__name__})")
         return None
     store = media_store or _idx.default_store()
-    hosted, _converted = _idx.ensure_rendition(asset, path, store=store,
-                                               probe_fn=_idx.probe_video)
+    info = None
     if asset.get("kind") == _idx.KIND_VIDEO:
         info = _idx.probe_video(path)
         if not info:
@@ -268,10 +291,19 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
             info["duration_sec"], info["width"], info["height"])
         if el is not True:
             return None
-        if not hosted and not is_publishable_video(title):
-            return None                       # .webm/.avi/.mkv with no .mp4 rendition
-    elif not hosted and _idx.is_heic(title, asset.get("mime_type")):
-        return None                           # HEIC with no converter: not servable
+    # BOUNDED (audit R-D1 #4): this runs inside the portal request. At most ONE
+    # transcode, capped at SWAP_TRANSCODE_TIMEOUT_SEC; a spent budget or a timeout
+    # means "next candidate", never a hung request and never raw HEVC.
+    try:
+        hosted, _converted = _idx.ensure_rendition(
+            asset, path, store=store, probe_info=info,
+            budget=_idx.RenditionBudget(1), timeout=SWAP_TRANSCODE_TIMEOUT_SEC)
+    except (_idx.RenditionBudgetExhausted, _idx.RenditionTimeout) as exc:
+        _log(f"{base_key}: {title!r} not renditioned in time ({type(exc).__name__}); "
+             "trying the next candidate")
+        return None
+    if not hosted and _idx.needs_rendition(asset, info):
+        return None                           # HEVC / odd container / HEIC, no rendition
     return {"path": path, "hosted": hosted}
 
 
@@ -417,12 +449,19 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                           poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
             if not out.get("ok"):
                 return out
+            # ALL OR NOTHING (audit 3c residual): every sibling variant is computed
+            # here, BEFORE the caller writes anything. One failed variant (a story
+            # re-burn) fails the whole swap with its reason, so the clicked row and
+            # its siblings can never end up carrying different media.
             out["siblings"] = {}
             for sib in siblings or ():
                 sfmt = str((sib or {}).get("format") or "feed").strip().lower()
-                out["siblings"][str(sib.get("id"))] = _finish(
-                    base_key, sib, sfmt, cand, path, hosted, lib, work, tenant,
-                    poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
+                var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work, tenant,
+                              poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
+                if not var.get("ok"):
+                    return {"ok": False, "reason": var.get("reason") or REASON_STORY_REBURN,
+                            "failed_sibling": str(sib.get("id"))}
+                out["siblings"][str(sib.get("id"))] = var
             return out
         return {"ok": False, "reason": REASON_NO_FRESH_PHOTO}
     finally:
@@ -525,9 +564,12 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=Non
     pick_media re-stage the very asset the client just rejected), and record a local
     pick as served. Best effort, never raises.
 
-    book_rows: the gym's rows after the swaps (the caller re-reads); swapped_ids: the
-    rows this swap just repointed (they now carry the NEW asset even if the caller's
-    read predates the write)."""
+    book_rows: the gym's rows after the swaps (the caller re-reads). None means the
+    read FAILED = unknown: the old asset is left stamped (a stamp that lingers costs
+    one asset a cooldown; a rollback of an asset a sibling still carries re-pools the
+    very media the client rejected). An empty list is a real "nothing else carries it".
+    swapped_ids: the rows this swap just repointed (they now carry the NEW asset even
+    if the caller's read predates the write)."""
     pd = str((row or {}).get("post_date") or "")[:10]
     if not pd:
         return
@@ -535,13 +577,16 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=Non
         from . import gym_media_selector as _sel
         old = media_guard.row_asset_key(row)
         new = (pick or {}).get("source_media_asset_id") or ""
-        still_carried = (book_rows is not None
-                         and book_carries_asset(book_rows, old, except_ids=swapped_ids))
+        if book_rows is None:
+            still_carried = bool(old)            # unknown book: never roll back
+        else:
+            still_carried = book_carries_asset(book_rows, old, except_ids=swapped_ids)
         if old and old != new and not still_carried:
             _sel.rollback_use(base_key, pd, store=media_store, asset_id=old)
         elif old and old != new:
-            _log(f"{base_key}: asset {old} still carried by a sibling row on {pd}; "
-                 "left stamped")
+            _log(f"{base_key}: asset {old} "
+                 + ("book unreadable" if book_rows is None
+                    else f"still carried by a sibling row on {pd}") + "; left stamped")
         if new and (pick or {}).get("source") == "drive":
             store = media_store
             if store is None:
@@ -582,7 +627,8 @@ def client_message(reason, base_key=""):
 
 __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "local_candidates", "drive_candidates", "swap_fields", "after_swap",
-           "sibling_rows", "book_carries_asset",
+           "sibling_rows", "book_carries_asset", "has_rendition",
+           "SWAP_TRANSCODE_TIMEOUT_SEC",
            "library_path_for", "client_message", "is_video",
            "REASON_NO_LIBRARY", "REASON_NO_FRESH_PHOTO", "REASON_HOSTING",
            "REASON_STORY_REBURN"]

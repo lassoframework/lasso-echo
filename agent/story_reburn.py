@@ -17,8 +17,7 @@ import os
 import tempfile
 
 from . import config
-
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
+from .media_types import VIDEO_EXTS as _VIDEO_EXTS   # ONE definition (audit D1)
 
 
 def should_reburn(row):
