@@ -36,7 +36,7 @@ class _KV:
 
 
 def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
-          platforms=None, pages=None, names=None, voice=None):
+          platforms=None, pages=None, names=None, voice=None, zero_token=()):
     sources = sources or {}
     profiles = profiles or {}
     platforms = platforms or {}
@@ -53,6 +53,9 @@ def _deps(*, roster=(), intake=None, bases=(), sources=None, profiles=None,
         "platforms": lambda pid: set(platforms.get(pid, set())),
         "fb_page": lambda b: pages.get(b, ""),
         "gym_name": lambda gid: (names or {}).get(gid, ""),
+        # default (): no gym is missing a token row, so every pre-existing case here
+        # keeps testing exactly what it was written to test.
+        "zero_token": lambda known_ids, http=None: list(zero_token),
     }
 
 
@@ -448,3 +451,136 @@ def test_autoregister_never_reports_success_when_it_wrote_nothing(monkeypatch, t
     assert not any("registered into Echo's account registry" in m for m in seen)
     assert any("did nothing" in m and "AGENT_DYNAMIC_ACCOUNTS" in m for m in seen)
     accounts._dynamic_cache = None
+
+
+# ---- the blind spot: a gym with ZERO echo_intake_tokens rows -----------------
+
+class _FakeGymsHttp:
+    """A minimal stand-in for `requests` returning a fixed gyms table payload."""
+
+    def __init__(self, rows, status_code=200):
+        self._rows = rows
+        self.status_code = status_code
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        return self
+
+    def json(self):
+        return self._rows
+
+
+def test_a_zero_token_gym_is_caught_even_with_an_empty_roster():
+    """Empire Training Academy, 2026-09-09: the gym has a real `gyms` row but NO
+    echo_intake_tokens row at all, so the token-keyed roster loop never sees it. The
+    zero_token reader must catch it independently of that loop."""
+    seen = []
+    deps = _deps(roster=(), zero_token=[("g99", "Empire Training Academy", "empire")])
+    out = ow.run(deps=deps, alert=seen.append, kv=_KV())
+    assert out == {"empire": [ow.REASON_NO_INTAKE_TOKEN]}
+    assert len(seen) == 1
+    assert "Empire Training Academy" in seen[0]
+    assert "no_intake_token" in seen[0]
+
+
+def test_zero_token_alert_dedupes_per_day():
+    deps = _deps(roster=(), zero_token=[("g99", "Empire", "empire")])
+    kv = _KV()
+    seen = []
+    ow.run(deps=deps, alert=seen.append, kv=kv)
+    ow.run(deps=deps, alert=seen.append, kv=kv)
+    assert len(seen) == 1
+
+
+def test_zero_token_never_flags_lasso_or_staff():
+    deps = _deps(roster=(), zero_token=[("g1", "LASSO", "lasso"),
+                                        ("g2", "Blake", "blake_personal")])
+    seen = []
+    out = ow.run(deps=deps, alert=seen.append, kv=_KV())
+    assert out == {}
+    assert seen == []
+
+
+def test_zero_token_never_blocks_the_per_key_alerts_on_a_reader_crash():
+    """A crash in the NEW reader must never swallow the existing per-key alerts; the
+    two watchers are independent."""
+    deps = _deps(roster=[("g1", "reverb")], intake={"g1": "reverb"}, bases=[],
+                 sources={"reverb": ["a source"]}, profiles={"reverb": "p1"},
+                 platforms={"p1": {"instagram", "facebook"}}, pages={"reverb": "1"})
+    deps["zero_token"] = lambda known_ids, http=None: (_ for _ in ()).throw(
+        OSError("supabase down"))
+    seen = []
+    out = ow.run(deps=deps, alert=seen.append, kv=_KV())
+    assert out == {"reverb": [ow.REASON_NOT_REGISTERED]}
+
+
+def test_zero_token_gyms_reader_excludes_lead_and_dead_statuses(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    rows = [
+        {"id": "1", "name": "Real Client", "slug": "realclient", "status": "active"},
+        {"id": "2", "name": "Just A Lead", "slug": "justalead", "status": "onboarding"},
+        {"id": "3", "name": "Gone", "slug": "gone", "status": "archived"},
+        {"id": "4", "name": "Dead", "slug": "dead", "status": "inactive"},
+        {"id": "5", "name": "Unknown Status", "slug": "unk", "status": "brand_new_status"},
+    ]
+    http = _FakeGymsHttp(rows)
+    out = ow.zero_token_gyms(known_gym_ids=set(), http=http)
+    keys = {slug for _, _, slug in out}
+    assert keys == {"realclient", "unk"}, keys
+
+
+def test_zero_token_gyms_reader_excludes_gyms_already_in_the_token_roster(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    rows = [{"id": "1", "name": "Has Token", "slug": "hastoken", "status": "active"}]
+    http = _FakeGymsHttp(rows)
+    out = ow.zero_token_gyms(known_gym_ids={"1"}, http=http)
+    assert out == []
+
+
+def test_zero_token_gyms_reader_returns_empty_without_creds(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    assert ow.zero_token_gyms(known_gym_ids=set()) == []
+
+
+def test_zero_token_gyms_reader_returns_empty_on_http_error(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    http = _FakeGymsHttp([], status_code=500)
+    assert ow.zero_token_gyms(known_gym_ids=set(), http=http) == []
+
+
+def test_zero_token_gyms_reader_excludes_demo_and_test_fixtures(monkeypatch):
+    """Verified live 2026-09-10: EVERY zero-token active gym in the portal table today
+    is fixture data (Demo Fitness, ZZ Test Gym, SAMPLE *), each is_demo=true. Without
+    this exclusion the very first deploy of this check would have paged 16 false
+    alerts."""
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    rows = [
+        {"id": "1", "name": "Demo Fitness", "slug": "demo-fitness", "status": "active",
+         "is_demo": True, "load_test": False, "is_verification": False},
+        {"id": "2", "name": "ZZ Test Gym", "slug": "zz-test-gym", "status": "active",
+         "is_demo": True, "load_test": False, "is_verification": True},
+        {"id": "3", "name": "Real Client", "slug": "realclient", "status": "active",
+         "is_demo": False, "load_test": False, "is_verification": False},
+        {"id": "4", "name": "Load Test", "slug": "loadtest", "status": "active",
+         "is_demo": False, "load_test": True, "is_verification": False},
+    ]
+    http = _FakeGymsHttp(rows)
+    out = ow.zero_token_gyms(known_gym_ids=set(), http=http)
+    keys = {slug for _, _, slug in out}
+    assert keys == {"realclient"}, keys
+
+
+def test_zero_token_gyms_reader_missing_demo_columns_fails_open(monkeypatch):
+    """A row with no is_demo/load_test/is_verification fields at all (an older portal
+    schema, or a column PostgREST omitted) must still be REPORTED, not silently
+    dropped: .get() defaults to falsy, never a hard failure."""
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    rows = [{"id": "1", "name": "Old Schema Gym", "slug": "oldschema", "status": "active"}]
+    http = _FakeGymsHttp(rows)
+    out = ow.zero_token_gyms(known_gym_ids=set(), http=http)
+    assert {slug for _, _, slug in out} == {"oldschema"}

@@ -30,13 +30,25 @@ from .trust import effective_level as _effective_level, TrustLevel
 # internal helpers
 # ---------------------------------------------------------------------------
 
-def _voice_path(account_key, root="."):
-    """The expected brand_voice/<key>.md path."""
+def _voice_path(account_key, root=None):
+    """The expected onboard-scaffold voice path. root=None (the production default)
+    resolves through config.client_voice_dir(), the SAME durable root onboard.run now
+    writes to (2026-09-10): <AGENT_DATA_DIR or /data>/brand_voice, falling back to the
+    repo-relative "./brand_voice" where no volume is mounted. An explicit root (every
+    existing test) is honored exactly as before: root/brand_voice/<key>.md."""
+    if root is None:
+        from . import config
+        return os.path.join(config.client_voice_dir(), f"{account_key}.md")
     return os.path.join(root, "brand_voice", f"{account_key}.md")
 
 
-def _brain_path(account_key, root="."):
-    """The expected brains/<key>.md path."""
+def _brain_path(account_key, root=None):
+    """The expected onboard-scaffold brain path. root=None resolves through
+    config.tenant_brain_dir(), matching onboard.run's durable default; an explicit root
+    (every existing test) is honored exactly as before: root/brains/<key>.md."""
+    if root is None:
+        from . import config
+        return os.path.join(config.tenant_brain_dir(), f"{account_key}.md")
     return os.path.join(root, "brains", f"{account_key}.md")
 
 
@@ -61,7 +73,7 @@ def _check_approved_calendar(account_key, conn=None):
 # public API
 # ---------------------------------------------------------------------------
 
-def verify_gym(account_key, db_conn=None, root="."):
+def verify_gym(account_key, db_conn=None, root=None):
     """
     Run the onboarding self-check for one gym.
 
@@ -173,7 +185,7 @@ def verify_gym(account_key, db_conn=None, root="."):
     }
 
 
-def verify_all(db_conn=None, root="."):
+def verify_all(db_conn=None, root=None):
     """
     Run verify_gym for every gym in the gyms table.
 
