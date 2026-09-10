@@ -124,6 +124,21 @@ conventions still reach it; the unprefixed name wins when both are set.
 | ASTRA_IMAGE_MODEL | gpt-image-2.5-sunburst | code | Sunburst: infographics, carousels, and ANY asset with text overlays. |
 | ASTRA_IMAGE_MODEL_FLARE | gpt-image-2.5-flare | code | Flare: story-format quick graphics that render no text. A story card WITH a rendered headline is a text asset and stays on Sunburst. |
 | AGENT_ASTRA_RESPONSES_URL | https://api.openai.com/v1/responses | code | Endpoint override for a proxy / gateway. Never for swapping providers. |
+
+**Sizes are SNAPPED before the call.** Verified against the live API 2026-09-10:
+the image tool rejects any size whose width or height is not divisible by 16
+(`HTTP 400 "Invalid size '1080x1350'. Width and height must both be divisible by
+16."`). Both Echo targets fail that rule on width, so `image_engine.snap_size`
+converts them to the same aspect with both dimensions divisible by 16 before the
+request, and the result is scaled back to the target afterwards:
+
+| target | sent to Astra | back to |
+|---|---|---|
+| 1080x1350 (4:5 feed) | 1024x1280 | 1080x1350 |
+| 1080x1920 (9:16 story) | 1152x2048 | 1080x1920 |
+
+Without the snap every Astra call 400s and the chain lives on the Gemini rung by
+accident, which looks identical to working.
 | AGENT_ASTRA_COST_SUNBURST_USD | 0.19 | code | ESTIMATED USD per Sunburst image (logging only, never a billing read). |
 | AGENT_ASTRA_COST_FLARE_USD | 0.04 | code | ESTIMATED USD per Flare image. |
 | AGENT_GEMINI_COST_PER_IMAGE_USD | 0.039 | code | ESTIMATED USD per Gemini image. |
