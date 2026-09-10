@@ -176,6 +176,13 @@ def pick_media(gym_id, kind_preference=None, *, store=None, now=None, exclude_id
     candidates = pickable(base, kind_preference, store=store, now=now,
                           exclude_ids=exclude_ids)
     if not candidates:
+        # KIND EXHAUSTION IS NOT AN EMPTY POOL (audit D6): the media-mix builder asks
+        # for one kind first and falls back to the other, so "no photo left" while
+        # videos remain must not page staff to "ask for photos". Alert only when the
+        # pool has nothing of ANY kind.
+        if kind_preference and pickable(base, None, store=store, now=now,
+                                        exclude_ids=exclude_ids):
+            return None
         # "Ask for photos" is only actionable for a gym that is actually posting.
         # A gym still onboarding (publish flag OFF, socials not connected yet) has an
         # empty pool BY DEFINITION, and paging staff about it every build is noise

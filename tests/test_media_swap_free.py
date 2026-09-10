@@ -402,6 +402,127 @@ def test_after_swap_stamps_the_new_drive_asset_and_returns_the_old_one(monkeypat
     assert store.assets["new_v"]["used_count"] == 1, "the swapped-in asset cools down"
 
 
+# ---- audit 3c: the FB mirror + paired story move WITH the clicked row -------------
+
+def _sib_rows():
+    base = dict(_row("p1"), source_media_asset_id="a1")
+    fb = dict(base, id="p2", account="facebook")
+    story = dict(base, id="p3", format="story", status="coach_review",
+                 image_url="https://cdn/old__story.jpg", source_media_url="old.jpg",
+                 caption="the story's own edited caption")
+    other = dict(base, id="p4", image_url="https://cdn/other.jpg",
+                 source_media_url="other.jpg", source_media_asset_id="a9")
+    tomorrow = dict(base, id="p5", post_date="2026-09-21")
+    return [base, fb, story, other, tomorrow]
+
+
+def test_sibling_rows_match_the_same_post_by_asset_id_and_never_the_days_other_post():
+    rows = _sib_rows()
+    sibs = msw.sibling_rows(rows[0], rows)
+    assert sorted(s["id"] for s in sibs) == ["p2", "p3"]
+    # clicking the STORY finds both feed rows
+    assert sorted(s["id"] for s in msw.sibling_rows(rows[2], rows)) == ["p1", "p2"]
+
+
+def test_sibling_rows_match_local_library_rows_by_media_key():
+    rows = [dict(r, source_media_asset_id="") for r in _sib_rows()]
+    assert sorted(s["id"] for s in msw.sibling_rows(rows[0], rows)) == ["p2", "p3"]
+
+
+def test_pick_replacement_shapes_a_variant_for_every_sibling(monkeypatch):
+    """One materialized file, three shapes: the clicked IG feed and its FB mirror get
+    the video + poster; the story sibling is re-burned with ITS OWN caption (a client
+    edit) and carries no poster (audit D4)."""
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    monkeypatch.setenv("AGENT_STORY_SOURCE_MEDIA", "true")
+    rows = _sib_rows()
+    burned = []
+    monkeypatch.setattr(msw, "_reburn_story_video",
+                        lambda base, row, path, lib: burned.append(row["caption"])
+                        or "https://cdn/squat__story.mp4")
+    posters = []
+    out = msw.pick_replacement(
+        "zanshin", rows[0], store=_Store(), library_path="",
+        candidates_fn=lambda g, r: [_cand("v1", kind="video", source="drive")],
+        materialize_fn=lambda c: {"path": "/tmp/squat.mp4", "hosted": None},
+        host_fn=lambda p: "https://cdn/squat.mp4",
+        poster_fn=lambda *a: posters.append(1) or "https://cdn/squat__poster.jpg",
+        siblings=[rows[1], rows[2]])
+    assert out["ok"] and out["image_url"] == "https://cdn/squat.mp4"
+    assert set(out["siblings"]) == {"p2", "p3"}
+    fb, story = out["siblings"]["p2"], out["siblings"]["p3"]
+    assert fb["image_url"] == "https://cdn/squat.mp4"
+    assert fb["thumbnail_url"] == "https://cdn/squat__poster.jpg"
+    assert story["image_url"] == "https://cdn/squat__story.mp4"
+    assert story["source_media_url"] == "https://cdn/squat.mp4"
+    assert story["thumbnail_url"] == ""
+    assert burned == ["the story's own edited caption"]
+    assert posters == [1], "ONE poster per swap, not one per variant"
+
+
+def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    rows = _sib_rows()
+    rows[1]["status"] = "pending"
+    approved_fb = dict(rows[1], id="p6", status="approved")   # same post, gym approved it
+    store = _Store(rows + [approved_fb])
+    monkeypatch.setattr(ps._pcs, "SupabaseCalendarStore", lambda *a, **k: store)
+    settled = {}
+    monkeypatch.setattr(msw, "after_swap",
+                        lambda base, row, pick, **kw: settled.update(kw))
+
+    def _picker(_gym, _row, siblings=(), **_kw):
+        var = {"ok": True, "image_url": "https://cdn/squat.mp4", "source_media_url": None,
+               "key": "v1", "kind": "video", "source": "drive",
+               "thumbnail_url": "https://cdn/squat__poster.jpg",
+               "source_media_asset_id": "v1", "path": "/tmp/squat.mp4"}
+        return dict(var, siblings={str(s["id"]): dict(var) for s in siblings})
+
+    status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                        picker=_picker)
+    assert status == 200
+    assert sorted(body["siblings_swapped"]) == ["p2", "p3"]
+    assert body["siblings_left"] == ["p6"]
+    swapped_ids = [s[0] for s in store.swaps]
+    assert sorted(swapped_ids) == ["p1", "p2", "p3"], "p4/p5/p6 must never be touched"
+    for rid in ("p1", "p2", "p3"):
+        assert store._rows[rid]["image_url"] == "https://cdn/squat.mp4"
+        assert store._rows[rid]["source_media_asset_id"] == "v1"
+    assert store._rows["p6"]["image_url"] == "https://cdn/old.jpg"
+    # the ledger settle saw the post-swap book and the ids that moved
+    assert sorted(settled["swapped_ids"]) == ["p1", "p2", "p3"]
+    assert any(r["id"] == "p6" for r in settled["book_rows"])
+
+
+def test_book_carries_asset_and_after_swap_keeps_the_old_asset_stamped(monkeypatch,
+                                                                       tmp_path):
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    from datetime import datetime, timezone
+    from agent import gym_media_selector as sel
+    from tests.gym_media_fakes import FakeMediaStore, make_asset
+    now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    store = FakeMediaStore(assets=[make_asset("a1", gym_id="zanshin"),
+                                   make_asset("v1", gym_id="zanshin", kind="video")])
+    sel.stamp_use(store.get_asset("a1"), "zanshin", "2026-09-20", store=store, now=now)
+    rows = _sib_rows()[:4]                    # p5 (tomorrow) also carries a1 by design
+    approved_fb = dict(rows[1], id="p6", status="approved")
+    book = rows + [approved_fb]
+    assert msw.book_carries_asset(book, "a1", except_ids=["p1", "p2", "p3"]) is True
+    assert msw.book_carries_asset(rows, "a1", except_ids=["p1", "p2", "p3"]) is False
+    # a DIFFERENT day's pending row carrying the same asset also keeps it stamped
+    assert msw.book_carries_asset(_sib_rows(), "a1", except_ids=["p1", "p2", "p3"]) is True
+    pick = {"ok": True, "source": "drive", "source_media_asset_id": "v1", "kind": "video"}
+    # an approved sibling still carries a1: it stays stamped
+    msw.after_swap("zanshin", rows[0], pick, media_store=store, now=now,
+                   book_rows=book, swapped_ids=["p1", "p2", "p3"])
+    assert store.assets["a1"]["used_count"] == 1
+    assert store.assets["v1"]["used_count"] == 1
+    # nothing left carries a1: it returns to the pool
+    msw.after_swap("zanshin", rows[0], pick, media_store=store, now=now,
+                   book_rows=rows, swapped_ids=["p1", "p2", "p3"])
+    assert store.assets["a1"]["used_count"] == 0
+
+
 def test_the_handler_writes_the_media_identity_columns_with_the_pixels(monkeypatch):
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
     store = _Store([_row("p1")])

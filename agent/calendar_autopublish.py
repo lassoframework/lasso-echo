@@ -32,6 +32,7 @@ from . import config
 from . import meta_publisher
 from .accounts import get_account
 from .drafter import Draft, DraftStatus
+from .media_types import is_video_url          # ONE video definition (audit D1)
 from .summit_queue import SPRINT_SLOT_TIMES
 
 
@@ -223,7 +224,7 @@ def _normalize_feed_image(row, account, store):
         the fix for the auditor's fail-open gap: once we KNOW it is bad, we never send it.
     Best effort: never raises. Feed only; a story is framed by its own burner."""
     url = (row.get("image_url") or "").strip()
-    if not url or url.lower().endswith((".mp4", ".mov", ".webm")):
+    if not url or is_video_url(url):
         return row                                        # video/no-image: not our job
     # PHASE 1 (fail-open): determine the aspect. If we cannot even read it, pass through
     # unchanged (unknown, not known-bad) — identical to the historical behavior; it will

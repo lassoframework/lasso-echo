@@ -727,6 +727,14 @@ def build_client_draft(account, day_key, voice, library_path, poster=None,
                 pass
         return draft
 
+    # DEFERRED TO THE DRIVE POOL (2026-09-10): pick_image returned no pick because
+    # every local creative is inside its repeat window and the gym's Drive pool can
+    # fill the day. That is not a thin library: no needs-media card, no "add photos"
+    # alert. The day goes back to client_month_run uncovered so the Drive lane (and,
+    # if the pool runs out, the no-empty-day fallback) owns it.
+    if not allow_reuse and drive_pool_can_fill(account.key):
+        return None
+
     # THIN-LIBRARY GRACE: caption is ready, but there is no image.
     caption, hashtags = make_caption(account, source, voice, f"src_{source.id}",
                                      avoid_openings=avoid_openings,

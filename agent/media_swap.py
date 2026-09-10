@@ -53,6 +53,8 @@ import os
 import tempfile
 
 from . import config, media_guard
+from .media_types import (VIDEO_EXTS as _VIDEO_EXTS,           # ONE definition (audit D1)
+                          is_video_url, is_publishable_video)
 
 # Why a reason code and not an exception: the portal answers a client, and every
 # outcome here is a normal thing that can happen to a real gym.
@@ -61,7 +63,6 @@ REASON_NO_FRESH_PHOTO = "no_fresh_photo"
 REASON_HOSTING = "hosting_unavailable"
 REASON_STORY_REBURN = "story_reburn_failed"
 
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 _MAX_MATERIALIZE_ATTEMPTS = 3      # a corrupt download / failed probe tries the next
 
@@ -75,7 +76,7 @@ def _log(msg):
 
 
 def is_video(name_or_url):
-    return str(name_or_url or "").split("?", 1)[0].lower().endswith(_VIDEO_EXTS)
+    return is_video_url(name_or_url)
 
 
 def library_path_for(base_key):
@@ -267,26 +268,93 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
             info["duration_sec"], info["width"], info["height"])
         if el is not True:
             return None
+        if not hosted and not is_publishable_video(title):
+            return None                       # .webm/.avi/.mkv with no .mp4 rendition
     elif not hosted and _idx.is_heic(title, asset.get("mime_type")):
         return None                           # HEIC with no converter: not servable
     return {"path": path, "hosted": hosted}
 
 
+def sibling_rows(row, rows, lib=None):
+    """The same-date rows that are the SAME POST as `row` and carry the same media: the
+    FB mirror of an IG feed and its paired IG story (or, when the clicked row is the
+    story, both feed rows). A swap that moves only the clicked row leaves FB publishing
+    the rejected still and lets the old Drive asset look free while a sibling still
+    carries it (audit 3c).
+
+    Match = same gym + same post_date + a different id + an IG/FB feed/story row +
+    (the same Drive asset id when both carry one, else the same raw media key, with
+    autofit reframe names resolved back to the library photo when `lib` is known).
+    The day's OTHER, unrelated posts (a 2x day's second slot, a rolled-forward
+    backfill) share neither and are never touched. Statuses are NOT filtered here:
+    the caller reports approved/live siblings as left in place."""
+    row = row or {}
+    pd = str(row.get("post_date") or "")[:10]
+    gym = str(row.get("gym_id") or "")
+    rid = str(row.get("id") or "")
+    old_asset = media_guard.row_asset_key(row)
+    old_key = media_guard.row_media_key(row)
+    keys = {old_key} | {media_guard.row_media_key(r) for r in (rows or []) if isinstance(r, dict)}
+    rmap = media_guard.reframe_map(lib, keys) if lib else {}
+    old_raw = rmap.get(old_key, old_key)
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict) or str(r.get("id") or "") == rid:
+            continue
+        if str(r.get("gym_id") or "") != gym or str(r.get("post_date") or "")[:10] != pd:
+            continue
+        if str(r.get("format") or "").lower() not in ("feed", "story"):
+            continue
+        if str(r.get("account") or "").lower() not in ("instagram", "ig", "facebook", "fb", ""):
+            continue
+        sib_asset = media_guard.row_asset_key(r)
+        if old_asset and sib_asset:
+            same = sib_asset == old_asset
+        else:
+            k = media_guard.row_media_key(r)
+            same = bool(old_raw) and rmap.get(k, k) == old_raw
+        if same:
+            out.append(r)
+    return out
+
+
+def book_carries_asset(rows, asset_id, *, except_ids=()):
+    """True when any LIVE row (pending/approved/publishing/coach_review/published) other
+    than `except_ids` still carries this Drive asset: the asset must then stay stamped."""
+    if not asset_id:
+        return False
+    skip = {str(i) for i in (except_ids or ())}
+    live = set(media_guard.FORWARD_STATUSES) | {"published"}
+    for r in rows or []:
+        if not isinstance(r, dict) or str(r.get("id") or "") in skip:
+            continue
+        if str(r.get("status") or "").lower() not in live:
+            continue
+        if media_guard.row_asset_key(r) == str(asset_id):
+            return True
+    return False
+
+
 def pick_replacement(base_key, row, *, store, library_path=None, book_state=None,
                      asset_state=None, candidates_fn=None, materialize_fn=None,
                      host_fn=None, feed_fn=None, reburn_fn=None, poster_fn=None,
-                     media_store=None, drive=None, now=None, log=None):
-    """A genuinely fresh creative for ONE waiting row.
+                     media_store=None, drive=None, now=None, log=None,
+                     siblings=()):
+    """A genuinely fresh creative for ONE waiting row (and the same creative shaped for
+    its same-date siblings, see `siblings`).
 
     Returns {"ok": True, "image_url", "source_media_url", "key", "kind", "source",
-    "thumbnail_url", "source_media_asset_id", "path"} or {"ok": False, "reason":
-    <REASON_*>}. Never writes, never publishes, never spends budget. Every piece of
-    I/O is injectable so this is testable offline.
+    "thumbnail_url", "source_media_asset_id", "path", "siblings": {row_id: variant}}
+    or {"ok": False, "reason": <REASON_*>}. Never writes, never publishes, never spends
+    budget. Every piece of I/O is injectable so this is testable offline.
 
     A story is re-burned with its OWN caption onto the new media (a still card or a
     9:16 story video); a photo feed gets the same autofit reframe the original
     shipped with; a video feed ships the hosted video itself with a poster frame.
-    """
+
+    siblings: the same-post rows (sibling_rows) that must move WITH the clicked row.
+    Each gets its own variant built from the SAME materialized file while it still
+    exists (a story sibling is re-burned with its own caption), keyed by row id."""
     say = log or _log
     lib = library_path if library_path is not None else library_path_for(base_key)
 
@@ -342,28 +410,34 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                             f"({type(exc).__name__})")
             if not hosted:
                 return {"ok": False, "reason": REASON_HOSTING}
+            # One poster per swap (audit D4): computed once, attached only to FEED
+            # variants; a story's media is the captioned card/video itself.
+            poster = (poster_fn(path, work, tenant) or "") if cand["kind"] == "video" else ""
             out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
-                          feed_fn=feed_fn, reburn_fn=reburn_fn, poster_fn=poster_fn,
-                          log=say)
-            if out is not None:
+                          poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
+            if not out.get("ok"):
                 return out
+            out["siblings"] = {}
+            for sib in siblings or ():
+                sfmt = str((sib or {}).get("format") or "feed").strip().lower()
+                out["siblings"][str(sib.get("id"))] = _finish(
+                    base_key, sib, sfmt, cand, path, hosted, lib, work, tenant,
+                    poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
+            return out
         return {"ok": False, "reason": REASON_NO_FRESH_PHOTO}
     finally:
         _cleanup(work)
 
 
-def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, feed_fn,
-            reburn_fn, poster_fn, log):
+def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster,
+            feed_fn, reburn_fn, log):
     """Shape the hosted replacement for the row's format: a story is re-burned with
     its caption (still card or 9:16 story video), a video feed ships the hosted video,
     a photo feed gets the autofit reframe. A failed story re-burn is a hard stop
     (REASON_STORY_REBURN), matching the pre-existing contract: never a bare story."""
     video = cand["kind"] == "video"
-    thumb = ""
-    if video:
-        thumb = poster_fn(path, work, tenant) or ""
     base = {"key": cand["key"], "kind": cand["kind"], "source": cand["source"],
-            "thumbnail_url": thumb, "path": path,
+            "thumbnail_url": poster if (video and fmt != "story") else "", "path": path,
             "source_media_asset_id": cand["key"] if cand["source"] == "drive" else ""}
     if fmt == "story":
         # A story publishes empty-body, so its caption lives ON the media. Swapping
@@ -374,8 +448,6 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, feed_f
             if not burned:
                 return {"ok": False, "reason": REASON_STORY_REBURN}
             target = burned
-            if video:
-                thumb = base["thumbnail_url"] = ""   # the captioned video IS the story
         else:
             target = hosted
         src = hosted if config.story_source_media_enabled() else None
@@ -443,11 +515,19 @@ def swap_fields(pick):
             "source_media_asset_id": (pick or {}).get("source_media_asset_id") or None}
 
 
-def after_swap(base_key, row, pick, *, media_store=None, now=None):
+def after_swap(base_key, row, pick, *, media_store=None, now=None, book_rows=None,
+               swapped_ids=()):
     """Settle the usage ledgers once the row write actually happened: stamp the Drive
     asset now on the row (so the 90-day cooldown and the deny rollback see it), roll
-    back the asset the row USED to carry on this date (it is back in the pool), and
-    record a local pick as served. Best effort, never raises."""
+    back the asset the row USED to carry on this date ONLY when no live row on the
+    book still carries it (audit 3c: the FB mirror / paired story keep the old asset
+    when they were approved or the sibling swap failed; a rollback then would let
+    pick_media re-stage the very asset the client just rejected), and record a local
+    pick as served. Best effort, never raises.
+
+    book_rows: the gym's rows after the swaps (the caller re-reads); swapped_ids: the
+    rows this swap just repointed (they now carry the NEW asset even if the caller's
+    read predates the write)."""
     pd = str((row or {}).get("post_date") or "")[:10]
     if not pd:
         return
@@ -455,8 +535,13 @@ def after_swap(base_key, row, pick, *, media_store=None, now=None):
         from . import gym_media_selector as _sel
         old = media_guard.row_asset_key(row)
         new = (pick or {}).get("source_media_asset_id") or ""
-        if old and old != new:
+        still_carried = (book_rows is not None
+                         and book_carries_asset(book_rows, old, except_ids=swapped_ids))
+        if old and old != new and not still_carried:
             _sel.rollback_use(base_key, pd, store=media_store, asset_id=old)
+        elif old and old != new:
+            _log(f"{base_key}: asset {old} still carried by a sibling row on {pd}; "
+                 "left stamped")
         if new and (pick or {}).get("source") == "drive":
             store = media_store
             if store is None:
@@ -497,6 +582,7 @@ def client_message(reason, base_key=""):
 
 __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "local_candidates", "drive_candidates", "swap_fields", "after_swap",
+           "sibling_rows", "book_carries_asset",
            "library_path_for", "client_message", "is_video",
            "REASON_NO_LIBRARY", "REASON_NO_FRESH_PHOTO", "REASON_HOSTING",
            "REASON_STORY_REBURN"]

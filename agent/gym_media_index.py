@@ -78,7 +78,8 @@ _HEIC_EXTS = (".heic", ".heif")
 _HEVC_HINT_EXTS = (".mov",)          # iPhone .mov is usually HEVC; probed to confirm
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".heic",
                ".heif")
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv", ".hevc")
+from .media_types import (VIDEO_EXTS as _VIDEO_EXTS,           # ONE definition (audit D1)
+                          is_publishable_video as _is_publishable_video)
 
 
 def _ext(title):
@@ -404,6 +405,14 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
             info = probe_fn(src_path) or {}
             codec = str(info.get("codec") or "").lower()
         needs_hevc = codec in ("hevc", "h265", "h.265")
+        # CONTAINER, not just codec (audit D1, 2026-09-10): the index admits .webm /
+        # .avi / .mkv / .hevc as video, but Zernio -> IG/FB only carry .mp4/.mov/.m4v.
+        # Such a file is transcoded to an H.264 .mp4 rendition through the same ffmpeg
+        # lane (hevc_to_h264 is a generic re-encode); without a converter the caller
+        # marks it not eligible. Nothing outside the publishable containers is ever
+        # staged raw.
+        if not _is_publishable_video(title):
+            needs_hevc = True
     if not needs_heic and not needs_hevc:
         return None, False               # plain asset: caller uses the original
 

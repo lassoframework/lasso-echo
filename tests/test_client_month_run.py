@@ -411,19 +411,23 @@ def test_stale_reuse_skipped_when_drive_pool_connected(tmp_path, monkeypatch):
     monkeypatch.setattr(client_content.rotation, "load_served",
                         lambda: {"gritx_ig": list(served)})
     store = _FakeStore()
+    logs = []
     out = cmr.build_client_month(
         _account(), "gritx", "2026-08-01", days=5, voice=_voice(),
-        library_path=lib, store=store, banned_words=())
+        library_path=lib, store=store, banned_words=(), logger=logs.append)
     assert out["ok"] is True
+    # Every day was DEFERRED to the Drive pool by Lane A (no stale repeat placed in
+    # the main loop)...
+    deferred = [m for m in logs if "leaving the day for the connected Drive pool" in m]
+    assert len(deferred) == 5, deferred
+    # ...but no Drive builder is wired into this fake store, so the Drive lane covered
+    # nothing, and the NO-EMPTY-DAY fallback (audit 2c, 2026-09-10) then placed a
+    # spaced repeat on each day: never 5 empty days.
     feed_ig = [r for r in store.inserted
                if r["format"] == "feed" and r["account"] == "instagram"]
-    # No Drive builder is wired into this fake store, so the Drive lane itself
-    # produces nothing here -- the point is that the STALE repeat was never placed
-    # either, unlike the no-Drive-connection baseline (5/5 placed).
-    assert len(feed_ig) == 0, (
-        f"expected the stale-reuse day to be left for the Drive pool, not filled "
-        f"with a repeat, got {len(feed_ig)} feed day(s)"
-    )
+    assert len(feed_ig) == 5, f"expected 5 fallback repeats, got {len(feed_ig)}"
+    assert len({r["image_url"] for r in feed_ig}) == 5, "repeats spread across photos"
+    assert sum("placed a spaced repeat" in m for m in logs) == 5
     client_content.clear_drive_pool_cache()
 
 

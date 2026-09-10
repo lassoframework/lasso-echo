@@ -209,6 +209,14 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 # HEIC but no converter available: not eligible, try the next.
                 _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
                 continue
+            elif (asset.get("kind") == _idx.KIND_VIDEO
+                    and not _idx._is_publishable_video(title)):
+                # A .webm/.avi/.mkv/.hevc that could not be transcoded to .mp4: Zernio
+                # cannot carry the container, so it is never staged raw (audit D1).
+                print(f"[gym-media-builder] {title!r} is not a publishable video "
+                      "container and no H.264 rendition could be made; skipping")
+                _mark_not_eligible(store, asset, _idx.REJECT_CONVERT_UNAVAILABLE)
+                continue
 
             # Re-gate from real bytes (fail closed) + probe videos.
             poster_url = ""
