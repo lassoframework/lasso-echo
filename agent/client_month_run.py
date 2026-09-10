@@ -782,7 +782,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             library_path="", slots_per_day=1, banned_words=(),
                             rendition_budget=None, covered_slots=None,
                             video_beats_only=False, kind_prefs=None,
-                            day_captions_seed=None):
+                            day_captions_seed=None, failed_assets=None):
     """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
     (gym_media_drive spec §7). This is the production caller of
     gym_media_builder.build_gym_media_draft: for each day in the span that the
@@ -818,7 +818,18 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     which it ADDS every slot it stages, so Lane A, the pre-pass and the gap-fill never
     place two feeds in one slot (2x: one slot may be a Lane A still, the other a Drive
     video). day_captions_seed: {day_key: [captions]} already placed on a day by another
-    lane, so the same-concept guard sees them."""
+    lane, so the same-concept guard sees them.
+
+    failed_assets: a BUILD-LOCAL set (shared by the pre-pass and the gap-fill call) of
+    Drive asset ids whose caption failed the A+ gate twice this build. They are passed
+    to the builder as exclude_ids so a poisoned asset (least-used again the moment it
+    is rolled back) cannot be re-picked on every later beat and starve the month
+    (final verification g).
+
+    NEVER LOSES WORK (final verification h): an exception escaping any step after the
+    builder returns rolls the in-flight draft's asset back and RETURNS the drafts
+    already finished, so covered_slots, the returned drafts and the usage stamps stay
+    consistent; the caller (and Lane A) carry on from the partial result."""
     from datetime import timedelta
     from . import gym_media_builder
     extra = []
@@ -827,6 +838,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     account_key = getattr(account, "key", "") or base_key
     pillar_i = 0
     slots = 2 if int(slots_per_day or 1) == 2 else 1
+    failed = failed_assets if failed_assets is not None else set()
     for i in range(days):
         day_key = (start + timedelta(days=i)).isoformat()
         if day_key in covered:
@@ -851,7 +863,7 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
                     slot_index=slot_i, rendition_budget=rendition_budget,
-                    kind_prefs=kind_prefs)
+                    kind_prefs=kind_prefs, exclude_ids=tuple(sorted(failed)))
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
                     f"{type(e).__name__}: {e}")
@@ -862,81 +874,108 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 # Empty pool / gate miss: the builder already alerted if needed. Stop
                 # this day rather than retry the same starved pool for slot 2.
                 break
-            # A+ GATE (Blake grades calendars; the denied-slot backfill already
-            # enforces this on its Drive-first replacement and the uploaded-media
-            # loop on every pick): a Drive caption that fails A+ / carries a banned
-            # word is DROPPED, its asset returned to the pool, never staged because
-            # it came from a different lane.
             try:
-                from . import post_quality as _pq
-                _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()), require_media=True)
-                            if config.sb7_enabled()
-                            else not _has_banned_word(getattr(draft, "caption", "") or "",
-                                                      tuple(banned_words or ())))
-            except Exception as e:  # noqa: BLE001 - a gate error is a fail, never a pass
-                log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
-                    f"({type(e).__name__}); dropping the draft")
-                _gate_ok = False
-            if not _gate_ok:
-                # RETRY ONCE WITH A FRESH CAPTION ON THE SAME ASSET (audit round 4 #3):
-                # dropping the day here sent a video beat to a still repeat over a
-                # caption problem the asset had nothing to do with.
-                if _recaption_drive_draft(account, draft, voice, account_key, day_key,
-                                          slot_i, log):
-                    try:
-                        _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()),
-                                                  require_media=True)
-                                    if config.sb7_enabled()
-                                    else not _has_banned_word(
-                                        getattr(draft, "caption", "") or "",
-                                        tuple(banned_words or ())))
-                    except Exception:  # noqa: BLE001
-                        _gate_ok = False
-            if not _gate_ok:
-                log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
-                    "failed the A+/banned-word gate twice")
+                placed = _stage_drive_draft(
+                    account, base_key, account_key, platform, draft, day_key, slot_i,
+                    slots, voice, banned_words, day_captions, library_path, log,
+                    failed, extra, covered_slots, pillar, video_beats_only)
+            except Exception as e:  # noqa: BLE001 - never lose the drafts already made
+                log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: staging raised "
+                    f"{type(e).__name__}: {e}; returning the {len(extra)} draft(s) already "
+                    "finished, the in-flight asset returned to the pool")
                 _rollback_drive_asset(draft, day_key, log)
+                return extra
+            if not placed:
                 break
-            # NEVER THE SAME CONCEPT TWICE IN ONE DAY (the uploaded loop's rule). The
-            # slot-offset source rotation above should already differ, but this is the
-            # hard guard: a repeat caption is DROPPED rather than staged, so a 2x day
-            # can never publish the same words twice.
-            _cap = (getattr(draft, "caption", "") or "").strip()
-            if _cap and _cap in day_captions:
-                log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, its "
-                    "caption repeats the day's other post")
-                _rollback_drive_asset(draft, day_key, log)
-                break
-            day_captions.append(_cap)
-            # Cross-post platform parity with the uploaded-media feed (the FB mirror in
-            # _to_rows keys off an ig/empty account); leave the platform as the account's.
-            if not (getattr(draft, "platform", "") or "").strip():
-                try:
-                    draft.platform = platform
-                except Exception:  # noqa: BLE001 - a frozen draft never blocks the build
-                    pass
-            draft.day_key = day_key
-            # SAME cards as the uploaded-media loop: feed + its paired story on the one
-            # asset, through the shared helper (video edit, poster, autofit, captionless
-            # guard). A story that cannot carry its caption is still dropped in there.
-            day_drafts = _finish_feed_with_story(
-                account, draft, library_path, log, day_key=day_key)
-            if slots == 2:
-                for d in day_drafts:
-                    try:
-                        d.cadence_slot_index = slot_i
-                    except Exception:  # noqa: BLE001 - a frozen draft never blocks
-                        pass
-            extra.extend(day_drafts)
             pillar_i += 1
-            if covered_slots is not None:
-                covered_slots.add((day_key, slot_i))
-            log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} "
-                f"{'video ' if video_beats_only else ''}post from the connected Drive "
-                f"pool (asset {draft.source_media_asset_id}), PENDING")
         if not video_beats_only:
             covered.add(day_key)
     return extra
+
+
+def _stage_drive_draft(account, base_key, account_key, platform, draft, day_key, slot_i,
+                       slots, voice, banned_words, day_captions, library_path, log,
+                       failed, extra, covered_slots, pillar, video_beats_only):
+    """Gate, guard, finish and append ONE built Drive draft. True when it was placed;
+    False when it was dropped (asset rolled back) and the caller should stop this day.
+    Split out of append_gym_drive_drafts so its exception path is one place."""
+    # A+ GATE (Blake grades calendars; the denied-slot backfill already
+    # enforces this on its Drive-first replacement and the uploaded-media
+    # loop on every pick): a Drive caption that fails A+ / carries a banned
+    # word is DROPPED, its asset returned to the pool, never staged because
+    # it came from a different lane.
+    try:
+        from . import post_quality as _pq
+        _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()), require_media=True)
+                    if config.sb7_enabled()
+                    else not _has_banned_word(getattr(draft, "caption", "") or "",
+                                              tuple(banned_words or ())))
+    except Exception as e:  # noqa: BLE001 - a gate error is a fail, never a pass
+        log(f"[gym-drive] {base_key} {day_key}: A+ gate errored "
+            f"({type(e).__name__}); dropping the draft")
+        _gate_ok = False
+    if not _gate_ok:
+        # RETRY ONCE WITH A FRESH CAPTION ON THE SAME ASSET (audit round 4 #3):
+        # dropping the day here sent a video beat to a still repeat over a
+        # caption problem the asset had nothing to do with.
+        if _recaption_drive_draft(account, draft, voice, account_key, day_key,
+                                  slot_i, log):
+            try:
+                _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()),
+                                          require_media=True)
+                            if config.sb7_enabled()
+                            else not _has_banned_word(
+                                getattr(draft, "caption", "") or "",
+                                tuple(banned_words or ())))
+            except Exception:  # noqa: BLE001
+                _gate_ok = False
+    if not _gate_ok:
+        log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
+            "failed the A+/banned-word gate twice")
+        _rollback_drive_asset(draft, day_key, log)
+        # POISONED ASSET (final verification g): rolled back, it is the pool's
+        # least-used candidate again; keep it out of every later beat this build.
+        aid = (getattr(draft, "source_media_asset_id", "") or "").strip()
+        if aid:
+            failed.add(aid)
+        return False
+    # NEVER THE SAME CONCEPT TWICE IN ONE DAY (the uploaded loop's rule). The
+    # slot-offset source rotation above should already differ, but this is the
+    # hard guard: a repeat caption is DROPPED rather than staged, so a 2x day
+    # can never publish the same words twice.
+    _cap = (getattr(draft, "caption", "") or "").strip()
+    if _cap and _cap in day_captions:
+        log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, its "
+            "caption repeats the day's other post")
+        _rollback_drive_asset(draft, day_key, log)
+        return False
+    day_captions.append(_cap)
+    # Cross-post platform parity with the uploaded-media feed (the FB mirror in
+    # _to_rows keys off an ig/empty account); leave the platform as the account's.
+    if not (getattr(draft, "platform", "") or "").strip():
+        try:
+            draft.platform = platform
+        except Exception:  # noqa: BLE001 - a frozen draft never blocks the build
+            pass
+    draft.day_key = day_key
+    # SAME cards as the uploaded-media loop: feed + its paired story on the one
+    # asset, through the shared helper (video edit, poster, autofit, captionless
+    # guard). A story that cannot carry its caption is still dropped in there.
+    day_drafts = _finish_feed_with_story(
+        account, draft, library_path, log, day_key=day_key)
+    if slots == 2:
+        for d in day_drafts:
+            try:
+                d.cadence_slot_index = slot_i
+            except Exception:  # noqa: BLE001 - a frozen draft never blocks
+                pass
+    extra.extend(day_drafts)
+    if covered_slots is not None:
+        covered_slots.add((day_key, slot_i))
+    log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} "
+        f"{'video ' if video_beats_only else ''}post from the connected Drive "
+        f"pool (asset {draft.source_media_asset_id}), PENDING")
+    return True
 
 
 def build_client_month(account, base_key, start_date, days=30, *, voice,

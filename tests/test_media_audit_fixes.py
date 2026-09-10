@@ -1132,6 +1132,81 @@ def test_pre_pass_leaves_a_video_beat_to_lane_a_when_no_video_is_pickable(monkey
     assert all(a["used_count"] == 0 for a in store.assets.values())
 
 
+# ---- final verification (g): a poisoned asset is excluded after its second failure --
+def test_a_poisoned_asset_is_skipped_after_two_gate_failures_and_beats_still_get_videos(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool(n_videos=6, n_photos=0))
+    _arm(monkeypatch, store, FakeDrive())
+    n = iter(range(1000))
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: (f"A grounded caption number {next(n)}", []))
+    from agent import post_quality
+    gate_calls = []
+
+    def gate(draft, banned, require_media=True):
+        gate_calls.append(draft.source_media_asset_id)
+        return draft.source_media_asset_id != "v00"       # v00 is poisoned, always fails
+    monkeypatch.setattr(post_quality, "is_a_plus", gate)
+    covered, failed = set(), set()
+    start = date(2026, 8, 1)
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", start, 11, _voice(),
+                                        log=lambda m: None, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), covered_slots=covered,
+                                        video_beats_only=True, kind_prefs=("video",),
+                                        failed_assets=failed, banned_words=("x",))
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    beats = _video_beats(start, 11)
+    assert failed == {"v00"}
+    assert gate_calls.count("v00") == 2, "gated twice (once + one retry), then excluded"
+    # v00 is least-used again after its rollback; without the exclusion it would have
+    # been re-picked on every later beat. Every OTHER beat still got a video.
+    assert len(feeds) == beats - 1 and "v00" not in {f.source_media_asset_id for f in feeds}
+    assert store.assets["v00"]["used_count"] == 0
+    assert len({f.source_media_asset_id for f in feeds}) == beats - 1
+
+
+# ---- final verification (h): an exception mid-lane never loses finished drafts ------
+def test_a_raise_mid_lane_keeps_finished_drafts_and_rolls_back_the_in_flight_asset(
+        monkeypatch, tmp_path):
+    """Raise on the 3rd _finish_feed_with_story: the two finished video drafts land,
+    the third asset is returned to the pool, Lane A covers every remaining day ->
+    20/20 feeds and no stamped-but-unlanded asset."""
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool())
+    _arm(monkeypatch, store, FakeDrive())
+    calls = {"n": 0}
+    real_finish = cmr._finish_feed_with_story
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("story lane blew up")
+        return real_finish(*a, **k)
+    monkeypatch.setattr(cmr, "_finish_feed_with_story", flaky)
+    start = date(2026, 8, 1)
+    cal = _CalStore()
+    logs = []
+    out = cmr.build_client_month(_account(), "gritx", start.isoformat(), days=20,
+                                 voice=_voice(), library_path=_lib(tmp_path, n=95),
+                                 store=cal, banned_words=(), logger=logs.append)
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len(feeds) == 20 and len({r["post_date"] for r in feeds}) == 20, "20/20 feeds"
+    videos = [r for r in feeds if r.get("source_media_asset_id")]
+    assert len(videos) == 2, "the two drafts finished before the raise landed"
+    assert any("staging raised RuntimeError" in m for m in logs)
+    landed = {r["source_media_asset_id"] for r in videos}
+    stamped = {a["id"] for a in store.assets.values() if a["used_count"]}
+    assert stamped == landed, f"stamped-but-unlanded: {stamped - landed}"
+    # the slots the pre-pass claimed are exactly the ones that landed (Lane A filled
+    # the rest), so no day has two feeds on one account
+    assert len({(r["post_date"], r["account"]) for r in cal.inserted
+                if r["format"] == "feed"}) == 40
+
+
 # ---- MAJOR 2: sync_source resolves a stale gym_id exactly like run() -----------------
 def test_sync_source_resolves_a_stale_gym_id_before_touching_the_store(monkeypatch):
     from agent.jobs import sync_gym_media as job
