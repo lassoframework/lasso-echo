@@ -32,6 +32,14 @@ PNG_B64 = base64.b64encode(PNG).decode()
 GEM = b"\x89PNG\r\n\x1a\nGEMINI-FAKE-BYTES"
 
 
+def _real_png_b64_sized(w, h, color=(11, 22, 33)):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def _astra_ok_body(revised="revised by astra"):
     return json.dumps({"output": [{
         "type": "image_generation_call",
@@ -177,6 +185,62 @@ def test_size_defaults_are_feed_1080x1350_and_story_1080x1920():
     assert image_engine.size_for({"size": "2048x2048"}) == "2048x2048"
 
 
+# ---- size snapping: the live API rejects any dimension not divisible by 16 ----
+# Verified against the real endpoint 2026-09-10:
+#   1080x1350 -> HTTP 400 "Width and height must both be divisible by 16."
+#   1024x1280 / 1152x2048 / 1024x1024 -> HTTP 200
+# Without the snap, EVERY Astra call 400s and the chain lives on Gemini forever.
+
+
+def test_every_snapped_dimension_is_divisible_by_sixteen():
+    for target in ("1080x1350", "1080x1920", "1024x1024", "1000x1500", "37x99"):
+        w, h = image_engine.parse_size(image_engine.snap_size(target))
+        assert w % 16 == 0 and h % 16 == 0, (target, w, h)
+        assert w >= 16 and h >= 16
+
+
+def test_the_two_echo_targets_snap_to_the_verified_sizes():
+    assert image_engine.snap_size("1080x1350") == "1024x1280"   # 4:5, HTTP 200
+    assert image_engine.snap_size("1080x1920") == "1152x2048"   # 9:16, HTTP 200
+
+
+def test_the_snap_preserves_the_aspect_ratio():
+    for target in ("1080x1350", "1080x1920"):
+        tw, th = image_engine.parse_size(target)
+        sw, sh = image_engine.parse_size(image_engine.snap_size(target))
+        assert abs((sw / sh) - (tw / th)) < 0.001, (target, sw, sh)
+
+
+def test_astra_sends_the_snapped_size_not_the_raw_target(astra_key):
+    transport = _Transport((200, _astra_ok_body()))
+    engine = image_engine.AstraImageEngine("sk-test", transport=transport)
+    engine.generate("brief", {"kind": "infographic"})
+    assert transport.payloads[0]["tools"][0]["size"] == "1024x1280"
+
+    transport2 = _Transport((200, _astra_ok_body()))
+    engine2 = image_engine.AstraImageEngine("sk-test", transport=transport2)
+    engine2.generate("brief", {"surface": "instagram story"})
+    assert transport2.payloads[0]["tools"][0]["size"] == "1152x2048"
+
+
+def test_the_result_is_scaled_back_to_the_requested_target(astra_key):
+    from PIL import Image
+    import io
+    body = json.dumps({"output": [{"type": "image_generation_call",
+                                   "result": _real_png_b64_sized(1024, 1280)}]})
+    engine = image_engine.AstraImageEngine(
+        "sk-test", transport=_Transport((200, body)))
+    res = engine.generate("brief", {"kind": "infographic"})
+    with Image.open(io.BytesIO(res.image_bytes)) as im:
+        assert im.size == (1080, 1350)
+
+
+def test_a_failed_resize_keeps_the_generated_bytes():
+    """Losing a card to a resize would be worse than a few pixels off target."""
+    assert image_engine.fit_to_size(b"not-an-image", "1080x1350") == b"not-an-image"
+    assert image_engine.fit_to_size(b"", "1080x1350") == b""
+
+
 def test_sunburst_costs_more_than_flare():
     sun = image_engine.cost_estimate("astra", "gpt-image-2.5-sunburst")
     flare = image_engine.cost_estimate("astra", "gpt-image-2.5-flare")
@@ -200,7 +264,8 @@ def test_astra_posts_the_spec_responses_payload(astra_key):
     tool = payload["tools"][0]
     assert tool["type"] == "image_generation"
     assert tool["model"] == "gpt-image-2.5-sunburst"
-    assert tool["size"] == "1080x1350"
+    # the SNAPPED size: the live tool rejects anything not divisible by 16
+    assert tool["size"] == "1024x1280"
 
 
 def test_astra_extracts_image_and_revised_prompt_from_tool_output(astra_key):
@@ -509,7 +574,7 @@ def test_story_surface_with_a_headline_still_asks_for_sunburst(monkeypatch,
                              out_path=str(tmp_path / "s.png"))
     tool = transport.payloads[0]["tools"][0]
     assert tool["model"] == "gpt-image-2.5-sunburst"
-    assert tool["size"] == "1080x1920"
+    assert tool["size"] == "1152x2048"          # snapped 9:16, same ratio
 
 
 # ---------------------------------------------------------------------------
