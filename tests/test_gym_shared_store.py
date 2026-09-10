@@ -218,11 +218,19 @@ def test_gym_get_read_through_hydrates_a_shared_only_row(armed, monkeypatch):
     row = db.gym_get("onlyshared")
     assert row is not None and row["display_name"] == "Only Shared"
     assert row["zernio_profile_id"] == "prof-1"
-    # hydrated: the SECOND read is answered locally, with no further network call
-    before = len(fake.calls)
+    # Hydrated. The SECOND read never makes another PER-KEY lookup; the only further
+    # traffic it may cause is the throttled FULL-table refresh, which is one request
+    # for the whole fleet and is capped at one per window (asserted below).
+    before = list(fake.calls)
     again = db.gym_get("onlyshared")
     assert again["posting_timezone"] == "America/Chicago"
-    assert len(fake.calls) == before
+    new_calls = fake.calls[len(before):]
+    assert not [c for c in new_calls if c[1].get("account_key")], (
+        "a hydrated row still cost a per-key network lookup")
+    n = len(fake.calls)
+    db.gym_get("onlyshared")
+    db.gym_get("onlyshared")
+    assert len(fake.calls) == n, "the full-table refresh was not throttled"
 
 
 def test_a_failed_hydrate_still_returns_the_shared_row(armed, monkeypatch):
@@ -345,6 +353,87 @@ def test_gym_list_pulls_shared_only_rows(armed, monkeypatch):
     keys = {r["account_key"] for r in db.gym_list()}
     assert {"localone", "pulled1", "pulled2"} <= keys
     assert db.gym_get("pulled2", _shared_read=False)["stripe_customer_id"] == "cus_p2"
+
+
+def test_an_update_to_an_EXISTING_row_propagates(armed, monkeypatch):
+    """The gap the live end-to-end found on 2026-09-10: gym_get's read-through only
+    fires on a local MISS, so a row this service already had answered from its stale
+    local copy forever. A change made on the OTHER service must reach this one."""
+    fake = FakePostgrest(rows=[{
+        "account_key": "updateme", "display_name": "Update Me",
+        "stripe_customer_id": "cus_written_by_the_other_service",
+        "updated_at": "2026-09-10T20:00:00+00:00"}])
+    _wire(monkeypatch, fake)
+    # this service already HAS the row, with an older stamp and no customer id
+    db._local_gym_upsert("updateme", "Update Me", {})
+    with db.connect() as c:
+        c.execute("UPDATE gyms SET updated_at='2026-09-10 19:00:00' "
+                  "WHERE account_key='updateme'")
+        c.commit()
+    assert db.gym_get("updateme", _shared_read=False)["stripe_customer_id"] is None
+
+    row = db.gym_get("updateme")
+    assert row["stripe_customer_id"] == "cus_written_by_the_other_service", (
+        "an update made on the other service never reached this one")
+
+
+def test_a_CHANGED_field_is_overwritten_when_the_shared_row_is_newer(
+        armed, monkeypatch):
+    """The strict case: this service already holds a NON-EMPTY value and the other
+    service CHANGED it. Filling only empty fields (the first cut) leaves the old value
+    in place forever and calls the divergence a 'disagreement'. Newest wins."""
+    fake = FakePostgrest(rows=[{
+        "account_key": "changedfield", "display_name": "Changed Field",
+        "zernio_profile_id": "prof-REPOINTED",
+        "posting_timezone": "Europe/Lisbon",
+        "updated_at": "2026-09-10T20:00:00+00:00"}])
+    _wire(monkeypatch, fake)
+    db._local_gym_upsert("changedfield", "Changed Field",
+                         {"zernio_profile_id": "prof-STALE",
+                          "posting_timezone": "America/New_York"})
+    with db.connect() as c:
+        c.execute("UPDATE gyms SET updated_at='2026-09-10 19:00:00' "
+                  "WHERE account_key='changedfield'")
+        c.commit()
+
+    db.pull_shared_into_local(force=True)
+
+    row = db.gym_get("changedfield", _shared_read=False)
+    assert row["zernio_profile_id"] == "prof-REPOINTED", (
+        "a value CHANGED on the other service never propagated")
+    assert row["posting_timezone"] == "Europe/Lisbon"
+
+
+def test_a_stale_shared_row_never_rolls_back_a_newer_local_value(armed, monkeypatch):
+    """The mirror can fail (it alerts, and the local write stands). A shared copy that
+    is OLDER than the local row must never overwrite it back."""
+    fake = FakePostgrest(rows=[{
+        "account_key": "newerlocal", "display_name": "Newer Local",
+        "zernio_profile_id": "prof-OLD",
+        "updated_at": "2026-09-10T18:00:00+00:00"}])
+    _wire(monkeypatch, fake)
+    db._local_gym_upsert("newerlocal", "Newer Local",
+                         {"zernio_profile_id": "prof-NEW"})
+    with db.connect() as c:
+        c.execute("UPDATE gyms SET updated_at='2026-09-10 21:00:00' "
+                  "WHERE account_key='newerlocal'")
+        c.commit()
+    db.pull_shared_into_local(force=True)
+    assert db.gym_get("newerlocal", _shared_read=False)["zernio_profile_id"] \
+        == "prof-NEW", "a stale shared copy rolled back a newer local write"
+
+
+def test_naive_local_stamps_are_read_as_utc_not_local_time(armed):
+    """SQLite writes datetime('now') (naive UTC) and the shared store an ISO string
+    with an offset. Reading the naive one as LOCAL time would make every comparison
+    wrong by the host's offset -- silently, and differently per machine."""
+    from datetime import timezone
+    naive = db._parse_ts("2026-09-10 19:00:00")
+    aware = db._parse_ts("2026-09-10T19:00:00+00:00")
+    assert naive is not None and naive.tzinfo is not None
+    assert naive == aware
+    assert db._parse_ts("2026-09-10T19:00:00Z") == aware
+    assert db._parse_ts(None) is None and db._parse_ts("nonsense") is None
 
 
 def test_a_pull_never_overwrites_a_non_empty_local_value(armed, monkeypatch):
