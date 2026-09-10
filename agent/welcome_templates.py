@@ -673,17 +673,35 @@ def ensure_background(template, bg_client=None, cache_dir=None, force=False,
 
     if client is not None:
         prompt = background_prompt(t, fmt=fmt)
-        img_bytes = client.generate_image(prompt=prompt, model=config.NANO_MODEL)
-        with open(path, "wb") as fh:
-            fh.write(img_bytes)
-        # cover-crop center to the target frame (never stretch), so real Pro art
-        # keeps its proportions whether square (feed) or portrait (story).
-        src = _cover_crop(Image.open(path).convert("RGB"), W, H)
-        src.save(path)
-    else:
-        bg = (_procedural_background_story(t, W, H) if fmt == "story"
-              else _procedural_background(t))
-        bg.convert("RGB").save(path)
+        # Astra first, Gemini as the fallback rung (image_engine owns the chain).
+        # A background renders NO text, so a story frame takes the Flare quick
+        # graphic route while the square feed frame stays on Sunburst.
+        from . import image_engine as _ie
+        res = _ie.generate_image(
+            prompt,
+            {"kind": "background", "has_text_overlay": False,
+             "surface": "instagram story" if fmt == "story" else "feed post",
+             "size": f"{W}x{H}", "gemini_model": config.NANO_MODEL},
+            gemini_client=client, subject=f"welcome background {t['id']} {fmt}")
+        if res is not None:
+            with open(path, "wb") as fh:
+                fh.write(res.image_bytes)
+            # cover-crop center to the target frame (never stretch), so real Pro art
+            # keeps its proportions whether square (feed) or portrait (story).
+            src = _cover_crop(Image.open(path).convert("RGB"), W, H)
+            src.save(path)
+            return path, mode
+        # EVERY engine failed. image_engine already marked it NEEDS HUMAN (ops
+        # alert + audit row); degrade to the procedural background under its own
+        # cache name rather than raising into the caller or caching a blank as
+        # 'pro'. Previously the provider exception escaped this function.
+        mode = "placeholder"
+        path = os.path.join(cdir, f"{t['id']}_{mode}{suffix}.png")
+        if os.path.isfile(path) and not force:
+            return path, mode
+    bg = (_procedural_background_story(t, W, H) if fmt == "story"
+          else _procedural_background(t))
+    bg.convert("RGB").save(path)
     return path, mode
 
 

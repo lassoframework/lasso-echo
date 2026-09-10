@@ -79,6 +79,24 @@ NANO_MODEL_FLASH = os.environ.get("AGENT_NANO_MODEL_FLASH", "gemini-3.1-flash-im
 # in this document. Code constants in creative_studio.py must match section 8.
 HOUSE_STYLE_PATH = os.environ.get("AGENT_HOUSE_STYLE_PATH",
                                   "brand_voice/lasso_house_style.md")
+
+# ---- Image engine: Astra is the DEFAULT, Gemini is the fallback --------------
+# ChatGPT-6 Astra (gpt-image-2.5) draws every image first; the Gemini / Nano
+# Banana path above is UNCHANGED and demoted to the fallback rung. The engine and
+# the model ids are read fresh from env in image_engine.py (spec names
+# IMAGE_ENGINE / ASTRA_IMAGE_MODEL, with AGENT_-prefixed aliases); the constants
+# below are only the DEFAULTS that apply when neither env name is set.
+#
+# The OpenAI key is read lazily BY NAME at the moment of use — never stored on an
+# object, never logged. Absent key = boot with engine=gemini and one warning.
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"  # name of the env var, not the value
+# The Responses-API model that reads the creative brief and calls the image tool.
+ASTRA_BRIEF_MODEL = os.environ.get("ASTRA_BRIEF_MODEL", "gpt-6-astra")
+# Sunburst: infographics, carousels, and any asset with text overlays.
+ASTRA_IMAGE_MODEL = os.environ.get("ASTRA_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+# Flare: story-format quick graphics that render no text.
+ASTRA_IMAGE_MODEL_FLARE = os.environ.get("ASTRA_IMAGE_MODEL_FLARE",
+                                         "gpt-image-2.5-flare")
 # VISION READ model (image -> text), SEPARATE from the generation model above.
 # The *-image models (Nano Banana family: gemini-3-pro-image, gemini-3.1-flash-image)
 # GENERATE images and return image parts, not text, so they cannot transcribe text

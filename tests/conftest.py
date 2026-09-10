@@ -39,6 +39,12 @@ _CRED_PREFIXES = (
     # is GOOGLE_DRIVE_SA_JSON — strip both families so an armed container can
     # never hand a test a live Drive key or a flipped stage flag.
     "PODCAST_", "GOOGLE_DRIVE_",
+    # IMAGE ENGINE (Astra default): the spec env names are UNPREFIXED
+    # (IMAGE_ENGINE, ASTRA_IMAGE_MODEL, ASTRA_BRIEF_MODEL), so the AGENT_ sweep
+    # above does not reach them. A container with IMAGE_ENGINE armed would
+    # otherwise hand the suite live routing state. OPENAI_ is already stripped
+    # above, which is what keeps the Astra engine out of an offline test run.
+    "IMAGE_ENGINE", "ASTRA_",
 )
 
 
