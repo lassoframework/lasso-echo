@@ -42,9 +42,48 @@ from .drafter import Draft, DraftStatus
 
 _MAX_ASSET_ATTEMPTS = 3      # validation/vision failures try the next asset, bounded
 
-# Which media kind a slot prefers. faces/community/results are people-forward, so
-# photos first; a slot with no photo falls through to the uploaded-media logic.
-_SLOT_KIND = {"faces": "photo", "community": "photo", "results": "photo"}
+# MEDIA MIX (John Weeks / Tough Temple, 2026-09-10). This lane used to map every
+# pillar to kind_preference="photo" (_SLOT_KIND), and pick_media hard-filters on kind,
+# so a gym with 57 eligible Drive VIDEOS and 6 photos was staged photo-only for its
+# whole life: not one Drive video ever reached content_calendar, the 6 photos burned
+# their 90-day cooldown in a week, and the book fell back to the same local stills.
+# Now a slot's kind comes from a deterministic per-day/slot pattern: VIDEO_MIX_PATTERN
+# out of every VIDEO_MIX_CYCLE consecutive (day, slot) ordinals are video slots
+# (5/11 = 45%, the "roughly 40-50% video" target), the rest photo. Deterministic on the
+# calendar date + slot index so a re-run of the same month stages the same shape. The
+# preferred kind is only ever ASKED FOR when the pool can supply it, and when the
+# preferred kind is exhausted mid-month the slot falls back to the other kind rather
+# than leaving the day empty (kinds_for_slot returns the ordered preference list).
+VIDEO_MIX_CYCLE = 11
+VIDEO_MIX_PATTERN = frozenset({0, 2, 4, 7, 9})
+
+
+def is_video_slot(day_key, slot_index=0):
+    """True when this (day, slot) ordinal falls on a video beat of the mix pattern.
+    Pure and deterministic: the same date + slot always answers the same way."""
+    try:
+        from datetime import date as _date
+        ordinal = _date.fromisoformat(str(day_key)[:10]).toordinal()
+    except (TypeError, ValueError):
+        ordinal = 0
+    return (ordinal + int(slot_index or 0)) % VIDEO_MIX_CYCLE in VIDEO_MIX_PATTERN
+
+
+def kinds_for_slot(pool_kinds, day_key, slot_index=0):
+    """The ordered kind preference for one slot given what the pool can supply.
+    ['video', 'photo'] on a video beat when the pool has videos, ['photo', 'video']
+    otherwise; a pool with only one kind collapses to that kind. [] when the pool has
+    neither (the caller falls through)."""
+    kinds = {str(k) for k in (pool_kinds or ()) if k in (_idx.KIND_PHOTO, _idx.KIND_VIDEO)}
+    if not kinds:
+        return []
+    if kinds == {_idx.KIND_VIDEO}:
+        return [_idx.KIND_VIDEO]
+    if kinds == {_idx.KIND_PHOTO}:
+        return [_idx.KIND_PHOTO]
+    if is_video_slot(day_key, slot_index):
+        return [_idx.KIND_VIDEO, _idx.KIND_PHOTO]
+    return [_idx.KIND_PHOTO, _idx.KIND_VIDEO]
 
 
 def _vision_alert(msg):
@@ -68,7 +107,8 @@ class _PickedCreative:
 
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
-                          drive=None, now=None, library_dir=None, exclude_ids=()):
+                          drive=None, now=None, library_dir=None, exclude_ids=(),
+                          slot_index=0):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -85,7 +125,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     function's own per-call retry tracking; without a caller-supplied set, a denied
     Drive asset's used_count is reset by gym_media_selector.rollback_use the moment
     it's denied, making it the pool's least-used candidate again -- so the exact
-    photo just denied could come right back as its own "fresh" replacement."""
+    photo just denied could come right back as its own "fresh" replacement.
+
+    slot_index: the slot ordinal within the day (0 = the day's first post, 1 = the
+    PM post on a 2x day). Feeds the media-mix pattern together with day_key so the
+    two slots of one day can differ in kind and a re-run stages the same shape."""
     from .integrations import drive_client as _dc
     from . import client_content, vision, media_host
 
@@ -98,17 +142,28 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     acct_key = getattr(account, "key", "") or (account if isinstance(account, str) else "")
     gym_base = _sel.base_gym_key(acct_key)
     platform = getattr(account, "platform", None) or acct_key or ""
-    kind_pref = _SLOT_KIND.get(str(pillar or "").strip().lower())
 
     lib = Path(library_dir or tempfile.mkdtemp(prefix="gymmedia_"))
     lib.mkdir(parents=True, exist_ok=True)
 
     caller_excludes = {str(i) for i in (exclude_ids or ()) if i}
+    # MEDIA MIX: ask the pool what it can supply, then order the kinds for this
+    # (day, slot). The pool-empty alert stays with pick_media below.
+    kind_prefs = kinds_for_slot(
+        _sel.pool_kinds(gym_base, store=store, now=now,
+                        exclude_ids=tuple(caller_excludes)),
+        day_key, slot_index)
     tried = []
     for _attempt in range(_MAX_ASSET_ATTEMPTS):
-        asset = _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
-                                now=now,
-                                exclude_ids=tuple(caller_excludes) + tuple(tried))
+        asset = None
+        for kind_pref in (kind_prefs or [None]):
+            asset = _sel.pick_media(gym_base, kind_preference=kind_pref, store=store,
+                                    now=now,
+                                    exclude_ids=tuple(caller_excludes) + tuple(tried))
+            if asset is not None:
+                break
+            # The preferred kind is exhausted (or every one of it just failed
+            # validation): fall back to the other kind before giving the day up.
         if asset is None:
             return None  # pool empty: pick_media already fired the deduped alert
         tried.append(asset["id"])
@@ -156,6 +211,7 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                 continue
 
             # Re-gate from real bytes (fail closed) + probe videos.
+            poster_url = ""
             if asset.get("kind") == _idx.KIND_VIDEO:
                 info = _idx.probe_video(tmp_path)
                 if not info:
@@ -170,6 +226,12 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                     print(f"[gym-media-builder] {title!r} failed the video gate "
                           f"({reason}); trying the next asset")
                     continue
+                # POSTER FRAME while the download still exists on disk. The month
+                # run's _attach_video_poster reads creative_path, which for a Drive
+                # draft is the asset TITLE (nothing on disk by then), so without this
+                # a Drive video shows as a BLANK card in the portal. Display only:
+                # the row publishes the video itself. Best effort, never blocks.
+                poster_url = video_poster_url(tmp_path, lib, gym_base)
 
             # ECHO_VISION on the frame (photos). vision writes the analysis to the
             # DAM sidecar; we mirror it into media_asset.vision_json.
@@ -253,12 +315,35 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # sweep can flip this PENDING post back to needs_media (§4, §8).
             source_media_asset_id=str(asset["id"]),
         )
+        if poster_url:
+            draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
         try:
             _sel.stamp_use(asset, gym_base, day_key, store=store, now=now)
         except Exception as e:  # noqa: BLE001
             print(f"[gym-media-builder] usage stamp failed: {type(e).__name__}: {e}")
         return draft
     return None
+
+
+def video_poster_url(video_path, work_dir, tenant):
+    """A hosted poster JPG for a local video file, or '' on any failure. Pure ffmpeg
+    frame grab (action_reel.poster_frame) into work_dir, hosted under the gym's
+    tenant. Shared by the Drive builder and the portal media swap so a Drive video
+    row always carries a preview frame. NEVER raises."""
+    try:
+        from . import action_reel, media_host
+        if not config.hosting_enabled():
+            return ""
+        out = Path(work_dir) / (os.path.splitext(os.path.basename(str(video_path)))[0]
+                                + "__poster.jpg")
+        action_reel.poster_frame(str(video_path), str(out))
+        if not out.is_file() or out.stat().st_size == 0:
+            return ""
+        return media_host.host_media(str(out), tenant) or ""
+    except Exception as exc:  # noqa: BLE001 - a missing preview never blocks a post
+        print(f"[gym-media-builder] poster skipped for "
+              f"{os.path.basename(str(video_path))}: {type(exc).__name__}")
+        return ""
 
 
 def assert_tenant(asset, gym_base):

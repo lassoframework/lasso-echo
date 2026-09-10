@@ -144,8 +144,17 @@ def _as_date(value):
         return None
 
 
+def row_asset_key(row):
+    """A calendar row's DRIVE ASSET identity (content_calendar.source_media_asset_id),
+    or '' for a row not staged from the Drive pool. The Drive pool is keyed by asset
+    id, a different id space from library basenames, so the swap reads the book once
+    per key space (book_state with key_fn=row_asset_key) to block an asset already
+    sitting elsewhere in the gym's book."""
+    return str((row or {}).get("source_media_asset_id") or "").strip()
+
+
 def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(),
-               library_path=None):
+               library_path=None, key_fn=None):
     """{media_key: {(iso_date, status), ...}} for every guard-relevant row of the
     gym: forward-book statuses (any date) + PUBLISHED rows near the planned span
     (read back one repeat window before start). Reads via store.list_month
@@ -156,8 +165,13 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
     skip_wipeable_months: 'YYYY-MM' months a rebuild is about to delete-then-
     insert — a WIPEABLE (pending/draft/queued) row inside them will not survive
     the rebuild, so it must not block the very photos it is about to release.
-    coach_review rows are NOT wipeable and always count."""
+    coach_review rows are NOT wipeable and always count.
+
+    key_fn: how a row is keyed (default row_media_key, the photo basename). Pass
+    row_asset_key to read the same book by Drive asset id; the autofit reframe
+    resolution only applies to the default photo keying."""
     _log = log or (lambda m: print(f"[media-guard] {m}"))
+    key_fn = key_fn or row_media_key
     list_month = getattr(store, "list_month", None)
     if list_month is None or start is None:
         return {}
@@ -190,10 +204,12 @@ def book_state(base_key, store, start, days, *, log=None, skip_wipeable_months=(
                 continue
             if status in _WIPEABLE and pd[:7] in skip:
                 continue                     # this rebuild wipes it; photo is free
-            key = row_media_key(row)
+            key = key_fn(row)
             if not key:
                 continue
             state.setdefault(key, set()).add((pd, status))
+    if key_fn is not row_media_key:
+        return state                         # asset ids have no reframe aliases
     # Resolve autofit reframe names back to their raw library photos so the raw
     # basename (the key every pick excludes by) carries the block.
     return resolve_raw_keys(state, library_path)

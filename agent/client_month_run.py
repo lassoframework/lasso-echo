@@ -603,8 +603,12 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 # No approved fact for the copy: a Drive photo never posts on imagination.
                 break
             try:
+                # slot_index feeds the media mix (gym_media_builder.kinds_for_slot) so
+                # the AM and PM slots of a 2x day can differ in kind and a re-run stages
+                # the same photo/video shape.
                 draft = gym_media_builder.build_gym_media_draft(
-                    account, day_key, pillar, voice, source, store=store, drive=drive)
+                    account, day_key, pillar, voice, source, store=store, drive=drive,
+                    slot_index=slot_i)
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
                     f"{type(e).__name__}: {e}")
@@ -869,7 +873,15 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                     skipped_banned += 1
                     log(f"drop {day_key} feed slot {slot_i + 1}: {feed_drop}")
                 elif slot_i == 0:
-                    log(f"skip {day_key} feed: no approved source could build the day")
+                    if client_content.drive_pool_can_fill(
+                            getattr(account, "key", "") or base_key):
+                        # pick_image returned no pick on purpose: every local
+                        # creative is inside its repeat window and the Drive pool
+                        # can fill the day (append_gym_drive_drafts below).
+                        log(f"skip {day_key} feed: local library exhausted within its "
+                            "repeat window; leaving the day for the connected Drive pool")
+                    else:
+                        log(f"skip {day_key} feed: no approved source could build the day")
                 else:
                     # NEVER the same concept twice in one day: a 2x day that can only
                     # produce one distinct concept emits ONE pair (honest, logged).
@@ -907,9 +919,14 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
             # never runs, so skipping here without checking staging too would
             # leave the gap unfilled by anything at all -- worse than the repeat
             # this fix exists to replace.
+            # ... AND the pool can actually fill it (2026-09-10): with GYM_DRIVE_CONNECT
+            # globally ON, the two flags alone said yes for EVERY gym, including gyms
+            # with no Drive source or a pool fully on cooldown, and their stale repeat
+            # became an empty day. client_content.drive_pool_can_fill checks both
+            # flags AND a pickable asset; it is the same gate pick_image itself now
+            # applies, so this block is the belt for a pick that predates the gate.
             if (getattr(feed, "stale_reuse", False)
-                    and config.gym_drive_stage_enabled()
-                    and config.gym_drive_connect_active_for(
+                    and client_content.drive_pool_can_fill(
                         getattr(account, "key", "") or base_key)):
                 log(f"skip {day_key} feed: stale repeat from an exhausted library, "
                     "leaving the day for the connected Drive pool")

@@ -58,6 +58,10 @@ _ACTION_STATUS = {
 # leaves anything approved / denied / killed / published / publishing / failed in place.
 _WIPEABLE_STATUSES = ("pending", "draft", "queued")
 
+# The only columns swap_media may carry besides image_url / source_media_url: the
+# media identity that must travel with a swapped creative (see swap_media).
+_SWAP_EXTRA_COLUMNS = ("thumbnail_url", "source_media_asset_id")
+
 
 def _slot_key(row):
     """The (post_date, account, format) a row occupies, normalized. Two rows with the
@@ -380,7 +384,8 @@ class SupabaseCalendarStore:
                 return row
         return None
 
-    def swap_media(self, account_key, row_id, image_url, source_media_url=None):
+    def swap_media(self, account_key, row_id, image_url, source_media_url=None,
+                   extra_fields=None):
         """CROSS-DAY MEDIA GUARD sweep (Blake, 2026-08-31): re-point a WAITING row's
         media to a fresh photo because its current photo already sits on another day
         of the gym's book. STATUS-GUARDED SERVER-SIDE: the PATCH itself is filtered to
@@ -389,10 +394,21 @@ class SupabaseCalendarStore:
         live keep exactly the pixels they had. Caption, status and date are untouched.
         source_media_url (when given) is updated too, so a later edited-caption story
         re-burn burns onto the NEW photo, not the replaced duplicate. id+gym_id
-        isolation. Returns the updated row, or None when nothing matched."""
+        isolation. Returns the updated row, or None when nothing matched.
+
+        extra_fields (2026-09-10, the video-capable portal swap): the media identity
+        columns that must move WITH the pixels, limited to thumbnail_url (a video's
+        poster frame; None clears a stale poster when a video row becomes a photo)
+        and source_media_asset_id (the Drive asset now on the row; None clears it when
+        a Drive row becomes a local-library row, so the hide / removed-from-Drive
+        sweeps stop tracking an asset the row no longer carries). Any other key is
+        ignored: this method never becomes a general row editor."""
         payload = {"image_url": image_url}
         if source_media_url is not None:
             payload["source_media_url"] = source_media_url
+        for col in _SWAP_EXTRA_COLUMNS:
+            if col in (extra_fields or {}):
+                payload[col] = extra_fields[col]
         r = self._client().patch(
             self._rest(_TABLE),
             params={"id": f"eq.{row_id}", "gym_id": f"eq.{account_key}",

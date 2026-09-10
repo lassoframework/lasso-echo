@@ -972,8 +972,12 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
                          "error": _ms.client_message(pick.get("reason")),
                          "reason": pick.get("reason"),
                          "recreate_budget": _budget_state(account_key)}
+        # The media identity travels WITH the pixels (2026-09-10): a video's poster
+        # frame (or a cleared poster when a video row becomes a photo) and the Drive
+        # asset id now on the row (or None when it left the Drive pool).
         updated = sb_store.swap_media(account_key, draft_id, pick["image_url"],
-                                      source_media_url=pick.get("source_media_url"))
+                                      source_media_url=pick.get("source_media_url"),
+                                      extra_fields=_ms.swap_fields(pick))
         if updated is None:
             # swap_media filters to pending / coach_review server-side: a row that
             # matched nothing was approved or live between the read and the write.
@@ -981,11 +985,21 @@ def handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=Non
                          "error": ("This post is already approved or live, so its "
                                    "photo is locked. Deny it if you want it redone."),
                          "recreate_budget": _budget_state(account_key)}
+        # The write landed: settle the Drive usage ledger + the served ledger so the
+        # asset now on the row cools down and the one it replaced returns to the pool.
+        _ms.after_swap(account_key, row, pick)
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
     return 200, {"ok": True, "action": "swap-media", "draft_id": draft_id,
-                 "image_public_url": updated.get("image_url", ""),
+                 # Display url: a video row's poster frame, else the media itself (the
+                 # same rule _post_from_row applies for the calendar card).
+                 "image_public_url": (updated.get("thumbnail_url")
+                                      or updated.get("image_url", "")),
+                 "media_kind": _media_kind(updated.get("image_url", "")),
+                 "video_url": (updated.get("image_url", "")
+                               if _media_kind(updated.get("image_url", "")) == "video"
+                               else None),
                  "caption": updated.get("caption", ""),
                  "status": updated.get("status", "pending"),
                  "day_key": updated.get("post_date", ""),
