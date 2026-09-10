@@ -910,6 +910,23 @@ def handle_portal_gym_status(account_key, r2=None):
 _ONBOARD_KEY_RE = re.compile(r"^[a-z0-9]+$")
 
 
+def _valid_iana_timezone(tz):
+    """True when `tz` is a real, loadable IANA zone name. Uses zoneinfo (stdlib, Python
+    3.9+) so this can never accept a shape that merely LOOKS like a zone -- a forged or
+    misspelled value must fail closed (dropped by the caller), never stored."""
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except Exception:  # noqa: BLE001 - no tzdata available: refuse rather than guess
+        return False
+    try:
+        ZoneInfo(tz)
+        return True
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return False
+    except Exception:  # noqa: BLE001 - any other failure: refuse, never crash the onboard call
+        return False
+
+
 def handle_portal_onboard(body):
     """
     The LASSO portal's self-serve onboard call, pure and offline-testable.
@@ -917,8 +934,14 @@ def handle_portal_onboard(body):
     BEFORE this runs. Returns (status_code, response_dict).
 
     Request body (already-parsed JSON):
-      account_key   - lowercase [a-z0-9] slug (rejected otherwise -> 400)
-      display_name  - required, non-empty gym name
+      account_key      - lowercase [a-z0-9] slug (rejected otherwise -> 400)
+      display_name     - required, non-empty gym name
+      posting_timezone - OPTIONAL onboarding-time hint (an IANA zone name, e.g.
+                         "America/New_York"), used ONLY as a same-day default when the
+                         gym has none set yet. A malformed value is IGNORED (never a 400
+                         for an optional field), never fabricated, and never overwrites a
+                         value a human or the posting-tz backfill watchdog already wrote
+                         (see onboard.run's posting_timezone handling).
 
     On success returns 200 with:
       account_key  - the CANONICAL slug onboard.run actually stood the gym up under
@@ -957,6 +980,13 @@ def handle_portal_onboard(body):
     if not display_name:
         return 400, {"error": "display_name is required"}
 
+    # OPTIONAL, best-effort only: a malformed/absent value is silently dropped rather than
+    # rejecting the whole onboard call over a hint field. onboard.run() itself refuses to
+    # overwrite an existing value, so passing a bad guess here can never clobber real data.
+    posting_timezone = str(body.get("posting_timezone") or "").strip()
+    if posting_timezone and not _valid_iana_timezone(posting_timezone):
+        posting_timezone = ""
+
     # Force automint FOR THIS CALL ONLY so a token is minted the same way the CLI
     # does when AGENT_ONBOARD_AUTOMINT is armed. The signing secret must exist for
     # a real token; onboard.run() mints deterministically when it does. We restore
@@ -966,7 +996,8 @@ def handle_portal_onboard(body):
     _prev = os.environ.get(_AUTOMINT)
     os.environ[_AUTOMINT] = "true"
     try:
-        result = _onboard.run(account_key, display_name, base_url=_upload_base_url())
+        result = _onboard.run(account_key, display_name, base_url=_upload_base_url(),
+                               posting_timezone=posting_timezone or None)
     except Exception as exc:
         # Generic failure: no token, no secret, no internals leaked to the portal.
         print(f"[portal] onboard failed for {account_key}: {type(exc).__name__}")
