@@ -333,3 +333,28 @@ def test_onboard_idempotent_rerun_with_timezone_hint_each_time(tmp_path):
     _run(tmp_path, "gymtz4", "TZ Gym Four", posting_timezone="America/Denver")
     row = db.gym_get("gymtz4")
     assert row.get("posting_timezone") == "America/Denver"
+
+
+# ---------------------------------------------------------------------------
+# Durable storage defaults (2026-09-10 storage-risk fix)
+# ---------------------------------------------------------------------------
+
+def test_default_voice_and_brain_dirs_resolve_under_the_data_volume(tmp_path, monkeypatch):
+    """This is the production shape: /portal/onboard -> onboard.run() with NO voice_dir
+    / brains_dir override. On the echo-intake-web Railway service, a bare cwd-relative
+    "brand_voice" / "brains" is the ephemeral container image, wiped on that service's
+    own next deploy. The default must resolve through config.client_voice_dir() /
+    config.tenant_brain_dir() -- the same durable <AGENT_DATA_DIR>/brand_voice and
+    .../brains roots the `echo` worker itself uses -- so the scaffold survives THIS
+    service's redeploys."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    volume = tmp_path / "fake_volume"
+    volume.mkdir()
+    monkeypatch.setenv("AGENT_DATA_DIR", str(volume))
+    r = onboard.run("durablegym", "Durable Gym")
+    assert r["voice_path"] == os.path.join(str(volume), "brand_voice", "durablegym.md")
+    assert r["brain_path"] == os.path.join(str(volume), "brains", "durablegym.md")
+    assert os.path.exists(r["voice_path"])
+    assert os.path.exists(r["brain_path"])
+    # never wrote to the ephemeral cwd-relative paths
+    assert not os.path.exists(os.path.join(os.getcwd(), "brand_voice", "durablegym.md"))

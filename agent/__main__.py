@@ -1992,6 +1992,25 @@ def main(argv=None):
             if _hit:
                 print(f"  {_reason}: {', '.join(_hit)}")
                 print(f"    fix: {_ow._FIX[_reason]}")  # noqa: SLF001
+        # THE BLIND SPOT (2026-09-10, Empire Training Academy): every row above comes
+        # from `_roster`, i.e. echo_intake_tokens. A gym with ZERO such rows never
+        # entered that loop at all, so it is invisible to everything printed above no
+        # matter what is wrong with it. Report it separately, straight off the portal's
+        # gyms table.
+        try:
+            _known_ids = {_gid for _gid, _ in _roster}
+            _missing = _ow.zero_token_gyms(_known_ids)
+        except Exception as exc:  # noqa: BLE001 - never break the audit over this
+            _missing = []
+            print(f"  (zero-token sweep failed: {type(exc).__name__}: {exc})")
+        _missing = [(g, n, s) for g, n, s in _missing if _ow.is_client_gym(s or n or g)]
+        if _missing:
+            print()
+            print(f"NEVER ENTERED THE SWEEP ABOVE (no echo_intake_tokens row at all): "
+                  f"{len(_missing)}")
+            for _gid, _name, _slug in _missing:
+                print(f"  {_name or _slug or _gid} ({_gid})")
+            print(f"    fix: {_ow._FIX[_ow.REASON_NO_INTAKE_TOKEN]}")  # noqa: SLF001
     elif cmd == "add-client":
         # MANUAL onboarding scaffold: config entry + voice/proof templates +
         # library folder + the by-hand checklist. Touches no env, arms nothing.

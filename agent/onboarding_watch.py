@@ -31,6 +31,11 @@ WHAT IT CATCHES (each its own reason code, so an alert names the actual next act
                   case by design: it only reports PARTIAL connections)
   no_fb_page      Facebook is connected but no page is selected -> every Facebook
                   publish raises "no Facebook page selected" (live on Reverb)
+  no_intake_token the portal's gyms table knows this gym but echo_intake_tokens has
+                  ZERO rows for it, so it never even ENTERS the sweep above (Empire
+                  Training Academy, 2026-09-09). Read straight from `gyms` rather than
+                  through the token-keyed roster, so this is the one check that does
+                  not require a base_key to already exist.
 
 RAILS: read-only everywhere except its own kv dedup stamps. Never registers, connects,
 approves or publishes anything: a human reads the alert and acts. ONE alert per gym per
@@ -56,13 +61,32 @@ REASON_NO_FB_PAGE = "no_fb_page"
 #: ones by name (e.g. "missing_platform:instagram"), because "not set up to post"
 #: with no platform named is a support ticket, not an answer.
 REASON_MISSING_PLATFORM = "missing_platform"
+# THE BLIND SPOT THIS WATCH WAS BUILT TO CATCH, AND COULD NOT (2026-09-10, Empire
+# Training Academy incident): every check above is keyed off portal_keys(), i.e.
+# echo_intake_tokens rows. A gym with ZERO such rows -- exactly Empire's situation, and
+# exactly the failure mode this whole watch exists for -- never enters the roster loop
+# in run() at all, so it can never be checked, let alone alerted on. zero_token_gyms()
+# reads the portal's OWN `gyms` table directly (the same table the portal's new
+# 15-minute retry cron sweeps from the other direction) and reports any real client gym
+# absent from echo_intake_tokens entirely. Deliberately kept as a SECOND, independent
+# watcher rather than folded away in favor of the portal cron: two watchers catching the
+# same gap from different angles is safety margin, not redundancy waste, and this one
+# still fires even if the portal cron is ever disabled, misconfigured, or has its own bug.
+REASON_NO_INTAKE_TOKEN = "no_intake_token"
 
 # The full set, in check order. Anything summarising this watch (the onboarding-audit
 # screen) should iterate THIS rather than its own hand-listed tuple, so a new reason
 # code can never be invisible in the summary the way no_voice was invisible for months.
 REASONS = (REASON_NOT_REGISTERED, REASON_KEY_MISMATCH, REASON_NO_SOURCES,
            REASON_NO_VOICE, REASON_NO_PROFILE, REASON_NOT_CONNECTED,
-           REASON_NO_FB_PAGE, REASON_MISSING_PLATFORM)
+           REASON_NO_FB_PAGE, REASON_MISSING_PLATFORM, REASON_NO_INTAKE_TOKEN)
+
+# gyms.status values that are NOT a real onboarded client yet (mirrors portal_gyms.py's
+# _EXCLUDED_STATUSES ruling, 2026-08-27: an 'onboarding' row is a lead who started the
+# funnel, not a client yet, and 'inactive'/'archived' are dead rows). A NULL, empty, or
+# unrecognized future status is NOT excluded here: fail open, never drop a possibly-real
+# gym on a status this watch has not seen.
+_EXCLUDED_GYM_STATUSES = {"onboarding", "inactive", "archived"}
 
 _FIX = {
     REASON_NOT_REGISTERED:
@@ -97,6 +121,13 @@ _FIX = {
         "on a subset of the lanes it is paying for. The reason names the missing ones. "
         "Send the gym its connect link (python -m agent intake-link --account <key>) "
         "and have the owner finish the platform named.",
+    REASON_NO_INTAKE_TOKEN:
+        "this gym exists in the portal's gyms table but has ZERO echo_intake_tokens "
+        "rows, so it never enters this watch's own per-key sweep either (the exact "
+        "blind spot that let Empire Training Academy go unseen). The portal's 15 "
+        "minute retry cron should mint one automatically; if this alert repeats past "
+        "an hour, mint by hand: python -m agent onboard --account <key> --name "
+        "'<name>' (any lowercase slug; onboard.run derives the canonical key itself).",
 }
 
 
@@ -213,6 +244,59 @@ def intake_keys(http=None):
                 for x in (r.json() or [])}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def zero_token_gyms(known_gym_ids, http=None):
+    """Real client gyms in the portal's `gyms` table with ZERO echo_intake_tokens rows:
+    the blind spot portal_keys() (and therefore every check_gym() sweep) can never see,
+    because a gym needs a token row just to enter that roster in the first place.
+
+    Reads `gyms` directly (id, name, slug, status, is_demo, load_test, is_verification)
+    rather than joining in SQL, so a read failure here fails the SAME way every other
+    reader in this module does: an empty list, never a crash, never a guess. Verified
+    2026-09-10 against the live table (project ooqcvmcjspeltuuhcvlh): EVERY status='active'
+    row with zero token rows today is portal fixture data (Demo Fitness, ZZ Test Gym,
+    SAMPLE Green Healthy, etc.), each carrying is_demo=true -- so `select=*` and reading
+    fields with .get() (never a hardcoded column list) means a portal environment missing
+    one of these columns degrades to "field absent -> excluded flag reads False" instead
+    of a hard 400 that would blind this whole check. known_gym_ids is the set of gym_id
+    already seen in portal_keys() -- anything NOT in it is a gym the token-keyed sweep
+    will never reach. Excludes the same not-a-real-client-yet statuses portal_gyms.py
+    already established (an 'onboarding' row is a lead, not a client) PLUS any row
+    flagged is_demo / load_test / is_verification; an unrecognized future status is NOT
+    excluded (fail open).
+
+    Returns [(gym_id, name, slug), ...]."""
+    url = config.supabase_url()
+    key = config.supabase_service_key()
+    if not url or not key:
+        return []
+    if http is None:
+        import requests  # lazy
+        http = requests
+    try:
+        r = http.get(f"{url.rstrip('/')}/rest/v1/gyms",
+                     params={"select": "*"},
+                     headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                     timeout=30)
+        if r.status_code >= 400:
+            return []
+        rows = r.json() or []
+    except Exception:  # noqa: BLE001 - a roster read failure is a silent no-op
+        return []
+    known = set(known_gym_ids or ())
+    out = []
+    for g in rows:
+        gid = str(g.get("id") or "")
+        if not gid or gid in known:
+            continue
+        status = str(g.get("status") or "").strip().lower()
+        if status in _EXCLUDED_GYM_STATUSES:
+            continue
+        if g.get("is_demo") or g.get("load_test") or g.get("is_verification"):
+            continue
+        out.append((gid, str(g.get("name") or ""), str(g.get("slug") or "")))
+    return out
 
 
 def check_gym(base_key, gym_id="", intake_key="", *, bases=None, deps=None):
@@ -405,6 +489,36 @@ def run(*, deps=None, alert=None, kv=None, today=None, http=None):
         except Exception:  # noqa: BLE001
             pass
         out[base_key] = issues
+
+    # THE BLIND SPOT: everything above iterates `roster`, which is entirely
+    # echo_intake_tokens rows. A gym with none never appears in that loop no matter what
+    # is wrong with it. Sweep the portal's own gyms table for exactly that gap, keyed by
+    # gym_id (there is no minted account key yet to check_gym() against). Best-effort:
+    # a reader failure here never blocks the per-key alerts above, and a bad gym row
+    # never blocks another gym's alert.
+    zero_token_reader = d.get("zero_token", zero_token_gyms)
+    try:
+        known_ids = {gym_id for gym_id, _ in roster}
+        missing = zero_token_reader(known_ids, http)
+    except Exception:  # noqa: BLE001
+        missing = []
+    for gym_id, name, slug in missing:
+        label = slug or name or gym_id
+        if not is_client_gym(label):
+            continue
+        stamp = f"onboarding_watch_notoken_{gym_id}_{day}"
+        try:
+            if kv.get(stamp, ""):
+                continue                      # already said this today
+        except Exception:  # noqa: BLE001
+            pass
+        alert(f"{name or label} ({gym_id}): not set up to post "
+              f"({REASON_NO_INTAKE_TOKEN}). {_fix_for(REASON_NO_INTAKE_TOKEN, label)}")
+        try:
+            kv.set(stamp, "alerted")
+        except Exception:  # noqa: BLE001
+            pass
+        out[label] = [REASON_NO_INTAKE_TOKEN]
     return out
 
 
@@ -493,4 +607,5 @@ def _live_deps():
 
     return {"roster": portal_keys, "intake": intake_keys, "bases": _bases,
             "approved_sources": _approved, "voice": _voice, "profile_id": _profile,
-            "platforms": _platforms, "fb_page": _fb_page, "gym_name": _gym_name}
+            "platforms": _platforms, "fb_page": _fb_page, "gym_name": _gym_name,
+            "zero_token": zero_token_gyms}

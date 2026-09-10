@@ -184,12 +184,26 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
       had at signup), not a replacement for that watchdog: an unresolved gym still gets
       picked up and alerted on by AGENT_POSTING_TZ_WATCH the same as any other.
     """
-    # Resolve paths relative to cwd when not supplied, using the same conventions
-    # as the rest of the codebase (brand_voice/ and brains/ at the repo root).
+    # DURABLE ROOTS BY DEFAULT (2026-09-10 storage-risk fix). Every self-serve gym runs
+    # this from /portal/onboard on the echo-intake-web Railway service, whose CWD is the
+    # container image (/app): a bare "brand_voice" / "brains" relative dir there is
+    # EPHEMERAL and is wiped on the service's own next deploy, taking this gym's scaffold
+    # voice/brain files with it. config.client_voice_dir() / config.tenant_brain_dir()
+    # resolve to <AGENT_DATA_DIR or /data>/brand_voice and .../brains -- the SAME durable
+    # roots the `echo` worker already uses for the REAL bible it writes later from intake
+    # answers (social_intake_reader.write_brand_docs), and they fall back to the
+    # repo-relative "." dirs in local dev/tests where no /data volume is mounted, so this
+    # is a no-op change everywhere a volume is absent. NOTE: echo-intake-web and echo are
+    # two separate Railway services with two SEPARATE volumes (Railway does not support
+    # mounting one volume on two services), so this durable write survives THIS service's
+    # own redeploys but does not by itself land on the worker's volume -- that is fine,
+    # because the worker never reads this scaffold: it independently writes the real,
+    # canonical bible to ITS OWN durable volume once social intake completes. This write
+    # only has to survive echo-intake-web's own redeploy, which it now does.
     if voice_dir is None:
-        voice_dir = "brand_voice"
+        voice_dir = config.client_voice_dir()
     if brains_dir is None:
-        brains_dir = "brains"
+        brains_dir = config.tenant_brain_dir()
 
     # CANONICAL KEY AT MINT (topfuel / district_h stranding fix): derive the key EVERY
     # onboarding artifact + the intake link will use from the portal gyms.id UUID +
