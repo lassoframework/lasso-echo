@@ -63,9 +63,38 @@ REASON_NO_FRESH_PHOTO = "no_fresh_photo"
 REASON_HOSTING = "hosting_unavailable"
 REASON_STORY_REBURN = "story_reburn_failed"
 
+REASON_TIMEOUT = "swap_timeout"
+
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 _MAX_MATERIALIZE_ATTEMPTS = 3      # a corrupt download / failed probe tries the next
 SWAP_TRANSCODE_TIMEOUT_SEC = 45    # the ONE transcode a portal request may wait on
+SWAP_REQUEST_DEADLINE_SEC = 75     # the whole request: downloads + probes + transcode + burn
+SWAP_DOWNLOAD_TIMEOUT_SEC = 20     # one Drive download
+
+
+class SwapDeadline(Exception):
+    """The request-level deadline passed before the swap could finish a step."""
+
+
+class _Deadline:
+    """A request budget checked BEFORE every expensive step (download, probe,
+    transcode, burn), so a portal request completes in bounded time no matter how
+    many candidates it walks (audit round 4 #1). `clock` is injectable for tests."""
+
+    def __init__(self, seconds, clock=None):
+        import time as _time
+        self._clock = clock or _time.monotonic
+        self._end = self._clock() + float(seconds)
+
+    def remaining(self):
+        return max(0.0, self._end - self._clock())
+
+    def expired(self):
+        return self.remaining() <= 0.0
+
+    def check(self, step):
+        if self.expired():
+            raise SwapDeadline(f"request deadline passed before {step}")
 
 
 def enabled():
@@ -260,11 +289,34 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
 
 
 # ---- materialize (a local file + maybe an already-hosted url) ------------------------
-def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
+def _download_bounded(drive, file_id, path, timeout):
+    """drive.download in a worker thread, waited on for at most `timeout` seconds.
+    Returns True on success; False on failure or timeout (the request moves on; a
+    still-running download is abandoned to the thread and its temp file cleaned up
+    with the work dir)."""
+    import concurrent.futures as _cf
+    ex = _cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(drive.download, file_id, path)
+        fut.result(timeout=max(0.1, float(timeout)))
+        return True
+    except Exception:  # noqa: BLE001 - timeout and transport errors both mean "skip"
+        return False
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None, budget=None,
+                 deadline=None):
     """{"path": local file, "hosted": url or None} for one candidate, or None when it
     cannot be used (download failed, video failed its probe gate). A Drive asset is
     downloaded into work_dir; a HEIC/HEVC original gets its cached rendition (already
-    hosted) via gym_media_index.ensure_rendition, exactly like the Drive builder."""
+    hosted) via gym_media_index.ensure_rendition, exactly like the Drive builder.
+
+    budget: the ONE shared RenditionBudget(1) for the whole request (audit round 4 #1:
+    a per-candidate budget let three candidates mean three transcodes). deadline: the
+    request _Deadline, checked before the download, the probe and the transcode;
+    raises SwapDeadline when it has passed."""
     if cand["source"] == "local":
         return {"path": cand["path"], "hosted": None}
     from . import gym_media_index as _idx
@@ -275,14 +327,20 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
         return None
     title = asset.get("title") or f"{asset['id']}.bin"
     path = os.path.join(work_dir, os.path.basename(title))
-    try:
-        drive.download(asset["id"], path)
-    except Exception as exc:  # noqa: BLE001
-        _log(f"{base_key}: Drive download failed for {title!r} ({type(exc).__name__})")
+    if deadline is not None:
+        deadline.check(f"download of {title!r}")
+    dl_timeout = SWAP_DOWNLOAD_TIMEOUT_SEC
+    if deadline is not None:
+        dl_timeout = min(dl_timeout, deadline.remaining())
+    if not _download_bounded(drive, asset["id"], path, dl_timeout):
+        _log(f"{base_key}: Drive download of {title!r} failed or ran past "
+             f"{dl_timeout:.0f}s; trying the next candidate")
         return None
     store = media_store or _idx.default_store()
     info = None
     if asset.get("kind") == _idx.KIND_VIDEO:
+        if deadline is not None:
+            deadline.check(f"probe of {title!r}")
         info = _idx.probe_video(path)
         if not info:
             return None                       # unprobed never ships (fail closed)
@@ -291,13 +349,19 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None):
             info["duration_sec"], info["width"], info["height"])
         if el is not True:
             return None
-    # BOUNDED (audit R-D1 #4): this runs inside the portal request. At most ONE
-    # transcode, capped at SWAP_TRANSCODE_TIMEOUT_SEC; a spent budget or a timeout
-    # means "next candidate", never a hung request and never raw HEVC.
+    # BOUNDED (audit R-D1 #4 + round 4 #1): this runs inside the portal request. At
+    # most ONE transcode per REQUEST (the shared budget), capped at
+    # SWAP_TRANSCODE_TIMEOUT_SEC and at the time the request has left; a spent budget
+    # or a timeout means "next candidate", never a hung request and never raw HEVC.
+    timeout = SWAP_TRANSCODE_TIMEOUT_SEC
+    if deadline is not None and _idx.needs_rendition(asset, info):
+        deadline.check(f"transcode of {title!r}")
+        timeout = max(1.0, min(timeout, deadline.remaining()))
     try:
         hosted, _converted = _idx.ensure_rendition(
             asset, path, store=store, probe_info=info,
-            budget=_idx.RenditionBudget(1), timeout=SWAP_TRANSCODE_TIMEOUT_SEC)
+            budget=budget if budget is not None else _idx.RenditionBudget(1),
+            timeout=timeout)
     except (_idx.RenditionBudgetExhausted, _idx.RenditionTimeout) as exc:
         _log(f"{base_key}: {title!r} not renditioned in time ({type(exc).__name__}); "
              "trying the next candidate")
@@ -371,7 +435,7 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                      asset_state=None, candidates_fn=None, materialize_fn=None,
                      host_fn=None, feed_fn=None, reburn_fn=None, poster_fn=None,
                      media_store=None, drive=None, now=None, log=None,
-                     siblings=()):
+                     siblings=(), clock=None):
     """A genuinely fresh creative for ONE waiting row (and the same creative shaped for
     its same-date siblings, see `siblings`).
 
@@ -415,12 +479,28 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                                         else REASON_NO_LIBRARY)}
 
     fmt = str((row or {}).get("format") or "feed").strip().lower()
+    # ONE request budget (audit round 4 #1): a single transcode for the whole request
+    # and a wall-clock deadline every expensive step checks first, so the portal call
+    # returns in bounded time however many candidates it walks. Deadline hit -> 409
+    # swap_timeout with nothing written (the caller writes only on ok).
+    from . import gym_media_index as _idx
+    budget = _idx.RenditionBudget(1)
+    deadline = _Deadline(SWAP_REQUEST_DEADLINE_SEC, clock)
     work = tempfile.mkdtemp(prefix="mediaswap_")
     try:
         for cand in cands[:_MAX_MATERIALIZE_ATTEMPTS]:
-            mat = (materialize_fn(cand) if materialize_fn is not None
-                   else _materialize(base_key, cand, work, drive=drive,
-                                     media_store=media_store))
+            if deadline.expired():
+                say(f"{base_key}: swap request deadline passed before candidate "
+                    f"{cand.get('key')}; nothing written")
+                return {"ok": False, "reason": REASON_TIMEOUT}
+            try:
+                mat = (materialize_fn(cand) if materialize_fn is not None
+                       else _materialize(base_key, cand, work, drive=drive,
+                                         media_store=media_store, budget=budget,
+                                         deadline=deadline))
+            except SwapDeadline as exc:
+                say(f"{base_key}: {exc}; nothing written")
+                return {"ok": False, "reason": REASON_TIMEOUT}
             if not mat or not mat.get("path"):
                 continue
             path = mat["path"]
@@ -445,23 +525,30 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
             # One poster per swap (audit D4): computed once, attached only to FEED
             # variants; a story's media is the captioned card/video itself.
             poster = (poster_fn(path, work, tenant) or "") if cand["kind"] == "video" else ""
-            out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
-                          poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
-            if not out.get("ok"):
-                return out
-            # ALL OR NOTHING (audit 3c residual): every sibling variant is computed
-            # here, BEFORE the caller writes anything. One failed variant (a story
-            # re-burn) fails the whole swap with its reason, so the clicked row and
-            # its siblings can never end up carrying different media.
-            out["siblings"] = {}
-            for sib in siblings or ():
-                sfmt = str((sib or {}).get("format") or "feed").strip().lower()
-                var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work, tenant,
-                              poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say)
-                if not var.get("ok"):
-                    return {"ok": False, "reason": var.get("reason") or REASON_STORY_REBURN,
-                            "failed_sibling": str(sib.get("id"))}
-                out["siblings"][str(sib.get("id"))] = var
+            try:
+                out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
+                              poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
+                              deadline=deadline)
+                if not out.get("ok"):
+                    return out
+                # ALL OR NOTHING (audit 3c residual): every sibling variant is computed
+                # here, BEFORE the caller writes anything. One failed variant (a story
+                # re-burn) fails the whole swap with its reason, so the clicked row and
+                # its siblings can never end up carrying different media.
+                out["siblings"] = {}
+                for sib in siblings or ():
+                    sfmt = str((sib or {}).get("format") or "feed").strip().lower()
+                    var = _finish(base_key, sib, sfmt, cand, path, hosted, lib, work,
+                                  tenant, poster=poster, feed_fn=feed_fn,
+                                  reburn_fn=reburn_fn, log=say, deadline=deadline)
+                    if not var.get("ok"):
+                        return {"ok": False,
+                                "reason": var.get("reason") or REASON_STORY_REBURN,
+                                "failed_sibling": str(sib.get("id"))}
+                    out["siblings"][str(sib.get("id"))] = var
+            except SwapDeadline as exc:
+                say(f"{base_key}: {exc}; nothing written")
+                return {"ok": False, "reason": REASON_TIMEOUT}
             return out
         return {"ok": False, "reason": REASON_NO_FRESH_PHOTO}
     finally:
@@ -469,11 +556,13 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
 
 
 def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster,
-            feed_fn, reburn_fn, log):
+            feed_fn, reburn_fn, log, deadline=None):
     """Shape the hosted replacement for the row's format: a story is re-burned with
     its caption (still card or 9:16 story video), a video feed ships the hosted video,
     a photo feed gets the autofit reframe. A failed story re-burn is a hard stop
-    (REASON_STORY_REBURN), matching the pre-existing contract: never a bare story."""
+    (REASON_STORY_REBURN), matching the pre-existing contract: never a bare story.
+    deadline (request _Deadline) is checked before a story burn, the other expensive
+    step; raises SwapDeadline."""
     video = cand["kind"] == "video"
     base = {"key": cand["key"], "kind": cand["kind"], "source": cand["source"],
             "thumbnail_url": poster if (video and fmt != "story") else "", "path": path,
@@ -482,6 +571,8 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
         # A story publishes empty-body, so its caption lives ON the media. Swapping
         # the pixels without re-burning would ship a captionless story.
         if config.story_format_enabled():
+            if deadline is not None:
+                deadline.check(f"story burn for row {row.get('id')}")
             burned = (_reburn_story_video(base_key, row, path, lib) if video
                       else reburn_fn(base_key, row, path, lib))
             if not burned:
@@ -621,6 +712,10 @@ def client_message(reason, base_key=""):
     if reason == REASON_STORY_REBURN:
         return ("Echo could not rebuild the story card on the new media, so nothing "
                 "was changed. Try again shortly. Your recreates were not touched.")
+    if reason == REASON_TIMEOUT:
+        return ("Echo could not prepare a fresh photo or video within the time it "
+                "allows itself, so nothing was changed. Try again in a minute. Your "
+                "recreates were not touched.")
     return ("Echo could not swap the media right now, so nothing was changed. Try "
             "again shortly. Your recreates were not touched.")
 
@@ -628,7 +723,8 @@ def client_message(reason, base_key=""):
 __all__ = ["enabled", "pick_replacement", "candidates_for", "order_candidates",
            "local_candidates", "drive_candidates", "swap_fields", "after_swap",
            "sibling_rows", "book_carries_asset", "has_rendition",
-           "SWAP_TRANSCODE_TIMEOUT_SEC",
+           "SWAP_TRANSCODE_TIMEOUT_SEC", "SWAP_REQUEST_DEADLINE_SEC",
+           "SWAP_DOWNLOAD_TIMEOUT_SEC", "REASON_TIMEOUT", "SwapDeadline",
            "library_path_for", "client_message", "is_video",
            "REASON_NO_LIBRARY", "REASON_NO_FRESH_PHOTO", "REASON_HOSTING",
            "REASON_STORY_REBURN"]

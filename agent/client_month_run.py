@@ -644,7 +644,8 @@ def _rollback_new_drive_drafts(drafts, log):
 
 def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, log, *,
                          deferred_days, covered_days, locked_keys, used_keys, drafts,
-                         store, start, days, edited_story_caps=None, max_fill=None):
+                         store, start, days, edited_story_caps=None, max_fill=None,
+                         local_days=0):
     """NO EMPTY DAYS (audit 2c, 2026-09-10), UNDER THE MEDIA CAP (audit R-A1). Lane A
     deferred these days to the Drive pool (every local creative was inside its repeat
     window and the pool had at least one pickable asset) and the Drive lane did not
@@ -722,19 +723,49 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         log(f"{base_key} {day_key}: Drive pool exhausted for the day; placed a spaced "
             f"repeat ({key}) so the day is never empty")
     if filled:
-        # TRUTHFUL DIGEST (audit R-A3): the reason these days repeated is that the
-        # Drive pool ran short, not that the local library is small. The small-library
-        # digest fires ONLY when the local library really is smaller than the forward
-        # book (fewer usable photos than covered days).
+        # TRUTHFUL DIGEST (audit R-A3 + round 4 #4): the reason these days repeated is
+        # that the Drive pool ran short, not that the local library is small. The
+        # small-library digest fires ONLY when the local library really is smaller
+        # than the days IT covers (Lane A days + these fills); Drive-covered days are
+        # distinct media and never count against the stills.
         log(f"{base_key}: Drive pool ran short; {filled} day(s) filled with spaced "
             "repeats from the uploaded library")
         try:
             lib_n = len(media_guard.library_keys(library_path))
-            if lib_n and lib_n < len(covered_days):
+            if lib_n and lib_n < int(local_days or 0) + filled:
                 media_guard.alert_small_library(base_key, todo[0], log)
         except Exception:  # noqa: BLE001
             pass
     return filled
+
+
+def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, log):
+    """One fresh caption for a Drive draft that failed the A+ gate, on the SAME asset:
+    the next approved source in the day's rotation (else the same one) and the failed
+    opening as an avoid hint, through the same generator. Mutates draft.caption /
+    hashtags in place; True when a different caption was produced. Never raises."""
+    try:
+        from .drafter import opening_signature
+        prev = (getattr(draft, "caption", "") or "").strip()
+        source = (_gym_drive_source_for(account_key, day_key, slot_i + 1)
+                  or _gym_drive_source_for(account_key, day_key, slot_i))
+        if source is None:
+            return False
+        avoid = tuple(s for s in (opening_signature(prev),) if s)
+        caption, tags = client_content.make_caption(
+            account, source, voice, getattr(draft, "creative_path", "") or "",
+            avoid_openings=avoid)
+        caption = (caption or "").strip()
+        if not caption or caption == prev:
+            return False
+        draft.caption = caption
+        draft.hashtags = tags or []
+        log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: caption failed A+, "
+            "retried once with a fresh caption on the same asset")
+        return True
+    except Exception as exc:  # noqa: BLE001 - a retry failure is just "no retry"
+        log(f"[gym-drive] {account_key} {day_key}: recaption failed ({type(exc).__name__})")
+        return False
 
 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
@@ -813,8 +844,23 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                     f"({type(e).__name__}); dropping the draft")
                 _gate_ok = False
             if not _gate_ok:
+                # RETRY ONCE WITH A FRESH CAPTION ON THE SAME ASSET (audit round 4 #3):
+                # dropping the day here sent a video beat to a still repeat over a
+                # caption problem the asset had nothing to do with.
+                if _recaption_drive_draft(account, draft, voice, account_key, day_key,
+                                          slot_i, log):
+                    try:
+                        _gate_ok = (_pq.is_a_plus(draft, tuple(banned_words or ()),
+                                                  require_media=True)
+                                    if config.sb7_enabled()
+                                    else not _has_banned_word(
+                                        getattr(draft, "caption", "") or "",
+                                        tuple(banned_words or ())))
+                    except Exception:  # noqa: BLE001
+                        _gate_ok = False
+            if not _gate_ok:
                 log(f"[gym-drive] {base_key} {day_key} slot {slot_i}: dropped, the caption "
-                    "failed the A+/banned-word gate")
+                    "failed the A+/banned-word gate twice")
                 _rollback_drive_asset(draft, day_key, log)
                 break
             # NEVER THE SAME CONCEPT TWICE IN ONE DAY (the uploaded loop's rule). The
@@ -1253,6 +1299,11 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             pass
         log(f"{base_key}: {weak} weak_match pick(s) flagged for the coach")
 
+    # Days the UPLOADED library covered (Lane A only, locked days excluded): the
+    # small-library digest compares the library against these + the fallback fills,
+    # never against Drive-covered days (audit round 4 #4).
+    lane_a_days = len(set(covered_days) - set(locked_feed_days))
+
     # GYM-DRIVE LANE (GYM_DRIVE_STAGE, default OFF): a gym that connected Google Drive
     # gets PENDING posts built from its synced photo pool for the days the uploaded-
     # media path did not fill (spec §7). Layered UNDER the per-gym GYM_DRIVE_CONNECT
@@ -1297,7 +1348,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 locked_keys=locked_keys, used_keys=used_keys, drafts=drafts,
                 store=store, start=start, days=days,
                 edited_story_caps=edited_story_caps,
-                max_fill=max_feed_days - built_feeds - _drive_feeds)
+                max_fill=max_feed_days - built_feeds - _drive_feeds,
+                local_days=lane_a_days)
             if filled:
                 built_feeds += filled
                 built_days += filled

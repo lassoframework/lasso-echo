@@ -508,6 +508,89 @@ def test_the_handler_swaps_pending_siblings_and_leaves_approved_ones(monkeypatch
     assert any(r["id"] == "p6" for r in settled["book_rows"])
 
 
+# ---- audit round 4 #1: the swap request is bounded as a whole --------------------
+
+def test_swap_request_runs_at_most_one_transcode_across_all_candidates(monkeypatch):
+    """Three unrenditioned HEVC candidates used to mean up to three synchronous
+    transcodes (a fresh RenditionBudget(1) per candidate). ONE shared budget per
+    request: the first attempt times out, the next two are refused without encoding."""
+    from agent import gym_media_index as _gmi
+    from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_asset
+    monkeypatch.setattr(_gmi, "probe_video",
+                        lambda p: {"duration_sec": 20.0, "width": 1080, "height": 1920,
+                                   "codec": "hevc"})
+    encoded = []
+
+    def slow(src, dest, timeout=None):
+        encoded.append(timeout)
+        raise _gmi.RenditionTimeout("too slow")
+    monkeypatch.setattr(_gmi, "hevc_to_h264", slow)
+    assets = [make_asset(f"v{i}", gym_id="zanshin", kind="video", title=f"c{i}.mov")
+              for i in range(3)]
+    cands = [{"source": "drive", "kind": "video", "key": a["id"], "asset": a,
+              "last_used": "", "used_count": 0, "name": a["title"]} for a in assets]
+    drive = FakeDrive()
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path="",
+        candidates_fn=lambda g, r: cands, drive=drive,
+        media_store=FakeMediaStore(assets=assets))
+    assert out == {"ok": False, "reason": msw.REASON_NO_FRESH_PHOTO}
+    assert len(encoded) == 1, f"exactly one transcode per request, got {len(encoded)}"
+    assert encoded[0] <= msw.SWAP_TRANSCODE_TIMEOUT_SEC
+    assert len(drive.downloads) == 3, "candidates are still walked (cheap) once the budget is spent"
+
+
+def test_swap_request_deadline_returns_swap_timeout_with_zero_writes(monkeypatch):
+    from tests.gym_media_fakes import FakeMediaStore, FakeDrive, make_asset
+    asset = make_asset("v1", gym_id="zanshin", kind="video", title="c.mov")
+    cand = {"source": "drive", "kind": "video", "key": "v1", "asset": asset,
+            "last_used": "", "used_count": 0, "name": "c.mov"}
+    ticks = iter([0.0] + [10_000.0] * 20)            # the deadline is already gone
+    drive = FakeDrive()
+    out = msw.pick_replacement(
+        "zanshin", _row("p1"), store=_Store(), library_path="",
+        candidates_fn=lambda g, r: [cand], drive=drive,
+        media_store=FakeMediaStore(assets=[asset]), clock=lambda: next(ticks))
+    assert out == {"ok": False, "reason": msw.REASON_TIMEOUT}
+    assert drive.downloads == [], "nothing is downloaded past the deadline"
+    assert "-" not in msw.client_message(msw.REASON_TIMEOUT)
+
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    store = _Store([_row("p1")])
+    _wire(monkeypatch, store)
+    status, body = ps.handle_swap_media(
+        "zanshin", "p1", "u1", sb_store=store,
+        picker=lambda *a, **k: {"ok": False, "reason": msw.REASON_TIMEOUT})
+    assert status == 409 and body["reason"] == msw.REASON_TIMEOUT
+    assert store.swaps == [] and store._rows["p1"]["image_url"] == "https://cdn/old.jpg"
+
+
+def test_deadline_is_checked_before_the_story_burn(monkeypatch):
+    monkeypatch.setenv("AGENT_STORY_FORMAT", "true")
+    # clock calls: deadline start (0), the loop's expired() check (1), then the check
+    # before the story burn (10_000 = past the 75 s deadline)
+    ticks = iter([0.0, 1.0] + [10_000.0] * 10)
+    out = msw.pick_replacement(
+        "zanshin", _row("p1", fmt="story"), store=_Store(), library_path="/lib",
+        candidates_fn=lambda g, r: [_cand("new.jpg")], materialize_fn=_mat,
+        host_fn=lambda p: "https://cdn/new.jpg",
+        reburn_fn=lambda *a: pytest.fail("the burn must not start past the deadline"),
+        clock=lambda: next(ticks))
+    assert out == {"ok": False, "reason": msw.REASON_TIMEOUT}
+
+
+def test_a_slow_drive_download_is_abandoned_within_the_download_timeout():
+    import time as _time
+
+    class _Slow:
+        def download(self, file_id, dest):
+            _time.sleep(1.0)
+    t0 = _time.monotonic()
+    assert msw._download_bounded(_Slow(), "x", "/tmp/never", timeout=0.2) is False
+    assert _time.monotonic() - t0 < 0.9, "the request must not wait for the download"
+    assert msw.SWAP_DOWNLOAD_TIMEOUT_SEC == 20 and msw.SWAP_REQUEST_DEADLINE_SEC == 75
+
+
 def test_a_failed_sibling_variant_writes_nothing_and_answers_409(monkeypatch):
     """Audit 3c residual: all or nothing. The story sibling's re-burn fails -> the
     picker fails the WHOLE swap before any write; the clicked row keeps its media."""

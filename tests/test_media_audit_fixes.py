@@ -753,7 +753,7 @@ def test_sync_prerender_pass_renders_within_budget_and_prehosts_playable_clips(m
     assets = [make_asset("h1", gym_id="gritx", kind="video", title="a.mov"),
               make_asset("h2", gym_id="gritx", kind="video", title="b.mov"),
               make_asset("h3", gym_id="gritx", kind="video", title="c.mov"),
-              make_asset("ok", gym_id="gritx", kind="video", title="d.mp4"),
+              make_asset("a_ok", gym_id="gritx", kind="video", title="d.mp4"),
               make_asset("done", gym_id="gritx", kind="video", title="e.mov"),
               make_asset("unp", gym_id="gritx", kind="video", title="f.mov", eligible=None),
               make_asset("ph", gym_id="gritx", kind="photo")]
@@ -782,11 +782,14 @@ def test_sync_prerender_pass_renders_within_budget_and_prehosts_playable_clips(m
         budget_n=2, host_fn=host)
     assert rendered == 2 and len(encoded) == 2, "RENDITION_MAX_PER_SYNC binds"
     assert prehosted == 1 and "d.mp4" in hosted, "a playable clip is hosted as-is once"
-    assert store.assets["ok"]["rendition_url"].endswith("d.mp4")
-    assert store.assets["ok"]["rendition_key"].startswith("echo/gritx/")
+    assert store.assets["a_ok"]["rendition_url"].endswith("d.mp4")
+    assert store.assets["a_ok"]["rendition_key"].startswith("echo/gritx/")
     assert not store.assets["unp"].get("rendition_url")
     assert not store.assets["h3"].get("rendition_url"), "third HEVC clip waits for tomorrow"
-    assert skipped == 1, "the over-budget HEVC clip is counted, not silently dropped"
+    # audit round 4 #5: the pass STOPS at budget spent; h3 is neither downloaded nor
+    # probed (it is not even counted as skipped)
+    assert skipped == 0
+    assert "c.mov" not in hosted and "c.mov" not in encoded
 
 
 def test_sync_source_threads_render_budget(monkeypatch):
@@ -810,11 +813,18 @@ def test_sync_source_threads_render_budget(monkeypatch):
 # ---- D3 residual -------------------------------------------------------------------
 def test_a_raise_between_release_and_apply_restores_the_released_stamps(monkeypatch,
                                                                          tmp_path):
+    """Audit round 4 #2: the round-3 version of this test used ONE asset, so the
+    build re-picked the very asset it had released on the same day and the leak was
+    masked (it passed on the round-2 tree too). Here the pending row carries z_old
+    and the pool also holds a_new (sorts first, so the build picks IT); after the
+    mid-build raise: z_old must be stamped again (its row survived) and a_new must be
+    unstamped (its draft never landed). Round 2 leaves z_old=0 and a_new=1."""
     _sources()
-    store = FakeMediaStore(assets=[make_asset("a1", gym_id="gritx")])
+    store = FakeMediaStore(assets=[make_asset("z_old", gym_id="gritx", title="old.jpg"),
+                                   make_asset("a_new", gym_id="gritx", title="new.jpg")])
     _arm(monkeypatch, store, FakeDrive())
-    sel.stamp_use(store.get_asset("a1"), "gritx", "2026-08-01", store=store)
-    cal = _CalStore(existing=_pending_drive_rows(["a1"]))
+    sel.stamp_use(store.get_asset("z_old"), "gritx", "2026-08-01", store=store)
+    cal = _CalStore(existing=_pending_drive_rows(["z_old"]))
 
     def boom(*a, **k):
         raise RuntimeError("mid-build crash")
@@ -824,7 +834,8 @@ def test_a_raise_between_release_and_apply_restores_the_released_stamps(monkeypa
     with pytest.raises(RuntimeError):
         cmr.build_client_month(_account(), "gritx", "2026-08-01", days=1, voice=_voice(),
                                library_path=_lib(tmp_path, n=0), store=cal, banned_words=())
-    assert store.assets["a1"]["used_count"] == 1, "released stamp must be restored"
+    assert store.assets["z_old"]["used_count"] == 1, "released stamp must be restored"
+    assert store.assets["a_new"]["used_count"] == 0, "the unlanded pick must be rolled back"
     assert len(cal.existing) == 3
 
 
@@ -884,6 +895,88 @@ def test_drive_lane_banned_word_gate_without_sb7(monkeypatch, tmp_path):
                                         library_path=str(tmp_path),
                                         banned_words=("bootcamp",))
     assert extra == [] and store.assets["a1"]["used_count"] == 0
+
+
+def test_drive_lane_retries_a_failed_caption_once_on_the_same_asset(monkeypatch, tmp_path):
+    """Audit round 4 #3: a caption that fails A+ no longer costs the day its video.
+    One fresh caption on the SAME asset; the second verdict keeps it."""
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("v1", gym_id="gritx", kind="video",
+                                              title="clip.mp4")])
+    _arm(monkeypatch, store, FakeDrive())
+    captions = iter(["Weak first try", "A grounded caption about the class"])
+    calls = []
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: (calls.append(k.get("avoid_openings")) or
+                                         (next(captions), [])))
+    from agent import post_quality
+    verdicts = iter([False, True])
+    monkeypatch.setattr(post_quality, "is_a_plus",
+                        lambda draft, banned, require_media=True: next(verdicts))
+    logs = []
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 1, _voice(),
+                                        log=logs.append, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), banned_words=("x",))
+    feeds = [d for d in extra if not getattr(d, "is_story", False)]
+    assert len(feeds) == 1 and feeds[0].source_media_asset_id == "v1"
+    assert feeds[0].caption == "A grounded caption about the class"
+    assert len(calls) == 2 and calls[1], "the retry carries the failed opening to avoid"
+    assert store.assets["v1"]["used_count"] == 1
+    assert any("retried once with a fresh caption" in m for m in logs)
+
+
+def test_drive_lane_drops_after_the_second_failed_caption(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("v1", gym_id="gritx", kind="video",
+                                              title="clip.mp4")])
+    _arm(monkeypatch, store, FakeDrive())
+    captions = iter(["first", "second"])
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: (next(captions), []))
+    from agent import post_quality
+    monkeypatch.setattr(post_quality, "is_a_plus", lambda *a, **k: False)
+    logs = []
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 1, _voice(),
+                                        log=logs.append, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), banned_words=("x",))
+    assert extra == []
+    assert store.assets["v1"]["used_count"] == 0, "rolled back only after the retry"
+    assert any("failed the A+/banned-word gate twice" in m for m in logs)
+
+
+def test_small_library_alert_ignores_drive_covered_days(monkeypatch, tmp_path):
+    """Audit round 4 #4: a 5-still gym whose month is mostly Drive video is not a
+    'small library'. The digest compares the library against Lane A days + fallback
+    fills only."""
+    _sources()
+    _stale_ledger(monkeypatch)
+    store = FakeMediaStore(assets=[make_asset(f"a{i}", gym_id="gritx", title=f"t{i}.jpg")
+                                   for i in range(3)])
+    _arm(monkeypatch, store, FakeDrive())
+    fired = []
+    from agent import media_guard
+    monkeypatch.setattr(media_guard, "alert_small_library",
+                        lambda base, day, log=None: fired.append(day))
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=10, voice=_voice(),
+                                 library_path=_lib(tmp_path), store=cal, banned_words=())
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len([r for r in feeds if not r.get("source_media_asset_id")]) == 2   # fills
+    assert fired == [], "5 stills covering 2 days is not a small library"
+    # the helper's own comparison: the SAME fill with 99 Lane A days behind it alerts
+    logs = []
+    cal2 = _CalStore()
+    filled = cmr._fill_uncovered_days(
+        _account(), "gritx", _voice(), _lib(tmp_path), (), logs.append,
+        deferred_days={"2026-08-20"}, covered_days=set(), locked_keys=set(),
+        used_keys=set(), drafts=[], store=cal2, start=date(2026, 8, 20), days=1,
+        max_fill=1, local_days=99)
+    assert filled == 1 and fired == ["2026-08-20"]
 
 
 # ---- D1 residual ---------------------------------------------------------------------

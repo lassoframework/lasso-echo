@@ -317,8 +317,10 @@ def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
     budget = _idx.RenditionBudget(budget_n)
     rendered = prehosted = skipped = 0
     for asset in cands[: budget_n * 2]:
-        # A spent budget stops TRANSCODES (RenditionBudgetExhausted below), not the
-        # pre-hosting of already-playable clips later in the list.
+        # STOP AT BUDGET SPENT (audit round 4 #5): no further download or probe once
+        # the transcode budget is gone; the rest of the list waits for tomorrow.
+        if budget.spent:
+            break
         tmp_dir = tempfile.mkdtemp(prefix="gymrender_")
         tmp_path = Path(tmp_dir) / os.path.basename(asset.get("title") or "clip.bin")
         try:
