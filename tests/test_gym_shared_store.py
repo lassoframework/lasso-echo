@@ -425,6 +425,34 @@ def test_sync_reports_zernio_profile_ids_bound_to_two_keys(armed, monkeypatch):
     assert all(c["zernio_profile_id"] != "prof-solo" for c in collisions)
 
 
+def test_an_unreadable_shared_store_reports_unknown_and_writes_nothing(
+        armed, monkeypatch):
+    """An operator command must REPORT an unreachable store, not traceback at it --
+    and must never phrase an unread store as zero drift, which reads as 'the two
+    services agree'."""
+    fake = FakePostgrest(fail_on=("get",))
+    _wire(monkeypatch, fake)
+    db._local_gym_upsert("wouldpush", "Would Push", {})
+    store = gss.SharedGymStore(url="https://x", service_key="k", http=fake)
+
+    # Count the local reads: compare() makes exactly ONE. A sync that carries on into
+    # its write phase after a failed read makes a second, which is the observable
+    # signature of "acting on a comparison that never happened".
+    reads = []
+    real_list = db.gym_list
+    monkeypatch.setattr(gym_store_sync._db, "gym_list",
+                        lambda *a, **k: (reads.append(1), real_list(*a, **k))[1])
+
+    report = gym_store_sync.sync(apply=True, store=store)
+    assert report["error"]
+    assert report["pushed"] == 0 and report["pulled"] == 0
+    assert "wouldpush" not in fake.rows, "wrote on the strength of a read it never made"
+    assert len(reads) == 1, (
+        f"sync entered its write phase after a failed read ({len(reads)} local reads)")
+    text = gym_store_sync.format_report(report)
+    assert "UNKNOWN" in text and "nothing was written" in text
+
+
 def test_sync_without_apply_writes_nothing(armed, monkeypatch):
     fake = FakePostgrest()
     _wire(monkeypatch, fake)

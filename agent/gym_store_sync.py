@@ -53,7 +53,18 @@ def compare(store=None, local_rows=None):
 
     local = {r["account_key"]: r for r in
              (local_rows if local_rows is not None else _db.gym_list(_shared_read=False))}
-    shared = {str(r.get("account_key") or ""): r for r in store.list_all()}
+    try:
+        rows = store.list_all()
+    except Exception as e:  # noqa: BLE001
+        # An operator command must REPORT an unreachable store, not traceback at it.
+        # Reporting zero drift here would be the dangerous answer (it reads as "the two
+        # services agree"), so the caller gets an explicit error and sync() refuses to
+        # write anything on the strength of a read it could not make.
+        return {"available": True, "error": f"{type(e).__name__}: {e}",
+                "local_only": [], "shared_only": [], "disagree": [],
+                "profile_collisions": [],
+                "local_count": len(local), "shared_count": None}
+    shared = {str(r.get("account_key") or ""): r for r in rows}
     shared.pop("", None)
 
     local_only = sorted(set(local) - set(shared))
@@ -110,7 +121,7 @@ def sync(apply=False, store=None):
     report = compare(store=store)
     report["pushed"], report["pulled"] = 0, 0
     report["push_errors"], report["pull_errors"] = [], []
-    if not report["available"] or not apply:
+    if not report["available"] or report.get("error") or not apply:
         return report
 
     local = {r["account_key"]: r for r in _db.gym_list(_shared_read=False)}
@@ -138,6 +149,11 @@ def format_report(report):
         return ("gym-store-sync: the shared echo_gyms store is unavailable "
                 "(SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY absent, or "
                 "AGENT_GYM_SHARED_STORE=false). Nothing compared.")
+    if report.get("error"):
+        # Deliberately NOT phrased as "0 drift": an unread store is unknown, not agreed.
+        return (f"gym-store-sync: could not READ the shared echo_gyms store "
+                f"({report['error']}). Drift is UNKNOWN, not zero, and nothing was "
+                f"written. Fix the connection and re-run.")
     lines = [
         f"gym-store-sync: local={report['local_count']} shared={report['shared_count']}",
         f"  local only (need a push):  {len(report['local_only'])}",
