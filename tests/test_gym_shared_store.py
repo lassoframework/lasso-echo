@@ -406,6 +406,25 @@ def test_sync_apply_moves_missing_rows_both_ways_and_is_idempotent(armed, monkey
     assert second["pushed"] == 0
 
 
+def test_sync_reports_zernio_profile_ids_bound_to_two_keys(armed, monkeypatch):
+    """One real gym known under two account keys (the separate duplicate-derivation
+    problem) becomes visible on a service that previously saw only one twin. Not fixed
+    here, but it must not be discovered later by accident."""
+    fake = FakePostgrest(rows=[{"account_key": "reverbnew", "display_name": "Reverb",
+                                "zernio_profile_id": "prof-shared"}])
+    _wire(monkeypatch, fake)
+    db._local_gym_upsert("reverbold", "Reverb", {"zernio_profile_id": "prof-shared"})
+    db._local_gym_upsert("unrelated", "Unrelated", {"zernio_profile_id": "prof-solo"})
+    store = gss.SharedGymStore(url="https://x", service_key="k", http=fake)
+    report = gym_store_sync.compare(store=store)
+    collisions = report["profile_collisions"]
+    assert len(collisions) == 1
+    assert collisions[0]["account_keys"] == ["reverbnew", "reverbold"]
+    assert "reverbold" in gym_store_sync.format_report(report)
+    # a profile bound to exactly one key is not a collision
+    assert all(c["zernio_profile_id"] != "prof-solo" for c in collisions)
+
+
 def test_sync_without_apply_writes_nothing(armed, monkeypatch):
     fake = FakePostgrest()
     _wire(monkeypatch, fake)

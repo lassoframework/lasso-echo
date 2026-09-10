@@ -73,7 +73,31 @@ def compare(store=None, local_rows=None):
             disagree.append({"account_key": key, "fields": diffs})
 
     return {"available": True, "local_only": local_only, "shared_only": shared_only,
-            "disagree": disagree, "local_count": len(local), "shared_count": len(shared)}
+            "disagree": disagree, "local_count": len(local), "shared_count": len(shared),
+            "profile_collisions": profile_collisions(local, shared)}
+
+
+def profile_collisions(local, shared):
+    """Zernio profile ids bound to MORE THAN ONE account_key across the union of both
+    stores, as [{"zernio_profile_id": id, "account_keys": [...]}, ...].
+
+    NOT caused by this fix, and NOT fixed by it: it is the separate account-key
+    duplicate-derivation problem (one real gym known under two keys, e.g.
+    crossfitreverb6cdf33 and crossfitreverb30b5b2). It is reported here because
+    hydrating the shared record makes both twins visible on a service that previously
+    saw only one, which makes db.gym_key_for_zernio_profile ambiguous there (it answers
+    with the lowest account_key, by design) and gives account_key_guard's STEAL-PROFILE
+    check a second candidate to reason about. Surfacing it beats discovering it later:
+    this function only LOOKS, it never merges, rebinds, or deletes anything."""
+    by_profile = {}
+    for source in (local, shared):
+        for key, row in (source or {}).items():
+            pid = str((row or {}).get("zernio_profile_id") or "").strip()
+            if not pid:
+                continue
+            by_profile.setdefault(pid, set()).add(key)
+    return [{"zernio_profile_id": pid, "account_keys": sorted(keys)}
+            for pid, keys in sorted(by_profile.items()) if len(keys) > 1]
 
 
 def sync(apply=False, store=None):
@@ -128,4 +152,10 @@ def format_report(report):
         cols = ", ".join(sorted(item["fields"]))
         lines.append(f"  DISAGREE {item['account_key']}: {cols} "
                      f"(reported only, never auto resolved)")
+    collisions = report.get("profile_collisions") or []
+    if collisions:
+        lines.append(f"  zernio profile ids bound to >1 account_key: {len(collisions)} "
+                     f"(pre-existing duplicate-key problem, NOT caused or fixed here)")
+        for item in collisions:
+            lines.append(f"    {', '.join(item['account_keys'])}")
     return "\n".join(lines)
