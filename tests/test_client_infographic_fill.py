@@ -145,3 +145,80 @@ def test_no_sources_is_noop(monkeypatch):
     _stub_pipeline(monkeypatch)
     out = cif.fill_gaps("gymx", _acct(), _Store(), voice=_voice())
     assert out["ok"] is False and out["reason"] == "no sources"
+
+
+# ---- image engine: Astra draws these cards, and a dead chain is never silent ----
+
+def _astra_body():
+    import base64 as _b64
+    import json as _json
+    return _json.dumps({"output": [{
+        "type": "image_generation_call",
+        "result": _b64.b64encode(b"\x89PNG_astra_card_bytes_padded_long").decode(),
+    }]})
+
+
+def _arm_astra(monkeypatch, status, body):
+    """Give the fill path a live Astra key and a scripted Responses reply."""
+    from agent import image_engine
+    monkeypatch.setenv(image_engine.OPENAI_API_KEY_ENV, "sk-test-not-real")
+    monkeypatch.setattr(image_engine, "ASTRA_RETRY_BACKOFF_SECS", 0.0)
+    seen = []
+
+    def _post(self, payload):
+        seen.append(payload)
+        return status, body
+
+    monkeypatch.setattr(image_engine.AstraImageEngine, "_post", _post)
+    return seen
+
+
+def test_fill_cards_are_drawn_by_astra(monkeypatch):
+    _sources()
+    _stub_pipeline(monkeypatch)
+    seen = _arm_astra(monkeypatch, 200, _astra_body())
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["filled"] == 1
+    assert len(seen) == 1
+    assert seen[0]["model"] == "gpt-6-astra"
+    assert seen[0]["tools"][0]["model"] == "gpt-image-2.5-sunburst"
+
+
+def test_fill_falls_back_to_gemini_when_astra_is_down(monkeypatch):
+    _sources()
+    _stub_pipeline(monkeypatch)
+    seen = _arm_astra(monkeypatch, 503, "astra unavailable")
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert len(seen) == 2, "Astra is retried once before the fallback"
+    assert out["filled"] == 1, "the Gemini rung still fills the slot"
+
+
+def test_a_dead_chain_marks_the_calendar_slot_needs_human(monkeypatch):
+    """A calendar slot may NEVER fail silently."""
+    from agent import creative_studio, media_host
+    _sources()
+    _stub_pipeline(monkeypatch)
+    _arm_astra(monkeypatch, 503, "astra unavailable")
+
+    class _DeadGemini:
+        def generate_image(self, prompt, model):
+            raise RuntimeError("gemini down too")
+
+    monkeypatch.setattr(creative_studio, "_default_client", lambda: _DeadGemini())
+    monkeypatch.setattr(media_host, "host_media", lambda path, key: "https://r2/x")
+    alerts = []
+    monkeypatch.setattr("agent.ops_alerts.alert", lambda msg: alerts.append(msg))
+
+    store = _Store()
+    out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
+                        now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
+    assert out["filled"] == 0 and store.inserted == []
+    assert any("NEEDS HUMAN" in a for a in alerts), alerts
+
+    from agent import db
+    rows = [r for r in db.audit_rows() if r["kind"] == "image_needs_human"]
+    assert rows and rows[0]["account_key"] == "gymx_ig"

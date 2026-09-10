@@ -125,10 +125,21 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         except Exception as e:  # noqa: BLE001 - a hard-rule miss skips the day
             log(f"{base} {day}: headline failed hard rules ({type(e).__name__}); skipped")
             continue
-        img = creative_studio._render_with_timeout(
-            lambda: client.generate_image(prompt=prompt, model=config.NANO_MODEL))
+        # Astra first, Gemini as the fallback rung. A calendar slot may NEVER
+        # fail silently: when every engine fails, image_engine marks the slot
+        # NEEDS HUMAN (ops alert + audit row) before this returns None.
+        from . import image_engine as _ie
+        _res = _ie.generate_image(
+            prompt,
+            {"kind": "infographic", "surface": "feed post",
+             "has_text_overlay": bool(str(headline or "").strip()),
+             "gemini_model": config.NANO_MODEL},
+            gemini_client=client, account_key=account.key,
+            subject=f"{day} {headline}"[:120])
+        img = _res.image_bytes if _res is not None else None
         if not img:
-            log(f"{base} {day}: nano render failed; skipped")
+            log(f"{base} {day}: image render failed on every engine; "
+                "marked NEEDS HUMAN and skipped")
             continue
         out = os.path.join(config.LIBRARY_PATH, base,
                            f"igfill_{day}_{archetype}.png")
