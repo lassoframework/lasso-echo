@@ -104,6 +104,21 @@ def clear_drive_pool_cache():
     _DRIVE_POOL_CACHE.clear()
 
 
+def drive_pool_has_video(account_key, *, store=None, now=None):
+    """True when the Drive lane is armed for this gym AND its pool holds at least one
+    pickable VIDEO (audit round 5 MAJOR 1): the month build then hands video-beat days
+    to the Drive lane BEFORE Lane A, so a big fresh local still library can no longer
+    make the video mix inert. Never raises; a read failure answers False."""
+    try:
+        if not drive_pool_can_fill(account_key, store=store, now=now):
+            return False
+        from . import gym_media_selector as _sel
+        return "video" in _sel.pool_kinds(_sel.base_gym_key(account_key), store=store,
+                                          now=now)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def drive_pool_can_fill(account_key, *, store=None, now=None):
     """True when the connected Drive lane could fill a slot for this gym RIGHT NOW:
     GYM_DRIVE_STAGE is on, the gym is armed for GYM_DRIVE_CONNECT, AND its Drive pool

@@ -159,6 +159,37 @@ def _real_file(path, kind):
         return False
 
 
+def _probe(path, timeout):
+    """gym_media_index.probe_video with the bounded timeout when it accepts one (the
+    real one does); injected stubs without the parameter still work."""
+    import inspect
+    from . import gym_media_index as _idx
+    fn = _idx.probe_video
+    try:
+        params = inspect.signature(fn).parameters
+        accepts = "timeout" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        accepts = False
+    return fn(path, timeout=timeout) if accepts else fn(path)
+
+
+def _local_video_servable(path):
+    """A local-library video may be swapped in only when its codec is web-playable and
+    its container publishable: ffprobe the codec (bounded) and refuse HEVC / .webm /
+    .avi / .mkv, exactly as the Drive pool does (audit round 5 minor: never host raw
+    HEVC from the local library either). An unprobed file is refused (fail closed)."""
+    from . import gym_media_index as _idx
+    try:
+        info = _probe(path, SWAP_DOWNLOAD_TIMEOUT_SEC)
+    except Exception:  # noqa: BLE001
+        info = None
+    if not info:
+        return False
+    pseudo = {"kind": _idx.KIND_VIDEO, "title": os.path.basename(path)}
+    return not _idx.needs_rendition(pseudo, info)
+
+
 def local_candidates(base_key, lib, post_date, blocked_keys):
     """The gym's local-library creatives a swap may use for a row on post_date."""
     if not lib or not os.path.isdir(lib):
@@ -186,6 +217,8 @@ def local_candidates(base_key, lib, post_date, blocked_keys):
         path = os.path.join(lib, key)
         if not os.path.isfile(path) or not _real_file(path, kind):
             continue
+        if kind == "video" and not _local_video_servable(path):
+            continue                      # HEVC / odd container in the library: never raw
         try:
             rk = dam.rotation_key(path)
         except Exception:  # noqa: BLE001
@@ -290,20 +323,24 @@ def candidates_for(base_key, row, *, store, lib, book_state=None, asset_state=No
 
 # ---- materialize (a local file + maybe an already-hosted url) ------------------------
 def _download_bounded(drive, file_id, path, timeout):
-    """drive.download in a worker thread, waited on for at most `timeout` seconds.
-    Returns True on success; False on failure or timeout (the request moves on; a
-    still-running download is abandoned to the thread and its temp file cleaned up
-    with the work dir)."""
-    import concurrent.futures as _cf
-    ex = _cf.ThreadPoolExecutor(max_workers=1)
-    try:
-        fut = ex.submit(drive.download, file_id, path)
-        fut.result(timeout=max(0.1, float(timeout)))
-        return True
-    except Exception:  # noqa: BLE001 - timeout and transport errors both mean "skip"
-        return False
-    finally:
-        ex.shutdown(wait=False)
+    """drive.download in a DAEMON worker thread, waited on for at most `timeout`
+    seconds. Returns True on success; False on failure or timeout (the request moves
+    on; a still-running download is abandoned to the daemon thread, which can never
+    hold the process open at exit, and its temp file is cleaned up with the work
+    dir)."""
+    import threading
+    box = {}
+
+    def _run():
+        try:
+            drive.download(file_id, path)
+            box["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - reported as a failed download
+            box["err"] = exc
+    t = threading.Thread(target=_run, name="media-swap-download", daemon=True)
+    t.start()
+    t.join(timeout=max(0.1, float(timeout)))
+    return bool(box.get("ok")) and not t.is_alive()
 
 
 def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None, budget=None,
@@ -341,7 +378,10 @@ def _materialize(base_key, cand, work_dir, *, drive=None, media_store=None, budg
     if asset.get("kind") == _idx.KIND_VIDEO:
         if deadline is not None:
             deadline.check(f"probe of {title!r}")
-        info = _idx.probe_video(path)
+        probe_timeout = _idx.PROBE_TIMEOUT_SEC
+        if deadline is not None:
+            probe_timeout = min(probe_timeout, deadline.remaining())
+        info = _probe(path, probe_timeout)
         if not info:
             return None                       # unprobed never ships (fail closed)
         el, _reason, _label = _idx.video_eligibility(
@@ -510,6 +550,10 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
             tenant = base_key if cand["source"] == "drive" else f"{base_key}_ig"
             hosted = mat.get("hosted") or ""
             if not hosted:
+                if deadline.expired():
+                    say(f"{base_key}: swap request deadline passed before hosting "
+                        f"{cand.get('key')}; nothing written")
+                    return {"ok": False, "reason": REASON_TIMEOUT}
                 if host_fn is not None:
                     hosted = host_fn(path) or ""
                 else:
@@ -524,8 +568,11 @@ def pick_replacement(base_key, row, *, store, library_path=None, book_state=None
                 return {"ok": False, "reason": REASON_HOSTING}
             # One poster per swap (audit D4): computed once, attached only to FEED
             # variants; a story's media is the captioned card/video itself.
-            poster = (poster_fn(path, work, tenant) or "") if cand["kind"] == "video" else ""
+            poster = ""
             try:
+                if cand["kind"] == "video":
+                    deadline.check(f"poster frame for {cand.get('key')}")
+                    poster = poster_fn(path, work, tenant) or ""
                 out = _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant,
                               poster=poster, feed_fn=feed_fn, reburn_fn=reburn_fn, log=say,
                               deadline=deadline)
@@ -590,6 +637,8 @@ def _finish(base_key, row, fmt, cand, path, hosted, lib, work, tenant, *, poster
     # FEED AUTOFIT PARITY: the original shipped through the square reframe, so the
     # replacement gets it too. Any failure keeps the raw hosted photo (never a drop).
     target = hosted
+    if deadline is not None and (feed_fn is not None or config.feed_autofit_enabled()):
+        deadline.check(f"autofit for row {row.get('id')}")
     if feed_fn is not None:
         target = feed_fn(path) or hosted
     elif config.feed_autofit_enabled():

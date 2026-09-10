@@ -382,6 +382,18 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     gym_id = source.get("gym_id")
     source_id = source.get("id")
     folder_id = source.get("folder_id")
+    # STALE-KEY RESOLUTION HERE TOO (audit round 5 MAJOR 2): run() remaps a source's
+    # stale gym_id (a portal link minted before a re-key) before calling this, but a
+    # direct caller (the Tough Temple re-stage recipe: media_source under
+    # toughtemple086f51, media_asset under toughtemple52040e) got the raw row, listed
+    # ZERO existing assets under the stale key, re-inserted every file, hit the PK and
+    # rendered nothing. Same resolver, same rule, so the recipe cannot be wrong again.
+    from .. import gym_media_routes as _gm_routes
+    resolved = _gm_routes._resolve_stale_fingerprint(gym_id)
+    if resolved != gym_id:
+        log(f"source {source_id} carries stale key {gym_id!r}; resolved to {resolved!r} "
+            "for this sync (the media_source row itself was NOT rewritten)")
+        gym_id = resolved
 
     # 1. walk (403 -> revoked_externally + notify, no crash)
     try:

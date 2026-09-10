@@ -979,6 +979,285 @@ def test_small_library_alert_ignores_drive_covered_days(monkeypatch, tmp_path):
     assert filled == 1 and fired == ["2026-08-20"]
 
 
+# =====================================================================================
+# Round 5: MAJOR 1 (video beats claimed before Lane A), MAJOR 2 (sync_source resolves
+# a stale gym_id), minors.
+# =====================================================================================
+def _tt_pool(n_videos=57, n_photos=6, renditioned=True):
+    assets = []
+    for i in range(n_videos):
+        a = make_asset(f"v{i:02d}", gym_id="gritx", kind="video", title=f"clip{i:02d}.mp4",
+                       mime="video/mp4")
+        if renditioned:
+            a["rendition_url"] = f"https://cdn.fake/rend/clip{i:02d}.mp4"
+        assets.append(a)
+    for i in range(n_photos):
+        assets.append(make_asset(f"p{i:02d}", gym_id="gritx", kind="photo",
+                                 title=f"team{i:02d}.jpg"))
+    return assets
+
+
+def _video_beats(start, days, slot=0):
+    return sum(1 for i in range(days)
+               if builder.is_video_slot((start + timedelta(days=i)).isoformat(), slot))
+
+
+def test_video_beats_are_claimed_by_drive_before_lane_a_with_fresh_stills(monkeypatch,
+                                                                          tmp_path):
+    """Tough Temple's rebuild: 95 FRESH local stills, 57 renditioned Drive videos, 6
+    Drive photos, 20 days at 1x. Before round 5 Lane A took every day (20 stills, 0
+    videos). Now every video beat is a Drive video, every photo beat a fresh still:
+    0 repeats, 0 uncovered, and each video day carries its FB mirror + story."""
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool())
+    _arm(monkeypatch, store, FakeDrive())
+    start = date(2026, 8, 1)
+    cal = _CalStore()
+    logs = []
+    out = cmr.build_client_month(_account(), "gritx", start.isoformat(), days=20,
+                                 voice=_voice(), library_path=_lib(tmp_path, n=95),
+                                 store=cal, banned_words=(), logger=logs.append)
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    beats = _video_beats(start, 20)
+    assert 8 <= beats <= 10                                   # the 5/11 pattern over 20 days
+    videos = [r for r in feeds if mt.is_video_url(r["image_url"])]
+    stills = [r for r in feeds if not r.get("source_media_asset_id")]
+    assert len(videos) == beats, f"{len(videos)} video days for {beats} beats"
+    assert len(stills) == 20 - beats and len(feeds) == 20, "0 uncovered"
+    assert len({r["post_date"] for r in feeds}) == 20, "no double placement"
+    assert len({r["image_url"] for r in feeds}) == 20, "0 repeats"
+    assert all(r.get("source_media_asset_id", "").startswith("v") for r in videos)
+    assert any("video pre-pass claimed" in m for m in logs)
+    rows = cal.inserted
+    for v in videos:
+        d = v["post_date"]
+        assert any(r["post_date"] == d and r["format"] == "feed" and r["account"] == "facebook"
+                   and r["image_url"] == v["image_url"] for r in rows), "FB mirror"
+        assert any(r["post_date"] == d and r["format"] == "story" for r in rows), "story"
+    # one feed per (date, account): the day-shape assertion inside _apply also held
+    assert len({(r["post_date"], r["account"]) for r in rows if r["format"] == "feed"}) == 40
+
+
+def test_video_beats_then_drive_photos_when_no_still_is_fresh(monkeypatch, tmp_path):
+    """Same pool, every local still stale: video beats -> Drive videos; the deferred
+    photo beats -> the 6 Drive photos first, then videos again. ~14 video + 6 Drive
+    photo days, 0 repeats, 0 uncovered."""
+    _sources()
+    _stale_ledger(monkeypatch, n=95)
+    store = FakeMediaStore(assets=_tt_pool())
+    _arm(monkeypatch, store, FakeDrive())
+    start = date(2026, 8, 1)
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", start.isoformat(), days=20,
+                                 voice=_voice(), library_path=_lib(tmp_path, n=95),
+                                 store=cal, banned_words=())
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len(feeds) == 20 and len({r["post_date"] for r in feeds}) == 20
+    videos = [r for r in feeds if mt.is_video_url(r["image_url"])]
+    photos = [r for r in feeds if r.get("source_media_asset_id", "").startswith("p")]
+    assert len(photos) == 6 and len(videos) == 14
+    assert not any(not r.get("source_media_asset_id") for r in feeds), "0 repeats"
+    assert len({r["source_media_asset_id"] for r in feeds}) == 20
+
+
+def test_no_drive_pool_keeps_lane_a_unchanged(monkeypatch, tmp_path):
+    _sources()
+    store = FakeMediaStore(assets=[])
+    _arm(monkeypatch, store, FakeDrive())
+    calls = []
+    real = cmr.append_gym_drive_drafts
+
+    def spy(*a, **k):
+        calls.append(k.get("video_beats_only"))
+        return real(*a, **k)
+    monkeypatch.setattr(cmr, "append_gym_drive_drafts", spy)
+    cal = _CalStore()
+    out = cmr.build_client_month(_account(), "gritx", "2026-08-01", days=20, voice=_voice(),
+                                 library_path=_lib(tmp_path, n=95), store=cal, banned_words=())
+    assert out["ok"] is True
+    feeds = _feeds(cal)
+    assert len(feeds) == 20 and not any(r.get("source_media_asset_id") for r in feeds)
+    assert True not in calls, "no pre-pass without a video pool"
+    assert client_content.drive_pool_has_video("gritx_ig") is False
+
+
+def test_pre_pass_claims_only_the_video_slot_of_a_2x_day(monkeypatch, tmp_path):
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool(n_videos=4, n_photos=2))
+    _arm(monkeypatch, store, FakeDrive())
+    # distinct captions per call: the two slots of one day must be two concepts
+    n = iter(range(100))
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: (f"A grounded caption number {next(n)}", []))
+    d = date(2026, 8, 1)
+    while not (not builder.is_video_slot(d.isoformat(), 0)
+               and builder.is_video_slot(d.isoformat(), 1)):
+        d += timedelta(days=1)
+    covered = set()
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", d, 1, _voice(), log=lambda m: None,
+                                        covered_days=set(), drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), slots_per_day=2,
+                                        covered_slots=covered, video_beats_only=True,
+                                        kind_prefs=("video",))
+    feeds = [x for x in extra if not getattr(x, "is_story", False)]
+    assert len(feeds) == 1 and feeds[0].cadence_slot_index == 1
+    assert covered == {(d.isoformat(), 1)}
+    assert mt.is_video_url(feeds[0].creative_public_url)
+    # the gap-fill lane then respects the owned slot and fills only slot 0
+    more = cmr.append_gym_drive_drafts(_account(), "gritx", d, 1, _voice(), log=lambda m: None,
+                                       covered_days=set(), drive=FakeDrive(), store=store,
+                                       library_path=str(tmp_path), slots_per_day=2,
+                                       covered_slots=covered,
+                                       day_captions_seed={d.isoformat(): [feeds[0].caption]})
+    more_feeds = [x for x in more if not getattr(x, "is_story", False)]
+    assert [x.cadence_slot_index for x in more_feeds] == [0]
+    assert covered == {(d.isoformat(), 0), (d.isoformat(), 1)}
+
+
+def test_pre_pass_leaves_a_video_beat_to_lane_a_when_no_video_is_pickable(monkeypatch,
+                                                                          tmp_path):
+    """kind_prefs=('video',) means NO photo fallback in the pre-pass."""
+    _sources()
+    store = FakeMediaStore(assets=_tt_pool(n_videos=0, n_photos=3))
+    _arm(monkeypatch, store, FakeDrive())
+    covered = set()
+    extra = cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 11, _voice(),
+                                        log=lambda m: None, covered_days=set(),
+                                        drive=FakeDrive(), store=store,
+                                        library_path=str(tmp_path), covered_slots=covered,
+                                        video_beats_only=True, kind_prefs=("video",))
+    assert extra == [] and covered == set()
+    assert all(a["used_count"] == 0 for a in store.assets.values())
+
+
+# ---- MAJOR 2: sync_source resolves a stale gym_id exactly like run() -----------------
+def test_sync_source_resolves_a_stale_gym_id_before_touching_the_store(monkeypatch):
+    from agent.jobs import sync_gym_media as job
+    from tests.gym_media_fakes import make_source, photo
+    monkeypatch.setattr(job, "_post_digest", lambda *a, **k: None)
+    monkeypatch.setattr("agent.gym_media_routes._resolve_stale_fingerprint",
+                        lambda g, **k: "toughtemple52040e" if g == "toughtemple086f51" else g)
+    # the asset already indexed under the REAL key (id == the Drive file id)
+    existing = make_asset("p1", gym_id="toughtemple52040e", source_id="src1", kind="photo")
+    store = FakeMediaStore(sources=[make_source("src1", gym_id="toughtemple086f51")],
+                           assets=[existing])
+    listed = []
+    real_list = store.list_assets
+
+    def spy_list(gym_id, source_id=None):
+        listed.append(gym_id)
+        return real_list(gym_id, source_id=source_id)
+    store.list_assets = spy_list
+    drive = FakeDrive(files=[photo("p1")])
+    out = job.sync_source(make_source("src1", gym_id="toughtemple086f51"), drive=drive,
+                          store=store, probe_fn=lambda p: None, log=lambda m: None)
+    assert out["ok"] and out["gym_id"] == "toughtemple52040e"
+    assert listed and set(listed) == {"toughtemple52040e"}, "listed under the RESOLVED key"
+    assert out["inserted"] == 0, "the existing asset is recognised, not re-inserted"
+    assert len(store.assets) == 1 and store.assets["p1"]["gym_id"] == "toughtemple52040e"
+
+
+def test_recipe_step_0b_remap_matches_run(monkeypatch):
+    """The PR body's pre-step mirrors run(): src['gym_id'] =
+    gym_media_routes._resolve_stale_fingerprint(src['gym_id'])."""
+    from agent import gym_media_routes as gmr
+    assert gmr._resolve_stale_fingerprint("x", resolve=lambda g: "y") == "y"
+    assert gmr._resolve_stale_fingerprint("x", resolve=lambda g: None) == "x"
+
+
+# ---- round 5 minors ----------------------------------------------------------------
+def test_recaption_retry_carries_the_builders_grounding(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_SB7_ENABLED", "true")
+    _sources()
+    store = FakeMediaStore(assets=[make_asset("v1", gym_id="gritx", kind="video",
+                                              title="clip.mp4")])
+    _arm(monkeypatch, store, FakeDrive())
+    seen = []
+    captions = iter(["weak", "A grounded caption about the class"])
+    monkeypatch.setattr("agent.client_content.make_caption",
+                        lambda *a, **k: (seen.append(k) or (next(captions), [])))
+    from agent import post_quality
+    verdicts = iter([False, True])
+    monkeypatch.setattr(post_quality, "is_a_plus",
+                        lambda draft, banned, require_media=True: next(verdicts))
+    cmr.append_gym_drive_drafts(_account(), "gritx", date(2026, 8, 1), 1, _voice(),
+                                log=lambda m: None, covered_days=set(), drive=FakeDrive(),
+                                store=store, library_path=str(tmp_path), banned_words=("x",))
+    assert len(seen) == 2
+    first, retry = seen
+    assert getattr(retry["creative"], "path", "").endswith("clip.mp4")
+    assert os.path.basename(getattr(first["creative"], "path", "")) == \
+        os.path.basename(getattr(retry["creative"], "path", ""))
+    assert "verified" in retry and retry["verified"] == first.get("verified")
+
+
+def test_local_hevc_video_is_never_a_swap_candidate(monkeypatch, tmp_path):
+    from agent import media_swap as msw
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "raw.mov").write_bytes(b"\0" * 4096)
+    (lib / "ok.mp4").write_bytes(b"\0" * 4096)
+    monkeypatch.setattr(_gmi, "probe_video",
+                        lambda p, timeout=None: {"duration_sec": 10, "width": 1080,
+                                                 "height": 1920,
+                                                 "codec": "hevc" if str(p).endswith(".mov") else "h264"})
+    monkeypatch.setattr(msw, "_last_served_local", lambda base: {})
+    cands = msw.local_candidates("gritx", str(lib), "2026-09-20", set())
+    assert [c["key"] for c in cands] == ["ok.mp4"]
+
+
+def test_swap_probe_and_host_run_under_the_request_deadline(monkeypatch, tmp_path):
+    from agent import media_swap as msw
+    seen = {}
+
+    def probe(p, timeout=None):
+        seen["probe_timeout"] = timeout
+        return {"duration_sec": 10, "width": 1080, "height": 1920, "codec": "h264"}
+    monkeypatch.setattr(_gmi, "probe_video", probe)
+    asset = make_asset("v1", gym_id="gritx", kind="video", title="c.mp4")
+    cand = {"source": "drive", "kind": "video", "key": "v1", "asset": asset}
+    ticks = iter([0.0] + [30.0] * 20)          # 45 s of the 75 s budget left
+    dl = msw._Deadline(msw.SWAP_REQUEST_DEADLINE_SEC, clock=lambda: next(ticks))
+    out = msw._materialize("gritx", cand, str(tmp_path), drive=FakeDrive(),
+                           media_store=FakeMediaStore(assets=[asset]),
+                           budget=_gmi.RenditionBudget(1), deadline=dl)
+    assert out and out["path"].endswith("c.mp4")
+    assert seen["probe_timeout"] == pytest.approx(45.0), "probe bounded by the time left"
+    # hosting is refused once the deadline has passed
+    ticks2 = iter([0.0, 1.0, 10_000.0] + [10_000.0] * 10)
+    out2 = msw.pick_replacement(
+        "gritx", {"id": "r", "gym_id": "gritx", "post_date": "2026-09-20", "format": "feed",
+                  "image_url": "https://cdn/old.jpg"},
+        store=None, library_path="", candidates_fn=lambda g, r: [{"source": "local",
+                                                                 "kind": "photo", "key": "n.jpg",
+                                                                 "path": "/x/n.jpg"}],
+        materialize_fn=lambda c: {"path": c["path"], "hosted": None},
+        host_fn=lambda p: pytest.fail("hosting must not start past the deadline"),
+        clock=lambda: next(ticks2))
+    assert out2 == {"ok": False, "reason": msw.REASON_TIMEOUT}
+
+
+def test_download_worker_thread_is_a_daemon(monkeypatch):
+    import threading
+    from agent import media_swap as msw
+    made = []
+    real = threading.Thread
+
+    class Spy(real):
+        def __init__(self, *a, **k):
+            made.append(k.get("daemon"))
+            super().__init__(*a, **k)
+    monkeypatch.setattr(threading, "Thread", Spy)
+
+    class _Drive:
+        def download(self, file_id, dest):
+            return dest
+    assert msw._download_bounded(_Drive(), "x", "/tmp/y", timeout=2) is True
+    assert made == [True]
+
+
 # ---- D1 residual ---------------------------------------------------------------------
 def test_story_reburn_and_meta_publisher_use_the_shared_video_definition():
     from agent import meta_publisher, story_reburn

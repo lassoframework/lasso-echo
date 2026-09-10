@@ -149,16 +149,22 @@ def image_dims(path):
         return None
 
 
-def probe_video(path, runner=None):
+PROBE_TIMEOUT_SEC = 120
+
+
+def probe_video(path, runner=None, timeout=PROBE_TIMEOUT_SEC):
     """{'duration_sec','width','height','codec'} via ffprobe, or None when ffprobe
     is missing/fails (the asset then stays unprobed -> not selectable, fail
-    closed). codec lets the caller decide whether an HEVC transcode is needed."""
+    closed). codec lets the caller decide whether an HEVC transcode is needed.
+    `timeout` (seconds, default 120) lets a caller under a request deadline hand in
+    min(120, time left)."""
     run = runner or subprocess.run
     try:
         proc = run(
             ["ffprobe", "-v", "error", "-print_format", "json",
              "-show_format", "-show_streams", str(path)],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True,
+            timeout=max(1.0, min(float(PROBE_TIMEOUT_SEC), float(timeout))))
         data = json.loads(proc.stdout or "{}")
     except Exception as e:  # noqa: BLE001 - a probe failure is a skip, not a crash
         print(f"[gym-media] ffprobe failed for {path}: {type(e).__name__}: {e}")

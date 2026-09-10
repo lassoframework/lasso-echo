@@ -108,7 +108,7 @@ class _PickedCreative:
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
                           drive=None, now=None, library_dir=None, exclude_ids=(),
-                          slot_index=0, rendition_budget=None):
+                          slot_index=0, rendition_budget=None, kind_prefs=None):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -153,11 +153,18 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
 
     caller_excludes = {str(i) for i in (exclude_ids or ()) if i}
     # MEDIA MIX: ask the pool what it can supply, then order the kinds for this
-    # (day, slot). The pool-empty alert stays with pick_media below.
-    kind_prefs = kinds_for_slot(
-        _sel.pool_kinds(gym_base, store=store, now=now,
-                        exclude_ids=tuple(caller_excludes)),
-        day_key, slot_index)
+    # (day, slot). The pool-empty alert stays with pick_media below. A caller may
+    # pin the kinds (the video pre-pass asks for ("video",) ONLY: no photo fallback,
+    # a video beat the pool cannot serve is left to Lane A).
+    if kind_prefs is None:
+        kind_prefs = kinds_for_slot(
+            _sel.pool_kinds(gym_base, store=store, now=now,
+                            exclude_ids=tuple(caller_excludes)),
+            day_key, slot_index)
+    else:
+        kind_prefs = [k for k in kind_prefs if k in (_idx.KIND_PHOTO, _idx.KIND_VIDEO)]
+        if not kind_prefs:
+            return None
     if rendition_budget is None:
         rendition_budget = _idx.RenditionBudget(1)
 
@@ -356,6 +363,12 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         )
         if poster_url:
             draft.thumbnail_url = poster_url          # -> content_calendar.thumbnail_url
+        # The grounding this caption was written against, so a caption RETRY
+        # (client_month_run._recaption_drive_draft) grounds the same way instead of
+        # from nothing (audit round 5 minor).
+        draft.caption_grounding = {
+            "creative_name": os.path.basename(str(local_for_vision)),
+            "verified": verified}
         try:
             _sel.stamp_use(asset, gym_base, day_key, store=store, now=now)
         except Exception as e:  # noqa: BLE001

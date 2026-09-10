@@ -493,6 +493,7 @@ def _is_first_month(base_key, store, log):
 # The gym-drive lane fills these people-forward slots (spec §7). Kept in the order
 # a month rotates through them so consecutive Drive days do not repeat one pillar.
 _GYM_DRIVE_PILLARS = ("faces", "community", "results")
+_VIDEO_KIND = "video"        # gym_media_index.KIND_VIDEO, without the import cycle
 
 
 def _gym_drive_source_for(account_key, day_key, slot_i=0):
@@ -752,8 +753,16 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
         if source is None:
             return False
         avoid = tuple(s for s in (opening_signature(prev),) if s)
+        # SAME GROUNDING as the builder's first attempt (audit round 5 minor): the
+        # frame's name hint + the crop-verify result it recorded on the draft, so the
+        # retry is written against the same shot, never from nothing.
+        from .gym_media_builder import _PickedCreative
+        grounding = getattr(draft, "caption_grounding", None) or {}
+        creative = _PickedCreative(grounding.get("creative_name")
+                                   or getattr(draft, "creative_path", "") or "")
         caption, tags = client_content.make_caption(
             account, source, voice, getattr(draft, "creative_path", "") or "",
+            creative=creative, verified=grounding.get("verified"),
             avoid_openings=avoid)
         caption = (caption or "").strip()
         if not caption or caption == prev:
@@ -771,7 +780,9 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
 def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                             covered_days, drive=None, store=None,
                             library_path="", slots_per_day=1, banned_words=(),
-                            rendition_budget=None):
+                            rendition_budget=None, covered_slots=None,
+                            video_beats_only=False, kind_prefs=None,
+                            day_captions_seed=None):
     """Widen the month with PENDING posts built FROM THE GYM'S CONNECTED DRIVE POOL
     (gym_media_drive spec §7). This is the production caller of
     gym_media_builder.build_gym_media_draft: for each day in the span that the
@@ -793,7 +804,21 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
     so a gym on 2x gets two Drive pairs a day and its rows carry the slot ordinal.
     (Before 2026-08-30 this lane emitted a bare feed and hard-coded one post per day,
     which is what left Dale/ENG with no stories and a single daily post after his 2x
-    toggle — the Drive lane had quietly taken over his whole forward month.)"""
+    toggle — the Drive lane had quietly taken over his whole forward month.)
+
+    TWO MODES (audit round 5 MAJOR 1). Gap-fill (default): every slot of every day
+    the uploaded-media loop left uncovered. VIDEO PRE-PASS (video_beats_only=True,
+    kind_prefs=("video",)): runs BEFORE Lane A and claims only the (day, slot) video
+    beats of the mix (gym_media_builder.is_video_slot) with a Drive VIDEO; a beat the
+    pool cannot serve is simply left to Lane A (no photo fallback, no day break).
+    Without this, Lane A's precedence made the mix inert for any gym with enough fresh
+    local stills (Tough Temple: 95 stills, 57 videos, zero video days).
+
+    covered_slots: a shared set of (day_key, slot_index) this call must skip and to
+    which it ADDS every slot it stages, so Lane A, the pre-pass and the gap-fill never
+    place two feeds in one slot (2x: one slot may be a Lane A still, the other a Drive
+    video). day_captions_seed: {day_key: [captions]} already placed on a day by another
+    lane, so the same-concept guard sees them."""
     from datetime import timedelta
     from . import gym_media_builder
     extra = []
@@ -806,8 +831,14 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
         day_key = (start + timedelta(days=i)).isoformat()
         if day_key in covered:
             continue
-        day_captions = []          # captions already placed on THIS day (2x uniqueness)
+        # captions already placed on THIS day (2x uniqueness), seeded with the other
+        # lanes' placements on the same day
+        day_captions = list((day_captions_seed or {}).get(day_key, []))
         for slot_i in range(slots):
+            if covered_slots is not None and (day_key, slot_i) in covered_slots:
+                continue                   # another lane already owns this slot
+            if video_beats_only and not gym_media_builder.is_video_slot(day_key, slot_i):
+                continue                   # the pre-pass claims video beats only
             pillar = _GYM_DRIVE_PILLARS[pillar_i % len(_GYM_DRIVE_PILLARS)]
             source = _gym_drive_source_for(account_key, day_key, slot_i)
             if source is None:
@@ -819,12 +850,15 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 # the same photo/video shape.
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
-                    slot_index=slot_i, rendition_budget=rendition_budget)
+                    slot_index=slot_i, rendition_budget=rendition_budget,
+                    kind_prefs=kind_prefs)
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
                     f"{type(e).__name__}: {e}")
                 draft = None
             if draft is None:
+                if video_beats_only:
+                    continue               # this beat goes to Lane A; try the next slot
                 # Empty pool / gate miss: the builder already alerted if needed. Stop
                 # this day rather than retry the same starved pool for slot 2.
                 break
@@ -895,9 +929,13 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                         pass
             extra.extend(day_drafts)
             pillar_i += 1
-            log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} post from the "
-                f"connected Drive pool (asset {draft.source_media_asset_id}), PENDING")
-        covered.add(day_key)
+            if covered_slots is not None:
+                covered_slots.add((day_key, slot_i))
+            log(f"[gym-drive] {base_key} {day_key}: staged a {pillar} "
+                f"{'video ' if video_beats_only else ''}post from the connected Drive "
+                f"pool (asset {draft.source_media_asset_id}), PENDING")
+        if not video_beats_only:
+            covered.add(day_key)
     return extra
 
 
@@ -1119,6 +1157,42 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
     # Days the uploaded-media path placed a feed on. The gym-drive lane (below) fills
     # only the GAPS, so a Drive post never doubles up a day that already has a photo.
     covered_days = set(locked_feed_days)
+    # VIDEO PRE-PASS (audit round 5 MAJOR 1): when the gym's Drive pool holds pickable
+    # VIDEOS, the video beats of the mix (gym_media_builder.is_video_slot) are claimed
+    # by the Drive lane BEFORE Lane A runs. Lane A used to take every day it had a
+    # fresh local still for and the Drive lane only ever saw the leftovers, so a gym
+    # with a big fresh still library (Tough Temple: 95 stills, 57 videos) rebuilt to
+    # 20 photo days and zero videos. Per SLOT, so a 2x day can be one Lane A still
+    # plus one Drive video. Every guard still applies inside the lane (A+ gate,
+    # same-concept guard, budget, tenant, cooldown); Lane A then skips the slots
+    # the pre-pass owns and keeps every photo beat (fresh still, else Drive photo
+    # via the gap-fill lane, else the cap-respecting fallback).
+    covered_slots = set()
+    pre_captions = {}
+    if (config.gym_drive_stage_enabled()
+            and config.gym_drive_connect_active_for(base_key)
+            and client_content.drive_pool_has_video(base_key)):
+        try:
+            pre = append_gym_drive_drafts(
+                account, base_key, start, days, voice, log=log,
+                covered_days=locked_feed_days, library_path=library_path,
+                slots_per_day=slots_per_day, banned_words=banned_words,
+                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                video_beats_only=True, kind_prefs=(_VIDEO_KIND,))
+            if pre:
+                drafts.extend(pre)
+                for d in pre:
+                    if not getattr(d, "is_story", False):
+                        pre_captions.setdefault(str(getattr(d, "day_key", ""))[:10], []).append(
+                            (getattr(d, "caption", "") or "").strip())
+                # a day whose EVERY slot the pre-pass owns is a covered day
+                for dk in {d for d, _s in covered_slots}:
+                    if all((dk, s) in covered_slots for s in range(slots_per_day)):
+                        covered_days.add(dk)
+                log(f"{base_key}: video pre-pass claimed {len(covered_slots)} video "
+                    f"beat(s) from the connected Drive pool before the uploaded-media loop")
+        except Exception as e:  # noqa: BLE001 - the pre-pass never sinks the month
+            log(f"{base_key}: video pre-pass skipped ({type(e).__name__}: {e})")
     # Walk day keys as an UPPER bound (days), but STOP emitting feeds once we have
     # placed one per unique photo (max_feed_days). Stories reuse the feed's photo (a
     # feed + its paired story are the same asset), so stories do not consume the cap.
@@ -1133,11 +1207,15 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"locked {day_key}: day already has approved/published content")
             continue
 
-        day_captions = []          # captions placed on THIS day (2x uniqueness, D5)
+        # captions placed on THIS day (2x uniqueness, D5), seeded with the video
+        # pre-pass's placements so a Lane A slot never repeats a Drive concept
+        day_captions = list(pre_captions.get(day_key, []))
         day_built = 0
         for slot_i in range(slots_per_day):
             if built_feeds >= max_feed_days:
                 break
+            if (day_key, slot_i) in covered_slots:
+                continue                   # the video pre-pass owns this slot
             # Choose this slot's angle (round-robin by the accepted-feed index) + the
             # recent angles to avoid, and widen the opening window, only when angle
             # rotation is armed.
@@ -1319,7 +1397,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                 account, base_key, start, days, voice, log=log,
                 covered_days=covered_days, library_path=library_path,
                 slots_per_day=slots_per_day, banned_words=banned_words,
-                rendition_budget=rendition_budget)
+                rendition_budget=rendition_budget, covered_slots=covered_slots,
+                day_captions_seed=pre_captions)
             if drive_extra:
                 drafts.extend(drive_extra)
                 # append_gym_drive_drafts tracks coverage on its own copy; the
