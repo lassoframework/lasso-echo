@@ -10,6 +10,54 @@ Last updated: 2026-09-03
 
 ---
 
+## echo.db SPLIT BRAIN CLOSED — shared `echo_gyms` record (2026-09-10, PR #94)
+
+`echo` (worker) and `echo-intake-web` (HTTP) are two Railway services with two
+SEPARATE volumes, so two separate `/data/echo.db` files. Railway cannot mount one
+volume on two services. Every `gyms` row `onboard.run` wrote from
+`POST /portal/onboard` landed on the WEB service's copy, while the worker, where
+every read of that row actually happens, opened a different file.
+
+Measured before the fix: **113 gym rows on echo-intake-web, 21 on `echo`.**
+
+- [x] `migrations/echo_gyms_20260910.sql` — shared `echo_gyms` table (PK `account_key`,
+      RLS on, zero policies = service_role only). APPLIED to `ooqcvmcjspeltuuhcvlh`.
+- [x] `agent/gym_shared_store.py` — PostgREST client. `MIRRORED_COLUMNS` deliberately
+      EXCLUDES `upload_link` (embeds a raw capability token) and every token
+      hash/blob column: none is read cross service and each token is re-mintable
+      from the shared signing secret.
+- [x] `agent/db.py` — `gym_upsert` dual writes; `gym_get` read-through hydrates a
+      local miss (negative cached 60s); `gym_list` pulls on a 15 min throttle. A
+      mirror failure prints, writes its own audit row, and fires a FORCED ops alert
+      (`AGENT_OPS_ALERTS_ENABLED` is not set on echo-intake-web, so an unforced
+      alert there is dormant), collapsed to one Slack line per 30 min.
+- [x] `agent/db.py connect()` — schema drift repair. `_SCHEMA` is
+      `CREATE TABLE IF NOT EXISTS`, so gyms columns added later never reach an
+      existing database. The worker's volume predated `upload_link` / `gym_name` /
+      `token_sha256` / `token_status` / `publish_creds`, making
+      `gym_upsert(upload_link=...)` a "no such column" crash there.
+- [x] `agent/gym_store_sync.py` + `python -m agent gym-store-sync [--apply]` — the one
+      time heal and the ongoing drift report. Moves only MISSING rows in either
+      direction; field disagreements are REPORTED, never auto resolved.
+- [x] `AGENT_GYM_SHARED_STORE` — kill switch (default ON when Supabase creds are set,
+      same creds-are-the-flag idiom as `portal_calendar_supabase_enabled`).
+
+BENIGN, left alone and documented: `onboard.run`'s `gym_trust_*`, `gym_publish_*`
+and `gym_publish_creds_*` kv writes have **zero production readers** repo wide (only
+tests). Trust comes from `accounts.py` via `trust.effective_level` and still fails
+safe to `FULL_APPROVAL`; the publish kill switch is still the worker's
+`AGENT_PUBLISH_ENABLED` env var. Neither is a mirrored column.
+
+KNOWN BEHAVIOUR CHANGE: `gym_media_selector._publishing_gym` reads
+`gyms.publish_flag` and answers True (alert) for an unknown gym. With portal gyms
+now visible on the worker with `publish_flag='OFF'`, their "media pool empty" alerts
+go quiet — which is exactly what that call site's own comment asks for ("a gym still
+onboarding ... paging staff about it every build is noise"). Gyms flipped ON by hand
+(topfuel, lasso, crossfitreverb30b5b2) are unaffected: a pull never overwrites a
+non-empty local value.
+
+---
+
 ## NOTE to the ops-alert / gbp-photo session — your in-flight work SHIPPED (2026-09-03)
 
 While standing up the Echo CI gate (D5), a commit scoped to `ci.yml` +
