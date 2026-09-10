@@ -1364,6 +1364,26 @@ def portal_calendar_supabase_enabled() -> bool:
     return bool(supabase_url()) and bool(supabase_service_key())
 
 
+def gym_shared_store_enabled() -> bool:
+    """
+    Mirror the per gym `gyms` row to the SHARED Supabase `echo_gyms` table so the
+    `echo` worker and the `echo-intake-web` service stop keeping two disagreeing
+    copies of it on two separate Railway volumes (the 2026-09-10 split brain: 113
+    gym rows on web, 21 on the worker).
+
+    Same shape as portal_calendar_supabase_enabled: creds present = the shared
+    record is used; creds absent = purely local SQLite, behaviour unchanged (which
+    is every test and every dev checkout). AGENT_GYM_SHARED_STORE=false is an
+    explicit kill switch that turns the mirror off even WITH creds, so the change
+    is reversible from Railway env without a deploy. This is a storage correctness
+    fix, not a new capability, so it does not ship behind a default OFF flag: a
+    default OFF flag here would simply leave the split brain in place.
+    """
+    if not _truthy(os.environ.get("AGENT_GYM_SHARED_STORE", "true")):
+        return False
+    return bool(supabase_url()) and bool(supabase_service_key())
+
+
 def slack_cancel_post_enabled() -> bool:
     """
     Slack "cancel my post" / "skip today's post" master switch. OFF by default: the

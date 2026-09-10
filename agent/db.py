@@ -172,6 +172,25 @@ def connect(path=None):
             conn.execute("ALTER TABLE gyms ADD COLUMN stripe_customer_id TEXT")
         except Exception:
             pass
+    # SCHEMA DRIFT REPAIR (2026-09-10). _SCHEMA is CREATE TABLE IF NOT EXISTS, so a
+    # column ADDED to the gyms DDL after a database was first created never lands on
+    # that database: only the additive ALTERs above ever reach an existing file. The
+    # `echo` worker's volume was created before upload_link / gym_name / token_sha256 /
+    # token_status / publish_creds were added to _SCHEMA, so its gyms table is missing
+    # all five while echo-intake-web's (created later) has them. That is a latent crash,
+    # not a cosmetic gap: db.gym_upsert(key, upload_link=...) raises "no such column"
+    # on the worker, and any cross service reconcile would fail to round trip a row.
+    # Additive and idempotent, exactly like every ALTER above; existing rows keep NULL.
+    for _col, _type in (("gym_name", "TEXT"),
+                        ("token_sha256", "TEXT"),
+                        ("token_status", "TEXT"),
+                        ("publish_creds", "TEXT"),
+                        ("upload_link", "TEXT")):
+        if _col not in gyms_have:
+            try:
+                conn.execute(f"ALTER TABLE gyms ADD COLUMN {_col} {_type}")
+            except Exception:
+                pass
     return conn
 
 
@@ -496,9 +515,178 @@ def gym_upsert(account_key, display_name='', **fields):
         conn.execute(sql, all_vals)
         conn.commit()
 
+    # SHARED RECORD (2026-09-10 split-brain fix). The local write above is the source
+    # of truth for THIS service; the mirror below is what makes it visible to the OTHER
+    # one. Deliberately OUTSIDE the `with _lock` block: the failure path calls
+    # ops_alerts/alert_repeat, which call kv_get/kv_set, which take the same
+    # NON-reentrant _lock. Mirroring inside the lock would deadlock the process on the
+    # first failed write.
+    mirror_fields = dict(fields)
+    mirror_fields["display_name"] = display_name
+    _mirror_gym_row(account_key, mirror_fields)
 
-def gym_get(account_key, conn=None):
-    """Returns the gyms row as a dict, or None. Accepts an optional open connection."""
+
+def _shared_store(store=None):
+    """The shared echo_gyms store when it is usable, else None. Never raises."""
+    if store is not None:
+        return store
+    try:
+        from . import config
+        if not config.gym_shared_store_enabled():
+            return None
+        from .gym_shared_store import SharedGymStore
+        s = SharedGymStore()
+        return s if s.available() else None
+    except Exception:  # noqa: BLE001 - a config/import fault never breaks the local write
+        return None
+
+
+# ONE Slack line per incident, not one per gym. A Supabase outage during a fleet
+# reconcile fails 100+ gym writes back to back, and alert_repeat fingerprints the
+# MESSAGE while every message names its own account_key -- leaning on it alone would put
+# 100+ lines in the channel, the exact alert-flood shape Blake killed on 2026-09-04.
+# Every individual failure still gets its OWN append-only audit row (queryable with
+# `python -m agent audit`), so no failure is lost; only the Slack fan-out is collapsed.
+_MIRROR_ALERT_STAMP = "gym_shared_store_alerted_at"
+_MIRROR_ALERT_WINDOW_SECONDS = 30 * 60
+
+
+def _mirror_alert(message, account_key="", now=None):
+    """Surface a shared-store failure LOUDLY, on the same ops surface as every other
+    alert, without ever storming it.
+
+    force=True on the Slack call is deliberate: AGENT_OPS_ALERTS_ENABLED is NOT set on
+    echo-intake-web, so a plain alert() there is dormant, which would be exactly the
+    silent-failure mode this whole fix exists to remove. The 30 minute kv stamp is this
+    caller's OWN gate, the pattern ops_alerts documents for force callers. Never raises.
+    """
+    import time as _t
+    now = now if now is not None else _t.time()
+    # ALWAYS record this specific failure, whether or not Slack is told about it.
+    try:
+        # account_key goes in the ACCOUNT_KEY column, not just the subject, so
+        # `python -m agent audit --account <key>` actually finds this row.
+        audit("gym_shared_store", account_key or "-", message,
+              account_key=account_key or "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        raw = kv_get(_MIRROR_ALERT_STAMP, "")
+        last = float(raw) if raw else 0.0
+    except Exception:  # noqa: BLE001 - an unreadable stamp must never eat the alert
+        last = 0.0
+    if last and (now - last) < _MIRROR_ALERT_WINDOW_SECONDS:
+        return
+    try:
+        kv_set(_MIRROR_ALERT_STAMP, str(now))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import ops_alerts
+        ops_alerts.alert(message, force=True)
+    except Exception as e:  # noqa: BLE001 - alerting must never take the caller down
+        print(f"[gym-shared-store] alert failed: {type(e).__name__}: {e}")
+
+
+def _mirror_gym_row(account_key, fields, store=None):
+    """Best-effort dual write of one gym row to the shared echo_gyms table.
+
+    Returns True when mirrored, False when there is no shared store (creds absent /
+    kill switch off) or the write failed. A failure NEVER raises (the local write
+    already succeeded and nothing is lost) but it is never silent either: it prints
+    and fires a deduped ops alert. Token material and upload_link are filtered out by
+    gym_shared_store.mirrorable and never leave this process."""
+    s = _shared_store(store)
+    if s is None:
+        return False
+    try:
+        s.upsert(account_key, fields)
+        return True
+    except Exception as e:  # noqa: BLE001
+        detail = f"{type(e).__name__}: {e}"
+        print(f"[gym-shared-store] mirror FAILED for {account_key}: {detail}")
+        _mirror_alert(
+            f"gym shared store: could not mirror the gyms row for {account_key} to "
+            f"Supabase echo_gyms ({detail}). The local write succeeded, so nothing is "
+            f"lost, but the other Echo service will not see this change until it is "
+            f"retried (python -m agent gym-store-sync --apply). Further failures in "
+            f"the next 30 minutes go to the audit table only.",
+            account_key=account_key,
+        )
+        return False
+
+
+# Negative-result cache for the read-through below. gym_get is called on the publish
+# hot path and callers routinely probe two keys (zernio_publisher tries "<base>_ig"
+# then "<base>"), so an uncached miss would pay a network round trip on EVERY post for
+# a key that legitimately does not exist. 60s is short enough that a gym onboarded on
+# the web service shows up on the worker within a minute, long enough to collapse a
+# publish sweep's probes into one lookup.
+_MISS_TTL_SECONDS = 60
+_miss_cache = {}
+_miss_lock = threading.Lock()
+
+
+def _miss_cached(account_key, now=None):
+    import time as _t
+    now = now if now is not None else _t.time()
+    with _miss_lock:
+        stamp = _miss_cache.get(account_key)
+        return stamp is not None and (now - stamp) < _MISS_TTL_SECONDS
+
+
+def _remember_miss(account_key, now=None):
+    import time as _t
+    now = now if now is not None else _t.time()
+    with _miss_lock:
+        _miss_cache[account_key] = now
+
+
+def _forget_miss(account_key):
+    with _miss_lock:
+        _miss_cache.pop(account_key, None)
+
+
+def _hydrate_local(row):
+    """Write a shared row into the LOCAL gyms table so subsequent reads are local.
+    Only mirrored columns are written (never token material). Never raises."""
+    from .gym_shared_store import MIRRORED_COLUMNS
+    account_key = str((row or {}).get("account_key") or "").strip()
+    if not account_key:
+        return None
+    fields = {c: row[c] for c in MIRRORED_COLUMNS
+              if c in row and row[c] is not None and c != "display_name"}
+    display_name = str(row.get("display_name") or "")
+    try:
+        # NB: _local_gym_upsert, not gym_upsert - hydrating must not bounce the row
+        # straight back at the shared store (a pointless write, and an echo loop if
+        # the shared store were ever slow).
+        _local_gym_upsert(account_key, display_name, fields)
+    except Exception as e:  # noqa: BLE001 - a cache fill failure is not a read failure
+        print(f"[gym-shared-store] local hydrate failed for {account_key}: "
+              f"{type(e).__name__}: {e}")
+    _forget_miss(account_key)
+    local = gym_get(account_key, _shared_read=False)
+    # A failed cache fill must not turn a row we DID find into a None. Fall back to the
+    # shared row itself: the caller asked "what is this gym's record", and we have it.
+    if local is None:
+        local = dict(row)
+        local["account_key"] = account_key
+        local.setdefault("display_name", display_name)
+    return local
+
+
+def gym_get(account_key, conn=None, _shared_read=True):
+    """Returns the gyms row as a dict, or None. Accepts an optional open connection.
+
+    READ THROUGH (2026-09-10 split-brain fix): when the row is absent from THIS
+    service's SQLite and the shared echo_gyms store is available, the row is fetched
+    from Supabase and hydrated into the local table, so the `echo` worker sees a gym
+    that `echo-intake-web` onboarded (and vice versa) without waiting for a sync job.
+    A caller that passed its own `conn` gets the pure local read it asked for, and a
+    shared-store error falls back to the local answer (None) rather than raising:
+    every caller of this function already treats None as "not set" and has its own
+    safe default, so a Supabase outage degrades to exactly today's behaviour."""
     def _get(c):
         row = c.execute(
             "SELECT * FROM gyms WHERE account_key = ?", (account_key,)
@@ -508,7 +696,59 @@ def gym_get(account_key, conn=None):
     if conn is not None:
         return _get(conn)
     with connect() as c:
-        return _get(c)
+        row = _get(c)
+    if row is not None or not _shared_read:
+        return row
+    key = str(account_key or "").strip()
+    if not key or _miss_cached(key):
+        return None
+    s = _shared_store()
+    if s is None:
+        return None
+    try:
+        shared = s.get(key)
+    except Exception as e:  # noqa: BLE001 - a read fault degrades to the local answer
+        print(f"[gym-shared-store] read-through failed for {key}: "
+              f"{type(e).__name__}: {e}")
+        return None
+    if not shared:
+        _remember_miss(key)
+        return None
+    return _hydrate_local(shared)
+
+
+def _local_gym_upsert(account_key, display_name, fields):
+    """The LOCAL half of gym_upsert, with no shared mirror. Used by the read-through
+    hydrate so a pull can never turn into a push."""
+    allowed = {
+        'display_name', 'gym_name', 'intake_token_hash', 'token_rotated_at',
+        'token_revoked', 'intake_token_encrypted', 'upload_link', 'publish_flag',
+        'publish_creds', 'publish_creds_status',
+        'zernio_profile_id', 'zernio_default_fb_page_id',
+        'posting_timezone',
+        'baseline_posts_per_week', 'baseline_captured_at',
+        'stripe_customer_id',
+    }
+    extra_cols, extra_vals = [], []
+    for k, v in (fields or {}).items():
+        if k in allowed and k != 'display_name':
+            extra_cols.append(k)
+            extra_vals.append(v)
+    all_cols = ['account_key', 'display_name'] + extra_cols
+    all_vals = [account_key, display_name or ''] + extra_vals
+    placeholders = ', '.join(['?'] * len(all_cols)) + ", datetime('now')"
+    col_str = ', '.join(all_cols) + ', updated_at'
+    update_parts = [f"{c} = excluded.{c}" for c in all_cols
+                    if c != 'account_key'
+                    and not (c == 'display_name' and not (display_name or '').strip())]
+    update_parts.append("updated_at = datetime('now')")
+    sql = (
+        f"INSERT INTO gyms ({col_str}) VALUES ({placeholders}) "
+        f"ON CONFLICT(account_key) DO UPDATE SET {', '.join(update_parts)}"
+    )
+    with _lock, connect() as conn:
+        conn.execute(sql, all_vals)
+        conn.commit()
 
 
 def gym_key_for_zernio_profile(zernio_profile_id, conn=None):
@@ -534,9 +774,87 @@ def gym_key_for_zernio_profile(zernio_profile_id, conn=None):
         return _get(c)
 
 
-def gym_list(conn=None):
+# gym_list refresh throttle. gym_get's read-through covers every BY KEY read, but
+# gym_list callers (welcome_posts.backfill's portal lookup, onboard_verify) enumerate
+# the table and would still only ever see THIS service's rows. A full pull is one
+# PostgREST request; 15 minutes keeps a long-lived worker converged without adding a
+# network call to a tight loop. In-process only, so a restart re-pulls immediately.
+_LIST_REFRESH_SECONDS = 15 * 60
+_last_list_refresh = [0.0]
+
+
+def pull_shared_into_local(store=None, force=False, now=None):
+    """Hydrate every shared echo_gyms row that is missing (or stale) locally.
+
+    Returns the number of local rows written. Never raises: on any shared-store
+    error it prints, fires the deduped ops alert, and returns 0, leaving the caller
+    with exactly today's local-only behaviour."""
+    import time as _t
+    now = now if now is not None else _t.time()
+    if not force and (now - _last_list_refresh[0]) < _LIST_REFRESH_SECONDS:
+        return 0
+    s = _shared_store(store)
+    if s is None:
+        return 0
+    _last_list_refresh[0] = now
+    try:
+        rows = s.list_all()
+    except Exception as e:  # noqa: BLE001
+        detail = f"{type(e).__name__}: {e}"
+        print(f"[gym-shared-store] pull failed: {detail}")
+        _mirror_alert(
+            f"gym shared store: could not read Supabase echo_gyms ({detail}). This "
+            f"service is answering gym lookups from its LOCAL SQLite only, so a gym "
+            f"onboarded on the other Echo service may be invisible here until this "
+            f"clears.",
+            account_key="-",
+        )
+        return 0
+    with connect() as c:
+        local = {r["account_key"]: dict(r) for r in c.execute(
+            "SELECT * FROM gyms").fetchall()}
+    from .gym_shared_store import MIRRORED_COLUMNS
+    written = 0
+    for row in rows:
+        key = str(row.get("account_key") or "").strip()
+        if not key:
+            continue
+        have = local.get(key)
+        # Write when the row is absent locally, or when the shared row carries a
+        # mirrored value this service does not have yet. Never OVERWRITES a non-empty
+        # local value from the shared copy here: a local write always mirrors out, so a
+        # disagreement means a concurrent edit, and gym-store-sync reports those rather
+        # than silently picking a winner.
+        fields = {}
+        for col in MIRRORED_COLUMNS:
+            val = row.get(col)
+            if val is None or str(val).strip() == "":
+                continue
+            if have is not None and str(have.get(col) or "").strip():
+                continue
+            fields[col] = val
+        if have is not None and not fields:
+            continue
+        display_name = fields.pop("display_name", "") if have is not None \
+            else str(row.get("display_name") or "")
+        try:
+            _local_gym_upsert(key, display_name, fields)
+            _forget_miss(key)
+            written += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[gym-shared-store] local write failed for {key}: "
+                  f"{type(e).__name__}: {e}")
+    return written
+
+
+def gym_list(conn=None, _shared_read=True):
     """Returns all gyms rows as list of dicts, ordered by account_key.
-    Accepts an optional open connection."""
+    Accepts an optional open connection.
+
+    When the shared echo_gyms store is available, a THROTTLED pull hydrates rows this
+    service has not seen yet (see pull_shared_into_local), so an enumeration on the
+    `echo` worker includes gyms `echo-intake-web` onboarded. A caller that passed its
+    own `conn` gets the pure local read it asked for."""
     def _list(c):
         return [dict(r) for r in c.execute(
             "SELECT * FROM gyms ORDER BY account_key"
@@ -544,6 +862,8 @@ def gym_list(conn=None):
 
     if conn is not None:
         return _list(conn)
+    if _shared_read:
+        pull_shared_into_local()
     with connect() as c:
         return _list(c)
 

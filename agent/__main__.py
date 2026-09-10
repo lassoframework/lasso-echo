@@ -174,6 +174,7 @@ def _status():
     print(f"  real_cal_mirror: {config.real_calendar_mirror_enabled()}  (env AGENT_REAL_CALENDAR_MIRROR; fold a real gym's real drafts into the shared content_calendar, clear demo rows off real gyms; needs Supabase creds; no publish)")
     print(f"  cal_autopublish: {config.calendar_autopublish_enabled()}  (env AGENT_CALENDAR_AUTOPUBLISH; scheduled auto-publisher reads THAT day's content_calendar rows for gym_id='lasso' and posts each unpublished row to live IG/FB EXACTLY ONCE via an atomic status claim; ALSO needs AGENT_PUBLISH_ENABLED; OFF => nothing is read or published)")
     print(f"  real_month_plan: {config.real_month_plan_enabled()}  (env AGENT_REAL_MONTH_PLAN; assemble a full month of REAL LASSO drafts, 2/day feed+9:16 story, into content_calendar for gym_id='lasso' and clear ALL demo rows off that gym; reuses existing builders, skips missing sources; no publish)")
+    print(f"  gym_shared_store: {config.gym_shared_store_enabled()}  (env AGENT_GYM_SHARED_STORE, default ON when Supabase creds are set; mirror the per-gym gyms row to the shared Supabase echo_gyms table so the echo worker and echo-intake-web stop keeping two disagreeing copies on two separate volumes; read-through hydrates a local miss; reconcile with `python -m agent gym-store-sync --apply`; OFF => purely local SQLite, i.e. the split brain; never mirrors token material)")
     print(f"  zernio_analytics: {config.zernio_analytics_enabled()}  (env AGENT_ZERNIO_ANALYTICS_ENABLED; Part C metrics pull; OFF => portal metrics return the shape with null values)")
     print(f"  monthly_report : {config.monthly_report_enabled()}  (env AGENT_MONTHLY_REPORT_ENABLED; Part D before/after story; OFF => report shape only, gaps never zeros)")
     print(f"  chat_publish   : {config.chat_publish_enabled()}  (env AGENT_CHAT_PUBLISH_ENABLED; LASSO accts direct, clients draft-only)")
@@ -895,6 +896,7 @@ _COMMANDS = {
         ("onboard", "stand up a new gym end to end"),
         ("onboard-client / add-client", "scaffold a new client account"),
         ("onboard-verify", "check onboarding completeness for one or all gyms"),
+        ("gym-store-sync", "reconcile this service's gyms table with the shared echo_gyms record (--apply)"),
         ("onboarding-audit", "fleet readiness: every gym the PORTAL knows, and what blocks it posting"),
         ("onboard-dryrun", "30-day dryrun: plan + draft, no publish, no live tokens"),
         ("preflight", "is this account safe to draft for? (--account/--all, --live)"),
@@ -1797,6 +1799,16 @@ def main(argv=None):
         else:
             regen_run(only=only, dry_run=dry_run, set_name=set_name,
                       nano_client=_nano_default(), s3_client=_s3_default())
+    elif cmd == "gym-store-sync":
+        # Reconcile THIS service's local gyms table against the shared Supabase
+        # echo_gyms record (the 2026-09-10 split-brain heal). Report only unless
+        # --apply is passed; --apply moves only MISSING rows in either direction and
+        # never resolves a field disagreement. Idempotent, safe to re-run.
+        _apply = "--apply" in argv[1:]
+        from . import gym_store_sync as _gss
+        _report = _gss.sync(apply=_apply)
+        print(_gss.format_report(_report))
+
     elif cmd == "onboard":
         # Autonomous onboard (Stage 2 T2): gym row, voice file, brain file,
         # trust + publish records. Token minting is behind AGENT_ONBOARD_AUTOMINT
@@ -1944,6 +1956,19 @@ def main(argv=None):
             results = verify_all()
             if not results:
                 print("onboard-verify: no gyms found in the gyms table.")
+            # PER-SERVICE FILES, SHARED ROWS (2026-09-10). The gyms ROW is now the shared
+            # echo_gyms record, so --all enumerates every gym either Echo service knows.
+            # The scaffold voice/brain FILES are not shared: they live on whichever
+            # service's /data volume onboard.run ran on, and Railway cannot mount one
+            # volume on two services. So a self-serve-onboarded gym verified from the
+            # `echo` worker honestly reports its voice/brain file as missing -- the file
+            # is on echo-intake-web. Say so, rather than letting the tool imply the gym
+            # is broken.
+            if results and config.gym_shared_store_enabled():
+                print("NOTE: gym ROWS are shared across both Echo services, but the "
+                      "scaffold voice/brain FILES are per-service (separate volumes). "
+                      "A gym onboarded through /portal/onboard has its files on "
+                      "echo-intake-web; verify those there.")
             for r in results:
                 for line in format_result(r):
                     print(line)
