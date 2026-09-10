@@ -27,10 +27,17 @@ Measured before the fix: **113 gym rows on echo-intake-web, 21 on `echo`.**
       hash/blob column: none is read cross service and each token is re-mintable
       from the shared signing secret.
 - [x] `agent/db.py` — `gym_upsert` dual writes; `gym_get` read-through hydrates a
-      local miss (negative cached 60s); `gym_list` pulls on a 15 min throttle. A
-      mirror failure prints, writes its own audit row, and fires a FORCED ops alert
-      (`AGENT_OPS_ALERTS_ENABLED` is not set on echo-intake-web, so an unforced
-      alert there is dormant), collapsed to one Slack line per 30 min.
+      local MISS (negative cached 60s). A mirror failure prints, writes its own audit
+      row, and fires a FORCED ops alert (`AGENT_OPS_ALERTS_ENABLED` is not set on
+      echo-intake-web, so an unforced alert there is dormant), collapsed to one Slack
+      line per 30 min.
+- [x] PR #95 — UPDATES, not just new rows. The LIVE end-to-end caught this, no test
+      did: read-through only fires on a MISS, so a row a service already held kept
+      answering stale forever. Both `gym_get` (on a local HIT) and `gym_list` now
+      drive ONE throttled full-table pull (60s), and that pull is LAST WRITE WINS by
+      `updated_at`. A shared row that is NOT newer only fills fields this service is
+      missing, so a service whose mirror write failed keeps its own newer value and a
+      stale shared copy can never roll it back.
 - [x] `agent/db.py connect()` — schema drift repair. `_SCHEMA` is
       `CREATE TABLE IF NOT EXISTS`, so gyms columns added later never reach an
       existing database. The worker's volume predated `upload_link` / `gym_name` /
@@ -41,6 +48,18 @@ Measured before the fix: **113 gym rows on echo-intake-web, 21 on `echo`.**
       direction; field disagreements are REPORTED, never auto resolved.
 - [x] `AGENT_GYM_SHARED_STORE` — kill switch (default ON when Supabase creds are set,
       same creds-are-the-flag idiom as `portal_calendar_supabase_enabled`).
+- [x] `agent/listener.py` — `_gyms_short_on` now reads the ACCOUNT REGISTRY, not the
+      gyms table. It iterated `db.gym_list()`, which was ACCIDENTALLY almost right
+      while the worker's SQLite only held ~20 touched gyms. Against 140 rows it would
+      have made ~140 Supabase round trips per interrupted-draw alert and named ~119
+      onboarding stubs as "have NO rows for <day>".
+
+LIVE HEAL (2026-09-10, verified before/after): worker 21 rows / echo-intake-web 139 /
+shared 0  ->  140 / 140 / 140, converged, 0 rows needing a push or a pull on either
+service. The 3 hand-set `publish_flag=ON` gyms (topfuel, lasso, crossfitreverb30b5b2)
+are unchanged: a pull never rolls back a newer local value, and no gym gained publish
+access. Two `publish_flag` disagreements are REPORTED (echo-intake-web's stale OFF vs
+the worker's authoritative ON) rather than auto resolved, which is the tool's contract.
 
 BENIGN, left alone and documented: `onboard.run`'s `gym_trust_*`, `gym_publish_*`
 and `gym_publish_creds_*` kv writes have **zero production readers** repo wide (only
