@@ -697,7 +697,16 @@ def gym_get(account_key, conn=None, _shared_read=True):
         return _get(conn)
     with connect() as c:
         row = _get(c)
-    if row is not None or not _shared_read:
+    if not _shared_read:
+        return row
+    if row is not None:
+        # Local HIT. The row may still be STALE: the other service may have updated it
+        # since. One throttled full-table pull (a no-op inside its window) keeps every
+        # field fresh without a per-key network call. Re-read only if the pull wrote
+        # something, so the common path costs nothing.
+        if pull_shared_into_local():
+            with connect() as c:
+                return _get(c) or row
         return row
     key = str(account_key or "").strip()
     if not key or _miss_cached(key):
@@ -774,17 +783,53 @@ def gym_key_for_zernio_profile(zernio_profile_id, conn=None):
         return _get(c)
 
 
-# gym_list refresh throttle. gym_get's read-through covers every BY KEY read, but
-# gym_list callers (welcome_posts.backfill's portal lookup, onboard_verify) enumerate
-# the table and would still only ever see THIS service's rows. A full pull is one
-# PostgREST request; 15 minutes keeps a long-lived worker converged without adding a
-# network call to a tight loop. In-process only, so a restart re-pulls immediately.
-_LIST_REFRESH_SECONDS = 15 * 60
+# FULL-TABLE REFRESH THROTTLE.
+#
+# gym_get's read-through covers a local MISS, which is a NEW gym. It does NOT cover an
+# UPDATE to a row this service already has -- caught by the live end-to-end on
+# 2026-09-10: the worker wrote stripe_customer_id for a gym, the mirror reached
+# Supabase, and echo-intake-web kept answering from its own stale local row because the
+# row was present, so no read-through fired. Polling per key would be the obvious fix
+# and the wrong one (a network round trip per gym per publish sweep); ONE PostgREST
+# request refreshes the whole table instead, so both gym_get and gym_list drive this
+# throttled full pull and cross-service staleness is bounded at _REFRESH_SECONDS for
+# EVERY field, not just for new rows.
+#
+# 60s: one request per minute per process is negligible next to what the worker already
+# does per tick, and it converges to ZERO writes once both sides agree (a row whose
+# shared copy is not newer and has nothing to fill is skipped entirely). In-process
+# only, so a restart refreshes immediately.
+_LIST_REFRESH_SECONDS = 60
 _last_list_refresh = [0.0]
 
 
+def _parse_ts(value):
+    """A timestamp from either store as an aware UTC datetime, or None.
+
+    The two sides write different shapes: SQLite stamps `datetime('now')` (naive UTC,
+    'YYYY-MM-DD HH:MM:SS') and the shared store an explicit ISO string with an offset.
+    A naive value is UTC by construction here, so it is read as UTC rather than local
+    time -- reading it as local would make every comparison wrong by the host offset."""
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    text = str(value).strip().replace(" ", "T", 1)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def pull_shared_into_local(store=None, force=False, now=None):
-    """Hydrate every shared echo_gyms row that is missing (or stale) locally.
+    """Refresh the LOCAL gyms table from the shared echo_gyms record.
+
+    Rows missing locally are inserted; rows both stores have are updated when the
+    SHARED copy is newer (last write wins by updated_at) and otherwise only have their
+    still-empty fields filled. ONE PostgREST request covers the whole table, which is
+    why both gym_get and gym_list can afford to drive it.
 
     Returns the number of local rows written. Never raises: on any shared-store
     error it prints, fires the deduped ops alert, and returns 0, leaving the caller
@@ -820,17 +865,27 @@ def pull_shared_into_local(store=None, force=False, now=None):
         if not key:
             continue
         have = local.get(key)
-        # Write when the row is absent locally, or when the shared row carries a
-        # mirrored value this service does not have yet. Never OVERWRITES a non-empty
-        # local value from the shared copy here: a local write always mirrors out, so a
-        # disagreement means a concurrent edit, and gym-store-sync reports those rather
-        # than silently picking a winner.
+        # LAST WRITE WINS, BY TIMESTAMP -- the same semantics the ONE table this
+        # replaces always had. Both services write, so "newest wins" is the only rule
+        # that makes an UPDATE propagate at all; refusing to overwrite a non-empty local
+        # value (the first cut of this function) left a changed field stale forever on
+        # the other service and called it a "disagreement".
+        #
+        # When the shared row is NOT newer, the old rule still applies and only fills
+        # values this service is missing. That is what makes a service whose mirror
+        # write failed keep its own newer local value: the failure alerted, the local
+        # write is not lost, and a stale shared copy can never roll it back.
+        shared_newer = False
+        if have is not None:
+            st, lt = _parse_ts(row.get("updated_at")), _parse_ts(have.get("updated_at"))
+            shared_newer = bool(st and lt and st > lt)
         fields = {}
         for col in MIRRORED_COLUMNS:
             val = row.get(col)
             if val is None or str(val).strip() == "":
                 continue
-            if have is not None and str(have.get(col) or "").strip():
+            if (have is not None and not shared_newer
+                    and str(have.get(col) or "").strip()):
                 continue
             fields[col] = val
         if have is not None and not fields:
@@ -851,10 +906,10 @@ def gym_list(conn=None, _shared_read=True):
     """Returns all gyms rows as list of dicts, ordered by account_key.
     Accepts an optional open connection.
 
-    When the shared echo_gyms store is available, a THROTTLED pull hydrates rows this
-    service has not seen yet (see pull_shared_into_local), so an enumeration on the
-    `echo` worker includes gyms `echo-intake-web` onboarded. A caller that passed its
-    own `conn` gets the pure local read it asked for."""
+    When the shared echo_gyms store is available, the same THROTTLED full-table pull
+    gym_get uses runs first (see pull_shared_into_local), so an enumeration on the
+    `echo` worker includes gyms `echo-intake-web` onboarded, with current values. A
+    caller that passed its own `conn` gets the pure local read it asked for."""
     def _list(c):
         return [dict(r) for r in c.execute(
             "SELECT * FROM gyms ORDER BY account_key"
