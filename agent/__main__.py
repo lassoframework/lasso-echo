@@ -1956,6 +1956,19 @@ def main(argv=None):
             results = verify_all()
             if not results:
                 print("onboard-verify: no gyms found in the gyms table.")
+            # PER-SERVICE FILES, SHARED ROWS (2026-09-10). The gyms ROW is now the shared
+            # echo_gyms record, so --all enumerates every gym either Echo service knows.
+            # The scaffold voice/brain FILES are not shared: they live on whichever
+            # service's /data volume onboard.run ran on, and Railway cannot mount one
+            # volume on two services. So a self-serve-onboarded gym verified from the
+            # `echo` worker honestly reports its voice/brain file as missing -- the file
+            # is on echo-intake-web. Say so, rather than letting the tool imply the gym
+            # is broken.
+            if results and config.gym_shared_store_enabled():
+                print("NOTE: gym ROWS are shared across both Echo services, but the "
+                      "scaffold voice/brain FILES are per-service (separate volumes). "
+                      "A gym onboarded through /portal/onboard has its files on "
+                      "echo-intake-web; verify those there.")
             for r in results:
                 for line in format_result(r):
                     print(line)
