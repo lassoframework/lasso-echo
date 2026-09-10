@@ -157,7 +157,7 @@ Account(
 # ---------------------------------------------------------------------------
 
 def run(account_key, display_name, db_conn=None, voice_dir=None,
-        brains_dir=None, base_url=None, socialapi_http=None):
+        brains_dir=None, base_url=None, socialapi_http=None, posting_timezone=None):
     """
     Stand up a new gym end to end. Idempotent: re-running updates display_name
     if different, never re-mints unless rotate was called.
@@ -175,6 +175,14 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
       - publish_flag is ALWAYS OFF.
       - No em dashes, en dashes, or hyphens in any gym-facing copy in this result.
       - Fabrication gate: no invented facts, stats, prices, or offers written into files.
+
+    posting_timezone: OPTIONAL onboarding-time hint (an IANA zone name). Applied ONLY
+      when the gym has NO posting_timezone set yet -- never overwrites a value a human
+      set by hand, or one the posting_tz_backfill watchdog already resolved from real
+      evidence (a connected Google Business location or the gym's own brand bible). This
+      is a same-day head start for the common case (a phone area code the portal already
+      had at signup), not a replacement for that watchdog: an unresolved gym still gets
+      picked up and alerted on by AGENT_POSTING_TZ_WATCH the same as any other.
     """
     # Resolve paths relative to cwd when not supplied, using the same conventions
     # as the rest of the codebase (brand_voice/ and brains/ at the repo root).
@@ -211,6 +219,15 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
 
     # (a) Upsert gym row --------------------------------------------------
     db.gym_upsert(account_key, display_name=display_name)
+
+    # (a2) Onboarding-time timezone hint -----------------------------------
+    # NEVER CLOBBERS: only written when the row's posting_timezone is still empty, so a
+    # value a human set by hand or the posting_tz_backfill watchdog already resolved is
+    # always left alone, no matter how many times onboard.run is re-called.
+    if posting_timezone:
+        _existing_row = db.gym_get(account_key) or {}
+        if not (_existing_row.get("posting_timezone") or "").strip():
+            db.gym_upsert(account_key, posting_timezone=posting_timezone)
 
     # (b) Token minting ---------------------------------------------------
     if config.onboard_automint_enabled():

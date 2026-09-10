@@ -452,3 +452,63 @@ def test_missing_result_key_falls_back_to_passed_key(monkeypatch, tmp_path):
     assert status == 200, body
     assert body["account_key"] == "blankgym"
     assert intake_web.client_for_token(body["raw_token"]) == "blankgym"
+
+
+# ---- posting_timezone hint (root-cause fix, 2026-09-10) ------------------------
+
+def test_valid_posting_timezone_hint_is_applied(monkeypatch, tmp_path):
+    from agent import db
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+
+    status, body = _post_onboard({
+        "account_key": "tzgym1", "display_name": "TZ Gym One",
+        "posting_timezone": "America/Chicago",
+    })
+    assert status == 200, body
+    row = db.gym_get(body["account_key"])
+    assert row.get("posting_timezone") == "America/Chicago"
+
+
+def test_malformed_posting_timezone_is_dropped_not_rejected(monkeypatch, tmp_path):
+    """An optional field that fails validation must never turn a valid onboard
+    call into a 400 -- it is silently ignored."""
+    from agent import db
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+
+    status, body = _post_onboard({
+        "account_key": "tzgym2", "display_name": "TZ Gym Two",
+        "posting_timezone": "Not/AZone; DROP TABLE gyms;--",
+    })
+    assert status == 200, body
+    row = db.gym_get(body["account_key"])
+    assert not (row.get("posting_timezone") or "").strip()
+
+
+def test_posting_timezone_never_overwrites_existing_value_via_endpoint(monkeypatch, tmp_path):
+    from agent import db
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+
+    s1, b1 = _post_onboard({
+        "account_key": "tzgym3", "display_name": "TZ Gym Three",
+        "posting_timezone": "America/Denver",
+    })
+    assert s1 == 200, b1
+    # A second onboard call for the SAME gym with a DIFFERENT hint must not move it.
+    s2, b2 = _post_onboard({
+        "account_key": "tzgym3", "display_name": "TZ Gym Three",
+        "posting_timezone": "America/New_York",
+    })
+    assert s2 == 200, b2
+    row = db.gym_get(b2["account_key"])
+    assert row.get("posting_timezone") == "America/Denver"
+
+
+def test_missing_posting_timezone_is_fine(monkeypatch, tmp_path):
+    """The field is fully optional; omitting it must behave exactly as before."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_PORTAL_APPROVALS", "true")
+    status, body = _post_onboard({"account_key": "tzgym4", "display_name": "TZ Gym Four"})
+    assert status == 200, body
