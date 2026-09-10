@@ -138,20 +138,33 @@ def _accounts_starved_on(day):
         return None
 
 
-def _gyms_short_on(day):
+def _gyms_short_on(day, bases=None):
     """Registry gyms with ZERO calendar rows dated `day`. Returns None when coverage
     cannot be read, so the caller can say "unknown" rather than imply "fine".
 
     Best effort by design: this only ever decides how LOUD an alert is, never whether
-    content is published, so a read failure must degrade to the noisier branch."""
+    content is published, so a read failure must degrade to the noisier branch.
+
+    THE SET IS THE ACCOUNT REGISTRY, NOT THE gyms TABLE (2026-09-10). This iterated
+    db.gym_list(), which was ACCIDENTALLY almost the right set: the worker's local
+    SQLite only ever held the ~20 gyms someone had touched on THAT volume, which
+    happened to track the registry. Closing the echo.db split brain makes every
+    self-serve-onboarded gym visible here (139 rows and climbing, most of them
+    onboarding stubs with no registry entry and therefore no content lane at all), so
+    the old loop would have made ~140 Supabase round trips per alert and named ~119
+    stubs as "have NO rows" inside an already alarming line. "Registry gym" is what
+    this alert's own text has always promised, and client_gym_bases() is the exact set
+    the autopublish lane actually draws for. `bases` is injectable for tests."""
     try:
-        from . import db
         from .portal_calendar_store import SupabaseCalendarStore
+        if bases is None:
+            from .calendar_autopublish import client_gym_bases
+            bases = client_gym_bases()
         store = SupabaseCalendarStore()
         short = []
         checked = 0
-        for gym in (db.gym_list() or []):
-            base = str(gym.get("account_key") or "").strip()
+        for base in (bases or []):
+            base = str(base or "").strip()
             if not base:
                 continue
             rows = store.list_month(base, str(day)[:7]) or []
