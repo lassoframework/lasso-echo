@@ -14,9 +14,12 @@ Flow (mirrors podcast_library_builder + client_month_run's vision path):
     -> ensure rendition (HEIC->JPEG / HEVC->H.264, cached by content_hash; §5)
     -> VIDEO: ffprobe + re-gate (unprobed never stages, fail closed)
        PHOTO: read dims + re-gate
-    -> run ECHO_VISION (vision.analyze_and_store) on the frame; write vision_json
-       back to the asset. auto_plannable gate: a safety-flagged / identity-leaking
-       / unusable frame is NOT staged (the next asset is tried).
+    -> IF the gym is on AGENT_VISION_GYMS (config.vision_enabled_for): run ECHO_VISION
+       (vision.analyze_and_store) on the frame; write vision_json back to the asset.
+       auto_plannable gate: a safety-flagged / identity-leaking / unusable frame is
+       NOT staged (the next asset is tried). A gym NOT on the allowlist skips vision
+       entirely (no spend, no analysis) and gets an ungrounded caption instead --
+       this lane must never be a second, unguarded way to burn vision calls.
     -> draft a caption GROUNDED IN THE FRAME (client_content's SB7 + photo_grounding
        + crop_verify), never from imagination. A caption that cannot ground -> the
        slot does not stage.
@@ -170,8 +173,20 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
 
             # ECHO_VISION on the frame (photos). vision writes the analysis to the
             # DAM sidecar; we mirror it into media_asset.vision_json.
+            #
+            # ALLOWLIST GATE (vision_allowlist_watch drift report, 2026-09):
+            # AGENT_VISION_GYMS gates every other vision caller (client_content's
+            # pick_image, caption_swap) but this Drive lane called vision.analyze_and_store
+            # unconditionally -- confirmed live: crossfitlocal, crossfitreverb30b5b2,
+            # hillcountry, theboltonclub, toughtemple52040e, train7164ae502,
+            # zanshinfitness630e22 and others burning real vision spend despite never
+            # being on the allowlist. A gym not on AGENT_VISION_GYMS gets the same
+            # experience the module's own docstring promises ("client gyms already
+            # build from uploaded media; this simply widens the pool") -- Drive media
+            # without vision grounding, exactly like the legacy non-vision path
+            # everywhere else, not a blocked slot.
             analysis = None
-            if asset.get("kind") == _idx.KIND_PHOTO:
+            if asset.get("kind") == _idx.KIND_PHOTO and config.vision_enabled_for(gym_base):
                 # alert= is REQUIRED here (audit item 5, 2026-08-31). Without it the
                 # per-gym monthly runaway guard (vision.within_gym_budget) can only
                 # return False — it can never SAY anything — so a gym silently stops
