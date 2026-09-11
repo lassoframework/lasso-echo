@@ -4790,3 +4790,55 @@ Round 7's `source_media_url` fix means flags-OFF is NOT byte-for-byte origin/mai
 with no product trade (a stale pointer is never desirable, and it makes the row invisible
 to every future guard), so it ships unflagged, but the module no longer claims
 "byte for byte" where that is untrue.
+
+## Audit round 9 (2026-09-11): the classifier stops dispatching. It hints instead.
+
+Round 9 confirmed the end-to-end a fifth time (all three days on distinct media through
+the real picker) and found no criticals. Two majors:
+
+- [~] **A mixed DRIVE post was reported as an untouched small library.** Round 8 fixed
+  mixed-post counting on the LOCAL lane only. On the Drive lane, a forward write failing
+  AND `_restore_rows` being refused -- the likeliest pair, since the rows went live,
+  which is what failed the write -- returned "" and `sweep_gym` fell straight through to
+  `small_library`. The client line then said the sweep "left them in place ON PURPOSE"
+  and "could not prepare one" about a day that is half swapped: three false statements.
+  Now counted as `mixed_posts`, detailed, and never reported as untouched.
+
+- [~] **THE CLASSIFIER NO LONGER DISPATCHES A FIXER. It annotates the escalation card.**
+  This is the decision the last five rounds were pointing at, and it is worth recording
+  as a result rather than a defeat:
+
+        round 2   14 of 23 benign sentences dispatched a fixer
+        round 3   11 of 30    (added a not-a-report veto)
+        round 5   15 of 15 targeted    (added a request family)
+        round 6   16 of 20 bare imperatives    (added clause splitting)
+        round 7   15 of 18 possessive imperatives    (inverted to a report signal)
+        round 8   10 of 72    (demoted the possessive to weak evidence)
+        round 9    7 of 77, plus 15 of 20 on instruction verbs outside the closed list
+
+  Every round the false-positive FAMILY moved and the RATE did not. Round 9 tried the
+  obvious tightening and measured recall falling 0.978 -> 0.844: it starts eating real
+  reports like "you put the same picture on two different days". Telling an INSTRUCTION
+  from a COMPLAINT is an intent judgement and a regex cannot make it.
+
+  So the OUTCOME changed instead of the detector. A false `code_fix` is expensive:
+  `adapter.py` sets the ticket to `triage`, which locks every later message from that
+  owner into FOLLOW_UP until a person closes it, and Echo auto-replies "I read that as
+  something not working on our side" -- measured, in earlier rounds, against a thank-you
+  note and a scheduling instruction. A wrong HINT on an escalation card a human is
+  already reading costs nothing. `classify()` returns ESCALATE for this family exactly
+  as it did before this PR; `is_repeat_report` now feeds one sentence onto the card:
+  "This reads like a DUPLICATE MEDIA report ... If it is, it is a code fix, not a
+  question."
+
+  **Automatic dispatch on this class needs the LLM lane `classify()` already falls
+  through to.** That is the real fix, it is a bigger piece of work than this ticket, and
+  it is now the only thing standing between John's message and the fixer worker.
+
+Minors closed: `_fresh_photo` hashed with the content flag off (round 8 fixed only
+`_blocked_book_state`, and only that one had a test); `images_only` was defeated inside
+the `_blocked_book_state` loop, so booked mp4s were hashed with the flag ON; the hash
+cache bound is now exercised through the real function (the old test re-implemented
+eviction and never called it, so deleting the production guard left the suite green);
+the forward Drive `_src` rule is pinned; local dry-run `stories_reburned` parity; a dead
+`import re`; grammar in the client-readable copy.

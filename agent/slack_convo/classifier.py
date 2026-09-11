@@ -298,7 +298,38 @@ def _reads_as_a_report(clause):
 
 def is_repeat_report(text):
     """True when this reads as a CLIENT REPORTING duplicate media, not asking about it,
-    instructing us to reuse something, or thanking us. Pure and deterministic."""
+    instructing us to reuse something, or thanking us. Pure and deterministic.
+
+    A HINT, NOT A LABEL -- and that is the whole lesson of this ticket.
+
+    John Weeks reported "9/14-9/16 are still repeat images" twice and the fixer lane
+    never saw it, because `code_fix` requires _BREAKAGE_RE and every pattern there
+    describes something NOT HAPPENING. The obvious fix was to make a duplicate-media
+    report dispatch a fixer. FIVE rounds of independent audit killed that idea with
+    data, and it is worth writing down so nobody rebuilds it:
+
+        round 2   14 of 23 benign sentences dispatched a fixer
+        round 3   11 of 30   (added a not-a-report veto)
+        round 5   15 of 15 targeted   (added a request family)
+        round 6   16 of 20 bare imperatives   (added clause splitting)
+        round 7   15 of 18 possessive imperatives   (inverted to a report signal)
+        round 8   10 of 72   (demoted the possessive to weak evidence)
+        round 9    7 of 77 + 15 of 20 on instruction verbs outside the closed list
+
+    Each round the false-positive FAMILY moved and the RATE did not. Round 9 tried the
+    obvious tightening and measured recall falling 0.978 -> 0.844: it starts eating real
+    reports like "you put the same picture on two different days". Telling an
+    instruction from a complaint is an intent judgement, and a regex cannot make it.
+
+    So the OUTCOME changed instead of the detector. A false `code_fix` is expensive:
+    adapter.py sets the ticket to 'triage', which locks every later message from that
+    owner into FOLLOW_UP until a person closes it, and Echo auto-replies "I read that as
+    something not working on our side" -- to, in measured cases, a thank-you note and a
+    scheduling instruction. A wrong HINT on an escalation card a human is already
+    reading costs nothing. So this never dispatches: it annotates.
+
+    Automatic dispatch on this class needs the LLM lane classify() already falls
+    through to. That is the real fix and it is a bigger piece of work than this ticket."""
     t = _POLITE_OPENER_RE.sub("", (text or "").strip(), count=1).strip()
     if not t:
         return False
@@ -548,16 +579,10 @@ def classify(text, *, has_open_ticket, identity_product, llm=None, brain_hint=No
         return CODE_FIX
     if _QUESTION_RE.search(t):
         return QUESTION
-    # WRONG-OUTPUT reports ("still repeat images", "the same photo three days in a
-    # row"). Checked AFTER the question rule on purpose -- see _REPEAT_RE -- so an owner
-    # ASKING about repeats reaches the answer lane, while an owner REPORTING them
-    # reaches the fixer. Same _DOMAIN_RE gate every code_fix carries (RT-M2), plus
-    # _NOT_A_REPEAT_REPORT_RE for the instruction / client-is-the-actor / thanks
-    # families. Gated exactly like CANCEL_POST: repeat_report_enabled is the ONE switch
-    # (AGENT_SLACK_REPEAT_CODE_FIX, default OFF), so False is byte identical to before
-    # this rule existed.
-    if repeat_report_enabled and is_repeat_report(t):
-        return CODE_FIX
+    # NOTE: a duplicate-media report does NOT dispatch a fixer. is_repeat_report is a
+    # HINT for the escalation card a human already reads (adapter.py), not a label.
+    # See that function for why five rounds of audit ended here.
+    del repeat_report_enabled
     # CANCEL_POST is gated on cancel_post_enabled even from a brain hint or the LLM
     # fallback: the flag is the ONE switch for this whole capability, so a learned
     # phrase or a model guess can never turn it on when it is off.

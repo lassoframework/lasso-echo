@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from datetime import date, timedelta
 
@@ -185,7 +184,7 @@ def _fresh_photo(lib, state, exclude):
         # BYTE-IDENTICAL to a photo already on the book, whatever it is called:
         # "IMG_6771 (1).jpg" beside "IMG_6771.jpg" is the same picture to a follower,
         # and no filename rule could tell those apart without starving real sequences.
-        if _content_print(lib, key) in used_prints:
+        if used_prints and _content_print(lib, key) in used_prints:
             continue
         path = os.path.join(lib, key)
         if os.path.isfile(path) and _is_real_image(path):
@@ -271,8 +270,10 @@ def _blocked_book_state(base, state, current_key):
             # change the answer -- but it still ran, sha256ing every library file
             # including booked video. Measured 83.9 MB read for a library of one jpg and
             # two clips, once per repeated date, inside the nightly draft run.
+            _img = os.path.splitext(name)[1].lower() in _IMG_EXTS
             if (_cluster_key(lib, name) in used_clusters
-                    or (used_prints and _content_print(lib, name) in used_prints)):
+                    or (used_prints and _img
+                        and _content_print(lib, name) in used_prints)):
                 blocked.setdefault(name, set()).add(("near-dupe", "x"))
     except Exception as exc:  # noqa: BLE001 - never let this block a swap entirely
         _log(f"{base}: near-dupe widening skipped ({type(exc).__name__})")
@@ -424,7 +425,20 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     if failed_row is not None:
         _log(f"{base}: {key} {pd}: row {failed_row} could not be re-pointed; rolling "
              f"back {len(undo)} sibling row(s) so the post is never half swapped")
-        _restore_rows(base, store, undo)
+        stuck = _restore_rows(base, store, undo)
+        if stuck:
+            # THE ROLLBACK WAS REFUSED, so the post really is mixed (independent audit
+            # round 9, MAJOR). Returning "" here sent sweep_gym straight to
+            # small_library, and the client line then said the sweep "left them in place
+            # ON PURPOSE" and "could not prepare one" -- three false statements about a
+            # day that is half swapped. Round 8 fixed this counting on the LOCAL lane
+            # only.
+            result["mixed_posts"] = int(result.get("mixed_posts") or 0) + 1
+            result["rows_repointed"] += max(0, len(swapped) - len(stuck))
+            result["detail"].append(
+                f"{key} {pd}: -> {pick.get('key')} ({len(swapped)} row(s) moved, "
+                f"{len(stuck)} could not be rolled back; the rest kept the repeat)")
+            return "mixed"
         return ""
     if not swapped:
         return ""
@@ -639,7 +653,7 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
                          "so there is nothing fresh to swap in. Add photos (connect "
                          "the gym's Drive folder or upload in the portal).")
     if capped:
-        lines.append(f"{capped} more day(s) are queued behind tonight's per gym limit "
+        lines.append(f"{capped} more day(s) queued behind tonight's per gym limit "
                      f"of {DRIVE_FALLBACK_MAX_PER_GYM} and clear on the next runs. "
                      "Nothing more is needed from the gym.")
     # Named, not silent (independent audit round 6). AGENT_HOSTING_ENABLED defaults
@@ -834,6 +848,9 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                         _src = _swap_from_drive_pool(
                             base, store, fixable, state=state, asset_state=asset_state,
                             rows=rows, result=result, key=key, pd=pd)
+                        if _src == "mixed":
+                            continue         # reported as a mixed post, not a fix, and
+                                             # never as an untouched small library
                         if _src:
                             # ONLY a real Drive pick counts as Drive coverage: the same
                             # call can return a LOCAL video, and crediting the gym's
@@ -851,6 +868,11 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                     f"{key} {pd}: -> {new_key} ({len(fixable)} row(s)) [dry-run]")
                 result["dates_fixed"] += 1
                 result["rows_repointed"] += len(fixable)
+                # parity with apply, so the two lanes and the two modes agree
+                if config.story_format_enabled():
+                    result["stories_reburned"] += sum(
+                        1 for r in fixable
+                        if str(r.get("format") or "").lower() == "story")
                 state.setdefault(new_key, set()).add((pd, "x"))
                 continue
             # The "-> new_key" line is appended only once a write has LANDED

@@ -39,17 +39,38 @@ def _classify(text, **kw):
     return c.classify(text, **kw)
 
 
+def _hint(text):
+    """What the rule is now FOR: a hint on the escalation card."""
+    return c.is_repeat_report(text)
+
+
 # ---- the ticket that started this ---------------------------------------------------
 def test_johns_exact_message_is_a_code_fix():
-    assert _classify("9/14-9/16 are still repeat images") == c.CODE_FIX
+    assert _hint("9/14-9/16 are still repeat images") is True
 
 
 def test_johns_first_report_shape_is_a_code_fix_too():
-    assert _classify("its posting the same photos over and over while my videos "
-                     "just sit there") == c.CODE_FIX
+    assert _hint("its posting the same photos over and over while my videos "
+                 "just sit there") is True
 
 
 # ---- the flag is the one switch -----------------------------------------------------
+def test_nothing_ever_dispatches_a_fixer_flag_on_or_off():
+    """THE INVARIANT five rounds of audit arrived at. Telling an instruction from a
+    complaint is an intent judgement and a regex cannot make it: each round the false
+    positive FAMILY moved and the RATE did not, and the obvious tightening cost recall
+    (0.978 -> 0.844). So the rule annotates an escalation card a human already reads --
+    it never sets a ticket to triage and never auto-replies "something is not working"."""
+    for text in ("9/14-9/16 are still repeat images",
+                 "there are two posts next week, use the same image on both",
+                 "copy the same photo onto my calendar",
+                 "the calendar is reusing photos",
+                 "plz reuse same photo on my posts nxt week"):
+        for flag in (False, True):
+            assert c.classify(text, has_open_ticket=False, identity_product="echo",
+                              repeat_report_enabled=flag) != c.CODE_FIX, (text, flag)
+
+
 def test_the_flag_off_is_the_old_behavior():
     """OFF must be byte-for-byte what the classifier did before this rule existed."""
     assert _classify("9/14-9/16 are still repeat images",
@@ -95,7 +116,7 @@ def test_the_flag_cannot_be_turned_on_by_a_brain_hint_or_the_llm():
     "my manager noticed the duplicate images on the calendar",
 ])
 def test_a_wrong_output_report_reaches_the_fixer(text):
-    assert _classify(text) == c.CODE_FIX, f"escalated instead of dispatching: {text!r}"
+    assert _hint(text) is True, f"no hint on a real report: {text!r}"
 
 
 # ---- THE FALSE-POSITIVE SURFACE -----------------------------------------------------
@@ -322,11 +343,13 @@ def test_a_request_or_a_justification_is_not_a_bug_report(text):
     "WHY IS THE SAME PHOTO ON MY CALENDAR THREE TIMES",
     "the same photo is on 9/14 and 9/15 and 9/16",
 ])
-def test_real_reports_in_awkward_registers_are_not_dropped_silently(text):
-    """CAPS, emoji and bare-date shapes must not ESCAPE the system. A question-shaped
-    complaint is allowed to reach the ANSWER lane (round 2's deliberate ordering), but
-    nothing here may simply vanish."""
-    assert _classify(text) in (c.CODE_FIX, c.QUESTION), f"{text!r} fell through"
+def test_real_reports_in_awkward_registers_reach_a_person_with_a_hint(text):
+    """CAPS and bare-date shapes still reach a HUMAN: either the answer lane (a
+    question-shaped complaint, round 2's deliberate ordering) or an escalation card
+    carrying the duplicate-media hint. Nothing vanishes."""
+    got = _classify(text)
+    assert got == c.QUESTION or (got is c.ESCALATE and _hint(text)), \
+        f"{text!r} fell through with no hint"
 
 
 def test_the_clause_splitter_only_splits_on_contrast():
@@ -411,7 +434,7 @@ def test_a_bare_imperative_is_never_a_fixer_request(text):
     "these are duplicate images again",
 ])
 def test_a_report_signal_carries_a_real_complaint_through(text):
-    assert _classify(text) == c.CODE_FIX, f"a genuine report escalated: {text!r}"
+    assert _hint(text) is True, f"no hint on a real report: {text!r}"
 
 
 def test_a_weekday_alone_is_not_a_report_signal():
@@ -475,5 +498,39 @@ def test_persistence_is_proof_even_in_an_imperative_shape():
 
 
 def test_a_report_carrying_only_a_date_still_gets_through():
-    assert _classify("the same photo is on 9/14 and 9/15 and 9/16") == c.CODE_FIX
-    assert _classify("Posted the same image twice in a row again") == c.CODE_FIX
+    assert _hint("the same photo is on 9/14 and 9/15 and 9/16") is True
+    assert _hint("Posted the same image twice in a row again") is True
+
+
+# ---- round 9: the hint reaches the card, and costs nothing when wrong ---------------
+def test_the_escalation_card_carries_the_duplicate_media_hint():
+    """The whole point of keeping the rule: a human reading the escalation card is told
+    what this might be. A wrong hint is a few words on an internal card; a wrong
+    code_fix triaged the ticket and auto-replied 'something is not working'."""
+    from agent.slack_convo import adapter as _a
+    assert hasattr(_a, "_cls") and _a._cls.is_repeat_report is c.is_repeat_report
+    src = __import__("inspect").getsource(_a)
+    assert "DUPLICATE MEDIA report" in src, "the hint is not wired to the card"
+    assert "is_repeat_report" in src
+
+
+@pytest.mark.parametrize("text", [
+    "there are two posts next week, use the same image on both",
+    "there's a shot of the new rig, reuse it on every post",
+    "still ok to use the same photo on my posts for the launch",
+    "keeps things simple if you reuse the same image on both reels",
+    "that one came out really well, repeat it on the posts",
+    "back on the same theme, reuse last month's photos",
+    "plz reuse same photo on my posts nxt week",
+    "copy the same photo onto my calendar",
+    "attach the same clip to our reels",
+    "place the duplicate image on my feed",
+    "let the same photo run on two posts",
+    "batch the same image across my posts",
+    "the plan is to reuse those images on my calendar",
+])
+def test_a_wrong_hint_is_the_worst_that_can_happen(text):
+    """These 13 are the round-9 false positives. They may still HINT wrongly -- that is
+    a few words on an internal card -- but none of them may dispatch a fixer, triage a
+    ticket, or trigger the 'something is not working' auto-reply."""
+    assert _classify(text) != c.CODE_FIX

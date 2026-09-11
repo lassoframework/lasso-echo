@@ -1256,3 +1256,96 @@ def test_the_hash_cache_evicts_one_entry_not_all(tmp_path):
             media_guard._hash_cache.pop(next(iter(media_guard._hash_cache)), None)
     assert len(media_guard._hash_cache) >= media_guard._HASH_CACHE_MAX - 5
     media_guard._hash_cache.clear()
+
+
+def test_a_drive_post_whose_rollback_is_refused_is_reported_as_mixed(monkeypatch):
+    """Round 9 MAJOR. When a forward write fails AND _restore_rows cannot undo -- the
+    likeliest case, since the rows went live, which is what failed the write --
+    _swap_from_drive_pool returned "" and sweep_gym fell straight through to
+    small_library. The client line then said the sweep "left them in place ON PURPOSE"
+    and "could not prepare one" about a day that is half swapped. Round 8 fixed this
+    counting on the LOCAL lane only."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    n = {"i": 0}
+
+    def refuse_story_and_rollback(base, row_id, image_url, source_media_url=None,
+                                  extra_fields=None):
+        n["i"] += 1
+        if str(row_id) == "r14st":
+            return None                      # the forward write is refused
+        if n["i"] > 3:
+            return None                      # ...and so is the rollback
+        for r in store.rows:
+            if str(r["id"]) == str(row_id):
+                r["image_url"] = image_url
+                store.swaps.append((row_id, image_url))
+                return dict(r)
+        return None
+
+    store.swap_media = refuse_story_and_rollback
+    res = _sweep(store, picker=_picker(), drive_n=40, monkeypatch=monkeypatch)
+    assert res["mixed_posts"] == 1, "a half swapped post was reported as untouched"
+    assert res["dates_fixed"] == 0
+    assert res["small_library"] is False, \
+        "claimed the day was left alone for lack of media"
+    assert any("could not be rolled back" in d for d in res["detail"])
+    text = mrs.unfixable_report(res)
+    assert "ON PURPOSE" not in text or "could not be moved as a whole" in text
+
+
+def test_fresh_photo_does_not_hash_when_the_content_flag_is_off(monkeypatch, tmp_path):
+    """Round 9 MINOR: round 8 short-circuited _blocked_book_state but not _fresh_photo,
+    and only _blocked_book_state had a test. 2 MB hashed per pick on the DEFAULT path."""
+    monkeypatch.delenv("AGENT_MEDIA_DEDUPE_BY_CONTENT", raising=False)
+    lib = tmp_path / "nohash"
+    lib.mkdir()
+    for i in range(4):
+        (lib / f"P{i}.jpg").write_bytes(b"\xff\xd8\xff" + bytes([i + 1]) * 9000)
+    monkeypatch.setattr(mrs, "_is_real_image", lambda path: True)
+    hashed = []
+    real = media_guard._library_hash
+    monkeypatch.setattr(media_guard, "_library_hash",
+                        lambda path: hashed.append(path) or real(path))
+    mrs._fresh_photo(str(lib), {"P0.jpg": {("2026-09-13", "x")}}, exclude={"P0.jpg"})
+    assert hashed == [], f"hashed with the content flag off: {hashed}"
+
+
+def test_the_hash_cache_bound_is_exercised_through_the_real_function(tmp_path):
+    """Round 9 MINOR: the previous test re-implemented eviction and never called
+    _library_hash, so deleting the production guard left the suite green."""
+    media_guard._hash_cache.clear()
+    lib = tmp_path / "many"
+    lib.mkdir()
+    n = media_guard._HASH_CACHE_MAX + 20
+    for i in range(n):
+        p = lib / f"f{i}.bin"
+        p.write_bytes(bytes([i % 251]) * 64)
+        media_guard._library_hash(str(p))
+    assert len(media_guard._hash_cache) <= media_guard._HASH_CACHE_MAX, \
+        "the cache is unbounded"
+    assert len(media_guard._hash_cache) > media_guard._HASH_CACHE_MAX // 2, \
+        "clearing the whole cache makes a big library thrash every scan"
+    media_guard._hash_cache.clear()
+
+
+def test_the_forward_drive_path_never_creates_source_media_url(monkeypatch):
+    """Round 9 MINOR: unpinned. Never write the column on a gym whose schema predates
+    it -- the same rule this PR added and tested for the local path."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    sent = []
+    real = store.swap_media
+    store.swap_media = lambda b, r, u, source_media_url=None, extra_fields=None: (
+        sent.append(source_media_url)
+        or real(b, r, u, source_media_url=source_media_url, extra_fields=extra_fields))
+
+    def no_src(base, row, *, store, siblings=(), **kw):
+        got = _clip(1)
+        got["source_media_url"] = None
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    _sweep(store, picker=no_src, drive_n=40, monkeypatch=monkeypatch)
+    assert sent and all(v is None for v in sent), \
+        f"created source_media_url on rows that never had one: {sent}"

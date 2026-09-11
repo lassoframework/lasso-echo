@@ -942,11 +942,23 @@ def handle_event(event, event_id, deps):
 
     # ESCALATE: nothing decided -> a human looks. No worker, no answer.
     deps.bus.set_ticket(tid, status="hold", escalated=True)
+    # A HINT, never a dispatch (see classifier.is_repeat_report). A duplicate-media
+    # report is the one shape Echo could not classify for John Weeks, and it cannot be
+    # separated from an instruction by rule -- so the card a human is already reading
+    # says what it might be, and the human decides. A wrong hint costs nothing.
+    _hint = ""
+    try:
+        if (deps.repeat_report_enabled and deps.repeat_report_enabled()
+                and _cls.is_repeat_report(text)):
+            _hint = (". This reads like a DUPLICATE MEDIA report (the same photo or clip "
+                     "on more than one day). If it is, it is a code fix, not a question")
+    except Exception:  # noqa: BLE001 - a hint never blocks an escalation
+        _hint = ""
     emit(KIND_ESCALATION,
          question_card(deps, ident, tid, who, user, text,
                        proposal=(f"{NO_DRAFT_LABEL}: the classifier did not decide what this "
                                  f"is, so no answer, no fix request and no ad action was "
-                                 f"started. Nothing has been drafted for the client"),
+                                 f"started. Nothing has been drafted for the client{_hint}"),
                        status="hold, escalated, waiting on a person"),
          author_type="system")
     if not _is_staffish(who):
