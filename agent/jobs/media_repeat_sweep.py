@@ -103,21 +103,36 @@ def _owner_date(by_date):
 # was written for. _fresh_photo shares this function, so the hole was in the DEFAULT
 # (flag OFF) lane too: the sweep could replace a repeat with a byte-identical copy of
 # itself and report the date fixed.
-# ONLY UNAMBIGUOUS COPY MARKERS. A bare trailing number is NOT one: real libraries are
-# full of "photo_01.jpg", "squat_rack_3.jpg", "gym_shot_2024.jpg" -- genuine sequences,
-# not duplicates. Collapsing those would starve the very library this guard protects
-# (fewer usable photos -> more "small library" -> more repeats left standing), which is
-# worse than letting one oddly named dupe through. So: "(1)", "copy", "dup" only.
+# A duplicate's suffix: "IMG (1).jpg", "IMG-copy.jpg", "IMG_1.jpg", "Copy of IMG.jpg".
+# Matching one is NOT enough to collapse -- see the SIBLING GATE in _cluster_key.
 _COPY_SUFFIX_RE = re.compile(
     r"(?:[\s._-]*\(\s*\d+\s*\)"
-    r"|[\s._-]*(?:copy|copie|duplicate|dup)[\s._-]*\d*)+$", re.IGNORECASE)
+    r"|[\s._-]*(?:copy|copie|duplicate|dup)[\s._-]*\d*"
+    r"|[\s._-]+\d{1,3})+$", re.IGNORECASE)
+_COPY_PREFIX_RE = re.compile(r"^(?:copy|duplicate)\s+of\s+", re.IGNORECASE)
 
 
-def _cluster_key(lib, key):
-    """The near-dupe identity of a library file: dam.rotation_key when the gym
-    is vision-clustered, else the case-folded stem with any copy suffix stripped, so
-    "IMG_6771.jpg", "IMG_6771 (1).jpg", "IMG_6771-copy.jpg" and "IMG_6771_1.jpg" all
-    collapse to one identity (the same photo, uploaded twice)."""
+def _cluster_key(lib, key, lib_names=None):
+    """The near-dupe identity of a library file: dam.rotation_key when the gym is
+    vision-clustered, else the case-folded stem with a copy suffix stripped ONLY WHEN
+    THE ORIGINAL IS ACTUALLY IN THIS LIBRARY.
+
+    THE SIBLING GATE (independent audit round 3, 2026-09-11, CRITICAL). Round 2 stripped
+    copy markers unconditionally, which collapsed a whole library of "IMG (1).jpg" ..
+    "IMG (8).jpg" -- the standard bulk phone/Drive/Finder download naming, which
+    client_media_sync keeps verbatim -- into ONE cluster. _fresh_photo then returned
+    None for a gym with eight usable stills, _blocked_book_state blocked all eight, and
+    the sweep reported "small library" and left the repeats. That is worse than the
+    dupe it was catching, and it was live on the DEFAULT path.
+
+    Gating on the sibling gets both directions right: "IMG (1).jpg" collapses onto
+    "IMG.jpg" only when "IMG.jpg" is really there (a copy), and a library of numbered
+    siblings with no bare original stays N distinct photos (a sequence). It also closes
+    round 2's leftover "IMG_6771_1.jpg" case, which a suffix list alone could never
+    reach without eating "photo_01.jpg".
+
+    lib_names: every basename in the library. None = no library context, so no
+    collapsing beyond case folding (the safe direction: never starve)."""
     try:
         from agent import dam
         rk = dam.rotation_key(os.path.join(lib, key))
@@ -126,10 +141,13 @@ def _cluster_key(lib, key):
     except Exception:  # noqa: BLE001
         pass
     stem = os.path.splitext(key)[0].lower()
-    # Never collapse a name that is ONLY a copy suffix, and never return empty: a
-    # library of "1.jpg"/"2.jpg" must stay N distinct photos, not one.
-    trimmed = _COPY_SUFFIX_RE.sub("", stem).strip(" ._-")
-    return trimmed or stem
+    trimmed = _COPY_SUFFIX_RE.sub("", _COPY_PREFIX_RE.sub("", stem)).strip(" ._-")
+    if not trimmed or trimmed == stem:
+        return stem
+    if not lib_names:
+        return stem
+    originals = {os.path.splitext(str(n))[0].lower() for n in lib_names}
+    return trimmed if trimmed in originals else stem
 
 
 def _fresh_photo(lib, state, exclude):
@@ -138,13 +156,13 @@ def _fresh_photo(lib, state, exclude):
     (None, None) when nothing unused."""
     used = set(state.keys()) | set(exclude)
     lib_names = media_guard.library_keys(lib)
-    used_clusters = {_cluster_key(lib, k) for k in used if k in lib_names}
+    used_clusters = {_cluster_key(lib, k, lib_names) for k in used if k in lib_names}
     for key in sorted(lib_names):
         if key in used:
             continue
         if os.path.splitext(key)[1].lower() not in _IMG_EXTS:
             continue                       # image swaps only; videos need their lanes
-        if _cluster_key(lib, key) in used_clusters:
+        if _cluster_key(lib, key, lib_names) in used_clusters:
             continue                       # a near-dupe of a used photo repeats visually
         path = os.path.join(lib, key)
         if os.path.isfile(path) and _is_real_image(path):
@@ -217,9 +235,9 @@ def _blocked_book_state(base, state, current_key):
         if not lib_names:
             return blocked
         seeds = (set(state or {}) | {current_key}) & lib_names
-        used_clusters = {_cluster_key(lib, k) for k in seeds}
+        used_clusters = {_cluster_key(lib, k, lib_names) for k in seeds}
         for name in lib_names:
-            if name not in blocked and _cluster_key(lib, name) in used_clusters:
+            if name not in blocked and _cluster_key(lib, name, lib_names) in used_clusters:
                 blocked.setdefault(name, set()).add(("near-dupe", "x"))
     except Exception as exc:  # noqa: BLE001 - never let this block a swap entirely
         _log(f"{base}: near-dupe widening skipped ({type(exc).__name__})")
@@ -327,8 +345,15 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
                                    "source_media_asset_id":
                                        target.get("source_media_asset_id") or None}}
         try:
+            # "" not None (independent audit round 3, MAJOR): portal_calendar_store
+            # writes this column only when the value is not None, so a variant that
+            # carries no source (a story with AGENT_STORY_SOURCE_MEDIA off) used to
+            # STRAND the row's previous one. media_guard.row_media_key reads
+            # source_media_url FIRST, so that row would key as the old photo forever --
+            # invisible to the client, and blocking that photo from every future pick.
+            # _restore_rows got this fix in round 2; the forward path did not.
             done = store.swap_media(base, rid, var["image_url"],
-                                    source_media_url=var.get("source_media_url"),
+                                    source_media_url=(var.get("source_media_url") or ""),
                                     extra_fields=media_swap.swap_fields(var))
         except Exception as exc:  # noqa: BLE001
             _log(f"{base}: swap_media failed for {rid} ({type(exc).__name__})")
@@ -477,11 +502,14 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     detail = [d for d in (result or {}).get("detail") or []
               if "APPROVED duplicate" in d or "LIVE row also carries it" in d
               or "no unused photo left" in d]
-    if not detail:
+    capped = int((result or {}).get("budget_capped") or 0)
+    if not detail and not capped:
         return ""
     gym = (result or {}).get("gym", "")
     approved = int((result or {}).get("approved_left") or 0)
     small = bool((result or {}).get("small_library"))
+    if not detail:
+        small = False            # budget-only: nothing was left for lack of media
     photos = int((result or {}).get("photos_repeated") or 0)
 
     # Group the left-behind dates per photo so "twice inside a week" is provable.
@@ -529,14 +557,20 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
                    or (result or {}).get("drive_pool") or 0)
         armed = bool((result or {}).get("drive_armed"))
         if pool and armed:
-            # ARMED and still stuck: the lane reached for the pool tonight and could
-            # not use it (hosting down, a swap that timed out, a row that went live
-            # mid-write). Saying "cannot reach yet" here would be false -- it reached,
-            # and it failed. (Independent audit 2026-09-11.)
-            lines.append(f"This gym's uploaded photos are all on the book. Its "
-                         f"connected Drive folder holds {pool} unused item(s) and "
-                         "tonight's run could not prepare one; it retries on the next "
-                         "run. Nothing more is needed from the gym.")
+            # ARMED and still stuck. Say which of the three it actually was, because
+            # round 3 caught this branch claiming "could not prepare one" on a run that
+            # had prepared five. Nothing here may be a guess.
+            fixed = int((result or {}).get("dates_fixed") or 0)
+            if fixed:
+                lines.append(f"This gym's uploaded photos are all on the book. Its "
+                             f"connected Drive folder covered {fixed} day(s) tonight "
+                             f"and holds {pool} unused item(s) for the rest. Nothing "
+                             "more is needed from the gym.")
+            else:
+                lines.append(f"This gym's uploaded photos are all on the book. Its "
+                             f"connected Drive folder holds {pool} unused item(s) and "
+                             "tonight's run could not prepare one; it retries on the "
+                             "next run. Nothing more is needed from the gym.")
         elif pool:
             lines.append(f"This gym's uploaded photos are all on the book, but its "
                          f"connected Drive folder holds {pool} unused item(s) the "
@@ -546,6 +580,10 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
             lines.append("This gym has fewer usable photos than it has posting days, "
                          "so there is nothing fresh to swap in. Add photos (connect "
                          "the gym's Drive folder or upload in the portal).")
+    if capped:
+        lines.append(f"{capped} more day(s) are queued behind tonight's per-gym limit "
+                     f"of {DRIVE_FALLBACK_MAX_PER_GYM} and clear on the next runs. "
+                     "Nothing more is needed from the gym.")
     if near:
         lines.append(f"Inside {near_days} days (the ones a follower notices): "
                      + "; ".join(sorted(near)[:4]) + ".")
@@ -612,7 +650,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     result = {"gym": base, "photos_repeated": len(dupes), "dates_fixed": 0,
               "rows_repointed": 0, "stories_reburned": 0, "approved_left": 0,
               "small_library": False, "drive_pool": 0, "drive_pool_seen": 0,
-              "drive_armed": False, "detail": []}
+              "drive_armed": False, "budget_capped": 0, "detail": []}
     if not dupes:
         return result
 
@@ -632,6 +670,15 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
     # uncapped fallback is ~35 minutes on one gym. Bounded per gym per night; the rest
     # are reported and picked up by the next run.
     drive_fixes_left = DRIVE_FALLBACK_MAX_PER_GYM
+    budget_capped = 0                # dates the cap deferred to the next run
+    if config.media_repeat_sweep_drive_enabled():
+        # BEFORE the loop, so the report can tell a gym with a FULL folder apart from
+        # one with an empty folder even after this run drains the pool (independent
+        # audit round 3, CRITICAL: drive_pool_seen was written nowhere and always
+        # equalled the post-run count, so a run that used the last asset reported 0 and
+        # sent the exact "Add photos, connect your Drive folder" line it exists to stop).
+        result["drive_armed"] = True
+        result["drive_pool_seen"] = _drive_candidate_count(base, asset_state)
 
     today_iso = today.isoformat()
     for key, by_date in sorted(dupes.items()):
@@ -665,6 +712,16 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                 # Drive). Ask the portal swap's engine before calling this a small
                 # library. Flag OFF => the old behavior, byte for byte.
                 if config.media_repeat_sweep_drive_enabled():
+                    if drive_fixes_left <= 0:
+                        # BUDGET SPENT is not a small library (independent audit round
+                        # 3, MAJOR): falling through used to set small_library, fire the
+                        # small-library ops alert, and tell the gym "tonight's run could
+                        # not prepare one" while the run had in fact prepared five.
+                        budget_capped += 1
+                        result["detail"].append(
+                            f"{key} {pd}: Drive fallback budget for tonight is spent "
+                            f"({DRIVE_FALLBACK_MAX_PER_GYM}/gym); next run picks it up")
+                        continue
                     if not apply:
                         # A dry run places nothing, so the pool is read ONCE per gym --
                         # but it must still be SPENT DOWN as it reports (independent
@@ -677,16 +734,13 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                             pool_dry = _drive_candidate_count(base, asset_state)
                         if pool_dry > 0:
                             pool_dry -= 1
+                            drive_fixes_left -= 1    # the SAME budget apply spends
                             result["dates_fixed"] += 1
                             result["rows_repointed"] += len(fixable)
                             result["detail"].append(
                                 f"{key} {pd}: -> connected Drive pool "
                                 f"({pool_dry} asset(s) left after this) [dry-run]")
                             continue
-                    elif drive_fixes_left <= 0:
-                        result["detail"].append(
-                            f"{key} {pd}: Drive fallback budget for tonight is spent "
-                            f"({DRIVE_FALLBACK_MAX_PER_GYM}/gym); next run picks it up")
                     elif _swap_from_drive_pool(base, store, fixable, state=state,
                                                asset_state=asset_state, rows=rows,
                                                result=result, key=key, pd=pd):
@@ -763,6 +817,7 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
                                            "", pd)
                 except Exception:  # noqa: BLE001
                     pass
+    result["budget_capped"] = budget_capped
     if result["small_library"]:
         # MEASURE what the sweep could not reach, so the report tells the truth about
         # WHY (a genuinely thin library, or a full Drive folder behind an unarmed lane)
@@ -773,14 +828,10 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
         # night and new client-readable copy on the DEFAULT path. Flag OFF must be the
         # old behavior byte for byte -- CLAUDE.md's rule, and this module's own promise.
         if config.media_repeat_sweep_drive_enabled():
-            # In a dry run the pool was already counted once; do not pay for it twice.
+            # What is LEFT now. drive_pool_seen (captured before the loop) is what the
+            # report branches on. In a dry run the running count is already exact.
             result["drive_pool"] = (pool_dry if pool_dry is not None
                                     else _drive_candidate_count(base, asset_state))
-            result["drive_armed"] = True
-            # What the pool held when we FIRST looked, so the report can tell a gym with
-            # a full folder apart from one with an empty one even after a run drains it.
-            result["drive_pool_seen"] = max(int(result.get("drive_pool_seen") or 0),
-                                            int(result["drive_pool"]))
         if apply:
             media_guard.alert_small_library(base, today_iso, _log)
     return result
@@ -816,14 +867,18 @@ def run(gyms, *, apply=False, horizon=62):
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"\n=== media_repeat_sweep [{mode}] ===")
     print(f"{'gym':<14}{'photos':>7}{'dates_fixed':>12}{'rows':>6}"
-          f"{'reburned':>9}{'approved_left':>14}{'small_lib':>10}")
+          f"{'reburned':>9}{'approved_left':>14}{'small_lib':>10}"
+          f"{'drive_pool':>11}{'capped':>7}")
     for r in results:
         if r.get("error"):
             print(f"{r['gym']:<14} ERROR {r['error']}")
             continue
+        # drive_pool / capped so the operator can tell "thin library" apart from
+        # "the Drive lane could not deliver tonight" without reading the detail lines.
         print(f"{r['gym']:<14}{r['photos_repeated']:>7}{r['dates_fixed']:>12}"
               f"{r['rows_repointed']:>6}{r['stories_reburned']:>9}"
-              f"{r['approved_left']:>14}{str(r['small_library']):>10}")
+              f"{r['approved_left']:>14}{str(r['small_library']):>10}"
+              f"{r.get('drive_pool_seen', 0):>11}{r.get('budget_capped', 0):>7}")
     for r in results:
         for line in r.get("detail") or []:
             print(f"  {r['gym']}: {line}")

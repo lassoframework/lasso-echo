@@ -114,6 +114,20 @@ def test_a_wrong_output_report_reaches_the_fixer(text):
     "Repeat customers are up 12% since we started posting",
     "Heads up, we're closed Monday so the same post twice in a row would be weird",
     "we repeat that workout on purpose so the photo can too",
+    # round 3's eleven survivors
+    "Our anniversary promo repeats every year so just recycle last September's caption.",
+    "If a clip gets reused on the story that is totally fine with us.",
+    "It is fine to reuse photos from the summer challenge folder.",
+    "I think I uploaded the same photos twice to the Drive folder, sorry about that.",
+    "My front desk girl duplicated a bunch of images in the portal yesterday.",
+    "I accidentally approved the same post twice in the dashboard.",
+    "Our coach keeps sending me duplicate videos for the reels.",
+    "Appreciate you sorting out the duplicate photos so fast.",
+    "The repeat images issue looks resolved on my calendar now, nice work.",
+    "Honestly the same picture twice did not bother me at all.",
+    "Our schedule repeats weekly for the 5am class, not the posts.",
+    "my trainer uploaded duplicate pics again",
+    "our program repeats every 8 weeks so the captions can repeat too",
 ])
 def test_benign_chatter_with_an_echo_noun_is_never_a_fixer_request(text):
     got = _classify(text)
@@ -150,20 +164,46 @@ def test_chatter_is_never_a_ticket():
     assert _classify("thanks, that all looks great") != c.CODE_FIX
 
 
-# ---- the domain nouns a gym owner actually types -------------------------------------
+# ---- the media nouns are SEPARATE from _DOMAIN_RE ------------------------------------
 @pytest.mark.parametrize("noun", ["image", "images", "picture", "pictures", "pic",
                                   "pics", "clip", "clips", "footage"])
-def test_the_owner_words_for_media_are_domain_nouns(noun):
-    assert c._DOMAIN_RE.search(f"the {noun} is wrong"), \
-        f"{noun!r} is a word real clients type and must count as an Echo noun"
+def test_the_owner_words_for_media_widen_the_repeat_rule(noun):
+    assert c._MEDIA_NOUN_RE.search(f"the {noun} is wrong"), \
+        f"{noun!r} is a word real clients type and must reach the repeat rule"
+
+
+@pytest.mark.parametrize("noun", ["image", "images", "picture", "pic", "clip",
+                                  "footage"])
+def test_the_media_nouns_are_NOT_in_domain_re(noun):
+    """_DOMAIN_RE also gates _BREAKAGE_RE, which is NOT behind the repeat flag. Putting
+    these there changed the DEFAULT path: "the image is broken" and "the clip is broken"
+    flipped ESCALATE -> code_fix, and "is the image broken?" flipped QUESTION ->
+    code_fix, while every doc claimed the flag OFF was byte-for-byte the old classifier
+    (independent audit round 3, CRITICAL)."""
+    assert not c._DOMAIN_RE.search(f"the {noun} is broken"), \
+        f"{noun!r} in _DOMAIN_RE silently widens the unflagged breakage rule"
 
 
 @pytest.mark.parametrize("text", ["nice shot on that reel", "worth a shot",
                                   "give it a shot"])
-def test_bare_shot_is_not_a_domain_noun(text):
+def test_bare_shot_is_in_neither_noun_set(text):
     """Same reason bare "site" is excluded: the figurative use is the common one."""
-    assert not c._DOMAIN_RE.search(text.replace("reel", "thing")), \
-        f"'shot' invites figurative use: {text!r}"
+    stripped = text.replace("reel", "thing")
+    assert not c._DOMAIN_RE.search(stripped) and not c._MEDIA_NOUN_RE.search(stripped)
+
+
+@pytest.mark.parametrize("text", [
+    "the image is broken", "the images are not loading", "the clip is broken",
+    "the footage didn't go out", "the clips are not showing up",
+    "images stopped working", "the pic never went out this morning",
+    "is the image broken?",
+])
+def test_the_flag_off_does_not_change_a_breakage_sentence(text):
+    """The differential the round-2 test could not catch: it only exercised repeat-family
+    sentences, so eight breakage/question changes on the DEFAULT path went unnoticed."""
+    assert c.classify(text, has_open_ticket=False,
+                      identity_product="echo") != c.CODE_FIX, \
+        f"flag OFF dispatched a fixer on {text!r}; origin/main escalated it"
 
 
 # ---- ordering: the existing rules keep precedence -----------------------------------

@@ -4498,3 +4498,63 @@ This is the most likely way this PR ships and John still sees repeat images. The
 is what settles it, and it must be run against his gym before anyone tells him anything:
 
     python -m agent.jobs.media_repeat_sweep toughtemple52040e     # dry run, writes nothing
+
+## Audit round 3 (2026-09-11): the blocking risk is DISPROVEN, and four more defects
+
+**First, the good news, measured.** Round 2's concern that this PR might be a no-op for
+John is disproven. Offline simulation of a September book (30 days, 57 Drive videos +
+6 photos, stale local library) through `client_month_run.build_client_month`:
+
+    BUILD ok=True feeds=30 drive=24 local=6
+    assets stamped used this month: 24
+    PICKABLE on 2026-09-11: 39
+
+The this-month exclusion and the 90-day cooldown only touch the 24 assets the build
+actually stamped. On a book carrying the same still on 9/14, 9/15 and 9/16, the armed
+sweep re-points all three on the FIRST night, each to a different clip.
+
+**Four more defects, all fixed:**
+
+- [~] CRITICAL, and the worst one: the `_DOMAIN_RE` widening was UNFLAGGED.
+  `_DOMAIN_RE` also gates `_BREAKAGE_RE`, which is not behind the repeat flag, so
+  adding image/picture/clip/footage changed the DEFAULT path: eight sentences flipped,
+  including "the image is broken" ESCALATE -> code_fix and "is the image broken?"
+  QUESTION -> code_fix. Every doc claimed the flag OFF was byte-for-byte the old
+  classifier. Now a separate `_MEDIA_NOUN_RE`, used only inside `is_repeat_report`.
+  **Differential against origin/main over 18 sentences: 0 changes with the flag off.**
+- [~] CRITICAL: round 2's `_cluster_key` OVER-collapsed. A library of "IMG (1).jpg" ..
+  "IMG (8).jpg" -- the standard bulk phone/Drive/Finder download naming, which
+  `client_media_sync` keeps verbatim -- became ONE cluster, so `_fresh_photo` returned
+  None for a gym with eight usable stills and the sweep reported "small library". That
+  is worse than the dupe it was catching, and it was live on the DEFAULT path. Fixed
+  with a SIBLING GATE: a copy suffix is stripped only when the bare original is really
+  in the library. Both directions tested, and it also closes round 2's leftover
+  "IMG_6771_1.jpg" case, which no suffix list could reach without eating "photo_01.jpg".
+- [~] CRITICAL: `drive_pool_seen` was a no-op alias (written nowhere, always equal to
+  the POST-run count), so a run that used the last asset reported 0 and sent the exact
+  "Add photos, connect your Drive folder" line it exists to stop. Captured once now,
+  before the loop.
+- [~] CRITICAL: the dry run ignored `DRIVE_FALLBACK_MAX_PER_GYM`. On the Tough Temple
+  shape it promised 13 fixes where apply delivers 5 -- and the dry run is exactly the
+  instrument we verify a client's gym with. One shared budget across both branches.
+- [~] MAJOR: budget exhaustion fell through to `small_library`, firing the small-library
+  ops alert and telling the gym "tonight's run could not prepare one" on a run that had
+  prepared five with 35 assets still in the pool. Now its own counter and its own
+  sentence.
+- [~] MAJOR: the FORWARD swap could not clear a stale `source_media_url` (round 2 fixed
+  only the rollback). A story variant carrying no source stranded the row's previous
+  one on top of the NEW image_url, and `media_guard.row_media_key` reads
+  source_media_url FIRST -- so that row would key as the old photo forever: invisible
+  to Echo while the gym still saw it, and blocking that photo from every future pick.
+- [~] MAJOR: classifier false positives 11/30 -> **0/30**, with 0 of 14 real reports
+  lost. Added the third-person-actor, "already resolved", "appreciate", "fine with us"
+  and schedule-repeats families.
+- [x] `run()`'s table prints drive_pool_seen and capped, so an operator can tell a thin
+  library apart from a Drive lane that could not deliver.
+
+### Known limitation, accepted
+
+A repeat reported AS A QUESTION ("why is the same photo on three different days?")
+routes to the answer lane, not the fixer. That is round 2's deliberate ordering --
+questions about repeats must not dispatch a worker -- and chasing it reintroduces the
+"how often do posts repeat?" false positive. The answer lane is a real path, not silence.

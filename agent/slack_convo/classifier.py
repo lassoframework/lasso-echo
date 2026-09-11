@@ -63,6 +63,21 @@ _BREAKAGE_RE = re.compile(
     r"won't (?:post|publish|go out|send|load|connect|update)|"
     r"wont (?:post|publish|go out|send|load|connect|update))", re.IGNORECASE)
 
+# The words a gym owner types for media that _DOMAIN_RE does not carry. KEPT OUT of
+# _DOMAIN_RE on purpose (independent audit round 3, CRITICAL): _DOMAIN_RE also gates
+# _BREAKAGE_RE, which is NOT behind the repeat flag, so widening it changed the DEFAULT
+# path -- "the image is broken", "the clip is broken", "the footage didn't go out" all
+# flipped from ESCALATE to code_fix, and "is the image broken?" flipped from a QUESTION
+# to a code_fix. That contradicted every claim that the flag OFF is byte-for-byte the
+# old classifier. These nouns now widen the flagged repeat rule ONLY.
+#
+# Bare "shot" stays out of both, for the same reason bare "site" is out of _DOMAIN_RE:
+# "nice shot", "worth a shot", "a shot at the title".
+_MEDIA_NOUN_RE = re.compile(
+    r"\b(?:image|images|picture|pictures|pic|pics|clip|clips|footage)\b",
+    re.IGNORECASE)
+
+
 # WRONG OUTPUT, not a dead machine (John Weeks / Tough Temple, 2026-09-11).
 #
 # Every pattern in _BREAKAGE_RE describes something NOT HAPPENING: not posting, not
@@ -105,17 +120,36 @@ _REPEAT_RE = re.compile(
 #                                       "same image different caption is fine by me"
 # plus "repeat customers/clients/members", which is a business metric, not media.
 _NOT_A_REPEAT_REPORT_RE = re.compile(
+    # 1. an instruction, a request, or a hypothetical
     r"^\s*(?:please\b|pls\b|can (?:we|you)\b|could (?:we|you)\b|would you\b|"
     r"let'?s\b|lets\b|do not\b|don'?t\b|dont\b|never\b|make sure\b|"
-    r"go ahead\b|feel free\b|heads up\b|fyi\b|thanks\b|thank you\b|thx\b)|"
-    r"\b(?:i|we) (?:just |always |usually |keep |kept )?"
+    r"go ahead\b|feel free\b|heads up\b|fyi\b|thanks\b|thank you\b|thx\b|"
+    r"if\b|it'?s fine\b|it is fine\b|honestly\b|appreciate\b)|"
+    r"\b(?:just |please )(?:recycle|reuse|repeat|duplicate)\b|"
+    r"\bfine to (?:reuse|repeat|duplicate|recycle|use)\b|"
+    # 2. a PERSON did it, not Echo -- the client, or someone at the gym
+    r"\b(?:i|we) (?:just |already |think i |think we |always |usually |keep |kept |"
+    r"accidentally |may have |might have |must have )*"
     r"(?:duplicated|duplicate|reused|reuse|re-used|recycled|recycle|repeated|repeat|"
-    r"copied|copy)\b|"
+    r"copied|copy|uploaded|approved|sent|added)\b|"
+    r"\b(?:my|our) (?:front desk|desk|coach|coaches|manager|assistant|staff|team|gm|"
+    r"wife|husband|partner|kid|kids|son|daughter|intern|owner|trainer|trainers)\b|"
     r"\brepeat(?:ing)? (?:myself|ourselves|itself)\b|"
-    r"\bthank(?:s| you)\b|"
+    r"\b(?:accidentally|by accident|my bad|oops|sorry about that|my fault)\b|"
+    # 3. thanks, approval, or "already resolved"
+    r"\b(?:thank(?:s| you)|appreciate)\b|"
+    r"\b(?:resolved|all set|all good|no longer an issue|nice work|looks good|"
+    r"looks great|fixed now|sorted out|sorted it)\b|"
+    r"\b(?:did not|didn'?t|does not|doesn'?t) bother\b|"
+    r"\b(?:no worries|not a problem|not an issue|totally fine|fine (?:with|by) "
+    r"(?:us|me)|no big deal|hope that'?s ok|on purpose|intentional|deliberate)\b|"
+    r"\b(?:love|loved|loves|liked|great|perfect|awesome|crushed|working well)\b|"
+    # 4. a SCHEDULE or a business metric that repeats, not media
     r"\brepeat (?:customer|customers|client|clients|member|members|business|rate)\b|"
-    r"\b(?:love|loved|loves|like|liked|great|perfect|awesome|crushed|working well|"
-    r"fine by me|no big deal|hope that'?s ok|on purpose|intentional|deliberate)\b",
+    r"\b(?:schedule|class|classes|workout|workouts|programming|program|promo|"
+    r"promotion|event|hours) (?:repeats|repeat)\b|"
+    r"\brepeats? (?:weekly|daily|monthly|yearly|annually|every (?:year|week|month|day))"
+    r"\b",
     re.IGNORECASE)
 
 
@@ -127,7 +161,9 @@ def is_repeat_report(text):
         return False
     if _NOT_A_REPEAT_REPORT_RE.search(t):
         return False
-    return bool(_REPEAT_RE.search(t)) and bool(_DOMAIN_RE.search(t))
+    if not _REPEAT_RE.search(t):
+        return False
+    return bool(_DOMAIN_RE.search(t)) or bool(_MEDIA_NOUN_RE.search(t))
 
 _QUESTION_RE = re.compile(
     r"(\?\s*$)|^\s*(how|what|when|where|why|who|which|can you|could you|do you|does|is it|"
@@ -172,14 +208,6 @@ _DOMAIN_RE = re.compile(
     r"caption|captions|calendar|schedule|scheduled|instagram|ig|facebook|fb|page|google|"
     r"gbp|business profile|connect|connection|connected|connecting|link|upload|uploads|"
     r"photo|photos|video|videos|media|approve|approval|approvals|portal|login|log in|"
-    # "image / images / picture / pictures / clip / clips / footage / shot": the words a
-    # gym owner actually types for the same things. "photo" and "video" were here;
-    # "image" was not, so "9/14-9/16 are still repeat images" failed the domain check
-    # even once the breakage side matched (John Weeks / Tough Temple, 2026-09-11).
-    # Bare "shot" is deliberately OUT, for the same reason bare "site" is:
-    # "nice shot", "worth a shot", "a shot at the title". Every real report
-    # names the photo, the picture, the clip or the footage.
-    r"image|images|picture|pictures|pic|pics|clip|clips|footage|"
     r"sign in|echo|dashboard|reply|replies|comment|comments|drive|folder|"
     # RTF-1: the website product's nouns, which were missing entirely -- every
     # Wrangler-shaped breakage report ("the website is showing the wrong hours") failed

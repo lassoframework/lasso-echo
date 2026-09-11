@@ -672,34 +672,56 @@ def test_the_picker_is_told_what_is_already_on_the_book(monkeypatch):
 # still open by its own worked example, and four new defects were found.
 # =====================================================================================
 
-# ---- B1, for real this time: the copy-suffix family -------------------------------
-@pytest.mark.parametrize("dupe", [
-    "IMG_6771 (1).jpg", "IMG_6771-copy.jpg", "IMG_6771 copy.jpg",
-    "IMG_6771(2).png", "IMG_6771 - Copy.jpg", "img_6771.JPG",
-])
-def test_every_copy_suffix_shape_shares_one_cluster(dupe):
+# ---- B1 / C2: the copy-suffix family, SIBLING GATED ------------------------------
+_LIB_WITH_ORIGINAL = [REPEATED, "IMG_6771 (1).jpg", "IMG_6771-copy.jpg",
+                      "IMG_6771 copy.jpg", "IMG_6771(2).png", "IMG_6771 - Copy.jpg",
+                      "img_6771.JPG", "IMG_6771_1.jpg", "IMG_6771-2.jpg",
+                      "Copy of IMG_6771.jpg"]
+
+
+@pytest.mark.parametrize("dupe", [n for n in _LIB_WITH_ORIGINAL if n != REPEATED])
+def test_a_copy_collapses_when_the_original_is_in_the_library(dupe):
     """dam.rotation_key only clusters a MARKED library (mark_near_dupes runs once, at
-    onboarding, and nothing re-marks after a portal upload or a Drive sync), so in
-    production _cluster_key falls back to the stem. Case-folding alone missed every one
-    of these -- including 'IMG_6771 (1).jpg', the exact example the guard was written
-    for. This is the DEFAULT lane too: _fresh_photo shares _cluster_key."""
-    assert mrs._cluster_key("/nolib", dupe) == mrs._cluster_key("/nolib", REPEATED)
+    onboarding; nothing re-marks after a portal upload or a Drive sync), so in production
+    _cluster_key falls back to the stem. Case-folding alone missed every one of these --
+    including 'IMG_6771 (1).jpg', the exact example the guard was written for. This is
+    the DEFAULT lane too: _fresh_photo shares _cluster_key."""
+    assert (mrs._cluster_key("/nolib", dupe, _LIB_WITH_ORIGINAL)
+            == mrs._cluster_key("/nolib", REPEATED, _LIB_WITH_ORIGINAL))
 
 
-@pytest.mark.parametrize("distinct", [
-    "photo_01.jpg", "photo_02.jpg", "squat_rack_3.jpg", "gym_shot_2024.jpg",
-    "1.jpg", "2.jpg", "totally_other.jpg", "IMG_6772.jpg",
+@pytest.mark.parametrize("lib", [
+    [f"IMG ({i}).jpg" for i in range(1, 9)],          # bulk phone / Drive download
+    ["team copy.jpg", "team copy 2.jpg", "team copy 3.jpg"],
+    [f"photo_{i:02d}.jpg" for i in range(1, 6)],
+    ["1.jpg", "2.jpg", "3.jpg"],
 ])
-def test_a_numbered_sequence_is_not_a_duplicate(distinct):
-    """Over-collapsing is the worse failure: it starves the library, which produces MORE
-    'small library' and MORE repeats left standing. A bare trailing number is a sequence
-    ('photo_01', 'squat_rack_3'), not a copy marker."""
-    assert mrs._cluster_key("/nolib", distinct) != mrs._cluster_key("/nolib", REPEATED)
+def test_a_numbered_family_with_no_original_stays_distinct(lib):
+    """THE STARVATION CASE (audit round 3, CRITICAL). Round 2 stripped copy markers
+    unconditionally, so a library of 'IMG (1).jpg'..'IMG (8).jpg' -- the standard bulk
+    download naming, which client_media_sync keeps verbatim -- collapsed to ONE cluster.
+    _fresh_photo then returned None for a gym with eight usable stills and the sweep
+    reported 'small library'. Over-collapsing is the worse failure: it causes MORE
+    repeats, and it was live on the default path."""
+    keys = {mrs._cluster_key("/nolib", n, lib) for n in lib}
+    assert len(keys) == len(lib), f"collapsed {lib} into {keys}"
 
 
-def test_a_numbered_library_keeps_every_photo_distinct():
-    keys = [f"photo_{i:02d}.jpg" for i in range(10)]
-    assert len({mrs._cluster_key("/nolib", k) for k in keys}) == 10
+def test_no_library_context_never_collapses():
+    """The safe direction: with no library to check a sibling against, do not guess."""
+    assert (mrs._cluster_key("/nolib", "IMG_6771 (1).jpg")
+            != mrs._cluster_key("/nolib", REPEATED))
+
+
+def test_a_numbered_library_with_no_original_is_not_starved(tmp_path):
+    """End to end through _fresh_photo: eight usable stills must stay eight."""
+    lib = tmp_path / "bulk"
+    lib.mkdir()
+    for i in range(1, 9):
+        (lib / f"IMG ({i}).jpg").write_bytes(b"\xff\xd8\xff" + b"x" * 4096)
+    state = {"IMG (1).jpg": {("2026-09-13", "x")}}
+    got, _path = mrs._fresh_photo(str(lib), state, exclude={"IMG (1).jpg"})
+    assert got == "IMG (2).jpg", f"library starved: _fresh_photo returned {got!r}"
 
 
 def test_the_default_lane_never_swaps_a_repeat_for_its_own_copy(monkeypatch, tmp_path):
@@ -816,3 +838,111 @@ def test_the_drive_fallback_is_capped_per_gym_per_night(monkeypatch):
         f"{len(calls)} Drive materializations in one gym-night"
     assert res["dates_fixed"] == mrs.DRIVE_FALLBACK_MAX_PER_GYM
     assert any("budget for tonight is spent" in d for d in res["detail"])
+
+
+# =====================================================================================
+# INDEPENDENT AUDIT ROUND 3 (2026-09-11).
+# =====================================================================================
+
+def test_the_dry_run_respects_the_same_cap_apply_does(monkeypatch):
+    """C4: the cap was applied only in the apply branch, so a dry run against a client's
+    gym promised ~2.5x what apply could deliver -- and the dry run is the instrument we
+    verify a gym with before telling the client anything."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book()
+    for i in range(15, 26):
+        rows.append(_row(f"r{i}", f"2026-09-{i:02d}", "instagram", "feed"))
+    dry = _sweep(_Store(rows), apply=False, picker=None, drive_n=40,
+                 monkeypatch=monkeypatch)
+
+    calls = []
+
+    def counting(base, row, *, store, siblings=(), **kw):
+        calls.append(row.get("id"))
+        got = _clip(len(calls))
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    wet = _sweep(_Store(rows), apply=True, picker=counting, drive_n=40,
+                 monkeypatch=monkeypatch)
+    assert dry["dates_fixed"] == wet["dates_fixed"] == mrs.DRIVE_FALLBACK_MAX_PER_GYM, \
+        f"dry run promised {dry['dates_fixed']}, apply delivered {wet['dates_fixed']}"
+
+
+def test_budget_exhaustion_is_not_reported_as_a_small_library(monkeypatch):
+    """M1: the cap branch fell through to small_library, firing the small-library ops
+    alert and telling the gym 'tonight's run could not prepare one' on a run that had
+    prepared five, with 35 assets still in the pool."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book()
+    for i in range(15, 26):
+        rows.append(_row(f"r{i}", f"2026-09-{i:02d}", "instagram", "feed"))
+    alerts = []
+    monkeypatch.setattr("agent.media_guard.alert_small_library",
+                        lambda base, day, log=None: alerts.append(base))
+    res = _sweep(_Store(rows), picker=_picker(clips=range(1, 40)), drive_n=40,
+                 monkeypatch=monkeypatch)
+    assert res["budget_capped"] > 0
+    assert res["small_library"] is False, "the pool was full; nothing was short of media"
+    assert alerts == [], "fired the small-library alert with a full Drive folder"
+    text = mrs.unfixable_report(res)
+    assert "could not prepare one" not in text, "it prepared five"
+    assert "queued behind tonight's per-gym limit" in text
+
+
+def test_a_run_that_drains_the_pool_reports_what_it_first_saw(monkeypatch):
+    """C3: drive_pool_seen was written nowhere, so it always equalled the POST-run
+    count. A run that used the last asset reported 0 and sent the exact 'Add photos,
+    connect your Drive folder' line this branch exists to stop sending."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    rows = _book() + [_row("r15", "2026-09-15", "instagram", "feed"),
+                      _row("r16", "2026-09-16", "instagram", "feed")]
+    pool = [2]
+
+    def draining(base, asset_state):
+        return pool[0]
+
+    monkeypatch.setattr("agent.media_swap.after_swap", lambda *a, **k: None)
+    monkeypatch.setattr(mrs, "_drive_candidate_count", draining)
+
+    def pick(base, row, *, store, siblings=(), **kw):
+        if pool[0] <= 0:
+            return {"ok": False, "reason": "no_fresh_photo"}
+        pool[0] -= 1
+        got = _clip(pool[0])
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    monkeypatch.setattr("agent.media_swap.pick_replacement", pick)
+    import datetime
+    res = mrs.sweep_gym(GYM, _Store(rows), apply=True,
+                        today=datetime.date(2026, 9, 11))
+    assert res["drive_pool"] == 0, "the run drained it"
+    assert res["drive_pool_seen"] == 2, "but the folder was not empty when we looked"
+    text = mrs.unfixable_report(res)
+    assert "Add photos" not in text, "told a gym with a connected folder to add photos"
+
+
+def test_the_forward_swap_clears_a_stale_source_media_url(monkeypatch):
+    """M2: _restore_rows got the '' fix in round 2; the FORWARD path did not. A variant
+    carrying no source (a story with AGENT_STORY_SOURCE_MEDIA off) stranded the row's
+    previous source_media_url on top of the NEW image_url. media_guard.row_media_key
+    reads source_media_url FIRST, so the row would key as the OLD photo forever --
+    invisible to the client, and blocking that photo from every future pick."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    store = _Store(_book())
+    for r in store.rows:
+        if r["id"] == "r14st":
+            r["source_media_url"] = f"https://tt.media/{REPEATED}"
+
+    def no_src(base, row, *, store, siblings=(), **kw):
+        got = _clip(1)
+        got["source_media_url"] = None          # what _finish returns for this shape
+        got["siblings"] = {str(s.get("id")): dict(got) for s in siblings}
+        return got
+
+    _sweep(store, picker=no_src, drive_n=57, monkeypatch=monkeypatch)
+    story = [r for r in store.rows if r["id"] == "r14st"][0]
+    assert story["source_media_url"] == "", \
+        f"stranded {story['source_media_url']!r}: the repeat is now invisible to Echo"
+    assert media_guard.row_media_key(story).endswith(".mp4")
