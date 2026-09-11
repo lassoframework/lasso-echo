@@ -2084,6 +2084,53 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
 
 def backfill_denied_slots(account, base_key, start_date, days=30, *, voice,
                           library_path=None, store, banned_words=(), logger=None):
+    """Thin per-gym-locked wrapper around _backfill_denied_slots_body (below).
+
+    PER-GYM BUILD LOCK (independent audit, 2026-09-11, CrossFit Reverb): this
+    function is INSERT-only and was never wrapped by agent/build_lock.py, unlike
+    build_client_month. Ground truth in the deployed echo service's own logs
+    (2026-09-11 18:29-19:27 UTC) showed a full build_client_month rebuild placing
+    fresh rows on 2026-09-24 at 18:49:34, then THIS function independently
+    replacing a denied 2026-09-21 slot by "rolling forward" onto that SAME
+    2026-09-24 at 19:20:40 -- a second, fully independent 4-row batch stacked on
+    a day the rebuild had just filled seconds/minutes earlier. Not a classic
+    race (the two calls did not overlap in time): backfill_denied_slots's own
+    day-collision check (denybf_dayused_<base>_<day>) deliberately ignores rows
+    from ANY other path by design (the Dale/ENG fix above), so it had no way to
+    know the rebuild had just claimed that day. Serializing this function against
+    build_client_month (and against itself) with the SAME per-gym lock closes the
+    window: a backfill pass that starts while a rebuild for the same gym is still
+    writing (or another backfill pass is) is refused cleanly instead of stacking
+    a duplicate batch onto whatever day the other call just placed content on.
+    """
+    log = logger or (lambda m: print(f"[deny-backfill] {m}"))
+    if not config.deny_backfill_enabled():
+        return {"ok": False, "reason": "AGENT_DENY_BACKFILL off", "backfilled": 0}
+    if account is None or not base_key or store is None or voice is None:
+        return {"ok": False, "reason": "missing account, base_key, store, or voice",
+                "backfilled": 0}
+    list_month = getattr(store, "list_month", None)
+    insert_rows = getattr(store, "insert_rows", None)
+    if list_month is None or insert_rows is None:
+        return {"ok": False, "reason": "store cannot read/insert", "backfilled": 0}
+    from . import build_lock as _build_lock
+    _lock_holder = f"{os.getpid()}:{id(store)}"
+    if not _build_lock.acquire(base_key, holder=_lock_holder):
+        log(f"{base_key}: a build or another backfill pass is already in progress "
+            "for this gym; skipping this backfill rather than stacking onto "
+            "whatever day it just placed content on (see agent/build_lock.py)")
+        return {"ok": False, "reason": "build_in_progress", "backfilled": 0}
+    try:
+        return _backfill_denied_slots_body(
+            account, base_key, start_date, days, voice=voice,
+            library_path=library_path, store=store, banned_words=banned_words,
+            logger=log)
+    finally:
+        _build_lock.release(base_key, holder=_lock_holder)
+
+
+def _backfill_denied_slots_body(account, base_key, start_date, days=30, *, voice,
+                                library_path=None, store, banned_words=(), logger=None):
     """Give each DENIED feed POST a FRESH 1:1 replacement (a NEW caption on a REUSED photo)
     for a gym that is AT its creative cap — where the monthly grow-to-cap build is a no-op
     and the denied slot would otherwise stay empty forever (the portal's "recreating" state
