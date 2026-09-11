@@ -272,6 +272,17 @@ Account record in `agent/accounts.py` ("meta_direct" default, or "socialapi").
 | AGENT_SLACK_REPEAT_CODE_FIX | false | BLAKE | Appends ONE sentence to the escalation card when a client's Slack message reads like a duplicate-media report ("the same photo on more than one day"). It NEVER dispatches a fixer: `classify()` returns ESCALATE for this family on or off. The name is historical: five audit rounds measured that a regex cannot tell such a complaint from a scheduling instruction (false-positive rate flat at 10-20% while the family moved; tightening cost recall 0.978 -> 0.844), and a false `code_fix` triages the ticket and auto-replies "something is not working". Automatic dispatch needs the LLM lane. Arm by hand. |
 | AGENT_MEDIA_REPEAT_REPORT | false | BLAKE | Raises ONE client-readable line per gym per month naming the repeats the sweep deliberately did NOT fix. Arm by hand. |
 
+### One unflagged default-path change in this area (2026-09-11)
+
+The repeat sweep now writes `source_media_url = ""` on a row that ALREADY carried one,
+instead of leaving it pointing at media the row no longer has. `media_guard.row_media_key`
+reads that column FIRST, so a stale value made the row key as a photo it does not carry:
+invisible to every future guard and sweep, and the old photo stayed blocked from every
+future pick. It is a data-integrity fix with no product trade, guarded so a row that
+never had the column is never written to, and tested. It is NOT behind a flag, which is
+the one place this work departs from "every new capability ships behind a flag that
+defaults OFF" -- recorded here rather than carried silently.
+
 ## Previously read in code but documented nowhere (now closed)
 
 - **META_APP_ID / META_APP_SECRET** — the token watchdog's debug_token app

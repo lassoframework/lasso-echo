@@ -4923,3 +4923,55 @@ raised it again): a row that already carried a stale `source_media_url` is now w
 `""` instead of being left pointing at media it no longer has. It is a data-integrity
 fix with no product trade, guarded so a row without the column is never written to, and
 tested -- but it is not behind a flag, and CLAUDE.md says new capability ships OFF.
+
+## Audit round 12 (2026-09-11): B. The refusal table, and the end of this loop.
+
+Round 12 found **no critical**. One major, and it was the FOURTH appearance of one
+defect family, so it is fixed as a class rather than an instance:
+
+- [~] **Every `pick_replacement` REFUSAL collapsed into "small library".** Round 11
+  closed only the clean-rollback path; a picker exception, an unshapeable sibling, and
+  `ok=False` for ANY reason all still returned "" and fell through to
+  `small_library = True` plus `media_guard.alert_small_library`, whose text is
+  *"Add photos (connect the gym's Drive folder or upload in the portal)"* -- fired at a
+  gym with 57 unused clips in a connected folder. That is the exact sentence this entire
+  change exists to stop sending Tough Temple, reached by a fourth route.
+
+  `pick_replacement` hands back a REASON and it was being thrown away. `_refusal_outcome`
+  is now the ONE place that decides what a refusal means: only `no_fresh_photo` and
+  `no_library` mean "nothing to swap in"; hosting, timeout, a failed story burn, an
+  unknown reason and a crash are operational and retry, and are never the gym's fault.
+  This matters because `AGENT_HOSTING_ENABLED` defaults FALSE and the swap deadline is
+  75s over 40MB clips, so the operational reasons are the LIKELY ones, not the edge. A
+  test walks every `REASON_*` constant in `media_swap` so a new one cannot silently
+  start blaming a gym for photos it already gave us.
+
+- [~] A retry-only run no longer opens with "left them in place ON PURPOSE"; the mixed
+  path counts a re-burned story that stayed; `_restore_rows` no longer creates a
+  `source_media_url` column on a row that never had one (the forward path already
+  refused to); two unreachable branches removed.
+- [x] `docs/ENV.md` now records the one unflagged default-path write change instead of
+  carrying it silently.
+
+Four mutation tests, four caught. Suite 7110.
+
+### Closing the loop
+
+Grades across twelve rounds: D, D, D, C, B, B, B-, C, C, C+, B-, B.
+
+The write path has been clean of correctness defects for three rounds and is
+fuzz-verified (400 seeds). The end-to-end has passed SEVEN times through the real
+`media_swap.pick_replacement`. Every finding in the last three rounds has been in
+reporting copy, and the recurring shape of them is worth naming: **this system's hardest
+problem is not doing the right thing, it is saying the true thing about what it did.**
+Four separate routes all ended at "tell the gym to add photos", on a gym whose folder is
+full. That is the bug John actually experienced, twice.
+
+What is NOT closed and needs a person:
+1. Whether 9/14-9/16 are `pending` or `approved` on his real calendar. Approved rows are
+   never swapped, by design, so if they are approved this PR does not reach them and
+   someone has to deny those days. `python -m agent.jobs.media_repeat_sweep
+   toughtemple52040e` (dry, writes nothing) answers it.
+2. Blake's sign-off on the one unflagged default-path delta (above).
+3. Automatic fixer dispatch on a duplicate-media report needs the LLM lane. The
+   deterministic rule is a hint only, and five rounds of measurement say that is correct.

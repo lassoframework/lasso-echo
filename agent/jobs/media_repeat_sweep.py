@@ -307,7 +307,8 @@ def _restore_rows(base, store, undo):
         try:
             done = store.swap_media(
                 base, rid, before["image_url"],
-                source_media_url=(before.get("source_media_url") or ""),
+                source_media_url=("" if before.get("source_media_url") is not None
+                                  else None),
                 extra_fields=before.get("extra_fields") or {})
         except Exception as exc:  # noqa: BLE001
             _log(f"{base}: ROLLBACK FAILED for row {rid} ({type(exc).__name__})")
@@ -325,6 +326,34 @@ def _restore_rows(base, store, undo):
         except Exception:  # noqa: BLE001 - alerting never breaks a sweep
             pass
     return stuck
+
+
+# WHAT A REFUSAL MEANS. Four rounds of audit found the same defect wearing four masks:
+# a pick that was REFUSED collapsed into "small library", which fires
+# media_guard.alert_small_library -- "Add photos (connect the gym's Drive folder or
+# upload in the portal)" -- at a gym with 57 unused clips in a connected folder. That is
+# the exact sentence this entire change exists to stop sending Tough Temple.
+#
+# pick_replacement hands back a REASON and it was being thrown away. Only two of them
+# mean "there is nothing to swap in"; every other outcome is an operational failure that
+# retries, and is emphatically not the gym's problem. AGENT_HOSTING_ENABLED defaults
+# FALSE and the swap deadline is 75s over 40MB clips, so the operational reasons are the
+# LIKELY ones, not the edge.
+_REASONS_MEANING_NO_MEDIA = frozenset({"no_fresh_photo", "no_library"})
+
+
+def _refusal_outcome(reason):
+    """("thin"|"retry", one client-readable clause) for a refused pick."""
+    r = str(reason or "").strip().lower()
+    if r in _REASONS_MEANING_NO_MEDIA:
+        return "thin", "nothing fresh left to swap in"
+    if r == "hosting_unavailable":
+        return "retry", "media hosting was unavailable"
+    if r == "swap_timeout":
+        return "retry", "preparing the replacement ran out of time"
+    if r == "story_reburn_failed":
+        return "retry", "the story card could not be rebuilt"
+    return "retry", f"the replacement could not be prepared ({r or 'unknown'})"
 
 
 def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, result,
@@ -362,11 +391,19 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             asset_state=asset_state, siblings=siblings)
     except Exception as exc:  # noqa: BLE001 - a picker failure is "no Drive swap"
         _log(f"{base}: Drive replacement failed for {key} {pd} ({type(exc).__name__})")
-        return ""
+        result["detail"].append(
+            f"{key} {pd}: the replacement could not be prepared "
+            f"({type(exc).__name__}); retried on the next run")
+        return "rolledback"
     # A picker that returns a non-dict must not raise out of sweep_gym and skip every
     # remaining gym for the night (run() walks gyms in one unguarded loop).
     if not isinstance(pick, dict) or not pick.get("ok"):
-        return ""
+        kind, why = _refusal_outcome((pick or {}).get("reason")
+                                     if isinstance(pick, dict) else None)
+        if kind == "thin":
+            return ""                    # genuinely nothing to swap in
+        result["detail"].append(f"{key} {pd}: {why}; retried on the next run")
+        return "rolledback"
     from agent import media_swap
     variants = pick.get("siblings") or {}
     # ALL OR NOTHING, exactly like the portal swap: a sibling the picker could not
@@ -376,7 +413,10 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
     if missing:
         _log(f"{base}: {key} {pd}: Drive swap skipped, a sibling row could not be "
              "shaped from the same clip")
-        return ""
+        result["detail"].append(
+            f"{key} {pd}: a replacement was found but one row of the post could not be "
+            "shaped from it; retried on the next run")
+        return "rolledback"
 
     # ALL OR NOTHING AT WRITE TIME TOO (independent audit 2026-09-11, MAJOR). The
     # picker's own all-or-nothing only covers SHAPING. Each swap_media below is a
@@ -469,6 +509,13 @@ def _swap_from_drive_pool(base, store, fixable, *, state, asset_state, rows, res
             # still carrying the new media. The old arithmetic counted the ones put
             # BACK on the repeat (round 10 MAJOR).
             result["rows_repointed"] += len(stuck)
+            # a stuck row that IS a story kept its re-burned card (round 12 minor)
+            _stuck = set(stuck)
+            result["stories_reburned"] += sum(
+                1 for _t, _v in targets
+                if str(_t.get("id")) in _stuck
+                and str(_t.get("format") or "").lower() == "story"
+                and config.story_format_enabled())
             result["detail"].append(
                 f"{key} {pd}: -> {pick.get('key')} ({len(swapped)} row(s) moved, "
                 f"{len(stuck)} could not be rolled back; the rest kept the repeat)")
@@ -606,8 +653,7 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
               if "APPROVED duplicate" in d or "LIVE row also carries it" in d
               or "no unused photo left" in d or "hosting unavailable" in d
               or "past-dated" in d or "story re-burn failed" in d
-              or "kept the repeat" in d or "write did not land" in d
-              or "no row could be written" in d]
+              or "kept the repeat" in d or "retried on the next run" in d]
     capped = int((result or {}).get("budget_capped") or 0)
     if not detail and not capped:
         return ""
@@ -649,6 +695,8 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     # that left a post HALF swapped, which is the opposite of on purpose.
     _fixed = int((result or {}).get("dates_fixed") or 0)
     _mixed = int((result or {}).get("mixed_posts") or 0)
+    _retry = sum(1 for d in ((result or {}).get("detail") or [])
+                 if "retried on the next run" in d)
     if _mixed:
         # "the rest were left in place on purpose" swallowed the days that WERE fully
         # changed, because this short-circuited elif _fixed (round 11 MAJOR).
@@ -660,6 +708,10 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
         lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
                  f"{_fixed} day(s) were changed; the rest were left in place on "
                  "purpose."]
+    elif _retry:
+        lines = [f"{gym}: {photos} photo(s) repeat across different days of the book. "
+                 f"A replacement was ready for {_retry} of them but the change did not "
+                 "land on this run; it retries on the next one."]
     else:
         lines = [f"{gym}: {photos} photo(s) repeat across different days of the book "
                  "and this sweep left them in place ON PURPOSE."]
@@ -730,8 +782,8 @@ def unfixable_report(result, *, near_days=_NEAR_DAYS):
     if any("hosting unavailable" in d for d in detail):
         lines.append("Some of these could not be moved because media hosting was "
                      "unavailable on this run. That is ours to fix, not the gym's.")
-    if any("did not land" in d or "no row could be written" in d for d in detail):
-        lines.append("On at least one day a fresh photo was ready but the write did "
+    if _retry:
+        lines.append("On at least one day a fresh photo was ready but the change did "
                      "not land, so the day still shows the repeat. It retries on the "
                      "next run. That is ours to fix, not the gym's.")
     if any("story re-burn failed" in d or "kept the repeat" in d for d in detail):

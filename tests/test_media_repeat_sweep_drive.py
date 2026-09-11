@@ -234,7 +234,11 @@ def test_a_sibling_the_picker_cannot_shape_leaves_the_date_alone(monkeypatch):
 
     res = _sweep(store, picker=half_shaped, drive_n=57, monkeypatch=monkeypatch)
     assert store.swaps == [], "all or nothing: never half a post"
-    assert res["small_library"] is True
+    # NOT a small library: a replacement WAS found, the post could not be shaped from
+    # it. Reporting this as thin media fires the "Add photos" digest at a gym with 57
+    # unused clips (round 12 MAJOR).
+    assert res["small_library"] is False
+    assert any("could not be shaped" in d for d in res["detail"])
 
 
 def test_a_picker_that_raises_never_breaks_the_sweep(monkeypatch):
@@ -245,8 +249,9 @@ def test_a_picker_that_raises_never_breaks_the_sweep(monkeypatch):
         raise RuntimeError("drive down")
 
     res = _sweep(store, picker=boom, drive_n=57, monkeypatch=monkeypatch)
-    assert res["small_library"] is True
     assert store.swaps == []
+    assert res["small_library"] is False, "a picker crash is not thin media"
+    assert any("retried on the next run" in d for d in res["detail"])
 
 
 def test_a_dry_run_never_downloads_hosts_or_writes(monkeypatch):
@@ -572,8 +577,8 @@ def test_a_picker_returning_a_non_dict_does_not_raise(monkeypatch):
     store = _Store(_book())
     res = _sweep(store, picker=lambda *a, **k: None, drive_n=57,
                  monkeypatch=monkeypatch)
-    assert res["small_library"] is True
     assert store.swaps == []
+    assert res["small_library"] is False, "a broken picker is not thin media"
 
 
 def test_one_gym_raising_never_skips_the_rest(monkeypatch):
@@ -605,10 +610,10 @@ def test_the_report_pool_number_is_actually_measured(monkeypatch):
     import datetime
     # a picker that never succeeds -> small library, but the pool IS there
     monkeypatch.setattr("agent.media_swap.pick_replacement",
-                        lambda *a, **k: {"ok": False, "reason": "hosting_unavailable"})
+                        lambda *a, **k: {"ok": False, "reason": "no_fresh_photo"})
     res = mrs.sweep_gym(GYM, _Store(_book()), apply=True,
                         today=datetime.date(2026, 9, 11))
-    assert res["small_library"] is True
+    assert res["small_library"] is True, "no_fresh_photo genuinely IS thin media"
     assert res["drive_pool"] == 57, "the report would have no number to tell the truth with"
     assert res["drive_armed"] is True
 
@@ -834,7 +839,7 @@ def test_a_rollback_clears_a_source_media_url_the_forward_swap_set(monkeypatch):
     store = _Store([_row("r1", "2026-09-14", "instagram", "feed")])
     store.rows[0]["source_media_url"] = "https://cdn.tt/clip1.mp4"   # set by the swap
     mrs._restore_rows(GYM, store, [("r1", {"image_url": f"https://cdn.tt/{REPEATED}",
-                                           "source_media_url": None,
+                                           "source_media_url": "",
                                            "extra_fields": {}})])
     row = store.rows[0]
     assert row["source_media_url"] == "", "the stale source_media_url masks the repeat"
@@ -1524,3 +1529,69 @@ def test_the_approved_sentence_agrees_in_number():
     assert "1 of them sits on an APPROVED post" in mrs.unfixable_report(one)
     assert "2 of them sit on APPROVED posts" in mrs.unfixable_report(
         dict(one, approved_left=2))
+
+
+# ---- round 12: a REFUSAL is not a small library -----------------------------------
+@pytest.mark.parametrize("reason,thin", [
+    ("no_fresh_photo", True),          # genuinely nothing to swap in
+    ("no_library", True),
+    ("hosting_unavailable", False),    # ours to fix, and the DEFAULT posture
+    ("swap_timeout", False),
+    ("story_reburn_failed", False),
+    ("something_new", False),          # unknown reasons default to retry, never blame
+])
+def test_only_a_genuinely_empty_pool_reads_as_a_small_library(reason, thin, monkeypatch):
+    """Round 12 MAJOR, and the FOURTH appearance of this defect family. Every refusal
+    collapsed into small_library, which fires media_guard.alert_small_library -- "Add
+    photos (connect the gym's Drive folder or upload in the portal)" -- at a gym with 57
+    unused clips in a connected folder. pick_replacement hands back a REASON and it was
+    being thrown away. AGENT_HOSTING_ENABLED defaults FALSE and the swap deadline is 75s
+    over 40MB clips, so the operational reasons are the LIKELY ones."""
+    monkeypatch.setenv("AGENT_MEDIA_REPEAT_SWEEP_DRIVE", "true")
+    alerts = []
+    monkeypatch.setattr("agent.media_guard.alert_small_library",
+                        lambda base, day, log=None: alerts.append(base))
+    res = _sweep(_Store(_book()),
+                 picker=lambda *a, **k: {"ok": False, "reason": reason},
+                 drive_n=57, monkeypatch=monkeypatch)
+    assert res["small_library"] is thin, f"{reason} -> small_library={res['small_library']}"
+    assert bool(alerts) is thin, f"{reason} fired the add-photos digest: {alerts}"
+    if not thin:
+        assert any("retried on the next run" in d for d in res["detail"])
+        assert "Add photos" not in mrs.unfixable_report(res)
+
+
+def test_the_refusal_table_names_every_reason_media_swap_can_return():
+    """Every REASON_* constant must have a deliberate verdict, so a new one added to
+    media_swap cannot silently start blaming the gym for photos it already gave us."""
+    from agent import media_swap
+    reasons = [v for k, v in vars(media_swap).items() if k.startswith("REASON_")]
+    assert reasons, "no REASON_ constants found"
+    for r in reasons:
+        kind, why = mrs._refusal_outcome(r)
+        assert kind in ("thin", "retry") and why
+    assert mrs._refusal_outcome(media_swap.REASON_NO_FRESH_PHOTO)[0] == "thin"
+    assert mrs._refusal_outcome(media_swap.REASON_HOSTING)[0] == "retry"
+    assert mrs._refusal_outcome(media_swap.REASON_TIMEOUT)[0] == "retry"
+    assert mrs._refusal_outcome(None)[0] == "retry", "unknown must never blame the gym"
+
+
+def test_a_retry_only_run_does_not_open_with_on_purpose():
+    res = {"gym": GYM, "photos_repeated": 1, "approved_left": 0, "small_library": False,
+           "dates_fixed": 0, "mixed_posts": 0, "drive_pool_seen": 57, "drive_armed": True,
+           "detail": [f"{REPEATED} 2026-09-14: media hosting was unavailable; "
+                      "retried on the next run"]}
+    text = mrs.unfixable_report(res)
+    assert "ON PURPOSE" not in text, text
+    assert "retries on the next" in text
+    assert "That is ours to fix, not the gym's." in text
+
+
+def test_a_rollback_never_creates_a_source_media_url_column():
+    store = _Store([_row("r1", "2026-09-14", "instagram", "feed")])
+    sent = []
+    store.swap_media = lambda b, r, u, source_media_url=None, extra_fields=None: (
+        sent.append(source_media_url) or dict(store.rows[0]))
+    mrs._restore_rows(GYM, store, [("r1", {"image_url": "u", "source_media_url": None,
+                                           "extra_fields": {}})])
+    assert sent == [None], f"created the column on rollback: {sent}"
