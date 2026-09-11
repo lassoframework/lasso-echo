@@ -198,7 +198,40 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
 
+        def _send_json(self, status, obj):
+            import json as _json
+            body = _json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _ops_actions(self, method):
+            """D72: the FIXER's ops-action lane mounted INSIDE THE WORKER, which is the
+            process with the /data volume (media libraries, brand bibles, the kv that the
+            deny sweep and the recreate budget live in). Same fixer_ops.handle as
+            intake_web mounts on the web service; same secret header. True when answered."""
+            from . import fixer_ops as _fixer_ops
+            if not urllib.parse.urlparse(self.path).path.startswith(_fixer_ops.ROUTE_PREFIX):
+                return False
+            raw = b""
+            if method == "POST":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > _fixer_ops.MAX_BODY_BYTES:
+                    self._send_json(413, {"error": "too_large"})
+                    return True
+                raw = self.rfile.read(length) if length else b""
+            answered = _fixer_ops.handle(method, self.path, self.headers.get, raw)
+            if answered is None:
+                return False
+            status, body = answered
+            self._send_json(status, body)
+            return True
+
         def do_GET(self):
+            if self._ops_actions("GET"):
+                return
             parsed = urllib.parse.urlparse(self.path)
             # Admin tracker: /admin/tracker/<token>[/handoff] (read-only, token-gated)
             import re as _re
@@ -222,6 +255,8 @@ def serve(port=None):  # pragma: no cover - thin stdlib wiring over the pure cor
                 self._send(404, "not found")
 
         def do_POST(self):
+            if self._ops_actions("POST"):
+                return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/connect/select":
                 length = int(self.headers.get("Content-Length", 0) or 0)

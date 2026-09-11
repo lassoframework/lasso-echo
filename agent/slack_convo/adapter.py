@@ -241,6 +241,13 @@ import re as _re
 # touching injuries/liability, and anything below the classifier's confidence bar must ALWAYS
 # still hold for Blake's tap regardless of this flag -- these are hard lines, not tunable."
 #
+# SUPERSEDED IN PART by D72 (Blake, 2026-09-11): "hold for Blake's tap" is no longer the
+# disposition of anything. The org floor (billing/price/refunds, injury/liability, the GYM's
+# real hours or class schedule, pixel/CAPI/ad budget/targeting) still never auto-commits, but
+# a hold now tells the client, puts a TEAM card in #fixer and leaves the ticket open with its
+# tier visible; everything below the floor routes to the FIXER. See auto_answer_verdict and
+# hold_answer_for_team below, and DECISIONS.md D72.
+#
 # Structural, not advisory: no env var and no config function can widen this set, and it is
 # checked at DRAFT time here and again at POST time in outbox._dispatch_one. Billing/price is
 # already refused before any model call by answer_lane.is_billing (a stricter, earlier gate);
@@ -252,19 +259,55 @@ import re as _re
 # wrong opening time or moving a class is a real-world commitment we cannot make for a
 # client. A content calendar is not that. So those two topics are qualified; billing,
 # injuries and liability stay deliberately broad, because a false hold there costs nothing.
-AUTO_ANSWER_FORBIDDEN = _re.compile(
+# D72 (2026-09-11): the denylist is split by TOPIC so a hold can say which floor it hit --
+# the client is told "I can't confirm billing details myself", the #fixer card names the
+# topic, and the ticket carries it -- instead of every failed gate wearing the one label
+# "hard line (billing, hours or schedule, injury or liability)" whether or not any of those
+# was involved (that label sat on Dean Holcomb's caption/photo question, ticket 27728832,
+# which touched none of them). auto_answer_forbidden() is the union, byte for byte the same
+# decision as before plus the ad-settings floor below.
+TOPIC_BILLING = "billing"
+TOPIC_INJURY = "injury_liability"
+TOPIC_GYM_SCHEDULE = "gym_schedule"
+TOPIC_ADS = "ad_settings"
+_FORBIDDEN_BILLING = _re.compile(
     r"\b(price|prices|pricing|cost|costs|charge|charged|bill|billing|billed|invoice|refund|"
-    r"refunds|subscription|payment|pay|pays|paying|stripe|credit card|"
-    r"injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
-    r"liability|waiver|insurance|lawsuit|legal)\b|"
+    r"refunds|subscription|payment|pay|pays|paying|stripe|credit card)\b|"
+    r"\bhow much (?:is|does|will|would|do|are)\b|\$\s?\d", _re.IGNORECASE)
+_FORBIDDEN_INJURY = _re.compile(
+    r"\b(injur\w*|hurt|pain|sore|surgery|physio|physical therapy|doctor|medical|pregnan\w*|"
+    r"liability|waiver|insurance|lawsuit|legal)\b", _re.IGNORECASE)
+_FORBIDDEN_GYM_SCHEDULE = _re.compile(
     r"\b(?:gym|class|classes|session|sessions|group sessions|studio|business|holiday|"
     r"opening|door|front desk|member)\s+(?:hours|schedule|schedules|times|time)\b|"
     r"\b(?:hours|schedule)\s+(?:change|changes|for the gym|on (?:monday|tuesday|wednesday|"
     r"thursday|friday|saturday|sunday|the holiday|labor day|christmas|thanksgiving))\b|"
-    r"\b(?:change|move|update|adjust)\s+(?:our|the|my)\s+(?:hours|schedule|class)\b|"
+    r"\b(?:change|move|update|adjust|cancel|reschedule)\s+(?:our|the|my|your)\s+"
+    r"(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day\s+|\d{1,2}(?::\d{2})?\s*(?:am|pm)\s+)?"
+    r"(?:hours|schedule|class|classes)\b|"
     r"\breschedule\b|\btimetable\b|\bwhat time do (?:you|we) (?:open|close)\b|"
     r"\bare (?:you|we) open\b|\bwhen do (?:you|we) (?:open|close)\b|"
     r"\bwhat are (?:your|our) hours\b|\bholiday hours\b", _re.IGNORECASE)
+# The org floor's fourth leg (org instructions: pixel/CAPI, ad budget, targeting are never
+# touched without explicit approval). Echo is a social product; a message about ad settings
+# reaching it is either Ranger's (action_request, routed before this) or a person's to answer.
+_FORBIDDEN_ADS = _re.compile(
+    r"\b(pixel|capi|conversions? api|ad budget|ad spend|daily budget|targeting|"
+    r"ad set|ad sets|adset|adsets|campaign budget|boost(?:ed|ing)? (?:the |that |this )?post)\b",
+    _re.IGNORECASE)
+_FORBIDDEN_BY_TOPIC = ((TOPIC_BILLING, _FORBIDDEN_BILLING), (TOPIC_INJURY, _FORBIDDEN_INJURY),
+                       (TOPIC_GYM_SCHEDULE, _FORBIDDEN_GYM_SCHEDULE), (TOPIC_ADS, _FORBIDDEN_ADS))
+AUTO_ANSWER_FORBIDDEN = _re.compile(
+    "|".join(f"(?:{rx.pattern})" for _, rx in _FORBIDDEN_BY_TOPIC), _re.IGNORECASE)
+
+
+def forbidden_topic(text):
+    """Which org-floor topic this text touches ('' when none). The first matching leg wins;
+    the tiers are for wording a hold, not for ranking severity."""
+    for topic, rx in _FORBIDDEN_BY_TOPIC:
+        if rx.search(text or ""):
+            return topic
+    return ""
 
 
 # M3 (2026-09-05 audit 2): the denylist above was documented as "structural, not advisory",
@@ -379,7 +422,17 @@ _ASK_TO_PUBLISH = _re.compile(
 # A promise is a FIRST-PERSON FUTURE MARKER, whatever verb follows. The only first-person
 # futures that are not promises are perception and reporting ("I can see that...", "I can
 # confirm..."), so those are excepted explicitly and everything else holds.
-_NOT_A_PROMISE = r"(?:see|tell|confirm|find|check|report|show|read|look|understand)\b"
+# D72 (2026-09-11): ATTENTION is not a promise of action. "let us know which one and we
+# will take a look", "I'll flag this for someone on the team" held two real client answers
+# (tickets 27728832 and eb3be7d8) as commitments -- but a promise of human attention now HAS
+# a mechanism behind it (the ticket stays open, escalated, and the FIXER / a teammate picks
+# it up; see promises_human_follow_up), so it is a report of what this system does, not a
+# claim it cannot keep. Promises of ACTION on content ("I'll queue it up for monday") stay
+# caught: nobody performs them.
+_NOT_A_PROMISE = (r"(?:see|tell|confirm|find|check|report|show|read|look|understand|"
+                  r"take a look|have a look|flag|follow up|get back|pass (?:this|that|it)|"
+                  r"escalate|loop in|dig into|raise (?:this|that|it)|"
+                  r"make sure (?:someone|the team|a teammate)|ask (?:the team|someone))\b")
 _ANSWER_COMMITS = _re.compile(
     rf"\b(?:i|we)\s*(?:'ll|ll\b|will|can|could|shall|am going to|'m going to|am gonna|"
     rf"are going to|'re going to|would be happy to|am happy to|would)\s+"
@@ -395,6 +448,48 @@ _ANSWER_COMMITS = _re.compile(
 def answer_commits_to_action(text):
     """True when OUR OWN drafted answer promises to do something rather than reporting."""
     return bool(_ANSWER_COMMITS.search(text or ""))
+
+
+# D72: a commitment whose OBJECT is the real world -- a gym class, a member, money, the
+# gym's hours, ad money -- is the org floor speaking through our own mouth ("I'll move your
+# saturday class to 8am", "we'll refund that"). A commitment about Echo's own product ("I'll
+# swap that photo") is not a floor; it is work the FIXER's ops lane can actually do, so it
+# routes to a teammate/the FIXER (needs_review) rather than to a hold nobody may release.
+_REAL_WORLD_OBJECT = _re.compile(
+    r"\b(class|classes|membership|memberships|member|members|rate|rates|hours|"
+    r"appointment|coach|trainer|ads?|ad set|campaign|campaigns|budget|"
+    r"spend|audience|targeting|pixel|capi)\b", _re.IGNORECASE)
+_SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])\s+")
+
+
+def commitment_is_real_world(text):
+    """True when a first-person commitment in OUR answer sits in a sentence that names a
+    real-world object or an org-floor topic. Sentence-scoped so a descriptive sentence about
+    a class next to a benign commitment about a photo does not trip it."""
+    for sentence in _SENTENCE_SPLIT.split(text or ""):
+        if not _ANSWER_COMMITS.search(sentence):
+            continue
+        if forbidden_topic(sentence) or _REAL_WORLD_OBJECT.search(sentence):
+            return True
+    return False
+
+
+# D72: an answer that promises a PERSON will follow up ("I'll flag this for someone on the
+# team") is only honest if the ticket actually reaches a person. The adapter escalates such
+# tickets to the FIXER when the answer sends, so the sentence becomes true by mechanism.
+_HUMAN_FOLLOW_UP = _re.compile(
+    r"\b(?:i|we)\s*(?:'ll|ll\b|will|am going to|'m going to|are going to|'re going to)\s+"
+    r"(?:flag|escalate|raise|pass|hand|loop in|get someone|have someone|ask (?:the team|"
+    r"someone)|make sure (?:someone|the team|a teammate))\b|"
+    r"\b(?:someone|a teammate|the team|a person) (?:on the team )?will (?:follow up|"
+    r"look into|dig into|get back|take a look|reach out|be in touch)\b|"
+    r"\bflag(?:ged|ging)? (?:this|that|it) for (?:someone|the team|a teammate)\b",
+    _re.IGNORECASE)
+
+
+def promises_human_follow_up(text):
+    """True when our answer says a person will follow up. Not a hold: a routing signal."""
+    return bool(_HUMAN_FOLLOW_UP.search(text or ""))
 
 
 def asks_us_to_publish(text):
@@ -425,7 +520,11 @@ _THIRD_PARTY = _re.compile(
     r"\b(?:a |one of our |our |the )?(?:member|members|client|clients|athlete|athletes|"
     r"student|students|customer|customers|guy|lady|woman|man|kid|kids|someone|somebody|"
     r"she|he|they|her|him|them)\b", _re.IGNORECASE)
-MAX_AUTO_ANSWER_WORDS = 25
+# D72 (2026-09-11): 25 held both real client questions of the week (Dean, 35 words; Pete,
+# 44) -- two plain sentences about Echo's own posts, no second subject. The third-party and
+# advice-shape guards above are what catch a second subject; length is only a backstop for
+# a wall of text, so the backstop moves out of the way of two-sentence questions.
+MAX_AUTO_ANSWER_WORDS = 60
 
 
 def auto_answer_allowed(text):
@@ -461,9 +560,219 @@ def may_auto_answer(question, body=""):
     # our own reply cannot ask us to do anything. So the publish guard reads the question
     # only. The topic denylist still reads both, because a hard-line SUBJECT can surface in
     # an answer that a benign question invited.
-    return (auto_answer_allowed(question)
-            and not auto_answer_forbidden(body or "")
-            and not answer_commits_to_action(body or ""))
+    return auto_answer_verdict(question, body).ok
+
+
+# ---- D72: the verdict, with a tier ------------------------------------------------------
+# Blake, 2026-09-11: "Any message someone sends Echo, Ranger, Wrangler, or Scout is
+# addressed, and if it needs a fix it goes to Claude Code (the FIXER) -- autonomous, without
+# me." No client message may end in a silent hold that waits on Blake. The only things that
+# may still refuse to auto-commit are the org floor: billing/price/refunds, injury/liability,
+# the GYM's real hours or class schedule, and pixel/CAPI/ad-budget/targeting changes.
+#
+# So a failed check is no longer one undifferentiated "held": it carries a TIER that decides
+# what happens next, and every tier tells the client something and puts the ticket in front
+# of someone who can act:
+#   org_floor     the answer (or the question) touches the floor. Never auto-sends. The
+#                 client gets an honest non-committal line naming the topic; #fixer gets a
+#                 TEAM card; the ticket stays open, escalated, tier visible. A teammate's
+#                 release tap is still how the draft itself would go out.
+#   needs_review  a structural doubt about an ECHO-drafted answer (not about state, a
+#                 publish request, a third party, advice sought, a promise of content
+#                 action). Not a floor. The ticket is handed to the FIXER (classification
+#                 cleared so its poll picks it up); the client is told a teammate has it.
+#   auto_answer_unarmed  the flag is off (outbox/worker decide this, not the rule).
+# A FIXER-authored answer (attachments.fixer) is checked against the org floor ONLY: the
+# FIXER is the reviewer the structural checks were standing in for, and re-applying them to
+# its answers would bounce the same ticket between the two systems forever.
+HOLD_TIER_ORG_FLOOR = "org_floor"
+HOLD_TIER_NEEDS_REVIEW = "needs_review"
+HOLD_TIER_UNARMED = "auto_answer_unarmed"
+
+
+@dataclass(frozen=True)
+class AnswerVerdict:
+    ok: bool
+    tier: str = ""       # "" | HOLD_TIER_ORG_FLOOR | HOLD_TIER_NEEDS_REVIEW
+    rule: str = ""       # the check that failed, by name
+    detail: str = ""     # what matched, for the card
+    topic: str = ""      # org-floor topic, for the client's line
+
+    @property
+    def held(self):
+        return not self.ok
+
+
+def _first_match(rx, text):
+    m = rx.search(text or "")
+    return m.group(0) if m else ""
+
+
+def auto_answer_verdict(question, body="", *, grounded_by_fixer=False):
+    """THE decision for sending a drafted answer with no human tap, with the reason.
+
+    Org floor first, on the question AND on what we are about to say, whoever drafted it.
+    Then, for an Echo-drafted answer only, the structural checks (auto_answer_allowed's
+    four conditions, and a promise of content action in the body)."""
+    q = question or ""
+    b = body or ""
+    topic = forbidden_topic(q)
+    if topic:
+        return AnswerVerdict(False, HOLD_TIER_ORG_FLOOR, "forbidden_topic_in_question",
+                             _first_match(AUTO_ANSWER_FORBIDDEN, q), topic)
+    topic = forbidden_topic(b)
+    if topic:
+        return AnswerVerdict(False, HOLD_TIER_ORG_FLOOR, "forbidden_topic_in_answer",
+                             _first_match(AUTO_ANSWER_FORBIDDEN, b), topic)
+    if commitment_is_real_world(b):
+        return AnswerVerdict(False, HOLD_TIER_ORG_FLOOR, "real_world_commitment_in_answer",
+                             _first_match(_ANSWER_COMMITS, b), TOPIC_GYM_SCHEDULE
+                             if _FORBIDDEN_GYM_SCHEDULE.search(b) else "")
+    if grounded_by_fixer:
+        return AnswerVerdict(True)
+    if not q.strip() or not AUTO_ANSWER_ALLOWED.search(q):
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "question_not_about_account_state")
+    if asks_us_to_publish(q):
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "question_asks_us_to_publish",
+                             _first_match(_ASK_TO_PUBLISH, q))
+    if _ADVICE_SHAPE.search(q):
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "question_seeks_advice",
+                             _first_match(_ADVICE_SHAPE, q))
+    if _THIRD_PARTY.search(q):
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "question_names_a_third_party",
+                             _first_match(_THIRD_PARTY, q))
+    if len(q.split()) > MAX_AUTO_ANSWER_WORDS:
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "question_too_long",
+                             f"{len(q.split())} words > {MAX_AUTO_ANSWER_WORDS}")
+    if answer_commits_to_action(b):
+        return AnswerVerdict(False, HOLD_TIER_NEEDS_REVIEW, "answer_promises_content_action",
+                             _first_match(_ANSWER_COMMITS, b))
+    return AnswerVerdict(True)
+
+
+# What the CLIENT is told when their answer is held. Every line is true at the moment it is
+# written: the ticket is escalated (a teammate/the FIXER sees it) before the row is queued.
+_TOPIC_WORDS = {TOPIC_BILLING: "billing or pricing", TOPIC_INJURY: "injury or liability",
+                TOPIC_GYM_SCHEDULE: "your gym's hours or class schedule",
+                TOPIC_ADS: "ad budget, targeting or tracking"}
+TEMPLATE_HARD_LINE = (
+    "Got it. I can't confirm {topic} details myself, so I have not answered that part; a "
+    "LASSO teammate will follow up here today.")
+TEMPLATE_HELD_FOR_REVIEW = (
+    "Got it, I have your message. I have not sent you an answer on this one myself; it is "
+    "with the LASSO team now and someone will follow up here.")
+
+
+def client_hold_notice_text(verdict_or_tier, topic=""):
+    tier = getattr(verdict_or_tier, "tier", verdict_or_tier)
+    topic = getattr(verdict_or_tier, "topic", topic) or topic
+    if tier == HOLD_TIER_ORG_FLOOR:
+        words = _TOPIC_WORDS.get(topic) or "those"
+        return TEMPLATE_HARD_LINE.format(topic=words)
+    return TEMPLATE_HELD_FOR_REVIEW
+
+
+def hold_card_why(verdict_or_tier, *, unarmed_flag=""):
+    """The WHY line on the #fixer card. Names the actual rule, never a blanket label."""
+    tier = getattr(verdict_or_tier, "tier", verdict_or_tier)
+    rule = getattr(verdict_or_tier, "rule", "")
+    detail = getattr(verdict_or_tier, "detail", "")
+    topic = getattr(verdict_or_tier, "topic", "")
+    matched = f" matched {detail!r}" if detail else ""
+    if tier == HOLD_TIER_ORG_FLOOR:
+        words = _TOPIC_WORDS.get(topic) or ("billing, gym hours or class schedule, injury or "
+                                            "liability, ad settings")
+        return (f"hard line (org floor: {words}); rule {rule}{matched}. Never auto answers; "
+                f"needs a teammate. The client has been told a teammate will follow up.")
+    if tier == HOLD_TIER_UNARMED:
+        return (f"{unarmed_flag or 'AUTO_ANSWER'} is off, so this grounded answer needs a "
+                f"teammate's release. The client has been told a teammate will follow up.")
+    return (f"needs a teammate: rule {rule}{matched}. Handed to the FIXER (ticket escalated, "
+            f"unclassified). The client has been told.")
+
+
+def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, account_key,
+                         surface, body, held_message_id, verdict, person="",
+                         write_hold_notice_fn=None, fixer_authored=False, unarmed_flag="",
+                         log=print):
+    """D72: the ONE disposition for a held client answer, shared by the Slack adapter, the
+    portal bridge and the outbox's post-time re-check, so no path can hold silently.
+
+    Writes, in this order: (1) the #fixer TEAM card for the held row; (2) the client's
+    honest notice as a template row (once per ticket and tier; posts without a tap);
+    (3) the ticket: open, escalated, hold_tier visible, and -- for needs_review on an
+    Echo-drafted answer -- classification cleared so the FIXER's poll picks it up."""
+    tid = ticket["id"] if isinstance(ticket, dict) else ticket
+    tier = getattr(verdict, "tier", "") or HOLD_TIER_NEEDS_REVIEW
+    why = hold_card_why(verdict, unarmed_flag=unarmed_flag)
+    write = write_hold_notice_fn
+    if write is None:
+        def write(**kw):
+            return write_hold_notice(bus, **kw)
+    write(ident_name=ident_name, tid=tid, recipient_kind=recipient_kind, user=user or "?",
+          account_key=account_key, kind=KIND_ANSWER, body=body,
+          held_message_id=held_message_id, surface=surface, why=why, person=person)
+    notified = False
+    if recipient_kind not in ("staff", "coach"):
+        notified = _client_hold_notice(bus, tid, ident_name=ident_name,
+                                       recipient_kind=recipient_kind, surface=surface,
+                                       verdict=verdict, tier=tier, log=log)
+    _escalate_held_ticket(bus, ticket, tier=tier, verdict=verdict,
+                          fixer_authored=fixer_authored, log=log)
+    log(f"[slack-convo/{ident_name}] answer HELD ticket={tid} tier={tier} "
+        f"rule={getattr(verdict, 'rule', '')} client_notified={notified}")
+    return {"tier": tier, "why": why, "client_notified": notified}
+
+
+def _client_hold_notice(bus, tid, *, ident_name, recipient_kind, surface, verdict, tier,
+                        log=print):
+    """The client's line, once per ticket per tier. Fails CLOSED on a read fault (a second
+    notice is noise; a missing one is caught by the card, which says whether it was sent)."""
+    try:
+        rows = bus.messages(tid, limit=200) or []
+    except Exception as e:  # noqa: BLE001
+        log(f"[slack-convo/{ident_name}] hold-notice lookup failed ticket={tid}: "
+            f"{type(e).__name__}")
+        return False
+    for m in rows:
+        att = m.get("attachments") or {}
+        if m.get("direction") == "outbound" and att.get("hold_client_notice") == tier:
+            return True
+    text = client_hold_notice_text(verdict if getattr(verdict, "tier", "") else tier,
+                                   getattr(verdict, "topic", ""))
+    bus.record_outbound(ticket_id=tid, author_type=ident_name, body=text,
+                        delivery_status="ready", kind=KIND_TEMPLATE,
+                        meta={"identity": ident_name, "recipient_kind": recipient_kind,
+                              "surface": surface, "hold_client_notice": tier,
+                              "hold_rule": getattr(verdict, "rule", "")})
+    return True
+
+
+def _escalate_held_ticket(bus, ticket, *, tier, verdict, fixer_authored, log=print):
+    """Open, escalated, tier visible. support_tickets.hold_tier is CHECK-constrained to
+    routine|framework (portal migration 0302; 'framework' means Blake-only, which is exactly
+    what this must NOT be), so the column says 'routine' (a teammate's tap suffices) and the
+    detail rides in verification_after.hold. needs_review on an Echo-drafted answer also
+    clears classification: the FIXER's poll takes hold + escalated + classification NULL."""
+    from datetime import datetime as _dt, timezone as _tz
+    t = ticket if isinstance(ticket, dict) else {"id": ticket}
+    tid = t["id"]
+    fields = {"status": "hold", "escalated": True, "hold_tier": "routine"}
+    if tier == HOLD_TIER_NEEDS_REVIEW and not fixer_authored:
+        fields["classification"] = None
+    prior = t.get("verification_after") if isinstance(t.get("verification_after"), dict) \
+        else {}
+    fields["verification_after"] = {
+        **prior,
+        "hold": {"tier": tier, "rule": getattr(verdict, "rule", ""),
+                 "detail": getattr(verdict, "detail", ""),
+                 "topic": getattr(verdict, "topic", ""),
+                 "fixer_authored": bool(fixer_authored),
+                 "at": _dt.now(_tz.utc).isoformat()}}
+    try:
+        bus.set_ticket(tid, **fields)
+    except Exception as e:  # noqa: BLE001 - the card and notice are already written
+        log(f"[slack-convo] hold escalation stamp failed ticket={tid}: {type(e).__name__}")
 
 
 # ---- D53: cards a human can actually read ----------------------------------------------
@@ -749,7 +1058,7 @@ def handle_event(event, event_id, deps):
     lane = ticket.get("lane") or (ident.default_lane if ident.default_lane in ident.allowed_lanes
                                   else "hold")
 
-    def emit(kind, body, author_type=None, meta=None):
+    def emit(kind, body, author_type=None, meta=None, hold_handled=False):
         status = delivery_for(deps, who, kind, lane=lane)
         m = {"surface": surface, "recipient_kind": who.kind, "identity": ident.name}
         if meta:
@@ -757,7 +1066,9 @@ def handle_event(event, event_id, deps):
         # D54 hard line, applied at the single point every outbound row is written: a topic
         # on the forbidden list is HELD no matter what any flag says. delivery_for() reads
         # flags; this reads the message itself, so no flag combination can reach past it.
-        if kind == KIND_ANSWER and m.get("auto_answer_forbidden") and not _is_staffish(who):
+        # D72: any hold TIER stamped by the question branch holds the row the same way.
+        if kind == KIND_ANSWER and not _is_staffish(who) \
+                and (m.get("auto_answer_forbidden") or m.get("hold_tier")):
             status = "held"
         # DV4 (2026-09-03, MAJOR): a QUESTION's answer body is model-generated from a
         # transcript that includes the person's own words -- a successful prompt injection
@@ -773,12 +1084,16 @@ def handle_event(event, event_id, deps):
         row = deps.bus.record_outbound(ticket_id=tid, author_type=author_type or ident.name,
                                        body=safe_body, delivery_status=status, kind=kind, meta=m)
         out.append(kind)
+        if status == "held" and hold_handled:
+            # D72: the caller runs hold_answer_for_team (card + client notice + ticket).
+            out.append(KIND_HOLD_NOTICE)
+            return status, row
         if status == "held":
             _hold_notice(deps, ident, tid, who, user, kind, safe_body, row, surface,
                          no_draft=bool(m.get("no_draft")),
                          forbidden=bool(m.get("auto_answer_forbidden")))
             out.append(KIND_HOLD_NOTICE)
-        return status
+        return (status, row) if hold_handled else status
 
     # 9) the gates that end early
     if not who.is_human_known:
@@ -851,11 +1166,41 @@ def handle_event(event, event_id, deps):
             # D54: the hard lines are checked HERE, at draft time, as well as at post time.
             # A forbidden topic never reaches 'ready' whatever the flags say.
             # BOTH layers, on the question AND on what we are about to say.
-            forbidden = not may_auto_answer(text, answer["body"])
-            emit(KIND_ANSWER, answer["body"],
-                 meta={"answered_with": answer_ident.name,
-                       "routed_from_product": routed_from or None,
-                       "auto_answer_forbidden": bool(forbidden)})
+            # D72: the verdict carries a TIER, and a held answer is never silent -- the
+            # client is told, #fixer gets a team card, the ticket stays open and visible.
+            verdict = auto_answer_verdict(text, answer["body"])
+            armed = deps.auto_answer_armed() \
+                if callable(getattr(deps, "auto_answer_armed", None)) else False
+            base_meta = {"answered_with": answer_ident.name,
+                         "routed_from_product": routed_from or None,
+                         "auto_answer_forbidden": bool(verdict.tier == HOLD_TIER_ORG_FLOOR)}
+            if _is_staffish(who) or (verdict.ok and armed and deps.client_reply_armed()):
+                emit(KIND_ANSWER, answer["body"], meta=base_meta)
+                if not _is_staffish(who) and promises_human_follow_up(answer["body"]):
+                    # The answer says a person will follow up: make that true by mechanism.
+                    # hold + escalated + unclassified is what the FIXER's poll picks up.
+                    deps.bus.set_ticket(tid, status="hold", escalated=True,
+                                        hold_tier="routine", classification=None)
+            elif not deps.client_reply_armed():
+                # Nothing can reach this client at all (CLIENT_REPLY off): the legacy card
+                # is the only honest surface; a client notice would hold the same way.
+                emit(KIND_ANSWER, answer["body"],
+                     meta={**base_meta, "hold_tier": verdict.tier or HOLD_TIER_UNARMED,
+                           "hold_rule": verdict.rule})
+            else:
+                tier = verdict.tier if verdict.held else HOLD_TIER_UNARMED
+                _, row = emit(KIND_ANSWER, answer["body"],
+                              meta={**base_meta, "hold_tier": tier, "hold_rule": verdict.rule},
+                              hold_handled=True)
+                fresh = deps.bus.ticket(tid) or {"id": tid}
+                hold_answer_for_team(
+                    deps.bus, ticket=fresh, ident_name=ident.name, recipient_kind=who.kind,
+                    user=user, account_key=who.account_key, surface=surface,
+                    body=_slack_escape(answer["body"]), held_message_id=(row or {}).get("id"),
+                    verdict=verdict if verdict.held else AnswerVerdict(False, HOLD_TIER_UNARMED),
+                    person=describe_person(deps, who, user),
+                    unarmed_flag=f"SLACK_CONVO_{ident.name.upper()}_AUTO_ANSWER",
+                    log=deps.log)
         else:
             deps.bus.set_ticket(tid, classification=_cls.QUESTION, status="hold",
                                 escalated=True)
@@ -1091,8 +1436,8 @@ def _hold_notice(deps, ident, tid, who, user, kind, body, row, surface, *, no_dr
     if no_draft:
         why = ("nothing was drafted; this is the honest placeholder, not an answer")
     elif forbidden:
-        why = ("held by a hard line (billing, hours or schedule, injury or liability); this "
-               "one can never auto answer whatever the flags say")
+        why = ("held by a hard line (org floor: billing, gym hours or class schedule, injury "
+               "or liability, ad settings); this one never auto answers and needs a teammate")
     write_hold_notice(deps.bus, ident_name=ident.name, tid=tid, recipient_kind=who.kind,
                       user=user, account_key=who.account_key, kind=kind, body=body,
                       held_message_id=(row or {}).get("id"), surface=surface, why=why,
@@ -1160,7 +1505,10 @@ def write_hold_notice(bus, *, ident_name, tid, recipient_kind, user, account_key
             pass
     return bus.record_outbound(
         ticket_id=tid, author_type="system",
-        body=(f"HELD {label} awaiting your tap\n"
+        # D72 (Blake, 2026-09-11): a held row is a TEAM item. "awaiting your tap" named one
+        # person as the only way out; "needs a teammate" names the mechanism (any teammate's
+        # release, or the FIXER acting on the escalated ticket).
+        body=(f"HELD {label}: needs a teammate\n"
               f"FROM: {who_line}\n"
               f"BOT: {ident_name}   TICKET: {tid}\n"
               f"{'WHY: ' + why + chr(10) if why else ''}"

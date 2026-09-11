@@ -209,6 +209,17 @@ def _budget_state(account_key, now=None):
             "remaining": max(0, MONTHLY_RECREATE_BUDGET - used)}
 
 
+def reset_recreate_budget(account_key, now=None):
+    """Operator action (D72, the FIXER's ops lane): zero THIS gym's spend for the current
+    month so the portal's deny / recreate-caption buttons work again. Idempotent -- a
+    second call on an already-zero month changes nothing. Returns {before, after}; the key
+    carries the account_key, so gym A's reset never touches gym B."""
+    before = _budget_state(account_key, now)
+    if before["used"]:
+        _db.kv_set(_budget_key(account_key, now), "0")
+    return {"before": before, "after": _budget_state(account_key, now)}
+
+
 # ==========================================================================
 # GET /portal/<token>/social  -> month calendar for THIS gym
 # ==========================================================================

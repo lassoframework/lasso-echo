@@ -336,29 +336,34 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
             # "a member tweaked her back, what do we tell her?" posted to a client's group DM
             # with no tap. Both paths now call the SAME shared decision so they cannot drift
             # apart again.
-            forbidden = not _a.may_auto_answer(ticket.get("raw_text") or "", answer["body"])
+            # D72 (2026-09-11): the verdict carries a tier, and a held answer is never
+            # silent -- hold_answer_for_team writes the team card, tells the client (a
+            # template row the outbox delivers to the portal thread or the group DM), and
+            # escalates the ticket with the tier visible (needs_review clears the
+            # classification so the FIXER's poll picks it up).
+            verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", answer["body"])
             armed = (config.slack_convo_auto_answer_armed(identity_name)
                      and config.slack_convo_client_reply_armed(identity_name))
-            if forbidden or not armed:
-                why = ("hard line (billing, hours or schedule, injury or liability): this "
-                       "never auto answers, whatever the flags say" if forbidden else
-                       f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER is off: a grounded "
-                       f"answer needs your tap")
+            if verdict.held or not armed:
+                held_verdict = (verdict if verdict.held else
+                                _a.AnswerVerdict(False, _a.HOLD_TIER_UNARMED,
+                                                 "auto_answer_not_armed"))
                 row = bus.record_outbound(
                     ticket_id=tid, author_type=identity_name, body=answer["body"],
                     delivery_status="held", kind=_a.KIND_ANSWER,
                     meta={"identity": identity_name, "recipient_kind": who.kind,
                           "surface": "portal_ticket_bridge",
-                          "auto_answer_forbidden": bool(forbidden)})
-                bus.set_ticket(tid, status="hold", escalated=True)
-                if write_hold_notice:
-                    write_hold_notice(ident_name=identity_name, tid=tid,
-                                      recipient_kind=who.kind,
-                                      user=who.slack_user_id or "", account_key=who.account_key,
-                                      kind=_a.KIND_ANSWER, body=answer["body"],
-                                      held_message_id=(row or {}).get("id"),
-                                      surface="portal_ticket_bridge", why=why)
-                log(f"[echo-ticket-worker] answer HELD ticket={tid} why={why}")
+                          "auto_answer_forbidden": bool(
+                              verdict.tier == _a.HOLD_TIER_ORG_FLOOR),
+                          "hold_tier": held_verdict.tier, "hold_rule": held_verdict.rule})
+                fresh = bus.ticket(tid) or {"id": tid}
+                _a.hold_answer_for_team(
+                    bus, ticket=fresh, ident_name=identity_name, recipient_kind=who.kind,
+                    user=who.slack_user_id or "", account_key=who.account_key,
+                    surface="portal_ticket_bridge", body=answer["body"],
+                    held_message_id=(row or {}).get("id"), verdict=held_verdict,
+                    write_hold_notice_fn=write_hold_notice or None,
+                    unarmed_flag=f"SLACK_CONVO_{identity_name.upper()}_AUTO_ANSWER", log=log)
                 return
             result = _out.initiate(
                 _verified_ticket_dict(ticket), who, ident,

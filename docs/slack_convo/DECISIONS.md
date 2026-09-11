@@ -2821,3 +2821,90 @@ Mutation-checked, `__pycache__` cleared between each: reverting the `run_once()`
 product default, the runner's caller, the outbox dispatch-time recheck, or the
 `ESCALATE_ALWAYS` additions each turns the corresponding test red, including
 `test_client_dm_end_to_end.py`'s full real-adapter path.
+
+## D72 (2026-09-11) -- no silent holds; the FIXER gets hands; Dean's false hard line
+
+**Blake's ruling (2026-09-11), verbatim, supersedes the 2026-09-05 "hold for Blake's tap"
+language in D54 / adapter.py:** "Any message someone sends Echo, Ranger, Wrangler, or Scout
+is addressed, and if it needs a fix it goes to Claude Code (the FIXER) -- autonomous,
+without me." No client message may terminate in a silent hold that waits on Blake. The
+only things that may still refuse to auto-commit are the org floor: billing/price/refunds,
+injury/liability, the GYM's real hours or class schedule (a real-world commitment), and
+pixel/CAPI/ad-budget/targeting changes.
+
+### What was actually holding Dean (ticket 27728832, CrossFit Reverb)
+
+Reproduced against the stored rows (SELECT only). The FIXER drafted a correct answer to
+"is there a way to keep the caption but switch out the picture" and the outbox held it as
+"hard line (billing, hours or schedule, injury or liability)". Neither the question nor the
+answer touched any of those. The two rules that fired were:
+
+* `MAX_AUTO_ANSWER_WORDS = 25` -- Dean's question is 35 words (two plain sentences).
+* `_ANSWER_COMMITS` on "let us know which one and **we will** take a look" -- a promise of
+  human ATTENTION read as a promise of ACTION.
+
+The only other held answer row of the last 30 days (eb3be7d8, CrossFit Zanshin, Pete
+Mongeau) held on the same two rules (44 words; "I'll flag this for someone on the team").
+Both wore the hard-line label because outbox._dispatch_one collapsed every
+`may_auto_answer` failure into one string. The label was the lie, and it is gone.
+
+### What changed
+
+1. **The verdict has a tier** (`adapter.auto_answer_verdict` -> `AnswerVerdict(ok, tier,
+   rule, detail, topic)`; `may_auto_answer` is now `.ok`). `org_floor` = the topic denylist
+   on question or answer (split by topic so the client and the card can name it; the
+   ad-settings leg is new), or a first-person commitment whose SENTENCE names a real-world
+   object (`commitment_is_real_world`). `needs_review` = the structural checks on an
+   ECHO-drafted answer (not about state, publish request, third party, advice, >60 words,
+   a content-action promise). A FIXER-authored row (`attachments.fixer`) is checked against
+   the org floor ONLY -- the FIXER is the reviewer the structural checks stood in for, and
+   re-applying them would bounce the same ticket between the two systems forever.
+2. **Attention is not a promise.** `_NOT_A_PROMISE` gained take a look / flag / follow up /
+   get back / escalate / loop in / dig into / pass it along. A promise of human follow-up
+   in a SENT answer (`promises_human_follow_up`) escalates the ticket to the FIXER
+   (hold + escalated + classification NULL) so the sentence becomes true by mechanism.
+3. **The word cap is 60**, not 25. The third-party and advice-shape guards catch a second
+   subject; length only catches a wall of text.
+4. **One disposition for every hold** (`adapter.hold_answer_for_team`), shared by the
+   Slack adapter (draft time), the portal bridge (`echo_ticket_worker`, draft time) and the
+   outbox (post time): (a) the #fixer card, headed "HELD REPLY: needs a teammate" (never
+   "awaiting your tap"), WHY naming the rule and match; (b) the client's honest line as a
+   `template` row that posts with no tap -- for a floor: "I can't confirm <billing or
+   pricing | injury or liability | your gym's hours or class schedule | ad budget,
+   targeting or tracking> details myself, so I have not answered that part; a LASSO
+   teammate will follow up here today"; otherwise "I have not sent you an answer on this
+   one myself; it is with the LASSO team now and someone will follow up here" -- once per
+   ticket per tier; (c) the ticket open, `escalated=true`, `hold_tier='routine'` (the
+   CHECK constraint allows only routine|framework, and framework means Blake-only, which
+   is exactly what this must not be), the detail in `verification_after.hold = {tier,
+   rule, detail, topic, fixer_authored, at}`, and for `needs_review` on an Echo draft
+   `classification=NULL` so the FIXER's poll (hold + escalated + classification.is.null)
+   takes it. The AUTO_ANSWER-off hold (`auto_answer_unarmed`) tells the client too.
+5. **The FIXER's ops-action lane** (`agent/fixer_ops.py`, mounted on `echo-intake-web`
+   via intake_web and INSIDE the worker via connect_web, plus `python -m agent ops-action`):
+   `POST /ops/actions/<action>` with `X-Fixer-Ops-Secret` == env `FIXER_OPS_SECRET`
+   (constant-time; 401 wrong, 503 unset), body `{gym_key, ticket_id, args}`. Catalog:
+   resend_connect_link, reset_recreate_budget, release_denied_assets, swap_media(row_id),
+   requeue_failed_row(row_id), restage_month(days<=31, background job; `GET
+   /ops/actions/jobs/<id>`). Billing/Stripe, pixel/CAPI, ad budget, targeting and deleting
+   published posts are 403 `org_floor` by name. Every call writes a system row on the
+   ticket ("OPS ACTION <name> by fixer: ...", kind escalation so the portal hides it,
+   delivery_status null so nothing posts it) and one AUDIT log line. Actions that need the
+   worker's /data volume (release_denied_assets, restage_month) answer 503
+   `volume_unavailable` on the web service and say to call the worker.
+
+### Still Blake's, reported not decided
+
+* `SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE` is NOT set on the live `echo` service, so
+  `config.slack_convo_auto_answer_armed` returns False and every client answer -- Echo's
+  and the FIXER's -- still holds at post time (now with the client told and a team card,
+  never silently). D67's lock encodes the finding this entry's tiers address; lifting it is
+  one env var and Blake's call.
+* `FIXER_OPS_SECRET` exists on `echo-intake-web` but not on `echo`; the worker mount (the
+  one with the volume) authenticates nothing until it is set there too.
+* A new `hold_tier` CHECK value ('org_floor', 'needs_review') is a portal migration in the
+  other repo; until then the column says 'routine' and the JSON says which.
+
+Tests: `tests/test_no_silent_holds.py` (the two real held rows as fixtures, eight genuine
+floors, all three paths), `tests/test_fixer_ops.py` (auth, catalog, every action, org floor,
+volume preflight, jobs, the intake_web mount).

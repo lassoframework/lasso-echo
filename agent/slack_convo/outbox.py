@@ -407,32 +407,46 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None):
         # the single may_auto_answer decision (that no path enforces half the rule) did not
         # hold for the post-time path. The ticket carries the question -- raw_text -- so the
         # identical decision can be, and now is, made here too.
-        if (att.get("auto_answer_forbidden")
-                or not _a.may_auto_answer(ticket.get("raw_text") or "", row.get("body"))):
+        # D72 (2026-09-11): the verdict names the rule and carries a TIER. A row the FIXER
+        # authored (attachments.fixer) is checked against the org floor only; an Echo
+        # draft gets the structural checks too. Either way a hold is never silent:
+        # hold_answer_for_team writes the team card, tells the client, escalates the ticket.
+        fixer_authored = bool(att.get("fixer"))
+        verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", row.get("body"),
+                                         grounded_by_fixer=fixer_authored)
+        if att.get("auto_answer_forbidden") and verdict.ok:
+            # A draft-time check marked this org floor; the marker is a hard signal even
+            # when the body re-read passes (an older, stricter rule may have written it).
+            verdict = _a.AnswerVerdict(False, _a.HOLD_TIER_ORG_FLOOR,
+                                       "draft_time_forbidden_marker")
+        if verdict.held:
             bus.mark_message(row["id"], "held",
-                             meta_update={"held_why": "hard line: never auto answered"})
+                             meta_update={"held_why": f"{verdict.tier}: {verdict.rule}",
+                                          "hold_tier": verdict.tier,
+                                          "hold_rule": verdict.rule})
             summary["held"] += 1
-            _a.write_hold_notice(
-                bus, ident_name=identity.name, tid=ticket["id"],
-                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
-                account_key=None, kind=kind, body=row.get("body") or "",
-                held_message_id=row["id"], surface=att.get("surface") or "",
+            _a.hold_answer_for_team(
+                bus, ticket=ticket, ident_name=identity.name, recipient_kind=recipient_kind,
+                user=ticket.get("slack_user_id") or "?", account_key=None,
+                surface=att.get("surface") or "", body=row.get("body") or "",
+                held_message_id=row["id"], verdict=verdict,
                 person=_person_for_card(bus, ticket, identity),
-                why="hard line (billing, hours or schedule, injury or liability): this never "
-                    "auto answers, whatever the flags say")
+                fixer_authored=fixer_authored, log=log)
             return
         if not config.slack_convo_auto_answer_armed(identity.name):
+            flag = f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER"
             bus.mark_message(row["id"], "held",
-                             meta_update={"held_why": "auto answer not armed"})
+                             meta_update={"held_why": "auto answer not armed",
+                                          "hold_tier": _a.HOLD_TIER_UNARMED})
             summary["held"] += 1
-            _a.write_hold_notice(
-                bus, ident_name=identity.name, tid=ticket["id"],
-                recipient_kind=recipient_kind, user=ticket.get("slack_user_id") or "?",
-                account_key=None, kind=kind, body=row.get("body") or "",
-                held_message_id=row["id"], surface=att.get("surface") or "",
+            _a.hold_answer_for_team(
+                bus, ticket=ticket, ident_name=identity.name, recipient_kind=recipient_kind,
+                user=ticket.get("slack_user_id") or "?", account_key=None,
+                surface=att.get("surface") or "", body=row.get("body") or "",
+                held_message_id=row["id"],
+                verdict=_a.AnswerVerdict(False, _a.HOLD_TIER_UNARMED, "auto_answer_not_armed"),
                 person=_person_for_card(bus, ticket, identity),
-                why=f"SLACK_CONVO_{identity.name.upper()}_AUTO_ANSWER is off: a grounded "
-                    "answer needs your tap")
+                fixer_authored=fixer_authored, unarmed_flag=flag, log=log)
             return
     # 5b. GAP 2 (audit of PR #68): a row THIS SPECIFIC LANE wrote must re-verify that
     # lane's OWN full three-flag interlock at dispatch time, not only the general

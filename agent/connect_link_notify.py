@@ -174,14 +174,21 @@ def _slack_send(channel, text, *, token, http=None):
     return bool(body.get("ok"))
 
 
-def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None):
+def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None,
+                   force=False):
     """Send a newly-registered gym's owner its connect link, once. Returns True only
     when a message was actually sent this call. OFF unless
     config.auto_connect_link_enabled(). Never raises; every failure path ESCALATES
     via `alert` (NEEDS_TRIAGE by ops_triage's fail-safe default) rather than doing
     nothing silently -- a silent gap here is precisely the bug this module exists to
-    close."""
-    if not config.auto_connect_link_enabled():
+    close.
+
+    `force=True` (D72, the FIXER's `resend_connect_link` ops action): an explicit
+    operator RESEND. It skips the auto-send flag (this is not the automatic first send
+    the flag governs) and the once-ever dedupe stamp; everything else -- owner resolved
+    from the portal's own records, the fixed template, the approver in the DM -- is the
+    same path. Callers of the automatic send are byte-for-byte unchanged."""
+    if not force and not config.auto_connect_link_enabled():
         return False
     base_key = str(base_key or "").strip()
     gym_name = str(gym_name or "").strip()
@@ -193,11 +200,12 @@ def notify_new_gym(base_key, gym_id, gym_name, *, db=None, http=None, alert=None
         from .ops_alerts import alert as alert
 
     dedupe_key = f"connect_link_sent_{base_key}"
-    try:
-        if db.kv_get(dedupe_key):
-            return False
-    except Exception:
-        pass  # a dedupe READ failure must not block a first-ever send
+    if not force:
+        try:
+            if db.kv_get(dedupe_key):
+                return False
+        except Exception:
+            pass  # a dedupe READ failure must not block a first-ever send
 
     token = os.environ.get(config.SLACK_BOT_TOKEN_ENV, "")
     if not token:
