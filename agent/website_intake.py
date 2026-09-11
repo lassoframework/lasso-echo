@@ -489,8 +489,15 @@ def intake_from_website(base, *, domain=None, status=None, force=False,
 def _alert_once(base, message, alert=None):
     """One deduped ops alert per gym per outcome: the same message never posts
     twice (kv-stamped), so a daily runner pass cannot flood Slack with the same
-    'could not auto-intake' line every day. Best effort, never raises."""
+    'could not auto-intake' line every day. DURABLE-OR-SILENT: when the kv store
+    is ephemeral (no AGENT_DB_PATH, no data volume) the stamp cannot persist
+    across process runs, so this function logs locally and stays off Slack rather
+    than storm on every sweep pass (same rule as the gritx needs-media storm fix,
+    2026-08-27). Best effort, never raises."""
     try:
+        if not db.kv_is_durable():
+            print(f"[website-intake] alert suppressed (kv not durable): {message}")
+            return False
         key = f"website_intake_alert_{base}"
         if db.kv_get(key) == message:
             return False
@@ -518,6 +525,13 @@ def run(bases=None, websites=None, fetch=None, llm=None, alert=None):
     if bases is None:
         from .calendar_autopublish import client_gym_bases
         bases = client_gym_bases()
+    # ECHO CLIENTS ONLY (2026-09-11): this sweep fetched 131 gym websites -- the whole
+    # LASSO ads fleet -- and wrote brand bibles for gyms that never bought Echo, because
+    # the registry it iterated had been auto-filled off echo_intake_tokens. The registry
+    # is gated at its source now; this second gate makes the sweep safe even against a
+    # polluted registry or an explicit `bases` list. Fails closed.
+    from . import echo_clients
+    bases = echo_clients.only_client_bases(bases)
     websites = websites or {}
     intaken, skipped, failed, landed = [], [], [], 0
     for base in bases:

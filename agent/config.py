@@ -403,9 +403,12 @@ def onboarding_watch_enabled() -> bool:
     a different key, no approved sources, no Zernio profile, zero connected platforms,
     or Facebook connected with no page selected.
 
-    It audits against echo_intake_tokens rather than Echo's own registry, because every
+    It audits against the portal's roster rather than Echo's own registry, because every
     failure of this class has arrived as a gym MISSING from that registry — which is
     exactly why connection_watch never saw Hill Country, the gym it was built for.
+    THE ROSTER IS ECHO CLIENTS ONLY (2026-09-11): echo_intake_tokens rows for gyms with
+    an echo_gym_settings row, via agent/echo_clients.py. The token table alone is the
+    whole LASSO ads fleet, and sweeping it DMed 36 non-clients a connect link.
     Read-only apart from its dedup stamps; it never registers, connects or approves
     anything. Arm by hand in Railway env.
     """

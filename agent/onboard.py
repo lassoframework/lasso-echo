@@ -156,11 +156,27 @@ Account(
 # Stage 2 T2: Autonomous onboard  (run via: python -m agent onboard ...)
 # ---------------------------------------------------------------------------
 
+class OnboardRefused(RuntimeError):
+    """onboard.run refused to stand up a gym that carries no Echo client marker.
+    Raised (not returned) so POST /portal/onboard's generic exception path stops the
+    mint: no token, no gym row, no scaffold. `force=True` (the CLI's --force, a human
+    at the keyboard) bypasses it."""
+
+
 def run(account_key, display_name, db_conn=None, voice_dir=None,
-        brains_dir=None, base_url=None, socialapi_http=None, posting_timezone=None):
+        brains_dir=None, base_url=None, socialapi_http=None, posting_timezone=None,
+        force=False):
     """
     Stand up a new gym end to end. Idempotent: re-running updates display_name
     if different, never re-mints unless rotate was called.
+
+    ECHO CLIENTS ONLY (2026-09-11, round 2 ruling): after the canonical key is derived
+    the gym must carry an Echo client marker (echo_clients.is_echo_client by the portal
+    uuid or by the key) or OnboardRefused is raised before anything is written. The
+    portal's per-gym Echo onboard button upserts echo_gym_settings before it calls
+    POST /portal/onboard (parallel portal PR), so the rule is true by construction for
+    the real door; `force=True` is the operator's by-hand bypass (python -m agent
+    onboard --force).
 
     Returns a result dict with keys:
       account_key, display_name, token_minted, voice_path, brain_path,
@@ -215,6 +231,17 @@ def run(account_key, display_name, db_conn=None, voice_dir=None,
     # creds) the passed key is kept verbatim; NEVER fabricates a gym_id, NEVER blocks the mint.
     from . import account_key_mint as _akm
     account_key, _mint_info = _akm.derive_mint_key(account_key, display_name)
+
+    # THE GATE. Nothing below this line is written for a gym that is not an Echo client.
+    if not force:
+        from . import echo_clients
+        _uuid = (_mint_info or {}).get("gym_uuid") or ""
+        if not (echo_clients.is_echo_client(_uuid) or echo_clients.is_echo_client(account_key)):
+            raise OnboardRefused(
+                f"{account_key}: not an Echo client (no echo_gym_settings / "
+                "echo_social_intake / social product / echo_standalone marker). Onboard "
+                "it from the portal's Echo button (which writes the marker first), or "
+                "re-run with --force by hand.")
 
     result = {
         "account_key": account_key,
