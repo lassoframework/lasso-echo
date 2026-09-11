@@ -12,6 +12,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import config, ops_alerts, rotation  # noqa: E402
@@ -278,4 +280,34 @@ def test_output_gate_still_allows_unrelated_copy():
     # program is starting/enrolling
     source = "We coach every fitness level with real, sustainable programming."
     cap = "It's not about where you're starting; it's about where you're going."
+    assert rotation.caption_output_gate_clean(cap, source) is True
+
+
+# ---- second independent audit (2026-09-10) found the widened regex still missed
+# a whole FAMILY of scarcity/urgency CTA phrasing that names no "starting"/"sign
+# up"/"registration" word at all. Each of these is a bypass that audit found. ----
+
+_REVERB_CHALLENGE_SOURCE_2 = (
+    "Members who completed our 6-week Nutrition Challenge reported more energy.")
+
+
+@pytest.mark.parametrize("phrase", [
+    "Don't miss out on our next challenge!",
+    "Last chance to join the challenge!",
+    "Final week to sign up for the challenge!",
+    "Enroll before it is too late!",
+    "Seats are going fast for the challenge!",
+    "This is your chance to join the challenge!",
+    "Act now and grab your spot!",
+    "Only a few days left to register!",
+    "Hurry, the challenge starts in days!",
+    "Grab your spot before they are gone!",
+])
+def test_output_gate_blocks_scarcity_urgency_family(phrase):
+    assert rotation.caption_output_gate_clean(phrase, _REVERB_CHALLENGE_SOURCE_2) is False
+
+
+def test_output_gate_scarcity_phrase_allowed_when_source_states_it():
+    source = "Only 3 seats are going fast for tomorrow's free intro workshop."
+    cap = "Seats are going fast for tomorrow's free intro workshop, come try it out."
     assert rotation.caption_output_gate_clean(cap, source) is True

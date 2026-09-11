@@ -247,6 +247,26 @@ _TEMPORAL_IMMEDIACY_RE = re.compile(
     r"registration is (?:now )?open|starts soon|"
     r"limited spots|spots? (?:are |is )?(?:left|remaining|filling))\b", re.IGNORECASE)
 
+# A second, broader tier for the SAME fabrication class: scarcity/urgency CTA
+# phrasing an LLM reaches for around a "challenge"/"seminar" topic without ever
+# using the "starting"/"registration"/"sign up" words the first tier looks for
+# (a second independent audit, 2026-09-10, found 10/10 of these slipped past the
+# first tier: "don't miss out", "last chance", "seats are going fast", etc.).
+# Pattern-based (word roots, not literal phrases) so nearby paraphrases of the
+# audit's own examples are covered too, not just the exact strings it tried.
+# STILL a deny-list, not a semantic check: a sufficiently novel paraphrase of
+# urgency that uses none of these roots will not be caught by regex alone. A
+# fully bypass-proof close would need an LLM-based semantic fabrication check
+# (a real cost/latency tradeoff) -- flagged as a follow-up decision, not built
+# here without that call.
+_SCARCITY_URGENCY_RE = re.compile(
+    r"\b(don'?t miss(?: out)?|last chance|final (?:week|day|call|hours?) to "
+    r"(?:sign up|join|register|enroll)|before it'?s too late|enroll before|"
+    r"seats? (?:are |is )?(?:going fast|filling(?: up)? fast|almost gone|running out)|"
+    r"this is your chance|act now|grab your spot|hurry|"
+    r"only .{0,20}(?:days?|spots?|seats?) left|before the(?:y'?re| spots are) gone)\b",
+    re.IGNORECASE)
+
 _PERSONALIZED_CHILD_RE = re.compile(r"\byour (?:kid|kids|child|children)\b", re.IGNORECASE)
 _CHILD_GROUNDING_RE = re.compile(r"\b(kid|kids|child|children|youth|toddler)\b", re.IGNORECASE)
 
@@ -277,6 +297,9 @@ def caption_output_gate_clean(caption, source_text, verified=None, photo_hint=""
         return True
     source_text = source_text or ""
     for m in _TEMPORAL_IMMEDIACY_RE.finditer(text):
+        if m.group(0).lower() not in source_text.lower():
+            return False
+    for m in _SCARCITY_URGENCY_RE.finditer(text):
         if m.group(0).lower() not in source_text.lower():
             return False
     if _PERSONALIZED_CHILD_RE.search(text):
