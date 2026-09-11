@@ -1070,6 +1070,23 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 "upserted": 0, "days": 0, "skipped_banned": 0,
                 "media_count": media_count}
 
+    # PER-GYM BUILD LOCK (ticket 4941e162, CrossFit Reverb, 2026-09-11): refuse a
+    # SECOND concurrent rebuild for the same gym rather than race it. Ground truth
+    # in content_calendar showed five separate insert timestamps inside two hours,
+    # several landing near-duplicate captions on the SAME post_date side by side --
+    # only possible when two build_client_month calls (the nightly client_media_sync
+    # scan, a FIXER-triggered manual restage, a stale-run retry that was never
+    # actually killed) overlapped: delete_month then insert is idempotent ACROSS
+    # serial reruns, never across CONCURRENT ones. See agent/build_lock.py. A gym
+    # already mid-build answers a clean no-op, never a partial/duplicated write.
+    from . import build_lock as _build_lock
+    _lock_holder = f"{os.getpid()}:{id(store)}"
+    if not _build_lock.acquire(base_key, holder=_lock_holder):
+        log(f"{base_key}: rebuild already in progress for this gym; skipping "
+            "this call rather than racing it (see agent/build_lock.py)")
+        return {"ok": False, "reason": "build_in_progress", "upserted": 0,
+                "days": 0, "skipped_banned": 0, "media_count": media_count}
+
     # LOCKED-CALENDAR AWARENESS: read the gym's EXISTING human-owned rows (approved /
     # published / denied / killed — anything a rebuild must preserve) across the span
     # BEFORE planning, so the rebuild composes with them instead of fighting them:
@@ -1125,6 +1142,7 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
                 # assets stay free, which is correct.)
                 _restore_released_drive_assets(base_key, released_drive, log)
         client_content.clear_drive_pool_cache()
+        _build_lock.release(base_key, holder=_lock_holder)
 
 
 def _build_client_month_body(account, base_key, start, days, *, voice, library_path,
