@@ -133,6 +133,16 @@ Copy `.env.example` to `.env` and fill by hand. Never commit `.env`.
 - `AGENT_SLACK_BOT_TOKEN`, `AGENT_SLACK_CHANNEL_ID` — Slack control surface.
 - `AGENT_VOICE_DOC_PATH` — defaults to `brand_voice/lasso_voice.md`.
 - `AGENT_LIBRARY_PATH` — defaults to `content_library/`.
+- Image engine (Astra is the DEFAULT, Gemini is the fallback):
+  - `OPENAI_API_KEY` — Astra key. Absent = boot with `engine=gemini` + one warning.
+  - `IMAGE_ENGINE` — `astra` (default) or `gemini`.
+  - `ASTRA_BRIEF_MODEL` — defaults to `gpt-6-astra`.
+  - `ASTRA_IMAGE_MODEL` — defaults to `gpt-image-2.5-sunburst` (infographics,
+    carousels, any text overlay).
+  - `ASTRA_IMAGE_MODEL_FLARE` — defaults to `gpt-image-2.5-flare` (story-format
+    quick graphics with no rendered text).
+  - `AGENT_IMAGE_DAILY_COST_ALERT_USD` — defaults to `10.00`.
+  - Full table, including the cost-estimate rates: `docs/ENV.md`.
 - Per-account tokens + target ids (set by hand, never logged):
   - `AGENT_LASSO_IG_TOKEN`, `AGENT_LASSO_IG_USER_ID`
   - `AGENT_LASSO_FB_TOKEN`, `AGENT_LASSO_FB_PAGE_ID`

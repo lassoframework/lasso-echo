@@ -103,18 +103,62 @@ before this file existed.
 | AGENT_CAPTION_FORM_PLAN | false | BLAKE | Per-post caption SHAPE planning. ON: every post is handed a concrete form (an opening move out of six, a sentence/character band out of three) instead of the identical soft "VARY the ENTRY POINT" instruction on all of them. STYLE ONLY: a plan carries no fact, no topic and no copy, and every fabrication, figure, banned-word and no-dash gate still runs unchanged. OFF = the SB7 prompt is byte-for-byte today's, including its fixed "Max 260 characters". |
 | AGENT_CROSS_GYM_BRAIN | false | BLAKE | Fleet FORM rollup into the `cross_gym_brain` table, plus the `cross_gym_guidance.guidance_for()` read side. FORM ONLY: findings and guidance carry lever names, lever value tokens and numbers, and the writer REFUSES to write when any string is not a known token. No caption text, stat, offer, member name, handle or gym_id is ever stored. Guidance is identical for every gym by construction, which is the isolation guarantee. REQUIRES `migrations/cross_gym_brain_20260906.sql` to be hand-applied first; armed without it the writer fails loud (ok=False) and the reader returns empty guidance. |
 
-## Creative studio (Gemini)
+## Image engine (Astra default, Gemini fallback)
+
+ChatGPT-6 Astra (`gpt-image-2.5`) is the DEFAULT image/infographic generator.
+Gemini / Nano Banana is unchanged and demoted to the fallback rung. The chain is
+`Astra -> retry once with backoff -> Gemini -> mark "needs human"`; the last rung
+fires an ops alert AND writes an `image_needs_human` audit row, so a calendar
+slot can never fail silently. Nothing here changes publishing: every generated
+asset still lands in the same approval queue as uploaded creative.
+
+The spec env names are UNPREFIXED. Each also accepts an `AGENT_`-prefixed alias
+(`AGENT_IMAGE_ENGINE`, `AGENT_ASTRA_IMAGE_MODEL`, ...) so the repo's env
+conventions still reach it; the unprefixed name wins when both are set.
 
 | Var | Default | Owner | Notes |
 |---|---|---|---|
-| AGENT_NANO_ENABLED | false | BLAKE | Infographic generation. |
+| OPENAI_API_KEY | (unset) | BLAKE | OpenAI key for the Astra Responses call. Read lazily by name, never stored on an object, never logged. **Absent = boot with `engine=gemini` and ONE warning** (no crash, no silent drop). |
+| IMAGE_ENGINE | astra | code | Primary engine: `astra` (default) or `gemini`. `gemini` skips Astra entirely. Gemini is ALWAYS the last rung when Astra is primary. |
+| ASTRA_BRIEF_MODEL | gpt-6-astra | code | The Responses-API model that reads the creative brief and calls the image tool. |
+| ASTRA_IMAGE_MODEL | gpt-image-2.5-sunburst | code | Sunburst: infographics, carousels, and ANY asset with text overlays. |
+| ASTRA_IMAGE_MODEL_FLARE | gpt-image-2.5-flare | code | Flare: story-format quick graphics that render no text. A story card WITH a rendered headline is a text asset and stays on Sunburst. |
+| AGENT_ASTRA_RESPONSES_URL | https://api.openai.com/v1/responses | code | Endpoint override for a proxy / gateway. Never for swapping providers. |
+
+**Sizes are SNAPPED before the call.** Verified against the live API 2026-09-10:
+the image tool rejects any size whose width or height is not divisible by 16
+(`HTTP 400 "Invalid size '1080x1350'. Width and height must both be divisible by
+16."`). Both Echo targets fail that rule on width, so `image_engine.snap_size`
+converts them to the same aspect with both dimensions divisible by 16 before the
+request, and the result is scaled back to the target afterwards:
+
+| target | sent to Astra | back to |
+|---|---|---|
+| 1080x1350 (4:5 feed) | 1024x1280 | 1080x1350 |
+| 1080x1920 (9:16 story) | 1152x2048 | 1080x1920 |
+
+Without the snap every Astra call 400s and the chain lives on the Gemini rung by
+accident, which looks identical to working.
+| AGENT_ASTRA_COST_SUNBURST_USD | 0.19 | code | ESTIMATED USD per Sunburst image (logging only, never a billing read). |
+| AGENT_ASTRA_COST_FLARE_USD | 0.04 | code | ESTIMATED USD per Flare image. |
+| AGENT_GEMINI_COST_PER_IMAGE_USD | 0.039 | code | ESTIMATED USD per Gemini image. |
+| AGENT_IMAGE_DAILY_COST_ALERT_USD | 10.00 | code | One ops alert per day once estimated image spend crosses this. |
+| AGENT_IMAGE_URL_FOOTER | LASSOFRAMEWORK.COM | code | The URL rendered in the brief's footer block. |
+
+## Creative studio (Gemini)
+
+Now the FALLBACK engine. Everything below is unchanged.
+
+| Var | Default | Owner | Notes |
+|---|---|---|---|
+| AGENT_NANO_ENABLED | false | BLAKE | Infographic generation. Still the master switch for BOTH engines: off = no image is drawn by anyone. |
 | AGENT_NANO_API_KEY | (unset) | BLAKE | Gemini key. Never logged. |
 | AGENT_NANO_MODEL | gemini-3-pro-image | code | Image GENERATION model (Nano Banana). Returns image parts, not text. |
 | AGENT_OCR_MODEL | gemini-3.5-flash | code | Vision READ model (image to text) for OCR / autotag / the pixel fabrication gate. MUST be a vision-capable TEXT model, NOT a `*-image` generation model (those cannot transcribe text out of an image). Uses the same AGENT_NANO_API_KEY. NOTE: `gemini-2.5-flash` was retired for new accounts (returns 404 / "no longer available"); `gemini-3.5-flash` is the current default flash. A model-not-found error posts ONE loud ops warning naming the bad model and cards with rendered pixels BLOCK fail-closed until it is fixed. |
 | AGENT_IMAGE_ASPECT / AGENT_IMAGE_PIXELS | 4:5 / 1080x1350 | code | Feed target. |
 | AGENT_STORY_ASPECT / AGENT_STORY_PIXELS | 9:16 / 1080x1920 | code | Story target. |
-| AGENT_SPEND_CAP_ENABLED | false | BLAKE | Per-account daily generation cap. |
-| AGENT_GEMINI_DAILY_CAP | 40 | code | Calls/day/account under the cap. |
+| AGENT_SPEND_CAP_ENABLED | false | BLAKE | Per-account daily generation cap. Now covers BOTH engines: it gates `creative_studio.generate` before any engine is chosen, so an Astra render counts against it exactly like a Gemini one. The bucket name (`gemini_calls:<account>`) is historical. |
+| AGENT_GEMINI_DAILY_CAP | 40 | code | Generation calls/day/account under the cap, either engine. |
 | AGENT_OCR_CHECK_ENABLED | false | BLAKE | Headline OCR warning (never blocks). |
 | AGENT_AUTOTAG_ENABLED | false | BLAKE | DAM auto-tag on ingest. |
 | AGENT_CONSENT_GUARD_ENABLED | false | BLAKE | People=consent gate. |

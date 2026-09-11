@@ -47,7 +47,7 @@ exists (rotation's canvas guard).
 import os
 import re
 
-from . import config
+from . import config, image_engine as _image_engine
 
 
 # A single Gemini render call must never stall the whole calendar. Each network
@@ -561,6 +561,50 @@ def _route_model(headline="", facts=None):
     return config.NANO_MODEL_FLASH, f"flash:photographic (model={config.NANO_MODEL_FLASH})"
 
 
+def _astra_available():
+    """True when the Astra engine is selected AND a key is present. Used to keep
+    the old no-engine contract: with neither a Gemini client nor an Astra key,
+    generate() still returns None with no API call and no alert."""
+    return (_image_engine.engine_name() == "astra"
+            and bool(os.environ.get(_image_engine.OPENAI_API_KEY_ENV)))
+
+
+def _route_label(result, gemini_route):
+    """The `route` string on generate()'s return dict, now engine-prefixed. A
+    Gemini render KEEPS its existing pro/flash route label after the prefix, so
+    every reader of that field still sees what it always saw."""
+    if result.engine == "gemini":
+        return f"gemini:{gemini_route}"
+    return f"{result.engine}:{result.model}"
+
+
+def _engine_opts(headline, surface, pixels, gemini_model):
+    """Routing opts for one card. A rendered headline makes the card a TEXT
+    OVERLAY asset, which pins Astra to Sunburst even on a Story surface; a story
+    card with no rendered text takes the Flare quick-graphic route."""
+    use_surface = surface or "feed post"
+    return {
+        "kind": "infographic",
+        "surface": use_surface,
+        "pixels": pixels,
+        "has_text_overlay": bool(str(headline or "").strip()),
+        "gemini_model": gemini_model,
+    }
+
+
+def _astra_brief_for(headline, facts, surface, pixels):
+    """The Astra creative brief for this card, or None to reuse the Gemini prompt
+    if the brief cannot be built. Never raises into the render path."""
+    try:
+        from . import astra_prompt
+        return astra_prompt.build_infographic_brief(
+            headline, facts, surface=surface or "feed post", pixels=pixels)
+    except Exception as exc:  # noqa: BLE001 - a brief failure must not lose the card
+        print(f"[creative-studio] astra brief build failed "
+              f"({type(exc).__name__}: {exc}); using the shared prompt.")
+        return None
+
+
 def _scrub_dashes(text):
     """Strip em/en dashes from AI generation prompt text (the brand no-dash rule).
     Delegates to copy_gate.scrub_prompt(), which converts banned dashes to a space
@@ -711,14 +755,21 @@ def generate_social_proof(kind, main_line, support_line="", attribution="",
     prompt = build_social_proof_prompt(kind, main_line, support_line, attribution,
                                        aspect=aspect, pixels=pixels, surface=surface)
     client = client or _default_client()
-    if client is None:
+    # UNCHANGED contract: no Gemini client AND no Astra key -> None, no API call.
+    if client is None and not _astra_available():
         return None
 
-    image_bytes = _render_with_timeout(
-        lambda: client.generate_image(prompt=prompt, model=config.NANO_MODEL)
-    )
-    if image_bytes is None:
+    # A proof card always renders text, so Astra routes it to Sunburst. The card
+    # prompt is already a full brief, so both engines read the same text.
+    result = _image_engine.generate_image(
+        prompt,
+        {"kind": "infographic", "surface": surface or "feed post",
+         "pixels": pixels, "has_text_overlay": True,
+         "gemini_model": config.NANO_MODEL},
+        gemini_client=client, subject=str(main_line or "")[:120])
+    if result is None:
         return None
+    image_bytes = result.image_bytes
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", str(main_line).lower()).strip("_")[:60] or "proof"
@@ -958,21 +1009,38 @@ def generate(headline, facts, client=None, out_path=None,
                           canvas=canvas, layout=layout)
 
     client = client or _default_client()
-    if client is None:
+    # UNCHANGED contract: with NO usable engine at all (no Gemini client AND no
+    # Astra key) this returns None with no API call and no alert, exactly as it
+    # did before Astra existed. An Astra key alone is now enough to render.
+    if client is None and not _astra_available():
         return None
 
-    model, route = _route_model(headline, facts)
-    print(f"[creative-studio] model route: {route}")
+    gemini_model, gemini_route = _route_model(headline, facts)
+    print(f"[creative-studio] gemini fallback route: {gemini_route}")
+
+    opts = _engine_opts(headline, surface, pixels, gemini_model)
 
     def _do_generate(p):
-        # Wrapped with a hard timeout + bounded retry so one hung Gemini call
-        # can never stall a long render. Returns None on the final timeout /
-        # failure; the caller treats None as "no image" and skips the day.
-        return _render_with_timeout(lambda: client.generate_image(prompt=p, model=model))
+        # ASTRA FIRST (retry once with backoff), then the UNCHANGED Gemini path,
+        # then "needs human". Each engine gets its own prompt: Astra reads the
+        # creative brief, Gemini reads the classic single-prompt text.
+        call_opts = dict(opts)
+        call_opts["engine_prompts"] = {
+            "astra": _astra_brief_for(headline, facts, surface, pixels),
+            "gemini": p,
+        }
+        return _image_engine.generate_image(
+            p, call_opts, gemini_client=client,
+            account_key=account_key or "", subject=headline or "")
 
-    image_bytes = _do_generate(prompt)
-    if image_bytes is None:
+    result = _do_generate(prompt)
+    if result is None:
+        # Every engine failed; image_engine already marked it NEEDS HUMAN (ops
+        # alert + audit row). None keeps the caller's existing behavior.
         return None
+    image_bytes = result.image_bytes
+    prompt = result.prompt_used or prompt
+    model, route = result.model, _route_label(result, gemini_route)
 
     if config.style_gate_enabled() or config.image_grade_enabled():
         from . import grade_gate as _gg
@@ -1006,9 +1074,12 @@ def generate(headline, facts, client=None, out_path=None,
             prompt = build_prompt(headline, facts, aspect=aspect, pixels=pixels,
                                   surface=surface, archetype=archetype, palette=palette,
                                   canvas=canvas, layout=layout)
-            image_bytes = _do_generate(prompt)
-            if image_bytes is None:
+            result = _do_generate(prompt)
+            if result is None:
                 return None
+            image_bytes = result.image_bytes
+            prompt = result.prompt_used or prompt
+            model, route = result.model, _route_label(result, gemini_route)
 
     if out_path is None:
         slug = re.sub(r"[^a-z0-9]+", "_", (headline or "infographic").lower()).strip("_") or "infographic"

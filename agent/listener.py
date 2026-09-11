@@ -886,6 +886,11 @@ def run_listener():
     # 404s. Same class of self-announcing guard as the OCR model check.
     from . import creative_studio as _cs
     _cs.validate_generation_models()
+    # Image engine announcement: which engine is actually in force this boot.
+    # Astra (gpt-image-2.5) is the default; with no OPENAI_API_KEY the chain
+    # boots on Gemini and says so ONCE, so the demotion is never a silent one.
+    from . import image_engine as _ie
+    _ie.announce_boot()
     # Facebook connect page: a small HTTP surface INSIDE this process (it needs
     # the /data store for the page token). Dormant unless AGENT_CONNECT_ENABLED;
     # while off, no thread starts and the routes would 404 anyway.
