@@ -144,11 +144,17 @@ class PortalGymsReader:
             return set()
         return set(rows[0].keys())
 
-    def list_recent_portal_gyms(self, days=45):
-        """Portal gyms created within the last `days`, newest-usable first. Returns a
-        list of dicts: {gym_id, name, created_at, domain, slug}. `domain` is the first
+    def list_recent_portal_gyms(self, days=45, is_client=None):
+        """Recently created ECHO CLIENT gyms, newest-usable first. Returns a list of
+        dicts: {gym_id, name, created_at, domain, slug}. `domain` is the first
         non-empty domain-bearing column that ACTUALLY exists on the table (none today,
         so it is ""). Creds absent -> [] (nothing read, worker unchanged).
+
+        ECHO CLIENTS ONLY (2026-09-11): the portal `gyms` table is the whole LASSO ads
+        fleet, and this reader is the enumeration behind the welcome trigger. Every row
+        must pass `is_client` (default echo_clients.is_echo_client, fail closed) or it
+        is not returned at all -- the consumer gates again, but the enumerator itself
+        must never hand out a non-client.
 
         Demo / load-test / verification gyms are excluded when those flag columns exist,
         and so are rows in a known non-client status (onboarding lead stubs, inactive,
@@ -182,11 +188,15 @@ class PortalGymsReader:
             raise PortalGymsError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
 
+        from . import echo_clients
+        is_client = is_client or echo_clients.is_echo_client
         domain_cols = [c for c in _DOMAIN_COLS if c in cols]
         out = []
         for row in rows:
             if _is_excluded(row):
                 continue
+            if not is_client(row.get("id")):
+                continue                    # an ads-only gym: not Echo's to welcome
             name = (row.get("name") or "").strip()
             if not name:
                 continue  # no name = no card
@@ -255,12 +265,14 @@ def is_excluded(row):
 _is_excluded = is_excluded  # internal alias (kept for existing callers)
 
 
-def list_recent_portal_gyms(days=45, reader=None):
-    """Module-level convenience: recently created portal gyms as
+def list_recent_portal_gyms(days=45, reader=None, is_client=None):
+    """Module-level convenience: recently created ECHO CLIENT portal gyms as
     [{gym_id, name, created_at, domain, slug}]. Creds absent -> [] (nothing read).
     `reader` is injectable for tests; the default constructs a PortalGymsReader that
     reads SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY lazily."""
     reader = reader or PortalGymsReader()
+    if is_client is not None:
+        return reader.list_recent_portal_gyms(days=days, is_client=is_client)
     return reader.list_recent_portal_gyms(days=days)
 
 
