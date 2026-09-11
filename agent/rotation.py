@@ -220,6 +220,96 @@ def is_gate_clean(note, approved_claims=None):
     return True
 
 
+# ---- output-side caption gate (the GENERATED caption, not just its source) --------
+# is_gate_clean (above) validates the SOURCE sentence handed to the caption writer;
+# for a client account (agent/client_content.py) that source is an approved claim BY
+# CONSTRUCTION, so the check trivially passes and the LLM-WRITTEN caption itself was
+# never re-checked against anything. That let the writer invent a temporal frame
+# around a true fact (Dean/Reverb, 2026-09-10: an approved source describes a
+# COMPLETED past nutrition seminar/challenge; the generated caption said "last week"
+# and "join our challenge starting", asserting an enrollment that does not exist) or
+# personalize a photo the gym's own service list merely NAMES (Kids Classes) onto a
+# picture nothing has confirmed shows a child ("your kid" on an adult photo). Neither
+# is a numeric figure, so _CLAIM_RE / is_gate_clean never sees it.
+# Widened after an independent audit (2026-09-10) found the first version blocked
+# only Dean's exact phrasings and let realistic paraphrases of the SAME fabrication
+# ship: "starting THIS Monday", "kicks BACK off", "registration is now open",
+# "begins Monday", "sign-up is live", "limited spots left". This is a deny-list, not
+# an exhaustive grammar -- it cannot catch every future paraphrase -- but every
+# concretely-reported bypass is now covered.
+_DAY_OR_NOW = (r"(?:now|soon|today|tomorrow|this month|next month|"
+              r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)")
+_TEMPORAL_IMMEDIACY_RE = re.compile(
+    r"\b(last week|this week|just wrapped|just finished|just held|happening now|"
+    r"recently (?:held|ran|hosted)|"
+    r"(?:starting|begins?|kicks?\s+(?:back\s+)?off)\s+(?:this\s+)?" + _DAY_OR_NOW + r"|"
+    r"join our|now enrolling|enrolling now|sign[\s-]?up (?:is live|now)|sign up now|"
+    r"registration is (?:now )?open|starts soon|"
+    r"limited spots|spots? (?:are |is )?(?:left|remaining|filling))\b", re.IGNORECASE)
+
+# A second, broader tier for the SAME fabrication class: scarcity/urgency CTA
+# phrasing an LLM reaches for around a "challenge"/"seminar" topic without ever
+# using the "starting"/"registration"/"sign up" words the first tier looks for
+# (a second independent audit, 2026-09-10, found 10/10 of these slipped past the
+# first tier: "don't miss out", "last chance", "seats are going fast", etc.).
+# Pattern-based (word roots, not literal phrases) so nearby paraphrases of the
+# audit's own examples are covered too, not just the exact strings it tried.
+# STILL a deny-list, not a semantic check: a sufficiently novel paraphrase of
+# urgency that uses none of these roots will not be caught by regex alone. A
+# fully bypass-proof close would need an LLM-based semantic fabrication check
+# (a real cost/latency tradeoff) -- flagged as a follow-up decision, not built
+# here without that call.
+_SCARCITY_URGENCY_RE = re.compile(
+    r"\b(don'?t miss(?: out)?|last chance|final (?:week|day|call|hours?) to "
+    r"(?:sign up|join|register|enroll)|before it'?s too late|enroll before|"
+    r"seats? (?:are |is )?(?:going fast|filling(?: up)? fast|almost gone|running out)|"
+    r"this is your chance|act now|grab your spot|hurry|"
+    r"only .{0,20}(?:days?|spots?|seats?) left|before the(?:y'?re| spots are) gone)\b",
+    re.IGNORECASE)
+
+_PERSONALIZED_CHILD_RE = re.compile(r"\byour (?:kid|kids|child|children)\b", re.IGNORECASE)
+_CHILD_GROUNDING_RE = re.compile(r"\b(kid|kids|child|children|youth|toddler)\b", re.IGNORECASE)
+
+
+def caption_output_gate_clean(caption, source_text, verified=None, photo_hint=""):
+    """True when a GENERATED caption invents nothing beyond its source + the photo:
+
+      * TEMPORAL / ENROLLMENT IMMEDIACY: a phrase like "last week", "starting Monday",
+        or "join our ..." must already appear (case-insensitively) in the source text.
+        client_sources only ever approves a fact as stated; a source describing a
+        COMPLETED past program never licenses the caption to claim it is running now
+        or starting soon.
+      * PERSONALIZED CHILD CLAIM: "your kid"/"your child" asserts a child appears in
+        THIS photo. That requires real grounding, never just because the day's
+        approved fact happens to be a Kids Classes service line. Grounding today
+        comes ONLY from `photo_hint` (the picked creative's own sidecar note /
+        filename -- a real, non-fabricated client-provided signal, never invented
+        here) naming a child/youth subject; `verified.confirmed_children` is
+        accepted too but NOTHING in this codebase writes it yet (crop_verify's
+        people bucket is a COUNT, not an age check) -- it is forward-compatible
+        wiring for when a real child-confirming vision signal exists, not a live
+        path today. Absent either, the claim fails closed.
+
+    Runs IN ADDITION to is_gate_clean's numeric-figure check, never in place of it.
+    A blank caption is clean (nothing asserted)."""
+    text = (caption or "").strip()
+    if not text:
+        return True
+    source_text = source_text or ""
+    for m in _TEMPORAL_IMMEDIACY_RE.finditer(text):
+        if m.group(0).lower() not in source_text.lower():
+            return False
+    for m in _SCARCITY_URGENCY_RE.finditer(text):
+        if m.group(0).lower() not in source_text.lower():
+            return False
+    if _PERSONALIZED_CHILD_RE.search(text):
+        grounded = bool((verified or {}).get("confirmed_children")) \
+            or bool(_CHILD_GROUNDING_RE.search(photo_hint or ""))
+        if not grounded:
+            return False
+    return True
+
+
 def _sidecar_field(creative_path, field):
     try:
         with open(os.path.splitext(creative_path)[0] + ".json", encoding="utf-8") as fh:

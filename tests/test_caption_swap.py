@@ -501,6 +501,20 @@ def test_the_portal_relay_path_for_recreate_caption_is_routable():
     assert m and m.group(3) == "recreate-caption"
 
 
+def test_the_portal_relay_path_for_deny_day_is_routable():
+    import re
+
+    from agent import intake_web
+
+    actions = set(intake_web.PORTAL_POST_ACTIONS)
+    assert "deny-day" in actions
+
+    pattern = (r"^/portal/([A-Za-z0-9_.-]{8,})/posts/([A-Za-z0-9_-]+)/"
+               r"(" + "|".join(intake_web.PORTAL_POST_ACTIONS) + r")$")
+    m = re.match(pattern, "/portal/eyJhIjoiZW5nIn0.sig/posts/abc-123/deny-day")
+    assert m and m.group(3) == "deny-day"
+
+
 def test_client_messages_carry_no_dashes_and_never_say_vendor():
     for reason in (cs.REASON_NO_LIBRARY, cs.REASON_NO_PHOTO, cs.REASON_NO_SOURCE,
                    cs.REASON_GATE_EXHAUSTED):
