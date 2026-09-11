@@ -220,6 +220,61 @@ def is_gate_clean(note, approved_claims=None):
     return True
 
 
+# ---- output-side caption gate (the GENERATED caption, not just its source) --------
+# is_gate_clean (above) validates the SOURCE sentence handed to the caption writer;
+# for a client account (agent/client_content.py) that source is an approved claim BY
+# CONSTRUCTION, so the check trivially passes and the LLM-WRITTEN caption itself was
+# never re-checked against anything. That let the writer invent a temporal frame
+# around a true fact (Dean/Reverb, 2026-09-10: an approved source describes a
+# COMPLETED past nutrition seminar/challenge; the generated caption said "last week"
+# and "join our challenge starting", asserting an enrollment that does not exist) or
+# personalize a photo the gym's own service list merely NAMES (Kids Classes) onto a
+# picture nothing has confirmed shows a child ("your kid" on an adult photo). Neither
+# is a numeric figure, so _CLAIM_RE / is_gate_clean never sees it.
+_TEMPORAL_IMMEDIACY_RE = re.compile(
+    r"\b(last week|this week|just wrapped|just finished|just held|happening now|"
+    r"starting (?:now|soon|today|tomorrow|this month|next month|monday|tuesday|"
+    r"wednesday|thursday|friday|saturday|sunday)|join our|now enrolling|"
+    r"enrolling now|sign up now|kicks off|starts soon)\b", re.IGNORECASE)
+
+_PERSONALIZED_CHILD_RE = re.compile(r"\byour (?:kid|kids|child|children)\b", re.IGNORECASE)
+_CHILD_GROUNDING_RE = re.compile(r"\b(kid|kids|child|children|youth|toddler)\b", re.IGNORECASE)
+
+
+def caption_output_gate_clean(caption, source_text, verified=None, photo_hint=""):
+    """True when a GENERATED caption invents nothing beyond its source + the photo:
+
+      * TEMPORAL / ENROLLMENT IMMEDIACY: a phrase like "last week", "starting Monday",
+        or "join our ..." must already appear (case-insensitively) in the source text.
+        client_sources only ever approves a fact as stated; a source describing a
+        COMPLETED past program never licenses the caption to claim it is running now
+        or starting soon.
+      * PERSONALIZED CHILD CLAIM: "your kid"/"your child" asserts a child appears in
+        THIS photo. That requires real grounding, never just because the day's
+        approved fact happens to be a Kids Classes service line: either `verified`
+        carries an explicit confirmation, or `photo_hint` (the picked creative's own
+        sidecar note / filename -- a real, non-fabricated client-provided signal,
+        never invented here) itself names a child/youth subject. Absent either, the
+        claim fails closed -- no current vision signal confirms a child in a shipped
+        crop.
+
+    Runs IN ADDITION to is_gate_clean's numeric-figure check, never in place of it.
+    A blank caption is clean (nothing asserted)."""
+    text = (caption or "").strip()
+    if not text:
+        return True
+    source_text = source_text or ""
+    for m in _TEMPORAL_IMMEDIACY_RE.finditer(text):
+        if m.group(0).lower() not in source_text.lower():
+            return False
+    if _PERSONALIZED_CHILD_RE.search(text):
+        grounded = bool((verified or {}).get("confirmed_children")) \
+            or bool(_CHILD_GROUNDING_RE.search(photo_hint or ""))
+        if not grounded:
+            return False
+    return True
+
+
 def _sidecar_field(creative_path, field):
     try:
         with open(os.path.splitext(creative_path)[0] + ".json", encoding="utf-8") as fh:

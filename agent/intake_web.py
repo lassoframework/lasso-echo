@@ -80,8 +80,12 @@ def _rate_per_minute():
 # change cost one of the gym's 15 monthly recreates. "recreate-caption" (partial-
 # regen, 2026-09-07) is the missing other half: "the caption is wrong" rewrites ONLY
 # the copy on the SAME photo instead of a full recreate that can swap the photo too.
+# "deny-day" (Dean/Reverb, 2026-09-10) is a day-wide rework: one day's feed/story/FB/
+# GBP rows are one concept rendered per format, and denying them one click at a time
+# left a day mixing a freshly-reworked format with stale siblings still carrying the
+# rejected photo+caption. This denies every same-day denyable row together.
 PORTAL_POST_ACTIONS = ("approve", "edit", "deny", "kill", "swap-media",
-                       "recreate-caption")
+                       "recreate-caption", "deny-day")
 
 
 def client_for_token(token):
@@ -2917,6 +2921,9 @@ def build_server(port=None):
                 elif ps_action == "recreate-caption":
                     status, resp = _ps.handle_recreate_caption(account_key, ps_post_id,
                                                                actor_id)
+                elif ps_action == "deny-day":
+                    status, resp = _ps.handle_deny_day(account_key, ps_post_id, actor_id,
+                                                       note=note, store=store)
                 else:  # kill
                     status, resp = _ps.handle_kill(account_key, ps_post_id, actor_id,
                                                    confirm=confirm, store=store)

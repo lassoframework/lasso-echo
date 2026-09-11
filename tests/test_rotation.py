@@ -181,3 +181,53 @@ def test_nano_is_one_source_among_several(monkeypatch, tmp_path):
         else:
             rotation.record_served("lasso_ig", "nano:sig", f"brain:{payload}", day)
     assert "library" in kinds and "generate" in kinds  # both sources cycle
+
+
+# ---- caption_output_gate_clean (Dean/Reverb, 2026-09-10): the GENERATED caption,
+# not just its source, is checked for invented urgency/enrollment framing and for
+# personalizing a child onto an ungrounded photo. ---------------------------------
+
+def test_output_gate_blank_caption_is_clean():
+    assert rotation.caption_output_gate_clean("", "anything") is True
+
+
+def test_output_gate_blocks_join_now_on_a_completed_program():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    cap = "Join our 6-week challenge with 1-on-1 coaching starting Monday!"
+    assert rotation.caption_output_gate_clean(cap, source) is False
+
+
+def test_output_gate_blocks_last_week_when_source_has_no_timeframe():
+    source = "Our nutrition seminar (June 27, 2026) taught members to eat real food."
+    cap = "Last week our nutrition seminar showed members the difference."
+    assert rotation.caption_output_gate_clean(cap, source) is False
+
+
+def test_output_gate_allows_the_phrase_when_the_source_states_it():
+    source = "Join our free intro this week, no commitment required."
+    cap = "Join our free intro this week and meet the coaches."
+    assert rotation.caption_output_gate_clean(cap, source) is True
+
+
+def test_output_gate_blocks_personalized_child_claim_without_grounding():
+    cap = "Your kid's asking what you do at the gym."
+    assert rotation.caption_output_gate_clean(cap, "Kids Classes") is False
+
+
+def test_output_gate_allows_child_claim_with_vision_confirmation():
+    cap = "Your kid's confidence is built right here."
+    verified = {"ok": True, "confirmed_children": True}
+    assert rotation.caption_output_gate_clean(cap, "Kids Classes", verified=verified) is True
+
+
+def test_output_gate_allows_child_claim_with_photo_hint_grounding():
+    cap = "Your kid's confidence is built right here."
+    assert rotation.caption_output_gate_clean(
+        cap, "Kids Classes", photo_hint="Youth Wall Sit w smiles") is True
+
+
+def test_output_gate_case_insensitive_and_substring_safe():
+    # "STARTING TODAY" in the caption vs "starting today" style variants in source
+    source = "Our program is STARTING today, come join!"
+    cap = "Our program is starting today, come join!"
+    assert rotation.caption_output_gate_clean(cap, source) is True

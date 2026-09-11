@@ -657,3 +657,110 @@ def test_rejected_rows_are_hidden_never_deleted_or_restatused(monkeypatch):
     ps.handle_social("lasso", "2026-08")
     assert store.patches == [] and store.caption_patches == []
     assert store._rows["denied-1"]["status"] == "denied"   # the audit row survives
+
+
+# ---- deny-day (Dean/Reverb, 2026-09-10): one action reworks the WHOLE day ----------
+
+def test_deny_day_denies_every_format_together(monkeypatch):
+    store = _FakeStore([
+        _row("feed-ig", gym_id="reverb", post_date="2026-09-17", account="instagram",
+             fmt="feed", status="pending"),
+        _row("feed-fb", gym_id="reverb", post_date="2026-09-17", account="facebook",
+             fmt="feed", status="pending"),
+        _row("story-ig", gym_id="reverb", post_date="2026-09-17", account="instagram",
+             fmt="story", status="pending"),
+        _row("gbp", gym_id="reverb", post_date="2026-09-17", account="googlebusiness",
+             fmt="update", status="pending"),
+        # a different day's post must never be touched
+        _row("other-day", gym_id="reverb", post_date="2026-09-18", account="instagram",
+             fmt="feed", status="pending"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "feed-ig", "U_owner",
+                                      note="wrong photo", sb_store=store)
+    assert status == 200
+    assert body["ok"] is True
+    assert sorted(body["denied_ids"]) == sorted(["feed-ig", "feed-fb", "story-ig", "gbp"])
+    for rid in ("feed-ig", "feed-fb", "story-ig", "gbp"):
+        assert store._rows[rid]["status"] == "denied"
+    assert store._rows["other-day"]["status"] == "pending"
+
+
+def test_deny_day_charges_the_budget_exactly_once(monkeypatch):
+    store = _FakeStore([
+        _row("a", gym_id="reverb", post_date="2026-09-17", account="instagram",
+             fmt="feed", status="pending"),
+        _row("b", gym_id="reverb", post_date="2026-09-17", account="facebook",
+             fmt="feed", status="pending"),
+        _row("c", gym_id="reverb", post_date="2026-09-17", account="googlebusiness",
+             fmt="update", status="pending"),
+    ])
+    assert ps.recreate_spent("reverb") == 0
+    status, body = ps.handle_deny_day("reverb", "a", "U_owner", sb_store=store)
+    assert status == 200
+    assert ps.recreate_spent("reverb") == 1, "one day, one unit -- not one per format"
+    assert body["recreate_budget"]["remaining"] == ps.MONTHLY_RECREATE_BUDGET - 1
+
+
+def test_deny_day_only_touches_denyable_statuses(monkeypatch):
+    store = _FakeStore([
+        _row("pending-1", gym_id="reverb", post_date="2026-09-17", status="pending"),
+        _row("already-approved", gym_id="reverb", post_date="2026-09-17",
+             account="facebook", status="approved"),
+        _row("already-denied", gym_id="reverb", post_date="2026-09-17",
+             account="googlebusiness", status="denied"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "pending-1", "U_owner", sb_store=store)
+    assert status == 200
+    assert body["denied_ids"] == ["pending-1"]
+    assert store._rows["already-approved"]["status"] == "approved"
+    assert store._rows["already-denied"]["status"] == "denied"
+
+
+def test_deny_day_idempotent_when_nothing_left_to_deny(monkeypatch):
+    store = _FakeStore([
+        _row("only-row", gym_id="reverb", post_date="2026-09-17", status="denied"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "only-row", "U_owner", sb_store=store)
+    assert status == 200
+    assert body["idempotent"] is True
+    assert store.patches == []
+
+
+def test_deny_day_409_when_budget_exhausted(monkeypatch):
+    store = _FakeStore([
+        _row("a", gym_id="reverb", post_date="2026-09-17", status="pending"),
+    ])
+    for _ in range(ps.MONTHLY_RECREATE_BUDGET):
+        ps.spend_recreate("reverb")
+    status, body = ps.handle_deny_day("reverb", "a", "U_owner", sb_store=store)
+    assert status == 409
+    assert body["ok"] is False
+    assert store.patches == [], "an exhausted budget must not write to content_calendar"
+
+
+def test_deny_day_never_touches_another_gym(monkeypatch):
+    store = _FakeStore([
+        _row("mine", gym_id="reverb", post_date="2026-09-17", status="pending"),
+        _row("theirs", gym_id="othergym", post_date="2026-09-17", status="pending"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "mine", "U_owner", sb_store=store)
+    assert status == 200
+    assert body["denied_ids"] == ["mine"]
+    assert store._rows["theirs"]["status"] == "pending"
+
+
+def test_deny_day_404_for_a_cross_gym_draft_id(monkeypatch):
+    store = _FakeStore([
+        _row("theirs", gym_id="othergym", post_date="2026-09-17", status="pending"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "theirs", "U_owner", sb_store=store)
+    assert status == 404
+
+
+def test_deny_day_refuses_on_a_published_row(monkeypatch):
+    store = _FakeStore([
+        _row("live", gym_id="reverb", post_date="2026-09-17", status="published"),
+    ])
+    status, body = ps.handle_deny_day("reverb", "live", "U_owner", sb_store=store)
+    assert status == 409
+    assert store.patches == []

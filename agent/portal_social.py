@@ -1333,6 +1333,81 @@ def handle_deny(account_key, draft_id, actor_id, note="", store=None, reader=Non
 
 
 # ==========================================================================
+# POST /portal/<token>/posts/<id>/deny-day  (Dean/Reverb, 2026-09-10)
+#
+# THE COMPLAINT: "one day of posts consists of the same picture + caption across
+# 3-4 formats for post/story/GMB/etc, and I apparently have to click on each format
+# and deny and request a re-work on each one? ... It seems like it will then return
+# different caption+pictures across different formats on the same day." Denying one
+# format at a time regenerated JUST that row, so a day could end up mixing a brand
+# new rework on one format with the ORIGINAL rejected concept still sitting pending
+# on the others. This is a day-wide action: find every same-day row for this gym
+# still in a denyable status (pending/coach_review) -- feed, story, Facebook, AND
+# Google Business, every format Dean named -- and deny them together, so the whole
+# day reworks as ONE consistent concept instead of a patchwork.
+# ==========================================================================
+
+def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader=None,
+                    sb_store=None):
+    """Deny every denyable same-day row for this gym together (one action instead of
+    one click per format). Charges the recreate budget EXACTLY ONCE for the whole
+    day, not once per format -- the day is one concept, not N separate recreates.
+
+    Supabase-only (the shared content_calendar plane is what carries a day's other
+    formats); 503s on the local-drafts plane, which has no day-spanning book."""
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                     "error": "deny-day needs the shared calendar plane"}
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "deny-day", draft_id)
+        if final is not None:
+            return final
+        day_key = str(row.get("post_date") or "")[:10]
+        month_rows = _month_rows_for(sb_store, account_key, row) or [row]
+        denyable_statuses = {"pending", "coach_review"}
+        targets = [r for r in month_rows
+                  if str(r.get("post_date") or "")[:10] == day_key
+                  and str(r.get("status") or "").lower() in denyable_statuses]
+        if not targets:
+            # Already denied/approved/published elsewhere: report the clicked row's
+            # own state rather than a 404 -- the day may be clean by now.
+            return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                         "detail": "Nothing left to deny for this day.",
+                         "idempotent": True, "day_key": day_key,
+                         "recreate_budget": _budget_state(account_key)}
+        if recreate_remaining(account_key) <= 0:
+            return 409, {"ok": False, "action": "deny-day", "draft_id": draft_id,
+                         "error": "recreate budget for this month is used up",
+                         "recreate_budget": _budget_state(account_key)}
+        denied_ids = []
+        for r in targets:
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+            updated = sb_store.set_status(account_key, rid, _pcs.action_status("deny"))
+            if updated is not None:
+                denied_ids.append(rid)
+        if not denied_ids:
+            return 404, {"ok": False, "error": "no denyable rows found",
+                         "draft_id": draft_id}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    # ONE unit for the whole day (Dean's actual complaint: N clicks, N charges today).
+    spend_recreate(account_key)
+    return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
+                "day_key": day_key, "denied_ids": denied_ids,
+                "recreate_budget": _budget_state(account_key)}
+
+
+# ==========================================================================
 # POST /portal/<token>/posts/<id>/kill  (permanent, free, requires confirm=true)
 # ==========================================================================
 
