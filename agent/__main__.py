@@ -908,6 +908,7 @@ _COMMANDS = {
         ("approve-sources", "list/approve a gym's PENDING client sources (--account, --all or --id)"),
         ("website-intake", "auto-intake a gym's sources from its OWN website (--account <base> [--domain x.com] [--force])"),
         ("gym-deep-brain", "PRE-ONBOARD deep brain: scrape a gym's OWN website (robots-respecting, rate-limited, PII-scrubbed) + its OWN public Instagram feed into a per-gym voice/grounding artifact; facts land PENDING (AGENT_GYM_DEEP_BRAIN) -- (--account <base> [--domain x.com] [--handle <ig>] [--dry-run])"),
+        ("no-media-astra-seed", "by-hand/verification run of the automatic no-media Astra fallback for ONE named gym with zero approved sources + zero real media (AGENT_NO_MEDIA_ASTRA_SEED); the recurring scan already calls this itself for every qualifying gym -- (--account <base> [--limit N])"),
         ("set-timezone", "set one gym's posting timezone (--account <base> --tz America/Denver); unset = global"),
         ("intake-onboard", "one command: intake payload -> bible draft + pending sources + scan + plan + preflight"),
         ("social-intake-sync", "map un-routed social intakes into Echo (--all | --base <slug>)"),
@@ -2793,8 +2794,12 @@ def main(argv=None):
             else:
                 print(f"{_acct}: not intaken: {out.get('reason')}")
     elif cmd == "gym-deep-brain":
-        # PER-GYM DEEP BRAIN, one gym by hand (there is no automatic sweep):
-        # read the gym's OWN public website (robots.txt respected, rate limited,
+        # PER-GYM DEEP BRAIN, one gym by hand. (AGENT_NO_MEDIA_ASTRA_SEED, when
+        # armed, also calls build_deep_brain automatically — but ONLY for a gym
+        # client_media_sync.scan_and_generate finds with ZERO approved sources
+        # AND zero real uploaded media; see agent/no_media_astra_seed.py. This
+        # command remains the by-hand entry point for every other case.)
+        # Read the gym's OWN public website (robots.txt respected, rate limited,
         # PII scrubbed, page/byte capped) plus its OWN public Instagram feed, and
         # compile the per-gym voice + grounding artifact. Every fact carries the
         # URL it came from and lands PENDING; a scrape is never auto-approved.
@@ -2838,6 +2843,34 @@ def main(argv=None):
                     print(f"  note: {_n}")
                 print(f"  a human must approve before Echo may draft from these: "
                       f"python -m agent approve-sources --account {_acct}_ig")
+    elif cmd == "no-media-astra-seed":
+        # By-hand / verification entry point for the automatic no-media Astra
+        # fallback (agent/no_media_astra_seed.py). The recurring job
+        # (client_media_sync.scan_and_generate) calls this itself for any gym
+        # it finds with zero approved sources AND zero real media; this command
+        # exists to prove/verify the pipeline against one named gym on demand,
+        # never to run it as a sweep across the fleet.
+        #   python -m agent no-media-astra-seed --account <base> [--limit N]
+        from . import no_media_astra_seed as _nmas
+        from .accounts import get_account as _get_acct
+        from . import portal_calendar_store as _pcs
+        _args = argv[1:]
+        _acct, _limit = "", _nmas.SEED_MAX_PER_RUN
+        i = 0
+        while i < len(_args):
+            if _args[i] == "--account" and i + 1 < len(_args):
+                _acct = _args[i + 1]; i += 2; continue
+            if _args[i] == "--limit" and i + 1 < len(_args):
+                _limit = int(_args[i + 1]); i += 2; continue
+            i += 1
+        if not _acct:
+            print("usage: python -m agent no-media-astra-seed --account <base> [--limit N]")
+        else:
+            account = _get_acct(f"{_acct}_ig") or _get_acct(_acct)
+            store = _pcs.SupabaseCalendarStore()
+            n = _nmas.seed_gaps(_acct, account, store, max_rows=_limit)
+            print(f"{_acct}: {n} grounded infographic draft(s) inserted "
+                 "(status='pending'; nothing published)")
     elif cmd == "intake-onboard":
         from .intake_onboard import cli as intake_onboard_cli
         intake_onboard_cli(argv[1:])

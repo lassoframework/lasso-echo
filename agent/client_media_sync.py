@@ -828,6 +828,21 @@ def _maybe_seed_onboarding_demo(base_key, store, log):
         log(f"{base_key}: onboarding sample skipped ({type(exc).__name__})")
 
 
+def _maybe_seed_no_media_astra(base_key, account, store, log):
+    """Draft gym-specific Astra infographic cards from the gym's OWN scraped
+    website + Instagram (no_media_astra_seed.py), for a gym that has neither
+    approved sources nor any real uploaded media. Best effort: a scrape/generate
+    failure must never sink or slow the scan; the generic onboarding sample
+    (seeded just above this call site) still covers the gym either way."""
+    try:
+        from . import no_media_astra_seed
+        if not no_media_astra_seed.enabled():
+            return
+        no_media_astra_seed.seed_gaps(base_key, account, store, log=log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: no-media Astra seed skipped ({type(exc).__name__})")
+
+
 def _alert_stall(base_key, stage, detail, log):
     """A NEW-GYM STALL is never silent (audit 2026-08-25 MAJOR): every state where a
     gym's pipeline cannot advance (no registry account, no approved sources, no voice
@@ -979,6 +994,17 @@ def scan_and_generate(*, clients=None, store=None, r2=None, now=None, days=30,
                 # clearly-labelled sample so the client sees the shape of what they
                 # bought. Refuses if any real row exists; samples can never publish.
                 _maybe_seed_onboarding_demo(base, store, log)
+                # NO-MEDIA ASTRA SEED (AGENT_NO_MEDIA_ASTRA_SEED, default OFF; Blake
+                # 2026-09-11): a gym with NEITHER approved sources NOR any real
+                # uploaded media (CrossFit Chateau's exact state) sits on the generic
+                # fact-free SAMPLE above forever otherwise. Scrape its own site + IG
+                # (gym_deep_brain) and draft gym-specific Astra infographic cards from
+                # what it actually says about itself — still 'pending', still gated
+                # on the same human approval as every other post. A gym with uploaded
+                # media (media_count > 0) is left alone: it already has real
+                # collateral and this must never compete with it (see module docstring).
+                if _client_media_count(lib_dir) <= 0:
+                    _maybe_seed_no_media_astra(base, account, store, log)
                 results.append({"base": base, "status": "no_sources",
                                 "synced": sync.get("synced", 0)})
                 continue
