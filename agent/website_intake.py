@@ -489,8 +489,15 @@ def intake_from_website(base, *, domain=None, status=None, force=False,
 def _alert_once(base, message, alert=None):
     """One deduped ops alert per gym per outcome: the same message never posts
     twice (kv-stamped), so a daily runner pass cannot flood Slack with the same
-    'could not auto-intake' line every day. Best effort, never raises."""
+    'could not auto-intake' line every day. DURABLE-OR-SILENT: when the kv store
+    is ephemeral (no AGENT_DB_PATH, no data volume) the stamp cannot persist
+    across process runs, so this function logs locally and stays off Slack rather
+    than storm on every sweep pass (same rule as the gritx needs-media storm fix,
+    2026-08-27). Best effort, never raises."""
     try:
+        if not db.kv_is_durable():
+            print(f"[website-intake] alert suppressed (kv not durable): {message}")
+            return False
         key = f"website_intake_alert_{base}"
         if db.kv_get(key) == message:
             return False
