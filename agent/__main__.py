@@ -983,6 +983,7 @@ _COMMANDS = {
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
+        ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
     ],
@@ -3262,6 +3263,13 @@ def main(argv=None):
         #   python -m agent lasso-remap [--month YYYY-MM] [--gym lasso] [--write]
         from .lasso_remap import cli as _lasso_remap_cli
         _lasso_remap_cli(argv[1:])
+    elif cmd == "lasso-astra-rework":
+        # Regenerate the IMAGE (never the schedule) on LASSO's existing non-video,
+        # non-published slots as linked Astra v2 candidates. Same dates/times/count
+        # untouched; nothing publishes; a human picks in the portal.
+        #   python -m agent lasso-astra-rework [--months YYYY-MM,...] [--limit N] [--write]
+        from .lasso_astra_rework import cli as _lasso_astra_rework_cli
+        _lasso_astra_rework_cli(argv[1:])
     elif cmd == "ops-triage-classify":
         # Classify one ops-alert line as noise/needs_triage. Argument or stdin; prints
         # exactly "noise" or "needs_triage". The shell-out seam for scout-listener's

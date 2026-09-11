@@ -77,6 +77,21 @@ def real_builders_map(account):
         return daily_studio.build_daily_infographic_draft(acct, day_key)
 
     def _b2b(_target, day_key):
+        # ASTRA DEFAULT FOR NON-VIDEO (AGENT_LASSO_ASTRA_DEFAULT, Blake 2026-09-11:
+        # "I want it to be the default when we're not using any videos or
+        # anything like that"): b2b was the one LASSO pillar still library-first
+        # (rotation.py's LIBRARY FIRST-CLASS rule cycles content_library photos
+        # alongside the generated Nano/Astra card as co-equal sources, never
+        # Astra-preferred). Flag ON tries the SAME Astra-first infographic
+        # builder platform/doctrine already default to FIRST; only when it
+        # returns None (daily_studio dark, no content-brain source for the day)
+        # does this fall through to the existing library-rotation builder, so a
+        # day is never left blank. Flag OFF -> byte-for-byte today's
+        # rotation-first behavior.
+        if config.lasso_astra_default_enabled():
+            draft = daily_studio.build_daily_infographic_draft(acct, day_key)
+            if draft is not None:
+                return draft
         acct_lib = _library_for(acct)
         return rotation.build_rotated_draft(acct, day_key, _voice_for(acct), acct_lib)
 

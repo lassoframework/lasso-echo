@@ -1352,6 +1352,20 @@ def variant_pairing_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_VARIANT_PAIRING", "false"))
 
 
+def lasso_astra_default_enabled() -> bool:
+    """AGENT_LASSO_ASTRA_DEFAULT, default OFF. Blake (2026-09-11): "For Lasso, I
+    want [Astra infographics] to be the default when we're not using any videos
+    or anything like that." b2b was the one LASSO pillar still library-first
+    (rotation.py cycles content_library photos alongside a generated Nano/Astra
+    card as co-equal sources, never Astra-preferred). ON makes the b2b builder
+    try the SAME Astra-first daily_studio infographic builder every other
+    non-video LASSO pillar (platform, doctrine) already uses FIRST, falling back
+    to the existing library rotation only when that returns None (no fabrication
+    -- a day is never blanked). OFF -> byte-for-byte today's rotation-first b2b
+    behavior. Arm by hand: AGENT_LASSO_ASTRA_DEFAULT=true."""
+    return _truthy(os.environ.get("AGENT_LASSO_ASTRA_DEFAULT", "false"))
+
+
 def portal_show_rejected() -> bool:
     """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
 

@@ -138,6 +138,47 @@ def test_real_builders_map_wires_every_pillar():
         assert cat in builders and callable(builders[cat])
 
 
+# ---- AGENT_LASSO_ASTRA_DEFAULT: b2b prefers Astra infographic over library rotation --
+
+def test_b2b_astra_default_off_uses_rotation(monkeypatch):
+    """Flag OFF (today's shape): b2b never even calls daily_studio; it goes straight
+    to the existing library-rotation builder, byte-for-byte."""
+    from agent import daily_studio, rotation
+    monkeypatch.delenv("AGENT_LASSO_ASTRA_DEFAULT", raising=False)
+    monkeypatch.setattr(daily_studio, "build_daily_infographic_draft",
+                        lambda *a, **k: pytest.fail("must not call daily_studio while flag off"))
+    sentinel = _fake_feed("b2b", "2026-08-05")
+    monkeypatch.setattr(rotation, "build_rotated_draft", lambda *a, **k: sentinel)
+    builders = rmr.real_builders_map(_acct())
+    assert builders["b2b"](None, "2026-08-05") is sentinel
+
+
+def test_b2b_astra_default_on_prefers_infographic(monkeypatch):
+    """Flag ON: b2b tries the Astra infographic builder FIRST; when it returns a
+    real draft, library rotation is never even called."""
+    from agent import daily_studio, rotation
+    monkeypatch.setenv("AGENT_LASSO_ASTRA_DEFAULT", "true")
+    sentinel = _fake_feed("b2b", "2026-08-05")
+    monkeypatch.setattr(daily_studio, "build_daily_infographic_draft",
+                        lambda *a, **k: sentinel)
+    monkeypatch.setattr(rotation, "build_rotated_draft",
+                        lambda *a, **k: pytest.fail("must not fall back when Astra succeeds"))
+    builders = rmr.real_builders_map(_acct())
+    assert builders["b2b"](None, "2026-08-05") is sentinel
+
+
+def test_b2b_astra_default_on_falls_back_when_dark(monkeypatch):
+    """Flag ON but daily_studio has nothing for the day (returns None): b2b falls
+    through to the existing library-rotation builder — never a blank day."""
+    from agent import daily_studio, rotation
+    monkeypatch.setenv("AGENT_LASSO_ASTRA_DEFAULT", "true")
+    monkeypatch.setattr(daily_studio, "build_daily_infographic_draft", lambda *a, **k: None)
+    sentinel = _fake_feed("b2b", "2026-08-05")
+    monkeypatch.setattr(rotation, "build_rotated_draft", lambda *a, **k: sentinel)
+    builders = rmr.real_builders_map(_acct())
+    assert builders["b2b"](None, "2026-08-05") is sentinel
+
+
 def test_plan_and_build_flag_off_is_inert(monkeypatch):
     monkeypatch.delenv("AGENT_REAL_MONTH_PLAN", raising=False)
     # Nothing should be invoked while the flag is off.
