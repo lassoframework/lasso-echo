@@ -1286,6 +1286,64 @@ def handle_regen_variant(account_key, draft_id, actor_id, reader=None, sb_store=
                               "variant_status": candidate.get("variant_status")}}
 
 
+def handle_regen_variant_from_brief(account_key, draft_id, actor_id, brief,
+                                    reader=None, sb_store=None, regen_fn=None):
+    """Generate a NEW image for the logical post `draft_id` represents FROM A
+    HUMAN-TYPED BRIEF, and store it as a linked 'candidate' row, WITHOUT
+    touching `draft_id` itself. Companion to handle_regen_variant: that button
+    regenerates from the post's own existing pillar/caption with no new input;
+    this one is the "type what you want" button next to it — a deliberate,
+    per-request ask, grounded in the gym's own on-file brand material
+    (variant_regen_brief._brand_brain_facts), never invented. Human-initiated
+    every time: there is no path that reaches this handler except an explicit
+    call carrying a non-empty `brief` a person typed that turn.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read, no Astra call) — same gate handle_regen_variant uses."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen_brief as _vrb
+    if not _vrb.enabled():
+        return 403, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": "variant regeneration is not enabled for this gym"}
+    brief_text = str(brief or "").strip()
+    if not brief_text:
+        return 400, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": _vrb.client_message(_vrb.REASON_NO_BRIEF),
+                     "reason": _vrb.REASON_NO_BRIEF}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                     "error": "variant regeneration needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "regen-variant-brief", draft_id)
+        if final is not None:
+            return final
+        gen = regen_fn or _vrb.generate_variant_from_brief
+        result = gen(row, account_key, brief_text)
+        if not result.get("ok"):
+            return 409, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                         "error": _vrb.client_message(result.get("reason")),
+                         "reason": result.get("reason")}
+        candidate = sb_store.create_variant_candidate(
+            account_key, row, result["image_url"])
+        if candidate is None:
+            return 500, {"ok": False, "action": "regen-variant-brief", "draft_id": draft_id,
+                         "error": "the new image could not be saved as a candidate"}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "regen-variant-brief", "draft_id": draft_id,
+                 "candidate": {"id": candidate.get("id"),
+                              "image_url": candidate.get("image_url"),
+                              "caption": candidate.get("caption"),
+                              "variant_status": candidate.get("variant_status")}}
+
+
 def handle_pick_variant(account_key, draft_id, actor_id, reader=None, sb_store=None):
     """Promote the candidate `draft_id` to 'active' for its group. `draft_id`
     here IS the candidate's own row id (the id the client is looking at in

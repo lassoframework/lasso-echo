@@ -318,6 +318,75 @@ def test_regen_variant_409_on_generation_failure_writes_nothing(monkeypatch):
     assert store.created == []
 
 
+# ---------------------------------------------------------------------------
+# handle_regen_variant_from_brief — the "type what you want" manual button
+# ---------------------------------------------------------------------------
+
+def test_regen_variant_from_brief_403_while_flag_off(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "false")
+    store = _FakeVariantStore(rows=[_row("orig-1")])
+    status, body = ps.handle_regen_variant_from_brief(
+        "eng", "orig-1", "blake", "make it about our new 6am class", sb_store=store)
+    assert status == 403
+    assert store.created == []
+
+
+def test_regen_variant_from_brief_400_on_empty_brief(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    store = _FakeVariantStore(rows=[_row("orig-1")])
+    status, body = ps.handle_regen_variant_from_brief(
+        "eng", "orig-1", "blake", "   ", sb_store=store)
+    assert status == 400
+    assert store.created == []
+
+
+def test_regen_variant_from_brief_creates_candidate_without_touching_original(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    original = _row("orig-1", status="approved", image_url="https://cdn/v1.jpg")
+    store = _FakeVariantStore(rows=[original])
+    seen = {}
+
+    def fake_regen(row, account_key, brief):
+        seen["brief"] = brief
+        assert row["id"] == "orig-1"
+        return {"ok": True, "image_url": "https://cdn/v2-brief.jpg"}
+
+    status, body = ps.handle_regen_variant_from_brief(
+        "eng", "orig-1", "blake", "highlight our new 6am class",
+        sb_store=store, regen_fn=fake_regen)
+    assert status == 200
+    assert body["candidate"]["image_url"] == "https://cdn/v2-brief.jpg"
+    assert seen["brief"] == "highlight our new 6am class"
+    assert store.created == [("eng", "orig-1", "https://cdn/v2-brief.jpg")]
+    assert store._rows["orig-1"]["image_url"] == "https://cdn/v1.jpg"
+
+
+def test_regen_variant_from_brief_refuses_on_a_published_row(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    store = _FakeVariantStore(rows=[_row("orig-1", status="published")])
+    called = {"n": 0}
+
+    def fake_regen(row, account_key, brief):
+        called["n"] += 1
+        return {"ok": True, "image_url": "https://cdn/v2.jpg"}
+
+    status, body = ps.handle_regen_variant_from_brief(
+        "eng", "orig-1", "blake", "a brief", sb_store=store, regen_fn=fake_regen)
+    assert status in (409, 410, 422)
+    assert called["n"] == 0
+    assert store.created == []
+
+
+def test_regen_variant_from_brief_409_on_generation_failure_writes_nothing(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    store = _FakeVariantStore(rows=[_row("orig-1")])
+    status, body = ps.handle_regen_variant_from_brief(
+        "eng", "orig-1", "blake", "a brief", sb_store=store,
+        regen_fn=lambda row, account_key, brief: {"ok": False, "reason": "generate_failed"})
+    assert status == 409
+    assert store.created == []
+
+
 def test_pick_variant_403_while_flag_off(monkeypatch):
     monkeypatch.setenv("ECHO_VARIANT_PAIRING", "false")
     store = _FakeVariantStore(rows=[_row("cand-1", variant_status="candidate")])
@@ -427,3 +496,83 @@ def test_generate_variant_image_generate_failure_reason(monkeypatch):
         _row("orig-1", caption="fact one"), "eng",
         generate_fn=lambda *a, **k: None)
     assert out == {"ok": False, "reason": vr.REASON_GENERATE_FAILED}
+
+
+# ---------------------------------------------------------------------------
+# variant_regen_brief — the human-typed "type what you want" companion
+# ---------------------------------------------------------------------------
+
+from agent import variant_regen_brief as vrb  # noqa: E402
+
+
+def test_variant_regen_brief_disabled_reason_when_flag_off(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "false")
+    out = vrb.generate_variant_from_brief(_row("orig-1"), "eng", "a brief")
+    assert out == {"ok": False, "reason": vrb.REASON_DISABLED}
+
+
+def test_variant_regen_brief_empty_brief_guard(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    out = vrb.generate_variant_from_brief(_row("orig-1"), "eng", "   ")
+    assert out == {"ok": False, "reason": vrb.REASON_NO_BRIEF}
+
+
+def test_variant_regen_brief_uses_typed_brief_as_headline_and_grounds_in_sources(monkeypatch):
+    """The human's typed brief becomes the rendered headline; the gym's own
+    on-file approved material grounds the supporting facts -- nothing invented."""
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    from agent import client_sources
+    monkeypatch.setattr(client_sources, "approved_sources",
+                        lambda account_key: [type("S", (), {"text": "Free trial week for new members"})()])
+    seen = {}
+
+    def fake_generate(headline, facts, client=None, aspect=None, pixels=None,
+                      surface=None, account_key=None):
+        seen["headline"] = headline
+        seen["facts"] = facts
+        seen["account_key"] = account_key
+        return {"path": "/tmp/v2.png", "prompt": "p", "model": "astra"}
+
+    out = vrb.generate_variant_from_brief(
+        _row("orig-1"), "eng", "highlight our new 6am class",
+        generate_fn=fake_generate, host_fn=lambda path, key: "https://cdn/v2.png")
+    assert out["ok"] is True
+    assert seen["headline"] == "highlight our new 6am class"
+    assert seen["facts"] == ["Free trial week for new members"]
+    assert seen["account_key"] == "eng"
+
+
+def test_variant_regen_brief_falls_back_to_the_brief_itself_when_no_sources_on_file(monkeypatch):
+    """A brand-new gym with nothing approved/pending yet still gets a card from
+    its own typed brief -- never a hard failure, and never an invented fact."""
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    from agent import client_sources
+    monkeypatch.setattr(client_sources, "approved_sources", lambda account_key: [])
+    monkeypatch.setattr(client_sources, "pending_sources", lambda account_key: [])
+    seen = {}
+
+    def fake_generate(headline, facts, **kw):
+        seen["facts"] = facts
+        return {"path": "/tmp/v2.png", "prompt": "p"}
+
+    out = vrb.generate_variant_from_brief(
+        _row("orig-1"), "eng", "a brand new ask",
+        generate_fn=fake_generate, host_fn=lambda path, key: "https://cdn/v2.png")
+    assert out["ok"] is True
+    assert seen["facts"] == ["a brand new ask"]
+
+
+def test_variant_regen_brief_hosting_failure_reason(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    out = vrb.generate_variant_from_brief(
+        _row("orig-1"), "eng", "a brief",
+        generate_fn=lambda *a, **k: {"path": "/tmp/x.png"},
+        host_fn=lambda path, key: None)
+    assert out == {"ok": False, "reason": vrb.REASON_HOSTING}
+
+
+def test_variant_regen_brief_generate_failure_reason(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    out = vrb.generate_variant_from_brief(
+        _row("orig-1"), "eng", "a brief", generate_fn=lambda *a, **k: None)
+    assert out == {"ok": False, "reason": vrb.REASON_GENERATE_FAILED}

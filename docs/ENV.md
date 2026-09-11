@@ -144,6 +144,9 @@ accident, which looks identical to working.
 | AGENT_GEMINI_COST_PER_IMAGE_USD | 0.039 | code | ESTIMATED USD per Gemini image. |
 | AGENT_IMAGE_DAILY_COST_ALERT_USD | 10.00 | code | One ops alert per day once estimated image spend crosses this. |
 | AGENT_IMAGE_URL_FOOTER | LASSOFRAMEWORK.COM | code | The URL rendered in the brief's footer block. |
+| AGENT_LASSO_ASTRA_DEFAULT | false | BLAKE | LASSO's own b2b content pillar tries the Astra-first `daily_studio` infographic builder FIRST, falling back to library rotation only when it returns None (matches platform/doctrine pillars, which already defaulted to Astra). Also gates `python -m agent lasso-astra-rework` (regenerate the image only on existing non-video calendar slots) and the "type a brief" manual regen path. ARMED true in prod 2026-09-11. |
+| AGENT_NO_MEDIA_ASTRA_SEED | false | BLAKE | For a gym with ZERO real uploaded media and zero approved client sources, auto-runs that gym's deep-brain scrape and drafts a few gym-specific Astra infographic candidates instead of the generic fact-free onboarding sample. Rows land `content_calendar` status=`pending`, same human approval gate as every other post. One scrape attempt per gym (kv-marked). Built to cover CrossFit Chateau's real zero-media case first. ARMED true in prod 2026-09-11. |
+| ECHO_VARIANT_PAIRING | false | BLAKE | Astra v2 side-by-side variant regen (migration 0318): review + pick a v2 image for an existing scheduled post without overwriting the live creative. Portal review UI shipped in PR #614. ARMED true in prod 2026-09-11 — the fleet-wide ~1,000+ September post regen sweep this was originally gated on has NOT been run yet; the flag is live ahead of that sweep. |
 
 ## Creative studio (Gemini)
 

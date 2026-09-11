@@ -274,6 +274,7 @@ def _status():
     print(f"  zernio_publish : {config.zernio_publish_enabled()}  (env AGENT_ZERNIO_PUBLISH)")
     print(f"  lasso_via_zernio: {config.lasso_via_zernio_enabled()}  (env AGENT_LASSO_VIA_ZERNIO; LASSO's own calendar rows publish through the SAME Zernio lane as the client gyms and the Meta-direct calendar lanes stand down, so exactly ONE lane owns a lasso row — kills the second-publisher taint in Zernio analytics (metrics_sync learning loop); needs 'python -m agent lasso-zernio-setup' first + AGENT_CALENDAR_AUTOPUBLISH + AGENT_PUBLISH_ENABLED + AGENT_ZERNIO_PUBLISH; missing setup => HOLD with one deduped alert, never a Meta-direct fallback; OFF => byte-for-byte today's Meta-direct routing)")
     print(f"  lasso_video_mix: {config.lasso_video_mix_enabled()}  (env AGENT_LASSO_VIDEO_MIX; weave podcast VIDEO clips into LASSO's non-sprint rotation — thu/sun prefer a real Drive clip + a cap-safe Wed video slot — to move the grid off all-text-cards toward the >=40%-with-a-human target, at or under the 25% podcast cap; summit 10-day sprints untouched; rebuild with 'python -m agent lasso-remap --write'; OFF => byte-for-byte today's rotation)")
+    print(f"  lasso_astra_default: {config.lasso_astra_default_enabled()}  (env AGENT_LASSO_ASTRA_DEFAULT; LASSO's b2b pillar tries the Astra-first daily_studio infographic builder FIRST, falling back to library rotation only when it returns None — matches platform/doctrine, which already default to Astra; rework the existing calendar with 'python -m agent lasso-astra-rework --write'; OFF => byte-for-byte today's rotation-first b2b behavior)")
     print(f"  social_baseline: {config.social_baseline_enabled()}  (env AGENT_SOCIAL_BASELINE; BEFORE/AFTER social metrics from the PUBLIC Instagram feed via Apify — once-only immutable pre-Echo baseline + fresh last-90 after-pull, the social-before-after CLI, and the SINCE ECHO STARTED block in the monthly retro digest; needs APIFY_TOKEN (inert without it, clear reason, never a crash); read-only, nothing publishes; Apify is pay-per-result ~$1.50-2.70/1000 items, a 90-day gym pull is cents)")
     print(f"  social_metrics_daily: {config.social_metrics_daily_enabled()}  (env AGENT_SOCIAL_METRICS_DAILY; the DAILY follower series pull into gym_social_metrics_daily from Zernio /v1/accounts/follower-stats, one request for the whole org; fixes AUD-007/D1 where that table had 0 rows; read-only against Zernio, the only write is the metrics table; window AGENT_SOCIAL_METRICS_BACKFILL_DAYS default 90)")
     print(f"  gbp_failed_retry: {config.gbp_failed_retry_enabled()}  (env AGENT_GBP_FAILED_RETRY; retry + RE-ALERT for Google Business rows stuck in failed; fixes AUD-003 where a failed row was never retried and never alerted twice, so lasso sat failed 16 days with nobody told; bounded attempts, never retries a permanent error)")
@@ -987,6 +988,7 @@ _COMMANDS = {
         ("account-key-doctor", "early-warning coverage check: for every social-product gym base, assert it resolves to exactly one live gym (+ Zernio profile); flag UNRESOLVED/AMBIGUOUS/ARCHIVED-ONLY stranding risks (read-only; --alert fires throttled ops alerts) [--base <base>]"),
         ("lasso-zernio-setup", "stamp LASSO's Zernio publish setup for AGENT_LASSO_VIA_ZERNIO: gyms.zernio_profile_id, the Facebook page (auto-pick or --page <id>), and lasso autonomy; idempotent"),
         ("lasso-remap", "rebuild LASSO's forward calendar with the video mix (AGENT_LASSO_VIDEO_MIX): thu/sun prefer a real podcast video clip + a cap-safe Wed video slot, summit sprints untouched; approvals preserved; [--month YYYY-MM] [--write]"),
+        ("lasso-astra-rework", "regenerate the IMAGE (never the schedule) on LASSO's existing non-video, non-published calendar slots as linked Astra v2 candidates (ECHO_VARIANT_PAIRING); same dates/times/count untouched, nothing publishes; [--months YYYY-MM,...] [--limit N] [--write]"),
         ("gen-handoff", "regenerate the live admin tracker HTML page"),
         ("ops-triage-classify", "classify one ops-alert line as noise/needs_triage (agent/ops_triage.py); prints exactly that word. Arg or stdin: python -m agent ops-triage-classify \"<alert text>\""),
     ],
@@ -3368,6 +3370,13 @@ def main(argv=None):
         #   python -m agent lasso-remap [--month YYYY-MM] [--gym lasso] [--write]
         from .lasso_remap import cli as _lasso_remap_cli
         _lasso_remap_cli(argv[1:])
+    elif cmd == "lasso-astra-rework":
+        # Regenerate the IMAGE (never the schedule) on LASSO's existing non-video,
+        # non-published slots as linked Astra v2 candidates. Same dates/times/count
+        # untouched; nothing publishes; a human picks in the portal.
+        #   python -m agent lasso-astra-rework [--months YYYY-MM,...] [--limit N] [--write]
+        from .lasso_astra_rework import cli as _lasso_astra_rework_cli
+        _lasso_astra_rework_cli(argv[1:])
     elif cmd == "ops-triage-classify":
         # Classify one ops-alert line as noise/needs_triage. Argument or stdin; prints
         # exactly "noise" or "needs_triage". The shell-out seam for scout-listener's
