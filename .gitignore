@@ -52,3 +52,4 @@ content_library/.regen_last.json
 dry_run_pending.json
 force_card.py
 skills-lock.json
+.DS_Store
