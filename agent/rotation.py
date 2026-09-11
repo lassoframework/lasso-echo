@@ -231,11 +231,21 @@ def is_gate_clean(note, approved_claims=None):
 # personalize a photo the gym's own service list merely NAMES (Kids Classes) onto a
 # picture nothing has confirmed shows a child ("your kid" on an adult photo). Neither
 # is a numeric figure, so _CLAIM_RE / is_gate_clean never sees it.
+# Widened after an independent audit (2026-09-10) found the first version blocked
+# only Dean's exact phrasings and let realistic paraphrases of the SAME fabrication
+# ship: "starting THIS Monday", "kicks BACK off", "registration is now open",
+# "begins Monday", "sign-up is live", "limited spots left". This is a deny-list, not
+# an exhaustive grammar -- it cannot catch every future paraphrase -- but every
+# concretely-reported bypass is now covered.
+_DAY_OR_NOW = (r"(?:now|soon|today|tomorrow|this month|next month|"
+              r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)")
 _TEMPORAL_IMMEDIACY_RE = re.compile(
     r"\b(last week|this week|just wrapped|just finished|just held|happening now|"
-    r"starting (?:now|soon|today|tomorrow|this month|next month|monday|tuesday|"
-    r"wednesday|thursday|friday|saturday|sunday)|join our|now enrolling|"
-    r"enrolling now|sign up now|kicks off|starts soon)\b", re.IGNORECASE)
+    r"recently (?:held|ran|hosted)|"
+    r"(?:starting|begins?|kicks?\s+(?:back\s+)?off)\s+(?:this\s+)?" + _DAY_OR_NOW + r"|"
+    r"join our|now enrolling|enrolling now|sign[\s-]?up (?:is live|now)|sign up now|"
+    r"registration is (?:now )?open|starts soon|"
+    r"limited spots|spots? (?:are |is )?(?:left|remaining|filling))\b", re.IGNORECASE)
 
 _PERSONALIZED_CHILD_RE = re.compile(r"\byour (?:kid|kids|child|children)\b", re.IGNORECASE)
 _CHILD_GROUNDING_RE = re.compile(r"\b(kid|kids|child|children|youth|toddler)\b", re.IGNORECASE)
@@ -251,12 +261,14 @@ def caption_output_gate_clean(caption, source_text, verified=None, photo_hint=""
         or starting soon.
       * PERSONALIZED CHILD CLAIM: "your kid"/"your child" asserts a child appears in
         THIS photo. That requires real grounding, never just because the day's
-        approved fact happens to be a Kids Classes service line: either `verified`
-        carries an explicit confirmation, or `photo_hint` (the picked creative's own
-        sidecar note / filename -- a real, non-fabricated client-provided signal,
-        never invented here) itself names a child/youth subject. Absent either, the
-        claim fails closed -- no current vision signal confirms a child in a shipped
-        crop.
+        approved fact happens to be a Kids Classes service line. Grounding today
+        comes ONLY from `photo_hint` (the picked creative's own sidecar note /
+        filename -- a real, non-fabricated client-provided signal, never invented
+        here) naming a child/youth subject; `verified.confirmed_children` is
+        accepted too but NOTHING in this codebase writes it yet (crop_verify's
+        people bucket is a COUNT, not an age check) -- it is forward-compatible
+        wiring for when a real child-confirming vision signal exists, not a live
+        path today. Absent either, the claim fails closed.
 
     Runs IN ADDITION to is_gate_clean's numeric-figure check, never in place of it.
     A blank caption is clean (nothing asserted)."""

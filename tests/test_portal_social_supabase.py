@@ -764,3 +764,49 @@ def test_deny_day_refuses_on_a_published_row(monkeypatch):
     status, body = ps.handle_deny_day("reverb", "live", "U_owner", sb_store=store)
     assert status == 409
     assert store.patches == []
+
+
+def test_deny_day_does_not_double_charge_a_raced_duplicate_call(monkeypatch):
+    # independent audit, 2026-09-10: two deny-day calls racing on the SAME target
+    # row set (a double-click, a client retry) must not both charge the budget.
+    store = _FakeStore([
+        _row("a", gym_id="reverb", post_date="2026-09-17", account="instagram",
+             fmt="feed", status="pending"),
+        _row("b", gym_id="reverb", post_date="2026-09-17", account="facebook",
+             fmt="feed", status="pending"),
+    ])
+    status1, body1 = ps.handle_deny_day("reverb", "a", "U_owner", sb_store=store)
+    assert status1 == 200
+    assert ps.recreate_spent("reverb") == 1
+    # Simulate the race: re-run against a FRESH store snapshot carrying the SAME
+    # row ids still pending (as a concurrent request would have read them before
+    # either write landed) -- the charge-dedupe key is keyed on the row id set,
+    # not on store identity, so it still catches this.
+    store2 = _FakeStore([
+        _row("a", gym_id="reverb", post_date="2026-09-17", account="instagram",
+             fmt="feed", status="pending"),
+        _row("b", gym_id="reverb", post_date="2026-09-17", account="facebook",
+             fmt="feed", status="pending"),
+    ])
+    status2, body2 = ps.handle_deny_day("reverb", "a", "U_owner", sb_store=store2)
+    assert status2 == 200
+    assert ps.recreate_spent("reverb") == 1, "the duplicate call on the same row set must not charge again"
+
+
+def test_deny_day_charges_again_for_a_genuinely_new_days_rework(monkeypatch):
+    # a LATER, legitimate deny-day on that day's next rework (fresh row ids after
+    # a rebuild) must still charge -- the dedupe must not become a permanent
+    # free pass for the whole day.
+    store = _FakeStore([
+        _row("a", gym_id="reverb", post_date="2026-09-17", status="pending"),
+    ])
+    status1, _ = ps.handle_deny_day("reverb", "a", "U_owner", sb_store=store)
+    assert status1 == 200
+    assert ps.recreate_spent("reverb") == 1
+
+    store2 = _FakeStore([
+        _row("c", gym_id="reverb", post_date="2026-09-17", status="pending"),
+    ])
+    status2, _ = ps.handle_deny_day("reverb", "c", "U_owner", sb_store=store2)
+    assert status2 == 200
+    assert ps.recreate_spent("reverb") == 2, "a different row set is a real new rework, not a duplicate"

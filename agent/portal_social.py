@@ -1353,6 +1353,20 @@ def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader
     one click per format). Charges the recreate budget EXACTLY ONCE for the whole
     day, not once per format -- the day is one concept, not N separate recreates.
 
+    DOUBLE-CHARGE GUARD (independent audit, 2026-09-10): a naive check-then-act
+    (read budget, write N rows, spend once) still double-charges if two deny-day
+    calls race on the SAME set of rows (a double-click, a client retry) -- both
+    read the budget before either spends, both successfully re-PATCH the same
+    already-pending rows (idempotent at the DB layer), and both then charge. The
+    charge is deduped on a kv stamp keyed by the EXACT sorted set of target row
+    ids: a genuine repeat call denying the SAME rows shares the key and is
+    skipped; a LATER, legitimate deny-day on that day's NEXT rework (a fresh set
+    of row ids after a rebuild) hashes differently and still charges. This
+    narrows the race to a single local kv read+write (serialized by db.py's own
+    lock within one process) rather than eliminating cross-process races
+    entirely -- the same tolerance level as every other kv-stamped dedup in this
+    codebase, never a distributed lock.
+
     Supabase-only (the shared content_calendar plane is what carries a day's other
     formats); 503s on the local-drafts plane, which has no day-spanning book."""
     if not config.portal_calendar_supabase_enabled():
@@ -1386,6 +1400,16 @@ def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader
             return 409, {"ok": False, "action": "deny-day", "draft_id": draft_id,
                          "error": "recreate budget for this month is used up",
                          "recreate_budget": _budget_state(account_key)}
+        # Stamp keyed to the EXACT target set, computed BEFORE any write, so the
+        # dedupe check happens as early as possible (narrowest race window).
+        import hashlib
+        target_ids = sorted(str(r.get("id") or "") for r in targets if r.get("id"))
+        charge_key = ("denyday_charged_" + account_key + "_" + day_key + "_"
+                     + hashlib.sha256("|".join(target_ids).encode()).hexdigest()[:16])
+        from . import db as _db
+        already_charged = bool(_db.kv_get(charge_key))
+        if not already_charged:
+            _db.kv_set(charge_key, "1")
         denied_ids = []
         for r in targets:
             rid = str(r.get("id") or "")
@@ -1400,8 +1424,10 @@ def handle_deny_day(account_key, draft_id, actor_id, note="", store=None, reader
     except Exception as exc:
         return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
                      "draft_id": draft_id}
-    # ONE unit for the whole day (Dean's actual complaint: N clicks, N charges today).
-    spend_recreate(account_key)
+    # ONE unit for the whole day (Dean's actual complaint: N clicks, N charges today) --
+    # skipped when a raced duplicate call already charged for this exact row set.
+    if not already_charged:
+        spend_recreate(account_key)
     return 200, {"ok": True, "action": "deny-day", "draft_id": draft_id,
                 "day_key": day_key, "denied_ids": denied_ids,
                 "recreate_budget": _budget_state(account_key)}

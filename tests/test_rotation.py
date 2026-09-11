@@ -231,3 +231,51 @@ def test_output_gate_case_insensitive_and_substring_safe():
     source = "Our program is STARTING today, come join!"
     cap = "Our program is starting today, come join!"
     assert rotation.caption_output_gate_clean(cap, source) is True
+
+
+# ---- widened after an independent audit (2026-09-10) found the first version too
+# narrow: it blocked Dean's exact phrasings but let realistic paraphrases of the
+# same fabrication through. Each of these is a bypass the audit actually found. ----
+
+def test_output_gate_blocks_starting_this_day_variant():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Starting this Monday, come see the results for yourself!", source) is False
+
+
+def test_output_gate_blocks_kicks_back_off():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Our challenge kicks back off this Monday!", source) is False
+
+
+def test_output_gate_blocks_registration_is_now_open():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Registration is now open for our nutrition challenge!", source) is False
+
+
+def test_output_gate_blocks_begins_monday():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Our next challenge begins Monday, don't wait!", source) is False
+
+
+def test_output_gate_blocks_signup_is_live():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Sign-up is live for the challenge!", source) is False
+
+
+def test_output_gate_blocks_limited_spots_left():
+    source = "Members who completed our 6-week Nutrition Challenge reported more energy."
+    assert rotation.caption_output_gate_clean(
+        "Limited spots left for the upcoming challenge!", source) is False
+
+
+def test_output_gate_still_allows_unrelated_copy():
+    # the widened regex must not start flagging ordinary copy that never claims a
+    # program is starting/enrolling
+    source = "We coach every fitness level with real, sustainable programming."
+    cap = "It's not about where you're starting; it's about where you're going."
+    assert rotation.caption_output_gate_clean(cap, source) is True
