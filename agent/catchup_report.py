@@ -65,6 +65,9 @@ def _coverage_default(slug, today):
         params={
             "gym_id": f"eq.{slug}",
             "post_date": f"gte.{week_ago}",
+            # 0318: exclude candidate/archived variant rows so a pending Astra v2
+            # sitting beside its slot's active row never inflates this count.
+            "variant_status": "eq.active",
             "select": "post_date,status,published_at",
         },
         headers=store._headers(),

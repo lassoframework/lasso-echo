@@ -1189,6 +1189,136 @@ def handle_recreate_caption(account_key, draft_id, actor_id, reader=None,
                  "recreate_budget": _budget_state(account_key)}
 
 
+# ==========================================================================
+# Variant pairing (0318): "regenerate this photo" produces a v2 CANDIDATE
+# side by side with the live creative, instead of overwriting it. A human
+# picks between them via pick-variant, which does not touch approval status.
+#
+# GET  /portal/<token>/posts/<id>/variants      -- list the group (active + candidates)
+# POST /portal/<token>/posts/<id>/regen-variant -- generate a new candidate FOR <id>
+# POST /portal/<token>/posts/<id>/pick-variant  -- <id> IS the candidate; promote it
+#
+# Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF).
+# ==========================================================================
+
+def handle_list_variants(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """The variant group (active + candidates) `draft_id` belongs to. Read-only,
+    so NOT gated behind the ECHO_VARIANT_PAIRING flag -- there is nothing to
+    show if no candidate was ever created (create is gated), and a client
+    reading their own already-scoped calendar is never a new capability."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "variants", "draft_id": draft_id,
+                     "error": "variant listing needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        group = sb_store.get_variant_group(account_key, draft_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not group:
+        return 404, {"ok": False, "error": "draft not found", "draft_id": draft_id}
+    return 200, {"ok": True, "action": "variants", "draft_id": draft_id,
+                 "variants": [{
+                     "id": v.get("id"), "variant_status": v.get("variant_status"),
+                     "image_url": v.get("image_url"), "caption": v.get("caption"),
+                     "status": v.get("status"), "thumbnail_url": v.get("thumbnail_url"),
+                 } for v in group]}
+
+
+def handle_regen_variant(account_key, draft_id, actor_id, reader=None, sb_store=None,
+                         regen_fn=None):
+    """Generate a NEW image for the logical post `draft_id` represents and store
+    it as a linked 'candidate' row, WITHOUT touching `draft_id` itself. The
+    live creative stays exactly what it was; the candidate awaits a pick.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read, no Astra call)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                     "error": "variant regeneration needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        final = _published_is_final(row, "regen-variant", draft_id)
+        if final is not None:
+            return final
+        gen = regen_fn or _vr.generate_variant_image
+        result = gen(row, account_key)
+        if not result.get("ok"):
+            return 409, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": _vr.client_message(result.get("reason")),
+                         "reason": result.get("reason")}
+        candidate = sb_store.create_variant_candidate(
+            account_key, row, result["image_url"])
+        if candidate is None:
+            return 500, {"ok": False, "action": "regen-variant", "draft_id": draft_id,
+                         "error": "the new image could not be saved as a candidate"}
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    return 200, {"ok": True, "action": "regen-variant", "draft_id": draft_id,
+                 "candidate": {"id": candidate.get("id"),
+                              "image_url": candidate.get("image_url"),
+                              "caption": candidate.get("caption"),
+                              "variant_status": candidate.get("variant_status")}}
+
+
+def handle_pick_variant(account_key, draft_id, actor_id, reader=None, sb_store=None):
+    """Promote the candidate `draft_id` to 'active' for its group. `draft_id`
+    here IS the candidate's own row id (the id the client is looking at in
+    the side-by-side picker) -- ownership is still proven the same way every
+    other action proves it (get_row is gym-scoped), and the actual atomic
+    work happens server-side in content_calendar_swap_variant so this handler
+    never has a read-then-write race window of its own.
+
+    Flag: config.variant_pairing_enabled() (ECHO_VARIANT_PAIRING, default OFF
+    -> 403, no store read)."""
+    short = _action_gates(account_key, draft_id, actor_id, reader)
+    if short is not None:
+        return short
+    from . import variant_regen as _vr
+    if not _vr.enabled():
+        return 403, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking is not enabled for this gym"}
+    if not config.portal_calendar_supabase_enabled():
+        return 503, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                     "error": "variant picking needs the shared calendar plane"}
+    sb_store = sb_store or _pcs.SupabaseCalendarStore()
+    try:
+        # Ownership check up front, same 404-on-cross-gym contract as every
+        # other action -- the RPC ALSO re-checks gym_id itself (belt and
+        # braces: the RPC is the true authority, this is just consistent UX).
+        row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
+        if miss is not None:
+            return miss
+        result = sb_store.swap_variant(account_key, draft_id, actor=actor_id)
+    except Exception as exc:
+        return 500, {"ok": False, "error": f"store error: {type(exc).__name__}",
+                     "draft_id": draft_id}
+    if not result.get("ok"):
+        error = result.get("error", "unknown")
+        status = 409
+        if error == "not_found":
+            status = 404
+        return status, {"ok": False, "action": "pick-variant", "draft_id": draft_id,
+                        "error": error}
+    return 200, {"ok": True, "action": "pick-variant", "draft_id": draft_id,
+                 "active_id": result.get("active_id"),
+                 "archived_previous_active": result.get("archived_previous_active")}
+
+
 def _handle_kill_supabase(account_key, draft_id, actor_id, confirm, reader, sb_store):
     short = _action_gates(account_key, draft_id, actor_id, reader)
     if short is not None:

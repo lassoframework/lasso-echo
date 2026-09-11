@@ -1335,6 +1335,23 @@ def caption_recreate_scoped_enabled() -> bool:
     return _truthy(os.environ.get("ECHO_CAPTION_RECREATE_SCOPED", "false"))
 
 
+def variant_pairing_enabled() -> bool:
+    """ECHO_VARIANT_PAIRING, default OFF. The Astra "v2 creative" pairing feature
+    (migration 0318): regenerate an existing scheduled post's IMAGE as a linked
+    'candidate' content_calendar row (variant_of the original), review it side by
+    side with the live creative, and PICK one atomically via
+    content_calendar_swap_variant. Neither row's approval status is touched by any
+    of this -- a variant becoming active still goes through the exact same
+    publish-approval gate as any normal post.
+
+    This is a prerequisite for a queued fleet-wide regeneration sweep (~1,000+
+    September posts), so it ships gated OFF until verified end-to-end against a
+    real gym, same pattern as ECHO_MEDIA_SWAP_FREE / ECHO_CAPTION_RECREATE_SCOPED.
+    Arm by hand: ECHO_VARIANT_PAIRING=true.
+    """
+    return _truthy(os.environ.get("ECHO_VARIANT_PAIRING", "false"))
+
+
 def portal_show_rejected() -> bool:
     """ESCAPE HATCH for the client-calendar rejection filter (B12), default OFF.
 
