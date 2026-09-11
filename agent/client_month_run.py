@@ -712,7 +712,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         key = (_url_basename(getattr(feed, "creative_public_url", "") or "")
                or os.path.basename(feed_path))
         _record_feed_served(account, feed, day_key)
-        media_guard.note_placed(guard_state, key, day_key)
+        raw_basename = os.path.basename(feed_path) if feed_path else ""
+        media_guard.note_placed(guard_state, raw_basename or key, day_key)
         story_override = (edited_story_caps or {}).get(str(day_key)[:10])
         drafts.extend(_finish_feed_with_story(
             account, feed, library_path, log, day_key=day_key,
@@ -720,6 +721,8 @@ def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, l
         covered_days.add(day_key)
         if key:
             used_keys.add(key)
+        if raw_basename:
+            used_keys.add(raw_basename)
         filled += 1
         log(f"{base_key} {day_key}: Drive pool exhausted for the day; placed a spaced "
             f"repeat ({key}) so the day is never empty")
