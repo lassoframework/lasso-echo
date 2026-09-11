@@ -1024,7 +1024,7 @@ def run_daily(poster=None, voice_path=None, library_path=None,
                 _record_cap(account.key, draft.draft_type or "feed", day_key)
 
             existing = None
-            if idempotent:
+            if idempotent and draft is not None:
                 draft, existing = _reconcile(draft, day_key, "feed", store, poster)
                 if draft is None:
                     # Re-run, nothing new: the existing PENDING draft IS the result.
